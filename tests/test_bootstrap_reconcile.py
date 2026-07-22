@@ -148,6 +148,7 @@ def _write_jarvis_state(home: Path, desired: BootstrapDesiredState) -> tuple[Pat
         {
             "repos": [
                 str((home / ".local/share/clio-relay/clio_relay").absolute()),
+                str((root / "builtin").absolute()),
                 "/operator/clio_relay",
             ]
         },
@@ -158,6 +159,29 @@ def _write_jarvis_state(home: Path, desired: BootstrapDesiredState) -> tuple[Pat
     (root / "repos.yaml").write_bytes(repos_bytes)
     (root / "resource_graph.yaml").write_bytes(graph_bytes)
     return root, config_bytes, graph_bytes
+
+
+def _write_jarvis_cd_builtin_distribution(environment: Path) -> Path:
+    """Create the minimal wheel-install evidence used by repository migration tests."""
+    if os.name == "nt":
+        site_packages = environment / "Lib/site-packages"
+    else:
+        site_packages = environment / "lib/python3.12/site-packages"
+    builtin = site_packages / "builtin"
+    (builtin / "builtin").mkdir(parents=True)
+    (builtin / "__init__.py").write_text("", encoding="utf-8")
+    (builtin / "builtin/__init__.py").write_text("", encoding="utf-8")
+    distribution = site_packages / "jarvis_cd-x.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text(
+        "Metadata-Version: 2.4\nName: jarvis-cd\nVersion: 1.3.18\n",
+        encoding="utf-8",
+    )
+    (distribution / "RECORD").write_text(
+        "builtin/__init__.py,,\nbuiltin/builtin/__init__.py,,\n",
+        encoding="utf-8",
+    )
+    return builtin
 
 
 def _installation_info(desired: BootstrapDesiredState) -> dict[str, object]:
@@ -1185,6 +1209,25 @@ def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: P
     assert (root / "resource_graph.yaml").read_bytes() == graph_before
 
 
+def test_jarvis_state_requires_the_managed_builtin_slot_for_exact_reuse(tmp_path: Path) -> None:
+    """Bootstrap evidence distinguishes relay packages from JARVIS builtins."""
+    desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
+    root, _config, _graph = _write_jarvis_state(tmp_path, desired)
+
+    complete = inspect_jarvis_state(desired, home=tmp_path)
+    document = yaml.safe_load((root / "repos.yaml").read_text(encoding="utf-8"))
+    document["repos"].remove(str((root / "builtin").absolute()))
+    (root / "repos.yaml").write_text(
+        yaml.safe_dump(document, sort_keys=False),
+        encoding="utf-8",
+    )
+    missing = inspect_jarvis_state(desired, home=tmp_path)
+
+    assert complete.managed_builtin_repo_registered is True
+    assert missing.managed_repo_registered is True
+    assert missing.managed_builtin_repo_registered is False
+
+
 def test_managed_repo_migration_preserves_operator_repo_and_resolves_jarvis_package(
     tmp_path: Path,
 ) -> None:
@@ -1253,6 +1296,132 @@ def test_managed_repo_migration_preserves_operator_repo_and_resolves_jarvis_pack
     reused = reconcile_managed_jarvis_repository(repos_file, managed_repo)
     assert reused["action"] == "reused"
     assert repos_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("environment_kind", ["legacy", "generation"])
+def test_relay_owned_jarvis_builtin_reconcile_preserves_operator_repositories(
+    tmp_path: Path,
+    environment_kind: str,
+) -> None:
+    """Only a RECORD-proven builtin under a relay-owned venv is migrated."""
+    relay_root = tmp_path / ".local/share/clio-relay"
+    if environment_kind == "legacy":
+        environment = relay_root / "jarvis-venv"
+        supplied_environments: tuple[Path, ...] = ()
+    else:
+        environment = relay_root / "generations" / ("a" * 64) / "jarvis-venv"
+        supplied_environments = (environment,)
+    relay_builtin = _write_jarvis_cd_builtin_distribution(environment)
+    operator_environment = tmp_path / "operator/jarvis-venv"
+    operator_builtin = _write_jarvis_cd_builtin_distribution(operator_environment)
+    managed = relay_root / "clio_relay"
+    managed.mkdir(parents=True)
+    repos_file = tmp_path / "repos.yaml"
+    repos_file.write_text(
+        yaml.safe_dump(
+            {
+                "repos": [
+                    str(relay_builtin.absolute()),
+                    str(operator_builtin.absolute()),
+                    str(managed.absolute()),
+                ],
+                "operator_extension": {"preserve": True},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    proven = bootstrap_reconcile_module._relay_owned_jarvis_builtin_repositories(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        home=tmp_path,
+        execution_environments=supplied_environments,
+    )
+    evidence = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed,
+        managed_builtin_repo=tmp_path / "builtin",
+        previous_managed_repos=proven,
+    )
+    document = yaml.safe_load(repos_file.read_text(encoding="utf-8"))
+
+    assert proven == (relay_builtin,)
+    assert evidence["added_managed_repos"] == [
+        str(managed.absolute()),
+        str((tmp_path / "builtin").absolute()),
+    ]
+    assert evidence["removed_previous_managed_repos"] == [str(relay_builtin.absolute())]
+    assert document["repos"] == [
+        str(managed.absolute()),
+        str((tmp_path / "builtin").absolute()),
+        str(operator_builtin.absolute()),
+    ]
+    assert document["operator_extension"] == {"preserve": True}
+
+
+def test_managed_builtin_slot_replaces_stale_relay_path_without_operator_promotion(
+    tmp_path: Path,
+) -> None:
+    """Stable builtin binding retains explicit operator repository precedence."""
+    repos_file = tmp_path / ".ppi-jarvis/repos.yaml"
+    repos_file.parent.mkdir()
+    managed = tmp_path / ".local/share/clio-relay/clio_relay"
+    managed.mkdir(parents=True)
+    operator_builtin = tmp_path / "operator/builtin"
+    operator_builtin.mkdir(parents=True)
+    stale_builtin = _write_jarvis_cd_builtin_distribution(
+        tmp_path / ".local/share/clio-relay/jarvis-venv"
+    )
+    operator_other = tmp_path / "operator/science"
+    operator_other.mkdir(parents=True)
+    repos_file.write_text(
+        yaml.safe_dump(
+            {
+                "repos": [
+                    str(operator_builtin.absolute()),
+                    str(stale_builtin.absolute()),
+                    str(operator_other.absolute()),
+                ]
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = reconcile_managed_jarvis_repository(
+        repos_file,
+        managed,
+        managed_builtin_repo=repos_file.parent / "builtin",
+        previous_managed_repos=(stale_builtin,),
+    )
+
+    assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
+        str(managed.absolute()),
+        str(operator_builtin.absolute()),
+        str((repos_file.parent / "builtin").absolute()),
+        str(operator_other.absolute()),
+    ]
+    assert evidence["added_managed_repos"] == [
+        str(managed.absolute()),
+        str((repos_file.parent / "builtin").absolute()),
+    ]
+    assert evidence["removed_previous_managed_repos"] == [str(stale_builtin.absolute())]
+
+
+def test_relay_owned_jarvis_builtin_requires_distribution_record_proof(tmp_path: Path) -> None:
+    """A lookalike directory in relay's legacy venv is not sufficient provenance."""
+    environment = tmp_path / ".local/share/clio-relay/jarvis-venv"
+    if os.name == "nt":
+        builtin = environment / "Lib/site-packages/builtin"
+    else:
+        builtin = environment / "lib/python3.12/site-packages/builtin"
+    builtin.mkdir(parents=True)
+
+    assert (
+        bootstrap_reconcile_module._relay_owned_jarvis_builtin_repositories(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            home=tmp_path,
+        )
+        == ()
+    )
 
 
 def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
@@ -1818,6 +1987,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
     for path in (execution_python, execution_jarvis):
         path.write_bytes(path.name.encode())
         path.chmod(0o755)
+    stale_builtin_repo = _write_jarvis_cd_builtin_distribution(execution_root)
     legacy_identity = execution_environment_identity(
         execution_root,
         executables={"python": execution_python, "jarvis": execution_jarvis},
@@ -1856,7 +2026,13 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
     operator_repo = tmp_path / "operator/clio_relay"
     repos_file.write_text(
         yaml.safe_dump(
-            {"repos": [str(operator_repo.absolute()), str(previous_repo.absolute())]},
+            {
+                "repos": [
+                    str(operator_repo.absolute()),
+                    str(stale_builtin_repo.absolute()),
+                    str(previous_repo.absolute()),
+                ]
+            },
             sort_keys=False,
         ),
         encoding="utf-8",
@@ -1928,6 +2104,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         path: Path,
         managed: Path,
         *,
+        managed_builtin_repo: Path | None = None,
         previous_managed_repos: tuple[Path, ...] = (),
         exchange_identity: str | None = None,
     ) -> dict[str, object]:
@@ -1938,6 +2115,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         evidence = original_reconcile(
             path,
             managed,
+            managed_builtin_repo=managed_builtin_repo,
             previous_managed_repos=previous_managed_repos,
             exchange_identity=exchange_identity,
         )
@@ -1973,7 +2151,11 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
     )
 
     repositories = yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"]
-    assert repositories == [str(managed_repo.absolute()), str(operator_repo.absolute())]
+    assert repositories == [
+        str(managed_repo.absolute()),
+        str(operator_repo.absolute()),
+        str((jarvis_root / "builtin").absolute()),
+    ]
     first_repository = cast(dict[str, object], first_completed["jarvis_repository"])
     second_repository = cast(dict[str, object], second_completed["jarvis_repository"])
     second_update = cast(dict[str, object], second_repository["repositories"])

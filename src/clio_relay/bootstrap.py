@@ -3135,6 +3135,8 @@ def _validate_bootstrap_receipt(
     if (
         repository_update.get("before_sha256") != before_state.get("repos_sha256")
         or repository_update.get("after_sha256") != after_state.get("repos_sha256")
+        or after_state.get("managed_repo_registered") is not True
+        or after_state.get("managed_builtin_repo_registered") is not True
         or not isinstance(repository_update.get("added_managed_repos"), list)
         or not isinstance(repository_update.get("removed_previous_managed_repos"), list)
     ):
@@ -3225,13 +3227,12 @@ def _validate_bootstrap_receipt(
         )
         expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
         expected_legacy = remote_home + LEGACY_MANAGED_JARVIS_REPO_PATH.removeprefix("~")
+        expected_builtin = remote_home + "/.ppi-jarvis/builtin"
         typed_removed_repositories = cast(list[object], removed_repositories)
-        removed_repositories_are_proven = bool(
-            all(isinstance(value, str) for value in typed_removed_repositories)
-            and typed_removed_repositories
-            == sorted(set(cast(list[str], typed_removed_repositories)))
-            and set(cast(list[str], typed_removed_repositories))
-            <= {expected_previous, expected_legacy}
+        removed_repositories_are_proven = _jarvis_repository_removals_are_proven(
+            typed_removed_repositories,
+            remote_home=remote_home,
+            exact_paths={expected_previous, expected_legacy},
         )
         repository_action = repository_update.get("action")
         if binding.get("target") != expected_target:
@@ -3246,7 +3247,11 @@ def _validate_bootstrap_receipt(
         elif repository_action == "updated":
             if (
                 typed_jarvis_preservation.get("repositories_byte_identical") is not False
-                or added_repositories not in ([], [managed_repo])
+                or not _jarvis_repository_additions_are_proven(
+                    cast(list[object], added_repositories),
+                    managed_repo=managed_repo,
+                    managed_builtin_repo=expected_builtin,
+                )
                 or not removed_repositories_are_proven
                 or (not added_repositories and not removed_repositories)
             ):
@@ -3320,13 +3325,12 @@ def _validate_bootstrap_receipt(
         )
         expected_previous = remote_home + "/.local/src/clio-relay/jarvis-packages/clio_relay"
         expected_legacy = remote_home + LEGACY_MANAGED_JARVIS_REPO_PATH.removeprefix("~")
+        expected_builtin = remote_home + "/.ppi-jarvis/builtin"
         typed_removed_repositories = cast(list[object], removed_repositories)
-        removed_repositories_are_proven = bool(
-            all(isinstance(value, str) for value in typed_removed_repositories)
-            and typed_removed_repositories
-            == sorted(set(cast(list[str], typed_removed_repositories)))
-            and set(cast(list[str], typed_removed_repositories))
-            <= {expected_previous, expected_legacy}
+        removed_repositories_are_proven = _jarvis_repository_removals_are_proven(
+            typed_removed_repositories,
+            remote_home=remote_home,
+            exact_paths={expected_previous, expected_legacy},
         )
         repository_action = repository_update.get("action")
         if (
@@ -3345,7 +3349,11 @@ def _validate_bootstrap_receipt(
         elif repository_action == "updated":
             if (
                 typed_jarvis_preservation.get("repositories_byte_identical") is not False
-                or added_repositories not in ([], [managed_repo])
+                or not _jarvis_repository_additions_are_proven(
+                    cast(list[object], added_repositories),
+                    managed_repo=managed_repo,
+                    managed_builtin_repo=expected_builtin,
+                )
                 or not removed_repositories_are_proven
                 or (not added_repositories and not removed_repositories)
             ):
@@ -3389,6 +3397,86 @@ def _is_sha256_value(value: object) -> bool:
         and value == value.lower()
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _jarvis_repository_removals_are_proven(
+    values: list[object],
+    *,
+    remote_home: str,
+    exact_paths: set[str],
+) -> bool:
+    """Accept only exact historical relay repository paths in bootstrap evidence."""
+    if not all(isinstance(value, str) for value in values):
+        return False
+    repositories = cast(list[str], values)
+    return bool(
+        repositories == sorted(set(repositories))
+        and all(
+            value in exact_paths
+            or _is_relay_owned_jarvis_builtin_repository(value, remote_home=remote_home)
+            for value in repositories
+        )
+    )
+
+
+def _jarvis_repository_additions_are_proven(
+    values: list[object],
+    *,
+    managed_repo: str,
+    managed_builtin_repo: str,
+) -> bool:
+    """Accept only the ordered relay and JARVIS stable repository bindings."""
+    allowed = [managed_repo, managed_builtin_repo]
+    if not all(isinstance(value, str) for value in values):
+        return False
+    repositories = cast(list[str], values)
+    return bool(
+        len(repositories) <= len(allowed)
+        and len(repositories) == len(set(repositories))
+        and all(value in allowed for value in repositories)
+        and repositories == [value for value in allowed if value in repositories]
+    )
+
+
+def _is_relay_owned_jarvis_builtin_repository(value: str, *, remote_home: str) -> bool:
+    """Recognize the exact legacy or content-addressed relay venv builtin path."""
+    if any(character in value for character in "\x00\r\n"):
+        return False
+    path = PurePosixPath(value)
+    home = PurePosixPath(remote_home)
+    if not path.is_absolute() or str(path) != value or not home.is_absolute():
+        return False
+    try:
+        relative = path.relative_to(home / ".local/share/clio-relay")
+    except ValueError:
+        return False
+    parts = relative.parts
+    legacy_prefix = ("jarvis-venv",)
+    generation_prefix = (
+        ("generations", parts[1], "jarvis-venv")
+        if len(parts) >= 3 and _is_sha256_value(parts[1])
+        else ()
+    )
+    for prefix in (legacy_prefix, generation_prefix):
+        if not prefix or parts[: len(prefix)] != prefix:
+            continue
+        suffix = parts[len(prefix) :]
+        if (
+            len(suffix) == 4
+            and suffix[0] in {"lib", "lib64"}
+            and _is_python_library_directory_name(suffix[1])
+            and suffix[2:] == ("site-packages", "builtin")
+        ):
+            return True
+    return False
+
+
+def _is_python_library_directory_name(value: str) -> bool:
+    """Recognize one CPython virtual-environment library component."""
+    if not value.startswith("python"):
+        return False
+    major, separator, minor = value.removeprefix("python").partition(".")
+    return bool(separator and major.isdigit() and minor.isdigit())
 
 
 def _worker_writer_proof_shell(*, rendered_core_dir: str, success_variable: str) -> str:
@@ -7577,12 +7665,22 @@ import os
 import sys
 from pathlib import Path
 
-from clio_relay.bootstrap_reconcile import reconcile_managed_jarvis_repository
+from clio_relay.bootstrap_reconcile import (
+    _relay_owned_jarvis_builtin_repositories,
+    reconcile_managed_jarvis_repository,
+)
+
+relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(home=Path.home())
 
 evidence = reconcile_managed_jarvis_repository(
     Path(os.environ["JARVIS_REPOS_FILE"]),
     Path(os.environ["MANAGED_JARVIS_REPO"]),
-    previous_managed_repos=(Path(sys.argv[1]), Path(sys.argv[2])),
+    managed_builtin_repo=Path(os.environ["JARVIS_REPOS_FILE"]).parent / "builtin",
+    previous_managed_repos=(
+        Path(sys.argv[1]),
+        Path(sys.argv[2]),
+        *relay_owned_builtin_repos,
+    ),
 )
 print(f"jarvis_managed_repo={{evidence['action']}}")
 __CLIO_RELAY_JARVIS_REPO_RECONCILE__
