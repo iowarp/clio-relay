@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.5.0"
+$Version = "1.5.1"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }

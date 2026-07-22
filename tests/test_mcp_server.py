@@ -3703,24 +3703,64 @@ def test_registered_remote_mcp_ssh_forwarding_carries_evidence_not_lane(
         discovery_schema_digest="e" * 64,
         expected_server_artifact_digest="c" * 64,
     )
-    commands: list[list[str]] = []
+    commands: list[tuple[list[str], str | None]] = []
+    registry_writes: list[tuple[str, bytes]] = []
+    argument_writes: list[tuple[str, bytes]] = []
+    removals: list[tuple[str, str, bool]] = []
+    events: list[str] = []
 
-    def ignore_write(_definition: ClusterDefinition, _path: str, _data: bytes) -> None:
-        return None
+    def write_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
+        data: bytes,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("write-registry")
+        registry_writes.append((path, data))
 
-    def ignore_remove(
-        _definition: ClusterDefinition,
-        _path: str,
+    def remove_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
         *,
         remove_empty_parent: bool,
     ) -> None:
-        del remove_empty_parent
+        assert selected_definition == definition
+        events.append("remove-registry")
+        removals.append(("registry", path, remove_empty_parent))
 
-    monkeypatch.setattr(mcp_server_module, "write_remote_file", ignore_write)
-    monkeypatch.setattr(mcp_server_module, "remove_remote_file", ignore_remove)
+    def write_arguments(
+        selected_definition: ClusterDefinition,
+        path: str,
+        data: bytes,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("write-arguments")
+        argument_writes.append((path, data))
 
-    def run_remote(_definition: ClusterDefinition, command: list[str]) -> str:
-        commands.append(command)
+    def remove_arguments(
+        selected_definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("remove-arguments")
+        removals.append(("arguments", path, remove_empty_parent))
+
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
+    monkeypatch.setattr(mcp_server_module, "write_remote_file", write_arguments)
+    monkeypatch.setattr(mcp_server_module, "remove_remote_file", remove_arguments)
+
+    def run_remote(
+        selected_definition: ClusterDefinition,
+        command: list[str],
+        *,
+        cluster_registry_path: str | None = None,
+    ) -> str:
+        assert selected_definition == definition
+        events.append("run")
+        commands.append((command, cluster_registry_path))
         return "job_remote_registered\n"
 
     monkeypatch.setattr(mcp_server_module, "run_remote_clio", run_remote)
@@ -3747,10 +3787,129 @@ def test_registered_remote_mcp_ssh_forwarding_carries_evidence_not_lane(
     )
 
     assert result["job_id"] == "job_remote_registered"
-    command = commands[0]
+    assert len(registry_writes) == 1
+    registry_path, registry_payload = registry_writes[0]
+    staged_registry = ClusterRegistry.model_validate_json(registry_payload)
+    assert staged_registry.clusters == {definition.name: definition}
+    staged_definition = staged_registry.require(definition.name)
+    assert staged_definition.remote_mcp_servers == {"science": registration}
+    assert cluster_route_revision(staged_definition) == cluster_route_revision(definition)
+    assert len(argument_writes) == 1
+    arguments_path, arguments_payload = argument_writes[0]
+    assert json.loads(arguments_payload) == {"dataset": "asteroid2018"}
+    command, remote_registry_path = commands[0]
+    assert remote_registry_path == f"$HOME/{registry_path}"
     assert "--admission-class" not in command
     evidence_json = command[command.index("--control-query-evidence-json") + 1]
     assert McpControlQueryEvidence.model_validate_json(evidence_json) == evidence
+    assert removals == [
+        ("arguments", arguments_path, True),
+        ("registry", registry_path, True),
+    ]
+    assert events == [
+        "write-registry",
+        "write-arguments",
+        "run",
+        "remove-arguments",
+        "remove-registry",
+    ]
+
+
+def test_registered_remote_mcp_ssh_failure_cleans_arguments_and_route_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent-facing SSH submission removes all invocation authority after failure."""
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        remote_mcp_servers={"science": registration},
+    )
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    staged_paths: list[tuple[str, str]] = []
+    removed_paths: list[tuple[str, str, bool]] = []
+
+    def write_registry(
+        _definition: ClusterDefinition,
+        path: str,
+        _data: bytes,
+    ) -> None:
+        staged_paths.append(("registry", path))
+
+    def write_arguments(
+        _definition: ClusterDefinition,
+        path: str,
+        _data: bytes,
+    ) -> None:
+        staged_paths.append(("arguments", path))
+
+    def remove_registry(
+        _definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        removed_paths.append(("registry", path, remove_empty_parent))
+
+    def remove_arguments(
+        _definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        removed_paths.append(("arguments", path, remove_empty_parent))
+
+    def fail_remote(
+        _definition: ClusterDefinition,
+        _command: list[str],
+        *,
+        cluster_registry_path: str | None = None,
+    ) -> str:
+        assert cluster_registry_path == f"$HOME/{staged_paths[0][1]}"
+        raise RelayError("remote MCP launch failed")
+
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
+    monkeypatch.setattr(mcp_server_module, "write_remote_file", write_arguments)
+    monkeypatch.setattr(mcp_server_module, "remove_remote_file", remove_arguments)
+    monkeypatch.setattr(mcp_server_module, "run_remote_clio", fail_remote)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 124,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_submit_mcp_call",
+                "arguments": {
+                    "cluster": definition.name,
+                    "server": registration.command,
+                    "server_args": registration.args,
+                    "tool": "inspect",
+                    "arguments": {"dataset": "asteroid2018"},
+                },
+            },
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="admin",
+    )
+
+    assert response is not None
+    assert response["error"]["message"] == "remote MCP launch failed"
+    assert [kind for kind, _path in staged_paths] == ["registry", "arguments"]
+    assert removed_paths == [
+        ("arguments", staged_paths[1][1], True),
+        ("registry", staged_paths[0][1], True),
+    ]
 
 
 def test_virtual_remote_mcp_idempotency_replays_exactly_and_conflicts_on_drift(

@@ -9030,6 +9030,243 @@ def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPat
     assert job.spec.timeout_seconds == 90
 
 
+@pytest.mark.parametrize(
+    ("operation", "operation_arguments", "expected_tool_arguments"),
+    [
+        ("tools/list", [], None),
+        (
+            "tools/call",
+            [
+                "--tool",
+                "inspect",
+                "--arguments-json",
+                '{"dataset":"asteroid-first-five"}',
+            ],
+            {"dataset": "asteroid-first-five"},
+        ),
+    ],
+)
+def test_cli_remote_mcp_call_stages_exact_route_authority_for_one_invocation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    operation: str,
+    operation_arguments: list[str],
+    expected_tool_arguments: dict[str, object] | None,
+) -> None:
+    """Remote discovery and calls receive the exact operator route, then remove it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+        profiles=["user"],
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        scheduler_provider="slurm",
+        core_dir="$HOME/site/relay-core",
+        spool_dir="$HOME/site/relay-spool",
+        remote_mcp_servers={"science": registration},
+    )
+    ClusterRegistry(clusters={definition.name: definition}).save(
+        tmp_path / ".clio-relay" / "clusters.json"
+    )
+    registry_writes: list[tuple[str, bytes]] = []
+    argument_writes: list[tuple[str, bytes]] = []
+    removals: list[tuple[str, str, bool]] = []
+    shell_scripts: list[str] = []
+    events: list[str] = []
+
+    def write_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
+        data: bytes,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("write-registry")
+        registry_writes.append((path, data))
+
+    def remove_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("remove-registry")
+        removals.append(("registry", path, remove_empty_parent))
+
+    def write_arguments(
+        selected_definition: ClusterDefinition,
+        path: str,
+        data: bytes,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("write-arguments")
+        argument_writes.append((path, data))
+
+    def remove_arguments(
+        selected_definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("remove-arguments")
+        removals.append(("arguments", path, remove_empty_parent))
+
+    def run_remote_shell(selected_definition: ClusterDefinition, script: str) -> str:
+        assert selected_definition == definition
+        events.append("run")
+        shell_scripts.append(script)
+        return "job_remote_mcp\n"
+
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
+    monkeypatch.setattr("clio_relay.cli.write_remote_file", write_arguments)
+    monkeypatch.setattr("clio_relay.cli.remove_remote_file", remove_arguments)
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_remote_shell)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "mcp-call",
+            "--cluster",
+            definition.name,
+            "--server",
+            registration.command,
+            "--server-arg=--stdio",
+            "--operation",
+            operation,
+            *operation_arguments,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "job_remote_mcp"
+    assert len(registry_writes) == 1
+    registry_path, registry_payload = registry_writes[0]
+    staged_registry = ClusterRegistry.model_validate_json(registry_payload)
+    assert staged_registry.clusters == {definition.name: definition}
+    staged_definition = staged_registry.require(definition.name)
+    assert staged_definition.remote_mcp_servers == {"science": registration}
+    assert cluster_route_revision(staged_definition) == cluster_route_revision(definition)
+    assert registry_path.startswith(".local/share/clio-relay/desktop-submissions/mcp-registry-")
+    assert registry_path.endswith("/clusters.json")
+    assert len(shell_scripts) == 1
+    assert f'export CLIO_RELAY_CLUSTER_REGISTRY="$HOME/{registry_path}";' in shell_scripts[0]
+    assert "export CLIO_RELAY_CLI_MODE=local;" in shell_scripts[0]
+    assert f"clio-relay mcp-call --cluster {definition.name}" in shell_scripts[0]
+    assert removals[-1] == ("registry", registry_path, True)
+    if expected_tool_arguments is None:
+        assert argument_writes == []
+        assert events == ["write-registry", "run", "remove-registry"]
+    else:
+        assert len(argument_writes) == 1
+        arguments_path, arguments_payload = argument_writes[0]
+        assert json.loads(arguments_payload) == expected_tool_arguments
+        assert removals == [
+            ("arguments", arguments_path, True),
+            ("registry", registry_path, True),
+        ]
+        assert events == [
+            "write-registry",
+            "write-arguments",
+            "run",
+            "remove-arguments",
+            "remove-registry",
+        ]
+
+
+def test_cli_remote_mcp_call_cleans_arguments_and_route_authority_after_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A failed remote launch removes both invocation-scoped staging files."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    registration = RemoteMcpServerConfig(
+        command="science-mcp",
+        args=["--stdio"],
+        allow_tools=["inspect"],
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        remote_mcp_servers={"science": registration},
+    )
+    ClusterRegistry(clusters={definition.name: definition}).save(
+        tmp_path / ".clio-relay" / "clusters.json"
+    )
+    staged_paths: list[tuple[str, str]] = []
+    removed_paths: list[tuple[str, str, bool]] = []
+
+    def write_registry(
+        _definition: ClusterDefinition,
+        path: str,
+        _data: bytes,
+    ) -> None:
+        staged_paths.append(("registry", path))
+
+    def write_arguments(
+        _definition: ClusterDefinition,
+        path: str,
+        _data: bytes,
+    ) -> None:
+        staged_paths.append(("arguments", path))
+
+    def remove_registry(
+        _definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        removed_paths.append(("registry", path, remove_empty_parent))
+
+    def remove_arguments(
+        _definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        removed_paths.append(("arguments", path, remove_empty_parent))
+
+    def fail_remote_shell(_definition: ClusterDefinition, _script: str) -> str:
+        raise RelayError("remote launch failed")
+
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
+    monkeypatch.setattr("clio_relay.cli.write_remote_file", write_arguments)
+    monkeypatch.setattr("clio_relay.cli.remove_remote_file", remove_arguments)
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", fail_remote_shell)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "mcp-call",
+            "--cluster",
+            definition.name,
+            "--server",
+            registration.command,
+            "--server-arg=--stdio",
+            "--tool",
+            "inspect",
+            "--arguments-json",
+            '{"dataset":"asteroid-first-five"}',
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "remote launch failed" in result.output
+    assert [kind for kind, _path in staged_paths] == ["registry", "arguments"]
+    assert removed_paths == [
+        ("arguments", staged_paths[1][1], True),
+        ("registry", staged_paths[0][1], True),
+    ]
+
+
 @pytest.mark.parametrize("command", ["mcp-call", "jarvis-mcp-call"])
 def test_cli_mcp_call_rejects_public_admission_class_option(
     tmp_path: Path,

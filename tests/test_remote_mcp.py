@@ -3062,6 +3062,129 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
     assert cache.entry_for("alpha", "science") is not None
 
 
+def test_cli_remote_refresh_stages_exact_registry_for_tools_list_and_cleans_it(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Remote refresh gives tools/list its exact operator route for one submission only."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    registration = _registration(
+        profiles=["user"],
+        env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"},
+    )
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha-login",
+        core_dir="$HOME/site/relay-core",
+        spool_dir="$HOME/site/relay-spool",
+        remote_mcp_servers={"science": registration},
+    )
+    ClusterRegistry(clusters={definition.name: definition}).save(
+        tmp_path / ".clio-relay" / "clusters.json"
+    )
+    discovery_payload = _discovery_artifact(
+        registration,
+        tools=[_tool("inspect", required=["path"])],
+    )
+    registry_writes: list[tuple[str, bytes]] = []
+    registry_removals: list[tuple[str, bool]] = []
+    calls: list[tuple[list[str], str | None]] = []
+    events: list[str] = []
+
+    def write_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
+        payload: bytes,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("write-registry")
+        registry_writes.append((path, payload))
+
+    def remove_registry(
+        selected_definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool,
+    ) -> None:
+        assert selected_definition == definition
+        events.append("remove-registry")
+        registry_removals.append((path, remove_empty_parent))
+
+    def run_remote(
+        selected_definition: ClusterDefinition,
+        arguments: list[str],
+        *,
+        cluster_registry_path: str | None = None,
+    ) -> str:
+        assert selected_definition == definition
+        calls.append((arguments, cluster_registry_path))
+        if arguments[0] == "mcp-call":
+            events.append("submit-tools-list")
+            return "job_remote_discovery\n"
+        assert arguments[:2] == ["job", "wait"]
+        events.append("wait")
+        return json.dumps({"job_id": "job_remote_discovery", "state": "succeeded"})
+
+    def read_artifact(
+        selected_definition: ClusterDefinition,
+        job_id: str,
+    ) -> tuple[dict[str, object], bytes]:
+        assert selected_definition == definition
+        assert job_id == "job_remote_discovery"
+        return (
+            {
+                "artifact_id": "artifact_remote_discovery",
+                "kind": "mcp_result",
+                "sha256": hashlib.sha256(discovery_payload).hexdigest(),
+            },
+            discovery_payload,
+        )
+
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
+    monkeypatch.setattr(relay_cli, "run_remote_clio", run_remote)
+    monkeypatch.setattr(relay_cli, "_read_remote_mcp_result_artifact", read_artifact)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "remote-mcp",
+            "refresh",
+            "--cluster",
+            definition.name,
+            "--name",
+            "science",
+            "--idempotency-key",
+            "remote-refresh-route-authority",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(registry_writes) == 1
+    registry_path, registry_payload = registry_writes[0]
+    staged_registry = ClusterRegistry.model_validate_json(registry_payload)
+    assert staged_registry.clusters == {definition.name: definition}
+    staged_definition = staged_registry.require(definition.name)
+    assert staged_definition.remote_mcp_servers == {"science": registration}
+    assert cluster_route_revision(staged_definition) == cluster_route_revision(definition)
+    submission, submission_registry_path = calls[0]
+    assert submission[:7] == [
+        "mcp-call",
+        "--cluster",
+        definition.name,
+        "--server",
+        registration.command,
+        "--operation",
+        "tools/list",
+    ]
+    assert submission_registry_path == f"$HOME/{registry_path}"
+    assert calls[1][0][:2] == ["job", "wait"]
+    assert calls[1][1] is None
+    assert registry_removals == [(registry_path, True)]
+    assert events == ["write-registry", "submit-tools-list", "remove-registry", "wait"]
+
+
 def test_acceptance_report_has_canonical_checks_and_durable_provenance() -> None:
     registration = _registration(namespace="science", profiles=["user"])
     server_artifact = _server_artifact(registration)

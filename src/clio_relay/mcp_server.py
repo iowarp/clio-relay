@@ -128,6 +128,7 @@ from clio_relay.remote_cli import (
     remove_remote_file,
     run_remote_clio,
     should_execute_on_cluster,
+    staged_remote_cluster_registry,
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
@@ -4472,15 +4473,26 @@ def _submit_mcp_call(
             remote_args.extend(["--expected-registered-contract", expected_registered_contract])
         for item in used_artifact_refs:
             remote_args.extend(["--used-artifact", _artifact_use_cli_value(item)])
-        try:
-            write_remote_file(
-                definition,
-                remote_args_path,
-                json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-            )
-            output = run_remote_clio(definition, remote_args)
-        finally:
-            remove_remote_file(definition, remote_args_path, remove_empty_parent=True)
+        with staged_remote_cluster_registry(definition) as remote_registry_path:
+            try:
+                write_remote_file(
+                    definition,
+                    remote_args_path,
+                    json.dumps(tool_arguments, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    ),
+                )
+                output = run_remote_clio(
+                    definition,
+                    remote_args,
+                    cluster_registry_path=remote_registry_path,
+                )
+            finally:
+                remove_remote_file(
+                    definition,
+                    remote_args_path,
+                    remove_empty_parent=True,
+                )
         return _remote_mcp_submission_result(
             output,
             definition=definition,
