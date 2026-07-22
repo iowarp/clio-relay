@@ -1716,7 +1716,12 @@ def inspect_owned_session_recovery_status(
     _validate_session(session_id=session_id, remote_api_port=1)
     if not cluster:
         raise RelayError("cluster must not be empty")
-    selected_home = home or Path.home()
+    # Keep path identity aligned with ``open_owned_session_transaction``, which
+    # pins the canonical home directory before walking its private components.
+    # Cluster homes are commonly exposed through an alias (for example,
+    # ``/home/user`` -> ``/mnt/common/user``); comparing an unresolved alias to
+    # the pinned transaction path otherwise rejects our own committed metadata.
+    selected_home = (home or Path.home()).resolve(strict=True)
     session_dir = selected_home / ".local" / "share" / "clio-relay" / "sessions" / session_id
     metadata_path = session_dir / "metadata.json"
     errors: list[str] = []

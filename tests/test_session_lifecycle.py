@@ -639,6 +639,38 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.errors == []
 
 
+def test_owned_session_recovery_accepts_canonical_home_transaction(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Accept a pinned transaction when HOME is an alias of its canonical path."""
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    home_alias = tmp_path / "home-alias"
+    original_resolve = Path.resolve
+
+    def resolve_home_alias(path: Path, strict: bool = False) -> Path:
+        if path == home_alias:
+            return home
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_home_alias)
+    transaction = _FakeSessionTransaction(session_dir, session_id="session-1")
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home_alias,
+        proc_root=proc_root,
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+    assert status.metadata_verified is True
+    assert status.api_pid == 4321
+    assert status.recovery_verified is True
+    assert status.errors == []
+
+
 def test_start_persists_candidate_before_core_admission(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
