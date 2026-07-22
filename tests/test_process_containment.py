@@ -19,6 +19,15 @@ from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.process_containment import OwnedProcessSpawnError
 
 
+def _focused_cooperative_capability(**_kwargs: object) -> dict[str, object]:
+    """Return the explicitly typed non-enforceable provider used by focused tests."""
+    return {
+        "mode": "cooperative_process_group",
+        "enforceable": False,
+        "reason": "focused test",
+    }
+
+
 def test_embedded_containment_source_is_an_exact_isolated_runtime_mirror() -> None:
     root = Path(__file__).parents[1]
     source = root / "src" / "clio_relay" / "process_containment.py"
@@ -1204,11 +1213,7 @@ def test_malicious_child_stderr_cannot_enter_startup_diagnostic(
     monkeypatch.setattr(
         process_containment,
         "containment_capability",
-        lambda **_kwargs: {
-            "mode": "cooperative_process_group",
-            "enforceable": False,
-            "reason": "focused test",
-        },
+        _focused_cooperative_capability,
     )
     secret = "credential-and-stderr-must-not-leak"
     script = r"""
@@ -1276,11 +1281,7 @@ def test_startup_output_flood_fails_boundedly_without_being_read(
     monkeypatch.setattr(
         process_containment,
         "containment_capability",
-        lambda **_kwargs: {
-            "mode": "cooperative_process_group",
-            "enforceable": False,
-            "reason": "focused test",
-        },
+        _focused_cooperative_capability,
     )
     script = r"""
 import os
