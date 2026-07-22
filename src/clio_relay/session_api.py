@@ -25,6 +25,7 @@ from clio_relay.errors import ConfigurationError, ObservationTimeoutError, Relay
 from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
+    REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactUse,
     JarvisRunSpec,
     JobKind,
@@ -398,15 +399,24 @@ def _validate_submission_receipt(
         else:
             _expected_class = McpAdmissionClass.WORKLOAD
             expected_authority = None
+        expected_arguments = payload.get("arguments", {})
+        raw_tool = payload.get("tool")
+        normalized_tool = raw_tool.replace("-", "_").lower() if isinstance(raw_tool, str) else ""
+        if (
+            normalized_tool == "jarvis_run"
+            and payload.get("expected_registered_contract") == REGISTERED_JARVIS_USER_CONTRACT
+        ):
+            expected_arguments = _expected_jarvis_mcp_arguments(job, payload=payload)
         expected = {
             "server": payload.get("server"),
             "server_args": payload.get("server_args", []),
             "env_from": payload.get("env_from", {}),
             "expected_server_artifact_digest": payload.get("expected_server_artifact_digest"),
+            "expected_registered_contract": payload.get("expected_registered_contract"),
             "admission_class": _expected_class.value,
             "operation": operation.value,
             "tool": payload.get("tool"),
-            "arguments": payload.get("arguments", {}),
+            "arguments": expected_arguments,
             "timeout_seconds": payload.get("timeout_seconds"),
         }
         observed = {
@@ -414,6 +424,7 @@ def _validate_submission_receipt(
             "server_args": job.spec.server_args,
             "env_from": job.spec.env_from,
             "expected_server_artifact_digest": (job.spec.expected_server_artifact_digest),
+            "expected_registered_contract": job.spec.expected_registered_contract,
             "admission_class": job.spec.admission_class.value,
             "operation": job.spec.operation.value,
             "tool": job.spec.tool,

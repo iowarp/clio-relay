@@ -1318,6 +1318,7 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
         repos_sha256="c" * 64,
         resource_graph_sha256="d" * 64,
         managed_repo_registered=True,
+        managed_builtin_repo_registered=True,
     )
     inspection = BootstrapInspection(
         exact_match=True,
@@ -1749,6 +1750,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
             repos_sha256="c" * 64,
             resource_graph_sha256="d" * 64,
             managed_repo_registered=True,
+            managed_builtin_repo_registered=True,
         )
         inspection = BootstrapInspection(
             exact_match=True,
@@ -1918,6 +1920,7 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
         repos_sha256="c" * 64,
         resource_graph_sha256="d" * 64,
         managed_repo_registered=True,
+        managed_builtin_repo_registered=True,
     )
     initial = BootstrapInspection(
         exact_match=False,
@@ -2033,7 +2036,13 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         resource_graph_sha256="d" * 64,
         managed_repo_registered=False,
     )
-    after = before.model_copy(update={"repos_sha256": "e" * 64, "managed_repo_registered": True})
+    after = before.model_copy(
+        update={
+            "repos_sha256": "e" * 64,
+            "managed_repo_registered": True,
+            "managed_builtin_repo_registered": True,
+        }
+    )
     inspection = BootstrapInspection(
         exact_match=True,
         desired_fingerprint=desired.fingerprint,
@@ -2084,6 +2093,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         for name, action in actions.items()
     }
     managed_repo = "/home/operator/.local/share/clio-relay/clio_relay"
+    managed_builtin_repo = "/home/operator/.ppi-jarvis/builtin"
     repository_update: dict[str, object] = {
         "link_action": "created",
         "link": managed_repo,
@@ -2093,7 +2103,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "repositories": {
             "action": "updated",
             "managed_repo": managed_repo,
-            "added_managed_repos": [managed_repo],
+            "added_managed_repos": [managed_repo, managed_builtin_repo],
             "removed_previous_managed_repos": [
                 "/home/operator/.local/share/clio-relay/managed-jarvis-repo"
             ],
@@ -2127,6 +2137,47 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         expected_allow_jarvis_resource_graph_build=False,
         expected_worker_service=desired.worker_service,
     )
+
+    invalid_builtin_addition = copy.deepcopy(receipt)
+    invalid_preservation = cast(dict[str, object], invalid_builtin_addition["jarvis_preservation"])
+    invalid_binding = cast(dict[str, object], invalid_preservation["repositories"])
+    invalid_update = cast(dict[str, object], invalid_binding["repositories"])
+    invalid_update["added_managed_repos"] = [
+        managed_repo,
+        "/home/operator/custom/builtin",
+    ]
+    with pytest.raises(RelayError, match="repository migration is invalid"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            invalid_builtin_addition,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
+
+    for relay_builtin_path in (
+        "/home/operator/.local/share/clio-relay/jarvis-venv/lib/python3.12/site-packages/builtin",
+        (
+            "/home/operator/.local/share/clio-relay/generations/"
+            f"{'1' * 64}/jarvis-venv/lib/python3.12/site-packages/builtin"
+        ),
+    ):
+        builtin_cleanup = copy.deepcopy(receipt)
+        cleanup_preservation = cast(dict[str, object], builtin_cleanup["jarvis_preservation"])
+        cleanup_binding = cast(dict[str, object], cleanup_preservation["repositories"])
+        cleanup_update = cast(dict[str, object], cleanup_binding["repositories"])
+        cleanup_update["removed_previous_managed_repos"] = [relay_builtin_path]
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            builtin_cleanup,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
 
     relay_only = copy.deepcopy(receipt)
     relay_transaction = cast(dict[str, object], relay_only["transaction"])
@@ -2195,6 +2246,24 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
             expected_worker_service=desired.worker_service,
         )
 
+    lookalike_removal = copy.deepcopy(receipt)
+    preservation = cast(dict[str, object], lookalike_removal["jarvis_preservation"])
+    binding = cast(dict[str, object], preservation["repositories"])
+    update = cast(dict[str, object], binding["repositories"])
+    update["removed_previous_managed_repos"] = [
+        "/home/operator/.local/share/clio-relay/operator-venv/lib/python3.12/site-packages/builtin"
+    ]
+    with pytest.raises(RelayError, match="repository migration is invalid"):
+        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            lookalike_removal,
+            bootstrap_profile="linux-user",
+            relay_install_spec=desired.relay_install_spec,
+            desired_fingerprint=desired.fingerprint,
+            expected_jarvis_resource_graph_profile="ares",
+            expected_allow_jarvis_resource_graph_build=False,
+            expected_worker_service=desired.worker_service,
+        )
+
     replaced_link = copy.deepcopy(receipt)
     preservation = cast(dict[str, object], replaced_link["jarvis_preservation"])
     binding = cast(dict[str, object], preservation["repositories"])
@@ -2254,6 +2323,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         repos_sha256="c" * 64,
         resource_graph_sha256="d" * 64,
         managed_repo_registered=True,
+        managed_builtin_repo_registered=True,
     )
     inspection = BootstrapInspection(
         exact_match=False,

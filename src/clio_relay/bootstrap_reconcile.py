@@ -8,8 +8,10 @@ and the fsync-backed transaction journal.
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -50,6 +52,8 @@ LEGACY_MANAGED_JARVIS_REPO_PATH = "~/.local/share/clio-relay/managed-jarvis-repo
 MAX_JARVIS_CONFIG_BYTES = 1024 * 1024
 MAX_JARVIS_REPOS_BYTES = 4 * 1024 * 1024
 MAX_JARVIS_GRAPH_BYTES = 64 * 1024 * 1024
+MAX_JARVIS_DISTRIBUTION_METADATA_BYTES = 1024 * 1024
+MAX_JARVIS_DISTRIBUTION_RECORD_BYTES = 64 * 1024 * 1024
 BOOTSTRAP_LOCK_TIMEOUT_SECONDS = 30.0
 _O_BINARY = cast(int, getattr(os, "O_BINARY", 0))
 _O_NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW", 0))
@@ -253,6 +257,7 @@ class JarvisStateEvidence(BaseModel):
     repos_sha256: str | None = None
     resource_graph_sha256: str | None = None
     managed_repo_registered: bool = False
+    managed_builtin_repo_registered: bool = False
 
 
 class BootstrapReadinessEvidence(BaseModel):
@@ -864,6 +869,8 @@ def inspect_exact_bootstrap_noop(
         reasons.append("JARVIS is not initialized")
     if not jarvis_state.managed_repo_registered:
         reasons.append("the exact relay-managed JARVIS repository is not registered")
+    if not jarvis_state.managed_builtin_repo_registered:
+        reasons.append("the exact JARVIS-managed builtin repository slot is not registered")
 
     queue_ready = _queue_readiness_verified(queue_evidence)
     if not queue_ready:
@@ -981,11 +988,22 @@ def inspect_jarvis_state(
     managed_repo_path = _expand_home(desired.managed_jarvis_repo, lexical_home)
     managed_repo = str(_canonical_path_preserving_final(managed_repo_path))
     managed_aliases = {str(managed_repo_path.absolute()), managed_repo}
+    managed_builtin_path = jarvis_root / "builtin"
+    managed_builtin = str(_canonical_path_preserving_final(managed_builtin_path))
+    managed_builtin_aliases = {
+        str(Path(os.path.abspath(managed_builtin_path.expanduser()))),
+        managed_builtin,
+    }
     repo_values = cast(list[str], raw_repo_values)
     managed_matches = [value for value in repo_values if value in managed_aliases]
     if len(managed_matches) > 1:
         raise ConfigurationError(
             "relay-managed JARVIS repository is registered through multiple path aliases"
+        )
+    managed_builtin_matches = [value for value in repo_values if value in managed_builtin_aliases]
+    if len(managed_builtin_matches) > 1:
+        raise ConfigurationError(
+            "JARVIS-managed builtin repository is registered through multiple path aliases"
         )
     return JarvisStateEvidence(
         initialized=True,
@@ -995,6 +1013,7 @@ def inspect_jarvis_state(
         repos_sha256=hashlib.sha256(raw_repos).hexdigest(),
         resource_graph_sha256=hashlib.sha256(raw_graph).hexdigest(),
         managed_repo_registered=len(managed_matches) == 1,
+        managed_builtin_repo_registered=len(managed_builtin_matches) == 1,
     )
 
 
@@ -1243,10 +1262,19 @@ def finish_staged_activation(
     managed_repo = _expand_home(desired.managed_jarvis_repo, lexical_home)
     legacy_managed_repo = _expand_home(LEGACY_MANAGED_JARVIS_REPO_PATH, lexical_home)
     previous_repo = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
+    relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(
+        home=lexical_home,
+        execution_environments=(Path(legacy_venv), generation / "jarvis-venv"),
+    )
     repositories = reconcile_managed_jarvis_repository(
         _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml",
         managed_repo,
-        previous_managed_repos=(legacy_managed_repo, previous_repo),
+        managed_builtin_repo=_expand_home(desired.jarvis_root, lexical_home) / "builtin",
+        previous_managed_repos=(
+            legacy_managed_repo,
+            previous_repo,
+            *relay_owned_builtin_repos,
+        ),
         exchange_identity=desired.fingerprint,
     )
     expected_managed_target = (
@@ -2427,12 +2455,200 @@ def write_bootstrap_receipt(path: Path, receipt: dict[str, object]) -> None:
     _atomic_json(path, receipt)
 
 
+def _relay_owned_jarvis_builtin_repositories(
+    *,
+    home: Path,
+    execution_environments: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """Return builtin repositories proven to belong to relay-managed JARVIS venvs.
+
+    Old JARVIS releases registered their wheel-installed ``builtin`` package
+    directly in ``repos.yaml``.  JARVIS now owns a stable repository slot, but
+    that cannot identify the historical path when it lives in relay's legacy
+    virtual environment.  Constrain migration to the fixed legacy venv and to
+    content-addressed generation venvs, then require wheel ``METADATA`` and
+    ``RECORD`` evidence proving that ``jarvis-cd`` installed the repository.
+    """
+    lexical_home = Path(os.path.abspath(home.expanduser()))
+    resolved_home = lexical_home.resolve(strict=True)
+    lexical_relay_root = lexical_home / ".local/share/clio-relay"
+    resolved_relay_root = resolved_home / ".local/share/clio-relay"
+    fixed_legacy = lexical_relay_root / "jarvis-venv"
+    candidates = (fixed_legacy, *execution_environments)
+    repositories: dict[str, Path] = {}
+    seen_environments: set[str] = set()
+    for candidate in candidates:
+        lexical_environment = Path(os.path.abspath(candidate.expanduser()))
+        lexical_identity: tuple[int, int, int, int, int, int]
+        try:
+            before = lexical_environment.lstat()
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or _path_is_directory_alias(lexical_environment)
+                or not lexical_environment.is_absolute()
+                or ".." in lexical_environment.parts
+            ):
+                continue
+            resolved_environment = lexical_environment.resolve(strict=True)
+            fixed_environment = resolved_relay_root / "jarvis-venv"
+            owned_layout = resolved_environment == fixed_environment
+            if not owned_layout:
+                relative = resolved_environment.relative_to(
+                    (resolved_relay_root / "generations").resolve(strict=True)
+                )
+                owned_layout = bool(
+                    len(relative.parts) == 2
+                    and _is_sha256(relative.parts[0])
+                    and relative.parts[1] == "jarvis-venv"
+                )
+            if not owned_layout:
+                continue
+            lexical_identity = _stat_identity(before)
+            if _stat_identity(lexical_environment.lstat()) != lexical_identity:
+                continue
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid) and before.st_uid != getuid():
+                continue
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            continue
+        environment_key = str(resolved_environment)
+        if environment_key in seen_environments:
+            continue
+        seen_environments.add(environment_key)
+        for site_packages in _jarvis_site_package_directories(lexical_environment):
+            repository = _jarvis_cd_builtin_repository(site_packages)
+            if repository is not None:
+                repositories[str(repository)] = repository
+        if _stat_identity(lexical_environment.lstat()) != lexical_identity:
+            raise ConfigurationError(
+                "relay-owned JARVIS environment changed during repository reconciliation"
+            )
+    return tuple(repositories[key] for key in sorted(repositories))
+
+
+def _jarvis_site_package_directories(environment: Path) -> tuple[Path, ...]:
+    """Enumerate bounded, real site-package directories inside one proven venv."""
+    candidates = [environment / "Lib/site-packages"]
+    for library_name in ("lib", "lib64"):
+        library = environment / library_name
+        try:
+            python_directories = sorted(library.glob("python*"), key=lambda path: path.name)
+        except OSError:
+            continue
+        if len(python_directories) > 16:
+            raise ConfigurationError("relay-owned JARVIS environment has too many Python roots")
+        candidates.extend(path / "site-packages" for path in python_directories)
+    directories: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            before = candidate.lstat()
+            if not stat.S_ISDIR(before.st_mode) or _path_is_directory_alias(candidate):
+                continue
+            resolved = candidate.resolve(strict=True)
+            relative = resolved.relative_to(environment.resolve(strict=True))
+            parts = relative.parts
+            posix_shape = bool(
+                len(parts) == 3
+                and parts[0] in {"lib", "lib64"}
+                and _is_python_library_directory(parts[1])
+                and parts[2] == "site-packages"
+            )
+            windows_shape = parts == ("Lib", "site-packages")
+            if not posix_shape and not windows_shape:
+                continue
+            if _stat_identity(candidate.lstat()) != _stat_identity(before):
+                continue
+            directories[str(candidate)] = candidate
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            continue
+    return tuple(directories[key] for key in sorted(directories))
+
+
+def _is_python_library_directory(value: str) -> bool:
+    """Return whether a venv library name is exactly ``python<major>.<minor>``."""
+    if not value.startswith("python"):
+        return False
+    version = value.removeprefix("python")
+    major, separator, minor = version.partition(".")
+    return bool(separator and major.isdigit() and minor.isdigit())
+
+
+def _jarvis_cd_builtin_repository(site_packages: Path) -> Path | None:
+    """Prove that one site-packages ``builtin`` directory came from jarvis-cd."""
+    builtin = site_packages / "builtin"
+    try:
+        builtin_before = builtin.lstat()
+        if not stat.S_ISDIR(builtin_before.st_mode) or _path_is_directory_alias(builtin):
+            return None
+        distributions = sorted(
+            site_packages.glob("jarvis_cd-*.dist-info"),
+            key=lambda path: path.name,
+        )
+        if len(distributions) > 8:
+            raise ConfigurationError("relay-owned JARVIS environment has too many distributions")
+        for distribution in distributions:
+            distribution_before = distribution.lstat()
+            if not stat.S_ISDIR(distribution_before.st_mode) or _path_is_directory_alias(
+                distribution
+            ):
+                continue
+            metadata_payload = _read_regular_bounded(
+                distribution / "METADATA",
+                maximum=MAX_JARVIS_DISTRIBUTION_METADATA_BYTES,
+            )
+            record_payload = _read_regular_bounded(
+                distribution / "RECORD",
+                maximum=MAX_JARVIS_DISTRIBUTION_RECORD_BYTES,
+            )
+            if not _jarvis_cd_metadata(metadata_payload) or not _record_installs_jarvis_builtin(
+                record_payload
+            ):
+                continue
+            if _stat_identity(distribution.lstat()) != _stat_identity(
+                distribution_before
+            ) or _stat_identity(builtin.lstat()) != _stat_identity(builtin_before):
+                raise ConfigurationError(
+                    "relay-owned JARVIS distribution changed during repository reconciliation"
+                )
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid) and (
+                distribution_before.st_uid != getuid() or builtin_before.st_uid != getuid()
+            ):
+                continue
+            return builtin
+    except (FileNotFoundError, OSError, RuntimeError, UnicodeError, ValueError):
+        return None
+    return None
+
+
+def _jarvis_cd_metadata(payload: bytes) -> bool:
+    """Return whether wheel metadata names the jarvis-cd distribution exactly."""
+    for line in payload.decode("utf-8").splitlines():
+        field, separator, value = line.partition(":")
+        if separator and field.casefold() == "name":
+            return value.strip().casefold().replace("_", "-") == "jarvis-cd"
+    return False
+
+
+def _record_installs_jarvis_builtin(payload: bytes) -> bool:
+    """Require both repository package markers in a jarvis-cd wheel RECORD."""
+    paths: set[str] = set()
+    reader = csv.reader(io.StringIO(payload.decode("utf-8"), newline=""))
+    for row in reader:
+        if row:
+            paths.add(row[0].replace("\\", "/"))
+    return {"builtin/__init__.py", "builtin/builtin/__init__.py"} <= paths
+
+
 def _managed_repository_payload(
     raw: bytes,
     *,
     managed: str,
     managed_aliases: set[str],
+    managed_builtin: str | None,
+    managed_builtin_aliases: set[str],
     previous_aliases: dict[str, str],
+    previous_builtin_aliases: set[str],
 ) -> tuple[bytes, list[str], list[str]]:
     """Return the exact converged repository bytes and mutation evidence."""
     document = _yaml_mapping(raw, label="JARVIS repositories")
@@ -2448,6 +2664,11 @@ def _managed_repository_payload(
         raise ConfigurationError(
             "relay-managed JARVIS repository is registered through multiple path aliases"
         )
+    managed_builtin_matches = [value for value in repos if value in managed_builtin_aliases]
+    if len(managed_builtin_matches) > 1:
+        raise ConfigurationError(
+            "JARVIS-managed builtin repository is registered through multiple path aliases"
+        )
     previous_matches: dict[str, list[str]] = {}
     for value in repos:
         normalized = previous_aliases.get(value)
@@ -2459,13 +2680,59 @@ def _managed_repository_payload(
             "multiple path aliases"
         )
     removed_previous = sorted(previous_matches)
-    if managed_matches == [managed] and not removed_previous:
+    if managed_builtin is None:
+        if managed_matches == [managed] and not removed_previous:
+            return raw, [], []
+        updated = [
+            value
+            for value in repos
+            if value not in managed_aliases and value not in previous_aliases
+        ]
+        updated.insert(0, managed)
+        added_managed = [managed] if managed_matches != [managed] else []
+        document["repos"] = updated
+        return (
+            yaml.safe_dump(document, sort_keys=False).encode("utf-8"),
+            added_managed,
+            removed_previous,
+        )
+    if (
+        managed_matches == [managed]
+        and managed_builtin_matches == [managed_builtin]
+        and not removed_previous
+    ):
         return raw, [], []
-    updated = [
-        value for value in repos if value not in managed_aliases and value not in previous_aliases
-    ]
-    updated.insert(0, managed)
-    added_managed = [managed] if managed_matches != [managed] else []
+    builtin_anchor: int | None = None
+    if managed_builtin_matches:
+        builtin_anchor = repos.index(managed_builtin_matches[0])
+    else:
+        builtin_anchor = next(
+            (index for index, value in enumerate(repos) if value in previous_builtin_aliases),
+            None,
+        )
+    operator_repositories: list[str] = []
+    builtin_position: int | None = None
+    for index, value in enumerate(repos):
+        if index == builtin_anchor:
+            builtin_position = len(operator_repositories)
+        if (
+            value in managed_aliases
+            or value in managed_builtin_aliases
+            or value in previous_aliases
+        ):
+            continue
+        operator_repositories.append(value)
+    if builtin_position is None:
+        builtin_position = len(operator_repositories)
+    operator_repositories.insert(builtin_position, managed_builtin)
+    updated = [managed, *operator_repositories]
+    if repos == updated and not removed_previous:
+        return raw, [], []
+    added_managed: list[str] = []
+    if not repos or repos[0] != managed:
+        added_managed.append(managed)
+    if managed_builtin_matches != [managed_builtin]:
+        added_managed.append(managed_builtin)
     document["repos"] = updated
     return (
         yaml.safe_dump(document, sort_keys=False).encode("utf-8"),
@@ -2478,6 +2745,7 @@ def reconcile_managed_jarvis_repository(
     repos_file: Path,
     managed_repo: Path,
     *,
+    managed_builtin_repo: Path | None = None,
     previous_managed_repos: tuple[Path, ...] = (),
     exchange_identity: str | None = None,
 ) -> dict[str, object]:
@@ -2485,8 +2753,12 @@ def reconcile_managed_jarvis_repository(
 
     JARVIS's public ``repo add --force`` replaces every repository with the
     same basename. Relay instead performs a compare-before-replace update of
-    its one exact path and leaves operator repositories, including same-name
-    repositories, untouched. ``previous_managed_repos`` is a caller-supplied
+    its exact paths and leaves operator repositories, including same-name
+    repositories, untouched. ``managed_builtin_repo`` may name only JARVIS's
+    exact ``<JARVIS_ROOT>/builtin`` slot. JARVIS 1.6+ rebinds that stable slot
+    in memory to the builtin repository shipped by the running distribution,
+    so the independently installed execution and MCP runtimes each see their
+    release-pinned package contract. ``previous_managed_repos`` is a caller-supplied
     provenance boundary: each path must come from an earlier relay receipt or
     an exact relay-owned generation path. This operation is serialized by the
     bootstrap lock; the final byte-and-file-identity comparison also detects
@@ -2499,18 +2771,39 @@ def reconcile_managed_jarvis_repository(
     lexical_managed = str(Path(os.path.abspath(managed_repo.expanduser())))
     managed = str(_canonical_path_preserving_final(managed_repo))
     managed_aliases = {lexical_managed, managed}
+    managed_builtin: str | None = None
+    managed_builtin_aliases: set[str] = set()
+    if managed_builtin_repo is not None:
+        lexical_builtin_path = Path(os.path.abspath(managed_builtin_repo.expanduser()))
+        expected_builtin_path = Path(os.path.abspath(repos_file.parent.expanduser())) / "builtin"
+        canonical_builtin_path = _canonical_path_preserving_final(managed_builtin_repo)
+        canonical_expected_builtin = _canonical_path_preserving_final(expected_builtin_path)
+        if (
+            lexical_builtin_path != expected_builtin_path
+            or canonical_builtin_path != canonical_expected_builtin
+        ):
+            raise ConfigurationError(
+                "JARVIS-managed builtin repository must be the exact active root slot"
+            )
+        managed_builtin = str(canonical_builtin_path)
+        managed_builtin_aliases = {str(lexical_builtin_path), managed_builtin}
+    managed_alias_union = managed_aliases | managed_builtin_aliases
     previous_aliases: dict[str, str] = {}
+    previous_builtin_aliases: set[str] = set()
     for path in previous_managed_repos:
         lexical_previous = str(Path(os.path.abspath(path.expanduser())))
         try:
             canonical_previous = str(_canonical_path_preserving_final(path))
         except ConfigurationError:
             canonical_previous = lexical_previous
-        if canonical_previous in managed_aliases:
+        if canonical_previous in managed_alias_union:
             continue
         previous_aliases[lexical_previous] = canonical_previous
         previous_aliases[canonical_previous] = canonical_previous
-    token = exchange_identity or hashlib.sha256(managed.encode("utf-8")).hexdigest()
+        if Path(canonical_previous).name == "builtin":
+            previous_builtin_aliases.update({lexical_previous, canonical_previous})
+    token_source = managed if managed_builtin is None else f"{managed}\0{managed_builtin}"
+    token = exchange_identity or hashlib.sha256(token_source.encode("utf-8")).hexdigest()
     try:
         _require_sha256(token, field="repository_exchange_identity")
     except ValueError as exc:
@@ -2524,7 +2817,10 @@ def reconcile_managed_jarvis_repository(
         raw,
         managed=managed,
         managed_aliases=managed_aliases,
+        managed_builtin=managed_builtin,
+        managed_builtin_aliases=managed_builtin_aliases,
         previous_aliases=previous_aliases,
+        previous_builtin_aliases=previous_builtin_aliases,
     )
     if temporary.exists() or temporary.is_symlink():
         displaced, _displaced_identity = _read_regular_bounded_with_identity(
@@ -2535,7 +2831,10 @@ def reconcile_managed_jarvis_repository(
             displaced,
             managed=managed,
             managed_aliases=managed_aliases,
+            managed_builtin=managed_builtin,
+            managed_builtin_aliases=managed_builtin_aliases,
             previous_aliases=previous_aliases,
+            previous_builtin_aliases=previous_builtin_aliases,
         )
         if displaced != displaced_payload and displaced_payload == raw:
             temporary.unlink()
@@ -2715,10 +3014,19 @@ def repair_managed_jarvis_binding(
     )
     repos_file = _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml"
     legacy_managed_repo = _expand_home(LEGACY_MANAGED_JARVIS_REPO_PATH, lexical_home)
+    relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(
+        home=lexical_home,
+        execution_environments=(generation / "jarvis-venv",),
+    )
     repo_evidence = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
-        previous_managed_repos=(*previous_managed_repos, legacy_managed_repo),
+        managed_builtin_repo=_expand_home(desired.jarvis_root, lexical_home) / "builtin",
+        previous_managed_repos=(
+            *previous_managed_repos,
+            legacy_managed_repo,
+            *relay_owned_builtin_repos,
+        ),
         exchange_identity=desired.fingerprint,
     )
     canonical_home = lexical_home.resolve(strict=True)
