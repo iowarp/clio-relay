@@ -671,6 +671,19 @@ def test_packaged_stdio_child_does_not_inherit_ambient_credentials(
     assert secret not in json.dumps(session.evidence())
 
 
+def test_packaged_stdio_environment_retains_windows_programdata_only_when_present(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """OpenSSH receives PROGRAMDATA without widening the ambient environment."""
+    monkeypatch.setenv("PROGRAMDATA", r"C:\ProgramData")
+    monkeypatch.setenv("UNRELATED_AMBIENT_SETTING", "must-be-scrubbed")
+
+    environment = cast(Any, mcp_stdio_validation_module)._packaged_launch_environment()
+
+    assert environment["PROGRAMDATA"] == r"C:\ProgramData"
+    assert "UNRELATED_AMBIENT_SETTING" not in environment
+
+
 def test_packaged_user_profile_rejects_static_admin_tool_for_agent_alias(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

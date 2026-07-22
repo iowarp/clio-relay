@@ -72,6 +72,7 @@ _PACKAGED_BASE_ENVIRONMENT_NAMES = frozenset(
         "LOGNAME",
         "PATH",
         "PATHEXT",
+        "PROGRAMDATA",
         "SYSTEMDRIVE",
         "SYSTEMROOT",
         "TEMP",

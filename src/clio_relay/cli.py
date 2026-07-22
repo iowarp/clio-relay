@@ -215,6 +215,7 @@ from clio_relay.remote_cli import (
     run_remote_shell,
     should_execute_on_cluster,
     stage_jarvis_yaml,
+    staged_remote_cluster_registry,
     write_remote_file,
 )
 from clio_relay.remote_mcp import (
@@ -2361,7 +2362,14 @@ def remote_mcp_refresh(
                 remote_args.extend(["--server-arg", item])
             for child_name, source_name in sorted(registration.env_from.items()):
                 remote_args.extend(["--env-from", f"{child_name}={source_name}"])
-            job_id = _last_nonempty_line(run_remote_clio(definition, remote_args))
+            with staged_remote_cluster_registry(definition) as remote_registry_path:
+                job_id = _last_nonempty_line(
+                    run_remote_clio(
+                        definition,
+                        remote_args,
+                        cluster_registry_path=remote_registry_path,
+                    )
+                )
             wait_result = _json_output(
                 run_remote_clio(
                     definition,
@@ -10776,30 +10784,34 @@ def mcp_call(
             remote_command.extend(["--expected-registered-contract", expected_registered_contract])
         for ref in _artifact_use_refs(used_artifact):
             remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
-        try:
-            if remote_arguments_path is not None:
-                write_remote_file(
+        with staged_remote_cluster_registry(definition) as remote_registry_path:
+            try:
+                if remote_arguments_path is not None:
+                    write_remote_file(
+                        definition,
+                        remote_arguments_path,
+                        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode(
+                            "utf-8"
+                        ),
+                    )
+                _run_remote_or_exit(
                     definition,
-                    remote_arguments_path,
-                    json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                    remote_command
+                    + (
+                        ["--timeout-seconds", str(timeout_seconds)]
+                        if timeout_seconds is not None
+                        else []
+                    )
+                    + [item for value in server_args for item in ("--server-arg", value)],
+                    cluster_registry_path=remote_registry_path,
                 )
-            _run_remote_or_exit(
-                definition,
-                remote_command
-                + (
-                    ["--timeout-seconds", str(timeout_seconds)]
-                    if timeout_seconds is not None
-                    else []
-                )
-                + [item for value in server_args for item in ("--server-arg", value)],
-            )
-        finally:
-            if remote_arguments_path is not None:
-                remove_remote_file(
-                    definition,
-                    remote_arguments_path,
-                    remove_empty_parent=True,
-                )
+            finally:
+                if remote_arguments_path is not None:
+                    remove_remote_file(
+                        definition,
+                        remote_arguments_path,
+                        remove_empty_parent=True,
+                    )
         return
     queue = _managed_queue_from_env()
     try:
@@ -18505,9 +18517,31 @@ def _try_remote_job_wait_passthrough(
     return True
 
 
-def _run_remote_or_exit(definition: ClusterDefinition, args: list[str]) -> None:
+def _run_remote_or_exit(
+    definition: ClusterDefinition,
+    args: list[str],
+    *,
+    cluster_registry_path: str | None = None,
+) -> None:
+    if cluster_registry_path is None:
+        _run_or_exit(
+            lambda: typer.echo(
+                _console_safe_text(run_remote_clio(definition, args)),
+                nl=False,
+            )
+        )
+        return
     _run_or_exit(
-        lambda: typer.echo(_console_safe_text(run_remote_clio(definition, args)), nl=False)
+        lambda: typer.echo(
+            _console_safe_text(
+                run_remote_clio(
+                    definition,
+                    args,
+                    cluster_registry_path=cluster_registry_path,
+                )
+            ),
+            nl=False,
+        )
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import posixpath
 import shlex
@@ -15,10 +16,16 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 from typing import cast
+from uuid import uuid4
 
 import yaml
 
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    ClusterRegistry,
+)
 from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
@@ -63,10 +70,27 @@ def should_execute_on_cluster(definition: ClusterDefinition) -> bool:
     return definition.ssh_host not in {"", "localhost", "127.0.0.1", "::1"}
 
 
-def run_remote_clio(definition: ClusterDefinition, args: list[str]) -> str:
-    """Run a clio-relay command on a configured cluster and return stdout."""
+def run_remote_clio(
+    definition: ClusterDefinition,
+    args: list[str],
+    *,
+    cluster_registry_path: str | None = None,
+) -> str:
+    """Run a clio-relay command on a configured cluster and return stdout.
+
+    ``cluster_registry_path`` is invocation-scoped. It makes a staged desktop
+    route authoritative for only this SSH command and never changes persistent
+    configuration on the cluster.
+    """
     rendered_args = " ".join(shlex.quote(arg) for arg in args)
-    return run_remote_shell(definition, f"{remote_env(definition)} clio-relay {rendered_args}")
+    environment = remote_env(definition)
+    if cluster_registry_path is not None:
+        rendered_registry_path = render_remote_shell_path(
+            cluster_registry_path,
+            field="staged cluster registry path",
+        )
+        environment = f"{environment} export {CLUSTER_REGISTRY_ENV}={rendered_registry_path};"
+    return run_remote_shell(definition, f"{environment} clio-relay {rendered_args}")
 
 
 def run_remote_jarvis_runtime_authority(
@@ -252,6 +276,38 @@ def remove_remote_file(
     if remove_empty_parent and parent:
         script += f" && {{ rmdir -- {shlex.quote(parent)} 2>/dev/null || true; }}"
     run_remote_shell(definition, script)
+
+
+@contextmanager
+def staged_remote_cluster_registry(
+    definition: ClusterDefinition,
+) -> Generator[str, None, None]:
+    """Stage one exact desktop cluster definition for a remote invocation.
+
+    The yielded path is safe to export as ``CLIO_RELAY_CLUSTER_REGISTRY``. The
+    private file and its invocation-unique parent are removed when the caller
+    leaves the context, without mutating the cluster's persistent registry.
+    """
+    registry = ClusterRegistry(clusters={definition.name: definition})
+    payload = (json.dumps(registry.model_dump(mode="json"), indent=2) + "\n").encode("utf-8")
+    if len(payload) > MAX_CLUSTER_REGISTRY_BYTES:
+        raise ConfigurationError(
+            f"staged cluster registry exceeds {MAX_CLUSTER_REGISTRY_BYTES} bytes"
+        )
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    relative_path = (
+        ".local/share/clio-relay/desktop-submissions/"
+        f"mcp-registry-{digest}-{uuid4().hex}/clusters.json"
+    )
+    try:
+        write_remote_file(definition, relative_path, payload)
+        yield f"$HOME/{relative_path}"
+    finally:
+        remove_remote_file(
+            definition,
+            relative_path,
+            remove_empty_parent=True,
+        )
 
 
 def stage_jarvis_yaml(
