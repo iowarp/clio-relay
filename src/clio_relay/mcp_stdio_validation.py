@@ -968,11 +968,18 @@ def _validate_tools_contract(
     return tools, selected
 
 
-def _validate_pinned_jarvis_contract(tools: list[JSON]) -> str:
+def _validate_pinned_jarvis_contract(tools: list[JSON]) -> str | None:
     if jarvis_user_contract_digest() != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
         raise RelayError("bundled clio-kit JARVIS contract digest did not match its pin")
     pinned_names = set(jarvis_user_contract())
     actual = {cast(str, tool["name"]): tool for tool in tools if tool.get("name") in pinned_names}
+    # Built-in JARVIS tools are advertised only when this profile has a verified
+    # JARVIS route. Generic remote-MCP acceptance must therefore permit the exact
+    # empty surface. Once any built-in JARVIS tool is exposed, however, the whole
+    # pinned contract remains mandatory so a partial or mixed-version surface can
+    # never pass release validation.
+    if not actual:
+        return None
     if set(actual) != pinned_names:
         raise RelayError("packaged MCP tools/list omitted part of the pinned JARVIS contract")
     cluster_enums: list[tuple[str, ...]] = []
@@ -998,7 +1005,7 @@ def _validate_pinned_jarvis_contract(tools: list[JSON]) -> str:
         for definition in virtual_jarvis_tool_definitions(clusters=clusters)
     }
     if actual != expected:
-        raise RelayError("packaged MCP JARVIS v3.5 agent-facing schema did not match its pin")
+        raise RelayError("packaged MCP JARVIS v3.6 agent-facing schema did not match its pin")
     return _tools_digest([actual[name] for name in sorted(actual)])
 
 

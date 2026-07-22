@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -14,7 +16,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, TypeVar, cast
+from typing import Annotated, Literal, TypeVar, cast
 
 from fastapi import (
     Depends,
@@ -29,6 +31,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -39,8 +42,12 @@ from clio_relay.cluster_config import (
     default_registry_path,
     read_bounded_configuration_bytes,
 )
-from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.config import MAX_INPUT_FILE_MAX_BYTES, RelaySettings
+from clio_relay.core_queue import (
+    INPUT_INGEST_ATTEMPT_METADATA_KEY,
+    INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
+    ClioCoreQueue,
+)
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.jarvis_mcp import (
@@ -59,12 +66,15 @@ from clio_relay.jarvis_service_runtime import (
     reverify_jarvis_service_runtime,
 )
 from clio_relay.models import (
+    INPUT_INGEST_POLICY_METADATA_KEY,
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     ArtifactUse,
     Cursor,
     GatewaySession,
     GatewaySessionState,
+    InputArtifactIngestPolicy,
+    InputArtifactSpec,
     JarvisRunSpec,
     JobKind,
     JobState,
@@ -82,6 +92,8 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     TaskEventStatus,
     TaskTimelineEvent,
+    TransformRef,
+    deterministic_input_artifact_id,
     new_id,
     validate_mcp_env_from,
 )
@@ -125,10 +137,190 @@ from clio_relay.session_api import (
     SESSION_GENERATION_ID_HEADER,
     session_identity_document,
 )
+from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
 
 ModelRecord = TypeVar("ModelRecord", bound=BaseModel)
+INPUT_ARTIFACT_REQUEST_JSON_OVERHEAD_BYTES = 16 * 1024
+MAX_INPUT_ARTIFACT_BASE64_CHARS = 4 * ((MAX_INPUT_FILE_MAX_BYTES + 2) // 3)
+
+
+class InputArtifactBodyLimitMiddleware:
+    """Reject an oversized private ingest body before request-model parsing."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        api_token: str | None,
+        owner_session_id: str | None,
+        session_generation_id: str | None,
+    ) -> None:
+        if max_body_bytes < 1:
+            raise ValueError("input artifact request body limit must be positive")
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+        self._api_token = None if api_token is None else api_token.encode("utf-8")
+        self._owner_session_id = (
+            None if owner_session_id is None else owner_session_id.encode("utf-8")
+        )
+        self._session_generation_id = (
+            None if session_generation_id is None else session_generation_id.encode("utf-8")
+        )
+        self._body_slot = asyncio.Semaphore(1)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/input-artifacts/ingest"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        raw_headers = scope.get("headers", [])
+        if not isinstance(raw_headers, list):
+            await self._send_error(send, 400, "invalid HTTP request headers")
+            return
+        headers = cast(list[tuple[bytes, bytes]], raw_headers)
+        authentication_error = self._authentication_error(headers)
+        if authentication_error is not None:
+            status_code, detail = authentication_error
+            await self._send_error(send, status_code, detail)
+            return
+
+        async with self._body_slot:
+            await self._buffer_and_dispatch(scope, headers, receive, send)
+
+    async def _buffer_and_dispatch(
+        self,
+        scope: Scope,
+        headers: list[tuple[bytes, bytes]],
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        content_length_values = self._header_values(headers, b"content-length")
+        if len(content_length_values) > 1:
+            await self._send_error(send, 400, "invalid Content-Length header")
+            return
+        raw_content_length = content_length_values[0] if content_length_values else None
+        if raw_content_length is not None:
+            try:
+                content_length = int(raw_content_length.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                await self._send_error(send, 400, "invalid Content-Length header")
+                return
+            if content_length < 0:
+                await self._send_error(send, 400, "invalid Content-Length header")
+                return
+            if content_length > self.max_body_bytes:
+                await self._send_too_large(send)
+                return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            message_type = message.get("type")
+            if message_type == "http.disconnect":
+                return
+            if message_type != "http.request":
+                await self._send_error(send, 400, "invalid HTTP request body stream")
+                return
+            chunk = message.get("body", b"")
+            if not isinstance(chunk, bytes):
+                await self._send_error(send, 400, "invalid HTTP request body chunk")
+                return
+            if len(body) + len(chunk) > self.max_body_bytes:
+                await self._send_too_large(send)
+                return
+            body.extend(chunk)
+            if message.get("more_body") is not True:
+                break
+
+        replayed = False
+
+        async def replay_receive() -> Message:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+    def _authentication_error(
+        self,
+        headers: list[tuple[bytes, bytes]],
+    ) -> tuple[int, str] | None:
+        """Authenticate the private route before allocating its bounded body."""
+        if (
+            self._api_token is None
+            or self._owner_session_id is None
+            or self._session_generation_id is None
+        ):
+            return 404, "owned-session input artifact ingest is unavailable"
+
+        header_tokens = self._header_values(headers, b"x-clio-relay-token")
+        authorizations = self._header_values(headers, b"authorization")
+        supplied: bytes | None = None
+        if header_tokens:
+            if len(header_tokens) != 1 or not header_tokens[0]:
+                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+            supplied = header_tokens[0]
+        elif authorizations:
+            if len(authorizations) != 1:
+                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+            scheme, separator, token = authorizations[0].partition(b" ")
+            if separator != b" " or scheme.lower() != b"bearer" or not token:
+                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+            supplied = token
+        if supplied is None or not secrets.compare_digest(supplied, self._api_token):
+            return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+
+        session_ids = self._header_values(headers, OWNER_SESSION_ID_HEADER.lower().encode("ascii"))
+        generation_ids = self._header_values(
+            headers,
+            SESSION_GENERATION_ID_HEADER.lower().encode("ascii"),
+        )
+        if len(session_ids) != 1 or len(generation_ids) != 1:
+            return 409, "exact owner session and generation headers are required"
+        if not (
+            secrets.compare_digest(session_ids[0], self._owner_session_id)
+            and secrets.compare_digest(generation_ids[0], self._session_generation_id)
+        ):
+            return 409, "owner session or generation does not match this API process"
+        return None
+
+    @staticmethod
+    def _header_values(
+        headers: list[tuple[bytes, bytes]],
+        name: bytes,
+    ) -> list[bytes]:
+        return [value for key, value in headers if key.lower() == name]
+
+    async def _send_too_large(self, send: Send) -> None:
+        await self._send_error(
+            send,
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"input artifact request body exceeds the {self.max_body_bytes}-byte limit",
+        )
+
+    @staticmethod
+    async def _send_error(send: Send, status_code: int, detail: str) -> None:
+        payload = json.dumps({"detail": detail}, separators=(",", ":")).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
 
 
 def _public_record(record: ModelRecord) -> ModelRecord:  # noqa: UP047
@@ -361,6 +553,45 @@ class JarvisSubmitRequest(BaseModel):
     )
 
 
+class InputArtifactIngestRequest(BaseModel):
+    """Private owned-session request for one bounded regular-file input."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.input-artifact-ingest.v1"] = (
+        "clio-relay.input-artifact-ingest.v1"
+    )
+    cluster: str = Field(min_length=1, max_length=256)
+    logical_name: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_base64: str = Field(max_length=MAX_INPUT_ARTIFACT_BASE64_CHARS)
+    idempotency_key: str = Field(min_length=1, max_length=1_024)
+
+
+def _decode_input_artifact_payload(
+    request: InputArtifactIngestRequest,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Decode one canonical base64 payload without crossing the configured cap."""
+    if request.size_bytes > max_bytes:
+        raise ValueError(f"input artifact exceeds the {max_bytes}-byte per-file limit")
+    expected_encoded_bytes = 4 * ((request.size_bytes + 2) // 3)
+    if len(request.data_base64) != expected_encoded_bytes:
+        raise ValueError("input artifact base64 length does not match its declared size")
+    try:
+        payload = base64.b64decode(request.data_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("input artifact data_base64 is not canonical base64") from exc
+    if len(payload) != request.size_bytes:
+        raise ValueError("input artifact decoded size does not match its declaration")
+    digest = hashlib.sha256(payload).hexdigest()
+    if not secrets.compare_digest(digest, request.sha256):
+        raise ValueError("input artifact SHA-256 does not match its payload")
+    return payload
+
+
 class JarvisPipelineSubmitRequest(BaseModel):
     """HTTP request to submit an existing JARVIS pipeline by name."""
 
@@ -406,6 +637,7 @@ class McpCallSubmitRequest(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    expected_registered_contract: str | None = Field(default=None, min_length=1, max_length=256)
     operation: McpOperation = McpOperation.TOOLS_CALL
     tool: str | None = None
     arguments: dict[str, object] = Field(default_factory=dict)
@@ -436,6 +668,8 @@ class McpCallSubmitRequest(BaseModel):
             raise ValueError("arguments must be empty for tools/list")
         if self.expected_server_artifact_digest is not None:
             raise ValueError("tools/list must not carry an expected server artifact digest")
+        if self.expected_registered_contract is not None:
+            raise ValueError("tools/list must not carry a registered semantic contract binding")
         if self.control_query_evidence is not None:
             raise ValueError("tools/list must not carry control-query route evidence")
         return self
@@ -787,6 +1021,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             queue.close()
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
+    app.add_middleware(
+        InputArtifactBodyLimitMiddleware,
+        max_body_bytes=(
+            4 * ((resolved.input_file_max_bytes + 2) // 3)
+            + INPUT_ARTIFACT_REQUEST_JSON_OVERHEAD_BYTES
+        ),
+        api_token=resolved.api_token,
+        owner_session_id=resolved.owner_session_id,
+        session_generation_id=resolved.owner_session_generation_id,
+    )
     auth_dependency = Depends(_require_api_token(resolved))
     session_submission_dependency = Depends(_require_session_submission_binding(resolved))
 
@@ -837,6 +1081,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         job: RelayJob,
         *,
         mcp_admission_authority: McpAdmissionAuthority | None = None,
+        input_ingest_policy: InputArtifactIngestPolicy | None = None,
     ) -> RelayJob:
         ensure_intake_open()
         if owner_session_cluster is not None and job.cluster != owner_session_cluster:
@@ -852,6 +1097,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 "owner_session_generation_id",
                 "owner_session_admission_id",
                 MCP_ADMISSION_AUTHORITY_METADATA_KEY,
+                INPUT_INGEST_ATTEMPT_METADATA_KEY,
+                INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
+                INPUT_INGEST_POLICY_METADATA_KEY,
             }.intersection(metadata)
         )
         if protected:
@@ -883,6 +1131,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=422,
                 detail="MCP admission authority cannot be attached to another job kind",
+            )
+        if job.kind is JobKind.INPUT_INGEST:
+            if input_ingest_policy is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="input ingest requires server-owned generation quota policy",
+                )
+            metadata[INPUT_INGEST_POLICY_METADATA_KEY] = input_ingest_policy.model_dump(mode="json")
+        elif input_ingest_policy is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="input ingest policy cannot be attached to another job kind",
             )
         if resolved.owner_session_id is not None:
             for use in job.used_artifact_refs:
@@ -995,15 +1255,144 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
+        "/input-artifacts/ingest",
+        dependencies=[auth_dependency, session_submission_dependency],
+        include_in_schema=False,
+    )
+    def ingest_input_artifact(
+        request: InputArtifactIngestRequest,
+    ) -> dict[str, object]:
+        """Persist one authenticated owner-session input without exposing upload tooling."""
+        if (
+            resolved.owner_session_id is None
+            or resolved.owner_session_generation_id is None
+            or owner_session_cluster is None
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="owned-session input artifact ingest is unavailable",
+            )
+        try:
+            payload = _decode_input_artifact_payload(
+                request,
+                max_bytes=resolved.input_file_max_bytes,
+            )
+            spec = InputArtifactSpec(
+                logical_name=request.logical_name,
+                size_bytes=request.size_bytes,
+                sha256=request.sha256,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        input_ingest_policy = InputArtifactIngestPolicy(
+            max_file_count=resolved.input_file_max_count,
+            max_total_bytes=resolved.input_total_max_bytes,
+        )
+        job = submit_owned(
+            RelayJob(
+                cluster=request.cluster,
+                kind=JobKind.INPUT_INGEST,
+                spec=spec,
+                idempotency_key=request.idempotency_key,
+            ),
+            input_ingest_policy=input_ingest_policy,
+        )
+        attempt_id = new_id("ingest_attempt")
+        claimed = False
+        try:
+            queue.recover_abandoned_input_ingests(cluster=request.cluster)
+            current, claimed = queue.begin_input_ingest(
+                job.job_id,
+                attempt_id=attempt_id,
+                policy=input_ingest_policy,
+            )
+            if current.state is JobState.SUCCEEDED:
+                artifact = queue.get_artifact(deterministic_input_artifact_id(current.job_id))
+                return {
+                    "job": _public_record(current).model_dump(mode="json"),
+                    "artifact": _public_record(artifact).model_dump(mode="json"),
+                }
+            spool = JobSpool(
+                resolved.spool_dir,
+                current,
+                max_log_bytes_per_stream=resolved.spool_max_log_bytes_per_stream,
+                max_log_bytes_per_job=resolved.spool_max_log_bytes_per_job,
+            )
+            path = spool.write_input_artifact(
+                spec.logical_name,
+                payload,
+                size_bytes=spec.size_bytes,
+                sha256=spec.sha256,
+            )
+            candidate = spool.artifact_for(path, kind="input")
+            candidate = candidate.model_copy(
+                update={
+                    "artifact_id": deterministic_input_artifact_id(current.job_id),
+                    "created_at": current.created_at,
+                    "metadata": {
+                        **candidate.metadata,
+                        "schema_version": spec.schema_version,
+                        "logical_name": spec.logical_name,
+                    },
+                }
+            )
+            artifact = queue.reconcile_input_artifact(candidate, attempt_id=attempt_id)
+            current, _changed = queue.complete_input_ingest(
+                current.job_id,
+                attempt_id=attempt_id,
+            )
+        except StorageAdmissionError as exc:
+            raise HTTPException(status_code=507, detail=exc.decision.to_dict()) from exc
+        except ValueError as exc:
+            if claimed:
+                try:
+                    queue.fail_input_ingest(
+                        job.job_id,
+                        attempt_id=attempt_id,
+                        error=str(exc),
+                    )
+                except (QueueConflictError, StorageAdmissionError) as cleanup_exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "input artifact ingest failed and its attempt could not be "
+                            f"terminalized: {cleanup_exc}"
+                        ),
+                    ) from cleanup_exc
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (OSError, RuntimeError, QueueConflictError) as exc:
+            if claimed:
+                try:
+                    queue.fail_input_ingest(
+                        job.job_id,
+                        attempt_id=attempt_id,
+                        error=str(exc),
+                    )
+                except (QueueConflictError, StorageAdmissionError) as cleanup_exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "input artifact ingest failed and its attempt could not be "
+                            f"terminalized: {cleanup_exc}"
+                        ),
+                    ) from cleanup_exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "job": _public_record(current).model_dump(mode="json"),
+            "artifact": _public_record(artifact).model_dump(mode="json"),
+        }
+
+    @app.post(
         "/jobs",
         response_model=RelayJob,
         dependencies=[auth_dependency, session_submission_dependency],
     )
     def submit_job(job: RelayJob) -> RelayJob:
-        if job.kind is JobKind.MCP_CALL:
+        if job.kind in {JobKind.MCP_CALL, JobKind.INPUT_INGEST}:
             raise HTTPException(
                 status_code=422,
-                detail="MCP jobs must use /jobs/mcp-call or /jobs/jarvis-mcp-call",
+                detail=("this job kind must use its dedicated authenticated internal route"),
             )
         return submit_owned(job)
 
@@ -1089,6 +1478,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 tool=request.tool,
                 expected_server_artifact_digest=request.expected_server_artifact_digest,
                 evidence=request.control_query_evidence,
+                expected_registered_contract=request.expected_registered_contract,
                 timeout_seconds=request.timeout_seconds,
             )
         except (ConfigurationError, ValueError) as exc:
@@ -1102,6 +1492,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     server_args=request.server_args,
                     env_from=request.env_from,
                     expected_server_artifact_digest=(request.expected_server_artifact_digest),
+                    expected_registered_contract=request.expected_registered_contract,
                     admission_class=admission_class,
                     operation=request.operation,
                     tool=request.tool,
@@ -1195,6 +1586,37 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             return _public_record(require_owned_job(job_id))
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/jobs/{job_id}/transform",
+        response_model=TransformRef,
+        dependencies=[auth_dependency, session_submission_dependency],
+    )
+    def record_job_transform(job_id: DurableRecordId, transform: TransformRef) -> TransformRef:
+        """Record one immutable, execution-owned transform for an exact owned job."""
+        try:
+            require_owned_job(job_id)
+            if transform.job_id != job_id:
+                raise HTTPException(status_code=422, detail="transform job_id does not match path")
+            return _public_record(queue.record_transform_ref(transform))
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except QueueConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get(
+        "/jobs/{job_id}/transform",
+        response_model=TransformRef | None,
+        dependencies=[auth_dependency],
+    )
+    def get_job_transform(job_id: DurableRecordId) -> TransformRef | None:
+        """Return the nullable immutable transform for one exact owned job."""
+        try:
+            require_owned_job(job_id)
+            transform = queue.get_transform_ref(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return None if transform is None else _public_record(transform)
 
     @app.get("/jobs/{job_id}/status", dependencies=[auth_dependency])
     def get_job_status(job_id: DurableRecordId) -> dict[str, object]:

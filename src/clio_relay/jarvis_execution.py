@@ -660,6 +660,126 @@ if acknowledgement_written != 1:
     raise RuntimeError("scheduled JARVIS broker readiness acknowledgement was incomplete")
 
 from clio_relay.jarvis_execution import run_native_jarvis_broker
+
+# BEGIN REGISTERED RELAY PACKAGE REPOSITORY BINDING
+# Importing the trusted relay containment and execution modules above loads the
+# installed ``clio_relay`` package before JARVIS resolves a package from its
+# registered repositories.  Python otherwise keeps searching only that
+# installed package's ``__path__``, silently bypassing a newer registered
+# ``clio_relay.mcp_call`` package.  Retain the already-loaded trusted modules,
+# but give future relay-owned package imports the same first-repository
+# precedence that JARVIS applies in ``Pipeline._load_package_instance``.
+import clio_relay as clio_relay_namespace
+from jarvis_cd.core.config import Jarvis
+
+registered_repositories = Jarvis.get_instance().repos.get("repos")
+if not isinstance(registered_repositories, list):
+    raise RuntimeError("JARVIS repositories do not contain a list")
+lexical_home = Path(os.path.abspath(Path.home().expanduser()))
+registered_relay_repository = lexical_home / ".local/share/clio-relay/clio_relay"
+registered_relay_repository_text = str(registered_relay_repository)
+matching_repositories = []
+for value in registered_repositories:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character in value for character in "\\x00\\r\\n")
+    ):
+        continue
+    try:
+        lexical_repository = Path(os.path.abspath(Path(value).expanduser()))
+    except (OSError, RuntimeError, ValueError):
+        continue
+    if lexical_repository == registered_relay_repository:
+        matching_repositories.append(value)
+if matching_repositories != [registered_relay_repository_text]:
+    raise RuntimeError(
+        "JARVIS repositories must contain exactly one exact bootstrap-managed "
+        "clio_relay repository"
+    )
+try:
+    registered_link_before = registered_relay_repository.lstat()
+    if not stat.S_ISLNK(registered_link_before.st_mode):
+        raise RuntimeError("bootstrap-managed clio_relay repository is not a symbolic link")
+    resolved_relay_repository = registered_relay_repository.resolve(strict=True)
+    expected_active_repository = (
+        lexical_home
+        / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+    ).resolve(strict=True)
+    registered_link_after = registered_relay_repository.lstat()
+except (OSError, RuntimeError) as exc:
+    raise RuntimeError("bootstrap-managed clio_relay repository is unavailable") from exc
+registered_link_identity_before = (
+    registered_link_before.st_dev,
+    registered_link_before.st_ino,
+    registered_link_before.st_mode,
+    registered_link_before.st_mtime_ns,
+    registered_link_before.st_ctime_ns,
+)
+registered_link_identity_after = (
+    registered_link_after.st_dev,
+    registered_link_after.st_ino,
+    registered_link_after.st_mode,
+    registered_link_after.st_mtime_ns,
+    registered_link_after.st_ctime_ns,
+)
+if registered_link_identity_after != registered_link_identity_before:
+    raise RuntimeError("bootstrap-managed clio_relay repository changed during inspection")
+if resolved_relay_repository != expected_active_repository:
+    raise RuntimeError("bootstrap-managed clio_relay repository does not name active state")
+try:
+    canonical_home = lexical_home.resolve(strict=True)
+    generation_relative = resolved_relay_repository.relative_to(
+        canonical_home / ".local/share/clio-relay/generations"
+    )
+except (OSError, RuntimeError, ValueError) as exc:
+    raise RuntimeError("bootstrap-managed clio_relay repository is outside managed state") from exc
+generation_fingerprint = generation_relative.parts[0] if generation_relative.parts else ""
+if not (
+    len(generation_relative.parts) == 4
+    and len(generation_fingerprint) == 64
+    and all(character in "0123456789abcdef" for character in generation_fingerprint)
+    and generation_relative.parts[1:] == ("source", "jarvis-packages", "clio_relay")
+):
+    raise RuntimeError("bootstrap-managed clio_relay repository has an invalid generation shape")
+registered_relay_package_root = resolved_relay_repository / "clio_relay"
+try:
+    registered_package_before = registered_relay_package_root.lstat()
+    resolved_relay_package_root = registered_relay_package_root.resolve(strict=True)
+    registered_package_after = registered_relay_package_root.lstat()
+except (OSError, RuntimeError) as exc:
+    raise RuntimeError("bootstrap-managed clio_relay package root is unavailable") from exc
+if (
+    not stat.S_ISDIR(registered_package_before.st_mode)
+    or resolved_relay_package_root != registered_relay_package_root
+    or (
+        registered_package_before.st_dev,
+        registered_package_before.st_ino,
+        registered_package_before.st_mode,
+        registered_package_before.st_mtime_ns,
+        registered_package_before.st_ctime_ns,
+    )
+    != (
+        registered_package_after.st_dev,
+        registered_package_after.st_ino,
+        registered_package_after.st_mode,
+        registered_package_after.st_mtime_ns,
+        registered_package_after.st_ctime_ns,
+    )
+):
+    raise RuntimeError("bootstrap-managed clio_relay package root is not a stable directory")
+registered_relay_package_root_text = str(resolved_relay_package_root)
+existing_relay_package_roots = list(clio_relay_namespace.__path__)
+clio_relay_namespace.__path__ = [
+    registered_relay_package_root_text,
+    *(
+        value
+        for value in existing_relay_package_roots
+        if value != registered_relay_package_root_text
+    ),
+]
+# END REGISTERED RELAY PACKAGE REPOSITORY BINDING
+
 from jarvis_cd.core.pipeline_test import load_yaml_auto
 
 if len(sys.argv) != 3 or sys.argv[1] not in {"yaml", "named"}:

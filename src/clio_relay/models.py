@@ -25,6 +25,14 @@ RELAY_CREDENTIAL_ENV_NAMES = frozenset(
     }
 )
 MCP_ADMISSION_AUTHORITY_METADATA_KEY = "mcp_admission_authority"
+INPUT_INGEST_POLICY_METADATA_KEY = "input_ingest_policy"
+MAX_ARTIFACT_USE_PROVENANCE_BYTES = 8 * 1024
+MAX_ARTIFACT_USE_AGGREGATE_BYTES = 256 * 1024
+MAX_JARVIS_PACKAGE_INPUT_CONTRACT_BYTES = 256 * 1024
+MAX_TRANSFORM_ENVIRONMENT_BYTES = 16 * 1024
+MAX_TRANSFORM_REF_BYTES = 192 * 1024
+MAX_TRANSFORM_USED_EVIDENCE = 1_000
+REGISTERED_JARVIS_USER_CONTRACT = "clio-kit-jarvis-user-v3.6"
 
 
 def validate_mcp_env_from(value: dict[str, str]) -> dict[str, str]:
@@ -78,6 +86,7 @@ class JobKind(StrEnum):
     JARVIS = "jarvis"
     REMOTE_AGENT = "remote_agent"
     MCP_CALL = "mcp_call"
+    INPUT_INGEST = "input_ingest"
 
 
 class McpOperation(StrEnum):
@@ -390,6 +399,68 @@ class OwnerSessionJobMembership(BaseModel):
     updated_at: datetime
 
 
+class ArtifactUseEvidence(StrEnum):
+    """How one transform established a used edge's identity."""
+
+    SCHEMA_ARG = "schema-arg"
+    HASH_PAIR = "hash-pair"
+    LEASE_WINDOW = "lease-window"
+    AUTHORITY = "authority"
+    ASSERTION = "assertion"
+
+
+class ArtifactMechanism(StrEnum):
+    """What produced an artifact or transform record."""
+
+    HARNESS = "harness"
+    TOOL_SCHEMA = "tool-schema"
+    CHANGE_FEED = "change-feed"
+    MODEL = "model"
+    NONE = "none"
+
+
+class TransformEnvironmentTier(StrEnum):
+    """Strength of one non-secret execution-environment identity."""
+
+    DECLARED = "declared"
+    LOCKFILE_HASH = "lockfile-hash"
+    IMAGE_DIGEST = "image-digest"
+
+
+class TransformReplayContract(StrEnum):
+    """Permanent replay guarantee recorded for one transform."""
+
+    REPRODUCIBLE = "reproducible"
+    RE_RUNNABLE = "re-runnable"
+
+
+class ArtifactUseProvenance(BaseModel):
+    """Bounded non-secret evidence attached to one content-pinned used edge."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.artifact-use-provenance.v1"] = (
+        "clio-relay.artifact-use-provenance.v1"
+    )
+    evidence: ArtifactUseEvidence
+    authority: str = Field(default="", max_length=4_096)
+    external_ref: str = Field(default="", max_length=4_096)
+    arg: str = Field(default="", max_length=512)
+    note: str = Field(default="", max_length=512)
+
+    @model_validator(mode="after")
+    def require_bounded_consistent_evidence(self) -> ArtifactUseProvenance:
+        """Reject contradictory authority evidence and oversized JSON documents."""
+        if self.evidence is ArtifactUseEvidence.AUTHORITY and not self.authority:
+            raise ValueError("authority evidence requires a non-empty authority reference")
+        _require_canonical_json_size(
+            self.model_dump(mode="json"),
+            label="artifact-use provenance",
+            maximum=MAX_ARTIFACT_USE_PROVENANCE_BYTES,
+        )
+        return self
+
+
 class ArtifactUse(BaseModel):
     """A content-pinned artifact dependency supplied with a job submission."""
 
@@ -397,6 +468,7 @@ class ArtifactUse(BaseModel):
 
     artifact_id: DurableRecordId
     sha256: str = Field(min_length=64, max_length=64)
+    provenance: ArtifactUseProvenance | None = None
 
     @field_validator("sha256")
     @classmethod
@@ -406,6 +478,293 @@ class ArtifactUse(BaseModel):
         if any(character not in "0123456789abcdef" for character in normalized):
             raise ValueError("sha256 must be a SHA-256 digest")
         return normalized
+
+
+def artifact_use_payload(value: ArtifactUse) -> dict[str, Any]:
+    """Return the canonical additive wire form without changing legacy identities."""
+    return value.model_dump(mode="json", exclude_none=True)
+
+
+class JarvisPackageInputRoute(BaseModel):
+    """Exact immutable registered route used to describe one JARVIS package."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.jarvis-package-input-route.v1"] = (
+        "clio-relay.jarvis-package-input-route.v1"
+    )
+    cluster: str = Field(min_length=1, max_length=256)
+    server_name: str = Field(min_length=1, max_length=256)
+    contract: Literal["clio-kit-jarvis-user-v3.6"] = "clio-kit-jarvis-user-v3.6"
+    cluster_route_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    registration_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_server_artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_name: str = Field(min_length=1, max_length=512)
+
+    def identity_sha256(self) -> str:
+        """Return the canonical route-and-package storage identity."""
+        return _canonical_json_sha256(self.model_dump(mode="json"))
+
+
+class JarvisPackageLocalFileInput(BaseModel):
+    """Closed local-file setting names learned from a package description."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    canonical_name: str = Field(min_length=1, max_length=512)
+    accepted_names: tuple[Annotated[str, Field(min_length=1, max_length=512)], ...] = Field(
+        min_length=1,
+        max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def accepted_names_are_unique_and_canonical(self) -> Self:
+        """Require the canonical spelling first and reject ambiguous aliases."""
+        if self.accepted_names[0] != self.canonical_name:
+            raise ValueError("package local-file accepted names must start with the canonical name")
+        if len(self.accepted_names) != len(set(self.accepted_names)):
+            raise ValueError("package local-file accepted names must be unique")
+        return self
+
+
+class JarvisPackageInputContractRecord(BaseModel):
+    """Checksum-bound package input semantics for one exact immutable route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.jarvis-package-input-contract.v1"] = (
+        "clio-relay.jarvis-package-input-contract.v1"
+    )
+    route: JarvisPackageInputRoute
+    route_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_names: tuple[Annotated[str, Field(min_length=1, max_length=512)], ...] = Field(
+        min_length=1, max_length=64
+    )
+    local_file_settings: tuple[JarvisPackageLocalFileInput, ...] = Field(max_length=1_000)
+    settings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime
+    document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def identity_and_document_are_exact(self) -> Self:
+        """Reject route substitution, ambiguous settings, and record mutation."""
+        if self.route_sha256 != self.route.identity_sha256():
+            raise ValueError("package input route checksum does not match its identity")
+        if self.route.package_name not in self.package_names:
+            raise ValueError("package input route name is absent from the described package names")
+        if len(self.package_names) != len(set(self.package_names)):
+            raise ValueError("described package names must be unique")
+        accepted_names: set[str] = set()
+        for setting in self.local_file_settings:
+            overlap = accepted_names.intersection(setting.accepted_names)
+            if overlap:
+                raise ValueError("package local-file setting names and aliases must be unique")
+            accepted_names.update(setting.accepted_names)
+        if self.document_sha256 != _jarvis_package_input_contract_sha256(self):
+            raise ValueError("package input contract checksum does not match its document")
+        _require_canonical_json_size(
+            self.model_dump(mode="json"),
+            label="JARVIS package input contract",
+            maximum=MAX_JARVIS_PACKAGE_INPUT_CONTRACT_BYTES,
+        )
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        route: JarvisPackageInputRoute,
+        package_names: tuple[str, ...],
+        local_file_settings: tuple[JarvisPackageLocalFileInput, ...],
+        settings_sha256: str,
+        created_at: datetime | None = None,
+    ) -> JarvisPackageInputContractRecord:
+        """Create one validated immutable package-input contract record."""
+        provisional = cls.model_construct(
+            route=route,
+            route_sha256=route.identity_sha256(),
+            package_names=package_names,
+            local_file_settings=local_file_settings,
+            settings_sha256=settings_sha256,
+            created_at=created_at or utc_now(),
+            document_sha256="0" * 64,
+        )
+        return cls.model_validate(
+            {
+                **provisional.model_dump(mode="python"),
+                "document_sha256": _jarvis_package_input_contract_sha256(provisional),
+            }
+        )
+
+
+class JarvisPipelineInputRoute(BaseModel):
+    """Exact registered route and owner generation for staged pipeline inputs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.jarvis-pipeline-input-route.v1"] = (
+        "clio-relay.jarvis-pipeline-input-route.v1"
+    )
+    cluster: str = Field(min_length=1, max_length=256)
+    server_name: str = Field(min_length=1, max_length=256)
+    contract: Literal["clio-kit-jarvis-user-v3.6"] = "clio-kit-jarvis-user-v3.6"
+    cluster_route_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    registration_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_server_artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pipeline_id: str = Field(min_length=1, max_length=512)
+    owner_session_id: str = Field(min_length=1, max_length=256)
+    owner_session_generation_id: DurableRecordId
+
+    def identity_sha256(self) -> str:
+        """Return the canonical content identity used as the durable record key."""
+        return _canonical_json_sha256(self.model_dump(mode="json"))
+
+
+class JarvisPipelineInputLineage(BaseModel):
+    """Tamper-evident staged-input lineage for one exact JARVIS pipeline route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.jarvis-pipeline-input-lineage.v1"] = (
+        "clio-relay.jarvis-pipeline-input-lineage.v1"
+    )
+    route: JarvisPipelineInputRoute
+    route_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_uses: tuple[ArtifactUse, ...] = Field(max_length=1_000)
+    manifest_sha256s: tuple[str, ...] = Field(max_length=1_000)
+    created_at: datetime
+    updated_at: datetime
+    document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("artifact_uses")
+    @classmethod
+    def artifact_uses_must_be_unique_and_canonical(
+        cls,
+        value: tuple[ArtifactUse, ...],
+    ) -> tuple[ArtifactUse, ...]:
+        """Forbid ambiguous duplicate artifacts and non-canonical record order."""
+        canonical = tuple(sorted(value, key=lambda item: (item.artifact_id, item.sha256)))
+        if value != canonical:
+            raise ValueError("pipeline input artifact uses must be canonically ordered")
+        identities = [item.artifact_id for item in value]
+        if len(identities) != len(set(identities)):
+            raise ValueError("pipeline input artifact uses must have unique artifact IDs")
+        validate_artifact_use_collection(value)
+        return value
+
+    @field_validator("manifest_sha256s")
+    @classmethod
+    def manifests_must_be_unique_canonical_sha256s(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Require a sorted set of canonical staging-manifest identities."""
+        if value != tuple(sorted(set(value))):
+            raise ValueError("pipeline input manifests must be unique and canonically ordered")
+        if any(
+            len(item) != 64 or any(character not in "0123456789abcdef" for character in item)
+            for item in value
+        ):
+            raise ValueError("pipeline input manifests must be canonical SHA-256 digests")
+        return value
+
+    @model_validator(mode="after")
+    def checksums_must_match_exact_document(self) -> JarvisPipelineInputLineage:
+        """Detect route substitution or record mutation before lineage is reused."""
+        if self.route_sha256 != self.route.identity_sha256():
+            raise ValueError("pipeline input route checksum does not match its identity")
+        if self.updated_at < self.created_at:
+            raise ValueError("pipeline input lineage updated_at predates created_at")
+        if self.document_sha256 != _jarvis_pipeline_input_lineage_sha256(self):
+            raise ValueError("pipeline input lineage checksum does not match its document")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        route: JarvisPipelineInputRoute,
+        artifact_uses: tuple[ArtifactUse, ...],
+        manifest_sha256s: tuple[str, ...],
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> JarvisPipelineInputLineage:
+        """Create one validated checksum-bound durable lineage record."""
+        created = created_at or utc_now()
+        updated = updated_at or created
+        provisional = cls.model_construct(
+            route=route,
+            route_sha256=route.identity_sha256(),
+            artifact_uses=tuple(
+                sorted(artifact_uses, key=lambda item: (item.artifact_id, item.sha256))
+            ),
+            manifest_sha256s=tuple(sorted(set(manifest_sha256s))),
+            created_at=created,
+            updated_at=updated,
+            document_sha256="0" * 64,
+        )
+        return cls.model_validate(
+            {
+                **provisional.model_dump(mode="python"),
+                "document_sha256": _jarvis_pipeline_input_lineage_sha256(provisional),
+            }
+        )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    """Hash one finite canonical JSON value."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    """Serialize one finite JSON value deterministically for size enforcement."""
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("provenance must contain finite JSON values") from exc
+
+
+def _require_canonical_json_size(value: object, *, label: str, maximum: int) -> None:
+    """Reject a provenance document whose canonical UTF-8 encoding is oversized."""
+    if len(_canonical_json_bytes(value)) > maximum:
+        raise ValueError(f"{label} exceeds {maximum} UTF-8 bytes")
+
+
+def validate_artifact_use_collection(
+    value: list[ArtifactUse] | tuple[ArtifactUse, ...],
+) -> None:
+    """Bound the complete dependency document independently from item count."""
+    _require_canonical_json_size(
+        [artifact_use_payload(item) for item in value],
+        label="artifact-use collection",
+        maximum=MAX_ARTIFACT_USE_AGGREGATE_BYTES,
+    )
+
+
+def _jarvis_pipeline_input_lineage_sha256(record: JarvisPipelineInputLineage) -> str:
+    """Hash every durable lineage field except the checksum itself."""
+    payload = record.model_dump(mode="json", exclude={"document_sha256"})
+    payload["artifact_uses"] = [artifact_use_payload(item) for item in record.artifact_uses]
+    return _canonical_json_sha256(payload)
+
+
+def _jarvis_package_input_contract_sha256(record: JarvisPackageInputContractRecord) -> str:
+    """Hash every durable package-input field except the checksum itself."""
+    return _canonical_json_sha256(record.model_dump(mode="json", exclude={"document_sha256"}))
 
 
 def _empty_artifact_uses() -> list[ArtifactUse]:
@@ -424,6 +783,7 @@ class UsedArtifactRef(BaseModel):
     producer_job_id: DurableRecordId
     sequence: int = Field(ge=1, lt=2**63)
     sha256: str = Field(min_length=64, max_length=64)
+    provenance: ArtifactUseProvenance | None = None
     created_at: datetime
 
     @field_validator("sha256")
@@ -433,6 +793,116 @@ class UsedArtifactRef(BaseModel):
         if any(character not in "0123456789abcdef" for character in value):
             raise ValueError("sha256 must be a canonical SHA-256 digest")
         return value
+
+
+class TransformUseEvidence(ArtifactUseProvenance):
+    """One bounded used edge, including authority-only external inputs."""
+
+    artifact_id: DurableRecordId | None = None
+    sha256: str | None = Field(default=None, min_length=64, max_length=64)
+
+    @field_validator("sha256")
+    @classmethod
+    def optional_sha256_must_be_canonical(cls, value: str | None) -> str | None:
+        """Normalize an optional content pin without inventing one for authority edges."""
+        if value is None:
+            return None
+        normalized = value.lower()
+        if any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("sha256 must be a SHA-256 digest")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_edge_identity(self) -> TransformUseEvidence:
+        """Require an internal artifact or an explicit external/authority identity."""
+        if (self.artifact_id is None) != (self.sha256 is None):
+            raise ValueError("internal transform evidence requires artifact_id and sha256 together")
+        if self.artifact_id is None and not self.external_ref and not self.authority:
+            raise ValueError(
+                "transform used evidence requires artifact_id, external_ref, or authority"
+            )
+        return self
+
+
+class TransformEnvironment(BaseModel):
+    """Fixed non-secret environment identity for a durable transform."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tier: TransformEnvironmentTier = TransformEnvironmentTier.DECLARED
+    clio_version: str = Field(default="", max_length=256)
+    lockfile_sha256: str = Field(default="", max_length=64)
+    launcher_fingerprint: str = Field(default="", max_length=512)
+    provider_id: str = Field(default="", max_length=512)
+    model_id: str = Field(default="", max_length=1_024)
+    model_variant: str = Field(default="", max_length=512)
+    model_source: str = Field(default="", max_length=256)
+    os: str = Field(default="", max_length=256)
+    arch: str = Field(default="", max_length=256)
+    python_version: str = Field(default="", max_length=256)
+    image_digest: str = Field(default="", max_length=256)
+
+    @field_validator("lockfile_sha256")
+    @classmethod
+    def lockfile_sha256_must_be_canonical_or_empty(cls, value: str) -> str:
+        """Require the lockfile identity to be an exact SHA-256 when present."""
+        if value and (len(value) != 64 or any(char not in "0123456789abcdef" for char in value)):
+            raise ValueError("lockfile_sha256 must be empty or a canonical SHA-256 digest")
+        return value
+
+    @field_validator("image_digest")
+    @classmethod
+    def image_digest_must_be_canonical_or_empty(cls, value: str) -> str:
+        """Require an image digest rather than a mutable image tag."""
+        if not value:
+            return value
+        digest = value.removeprefix("sha256:")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("image_digest must be empty or a canonical SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def tier_must_have_its_identity(self) -> TransformEnvironment:
+        """Keep tier claims consistent and the fixed environment document bounded."""
+        if self.tier is TransformEnvironmentTier.LOCKFILE_HASH and not self.lockfile_sha256:
+            raise ValueError("lockfile-hash environment requires lockfile_sha256")
+        if self.tier is TransformEnvironmentTier.IMAGE_DIGEST and not self.image_digest:
+            raise ValueError("image-digest environment requires image_digest")
+        _require_canonical_json_size(
+            self.model_dump(mode="json"),
+            label="transform environment",
+            maximum=MAX_TRANSFORM_ENVIRONMENT_BYTES,
+        )
+        return self
+
+
+class TransformRef(BaseModel):
+    """One immutable activity record for a relay job, independent of used edges."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.transform-ref.v1"] = "clio-relay.transform-ref.v1"
+    job_id: DurableRecordId
+    activity_id: str = Field(min_length=1, max_length=512)
+    mechanism: ArtifactMechanism = ArtifactMechanism.NONE
+    environment: TransformEnvironment = Field(default_factory=TransformEnvironment)
+    replay: TransformReplayContract = TransformReplayContract.RE_RUNNABLE
+    replay_reason: str = Field(default="", max_length=512)
+    used_evidence: tuple[TransformUseEvidence, ...] = Field(
+        default_factory=tuple,
+        max_length=MAX_TRANSFORM_USED_EVIDENCE,
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def record_must_be_bounded(self) -> TransformRef:
+        """Bound a complete activity record independently from queue file limits."""
+        _require_canonical_json_size(
+            self.model_dump(mode="json"),
+            label="transform ref",
+            maximum=MAX_TRANSFORM_REF_BYTES,
+        )
+        return self
 
 
 class ArtifactUserOrderHead(BaseModel):
@@ -445,6 +915,61 @@ class ArtifactUserOrderHead(BaseModel):
     )
     artifact_id: DurableRecordId
     latest_sequence: int = Field(ge=0, lt=2**63)
+
+
+class InputArtifactSpec(BaseModel):
+    """Durable identity for one relay-ingested regular-file input."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.input-artifact.v1"] = "clio-relay.input-artifact.v1"
+    logical_name: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("logical_name")
+    @classmethod
+    def logical_name_must_be_a_safe_filename(cls, value: str) -> str:
+        """Require one portable filename rather than a caller-controlled path."""
+        if value in {".", ".."} or value.endswith((" ", ".")):
+            raise ValueError("logical_name must be a portable regular-file name")
+        if any(character in value for character in ("/", "\\", "\x00", ":")):
+            raise ValueError("logical_name must not contain path separators or drive syntax")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("logical_name must not contain control characters")
+        reserved_stem = value.split(".", 1)[0].upper()
+        reserved = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{number}" for number in range(1, 10)),
+            *(f"LPT{number}" for number in range(1, 10)),
+        }
+        if reserved_stem in reserved:
+            raise ValueError("logical_name must not be a reserved filename")
+        return value
+
+
+class InputArtifactIngestPolicy(BaseModel):
+    """Server-stamped owner-generation limits for input ingestion."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["clio-relay.input-artifact-ingest-policy.v1"] = (
+        "clio-relay.input-artifact-ingest-policy.v1"
+    )
+    max_file_count: int = Field(ge=1, le=1_000)
+    max_total_bytes: int = Field(ge=1)
+
+
+def deterministic_input_artifact_id(job_id: str) -> str:
+    """Return the single stable artifact identity owned by an ingest job."""
+    validated_job_id = validate_durable_record_id(job_id)
+    digest = hashlib.sha256(
+        f"clio-relay.input-artifact.v1\0{validated_job_id}".encode()
+    ).hexdigest()
+    return validate_durable_record_id(f"artifact_{digest[:32]}")
 
 
 class JarvisRunSpec(BaseModel):
@@ -508,6 +1033,7 @@ class McpCallSpec(BaseModel):
     server_args: list[str] = Field(default_factory=list)
     env_from: dict[str, str] = Field(default_factory=dict)
     expected_server_artifact_digest: str | None = None
+    expected_registered_contract: str | None = Field(default=None, min_length=1, max_length=256)
     expected_jarvis_cd_lock_binding: dict[str, str] | None = None
     admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD
     operation: McpOperation = McpOperation.TOOLS_CALL
@@ -566,16 +1092,32 @@ class McpCallSpec(BaseModel):
                 raise ValueError(
                     "control_query MCP calls require an expected server artifact digest"
                 )
+            if (
+                self.expected_registered_contract is not None
+                and self.expected_server_artifact_digest is None
+            ):
+                raise ValueError(
+                    "registered MCP contract binding requires an expected server artifact digest"
+                )
+            if (
+                self.expected_registered_contract is not None
+                and self.expected_jarvis_cd_lock_binding is not None
+            ):
+                raise ValueError(
+                    "registered MCP contract binding and built-in JARVIS lock pin are exclusive"
+                )
             return self
         if self.tool is not None:
             raise ValueError("tool must be omitted for tools/list")
         if self.arguments:
             raise ValueError("arguments must be empty for tools/list")
+        if self.expected_registered_contract is not None:
+            raise ValueError("expected_registered_contract must be omitted for tools/list")
         return self
 
 
 JobSpec = Annotated[
-    JarvisRunSpec | RemoteAgentTaskSpec | McpCallSpec,
+    JarvisRunSpec | RemoteAgentTaskSpec | McpCallSpec | InputArtifactSpec,
     Field(union_mode="left_to_right"),
 ]
 
@@ -602,15 +1144,23 @@ def deterministic_jarvis_execution_id(
 
 
 def is_owned_jarvis_run_spec(kind: JobKind, spec: JobSpec) -> bool:
-    """Recognize a relay-pinned built-in JARVIS run without importing configuration."""
+    """Recognize an artifact-bound built-in or registered JARVIS run."""
     if kind is not JobKind.MCP_CALL or not isinstance(spec, McpCallSpec):
         return False
     normalized_tool = (spec.tool or "").replace("-", "_").lower()
-    return (
+    artifact_bound_jarvis = (
         spec.operation is McpOperation.TOOLS_CALL
         and normalized_tool == "jarvis_run"
         and spec.expected_server_artifact_digest is not None
-        and spec.expected_jarvis_cd_lock_binding is not None
+    )
+    if not artifact_bound_jarvis:
+        return False
+    return (
+        spec.expected_jarvis_cd_lock_binding is not None
+        and spec.expected_registered_contract is None
+    ) or (
+        spec.expected_jarvis_cd_lock_binding is None
+        and spec.expected_registered_contract == REGISTERED_JARVIS_USER_CONTRACT
     )
 
 
@@ -685,7 +1235,9 @@ class RelayJob(BaseModel):
         artifact_ids = [item.artifact_id for item in value]
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("used_artifact_refs must contain unique artifact_id values")
-        return sorted(value, key=lambda item: item.artifact_id)
+        canonical = sorted(value, key=lambda item: item.artifact_id)
+        validate_artifact_use_collection(canonical)
+        return canonical
 
 
 class WaitObservation(BaseModel):

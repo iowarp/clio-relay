@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -40,6 +41,7 @@ from clio_relay.remote_cli import remote_env
 from clio_relay.validation_report import SoftwareIdentity
 
 if TYPE_CHECKING:
+    from clio_relay.models import RelayJob
     from clio_relay.validation_report import (
         CleanupEvidence,
         LiveValidationReport,
@@ -105,6 +107,45 @@ class _OwnedSessionQueue(Protocol):
         session_generation_id: str,
     ) -> None:
         """Clear a matching closing marker after exact API recovery."""
+
+
+class _FailedStartCleanupQueue(Protocol):
+    """Core operations required to close an admitted pre-metadata start."""
+
+    def owner_session_generation_status(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+    ) -> dict[str, object]:
+        """Return exact admission state for one generation."""
+        ...
+
+    def set_owner_session_closing(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str,
+        operation_id: str | None = None,
+        stop_worker: bool = False,
+        cancel_jobs: bool = False,
+        cancel_scheduler_jobs: bool = False,
+    ) -> dict[str, object]:
+        """Persist one immutable cleanup intent."""
+        ...
+
+    def list_owner_session_jobs_page(
+        self,
+        owner_session_id: str,
+        *,
+        session_generation_id: str | None,
+        cursor: str | None = None,
+        limit: int = 500,
+        cluster: str | None = None,
+        include_terminal: bool = False,
+    ) -> tuple[list[RelayJob], str | None, int, int]:
+        """Return one exact generation-scoped membership page."""
+        ...
 
 
 @dataclass
@@ -212,6 +253,71 @@ class _OwnedSessionTransaction:
             )
             if final_identity != initial_identity:
                 raise RelayError(f"owned session file changed while it was read: {name}")
+            return bytes(payload)
+        finally:
+            os.close(descriptor)
+
+    def read_tail(
+        self,
+        name: str,
+        *,
+        maximum_bytes: int,
+        required: bool = True,
+    ) -> bytes | None:
+        """Read a bounded tail from one pinned owner-private regular file.
+
+        Unlike :meth:`read_bytes`, this operation deliberately accepts a file
+        larger than ``maximum_bytes``.  It seeks directly to the bounded tail
+        and still rejects replacement, truncation, growth, or metadata changes
+        while the descriptor is being observed.
+        """
+        _validate_owned_session_filename(name)
+        if maximum_bytes <= 0:
+            raise ValueError("maximum_bytes must be positive")
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=self.directory_fd,
+            )
+        except FileNotFoundError:
+            if required:
+                raise RelayError(f"owned session file is unavailable: {name}") from None
+            return None
+        except OSError as exc:
+            raise RelayError(f"owned session file cannot be opened safely: {name}: {exc}") from exc
+        try:
+            opened = os.fstat(descriptor)
+            linked = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
+            _verify_owned_session_file(opened, linked, uid=self.uid, name=name)
+            initial_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            tail_size = min(opened.st_size, maximum_bytes)
+            os.lseek(descriptor, opened.st_size - tail_size, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) < tail_size:
+                chunk = os.read(descriptor, min(64 * 1024, tail_size - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            final_opened = os.fstat(descriptor)
+            final_linked = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
+            _verify_owned_session_file(final_opened, final_linked, uid=self.uid, name=name)
+            final_identity = (
+                final_opened.st_dev,
+                final_opened.st_ino,
+                final_opened.st_size,
+                final_opened.st_mtime_ns,
+                final_opened.st_ctime_ns,
+            )
+            if len(payload) != tail_size or final_identity != initial_identity:
+                raise RelayError(f"owned session file changed while its tail was read: {name}")
             return bytes(payload)
         finally:
             os.close(descriptor)
@@ -1065,7 +1171,14 @@ class OwnedSessionRecoveryStatus(BaseModel):
     api_release_identity_verified: bool = False
     ownership_token_present: bool = False
     admission_status: dict[str, object] | None = None
-    start_state: Literal["unknown", "starting", "ready", "failed", "not_current"] = "unknown"
+    start_state: Literal[
+        "unknown",
+        "starting",
+        "ready",
+        "failed",
+        "failed_cleaned",
+        "not_current",
+    ] = "unknown"
     start_phase: Literal["pending", "admitted", "scope_bound", "contained"] | None = None
     start_attempt_verified: bool = False
     start_retryable: bool = False
@@ -1106,6 +1219,8 @@ class OwnedSessionStartResult(BaseModel):
     state: Literal["ready", "starting", "ambiguous", "failed", "not_current"]
     terminal: bool
     retryable: bool
+    usable: bool = False
+    watch_deadline_exceeded: bool = False
     transition_accepted: bool | None = None
     transport_deadline_exceeded: bool = False
     running: bool = False
@@ -1137,6 +1252,10 @@ class OwnedSessionStartResult(BaseModel):
             and self.retry_selector.remote_api_port == self.remote_api_port
         ):
             raise ValueError("owned-session start selectors changed result identity")
+        if self.usable is not (self.state == "ready"):
+            raise ValueError("only a ready owned-session result is usable")
+        if self.watch_deadline_exceeded and self.terminal:
+            raise ValueError("a terminal start result cannot exceed a watch deadline")
         if self.state == "ready":
             if not (
                 self.terminal
@@ -1653,9 +1772,36 @@ def _inspect_owned_session_start_attempt_status(
             generation_process_scan_verified = True
         except RelayError as exc:
             errors.append(str(exc))
+    else:
+        from clio_relay.process_containment import adopt_linux_systemd_scope_identity
+
+        try:
+            adopted_scope = adopt_linux_systemd_scope_identity(
+                unit=cast(str, systemd_unit),
+                description=cast(str, systemd_description),
+            )
+            if adopted_scope is None:
+                generation_process_scan_verified = True
+            else:
+                generation_processes = _recorded_scope_processes(
+                    proc_root=proc_root,
+                    systemd_unit=adopted_scope["systemd_unit"],
+                    systemd_cgroup_path=adopted_scope["cgroup_path"],
+                    systemd_invocation_id=adopted_scope["systemd_invocation_id"],
+                    systemd_description=cast(str, systemd_description),
+                )
+                generation_process_scan_verified = True
+        except (RelayError, RuntimeError) as exc:
+            errors.append(f"could not verify predeclared owned-session scope: {exc}")
 
     attempt_verified = not errors
     start_error = cast(str | None, attempt.get("error"))
+    recovery_verified = bool(
+        attempt_verified
+        and cluster_registry_verified
+        and durable_generation_verified
+        and generation_process_scan_verified
+    )
     return OwnedSessionRecoveryStatus(
         cluster=cluster,
         session_id=session_id,
@@ -1664,8 +1810,18 @@ def _inspect_owned_session_start_attempt_status(
         cluster_route_revision=cast(str, route_revision),
         owner="clio-relay",
         remote_api_port=cast(int, remote_api_port),
-        process_state="unverified",
-        running=False,
+        leader_process_state="absent" if not generation_processes else "unverified",
+        process_state=(
+            "owned_running"
+            if recovery_verified and generation_processes
+            else "absent"
+            if recovery_verified
+            else "unverified"
+        ),
+        running=bool(recovery_verified and generation_processes),
+        process_absence_verified=(
+            recovery_verified and generation_process_scan_verified and not generation_processes
+        ),
         generation_process_pids=[process.pid for process in generation_processes],
         generation_process_absence_verified=(
             generation_process_scan_verified and not generation_processes
@@ -1673,8 +1829,8 @@ def _inspect_owned_session_start_attempt_status(
         metadata_verified=False,
         cluster_registry_verified=cluster_registry_verified,
         durable_generation_verified=durable_generation_verified,
-        ownership_verified=False,
-        recovery_verified=False,
+        ownership_verified=recovery_verified,
+        recovery_verified=recovery_verified,
         ownership_token_present=True,
         admission_status=admission_status,
         start_state=("failed" if start_error is not None else "starting"),
@@ -1688,6 +1844,443 @@ def _inspect_owned_session_start_attempt_status(
             attempt["expected_api_release_identity_sha256"],
         ),
         start_error=start_error,
+        errors=errors,
+    )
+
+
+def _owned_generation_job_ids(
+    queue: _FailedStartCleanupQueue,
+    *,
+    session_id: str,
+    session_generation_id: str,
+) -> list[str]:
+    """Return one bounded, exact generation membership snapshot."""
+    cursor: str | None = None
+    job_ids: list[str] = []
+    expected_total: int | None = None
+    while True:
+        jobs, next_cursor, source_total, _scanned = queue.list_owner_session_jobs_page(
+            session_id,
+            session_generation_id=session_generation_id,
+            cursor=cursor,
+            limit=500,
+            include_terminal=True,
+        )
+        if expected_total is None:
+            expected_total = source_total
+            if expected_total > 1_000:
+                raise RelayError("failed-start cleanup job membership exceeds its safe bound")
+        elif source_total != expected_total:
+            raise RelayError("failed-start cleanup job membership changed while observed")
+        job_ids.extend(job.job_id for job in jobs)
+        if len(job_ids) > 1_000:
+            raise RelayError("failed-start cleanup job membership exceeds its safe bound")
+        if next_cursor is None:
+            break
+        if next_cursor == cursor:
+            raise RelayError("failed-start cleanup job paging made no progress")
+        cursor = next_cursor
+    if len(job_ids) != expected_total:
+        raise RelayError("failed-start cleanup job membership was not read exactly")
+    if job_ids != sorted(set(job_ids)):
+        raise RelayError("failed-start cleanup job membership is not unique and sorted")
+    return job_ids
+
+
+def _inspect_owned_session_failed_cleaned_receipt(
+    *,
+    cluster: str,
+    session_id: str,
+    document: dict[str, object],
+    core_dir: Path,
+    transaction: _OwnedSessionTransaction,
+    proc_root: Path,
+) -> OwnedSessionRecoveryStatus:
+    """Validate a terminal pre-metadata cleanup receipt without inventing API identity."""
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.process_containment import adopt_linux_systemd_scope_identity
+
+    queue = ClioCoreQueue(core_dir)
+    errors: list[str] = []
+    try:
+        attempt = _validated_start_attempt(
+            transaction,
+            cluster=cluster,
+            session_id=session_id,
+        )
+    except RelayError as exc:
+        attempt = None
+        errors.append(str(exc))
+    generation = document.get("session_generation_id")
+    operation_id = document.get("start_operation_id")
+    route_revision = document.get("cluster_route_revision")
+    try:
+        validated_generation = (
+            validate_durable_record_id(generation) if isinstance(generation, str) else None
+        )
+        validated_operation_id = (
+            validate_durable_record_id(operation_id) if isinstance(operation_id, str) else None
+        )
+    except ValueError:
+        validated_generation = None
+        validated_operation_id = None
+
+    try:
+        report = SessionLifecycleReport.model_validate(document.get("report"))
+    except (TypeError, ValueError) as exc:
+        report = None
+        errors.append(f"failed-start cleanup report is invalid: {exc}")
+
+    coordinator_report_ref: OwnedSessionCleanupReportReference | None = None
+    coordinator_report_sha256: str | None = None
+    coordinator_report_bound = False
+    raw_reference = document.get("coordinator_report_ref")
+    if raw_reference is not None:
+        try:
+            coordinator_report_ref = OwnedSessionCleanupReportReference.model_validate(
+                raw_reference
+            )
+            if validated_generation is None or not isinstance(
+                document.get("cleanup_operation_id"), str
+            ):
+                raise RelayError("failed-start cleanup report reference has no durable identity")
+            coordinator_report = _read_coordinator_report_sidecar(
+                transaction,
+                coordinator_report_ref,
+                expected_session_generation_id=validated_generation,
+                expected_cleanup_operation_id=cast(str, document["cleanup_operation_id"]),
+            )
+            if report is None or not _coordinator_report_extends_remote_report(
+                coordinator_report,
+                report,
+            ):
+                raise RelayError("failed-start coordinator report changed the remote report")
+            coordinator_report_sha256 = coordinator_report_ref.sha256
+            coordinator_report_bound = True
+        except (RelayError, TypeError, ValueError) as exc:
+            errors.append(f"failed-start coordinator cleanup report is invalid: {exc}")
+
+    try:
+        targets = (
+            _validate_cleanup_targets(
+                document.get("cleanup_targets"),
+                generation_id=validated_generation,
+            )
+            if validated_generation is not None
+            else []
+        )
+    except RelayError as exc:
+        targets = []
+        errors.append(str(exc))
+    cleanup_paths_pending = document.get("cleanup_paths_pending")
+    targets_verified = bool(targets)
+    if targets and isinstance(cleanup_paths_pending, bool):
+        for target in targets:
+            observed = transaction.stat_regular(target.name, required=False)
+            if cleanup_paths_pending and target.present:
+                if observed is None or (
+                    observed.st_dev,
+                    observed.st_ino,
+                    observed.st_size,
+                ) != (target.device, target.inode, target.size):
+                    targets_verified = False
+                    errors.append(f"failed-start cleanup target changed: {target.name}")
+                    break
+            elif observed is not None:
+                targets_verified = False
+                errors.append(f"failed-start cleanup target remained unexpectedly: {target.name}")
+                break
+    else:
+        targets_verified = False
+
+    phase = attempt.get("start_phase") if attempt is not None else None
+    process_absence_verified = False
+    if attempt is not None and phase in {"scope_bound", "contained"}:
+        try:
+            processes = _recorded_scope_processes(
+                proc_root=proc_root,
+                systemd_unit=cast(str, attempt["systemd_unit"]),
+                systemd_cgroup_path=cast(str, attempt["systemd_cgroup_path"]),
+                systemd_invocation_id=cast(str, attempt["systemd_invocation_id"]),
+                systemd_description=cast(str, attempt["systemd_description"]),
+            )
+            process_absence_verified = not processes
+            if processes:
+                errors.append("failed-start owned scope still contains processes")
+        except RelayError as exc:
+            errors.append(str(exc))
+    elif attempt is not None and phase in {"pending", "admitted"}:
+        try:
+            adopted = adopt_linux_systemd_scope_identity(
+                unit=cast(str, attempt["systemd_unit"]),
+                description=cast(str, attempt["systemd_description"]),
+            )
+            process_absence_verified = adopted is None
+            if adopted is not None:
+                errors.append("failed-start predeclared scope still exists")
+        except RuntimeError as exc:
+            errors.append(f"failed-start scope absence could not be verified: {exc}")
+
+    admission_status: dict[str, object] | None = None
+    durable_generation_verified = False
+    raw_policy = document.get("cleanup_policy")
+    policy = cast(dict[str, object], raw_policy) if isinstance(raw_policy, dict) else None
+    if validated_generation is not None:
+        try:
+            admission_status = queue.owner_session_generation_status(
+                session_id,
+                session_generation_id=validated_generation,
+            )
+            intent = admission_status.get("cleanup_intent")
+            expected_intent = cast(dict[str, object], intent) if isinstance(intent, dict) else None
+            intent_matches = bool(
+                expected_intent is not None
+                and expected_intent.get("operation_id") == document.get("cleanup_operation_id")
+                and {
+                    key: expected_intent.get(key)
+                    for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+                }
+                == policy
+            )
+            exact_closing = bool(
+                admission_status.get("active_generation_id") == validated_generation
+                and admission_status.get("closing_generation_id") == validated_generation
+                and admission_status.get("closing") is True
+                and admission_status.get("closed") is False
+                and intent_matches
+            )
+            exact_closed = bool(
+                admission_status.get("active_generation_id") is None
+                and admission_status.get("closing_generation_id") == validated_generation
+                and admission_status.get("closing") is True
+                and admission_status.get("closed") is True
+                and intent_matches
+            )
+            durable_generation_verified = bool(
+                admission_status.get("owner_session_id") == session_id
+                and admission_status.get("session_generation_id") == validated_generation
+                and (exact_closing or exact_closed)
+            )
+        except (OSError, RelayError, ValueError) as exc:
+            errors.append(f"failed-start admission could not be verified: {exc}")
+    if not durable_generation_verified:
+        errors.append("failed-start cleanup has no exact closing or closed admission")
+
+    owned_job_ids: list[str] = []
+    if validated_generation is not None:
+        try:
+            owned_job_ids = _owned_generation_job_ids(
+                queue,
+                session_id=session_id,
+                session_generation_id=validated_generation,
+            )
+        except (OSError, RelayError, ValueError) as exc:
+            errors.append(f"failed-start owned jobs could not be verified: {exc}")
+
+    expected_keys = {
+        "schema_version",
+        "owner",
+        "cluster",
+        "session_id",
+        "session_generation_id",
+        "start_operation_id",
+        "start_phase",
+        "failure",
+        "remote_api_port",
+        "owner_token_sha256",
+        "api_release_identity_sha256",
+        "cluster_registry_path",
+        "cluster_registry_sha256",
+        "cluster_route_revision",
+        "systemd_unit",
+        "systemd_description",
+        "systemd_cgroup_path",
+        "systemd_invocation_id",
+        "process_absence_verified",
+        "owned_relay_job_ids",
+        "cleanup_operation_id",
+        "cleanup_policy",
+        "cleanup_paths",
+        "cleanup_targets",
+        "cleanup_paths_pending",
+        "cluster_registry_verified",
+        "cluster_registry_removed",
+        "completed_at",
+        "report",
+        "coordinator_report_ref",
+    }
+    registry_target = next(
+        (target for target in targets if target.name.startswith("cluster-registry-")),
+        None,
+    )
+    api_resources = (
+        [resource for resource in report.resources if resource.kind == "remote_relay_api"]
+        if report is not None
+        else []
+    )
+    file_resources = (
+        [resource for resource in report.resources if resource.kind == "remote_session_files"]
+        if report is not None
+        else []
+    )
+    raw_completed_at = document.get("completed_at")
+    try:
+        completed_at = (
+            datetime.fromisoformat(raw_completed_at) if isinstance(raw_completed_at, str) else None
+        )
+    except ValueError:
+        completed_at = None
+    metadata_verified = bool(
+        set(document) == expected_keys
+        and document.get("schema_version") == "clio-relay.owner-session-failed-cleaned-receipt.v1"
+        and document.get("owner") == "clio-relay"
+        and document.get("cluster") == cluster
+        and document.get("session_id") == session_id
+        and validated_generation is not None
+        and validated_operation_id is not None
+        and isinstance(route_revision, str)
+        and bool(route_revision)
+        and attempt is not None
+        and attempt.get("session_generation_id") == validated_generation
+        and attempt.get("start_operation_id") == validated_operation_id
+        and attempt.get("start_phase") == document.get("start_phase")
+        and attempt.get("remote_api_port") == document.get("remote_api_port")
+        and attempt.get("owner_token_sha256") == document.get("owner_token_sha256")
+        and attempt.get("api_release_identity_sha256")
+        == document.get("api_release_identity_sha256")
+        and attempt.get("cluster_registry_path") == document.get("cluster_registry_path")
+        and attempt.get("cluster_registry_sha256") == document.get("cluster_registry_sha256")
+        and attempt.get("cluster_route_revision") == route_revision
+        and attempt.get("systemd_unit") == document.get("systemd_unit")
+        and attempt.get("systemd_description") == document.get("systemd_description")
+        and attempt.get("systemd_cgroup_path") == document.get("systemd_cgroup_path")
+        and attempt.get("systemd_invocation_id") == document.get("systemd_invocation_id")
+        and isinstance(document.get("failure"), str)
+        and bool(document.get("failure"))
+        and len(cast(str, document.get("failure"))) <= _MAX_SESSION_START_ERROR_CHARS
+        and document.get("process_absence_verified") is True
+        and document.get("owned_relay_job_ids") == owned_job_ids
+        and policy is not None
+        and set(policy) == {"stop_worker", "cancel_jobs", "cancel_scheduler_jobs"}
+        and all(isinstance(value, bool) for value in policy.values())
+        and not (
+            cast(dict[str, bool], policy)["cancel_scheduler_jobs"]
+            and not cast(dict[str, bool], policy)["cancel_jobs"]
+        )
+        and document.get("cleanup_paths")
+        == sorted(
+            (
+                "api.log",
+                "api.pid",
+                f"api-startup-{validated_generation}.json",
+                f"cluster-registry-{validated_generation}.json",
+            )
+        )
+        and targets_verified
+        and registry_target is not None
+        and registry_target.present
+        and registry_target.sha256 == document.get("cluster_registry_sha256")
+        and document.get("cluster_registry_verified") is True
+        and isinstance(cleanup_paths_pending, bool)
+        and document.get("cluster_registry_removed") is not cleanup_paths_pending
+        and completed_at is not None
+        and completed_at.tzinfo is not None
+        and report is not None
+        and report.cluster == cluster
+        and report.session_id == session_id
+        and report.session_generation_id == validated_generation
+        and report.mode == "teardown"
+        and report.cleanup_operation_id == document.get("cleanup_operation_id")
+        and report.cleanup_policy == policy
+        and report.relay_cancel_requested is cast(dict[str, bool], policy)["cancel_jobs"]
+        and report.scheduler_cancel_requested
+        is cast(dict[str, bool], policy)["cancel_scheduler_jobs"]
+        and report.prior_session_status is not None
+        and report.prior_session_status.api_pid is None
+        and report.prior_session_status.ownership_verified
+        and report.post_session_status is not None
+        and report.post_session_status.api_pid is None
+        and not report.post_session_status.running
+        and report.post_session_status.ownership_verified
+        and len(api_resources) == 1
+        and api_resources[0].metadata.get("failed_start") is True
+        and api_resources[0].ownership_verified
+        and api_resources[0].verified_after_operation
+        and api_resources[0].outcome in {"stopped", "missing"}
+        and not api_resources[0].residual
+        and len(file_resources) == 1
+        and file_resources[0].metadata.get("target_identities")
+        == [target.model_dump(mode="json") for target in targets]
+        and not report.errors
+        and not report.residual_resources
+        and (raw_reference is None or coordinator_report_bound)
+    )
+    if not metadata_verified:
+        errors.append("failed-start cleanup receipt identity is invalid")
+    recovery_verified = bool(
+        metadata_verified
+        and process_absence_verified
+        and durable_generation_verified
+        and not errors
+    )
+    closed = bool(admission_status is not None and admission_status.get("closed") is True)
+    return OwnedSessionRecoveryStatus(
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=validated_generation,
+        start_operation_id=validated_operation_id,
+        cluster_route_revision=route_revision if isinstance(route_revision, str) else None,
+        owner="clio-relay" if document.get("owner") == "clio-relay" else None,
+        remote_api_port=(
+            cast(int, document.get("remote_api_port"))
+            if isinstance(document.get("remote_api_port"), int)
+            and not isinstance(document.get("remote_api_port"), bool)
+            else None
+        ),
+        leader_process_state="absent" if process_absence_verified else "unverified",
+        process_state=(
+            "already_closed"
+            if recovery_verified and closed
+            else "cleanup_pending"
+            if recovery_verified
+            else "unverified"
+        ),
+        running=False,
+        process_absence_verified=process_absence_verified,
+        generation_process_absence_verified=process_absence_verified,
+        metadata_verified=metadata_verified,
+        cluster_registry_verified=document.get("cluster_registry_verified") is True,
+        durable_generation_verified=durable_generation_verified,
+        cleanup_receipt=True,
+        cleanup_paths_pending=(
+            cleanup_paths_pending if isinstance(cleanup_paths_pending, bool) else None
+        ),
+        coordinator_report=None,
+        coordinator_report_ref=(coordinator_report_ref if coordinator_report_bound else None),
+        coordinator_report_sha256=(coordinator_report_sha256 if coordinator_report_bound else None),
+        coordinator_report_bound=coordinator_report_bound,
+        ownership_verified=recovery_verified,
+        recovery_verified=recovery_verified,
+        api_release_identity_verified=False,
+        ownership_token_present=False,
+        admission_status=admission_status,
+        start_state="failed_cleaned",
+        start_phase=cast(
+            Literal["pending", "admitted", "scope_bound", "contained"] | None,
+            phase,
+        ),
+        start_attempt_verified=attempt is not None,
+        start_retryable=False,
+        start_replace=(cast(bool, attempt["replace"]) if attempt is not None else None),
+        start_require_token=(cast(bool, attempt["require_token"]) if attempt is not None else None),
+        start_expected_api_release_identity_sha256=(
+            cast(str | None, attempt["expected_api_release_identity_sha256"])
+            if attempt is not None
+            else None
+        ),
+        start_error=(
+            cast(str, document.get("failure")) if isinstance(document.get("failure"), str) else None
+        ),
         errors=errors,
     )
 
@@ -1763,6 +2356,41 @@ def inspect_owned_session_recovery_status(
             cluster=cluster,
             session_id=session_id,
             errors=[str(exc)],
+        )
+
+    if document.get("schema_version") == ("clio-relay.owner-session-failed-cleaned-receipt.v1"):
+        if transaction is None:
+            try:
+                with open_owned_session_transaction(
+                    session_id=session_id,
+                    create=False,
+                    timeout_seconds=10.0,
+                    home=selected_home,
+                ) as pinned_transaction:
+                    pinned_document = pinned_transaction.read_json("metadata.json")
+                    if pinned_document is None:  # pragma: no cover - required read
+                        raise RelayError("failed-start cleanup receipt is unavailable")
+                    return _inspect_owned_session_failed_cleaned_receipt(
+                        cluster=cluster,
+                        session_id=session_id,
+                        document=pinned_document,
+                        core_dir=core_dir,
+                        transaction=pinned_transaction,
+                        proc_root=proc_root,
+                    )
+            except RelayError as exc:
+                return OwnedSessionRecoveryStatus(
+                    cluster=cluster,
+                    session_id=session_id,
+                    errors=[str(exc)],
+                )
+        return _inspect_owned_session_failed_cleaned_receipt(
+            cluster=cluster,
+            session_id=session_id,
+            document=document,
+            core_dir=core_dir,
+            transaction=transaction,
+            proc_root=proc_root,
         )
 
     if document.get("schema_version") == "clio-relay.owner-session-cleanup-receipt.v1":
@@ -3081,6 +3709,16 @@ class SessionLifecycleReport(BaseModel):
             prior = self.prior_session_status
             post = self.post_session_status
             linked_pid = None if prior is None or prior.api_pid is None else str(prior.api_pid)
+            failed_start_without_api_pid = bool(
+                prior is not None
+                and prior.api_pid is None
+                and relay_resources
+                and all(
+                    resource.metadata.get("failed_start") is True
+                    and resource.resource_id == "failed-start"
+                    for resource in relay_resources
+                )
+            )
             relay_stopped = (
                 prior is not None
                 and prior.ownership_verified
@@ -3091,7 +3729,7 @@ class SessionLifecycleReport(BaseModel):
                 and all(
                     resource.outcome in {"stopped", "missing"}
                     and resource.ownership_verified
-                    and resource.resource_id == linked_pid
+                    and (resource.resource_id == linked_pid or failed_start_without_api_pid)
                     and resource.verified_after_operation
                     and not resource.residual
                     for resource in relay_resources
@@ -3759,20 +4397,65 @@ def _owned_api_startup_log_detail(
     secret_values: Iterable[str],
 ) -> str:
     """Return one bounded credential-redacted API startup diagnostic."""
+    redaction_values = tuple(
+        sorted(
+            {value for value in secret_values if len(value) >= 4},
+            key=len,
+            reverse=True,
+        )
+    )
     try:
-        payload = transaction.read_bytes(
+        maximum_secret_bytes = max(
+            (len(value.encode("utf-8")) for value in redaction_values),
+            default=0,
+        )
+    except UnicodeEncodeError:
+        return ""
+    # Read enough overlap to include the beginning of every known secret whose
+    # suffix could otherwise land in the retained diagnostic.  If an
+    # unexpectedly enormous environment credential makes that impossible
+    # within the owned-document bound, fail closed instead of returning a log
+    # fragment that may contain an unrecognizable middle of the credential.
+    if maximum_secret_bytes > (_MAX_OWNED_SESSION_DOCUMENT_BYTES - _MAX_SESSION_START_ERROR_CHARS):
+        return ""
+    read_limit = _MAX_SESSION_START_ERROR_CHARS + maximum_secret_bytes
+    try:
+        payload = transaction.read_tail(
             "api.log",
-            maximum_bytes=_MAX_SESSION_START_ERROR_CHARS,
+            maximum_bytes=read_limit,
             required=False,
         )
     except RelayError:
         return ""
     if not payload:
         return ""
+    # A bounded tail can begin in an unknown credential that is not available
+    # through ``secret_values``.  Discard its first partial log line before
+    # decoding; retaining that fragment could expose the credential's suffix
+    # without its identifying assignment or Authorization prefix.  Equality is
+    # treated as truncated deliberately: dropping one complete line for an
+    # exactly-sized log is safer than guessing whether the transaction saw the
+    # whole file.
+    if len(payload) == read_limit:
+        _partial, separator, payload = payload.partition(b"\n")
+        if not separator:
+            return ""
     detail = payload.decode("utf-8", errors="replace").strip()
-    for value in secret_values:
-        if len(value) >= 4:
-            detail = detail.replace(value, "<redacted>")
+    for value in redaction_values:
+        detail = detail.replace(value, "<redacted>")
+    # Redact the complete Authorization value before generic assignments.  A
+    # whitespace-delimited assignment rule would consume only ``Bearer`` and
+    # leave the actual credential visible as its next token.
+    detail = re.sub(
+        r"(?im)(\bauthorization['\"]?\s*:\s*)[^\r\n,;]+",
+        r"\1<redacted>",
+        detail,
+    )
+    sensitive_assignment = re.compile(
+        r"(?i)(\b[a-z0-9_.-]*(?:token|secret|password|credential|api[_-]?key)"
+        r"[a-z0-9_.-]*['\"]?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    )
+    detail = sensitive_assignment.sub(r"\1<redacted>", detail)
     return detail[-_MAX_SESSION_START_ERROR_CHARS:]
 
 
@@ -5011,6 +5694,7 @@ def execute_owned_session_start(
         process: subprocess.Popen[Any] | None = None
         metadata_committed = False
         child_environment: dict[str, str] = {}
+        startup_secret_values: set[str] = set()
         try:
             from clio_relay.process_containment import (
                 broker_child_environment_payload,
@@ -5032,6 +5716,22 @@ def execute_owned_session_start(
             if api_token is not None:
                 child_environment["CLIO_RELAY_API_TOKEN"] = api_token
             environment = dict(os.environ)
+            startup_secret_values.update(
+                value
+                for name, value in {**environment, **child_environment}.items()
+                if value
+                and any(
+                    marker in name.upper()
+                    for marker in (
+                        "TOKEN",
+                        "SECRET",
+                        "PASSWORD",
+                        "CREDENTIAL",
+                        "API_KEY",
+                        "AUTHORIZATION",
+                    )
+                )
+            )
             for name in child_environment:
                 environment.pop(name, None)
             provider_interpreter = Path(sys.executable).absolute()
@@ -5213,7 +5913,7 @@ def execute_owned_session_start(
             if not metadata_committed:
                 startup_detail = _owned_api_startup_log_detail(
                     transaction,
-                    secret_values=child_environment.values(),
+                    secret_values=startup_secret_values,
                 )
                 try:
                     if attempt_identity.get("start_phase") == "contained":
@@ -5345,7 +6045,9 @@ def _delete_cleanup_targets(
             expected_size=target.size,
             expected_sha256=target.sha256,
             maximum_bytes=(
-                _MAX_OWNED_SESSION_DOCUMENT_BYTES
+                MAX_CLUSTER_REGISTRY_BYTES
+                if target.name.startswith("cluster-registry-")
+                else _MAX_OWNED_SESSION_DOCUMENT_BYTES
                 if target.identity_mode == "content_sha256"
                 else None
             ),
@@ -5491,6 +6193,301 @@ def _complete_cleanup_receipt_retry(
     return report
 
 
+def _terminate_failed_start_scope(
+    *,
+    attempt: dict[str, object],
+    proc_root: Path,
+) -> list[int]:
+    """Terminate and prove absence of the exact scope named by a start journal."""
+    from clio_relay.process_containment import adopt_linux_systemd_scope_identity
+
+    phase = attempt.get("start_phase")
+    systemd_unit = cast(str, attempt["systemd_unit"])
+    systemd_description = cast(str, attempt["systemd_description"])
+    if phase in {"scope_bound", "contained"}:
+        cgroup_path = cast(str, attempt["systemd_cgroup_path"])
+        invocation_id = cast(str, attempt["systemd_invocation_id"])
+    else:
+        try:
+            adopted = adopt_linux_systemd_scope_identity(
+                unit=systemd_unit,
+                description=systemd_description,
+            )
+        except RuntimeError as exc:
+            raise RelayError(f"failed-start scope recovery failed: {exc}") from exc
+        if adopted is None:
+            return []
+        cgroup_path = adopted["cgroup_path"]
+        invocation_id = adopted["systemd_invocation_id"]
+    processes = _recorded_scope_processes(
+        proc_root=proc_root,
+        systemd_unit=systemd_unit,
+        systemd_cgroup_path=cgroup_path,
+        systemd_invocation_id=invocation_id,
+        systemd_description=systemd_description,
+    )
+    targeted = [process.pid for process in processes]
+    _terminate_recorded_session_scope(
+        systemd_unit=systemd_unit,
+        systemd_cgroup_path=cgroup_path,
+        systemd_invocation_id=invocation_id,
+        systemd_description=systemd_description,
+    )
+    residual = _recorded_scope_processes(
+        proc_root=proc_root,
+        systemd_unit=systemd_unit,
+        systemd_cgroup_path=cgroup_path,
+        systemd_invocation_id=invocation_id,
+        systemd_description=systemd_description,
+    )
+    if residual:
+        raise RelayError("failed-start owned scope retained processes after termination")
+    return targeted
+
+
+def _execute_owned_failed_start_teardown(
+    *,
+    transaction: _OwnedSessionTransaction,
+    request: OwnedSessionTeardownRequest,
+    queue: _FailedStartCleanupQueue,
+    proc_root: Path,
+) -> SessionLifecycleReport:
+    """Close an admitted start that failed before API metadata was committed."""
+    attempt = _validated_start_attempt(
+        transaction,
+        cluster=request.cluster,
+        session_id=request.session_id,
+    )
+    if attempt is None:
+        raise RelayError("owned session has neither metadata nor a start attempt")
+    generation_id = cast(str, attempt["session_generation_id"])
+    if generation_id != request.expected_session_generation_id:
+        raise RelayError("failed-start generation does not match the teardown request")
+    registry_name = f"cluster-registry-{generation_id}.json"
+    registry_payload = transaction.read_bytes(
+        registry_name,
+        maximum_bytes=MAX_CLUSTER_REGISTRY_BYTES,
+    )
+    if registry_payload is None:  # pragma: no cover - required read
+        raise RelayError("failed-start cluster registry is unavailable")
+    registry_sha256 = hashlib.sha256(registry_payload).hexdigest()
+    if registry_sha256 != attempt.get("cluster_registry_sha256"):
+        raise RelayError("failed-start cluster registry digest changed")
+    try:
+        registry = ClusterRegistry.model_validate_json(registry_payload)
+    except ValueError as exc:
+        raise RelayError(f"failed-start cluster registry is invalid: {exc}") from exc
+    definition = registry.clusters.get(request.cluster)
+    if definition is None or cluster_route_revision(definition) != attempt.get(
+        "cluster_route_revision"
+    ):
+        raise RelayError("failed-start cluster route identity changed")
+
+    admission = queue.owner_session_generation_status(
+        request.session_id,
+        session_generation_id=generation_id,
+    )
+    existing_intent = admission.get("cleanup_intent")
+    expected_policy = {
+        "stop_worker": request.stop_worker,
+        "cancel_jobs": request.cancel_jobs,
+        "cancel_scheduler_jobs": request.cancel_scheduler_jobs,
+    }
+    exact_open = bool(
+        admission.get("active_generation_id") == generation_id
+        and admission.get("closing_generation_id") is None
+        and admission.get("open") is True
+    )
+    exact_closing = bool(
+        admission.get("active_generation_id") == generation_id
+        and admission.get("closing_generation_id") == generation_id
+        and admission.get("closing") is True
+        and isinstance(existing_intent, dict)
+        and cast(dict[str, object], existing_intent).get("operation_id")
+        == request.expected_cleanup_operation_id
+        and {
+            key: cast(dict[str, object], existing_intent).get(key)
+            for key in ("stop_worker", "cancel_jobs", "cancel_scheduler_jobs")
+        }
+        == expected_policy
+    )
+    if not (exact_open or exact_closing):
+        raise RelayError("failed-start generation is not the exact open or closing admission")
+    intent = queue.set_owner_session_closing(
+        request.session_id,
+        session_generation_id=generation_id,
+        operation_id=request.expected_cleanup_operation_id,
+        stop_worker=request.stop_worker,
+        cancel_jobs=request.cancel_jobs,
+        cancel_scheduler_jobs=request.cancel_scheduler_jobs,
+    )
+    if not _cleanup_intent_matches_request(intent, request):
+        raise RelayError("failed-start cleanup intent changed during teardown")
+
+    jobs_before = _owned_generation_job_ids(
+        queue,
+        session_id=request.session_id,
+        session_generation_id=generation_id,
+    )
+    targeted_pids = _terminate_failed_start_scope(attempt=attempt, proc_root=proc_root)
+    jobs_after = _owned_generation_job_ids(
+        queue,
+        session_id=request.session_id,
+        session_generation_id=generation_id,
+    )
+    if jobs_after != jobs_before:
+        raise RelayError("failed-start job membership changed after intake was quiesced")
+
+    resources = [
+        CleanupResource(
+            kind="remote_relay_api",
+            resource_id="failed-start",
+            location=request.cluster,
+            action="stop",
+            ownership_verified=True,
+            outcome="stopped" if targeted_pids else "missing",
+            verified_after_operation=True,
+            observed_state="absent",
+            residual=False,
+            detail="the exact pre-metadata owned scope is absent",
+            metadata={
+                "failed_start": True,
+                "start_operation_id": attempt["start_operation_id"],
+                "targeted_process_pids": targeted_pids,
+            },
+        )
+    ]
+    if request.stop_worker:
+        worker_resource = _stop_owned_worker_service(cluster=request.cluster)
+        resources.append(worker_resource)
+        if worker_resource.residual:
+            raise RelayError(worker_resource.detail or "owned worker service cleanup failed")
+
+    target_names = sorted(
+        (
+            "api.log",
+            "api.pid",
+            f"api-startup-{generation_id}.json",
+            registry_name,
+        )
+    )
+    targets = [
+        _capture_cleanup_target(
+            transaction,
+            name=name,
+            maximum_bytes=(
+                None
+                if name == "api.log"
+                else _MAX_API_STARTUP_RECEIPT_BYTES
+                if name.startswith("api-startup-")
+                else MAX_CLUSTER_REGISTRY_BYTES
+                if name.startswith("cluster-registry-")
+                else _MAX_OWNED_SESSION_DOCUMENT_BYTES
+            ),
+        )
+        for name in target_names
+    ]
+    registry_target = next(target for target in targets if target.name == registry_name)
+    if not registry_target.present or registry_target.sha256 != registry_sha256:
+        raise RelayError("failed-start registry cleanup identity changed")
+    resources.append(
+        CleanupResource(
+            kind="remote_session_files",
+            resource_id=f"{request.session_id}:{generation_id}",
+            location=request.cluster,
+            action="close",
+            ownership_verified=True,
+            outcome="closed",
+            verified_after_operation=True,
+            observed_state="sanitized",
+            residual=False,
+            metadata={
+                "cleanup_paths": target_names,
+                "metadata_sanitized": True,
+                "transition_lock_retained": True,
+                "failed_start": True,
+                "target_identities": [target.model_dump(mode="json") for target in targets],
+            },
+        )
+    )
+    now = datetime.now(UTC)
+    failure = cast(str | None, attempt.get("error")) or (
+        "owned-session start ended before API metadata commit"
+    )
+    report = SessionLifecycleReport(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        session_generation_id=generation_id,
+        mode="teardown",
+        cleanup_operation_id=request.expected_cleanup_operation_id,
+        cleanup_policy=expected_policy,
+        relay_cancel_requested=request.cancel_jobs,
+        scheduler_cancel_requested=request.cancel_scheduler_jobs,
+        prior_session_status=RemoteSessionStateEvidence(
+            api_pid=None,
+            session_generation_id=generation_id,
+            running=bool(targeted_pids),
+            ownership_verified=True,
+            observed_at=now,
+        ),
+        post_session_status=RemoteSessionStateEvidence(
+            api_pid=None,
+            session_generation_id=generation_id,
+            running=False,
+            ownership_verified=True,
+            observed_at=datetime.now(UTC),
+        ),
+        resources=resources,
+    )
+    receipt = {
+        "schema_version": "clio-relay.owner-session-failed-cleaned-receipt.v1",
+        "owner": "clio-relay",
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "session_generation_id": generation_id,
+        "start_operation_id": attempt["start_operation_id"],
+        "start_phase": attempt["start_phase"],
+        "failure": failure[:_MAX_SESSION_START_ERROR_CHARS],
+        "remote_api_port": attempt["remote_api_port"],
+        "owner_token_sha256": attempt["owner_token_sha256"],
+        "api_release_identity_sha256": attempt["api_release_identity_sha256"],
+        "cluster_registry_path": attempt["cluster_registry_path"],
+        "cluster_registry_sha256": attempt["cluster_registry_sha256"],
+        "cluster_route_revision": attempt["cluster_route_revision"],
+        "systemd_unit": attempt["systemd_unit"],
+        "systemd_description": attempt["systemd_description"],
+        "systemd_cgroup_path": attempt["systemd_cgroup_path"],
+        "systemd_invocation_id": attempt["systemd_invocation_id"],
+        "process_absence_verified": True,
+        "owned_relay_job_ids": jobs_after,
+        "cleanup_operation_id": request.expected_cleanup_operation_id,
+        "cleanup_policy": expected_policy,
+        "cleanup_paths": target_names,
+        "cleanup_targets": [target.model_dump(mode="json") for target in targets],
+        "cleanup_paths_pending": True,
+        "cluster_registry_verified": True,
+        "cluster_registry_removed": False,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "report": report.model_dump(mode="json"),
+        "coordinator_report_ref": None,
+    }
+    transaction.atomic_write(
+        "metadata.json",
+        json.dumps(receipt, indent=2).encode("utf-8"),
+    )
+    _delete_cleanup_targets(transaction, targets)
+    for target in targets:
+        if transaction.stat_regular(target.name, required=False) is not None:
+            raise RelayError(f"failed-start cleanup target remained: {target.name}")
+    receipt["cleanup_paths_pending"] = False
+    receipt["cluster_registry_removed"] = True
+    transaction.atomic_write(
+        "metadata.json",
+        json.dumps(receipt, indent=2).encode("utf-8"),
+    )
+    return report
+
+
 def execute_owned_session_teardown(
     request: OwnedSessionTeardownRequest,
     *,
@@ -5523,9 +6520,14 @@ def execute_owned_session_teardown(
         timeout_seconds=10.0,
         home=home,
     ) as transaction:
-        document = transaction.read_json("metadata.json")
-        if document is None:  # pragma: no cover - required read
-            raise RelayError("owned session metadata is unavailable")
+        document = transaction.read_json("metadata.json", required=False)
+        if document is None:
+            return _execute_owned_failed_start_teardown(
+                transaction=transaction,
+                request=request,
+                queue=queue,
+                proc_root=proc_root,
+            )
         original_metadata = transaction.read_bytes(
             "metadata.json",
             maximum_bytes=_MAX_OWNED_SESSION_DOCUMENT_BYTES,
@@ -5698,6 +6700,8 @@ def execute_owned_session_teardown(
                         if name == "api.log"
                         else _MAX_API_STARTUP_RECEIPT_BYTES
                         if name.startswith("api-startup-")
+                        else MAX_CLUSTER_REGISTRY_BYTES
+                        if name.startswith("cluster-registry-")
                         else _MAX_OWNED_SESSION_DOCUMENT_BYTES
                     ),
                 )
@@ -6226,6 +7230,7 @@ def _owned_session_start_result(
         state=state,
         terminal=terminal,
         retryable=retryable,
+        usable=state == "ready",
         transition_accepted=transition_accepted,
         transport_deadline_exceeded=transport_deadline_exceeded,
         running=running,
@@ -6314,7 +7319,7 @@ def _session_start_result_from_status(
             ],
         )
     if status.start_attempt_verified and generation_id is not None:
-        if status.start_state == "failed":
+        if status.start_state in {"failed", "failed_cleaned"}:
             detail = status.start_error or "owned-session start attempt failed"
             return _owned_session_start_result(
                 plan=plan,
@@ -6345,6 +7350,8 @@ def _session_start_result_from_status(
             start_phase=status.start_phase,
             compatibility_lines=[
                 "session_start_state=starting",
+                "session_ready=false",
+                "session_start_handle_only=true",
                 f"session_id={plan.session_id}",
                 f"start_operation_id={plan.start_operation_id}",
                 f"session_generation_id={generation_id}",
@@ -6361,6 +7368,8 @@ def _session_start_result_from_status(
         error=detail[:_MAX_SESSION_START_ERROR_CHARS],
         compatibility_lines=[
             "session_start_state=ambiguous",
+            "session_ready=false",
+            "session_start_handle_only=true",
             f"session_id={plan.session_id}",
             f"start_operation_id={plan.start_operation_id}",
             "session_generation_id=",
@@ -6395,6 +7404,52 @@ def query_remote_session_start(
         status=status,
         transport_deadline_exceeded=transport_deadline_exceeded,
     )
+
+
+def watch_remote_session_start(
+    *,
+    definition: ClusterDefinition,
+    plan: OwnedSessionStartPlan,
+    timeout_seconds: float,
+    poll_seconds: float = 0.5,
+    query: Callable[[], OwnedSessionStartResult] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> OwnedSessionStartResult:
+    """Poll one exact start until ready, terminal failure, or bounded detach.
+
+    A watch timeout does not erase or reinterpret the durable operation.  The
+    returned nonterminal result remains a handle carrying the exact status and
+    retry selectors, is explicitly unusable, and can be watched again later.
+    """
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("start watch timeout_seconds must be finite and positive")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("start watch poll_seconds must be finite and positive")
+    query_once = query or (lambda: query_remote_session_start(definition=definition, plan=plan))
+    deadline = monotonic() + timeout_seconds
+    while True:
+        result = query_once()
+        if result.terminal:
+            return result
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            detail = "start watch detached at its bounded deadline; use status_selector to resume"
+            if result.error:
+                detail = f"{result.error}; {detail}"
+            return result.model_copy(
+                update={
+                    "watch_deadline_exceeded": True,
+                    "error": detail[-_MAX_SESSION_START_ERROR_CHARS:],
+                    "compatibility_lines": [
+                        *result.compatibility_lines,
+                        "session_ready=false",
+                        "session_start_handle_only=true",
+                        "session_start_watch_detached=true",
+                    ],
+                }
+            )
+        sleep(min(poll_seconds, remaining))
 
 
 def start_remote_session_durable(
@@ -6480,6 +7535,7 @@ def start_remote_session_durable(
         state="ready",
         terminal=True,
         retryable=False,
+        usable=True,
         transition_accepted=True,
         running=True,
         ownership_verified=True,

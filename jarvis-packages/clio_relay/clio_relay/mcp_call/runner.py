@@ -1,4 +1,4 @@
-"""Minimal stdio MCP client used by the relay MCP-call JARVIS package."""
+"""Minimal stdio MCP client used by relay endpoint containment and legacy JARVIS adapters."""
 
 from __future__ import annotations
 
@@ -57,6 +57,8 @@ MCP_JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 MCP_JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 MCP_JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
+REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT = "clio-kit-jarvis-user-v3.6"
+MCP_REQUEST_MAX_BYTES = 16 * 1024 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATION_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATIONS = 10_000
 MCP_PACKAGE_PROGRESS_MAX_TOTAL_BYTES = 4 * 1024 * 1024
@@ -163,12 +165,12 @@ _JARVIS_CD_LOCK_BINDING_SCHEMA = "clio-relay.jarvis-cd-lock-binding.v1"
 # prevents either copy from moving independently. The JARVIS package also runs as
 # a standalone repository package, where importing the installed relay bootstrap
 # module is not a valid dependency boundary.
-JARVIS_CD_VERSION = "1.4.8"
+JARVIS_CD_VERSION = "1.6.0"
 JARVIS_CD_WHEEL_URL = (
     "https://github.com/grc-iit/jarvis-cd/releases/download/"
     f"v{JARVIS_CD_VERSION}/jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
 )
-JARVIS_CD_WHEEL_SHA256 = "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
+JARVIS_CD_WHEEL_SHA256 = "c4853138f3263715e806fcd794233d89f4aa58161e3c5fbab59e7f96d24f0e98"
 _CLIO_KIT_RUNTIME_PROJECT_EXCLUDED_NAMES = frozenset(
     {
         ".git",
@@ -862,25 +864,32 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _is_locked_jarvis_execution_query(
+def _is_validated_jarvis_execution_query(
     *,
     operation: str,
     tool: str | None,
     expected_server_artifact_digest: str | None,
+    expected_registered_contract: str | None,
     expected_jarvis_cd_lock_binding: dict[str, str] | None,
     observed_server_artifact_digest: str | None,
     server_artifact: dict[str, Any] | None,
 ) -> bool:
-    """Return whether this call is the artifact-bound built-in JARVIS query."""
+    """Return whether this is an artifact-bound, contract-identified JARVIS query."""
     if (
         operation != "tools/call"
         or tool != "jarvis_get_execution"
-        or expected_jarvis_cd_lock_binding is None
         or expected_server_artifact_digest is None
         or observed_server_artifact_digest != expected_server_artifact_digest
         or server_artifact is None
         or server_artifact.get("verified") is not True
     ):
+        return False
+    if (
+        expected_registered_contract == REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
+        and expected_jarvis_cd_lock_binding is None
+    ):
+        return True
+    if expected_jarvis_cd_lock_binding is None or expected_registered_contract is not None:
         return False
     nested_runtime = server_artifact.get("nested_runtime")
     return (
@@ -1772,6 +1781,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
         params.get("expected_server_artifact_digest"),
         key="expected_server_artifact_digest",
     )
+    expected_registered_contract = _optional_str(params.get("expected_registered_contract"))
     expected_jarvis_cd_lock_binding = _jarvis_cd_lock_expectation(
         params.get("expected_jarvis_cd_lock_binding")
     )
@@ -1828,6 +1838,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             tool=tool,
             arguments=arguments,
             expected_server_artifact_digest=expected_server_artifact_digest,
+            expected_registered_contract=expected_registered_contract,
             expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
             observed_server_artifact_digest=observed_server_artifact_digest,
             server_artifact=server_artifact,
@@ -1876,10 +1887,11 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             )
             structured_result = _structured_result(protocol_result, operation=operation)
             try:
-                if _is_locked_jarvis_execution_query(
+                if _is_validated_jarvis_execution_query(
                     operation=operation,
                     tool=tool,
                     expected_server_artifact_digest=expected_server_artifact_digest,
+                    expected_registered_contract=expected_registered_contract,
                     expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
                     observed_server_artifact_digest=observed_server_artifact_digest,
                     server_artifact=server_artifact,
@@ -1919,6 +1931,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
         server_args=server_args,
         env_from=env_from,
         expected_server_artifact_digest=expected_server_artifact_digest,
+        expected_registered_contract=expected_registered_contract,
         expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
         server_artifact=server_artifact,
         observed_server_artifact_digest=observed_server_artifact_digest,
@@ -1946,11 +1959,12 @@ def _package_progress_bridge_from_invocation(
     tool: str | None,
     arguments: dict[str, Any],
     expected_server_artifact_digest: str | None,
+    expected_registered_contract: str | None,
     expected_jarvis_cd_lock_binding: dict[str, str] | None,
     observed_server_artifact_digest: str,
     server_artifact: dict[str, Any],
 ) -> _McpProgressBridge | None:
-    """Create a private bridge only for an artifact-bound locked JARVIS call."""
+    """Create a private bridge only for a recognized artifact-bound JARVIS call."""
     progress_path = os.environ.get("CLIO_RELAY_PROGRESS_FILE")
     relay_token = os.environ.get("CLIO_RELAY_PROGRESS_TOKEN")
     if progress_path is None and relay_token is None:
@@ -1959,18 +1973,18 @@ def _package_progress_bridge_from_invocation(
         raise ValueError("relay progress sidecar path and token must be configured together")
     if operation != "tools/call" or tool != "jarvis_run":
         return None
-    raw_nested_runtime = server_artifact.get("nested_runtime")
-    nested_runtime = (
-        cast(dict[str, Any], raw_nested_runtime) if isinstance(raw_nested_runtime, dict) else None
+    registered_route = (
+        expected_registered_contract == REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
+        and expected_jarvis_cd_lock_binding is None
+    )
+    built_in_route = (
+        expected_registered_contract is None and expected_jarvis_cd_lock_binding is not None
     )
     if (
         expected_server_artifact_digest is None
-        or expected_jarvis_cd_lock_binding is None
+        or not (registered_route or built_in_route)
         or observed_server_artifact_digest != expected_server_artifact_digest
         or server_artifact.get("verified") is not True
-        or nested_runtime is None
-        or nested_runtime.get("server_name") != "jarvis"
-        or nested_runtime.get("locked_runtime_verified") is not True
     ):
         return None
     pipeline_id = arguments.get("pipeline_id")
@@ -2147,6 +2161,7 @@ def _write_mcp_result(
     server_args: list[str],
     env_from: dict[str, str],
     expected_server_artifact_digest: str | None,
+    expected_registered_contract: str | None,
     expected_jarvis_cd_lock_binding: dict[str, str] | None,
     server_artifact: dict[str, Any] | None,
     observed_server_artifact_digest: str | None,
@@ -2217,6 +2232,8 @@ def _write_mcp_result(
         "finished_at": finished_at,
         "duration_seconds": finished_at - started_at,
     }
+    if expected_registered_contract is not None:
+        result_document["expected_registered_contract"] = expected_registered_contract
     if expected_jarvis_cd_lock_binding is not None:
         result_document["expected_jarvis_cd_lock_binding"] = expected_jarvis_cd_lock_binding
     result_path.write_text(
@@ -5244,3 +5261,56 @@ def _optional_sha256(value: Any, *, key: str) -> str | None:
     ):
         raise ValueError(f"{key} must be a SHA-256 string")
     return normalized
+
+
+def run_mcp_call_request_file(request_path: Path) -> int:
+    """Execute one bounded request document and mirror its captured streams.
+
+    The endpoint worker uses this entry point directly under relay-owned process
+    containment.  The JARVIS package continues to call
+    :func:`run_mcp_call_from_params` for compatibility with already registered
+    repositories.
+    """
+    with request_path.open("rb") as stream:
+        payload = stream.read(MCP_REQUEST_MAX_BYTES + 1)
+    if len(payload) > MCP_REQUEST_MAX_BYTES:
+        raise ValueError(f"MCP request exceeds the {MCP_REQUEST_MAX_BYTES}-byte endpoint limit")
+    decoded = json.loads(payload, object_pairs_hook=_reject_duplicate_json_keys)
+    if not isinstance(decoded, dict):
+        raise ValueError("MCP request document must be an object")
+    return_code = run_mcp_call_from_params(cast(dict[str, Any], decoded))
+    result_path = Path.cwd() / "mcp-result.json"
+    try:
+        result = json.loads(
+            result_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return return_code
+    if not isinstance(result, dict):
+        return return_code
+    typed_result = cast(dict[str, Any], result)
+    stdout = typed_result.get("stdout")
+    stderr = typed_result.get("stderr")
+    if isinstance(stdout, str) and stdout:
+        print(stdout, end="")
+    if isinstance(stderr, str) and stderr:
+        print(stderr, end="", file=sys.stderr)
+    return return_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one endpoint-owned MCP request document from the command line."""
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) != 1:
+        print("usage: python runner.py REQUEST.json", file=sys.stderr)
+        return 2
+    try:
+        return run_mcp_call_request_file(Path(arguments[0]))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"invalid MCP request: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

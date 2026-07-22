@@ -62,10 +62,23 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
+    "clio-kit-jarvis-user-v3.6": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.6.json",
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
     "clio-kit-jarvis-user-v3.5": {
         "server_name": "jarvis",
         "artifact": "jarvis-user-v3.5.json",
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "contract_sha256": "9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d",
         "tool_names": {
             "jarvis_add_step",
             "jarvis_create_pipeline",
@@ -314,7 +327,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.5"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.6"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -470,7 +483,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "type": "object",
     }
     assert "token" not in cast(JSON, authorization["properties"])
-    assert shipped_contracts["clio-kit-jarvis-user-v3.5"]["wire_sha256"] == (
+    assert shipped_contracts["clio-kit-jarvis-user-v3.6"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 
@@ -478,7 +491,13 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     assert "spack_load" not in spack_tools
     locate_output = cast(JSON, spack_tools["spack_locate"]["outputSchema"])
     locate_properties = cast(JSON, locate_output["properties"])
-    assert locate_properties["load_spec"] == {"type": "string"}
+    assert locate_properties["load_spec"] == {
+        "description": (
+            "Exact runtime identity for JARVIS. Copy this value unchanged from "
+            "spack_locate.output.load_spec into one element of jarvis_run.input.spack_specs."
+        ),
+        "type": "string",
+    }
     assert "load_spec" in cast(list[str], locate_output["required"])
     assert "No matches is a successful result" in cast(
         str, spack_tools["spack_find"]["description"]

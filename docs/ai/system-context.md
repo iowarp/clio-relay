@@ -28,6 +28,8 @@ The durable record families are:
 - events
 - cursors
 - artifacts
+- artifact-use edges and reverse indexes
+- per-job transform references
 - progress
 - checkpoints
 - idempotency records
@@ -55,6 +57,14 @@ cleanup. A timeout leaves intake quiesced and the remaining resources explicit.
 
 JARVIS-owned execution is authoritative only when it supplies the exact `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and `jarvis.execution.progress.v1` documents. The relay preserves those documents and projects them into `clio-relay.jarvis-runtime.v1` for job/task metadata, events, artifacts, and provenance. The older `jarvis.runtime.v1`, flexible structured payloads, and stdout scheduler patterns are compatibility evidence only and cannot authorize polling or cancellation or satisfy the 1.0 gate.
 
+Generic remote MCP protocol execution is endpoint-owned. An `mcp_call` runs the
+packaged client and registered stdio server directly under relay process
+containment, not inside an outer JARVIS pipeline and not in a scheduler
+allocation. It still uses durable job, lease, cancellation, timeout, log,
+artifact, and recovery semantics. If an exact registered JARVIS tool creates an
+application execution, the returned handle and all application/scheduler
+semantics remain JARVIS-owned.
+
 ## Progress
 
 JARVIS core owns execution IDs, durable `jarvis.progress.v1` events, and aggregate execution progress. Package-local code owns only application-specific interpretation. Native MCP notifications carry exact execution progress snapshots and remain distinct from MCP transport sequence numbers.
@@ -62,6 +72,36 @@ JARVIS core owns execution IDs, durable `jarvis.progress.v1` events, and aggrega
 `clio_relay.package_progress_adapters` and generic regex progress remain explicitly labeled compatibility paths. They cannot satisfy a 1.0 release claim, even when their provider entry point or parsed output is otherwise valid.
 
 ETA is based on observed iterative progress after warmup. It should include confidence or sample metadata when exposed to clients.
+
+## provenance
+
+`ArtifactUse.provenance` is an additive, bounded explanation of a content-pinned
+dependency. Missing provenance preserves legacy serialization and digests. When
+present, the full object is immutable and copied to every forward/reverse used
+edge; changed evidence is a conflict, not an update.
+
+`TransformRef` is a separate one-per-job activity record. It contains a bounded
+activity/mechanism, fixed non-secret environment identity, replay contract, and
+used evidence. Internal evidence must exactly cover the job's immutable
+dependencies, while authority-only and zero-input activities are valid. Only
+the authenticated exact-generation HTTP/session API records a transform;
+agent-facing MCP has no transform mutation tool. Existing job/status reads may
+return the nullable record.
+
+## remote MCP inputs
+
+Transparent local-file staging is enabled only for an immutable registered
+`clio-kit-jarvis-user-v3.6` route and a package setting whose description carries
+the exact closed `jarvis.configuration-input-binding.v1` local-regular-file
+declaration. A successful package description on the same connection precedes
+add-step configuration; both description and add-step use their bounded
+same-call terminal observation when staging/lineage is needed. Relay snapshots
+only a stable regular file under
+`CLIO_RELAY_INPUT_WORKSPACE_ROOT`, applies the configured per-file, aggregate,
+and count bounds, ingests through the authenticated owner-generation API,
+rewrites the package argument, and records schema-argument provenance. Pipeline
+lineage is durable and bound to route, server artifact, pipeline, and session
+generation. Other schemas and path-looking arguments are pass-through.
 
 ## Transports
 
@@ -77,6 +117,14 @@ Transport failure must not corrupt queue state. Direct transport and NAT punchin
 ## Sessions
 
 Remote sessions are owned by a session id. Session metadata and PID files live under `$HOME/.local/share/clio-relay/sessions/<session-id>`.
+
+Session start is a durable transition with persistable status/retry selectors.
+Only `ready` is usable. `starting` and `ambiguous` remain nonterminal handles;
+bounded status/watch deadlines detach observation and do not fail, replace, or
+cancel the transition. A generation id on a non-ready result is lifecycle-only
+and must not authorize attach or submission. Compatibility text marks these
+results handle-only and exits nonzero. Pre-metadata failure teardown produces a
+verified `failed_cleaned` receipt and preserves jobs by default.
 
 The desktop shutdown choices are separate:
 
@@ -97,6 +145,13 @@ during a cancel race permits safe closure but must not be reported as canceled.
 An owner-session gateway without the exact active generation is ambiguous: detach
 or teardown reports it as a residual resource and does not use the session id alone
 to authorize connector or gateway cleanup.
+
+The persistent endpoint user service is independent of desktop session lifetime.
+With user lingering and its restart policy it recovers after process exits and
+survives logout; an explicit systemd stop remains intentional and is not treated
+as a crash. The status probe is read-only and reports ready, recovering,
+intentional-stop, failed, inactive-unexpected, not-installed, or degraded
+evidence.
 
 A JARVIS-owned live service uses a connector-only gateway. The user MCP operation
 `relay_bind_jarvis_runtime` resolves one ready authenticated

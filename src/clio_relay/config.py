@@ -24,6 +24,11 @@ from clio_relay.storage_policy import (
 )
 
 _DEFAULT_STORAGE_LIMITS = StorageLimits()
+DEFAULT_INPUT_FILE_MAX_BYTES = 1 * 1024 * 1024
+DEFAULT_INPUT_TOTAL_MAX_BYTES = 4 * 1024 * 1024
+DEFAULT_INPUT_FILE_MAX_COUNT = 16
+MAX_INPUT_FILE_MAX_BYTES = 64 * 1024 * 1024
+MAX_INPUT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
 
 
 class RelaySettings(BaseModel):
@@ -112,6 +117,18 @@ class RelaySettings(BaseModel):
     agent_bin: str = "agent"
     agent_adapter: str = "exec"
     agent_args: list[str] = Field(default_factory=list)
+    input_workspace_root: Path | None = None
+    input_file_max_bytes: int = Field(
+        default=DEFAULT_INPUT_FILE_MAX_BYTES,
+        ge=1,
+        le=MAX_INPUT_FILE_MAX_BYTES,
+    )
+    input_total_max_bytes: int = Field(
+        default=DEFAULT_INPUT_TOTAL_MAX_BYTES,
+        ge=1,
+        le=MAX_INPUT_TOTAL_MAX_BYTES,
+    )
+    input_file_max_count: int = Field(default=DEFAULT_INPUT_FILE_MAX_COUNT, ge=1, le=1_000)
 
     @model_validator(mode="after")
     def validate_owner_session_identity(self) -> Self:
@@ -159,6 +176,13 @@ class RelaySettings(BaseModel):
             raise ValueError("default spool reservation exceeds storage spool high-water limit")
         if default_total > self.storage_total_high_water_bytes:
             raise ValueError("default storage reservation exceeds storage total high-water limit")
+        return self
+
+    @model_validator(mode="after")
+    def validate_input_staging_policy(self) -> Self:
+        """Require coherent bounds for transparent local input staging."""
+        if self.input_total_max_bytes < self.input_file_max_bytes:
+            raise ValueError("input_total_max_bytes must be at least input_file_max_bytes")
         return self
 
     def storage_limits(self) -> StorageLimits:
@@ -263,6 +287,19 @@ class RelaySettings(BaseModel):
             ),
             agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "exec"),
             agent_args=_split_args(os.getenv("CLIO_RELAY_AGENT_ARGS")),
+            input_workspace_root=_optional_path_env("CLIO_RELAY_INPUT_WORKSPACE_ROOT"),
+            input_file_max_bytes=_positive_int_env(
+                "CLIO_RELAY_INPUT_FILE_MAX_BYTES",
+                DEFAULT_INPUT_FILE_MAX_BYTES,
+            ),
+            input_total_max_bytes=_positive_int_env(
+                "CLIO_RELAY_INPUT_TOTAL_MAX_BYTES",
+                DEFAULT_INPUT_TOTAL_MAX_BYTES,
+            ),
+            input_file_max_count=_positive_int_env(
+                "CLIO_RELAY_INPUT_FILE_MAX_COUNT",
+                DEFAULT_INPUT_FILE_MAX_COUNT,
+            ),
         )
 
 
@@ -324,6 +361,14 @@ def _split_args(value: str | None) -> list[str]:
     if value is None or value.strip() == "":
         return []
     return shlex.split(value)
+
+
+def _optional_path_env(name: str) -> Path | None:
+    """Return one configured absolute path without requiring it to exist yet."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return Path(value).expanduser().resolve()
 
 
 def _positive_int_env(name: str, default: int) -> int:

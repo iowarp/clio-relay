@@ -19,7 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, cast
 
-from pytest import MonkeyPatch, mark, raises
+from pytest import CaptureFixture, MonkeyPatch, mark, raises
 
 from clio_relay.bootstrap import (
     JARVIS_CD_VERSION,
@@ -2758,6 +2758,7 @@ def test_mcp_call_runner_does_not_unlock_progress_for_unverified_server(
         tool="jarvis_run",
         arguments={"pipeline_id": "pipeline-a"},
         expected_server_artifact_digest="a" * 64,
+        expected_registered_contract=None,
         expected_jarvis_cd_lock_binding=_jarvis_cd_lock_expectation(),
         observed_server_artifact_digest="a" * 64,
         server_artifact={
@@ -2772,11 +2773,11 @@ def test_mcp_call_runner_does_not_unlock_progress_for_unverified_server(
     assert bridge is None
 
 
-def test_registered_jarvis_run_does_not_enable_builtin_progress_bridge(
+def test_registered_jarvis_run_enables_artifact_bound_progress_bridge(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """Keep built-in package progress semantics out of operator JARVIS servers."""
+    """The explicit v3.6 JARVIS contract receives the same progress bridge."""
     runner = _load_runner()
     monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", str(tmp_path / "progress.jsonl"))
     monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "outer")
@@ -2786,6 +2787,31 @@ def test_registered_jarvis_run_does_not_enable_builtin_progress_bridge(
         tool="jarvis_run",
         arguments={"pipeline_id": "operator-pipeline"},
         expected_server_artifact_digest="a" * 64,
+        expected_registered_contract="clio-kit-jarvis-user-v3.6",
+        expected_jarvis_cd_lock_binding=None,
+        observed_server_artifact_digest="a" * 64,
+        server_artifact=_verified_jarvis_server_artifact(),
+    )
+
+    assert bridge is not None
+    assert bridge.expected_pipeline_id == "operator-pipeline"
+
+
+def test_unknown_registered_contract_does_not_enable_jarvis_progress_bridge(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A generic pinned MCP server cannot self-select JARVIS progress semantics."""
+    runner = _load_runner()
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_FILE", str(tmp_path / "progress.jsonl"))
+    monkeypatch.setenv("CLIO_RELAY_PROGRESS_TOKEN", "outer")
+
+    bridge = cast(Any, runner)._package_progress_bridge_from_invocation(
+        operation="tools/call",
+        tool="jarvis_run",
+        arguments={"pipeline_id": "operator-pipeline"},
+        expected_server_artifact_digest="a" * 64,
+        expected_registered_contract="operator-contract-v1",
         expected_jarvis_cd_lock_binding=None,
         observed_server_artifact_digest="a" * 64,
         server_artifact=_verified_jarvis_server_artifact(),
@@ -3244,6 +3270,105 @@ def test_registered_jarvis_execution_query_keeps_operator_result_schema(
         "status": "ready",
     }
     assert result["result_validation"] is None
+
+
+def test_registered_v36_jarvis_execution_query_persists_contract_validation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The exact registered contract receives the same durable query attestation."""
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    server = _write_structured_tools_call_server(
+        tmp_path,
+        _jarvis_execution_query_result(include_progress=True, include_artifacts=False),
+    )
+    artifact = _verified_jarvis_server_artifact(executable_path=sys.executable)
+
+    def server_artifact_identity(
+        _server: str,
+        _server_args: list[str],
+        *,
+        verify_relay_jarvis_cd_lock: bool = False,
+    ) -> dict[str, Any]:
+        assert verify_relay_jarvis_cd_lock is False
+        return artifact
+
+    monkeypatch.setattr(runner, "_server_artifact_identity", server_artifact_identity)
+
+    def server_artifact_digest(_artifact: dict[str, Any]) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(runner, "_server_artifact_digest", server_artifact_digest)
+
+    returncode = cast(Any, runner).run_mcp_call_from_params(
+        {
+            "server": sys.executable,
+            "server_args": [str(server)],
+            "operation": "tools/call",
+            "tool": "jarvis_get_execution",
+            "arguments": {
+                "pipeline_id": "pipeline-a",
+                "execution_id": "native-execution",
+            },
+            "expected_server_artifact_digest": "a" * 64,
+            "expected_registered_contract": "clio-kit-jarvis-user-v3.6",
+        }
+    )
+
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+    assert returncode == 0
+    assert result["expected_registered_contract"] == "clio-kit-jarvis-user-v3.6"
+    assert result["result_validation"] == {
+        "schema_version": "clio-relay.jarvis-execution-query-validation.v1",
+        "pipeline_id": "pipeline-a",
+        "execution_id": "native-execution",
+        "include_progress": True,
+        "progress_included": True,
+        "include_service_runtimes": False,
+        "service_runtimes_included": False,
+        "service_runtime_count": 0,
+        "artifacts_requested": False,
+        "artifact_filters": {},
+        "returned_artifact_count": 0,
+        "next_cursor_present": False,
+    }
+
+
+def test_endpoint_request_entrypoint_runs_params_and_mirrors_captured_streams(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    """The endpoint command wrapper preserves the existing durable runner result."""
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    request_path = tmp_path / "mcp-request.json"
+    request = {
+        "server": "science-mcp",
+        "server_args": ["--stdio"],
+        "operation": "tools/call",
+        "tool": "inspect",
+        "arguments": {"dataset": "sample"},
+    }
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    observed: list[dict[str, Any]] = []
+
+    def run(params: dict[str, Any]) -> int:
+        observed.append(params)
+        (tmp_path / "mcp-result.json").write_text(
+            json.dumps({"stdout": "server output\n", "stderr": "server warning\n"}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(runner, "run_mcp_call_from_params", run)
+
+    assert cast(Any, runner).main([str(request_path)]) == 0
+    assert observed == [request]
+    captured = capsys.readouterr()
+    assert captured.out == "server output\n"
+    assert captured.err == "server warning\n"
 
 
 def test_mcp_call_runner_accepts_explicit_execution_query_opt_outs() -> None:

@@ -12,13 +12,34 @@ call follows the normal relay path:
 2. The relay removes the local-only `cluster` selector.
 3. The relay submits a durable `mcp_call` job with the registered command,
    arguments, remote tool name, and untouched remote tool arguments.
-4. A worker launches the server in the cluster environment through JARVIS-CD.
+4. The persistent endpoint worker launches the MCP server directly in
+   relay-owned process containment.
 5. The worker records stdout, stderr, the MCP result, execution provenance, and
    terminal state.
 
 The low-level `relay_submit_mcp_call` admin tool remains available as an escape
 hatch. Registration is the safer agent-facing path because commands, schemas,
 profiles, and tools are operator-controlled.
+
+## keep transport execution separate from application execution
+
+Relay does not create an outer JARVIS pipeline, request a scheduler allocation,
+or consume a compute node merely to carry a generic `tools/list` or
+`tools/call`. The endpoint writes one bounded `mcp-request.json`, starts the
+packaged stdio client and registered server under relay-owned process
+containment, and applies the relay job's lease, timeout, cancellation, log,
+artifact, and recovery rules directly. Any domain side effect requested by the
+remote tool still belongs to that server's contract. Relay provenance identifies
+the transport provider as `clio-relay-endpoint-mcp` and records
+`outer_jarvis_pipeline=false`.
+
+JARVIS remains authoritative when the remote tool itself creates or queries a
+JARVIS execution. In that case the outer MCP transport is still endpoint-owned,
+while `jarvis_run` returns JARVIS's durable handle and JARVIS owns package,
+scheduler, progress, and output semantics. An arbitrary server or similarly
+named tool cannot acquire those semantics. Relay enables its specialized JARVIS
+validation, recovery, and input behavior only for an immutable registered
+server whose discovered surface matches the exact declared JARVIS contract.
 
 ## Register a server
 
@@ -233,6 +254,64 @@ operator acceptance evidence for the actual cluster-side execution. The raw
 `mcp_result` remains model-private; its public artifact binding and SHA-256 prove
 which immutable evidence backs the `relay_wait` projection.
 
+## stage declared local package inputs
+
+Registered JARVIS contract v3.6 can move a small caller-local file without
+adding an upload tool to the agent surface. Configure the desktop MCP process
+with a workspace it is allowed to read:
+
+```powershell
+$env:CLIO_RELAY_INPUT_WORKSPACE_ROOT = "$PWD\science-workspace"
+$env:CLIO_RELAY_INPUT_FILE_MAX_BYTES = "1048576"
+$env:CLIO_RELAY_INPUT_TOTAL_MAX_BYTES = "4194304"
+$env:CLIO_RELAY_INPUT_FILE_MAX_COUNT = "16"
+```
+
+The values shown are the defaults: 1 MiB per file, 4 MiB across one
+`jarvis_add_step` call, and 16 files. Operators may choose different positive
+bounds; the file-count setting is capped at 1,000 and the aggregate byte bound
+must be at least the per-file bound. Relative paths are resolved under the
+workspace. Absolute paths are accepted only when the verified file remains
+inside it.
+
+Staging is schema-driven, not filename-driven. It is enabled only when all of
+these statements are true:
+
+- the registration declares exactly `contract: clio-kit-jarvis-user-v3.6` and
+  its immutable server artifact and discovered schemas match that contract;
+- the same MCP connection first completes
+  `jarvis_describe(target="package", package_name=...,
+  wait_for_terminal=true)` on the same route;
+- the selected package setting contains exactly
+  `jarvis.configuration-input-binding.v1` with `kind="local_file"` and
+  `structure="regular_file"`;
+- the caller uses an active relay-owned session generation and supplies one
+  canonical setting name or declared alias.
+
+On `jarvis_add_step`, relay snapshots only the declared, owner-readable regular
+file under the configured workspace, enforcing stable identity and the count
+and byte bounds before any remote mutation. It hashes the bytes, ingests them
+through the authenticated owned-session API, verifies the returned durable
+input job and content-addressed artifact, and replaces the local argument with
+the cluster-local artifact path. Set `wait_for_terminal=true` on this bounded
+configuration call as well so relay can verify success before committing the
+pipeline lineage. The resulting job dependency has
+`clio-relay.artifact-use-provenance.v1` evidence `schema-arg` naming the exact
+package setting.
+
+After the add-step call succeeds, relay records the input lineage against the
+exact cluster route revision, MCP registration revision, immutable server
+artifact, pipeline id, and owner-session generation. A later `jarvis_run`
+inherits those content pins even after the desktop MCP process reconnects. A
+changed route, registration, artifact, pipeline, session generation, checksum,
+or provenance fails closed rather than reusing stale bytes.
+
+Settings without the exact declaration are passed through unchanged; a
+path-looking name is never sufficient authority to read a local file. Legacy or
+other remote MCP contracts also remain pass-through and cannot opt into staging.
+Large collections should use a separately managed data-staging service or
+shared storage rather than raising these control-plane limits without review.
+
 ## Keep the compact JARVIS surface
 
 The compact built-in JARVIS aliases remain compatible:
@@ -276,8 +355,8 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.5.23 artifact carries jarvis-mcp 3.5.4 and the pinned
-six-tool JARVIS v3.5 contract.
+The released clio-kit 2.6.2 artifact carries the pinned six-tool JARVIS v3.6
+contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
 `uv tool install`, and persists the wheel plus the direct JARVIS command in the
@@ -296,21 +375,23 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
-The release gate requires that exact 2.5.23 artifact to be rerun on every target
+The release gate requires that exact 2.6.2 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel is
-`clio_kit-2.5.23-py3-none-any.whl` with SHA-256
-`a2fb747fb2cdf4fdfcfd7c1056bcee8a84b3ea7a06c63e5b2a12defb11ad2de5`.
-Its canonical contract is `clio-kit-jarvis-user-v3.5`, with contract SHA-256
-`9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d`
+`clio_kit-2.6.2-py3-none-any.whl` with SHA-256
+`96ce0f85bacad637b715704565be0c57df9d1891193c1c00c3c85dc2904725a4`.
+Its canonical contract is `clio-kit-jarvis-user-v3.6`, with contract SHA-256
+`055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d`
 and canonical tools-wire SHA-256
-`05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366`.
+`c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023`.
+The bundled contract artifact SHA-256 is
+`6e839f3ac975f247053ef4b6a048c53686882c2ab6a1b103f91dfc744ed29ed5`.
 The nested runtime lock is bound to the public
-[`jarvis_cd-1.4.8-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.4.8/jarvis_cd-1.4.8-py3-none-any.whl)
+[`jarvis_cd-1.6.0-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.6.0/jarvis_cd-1.6.0-py3-none-any.whl)
 release artifact with SHA-256
-`ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935`;
+`c4853138f3263715e806fcd794233d89f4aa58161e3c5fbab59e7f96d24f0e98`;
 bootstrap and call-time validation reject any other URL, version, or bytes.
 
 ## Register the Spack MCP
@@ -325,10 +406,16 @@ The semantic check is enabled explicitly with the current
 operator-defined and do not select behavior. Existing
 `clio-kit-spack-user-v2` registrations remain supported and are verified
 against their distinct preserved contract digest.
+The current v2.1 contract SHA-256 is
+`f1a62d96179012975f763402446571146e04e519f98df30583f9800f233216fc`,
+its canonical tools-wire SHA-256 is
+`e06bfa71153e19ea44f03ed55f03873bc643f42b4b25b96788c02892df719da8`,
+and its bundled artifact SHA-256 is
+`24f6e2b340ef5e2649241c10d7c2260b8d8cbbaa4e10f1a389c9249c2e7e6171`.
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.5.23 also ships the two-tool
+clio-kit 2.6.2 also ships the two-tool
 `clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns the complete catalog record

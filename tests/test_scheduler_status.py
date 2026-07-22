@@ -2136,6 +2136,294 @@ def test_slurm_execution_adapter_uses_bounded_secure_sidecar_append(
     compile(source, "<jarvis-slurm-secure-sidecar>", "exec")
 
 
+def _directory_link(link: Path, target: Path) -> None:
+    """Create a test directory link without requiring Windows symlink privilege."""
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    completed = subprocess.run(
+        [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target.resolve(strict=True)),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if completed.returncode != 0:
+        raise OSError(
+            "could not create Windows test directory junction: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+
+
+def _managed_relay_repository(home: Path) -> tuple[Path, Path]:
+    """Create the exact stable-to-generation binding produced by bootstrap."""
+    fingerprint = "a" * 64
+    generation = home / ".local/share/clio-relay/generations" / fingerprint
+    registered_repository = generation / "source/jarvis-packages/clio_relay"
+    registered_package = registered_repository / "clio_relay"
+    registered_mcp_call = registered_package / "mcp_call"
+    registered_mcp_call.mkdir(parents=True)
+    (registered_package / "__init__.py").write_text("", encoding="utf-8")
+    (registered_mcp_call / "__init__.py").write_text("", encoding="utf-8")
+    (registered_mcp_call / "runner.py").write_text(
+        "IDENTITY = 'registered-package'\n",
+        encoding="utf-8",
+    )
+    share = home / ".local/share/clio-relay"
+    _directory_link(share / "current", generation)
+    managed = share / "clio_relay"
+    _directory_link(
+        managed,
+        share / "current/source/jarvis-packages/clio_relay",
+    )
+    return managed, registered_package
+
+
+def _relay_repository_binding_source(tmp_path: Path) -> str:
+    source = scheduled_jarvis_command(
+        "slurm",
+        python_bin=sys.executable,
+        pipeline_path=tmp_path / "pipeline.yaml",
+    )[4]
+    start_marker = "# BEGIN REGISTERED RELAY PACKAGE REPOSITORY BINDING"
+    end_marker = "# END REGISTERED RELAY PACKAGE REPOSITORY BINDING"
+    binding_start = source.index(start_marker)
+    binding_end = source.index(end_marker) + len(end_marker)
+    binding = source[binding_start:binding_end]
+    if os.name == "nt":
+        # Bootstrap uses a symbolic link in production, and this assertion
+        # locks that guard in the generated source. Windows CI may not have
+        # symbolic-link privilege, so the fixture supplies a directory
+        # junction and substitutes only its link-type predicate. The exact
+        # resolve, active-generation, shape, and stability checks still run.
+        symbolic_link_guard = "if not stat.S_ISLNK(registered_link_before.st_mode):"
+        if binding.count(symbolic_link_guard) != 1:
+            raise AssertionError("production symbolic-link guard changed")
+        binding = binding.replace(
+            symbolic_link_guard,
+            (
+                "if not (stat.S_ISLNK(registered_link_before.st_mode) "
+                "or stat.S_ISDIR(registered_link_before.st_mode)):"
+            ),
+        )
+    # The extracted boundary normally executes inside the complete wrapper,
+    # whose prelude has already imported these standard-library names. Keep
+    # the focused subprocess probe faithful to those production globals.
+    return "import os\nimport stat\nfrom pathlib import Path\n" + binding
+
+
+def test_wrapper_resolves_only_bootstrap_managed_relay_repository_after_core_import(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Bind the exact managed generation and preserve unrelated JARVIS repositories."""
+    # A factory-owned short base keeps the exact 64-character generation
+    # fingerprint below legacy Windows MAX_PATH while retaining pytest cleanup.
+    tmp_path = tmp_path_factory.mktemp("jrw")
+    installed_root = tmp_path / "installed"
+    installed_package = installed_root / "clio_relay"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+    (installed_package / "process_containment.py").write_text(
+        "IDENTITY = 'trusted-core'\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    managed_repository, registered_package = _managed_relay_repository(home)
+    registered_mcp_call = registered_package / "mcp_call"
+    same_basename_operator_repository = tmp_path / "operator/clio_relay"
+    same_basename_operator_repository.mkdir(parents=True)
+    unrelated_repository = tmp_path / "operator/science_packages"
+    unrelated_repository.mkdir(parents=True)
+    repositories = [
+        str(same_basename_operator_repository),
+        str(managed_repository),
+        str(unrelated_repository),
+    ]
+
+    jarvis_root = tmp_path / "jarvis"
+    jarvis_core = jarvis_root / "jarvis_cd" / "core"
+    jarvis_core.mkdir(parents=True)
+    (jarvis_root / "jarvis_cd" / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "config.py").write_text(
+        "class _Jarvis:\n"
+        f"    repos = {{'repos': {repositories!r}}}\n"
+        "class Jarvis:\n"
+        "    @classmethod\n"
+        "    def get_instance(cls):\n"
+        "        return _Jarvis()\n",
+        encoding="utf-8",
+    )
+
+    probe = (
+        "import json,sys\n"
+        "sys.path[:0] = [sys.argv[1], sys.argv[2]]\n"
+        "import clio_relay\n"
+        "import clio_relay.process_containment as containment\n"
+        "exec(sys.argv[3], globals(), globals())\n"
+        "import clio_relay.mcp_call.runner as runner\n"
+        "print(json.dumps({\n"
+        "    'containment': containment.__file__,\n"
+        "    'namespace_paths': list(clio_relay.__path__),\n"
+        "    'runner': runner.__file__,\n"
+        "    'identity': runner.IDENTITY,\n"
+        "    'repositories': registered_repositories,\n"
+        "}))\n"
+    )
+    environment = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            probe,
+            str(installed_root),
+            str(jarvis_root),
+            _relay_repository_binding_source(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=environment,
+    )
+    observed = loads(completed.stdout)
+
+    assert observed["containment"] == str(installed_package / "process_containment.py")
+    assert observed["namespace_paths"] == [
+        str(registered_package.resolve()),
+        str(installed_package),
+    ]
+    assert observed["runner"] == str(registered_mcp_call / "runner.py")
+    assert observed["identity"] == "registered-package"
+    assert observed["repositories"] == repositories
+
+
+def test_wrapper_rejects_basename_only_relay_repository(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """An operator repository named clio_relay is not relay bootstrap authority."""
+    tmp_path = tmp_path_factory.mktemp("jrb")
+    installed_root = tmp_path / "installed"
+    installed_package = installed_root / "clio_relay"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    operator_repository = tmp_path / "operator/clio_relay"
+    operator_repository.mkdir(parents=True)
+
+    jarvis_root = tmp_path / "jarvis"
+    jarvis_core = jarvis_root / "jarvis_cd" / "core"
+    jarvis_core.mkdir(parents=True)
+    (jarvis_root / "jarvis_cd" / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "config.py").write_text(
+        "class _Jarvis:\n"
+        f"    repos = {{'repos': [{str(operator_repository)!r}]}}\n"
+        "class Jarvis:\n"
+        "    @classmethod\n"
+        "    def get_instance(cls):\n"
+        "        return _Jarvis()\n",
+        encoding="utf-8",
+    )
+
+    probe = (
+        "import sys\n"
+        "sys.path[:0] = [sys.argv[1], sys.argv[2]]\n"
+        "import clio_relay\n"
+        "exec(sys.argv[3], globals(), globals())\n"
+    )
+    environment = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            probe,
+            str(installed_root),
+            str(jarvis_root),
+            _relay_repository_binding_source(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=environment,
+    )
+
+    assert completed.returncode != 0
+    assert "exactly one exact bootstrap-managed clio_relay repository" in completed.stderr
+
+
+def test_wrapper_rejects_ambiguous_managed_relay_repository_entries(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Duplicate or aliased stable entries cannot select package authority."""
+    tmp_path = tmp_path_factory.mktemp("jra")
+    installed_root = tmp_path / "installed"
+    installed_package = installed_root / "clio_relay"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    managed_repository, _registered_package = _managed_relay_repository(home)
+
+    jarvis_root = tmp_path / "jarvis"
+    jarvis_core = jarvis_root / "jarvis_cd" / "core"
+    jarvis_core.mkdir(parents=True)
+    (jarvis_root / "jarvis_cd" / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "__init__.py").write_text("", encoding="utf-8")
+    (jarvis_core / "config.py").write_text(
+        "class _Jarvis:\n"
+        f"    repos = {{'repos': [{str(managed_repository)!r}, "
+        f"{str(managed_repository.parent / '.' / managed_repository.name)!r}]}}\n"
+        "class Jarvis:\n"
+        "    @classmethod\n"
+        "    def get_instance(cls):\n"
+        "        return _Jarvis()\n",
+        encoding="utf-8",
+    )
+    probe = (
+        "import sys\n"
+        "sys.path[:0] = [sys.argv[1], sys.argv[2]]\n"
+        "import clio_relay\n"
+        "exec(sys.argv[3], globals(), globals())\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            probe,
+            str(installed_root),
+            str(jarvis_root),
+            _relay_repository_binding_source(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
+    )
+
+    assert completed.returncode != 0
+    assert "exactly one exact bootstrap-managed clio_relay repository" in completed.stderr
+
+
 def test_jarvis_gate_failure_reads_no_credentials_and_imports_no_package(
     monkeypatch: MonkeyPatch,
 ) -> None:

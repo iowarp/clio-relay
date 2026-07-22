@@ -39,13 +39,22 @@ from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictEr
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.identifiers import filesystem_key, validate_durable_record_id
 from clio_relay.models import (
+    INPUT_INGEST_POLICY_METADATA_KEY,
     TERMINAL_STATES,
     ArtifactRef,
+    ArtifactUse,
+    ArtifactUseProvenance,
     ArtifactUserOrderHead,
     Cursor,
     EndpointRegistration,
     GatewaySession,
     GatewaySessionState,
+    InputArtifactIngestPolicy,
+    InputArtifactSpec,
+    JarvisPackageInputContractRecord,
+    JarvisPackageInputRoute,
+    JarvisPipelineInputLineage,
+    JarvisPipelineInputRoute,
     JobGcPhase,
     JobKind,
     JobState,
@@ -67,7 +76,10 @@ from clio_relay.models import (
     TaskTimelineEvent,
     TerminalJobGcPlan,
     TerminalJobGcResult,
+    TransformRef,
     UsedArtifactRef,
+    artifact_use_payload,
+    deterministic_input_artifact_id,
     is_owned_jarvis_run_spec,
     prepare_owned_jarvis_run_submission,
     utc_now,
@@ -88,6 +100,11 @@ from clio_relay.worker_lifetime_lock import (
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = tuple[int, str, JobKind, str, str, str, str]
 _UNSET = object()
+INPUT_INGEST_ATTEMPT_METADATA_KEY = "input_ingest_attempt"
+INPUT_INGEST_ATTEMPT_SCHEMA = "clio-relay.input-ingest-attempt.v1"
+INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY = "input_ingest_original_policy"
+DEFAULT_INPUT_INGEST_ABANDONED_AFTER_SECONDS = 300
+MAX_INPUT_INGEST_RECOVERY_BATCH = 256
 # Queue mutations can legitimately serialize behind several durable writes on
 # slower filesystems (notably Windows endpoint storage).  Keep the wait bounded,
 # but allow enough time for a healthy owner to finish its critical section.
@@ -115,6 +132,8 @@ MAX_BOUNDED_SCAN_RECORDS = 10_000
 MAX_GATEWAY_INDEX_RECORDS = 10_000
 MAX_SCHEDULER_METADATA_RECORDS = 1_000
 MAX_TRANSITION_INTENT_RECORDS = 10_000
+MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS = 10_000
+MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS = 10_000
 MAX_ARTIFACT_USES_PER_JOB = 1_000
 MAX_ARTIFACT_CONSUMERS = 10_000
 ARTIFACT_USER_CURSOR_PREFIX = "edge_"
@@ -169,6 +188,8 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "jobs": 1_048_576,
     "jobs_active": 1_048_576,
     "jobs_queued": 1_048_576,
+    "jarvis_package_input_contracts": 262_144,
+    "jarvis_pipeline_input_lineage": 1_048_576,
     "leases": 65_536,
     "legacy_output_archives": MAX_LEGACY_OUTPUT_RECORD_BYTES,
     "legacy_output_receipts": 65_536,
@@ -196,6 +217,7 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "tasks_by_job": 1_048_576,
     "task_order_by_job": 1_048_576,
     "transition_intents": 16_777_216,
+    "transforms": 262_144,
     "used_artifacts_by_job": 262_144,
 }
 
@@ -313,6 +335,7 @@ _INITIALIZED_QUEUE_FAMILIES = (
     "gc_trash",
     "global_order",
 )
+_ADDITIVE_QUEUE_FAMILIES = ("transforms",)
 _LEGACY_ONLY_QUEUE_FAMILIES = ("cursors",)
 _GC_TERMINAL_SCHEDULER_PHASES = {
     SchedulerPhase.COMPLETED.value,
@@ -2492,6 +2515,14 @@ class ClioCoreQueue:
                         )
                 else:
                     legacy_output_audit = locked_indexed_audit
+                for family in _ADDITIVE_QUEUE_FAMILIES:
+                    directory = self._storage_root / family
+                    directory_stat = self._require_safe_write_directory(directory)
+                    self._require_owner_private_queue_directory(
+                        family,
+                        directory,
+                        directory_stat,
+                    )
                 self._require_legacy_output_migration_authorized(
                     legacy_output_audit,
                     migrate_legacy_output=migrate_legacy_output,
@@ -2693,6 +2724,7 @@ class ClioCoreQueue:
             raise ConfigurationError("locked queue permission repair has no pinned root descriptor")
         relative_paths = [Path()]
         relative_paths.extend(Path(family) for family in _INITIALIZED_QUEUE_FAMILIES)
+        relative_paths.extend(Path(family) for family in _ADDITIVE_QUEUE_FAMILIES)
         relative_paths.extend(Path(family) for family in _LEGACY_ONLY_QUEUE_FAMILIES)
         relative_paths.extend(Path("global_order") / family for family in _GLOBAL_ORDER_FAMILIES)
         relative_paths.extend(
@@ -3760,10 +3792,12 @@ class ClioCoreQueue:
                         f"idempotency key points to missing job: {job.idempotency_key}"
                     )
                 self._assert_owner_session_intake_open_unlocked(job.metadata)
+                self._assert_input_ingest_quota_unlocked(job)
                 self._ensure_active_job_capacity_unlocked(job)
                 job = job.model_copy(update={"job_id": existing_job_id})
             if raw_existing is None:
                 self._assert_owner_session_intake_open_unlocked(job.metadata)
+                self._assert_input_ingest_quota_unlocked(job)
                 self._ensure_active_job_capacity_unlocked(job)
                 self._write_json(
                     key_path,
@@ -4242,6 +4276,139 @@ class ClioCoreQueue:
             updated = job.model_copy(update={"updated_at": utc_now(), "metadata": updated_metadata})
             self._write_job_unlocked(updated)
             return updated
+
+    def get_jarvis_package_input_contract(
+        self,
+        route: JarvisPackageInputRoute,
+    ) -> JarvisPackageInputContractRecord | None:
+        """Load one exact checksum-bound package input contract record."""
+        self.initialize()
+        route_sha256 = route.identity_sha256()
+        path = self._storage_root / "jarvis_package_input_contracts" / f"{route_sha256}.json"
+        with self._lock:
+            record = self._read_optional(path, JarvisPackageInputContractRecord)
+            if record is None:
+                return None
+            if record.route != route or record.route_sha256 != route_sha256:
+                raise QueueConflictError(
+                    "durable JARVIS package input contract route identity changed"
+                )
+            return record
+
+    def put_jarvis_package_input_contract(
+        self,
+        record: JarvisPackageInputContractRecord,
+    ) -> JarvisPackageInputContractRecord:
+        """Persist immutable package semantics for one exact registered route."""
+        self.initialize()
+        route_sha256 = record.route.identity_sha256()
+        if record.route_sha256 != route_sha256:
+            raise ValueError("package input contract route checksum changed before persistence")
+        directory = self._storage_root / "jarvis_package_input_contracts"
+        path = directory / f"{route_sha256}.json"
+        with self._lock:
+            existing = self._read_optional(path, JarvisPackageInputContractRecord)
+            if existing is not None:
+                if (
+                    existing.route != record.route
+                    or existing.package_names != record.package_names
+                    or existing.local_file_settings != record.local_file_settings
+                    or existing.settings_sha256 != record.settings_sha256
+                ):
+                    raise QueueConflictError(
+                        "immutable JARVIS package input contract changed on the same route"
+                    )
+                return existing
+            count, over_capacity = _bounded_regular_json_count(
+                directory,
+                limit=MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS,
+                label="JARVIS package input contract",
+            )
+            if over_capacity or count >= MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS:
+                raise QueueConflictError(
+                    "JARVIS package input contracts reached their bounded record capacity"
+                )
+            self._write(path, record)
+            return record
+
+    def get_jarvis_pipeline_input_lineage(
+        self,
+        route: JarvisPipelineInputRoute,
+    ) -> JarvisPipelineInputLineage | None:
+        """Load one exact checksum-bound pipeline input lineage record."""
+        self.initialize()
+        route_sha256 = route.identity_sha256()
+        path = self._storage_root / "jarvis_pipeline_input_lineage" / f"{route_sha256}.json"
+        with self._lock:
+            record = self._read_optional(path, JarvisPipelineInputLineage)
+            if record is None:
+                return None
+            if record.route != route or record.route_sha256 != route_sha256:
+                raise QueueConflictError(
+                    "durable JARVIS pipeline input lineage route identity changed"
+                )
+            return record
+
+    def merge_jarvis_pipeline_input_lineage(
+        self,
+        route: JarvisPipelineInputRoute,
+        artifact_uses: tuple[ArtifactUse, ...],
+        *,
+        manifest_sha256: str,
+    ) -> JarvisPipelineInputLineage:
+        """Atomically merge staged inputs for one exact registered pipeline route."""
+        if not artifact_uses:
+            raise ValueError("pipeline input lineage requires at least one artifact use")
+        if len(manifest_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in manifest_sha256
+        ):
+            raise ValueError("pipeline input lineage manifest must be a canonical SHA-256")
+        self.initialize()
+        route_sha256 = route.identity_sha256()
+        directory = self._storage_root / "jarvis_pipeline_input_lineage"
+        path = directory / f"{route_sha256}.json"
+        with self._lock:
+            existing = self._read_optional(path, JarvisPipelineInputLineage)
+            if existing is None:
+                count, over_capacity = _bounded_regular_json_count(
+                    directory,
+                    limit=MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS,
+                    label="JARVIS pipeline input lineage",
+                )
+                if over_capacity or count >= MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS:
+                    raise QueueConflictError(
+                        "JARVIS pipeline input lineage reached its bounded record capacity"
+                    )
+                merged_uses = artifact_uses
+                manifests = (manifest_sha256,)
+                created_at = None
+            else:
+                if existing.route != route or existing.route_sha256 != route_sha256:
+                    raise QueueConflictError(
+                        "durable JARVIS pipeline input lineage route identity changed"
+                    )
+                by_artifact = {item.artifact_id: item for item in existing.artifact_uses}
+                for item in artifact_uses:
+                    previous = by_artifact.get(item.artifact_id)
+                    if previous is not None and previous != item:
+                        raise QueueConflictError(
+                            f"pipeline input artifact identity changed: {item.artifact_id}"
+                        )
+                    by_artifact[item.artifact_id] = item
+                merged_uses = tuple(
+                    sorted(by_artifact.values(), key=lambda item: (item.artifact_id, item.sha256))
+                )
+                manifests = (*existing.manifest_sha256s, manifest_sha256)
+                created_at = existing.created_at
+            record = JarvisPipelineInputLineage.create(
+                route=route,
+                artifact_uses=merged_uses,
+                manifest_sha256s=manifests,
+                created_at=created_at,
+                updated_at=utc_now(),
+            )
+            self._write(path, record)
+            return record
 
     def list_endpoints(self, cluster: str | None = None) -> list[EndpointRegistration]:
         """Return registered endpoints, optionally filtered by cluster."""
@@ -6236,6 +6403,8 @@ class ClioCoreQueue:
             for job in sorted(queued_jobs, key=self._job_submission_order_key_unlocked):
                 if job.cluster != cluster or job.state != JobState.QUEUED:
                     continue
+                if job.kind is JobKind.INPUT_INGEST:
+                    continue
                 if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
                     job,
                     mcp_admission_class,
@@ -6368,6 +6537,8 @@ class ClioCoreQueue:
             job = self.get_job(job_id)
             if job.cluster != cluster or job.state != JobState.QUEUED:
                 return None
+            if job.kind is JobKind.INPUT_INGEST:
+                return None
             if self._job_has_pending_execution_cleanup_unlocked(job.cluster, job.job_id):
                 return None
             kind_limit = normalized_kind_concurrency.get(job.kind)
@@ -6414,6 +6585,8 @@ class ClioCoreQueue:
                 raise QueueConflictError(
                     f"submitted job {submitted.job_id} changed cluster identity"
                 )
+            if submitted.kind is JobKind.INPUT_INGEST:
+                return submitted, None
             reusable_expiry_refs = self._recover_stale_jobs_for_admission_unlocked(
                 cluster=submitted.cluster,
                 max_attempts=max_attempts,
@@ -6458,6 +6631,8 @@ class ClioCoreQueue:
         validated_global_total: int | None = None,
     ) -> Lease:
         """Persist one lease and its job transition while the queue lock is held."""
+        if job.kind is JobKind.INPUT_INGEST:
+            raise QueueConflictError("input ingest jobs are never worker-leased")
         if validated_global_total is None:
             _counts, validated_global_total = self._lease_capacity_snapshot(cluster=job.cluster)
         if validated_global_total >= MAX_LIVE_LEASE_RECORDS:
@@ -7950,6 +8125,508 @@ class ClioCoreQueue:
             )
         return saved
 
+    def begin_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str,
+        policy: InputArtifactIngestPolicy | None = None,
+    ) -> tuple[RelayJob, bool]:
+        """Claim one synchronous ingest attempt, including an exact failed-job retry.
+
+        Input ingestion is intentionally never worker-leased.  This explicit claim
+        prevents concurrent HTTP requests from racing completion and gives crash
+        recovery a durable timestamp and identity to terminalize.
+        """
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        attempt_id = self._require_durable_record_id(attempt_id, field="attempt_id")
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            job = self.get_job(job_id)
+            if job.kind is not JobKind.INPUT_INGEST or not isinstance(
+                job.spec,
+                InputArtifactSpec,
+            ):
+                raise QueueConflictError(f"job is not an input ingest: {job_id}")
+            if job.state is JobState.SUCCEEDED:
+                return job, False
+            existing_attempt = _input_ingest_attempt(job)
+            if job.state is JobState.RUNNING:
+                if existing_attempt is not None and existing_attempt["attempt_id"] == attempt_id:
+                    return job, False
+                raise QueueConflictError(f"input ingest already has an active attempt: {job_id}")
+            if job.state not in {JobState.QUEUED, JobState.FAILED}:
+                raise QueueConflictError(
+                    f"input ingest cannot begin from state {job.state.value}: {job_id}"
+                )
+            stored_policy_raw = job.metadata.get(INPUT_INGEST_POLICY_METADATA_KEY)
+            try:
+                stored_policy = InputArtifactIngestPolicy.model_validate(stored_policy_raw)
+            except ValueError as exc:
+                raise QueueConflictError("input ingest has no valid server quota policy") from exc
+            effective_policy = policy or stored_policy
+            self._assert_input_ingest_quota_unlocked(job, policy=effective_policy)
+            now = utc_now()
+            metadata = dict(job.metadata)
+            original_policy_raw = metadata.get(INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY)
+            if original_policy_raw is not None:
+                try:
+                    InputArtifactIngestPolicy.model_validate(original_policy_raw)
+                except ValueError as exc:
+                    raise QueueConflictError(
+                        "input ingest original quota policy is invalid"
+                    ) from exc
+            policy_changed = effective_policy != stored_policy
+            if policy_changed and INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY not in metadata:
+                metadata[INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY] = stored_policy.model_dump(
+                    mode="json"
+                )
+            metadata[INPUT_INGEST_POLICY_METADATA_KEY] = effective_policy.model_dump(mode="json")
+            metadata[INPUT_INGEST_ATTEMPT_METADATA_KEY] = {
+                "schema_version": INPUT_INGEST_ATTEMPT_SCHEMA,
+                "attempt_id": attempt_id,
+                "started_at": now.isoformat(),
+                "outcome": "running",
+            }
+            started = job.model_copy(
+                update={
+                    "state": JobState.RUNNING,
+                    "updated_at": now,
+                    "last_error": None,
+                    "leased_by": None,
+                    "metadata": metadata,
+                }
+            )
+            self._write_job_unlocked(started)
+            self.append_event(
+                job_id,
+                "input_ingest.started",
+                "Input artifact ingest attempt started",
+                locked=True,
+                payload={
+                    "attempt_id": attempt_id,
+                    "retry": job.state is JobState.FAILED,
+                    "policy_changed": policy_changed,
+                },
+            )
+            return started, True
+
+    def fail_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str,
+        error: str,
+    ) -> tuple[RelayJob, bool]:
+        """Terminalize the exact failed ingest attempt without stranding capacity."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        attempt_id = self._require_durable_record_id(attempt_id, field="attempt_id")
+        bounded_error = bounded_error_detail(error) or "input artifact ingest failed"
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            job = self.get_job(job_id)
+            if job.kind is not JobKind.INPUT_INGEST or not isinstance(
+                job.spec,
+                InputArtifactSpec,
+            ):
+                raise QueueConflictError(f"job is not an input ingest: {job_id}")
+            attempt = _input_ingest_attempt(job)
+            if job.state is JobState.SUCCEEDED:
+                return job, False
+            if job.state is JobState.FAILED:
+                if attempt is not None and attempt["attempt_id"] == attempt_id:
+                    return job, False
+                raise QueueConflictError(f"input ingest failed under another attempt: {job_id}")
+            if (
+                job.state is not JobState.RUNNING
+                or attempt is None
+                or attempt["attempt_id"] != attempt_id
+                or attempt["outcome"] != "running"
+            ):
+                raise QueueConflictError(f"input ingest attempt identity changed: {job_id}")
+            now = utc_now()
+            metadata = dict(job.metadata)
+            metadata[INPUT_INGEST_ATTEMPT_METADATA_KEY] = {
+                **attempt,
+                "completed_at": now.isoformat(),
+                "outcome": "failed",
+                "error": bounded_error,
+            }
+            failed = job.model_copy(
+                update={
+                    "state": JobState.FAILED,
+                    "updated_at": now,
+                    "last_error": bounded_error,
+                    "leased_by": None,
+                    "metadata": metadata,
+                }
+            )
+            self._write_job_unlocked(failed)
+            self.append_event(
+                job_id,
+                "job.failed",
+                "Input artifact ingest failed",
+                locked=True,
+                payload={
+                    "state": JobState.FAILED.value,
+                    "attempt_id": attempt_id,
+                    "error": bounded_error,
+                },
+            )
+            return failed, True
+
+    def recover_abandoned_input_ingests(
+        self,
+        *,
+        cluster: str,
+        stale_before: datetime | None = None,
+        limit: int = MAX_INPUT_INGEST_RECOVERY_BATCH,
+    ) -> list[RelayJob]:
+        """Fail bounded orphaned synchronous ingests so quota and storage can recover."""
+        if limit < 1 or limit > MAX_INPUT_INGEST_RECOVERY_BATCH:
+            raise ValueError(
+                "input ingest recovery limit must be between 1 and "
+                f"{MAX_INPUT_INGEST_RECOVERY_BATCH}"
+            )
+        cutoff = stale_before or (
+            utc_now() - timedelta(seconds=DEFAULT_INPUT_INGEST_ABANDONED_AFTER_SECONDS)
+        )
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("input ingest recovery cutoff must include a timezone")
+        self.initialize()
+        recovered: list[RelayJob] = []
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            self._repair_active_job_index_unlocked()
+            active, truncated = self._scan_many(
+                self._storage_root / "jobs_active",
+                RelayJob,
+                limit=MAX_ACTIVE_JOB_RECORDS,
+            )
+            if truncated:
+                raise QueueConflictError("active job index exceeded its safety bound")
+            for indexed in sorted(active, key=self._job_submission_order_key_unlocked):
+                if len(recovered) >= limit:
+                    break
+                job = self.get_job(indexed.job_id)
+                if (
+                    job.cluster != cluster
+                    or job.kind is not JobKind.INPUT_INGEST
+                    or job.state not in {JobState.QUEUED, JobState.RUNNING}
+                    or job.updated_at > cutoff
+                ):
+                    continue
+                now = utc_now()
+                existing_attempt = _input_ingest_attempt(job)
+                attempt_id = (
+                    existing_attempt["attempt_id"]
+                    if existing_attempt is not None
+                    else f"ingest_recovery_{uuid4().hex}"
+                )
+                metadata = dict(job.metadata)
+                metadata[INPUT_INGEST_ATTEMPT_METADATA_KEY] = {
+                    "schema_version": INPUT_INGEST_ATTEMPT_SCHEMA,
+                    "attempt_id": attempt_id,
+                    "started_at": (
+                        existing_attempt["started_at"]
+                        if existing_attempt is not None
+                        else job.updated_at.isoformat()
+                    ),
+                    "completed_at": now.isoformat(),
+                    "outcome": "abandoned",
+                    "error": "input ingest attempt ended without terminal reconciliation",
+                }
+                failed = job.model_copy(
+                    update={
+                        "state": JobState.FAILED,
+                        "updated_at": now,
+                        "last_error": (
+                            "input ingest attempt ended without terminal reconciliation"
+                        ),
+                        "leased_by": None,
+                        "metadata": metadata,
+                    }
+                )
+                self._write_job_unlocked(failed)
+                self.append_event(
+                    job.job_id,
+                    "job.failed",
+                    "Abandoned input artifact ingest recovered",
+                    locked=True,
+                    payload={
+                        "state": JobState.FAILED.value,
+                        "attempt_id": attempt_id,
+                        "previous_state": job.state.value,
+                        "error": failed.last_error,
+                    },
+                )
+                recovered.append(failed)
+        return recovered
+
+    def reconcile_input_artifact(
+        self,
+        artifact: ArtifactRef,
+        *,
+        attempt_id: str | None = None,
+    ) -> ArtifactRef:
+        """Idempotently index the single verified artifact of an ingest job."""
+        self._require_durable_record_id(artifact.artifact_id, field="artifact_id")
+        self._require_durable_record_id(artifact.job_id, field="job_id")
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            job = self.get_job(artifact.job_id)
+            if job.kind is not JobKind.INPUT_INGEST or not isinstance(
+                job.spec,
+                InputArtifactSpec,
+            ):
+                raise QueueConflictError(
+                    f"input artifact producer is not an ingest job: {artifact.job_id}"
+                )
+            if job.state not in {JobState.QUEUED, JobState.RUNNING, JobState.SUCCEEDED}:
+                raise QueueConflictError(
+                    f"input ingest job is not reconcilable from state {job.state.value}: "
+                    f"{job.job_id}"
+                )
+            if attempt_id is not None:
+                attempt_id = self._require_durable_record_id(attempt_id, field="attempt_id")
+                attempt = _input_ingest_attempt(job)
+                if (
+                    job.state is not JobState.RUNNING
+                    or attempt is None
+                    or attempt["attempt_id"] != attempt_id
+                    or attempt["outcome"] != "running"
+                ):
+                    raise QueueConflictError(
+                        f"input ingest attempt identity changed before reconciliation: {job.job_id}"
+                    )
+            if (
+                job.metadata.get("owner") != "clio-relay"
+                or not isinstance(job.metadata.get("owner_session_id"), str)
+                or not isinstance(job.metadata.get("owner_session_generation_id"), str)
+            ):
+                raise QueueConflictError(
+                    f"input ingest job has no exact owner-session generation: {job.job_id}"
+                )
+            expected_artifact_id = deterministic_input_artifact_id(job.job_id)
+            if artifact.artifact_id != expected_artifact_id:
+                raise QueueConflictError(f"input artifact identity changed for job: {job.job_id}")
+            if (
+                artifact.kind != "input"
+                or artifact.size_bytes != job.spec.size_bytes
+                or artifact.sha256 != job.spec.sha256
+                or artifact.metadata.get("schema_version") != "clio-relay.input-artifact.v1"
+                or artifact.metadata.get("logical_name") != job.spec.logical_name
+            ):
+                raise QueueConflictError(
+                    f"input artifact content identity changed for job: {job.job_id}"
+                )
+
+            canonical_path = self._storage_root / "artifacts" / f"{artifact.artifact_id}.json"
+            existing = self._read_optional(canonical_path, ArtifactRef)
+            if existing is None:
+                sequence = self._next_job_record_sequence_unlocked(
+                    artifact.job_id,
+                    "artifact_count",
+                )
+                if sequence != 1:
+                    raise QueueConflictError(
+                        f"input ingest job already has another artifact: {job.job_id}"
+                    )
+                saved = artifact.model_copy(update={"sequence": sequence})
+                self._write(canonical_path, saved)
+            else:
+                if existing.sequence != 1 or not _same_input_artifact(existing, artifact):
+                    raise QueueConflictError(
+                        f"canonical input artifact identity changed: {artifact.artifact_id}"
+                    )
+                saved = existing
+
+            artifact_directory = (
+                self._storage_root / "artifacts_by_job" / self._durable_key(job.job_id)
+            )
+            paths = self._bounded_json_record_paths(
+                artifact_directory,
+                limit=2,
+                label=f"input artifacts for job {job.job_id}",
+            )
+            unexpected = [path for path in paths if path.stem != saved.artifact_id]
+            if unexpected:
+                raise QueueConflictError(
+                    f"input ingest job has an unexpected artifact: {unexpected[0].stem}"
+                )
+            by_job_path = self._job_record_path(
+                "artifacts_by_job",
+                saved.job_id,
+                saved.artifact_id,
+            )
+            existing_by_job = self._read_optional(by_job_path, ArtifactRef)
+            if existing_by_job is not None and existing_by_job != saved:
+                raise QueueConflictError(f"input artifact job index changed: {saved.artifact_id}")
+            self._write(by_job_path, saved)
+            order_path = (
+                self._storage_root
+                / "artifact_order_by_job"
+                / self._durable_key(saved.job_id)
+                / f"{saved.sequence:020d}.json"
+            )
+            existing_order = self._read_optional(order_path, ArtifactRef)
+            if existing_order is not None and existing_order != saved:
+                raise QueueConflictError(f"input artifact order index changed: {saved.artifact_id}")
+            self._write(order_path, saved)
+            index = self._read_job_index(saved.job_id)
+            if index is None:
+                raise QueueConflictError(f"input ingest job index is missing: {saved.job_id}")
+            artifact_count = _index_integer(index, "artifact_count")
+            if artifact_count not in {0, 1}:
+                raise QueueConflictError(f"input ingest artifact count is invalid: {saved.job_id}")
+            if artifact_count == 0:
+                self._update_job_index_unlocked(saved.job_id, artifact_count=1)
+            (self._storage_root / "artifact_users" / saved.artifact_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            self._initialize_artifact_user_order_unlocked(saved.artifact_id)
+            self._link_gateways_for_artifact_unlocked(saved)
+            if not self._input_artifact_event_exists_unlocked(saved):
+                self.append_event(
+                    saved.job_id,
+                    "artifact.created",
+                    f"Input artifact indexed: {job.spec.logical_name}",
+                    locked=True,
+                    payload={
+                        "artifact_id": saved.artifact_id,
+                        "uri": saved.uri,
+                        "kind": "input",
+                        "logical_name": job.spec.logical_name,
+                    },
+                )
+            return saved
+
+    def _input_artifact_event_exists_unlocked(self, artifact: ArtifactRef) -> bool:
+        index = self._read_job_index(artifact.job_id)
+        if index is None:
+            raise QueueConflictError(f"input ingest job index is missing: {artifact.job_id}")
+        latest_event_seq = _index_integer(index, "latest_event_seq")
+        if latest_event_seq > DEFAULT_EXACT_RECORD_LIMIT:
+            raise QueueConflictError(
+                f"input ingest event history exceeds its reconciliation bound: {artifact.job_id}"
+            )
+        for sequence in range(1, latest_event_seq + 1):
+            event = self._read_optional(
+                self._storage_root / "events" / artifact.job_id / f"{sequence:020d}.json",
+                RelayEvent,
+            )
+            if event is None or event.job_id != artifact.job_id or event.seq != sequence:
+                raise QueueConflictError(
+                    f"input ingest event history is incomplete: {artifact.job_id}"
+                )
+            if (
+                event.event_type == "artifact.created"
+                and event.payload.get("artifact_id") == artifact.artifact_id
+            ):
+                return True
+        return False
+
+    def complete_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str | None = None,
+    ) -> tuple[RelayJob, bool]:
+        """Idempotently terminalize an ingest job after its artifact is durable."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            job = self.get_job(job_id)
+            if job.kind is not JobKind.INPUT_INGEST or not isinstance(
+                job.spec,
+                InputArtifactSpec,
+            ):
+                raise QueueConflictError(f"job is not an input ingest: {job_id}")
+            if job.state not in {JobState.QUEUED, JobState.RUNNING, JobState.SUCCEEDED}:
+                raise QueueConflictError(
+                    f"input ingest job has unexpected state: {job.state.value}"
+                )
+            attempt = _input_ingest_attempt(job)
+            if attempt_id is not None:
+                attempt_id = self._require_durable_record_id(attempt_id, field="attempt_id")
+                if (
+                    job.state is not JobState.RUNNING
+                    or attempt is None
+                    or attempt["attempt_id"] != attempt_id
+                    or attempt["outcome"] != "running"
+                ):
+                    raise QueueConflictError(
+                        f"input ingest attempt identity changed before completion: {job_id}"
+                    )
+            artifact_id = deterministic_input_artifact_id(job.job_id)
+            artifact = self._read_optional(
+                self._storage_root / "artifacts" / f"{artifact_id}.json",
+                ArtifactRef,
+            )
+            if (
+                artifact is None
+                or artifact.job_id != job.job_id
+                or artifact.kind != "input"
+                or artifact.size_bytes != job.spec.size_bytes
+                or artifact.sha256 != job.spec.sha256
+            ):
+                raise QueueConflictError(
+                    f"input ingest cannot complete without its exact artifact: {job_id}"
+                )
+            changed = job.state in {JobState.QUEUED, JobState.RUNNING}
+            if changed:
+                metadata = dict(job.metadata)
+                if attempt is not None:
+                    metadata[INPUT_INGEST_ATTEMPT_METADATA_KEY] = {
+                        **attempt,
+                        "completed_at": utc_now().isoformat(),
+                        "outcome": "succeeded",
+                    }
+                job = job.model_copy(
+                    update={
+                        "state": JobState.SUCCEEDED,
+                        "updated_at": utc_now(),
+                        "last_error": None,
+                        "leased_by": None,
+                        "metadata": metadata,
+                    }
+                )
+                self._write_job_unlocked(job)
+            if not self._input_ingest_succeeded_event_exists_unlocked(job.job_id):
+                self.append_event(
+                    job.job_id,
+                    "job.succeeded",
+                    "Input artifact ingested",
+                    locked=True,
+                    payload={"state": JobState.SUCCEEDED.value, "error": None},
+                )
+            return job, changed
+
+    def _input_ingest_succeeded_event_exists_unlocked(self, job_id: str) -> bool:
+        index = self._read_job_index(job_id)
+        if index is None:
+            raise QueueConflictError(f"input ingest job index is missing: {job_id}")
+        latest_event_seq = _index_integer(index, "latest_event_seq")
+        if latest_event_seq > DEFAULT_EXACT_RECORD_LIMIT:
+            raise QueueConflictError(
+                f"input ingest event history exceeds its reconciliation bound: {job_id}"
+            )
+        for sequence in range(1, latest_event_seq + 1):
+            event = self._read_optional(
+                self._storage_root / "events" / job_id / f"{sequence:020d}.json",
+                RelayEvent,
+            )
+            if event is None or event.job_id != job_id or event.seq != sequence:
+                raise QueueConflictError(f"input ingest event history is incomplete: {job_id}")
+            if event.event_type == "job.succeeded":
+                return True
+        return False
+
     def list_artifacts(self, job_id: str) -> list[ArtifactRef]:
         """Return artifact refs for a job."""
         job_id = self._require_durable_record_id(job_id, field="job_id")
@@ -8037,12 +8714,17 @@ class ClioCoreQueue:
             identity_field="artifact_id",
             label=f"used artifacts for job {job_id}",
         )
-        expected = {item.artifact_id: item.sha256 for item in job.used_artifact_refs}
+        expected = {item.artifact_id: item for item in job.used_artifact_refs}
         if total != len(expected):
             raise QueueConflictError(f"used-artifact index is incomplete for job: {job_id}")
         for record in records:
-            expected_sha256 = expected.get(record.artifact_id)
-            if record.consumer_job_id != job_id or expected_sha256 != record.sha256:
+            expected_use = expected.get(record.artifact_id)
+            if (
+                record.consumer_job_id != job_id
+                or expected_use is None
+                or expected_use.sha256 != record.sha256
+                or expected_use.provenance != record.provenance
+            ):
                 raise QueueConflictError(f"used-artifact index identity mismatch for job: {job_id}")
             self._validate_artifact_use_record(record)
         return records, next_cursor, total
@@ -8262,6 +8944,7 @@ class ClioCoreQueue:
                     or record.consumer_job_id != job.job_id
                     or record.producer_job_id != artifact.job_id
                     or record.sha256 != canonical_sha256
+                    or record.provenance != use.provenance
                 ):
                     raise QueueConflictError(
                         f"immutable used-artifact edge identity changed: {artifact.artifact_id}"
@@ -8287,6 +8970,7 @@ class ClioCoreQueue:
                 consumer_job_id=job.job_id,
                 producer_job_id=artifact.job_id,
                 sha256=canonical_sha256,
+                provenance=use.provenance,
                 created_at=job.created_at,
             )
             records.append(record)
@@ -8332,6 +9016,7 @@ class ClioCoreQueue:
         consumer_job_id: str,
         producer_job_id: str,
         sha256: str,
+        provenance: ArtifactUseProvenance | None,
         created_at: datetime,
     ) -> UsedArtifactRef:
         """Reserve one monotonic edge identity, leaving safe gaps after crashes."""
@@ -8351,6 +9036,7 @@ class ClioCoreQueue:
             producer_job_id=producer_job_id,
             sequence=sequence,
             sha256=sha256,
+            provenance=provenance,
             created_at=created_at,
         )
         self._write(
@@ -8384,10 +9070,77 @@ class ClioCoreQueue:
         consumer = self.get_job(record.consumer_job_id)
         producer = self.get_job(record.producer_job_id)
         _require_artifact_lineage_owner_match(consumer=consumer, producer=producer)
-        pinned = {item.artifact_id: item.sha256 for item in consumer.used_artifact_refs}
-        if pinned.get(record.artifact_id) != record.sha256:
+        pinned = {item.artifact_id: item for item in consumer.used_artifact_refs}
+        expected = pinned.get(record.artifact_id)
+        if (
+            expected is None
+            or expected.sha256 != record.sha256
+            or expected.provenance != record.provenance
+        ):
             raise QueueConflictError(
                 f"used-artifact edge no longer matches consumer job: {record.consumer_job_id}"
+            )
+
+    def record_transform_ref(self, transform: TransformRef) -> TransformRef:
+        """Persist one immutable transform independently from its used-edge count."""
+        job_id = self._require_durable_record_id(transform.job_id, field="job_id")
+        self.initialize()
+        path = self._storage_root / "transforms" / f"{job_id}.json"
+        with self._lock:
+            job = self.get_job(job_id)
+            self._validate_transform_ref_unlocked(job, transform)
+            existing = self._read_optional(path, TransformRef)
+            if existing is not None:
+                if existing != transform:
+                    raise QueueConflictError(f"immutable transform ref changed for job: {job_id}")
+                return existing
+            self._write(path, transform)
+            return transform
+
+    def get_transform_ref(self, job_id: str) -> TransformRef | None:
+        """Return the nullable immutable transform associated with one retained job."""
+        job_id = self._require_durable_record_id(job_id, field="job_id")
+        self.initialize()
+        self.get_job(job_id)
+        record = self._read_optional(
+            self._storage_root / "transforms" / f"{job_id}.json",
+            TransformRef,
+        )
+        if record is not None and record.job_id != job_id:
+            raise QueueConflictError(f"transform ref identity mismatch for job: {job_id}")
+        return record
+
+    @staticmethod
+    def _validate_transform_ref_unlocked(job: RelayJob, transform: TransformRef) -> None:
+        """Bind every internal transform edge to the job's immutable dependency set."""
+        if transform.job_id != job.job_id:
+            raise QueueConflictError("transform ref belongs to a different job")
+        expected = {item.artifact_id: item for item in job.used_artifact_refs}
+        observed: set[str] = set()
+        for evidence in transform.used_evidence:
+            if evidence.artifact_id is None:
+                continue
+            use = expected.get(evidence.artifact_id)
+            if use is None or evidence.sha256 != use.sha256:
+                raise QueueConflictError(
+                    f"transform evidence does not match job dependency: {evidence.artifact_id}"
+                )
+            edge_provenance = ArtifactUseProvenance.model_validate(
+                evidence.model_dump(mode="python", exclude={"artifact_id", "sha256"})
+            )
+            if edge_provenance != use.provenance:
+                raise QueueConflictError(
+                    f"transform evidence provenance changed: {evidence.artifact_id}"
+                )
+            if evidence.artifact_id in observed:
+                raise QueueConflictError(
+                    f"transform evidence repeats artifact: {evidence.artifact_id}"
+                )
+            observed.add(evidence.artifact_id)
+        missing = set(expected).difference(observed)
+        if missing:
+            raise QueueConflictError(
+                f"transform evidence omits job dependency: {sorted(missing)[0]}"
             )
 
     def append_progress(self, progress: ProgressRecord) -> ProgressRecord:
@@ -10900,6 +11653,127 @@ class ClioCoreQueue:
         except OSError as exc:
             raise QueueConflictError(f"cannot inspect active job capacity: {exc}") from exc
 
+    def _assert_input_ingest_quota_unlocked(
+        self,
+        job: RelayJob,
+        *,
+        policy: InputArtifactIngestPolicy | None = None,
+    ) -> None:
+        """Enforce bounded input totals for one exact owner-session generation."""
+        if job.kind is not JobKind.INPUT_INGEST:
+            return
+        if not isinstance(job.spec, InputArtifactSpec):
+            raise QueueConflictError("input ingest job has an invalid specification")
+        identity = _owner_session_identity(job.metadata, allow_legacy=False)
+        if identity is None or job.metadata.get("owner") != "clio-relay":
+            raise QueueConflictError("input ingest requires exact relay owner-session identity")
+        owner_session_id, session_generation_id = identity
+        if session_generation_id is None:
+            raise QueueConflictError("input ingest requires an owner-session generation")
+        if policy is None:
+            raw_policy = job.metadata.get(INPUT_INGEST_POLICY_METADATA_KEY)
+            try:
+                policy = InputArtifactIngestPolicy.model_validate(raw_policy)
+            except ValueError as exc:
+                raise QueueConflictError("input ingest has no valid server quota policy") from exc
+
+        directory = self._owner_session_membership_dir(
+            owner_session_id,
+            session_generation_id=session_generation_id,
+        )
+        paths = self._bounded_json_record_paths(
+            directory,
+            limit=MAX_ACTIVE_JOB_RECORDS,
+            label="owner-session input ingest quota membership",
+        )
+        file_count = 0
+        total_bytes = 0
+        for path in paths:
+            membership = self._read_json_file(path, OwnerSessionJobMembership)
+            if (
+                membership.owner_session_id != owner_session_id
+                or membership.session_generation_id != session_generation_id
+            ):
+                raise QueueConflictError(f"input ingest quota membership identity mismatch: {path}")
+            existing = self._read_optional(
+                self._storage_root / "jobs" / f"{membership.job_id}.json",
+                RelayJob,
+            )
+            if existing is None:
+                raise QueueConflictError(
+                    f"input ingest quota membership has no producer: {membership.job_id}"
+                )
+            if existing.metadata.get("owner_session_id") != owner_session_id or (
+                existing.metadata.get("owner_session_generation_id") != session_generation_id
+            ):
+                raise QueueConflictError(
+                    f"input ingest quota producer identity changed: {membership.job_id}"
+                )
+            if existing.kind is not JobKind.INPUT_INGEST:
+                continue
+            if not isinstance(existing.spec, InputArtifactSpec):
+                raise QueueConflictError(
+                    f"input ingest quota producer has an invalid spec: {membership.job_id}"
+                )
+            if existing.job_id == job.job_id:
+                # A failed/queued retry already appears in generation membership.
+                # Exclude it here and add the candidate exactly once below.
+                continue
+            if not self._input_ingest_consumes_quota_unlocked(existing):
+                continue
+            file_count += 1
+            total_bytes += existing.spec.size_bytes
+            if file_count >= policy.max_file_count:
+                raise QueueConflictError(
+                    "input_ingest_file_count_limit_reached: owner-session generation "
+                    f"limit is {policy.max_file_count}"
+                )
+            if total_bytes + job.spec.size_bytes > policy.max_total_bytes:
+                raise QueueConflictError(
+                    "input_ingest_total_bytes_limit_reached: owner-session generation "
+                    f"limit is {policy.max_total_bytes} bytes"
+                )
+        if file_count + 1 > policy.max_file_count:
+            raise QueueConflictError(
+                "input_ingest_file_count_limit_reached: owner-session generation "
+                f"limit is {policy.max_file_count}"
+            )
+        if total_bytes + job.spec.size_bytes > policy.max_total_bytes:
+            raise QueueConflictError(
+                "input_ingest_total_bytes_limit_reached: owner-session generation "
+                f"limit is {policy.max_total_bytes} bytes"
+            )
+
+    def _input_ingest_consumes_quota_unlocked(self, job: RelayJob) -> bool:
+        """Return whether an admitted ingest owns bytes or can still create them."""
+        if job.kind is not JobKind.INPUT_INGEST or not isinstance(
+            job.spec,
+            InputArtifactSpec,
+        ):
+            raise QueueConflictError(f"input ingest quota producer is invalid: {job.job_id}")
+        if job.state not in {JobState.FAILED, JobState.CANCELED}:
+            return True
+        artifact_id = deterministic_input_artifact_id(job.job_id)
+        artifact = self._read_optional(
+            self._storage_root / "artifacts" / f"{artifact_id}.json",
+            ArtifactRef,
+        )
+        if artifact is None:
+            return False
+        if (
+            artifact.artifact_id != artifact_id
+            or artifact.job_id != job.job_id
+            or artifact.kind != "input"
+            or artifact.size_bytes != job.spec.size_bytes
+            or artifact.sha256 != job.spec.sha256
+            or artifact.metadata.get("schema_version") != job.spec.schema_version
+            or artifact.metadata.get("logical_name") != job.spec.logical_name
+        ):
+            raise QueueConflictError(
+                f"terminal input ingest artifact identity changed: {job.job_id}"
+            )
+        return True
+
     def _index_fresh_endpoint_unlocked(self, endpoint: EndpointRegistration) -> None:
         """Move one endpoint's mutable presence record into its current time bucket."""
         cluster_identity = endpoint.cluster or "__desktop__"
@@ -11675,6 +12549,7 @@ class ClioCoreQueue:
                 ("jobs_active", f"{job_id}.json"),
                 ("jobs_queued", f"{job_id}.json"),
                 ("job_indexes", f"{safe_job_id}.json"),
+                ("transforms", f"{job_id}.json"),
             )
         )
         actions = 0
@@ -13165,6 +14040,7 @@ def _record_identity_field(model: type[BaseModel]) -> str:
         RelayJob: "job_id",
         RelayTask: "task_id",
         SchedulerCancelPending: "job_id",
+        TransformRef: "job_id",
     }
     try:
         return identity_fields[model]
@@ -13188,6 +14064,7 @@ _CANONICAL_FLAT_RECORD_IDENTITIES: dict[
     "monitor_rules": (MonitorRule, "rule_id", "monitor rule"),
     "progress": (ProgressRecord, "progress_id", "progress"),
     "tasks": (RelayTask, "task_id", "task"),
+    "transforms": (TransformRef, "job_id", "transform ref"),
 }
 
 
@@ -14212,6 +15089,7 @@ def _lease_kind_code(job_kind: JobKind) -> str:
         JobKind.JARVIS: "j",
         JobKind.REMOTE_AGENT: "r",
         JobKind.MCP_CALL: "m",
+        JobKind.INPUT_INGEST: "i",
     }[job_kind]
 
 
@@ -14266,6 +15144,7 @@ def _parse_lease_expiry_ref_name(
             "j": JobKind.JARVIS,
             "r": JobKind.REMOTE_AGENT,
             "m": JobKind.MCP_CALL,
+            "i": JobKind.INPUT_INGEST,
         }[kind_code]
         expires_key = int(expires_raw)
     except (KeyError, ValueError):
@@ -14713,6 +15592,22 @@ def _job_idempotency_digest(job: RelayJob) -> str:
     # upgrade. Non-empty dependency pins remain part of the canonical identity.
     if not payload.get("used_artifact_refs"):
         payload.pop("used_artifact_refs", None)
+    else:
+        # A missing provenance field is the legacy two-field ArtifactUse wire
+        # shape. Keep its digest byte-for-byte stable after the additive model
+        # field is introduced; non-null provenance remains canonical identity.
+        payload["used_artifact_refs"] = [
+            artifact_use_payload(item) for item in job.used_artifact_refs
+        ]
+    raw_metadata = payload.get("metadata")
+    if job.kind is JobKind.INPUT_INGEST and isinstance(raw_metadata, dict):
+        typed_metadata = cast(dict[str, object], raw_metadata)
+        for key in (
+            INPUT_INGEST_POLICY_METADATA_KEY,
+            INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
+            INPUT_INGEST_ATTEMPT_METADATA_KEY,
+        ):
+            typed_metadata.pop(key, None)
     # Preserve the pre-JARVIS-lock digest for generic MCP calls. The marker is
     # release authority only when explicitly present on the built-in route.
     raw_spec = payload.get("spec")
@@ -14745,6 +15640,54 @@ def _is_sha256_digest(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _same_input_artifact(existing: ArtifactRef, requested: ArtifactRef) -> bool:
+    """Compare immutable input-artifact identity while preserving its first timestamp."""
+    return existing.model_dump(exclude={"sequence", "created_at"}) == requested.model_dump(
+        exclude={"sequence", "created_at"}
+    )
+
+
+def _input_ingest_attempt(job: RelayJob) -> dict[str, str] | None:
+    """Validate and return one durable synchronous-ingest attempt record."""
+    raw = job.metadata.get(INPUT_INGEST_ATTEMPT_METADATA_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise QueueConflictError(f"input ingest attempt metadata is invalid: {job.job_id}")
+    attempt = cast(dict[str, object], raw)
+    schema = attempt.get("schema_version")
+    attempt_id = attempt.get("attempt_id")
+    started_at = attempt.get("started_at")
+    outcome = attempt.get("outcome")
+    if (
+        schema != INPUT_INGEST_ATTEMPT_SCHEMA
+        or not isinstance(attempt_id, str)
+        or not isinstance(started_at, str)
+        or outcome not in {"running", "succeeded", "failed", "abandoned"}
+    ):
+        raise QueueConflictError(f"input ingest attempt metadata is invalid: {job.job_id}")
+    try:
+        validate_durable_record_id(attempt_id)
+        started = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError) as exc:
+        raise QueueConflictError(f"input ingest attempt metadata is invalid: {job.job_id}") from exc
+    if started.tzinfo is None or started.utcoffset() is None:
+        raise QueueConflictError(f"input ingest attempt timestamp is naive: {job.job_id}")
+    result: dict[str, str] = {
+        "schema_version": INPUT_INGEST_ATTEMPT_SCHEMA,
+        "attempt_id": attempt_id,
+        "started_at": started_at,
+        "outcome": cast(str, outcome),
+    }
+    for field in ("completed_at", "error"):
+        value = attempt.get(field)
+        if value is not None:
+            if not isinstance(value, str):
+                raise QueueConflictError(f"input ingest attempt metadata is invalid: {job.job_id}")
+            result[field] = value
+    return result
 
 
 def _artifact_user_cursor(sequence: int) -> str:

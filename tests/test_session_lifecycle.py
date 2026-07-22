@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -36,6 +37,7 @@ from clio_relay.session_lifecycle import (
     OwnedSessionRecoveryStatus,
     OwnedSessionStartPlan,
     OwnedSessionStartRequest,
+    OwnedSessionTeardownRequest,
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
@@ -158,6 +160,21 @@ class _FakeSessionTransaction:
             raise AssertionError("test transaction observed an unexpected bounded read")
         return payload
 
+    def read_tail(
+        self,
+        name: str,
+        *,
+        maximum_bytes: int,
+        required: bool = True,
+    ) -> bytes | None:
+        """Return the same bounded-tail contract as the pinned transaction."""
+        path = self.path / name
+        if not path.exists():
+            if required:
+                raise AssertionError(f"missing required test file: {name}")
+            return None
+        return path.read_bytes()[-maximum_bytes:]
+
     def open_output(self, name: str) -> int:
         """Open one test-owned output file like the pinned production transaction."""
         return os.open(self.path / name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -173,14 +190,26 @@ class _FakeSessionTransaction:
         maximum_bytes: int | None,
     ) -> bool:
         path = self.path / name
-        observed = path.stat()
+        try:
+            observed = path.stat()
+        except FileNotFoundError:
+            return False
         assert (observed.st_dev, observed.st_ino, observed.st_size) == (
             expected_device,
             expected_inode,
             expected_size,
         )
-        assert expected_sha256 is None
-        assert maximum_bytes is None
+        if expected_sha256 is not None:
+            assert maximum_bytes is not None
+            payload = self.read_bytes(name, maximum_bytes=maximum_bytes)
+            assert payload is not None
+            assert hashlib.sha256(payload).hexdigest() == expected_sha256
+        final = path.stat()
+        assert (final.st_dev, final.st_ino, final.st_size) == (
+            expected_device,
+            expected_inode,
+            expected_size,
+        )
         path.unlink()
         return True
 
@@ -211,6 +240,11 @@ def _fixed_process_start_identity(_pid: int) -> str:
     """Return the process identity used by replacement-session tests."""
 
     return "linux-proc:7000"
+
+
+def _no_adopted_scope(**_kwargs: object) -> None:
+    """Represent an absent predeclared systemd scope."""
+    return None
 
 
 def _successful_process_wait(**_kwargs: object) -> int:
@@ -274,6 +308,12 @@ def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
         session_lifecycle,
         "_recorded_scope_processes",
         recorded_scope_processes,
+    )
+    containment = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(
+        containment,
+        "adopt_linux_systemd_scope_identity",
+        _no_adopted_scope,
     )
 
 
@@ -384,6 +424,75 @@ def _owned_session_start_request() -> OwnedSessionStartRequest:
         cluster_registry_sha256=session_lifecycle.hashlib.sha256(payload).hexdigest(),
         cluster_route_revision=session_lifecycle.cluster_route_revision(definition),
     )
+
+
+def _failed_start_fixture(
+    root: Path,
+) -> tuple[
+    OwnedSessionStartRequest,
+    _FakeSessionTransaction,
+    ClioCoreQueue,
+    Path,
+]:
+    """Create one exact admitted v2 start journal without API metadata."""
+    request = _owned_session_start_request()
+    transaction = _FakeSessionTransaction(
+        root / "home" / ".local" / "share" / "clio-relay" / "sessions" / request.session_id,
+        session_id=request.session_id,
+    )
+    generation = "generation-failed-start"
+    registry_payload = json.dumps(
+        request.cluster_registry,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    registry_path = transaction.path / f"cluster-registry-{generation}.json"
+    registry_path.write_bytes(registry_payload)
+    owner_token = "c" * 64
+    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity={
+            "cluster": request.cluster,
+            "session_id": request.session_id,
+            "start_operation_id": request.start_operation_id,
+            "session_generation_id": generation,
+            "owner_token": owner_token,
+            "owner_token_sha256": session_lifecycle.hashlib.sha256(
+                owner_token.encode()
+            ).hexdigest(),
+            "api_release_identity_sha256": _api_release_identity().sha256(),
+            "expected_api_release_identity_sha256": None,
+            "cluster_registry_path": str(registry_path),
+            "cluster_registry_sha256": request.cluster_registry_sha256,
+            "cluster_route_revision": request.cluster_route_revision,
+            "remote_api_port": request.remote_api_port,
+            "replace": request.replace,
+            "require_token": request.require_token,
+            "start_phase": "admitted",
+            "systemd_unit": f"clio-relay-session-{generation}.scope",
+            "systemd_description": (
+                f"clio-relay-owned-session:{request.session_id}:{generation}:{'d' * 32}"
+            ),
+            "systemd_cgroup_path": None,
+            "systemd_invocation_id": None,
+            "containment_broker_pid": None,
+            "containment_broker_start_identity": None,
+        },
+        error="owned API process exited before readiness; api_log=bounded diagnostic",
+    )
+    queue = ClioCoreQueue(root / "core")
+    assert (
+        queue.prepare_owner_session_start(
+            request.session_id,
+            recorded_generation_id=None,
+            candidate_generation_id=generation,
+        )
+        == generation
+    )
+    proc_root = root / "proc"
+    proc_root.mkdir()
+    return request, transaction, queue, proc_root
 
 
 def _legacy_existing_start_fixture(
@@ -637,6 +746,125 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.running is False
     assert status.ownership_verified is True
     assert status.errors == []
+
+
+def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request, transaction, queue, proc_root = _failed_start_fixture(tmp_path)
+    generation = "generation-failed-start"
+    teardown = OwnedSessionTeardownRequest(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        expected_session_generation_id=generation,
+        expected_cleanup_operation_id="cleanup_failed_start",
+    )
+    containment = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(
+        containment,
+        "adopt_linux_systemd_scope_identity",
+        _no_adopted_scope,
+    )
+
+    report = session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        request=teardown,
+        queue=queue,
+        proc_root=proc_root,
+    )
+
+    receipt = transaction.read_json("metadata.json")
+    assert receipt is not None
+    assert receipt["schema_version"] == ("clio-relay.owner-session-failed-cleaned-receipt.v1")
+    assert receipt["process_absence_verified"] is True
+    assert receipt["owned_relay_job_ids"] == []
+    assert receipt["cleanup_policy"] == {
+        "stop_worker": False,
+        "cancel_jobs": False,
+        "cancel_scheduler_jobs": False,
+    }
+    assert "owner_token" not in receipt
+    assert report.resources[0].metadata["failed_start"] is True
+    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster=request.cluster,
+        session_id=request.session_id,
+        document=receipt,
+        core_dir=queue.root,
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        proc_root=proc_root,
+    )
+    assert status.recovery_verified is True
+    assert status.start_state == "failed_cleaned"
+    assert status.process_state == "cleanup_pending"
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "open_owned_session_transaction",
+        _fake_transaction_opener(transaction),
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    retried = session_lifecycle.execute_owned_session_teardown(
+        teardown,
+        home=tmp_path / "home",
+        core_dir=queue.root,
+        proc_root=proc_root,
+    )
+    assert retried == report
+
+    queue.set_owner_session_closed(
+        request.session_id,
+        session_generation_id=generation,
+    )
+    closed = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster=request.cluster,
+        session_id=request.session_id,
+        document=cast(dict[str, object], transaction.read_json("metadata.json")),
+        core_dir=queue.root,
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        proc_root=proc_root,
+    )
+    assert closed.recovery_verified is True
+    assert closed.process_state == "already_closed"
+
+
+def test_failed_cleaned_receipt_rejects_job_membership_drift(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    request, transaction, queue, proc_root = _failed_start_fixture(tmp_path)
+    containment = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(
+        containment,
+        "adopt_linux_systemd_scope_identity",
+        _no_adopted_scope,
+    )
+    teardown = OwnedSessionTeardownRequest(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        expected_session_generation_id="generation-failed-start",
+        expected_cleanup_operation_id="cleanup_failed_start",
+    )
+    session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        request=teardown,
+        queue=queue,
+        proc_root=proc_root,
+    )
+    receipt = cast(dict[str, object], transaction.read_json("metadata.json"))
+    receipt["owned_relay_job_ids"] = ["job-not-observed"]
+
+    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster=request.cluster,
+        session_id=request.session_id,
+        document=receipt,
+        core_dir=queue.root,
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        proc_root=proc_root,
+    )
+
+    assert status.recovery_verified is False
+    assert "receipt identity is invalid" in "; ".join(status.errors)
 
 
 def test_owned_session_recovery_accepts_canonical_home_transaction(
@@ -1593,6 +1821,148 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
     assert result.retryable is True
     assert result.transition_accepted is True
     assert result.session_generation_id == "generation-start"
+    assert result.usable is False
+
+
+def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
+    definition, _release, plan = _durable_start_plan()
+    observations = iter(
+        (
+            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                plan=plan,
+                status=_durable_start_status(plan, state="starting"),
+                transport_deadline_exceeded=False,
+            ),
+            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                plan=plan,
+                status=_durable_start_status(plan, state="ready"),
+                transport_deadline_exceeded=False,
+            ),
+        )
+    )
+    sleeps: list[float] = []
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=10.0,
+        query=lambda: next(observations),
+        sleep=sleeps.append,
+    )
+
+    assert result.state == "ready"
+    assert result.usable is True
+    assert result.watch_deadline_exceeded is False
+    assert sleeps
+
+
+def test_start_watch_detaches_with_exact_unusable_handle() -> None:
+    definition, _release, plan = _durable_start_plan()
+    pending = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        plan=plan,
+        status=_durable_start_status(plan, state="starting"),
+        transport_deadline_exceeded=False,
+    )
+    moments = iter((0.0, 2.0))
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=1.0,
+        query=lambda: pending,
+        monotonic=lambda: next(moments),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.state == "starting"
+    assert result.usable is False
+    assert result.watch_deadline_exceeded is True
+    assert result.status_selector == plan.status_selector
+    assert "status_selector" in cast(str, result.error)
+
+
+def test_owned_api_startup_diagnostic_keeps_oversized_redacted_tail(tmp_path: Path) -> None:
+    transaction = _FakeSessionTransaction(tmp_path)
+    api_token = "api-token-value-that-must-not-leak"
+    frp_token = "frp-token-value-that-must-not-leak"
+    (tmp_path / "api.log").write_text(
+        "x" * 9000
+        + f"\nCLIO_RELAY_API_TOKEN={api_token}\n"
+        + f"CLIO_RELAY_FRP_TOKEN='{frp_token}'\n"
+        + "authorization: Bearer unknown-bearer-value\n"
+        + "final traceback line\n",
+        encoding="utf-8",
+    )
+
+    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        secret_values=(api_token, frp_token),
+    )
+
+    assert len(detail) <= 8192
+    assert "final traceback line" in detail
+    assert api_token not in detail
+    assert frp_token not in detail
+    assert "unknown-bearer-value" not in detail
+    assert detail.count("<redacted>") >= 3
+
+
+def test_owned_api_startup_diagnostic_redacts_secret_crossing_tail_boundary(
+    tmp_path: Path,
+) -> None:
+    """The bounded diagnostic must not retain a suffix of a known credential."""
+    transaction = _FakeSessionTransaction(tmp_path)
+    api_token = "secret-boundary-" + "0123456789abcdef" * 32
+    (tmp_path / "api.log").write_text(
+        "startup noise\n"
+        f"CLIO_RELAY_API_TOKEN={api_token}\n" + "z" * 7900 + "\nfinal traceback line\n",
+        encoding="utf-8",
+    )
+
+    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        secret_values=(api_token,),
+    )
+
+    assert len(detail) <= 8192
+    assert "final traceback line" in detail
+    assert "CLIO_RELAY_API_TOKEN=<redacted>" in detail
+    assert api_token[-128:] not in detail
+
+
+def test_owned_api_startup_diagnostic_discards_unknown_bearer_crossing_tail_boundary(
+    tmp_path: Path,
+) -> None:
+    """A truncated first line cannot expose an unregistered credential suffix."""
+    transaction = _FakeSessionTransaction(tmp_path)
+    bearer_value = "unknown-bearer-" + "0123456789abcdef" * 600
+    (tmp_path / "api.log").write_text(
+        f"authorization: Bearer {bearer_value}\nfinal traceback line\n",
+        encoding="utf-8",
+    )
+
+    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        secret_values=(),
+    )
+
+    assert detail == "final traceback line"
+    assert bearer_value[-128:] not in detail
+
+
+def test_owned_api_startup_diagnostic_fails_closed_for_non_utf8_secret(
+    tmp_path: Path,
+) -> None:
+    """An environment value that cannot match decoded logs disables the diagnostic."""
+    transaction = _FakeSessionTransaction(tmp_path)
+    (tmp_path / "api.log").write_bytes(b"startup failed\n")
+
+    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        secret_values=("credential-\udcff-value",),
+    )
+
+    assert detail == ""
 
 
 def test_durable_start_status_transport_failure_is_ambiguous(

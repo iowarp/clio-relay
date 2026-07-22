@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
@@ -35,19 +36,21 @@ from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 
 class _LostRunResponseProvider(JarvisCdProvider):
-    """Execute one outer JARVIS transport whose MCP result never arrives."""
+    """Execute one endpoint MCP transport whose result never arrives."""
 
     def __init__(self, *, release_dispatch: bool = True) -> None:
         super().__init__(jarvis_bin="jarvis")
         self.dispatch_count = 0
         self.release_dispatch = release_dispatch
 
-    def run_pipeline_streaming(
+    def run_command_streaming(
         self,
-        pipeline_path: Path,
+        command: list[str],
         *,
+        process_label: str = "JARVIS-CD",
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        credential_payload: str | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         on_start: Callable[[int], None] | None = None,
@@ -56,12 +59,12 @@ class _LostRunResponseProvider(JarvisCdProvider):
         timeout_seconds: int | None = None,
         on_timeout: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Return a failed transport without fabricating a workload result."""
-        del pipeline_path, cwd, should_cancel, timeout_seconds, on_timeout
+        """Return a failed direct MCP transport without fabricating a result."""
+        del command, cwd, credential_payload, should_cancel, timeout_seconds, on_timeout
         self.dispatch_count += 1
+        assert process_label == "endpoint MCP operation"
         assert env is not None
         Path(env["CLIO_RELAY_PROGRESS_FILE"]).write_text("", encoding="utf-8")
-        Path(env["CLIO_RELAY_RUNTIME_METADATA_FILE"]).write_text("", encoding="utf-8")
         if on_start is not None and self.release_dispatch:
             probe = subprocess.Popen([sys.executable, "-c", "pass"])
             on_start(probe.pid)
@@ -247,6 +250,7 @@ def _execution_query_document(
         "server": spec.server,
         "server_args": spec.server_args,
         "expected_server_artifact_digest": spec.expected_server_artifact_digest,
+        "expected_registered_contract": spec.expected_registered_contract,
         "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
         "observed_server_artifact_digest": spec.expected_server_artifact_digest,
         "server_artifact": server_artifact,
@@ -279,15 +283,19 @@ def _execution_query_document(
     }
 
 
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
 def test_lost_run_response_converges_after_scheduler_assigns_native_id(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    registered: bool,
 ) -> None:
-    """A null-to-assigned SLURM identity eventually finalizes only the relay call."""
+    """Both supported JARVIS routes converge on the same durable scheduler identity."""
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
+    if registered:
+        server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
     submission = RelayJob(
@@ -297,7 +305,10 @@ def test_lost_run_response_converges_after_scheduler_assigns_native_id(
             server=command[0],
             server_args=command[1:],
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
+            expected_jarvis_cd_lock_binding=(
+                None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments={"pipeline_id": "durable-science"},
         ),
@@ -357,8 +368,13 @@ def test_lost_run_response_converges_after_scheduler_assigns_native_id(
     assert transport.dispatch_count == 1
     assert len(query_specs) == 1
     assert query_specs[0].tool == "jarvis_get_execution"
+    assert query_specs[0].expected_registered_contract == (
+        "clio-kit-jarvis-user-v3.6" if registered else None
+    )
     task = queue.list_tasks(job.job_id)[0]
     assert task.state is JobState.RUNNING
+    assert "runtime_sidecar_channel" not in task.metadata
+    assert "scheduler_submission_intent" not in task.metadata["execution_sidecars"]
     recovery = cast(dict[str, Any], task.metadata["jarvis_execution_recovery"])
     assert recovery["state"] == "pending"
     assert recovery["attempts"] == 1
@@ -405,6 +421,10 @@ def test_lost_run_response_converges_after_scheduler_assigns_native_id(
     assert transport.dispatch_count == 1
     assert len(query_specs) == 2
     assert all(spec.tool == "jarvis_get_execution" for spec in query_specs)
+    assert all(
+        spec.expected_registered_contract == ("clio-kit-jarvis-user-v3.6" if registered else None)
+        for spec in query_specs
+    )
     resolved = cast(dict[str, Any], completed_task.metadata["jarvis_execution_recovery"])
     assert resolved["state"] == "resolved"
     assert resolved["attempts"] == 2

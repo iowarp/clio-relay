@@ -51,6 +51,25 @@ The expected Ares acceptance includes:
 - verify transport through the configured path when transport behavior is in scope.
 - verify detach and teardown behavior when lifecycle behavior is in scope.
 
+For endpoint/session, remote-MCP, staging, or provenance changes, current live
+evidence must also prove the relevant boundary before it is claimed:
+
+- a persistent endpoint recovers from a process exit across desktop disconnect,
+  while an intentional service stop remains stopped and is reported distinctly;
+- a nonterminal session start remains unusable and resumable through its exact
+  status selector, and a pre-metadata failure converges to verified
+  `failed_cleaned` cleanup without default job cancellation;
+- a generic remote MCP call runs in endpoint containment with
+  `outer_jarvis_pipeline=false` and creates no scheduler allocation;
+- a package-declared v3.6 local file is hash-pinned, ingested, rewritten, and
+  inherited by the exact later JARVIS run after an MCP reconnect; and
+- edge provenance and any transform record round-trip through the authenticated
+  released API without changing legacy dependency identities.
+
+These are acceptance requirements, not evidence that the current candidate has
+already passed them. Record the actual released-artifact run before making a
+live-validation claim.
+
 ## recent live evidence
 
 Historical release-candidate evidence is retained in

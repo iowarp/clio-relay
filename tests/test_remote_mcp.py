@@ -111,6 +111,123 @@ def test_control_query_classification_requires_explicit_safe_annotations(
     assert is_remote_mcp_control_query(tool) is expected
 
 
+@pytest.mark.parametrize(
+    ("contract_id", "artifact_name"),
+    [
+        ("clio-kit-jarvis-user-v3.6", "jarvis-user-v3.6.json"),
+        ("clio-kit-jarvis-user-v3.5", "jarvis-user-v3.5.json"),
+    ],
+)
+def test_registered_jarvis_contract_accepts_current_and_frozen_legacy(
+    contract_id: str,
+    artifact_name: str,
+) -> None:
+    """The current and immediately preceding JARVIS contracts remain loadable."""
+    artifact = cast(
+        dict[str, object],
+        json.loads(
+            (Path(remote_mcp.__file__).with_name("_contracts") / artifact_name).read_text(
+                encoding="utf-8"
+            )
+        ),
+    )
+    tools = cast(list[dict[str, object]], artifact["tools"])
+    tool_names = [cast(str, tool["name"]) for tool in tools]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=["--from", "/opt/wheels/clio-kit.whl", "jarvis-mcp"],
+        allow_tools=tool_names,
+        profiles=["user"],
+        contract=cast(Any, contract_id),
+    )
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="jarvis",
+        tools=tools,
+    )
+
+    check = remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is True
+    assert check.evidence["declared_contract"] == contract_id
+    assert check.evidence["expected_contract_sha256"] == artifact["contract_sha256"]
+    assert check.evidence["expected_wire_sha256"] == artifact["wire_sha256"]
+    assert check.evidence["expected_contract_artifact"] == artifact_name
+    assert (
+        check.evidence["expected_contract_artifact_sha256"]
+        == hashlib.sha256(
+            (Path(remote_mcp.__file__).with_name("_contracts") / artifact_name).read_bytes()
+        ).hexdigest()
+    )
+
+
+def test_registered_jarvis_workload_admission_uses_exact_operator_route(
+    tmp_path: Path,
+) -> None:
+    """v3.6 mutations run as workload only when registration identity is exact."""
+    registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        args=["mcp-server", "jarvis"],
+        allow_tools=["jarvis_run"],
+        profiles=["user"],
+        contract="clio-kit-jarvis-user-v3.6",
+        call_timeout_seconds=300,
+    )
+    definition = _cluster("alpha", {"jarvis": registration})
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    admission, authority = remote_mcp.resolve_registered_remote_mcp_admission(
+        queue=queue,
+        definition=definition,
+        cluster="alpha",
+        server=registration.command,
+        server_args=registration.args,
+        env_from=registration.env_from,
+        operation=McpOperation.TOOLS_CALL,
+        tool="jarvis_run",
+        expected_server_artifact_digest="a" * 64,
+        expected_registered_contract="clio-kit-jarvis-user-v3.6",
+        evidence=None,
+        timeout_seconds=300,
+    )
+
+    assert admission is McpAdmissionClass.WORKLOAD
+    assert authority is None
+    with pytest.raises(ValueError, match="semantic contract changed"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_CALL,
+            tool="jarvis_run",
+            expected_server_artifact_digest="a" * 64,
+            expected_registered_contract="clio-kit-jarvis-user-v3.5",
+            evidence=None,
+            timeout_seconds=300,
+        )
+    with pytest.raises(ValueError, match="match exactly one operator registration"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server="other-clio-kit",
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_CALL,
+            tool="jarvis_run",
+            expected_server_artifact_digest="a" * 64,
+            expected_registered_contract="clio-kit-jarvis-user-v3.6",
+            evidence=None,
+            timeout_seconds=300,
+        )
+
+
 def test_registered_control_query_requires_exact_durable_discovery_evidence(
     tmp_path: Path,
 ) -> None:
@@ -192,6 +309,21 @@ def test_registered_control_query_requires_exact_durable_discovery_evidence(
     assert authority is not None
     assert authority.source == "registered_discovery_artifact"
     assert authority.evidence == evidence
+    with pytest.raises(ValueError, match="semantic contract changed"):
+        remote_mcp.resolve_registered_remote_mcp_admission(
+            queue=queue,
+            definition=definition,
+            cluster="alpha",
+            server=registration.command,
+            server_args=registration.args,
+            env_from=registration.env_from,
+            operation=McpOperation.TOOLS_CALL,
+            tool="inspect",
+            expected_server_artifact_digest=server_digest,
+            evidence=evidence,
+            expected_registered_contract="clio-kit-jarvis-user-v3.6",
+            timeout_seconds=registration.call_timeout_seconds,
+        )
     with pytest.raises(ValueError, match="schema does not match"):
         remote_mcp.resolve_registered_remote_mcp_admission(
             queue=queue,
@@ -1179,6 +1311,43 @@ def test_virtual_remote_mcp_relay_envelope_is_local_and_collision_safe() -> None
             "wait_for_terminal": True,
         }
     )
+
+
+def test_registered_jarvis_v36_describe_advertises_terminal_reconciliation_default() -> None:
+    """The generated tool contract matches relay's durable package-description semantics."""
+    route = remote_mcp.RemoteMcpRoute(
+        cluster="alpha",
+        server_name="jarvis",
+        command="clio-kit",
+        args=("mcp-server", "jarvis"),
+        env_from=(),
+        expected_server_artifact_digest="a" * 64,
+        remote_tool_name="jarvis_describe",
+        timeout_seconds=300,
+        contract=remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+        cluster_route_revision="b" * 64,
+        registration_revision="c" * 64,
+    )
+    virtual = remote_mcp.VirtualRemoteMcpTool(
+        alias="remote_jarvis_jarvis_describe",
+        namespace="remote_jarvis",
+        remote_tool=RemoteMcpToolSchema(
+            name="jarvis_describe",
+            input_schema={
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        ),
+        routes={"alpha": route},
+        arguments_wrapped=False,
+    )
+
+    definition = virtual.definition()
+
+    assert definition["inputSchema"]["properties"]["wait_for_terminal"]["default"] is True
+    assert "transparently reconciled" in definition["description"]
 
 
 def test_cluster_injection_wraps_nonempty_root_id_without_changing_remote_schema() -> None:
