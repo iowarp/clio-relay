@@ -585,7 +585,7 @@ def test_packaged_stdio_session_rejects_jarvis_schema_mismatch(
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
 
-    with pytest.raises(RelayError, match="JARVIS v3.5 agent-facing schema did not match"):
+    with pytest.raises(RelayError, match="JARVIS v3.6 agent-facing schema did not match"):
         run_packaged_mcp_stdio_session(profile="user", tool="jarvis_run", arguments={})
 
 

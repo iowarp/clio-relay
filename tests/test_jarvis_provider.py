@@ -62,6 +62,35 @@ def test_jarvis_environment_sanitization_removes_progress_and_runtime_secrets() 
     assert sanitized == {"SAFE_VALUE": "present"}
 
 
+def test_direct_command_spawn_failure_uses_the_callers_process_label(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A generic contained command must not be reported as a JARVIS launch."""
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected spawn refusal")
+
+    monkeypatch.setattr(
+        jarvis_provider.process_containment,
+        "spawn_owned_process",
+        fail_spawn,
+    )
+
+    with pytest.raises(
+        RelayError,
+        match="failed to execute endpoint MCP operation: injected spawn refusal",
+    ):
+        JarvisCdProvider().run_command_streaming(
+            ["unavailable-endpoint-runner"],
+            process_label="endpoint MCP operation",
+        )
+    with pytest.raises(
+        RelayError,
+        match="failed to execute contained command: injected spawn refusal",
+    ):
+        JarvisCdProvider().run_command_streaming(["unavailable-contained-command"])
+
+
 def test_streaming_cancel_terminates_child_in_separate_process_group() -> None:
     provider = JarvisCdProvider()
     child_pids: list[int] = []

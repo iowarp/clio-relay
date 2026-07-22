@@ -28,6 +28,7 @@ DEFAULT_MAX_LOG_BYTES_PER_STREAM = 64 * 1_048_576
 DEFAULT_MAX_LOG_BYTES_PER_JOB = 2 * DEFAULT_MAX_LOG_BYTES_PER_STREAM
 LOG_CAPTURE_SCHEMA = "clio-relay.log-capture.v1"
 LOG_CAPTURE_LOCK_TIMEOUT_SECONDS = 10
+INPUT_ARTIFACT_LOCK_TIMEOUT_SECONDS = 10
 ARTIFACT_OWNERSHIP_SCHEMA = "clio-relay.owned-artifact.v1"
 
 
@@ -153,6 +154,100 @@ class JobSpool:
             encoding="utf-8",
         )
         return target
+
+    def write_input_artifact(
+        self,
+        logical_name: str,
+        payload: bytes,
+        *,
+        size_bytes: int,
+        sha256: str,
+    ) -> Path:
+        """Atomically persist or reconcile one content-pinned input file."""
+        if len(payload) != size_bytes:
+            raise ValueError("input artifact payload size does not match its declared size")
+        observed_sha256 = hashlib.sha256(payload).hexdigest()
+        if not secrets.compare_digest(observed_sha256, sha256):
+            raise ValueError("input artifact payload SHA-256 does not match its declaration")
+        if (
+            not logical_name
+            or Path(logical_name).name != logical_name
+            or logical_name in {".", ".."}
+        ):
+            raise ValueError("input artifact logical_name must be one filename")
+
+        self.initialize()
+        logical_directory = self.path / "inputs"
+        storage_directory = self._storage_path / logical_directory.name
+        storage_directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        _lstat_owned_directory(storage_directory)
+        logical_target = logical_directory / logical_name
+        storage_target = storage_directory / logical_name
+        lock = FileLock(
+            str(self._storage_path / ".input-artifact.lock"),
+            timeout=INPUT_ARTIFACT_LOCK_TIMEOUT_SECONDS,
+        )
+        with lock:
+            try:
+                os.lstat(storage_target)
+            except FileNotFoundError:
+                pass
+            else:
+                existing = snapshot_owned_regular_file(
+                    logical_target,
+                    owned_root=self.path,
+                    max_bytes=size_bytes,
+                )
+                if existing.size_bytes != size_bytes or not secrets.compare_digest(
+                    existing.sha256,
+                    sha256,
+                ):
+                    raise RuntimeError(
+                        "existing input artifact content does not match its durable identity"
+                    )
+                return logical_target
+
+            temporary_name = f".input-{secrets.token_hex(16)}.tmp"
+            storage_temporary = storage_directory / temporary_name
+            logical_temporary = logical_directory / temporary_name
+            descriptor = -1
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_BINARY", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                descriptor = os.open(storage_temporary, flags, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                staged = snapshot_owned_regular_file(
+                    logical_temporary,
+                    owned_root=self.path,
+                    max_bytes=size_bytes,
+                )
+                if staged.size_bytes != size_bytes or not secrets.compare_digest(
+                    staged.sha256,
+                    sha256,
+                ):
+                    raise RuntimeError("staged input artifact failed content verification")
+                os.replace(storage_temporary, storage_target)
+                committed = snapshot_owned_regular_file(
+                    logical_target,
+                    owned_root=self.path,
+                    max_bytes=size_bytes,
+                )
+                if committed.size_bytes != size_bytes or not secrets.compare_digest(
+                    committed.sha256,
+                    sha256,
+                ):
+                    raise RuntimeError("committed input artifact failed content verification")
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                storage_temporary.unlink(missing_ok=True)
+        return logical_target
 
     def append_stdout(self, text: str) -> LogAppendResult:
         """Append standard output within the configured durable byte quotas."""

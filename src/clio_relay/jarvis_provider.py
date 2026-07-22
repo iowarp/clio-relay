@@ -163,6 +163,7 @@ class JarvisCdProvider:
                     "server_args": spec.server_args or None,
                     "env_from": spec.env_from or None,
                     "expected_server_artifact_digest": spec.expected_server_artifact_digest,
+                    "expected_registered_contract": spec.expected_registered_contract,
                     "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
                     "operation": spec.operation.value,
                     "tool": spec.tool,
@@ -263,6 +264,7 @@ class JarvisCdProvider:
         self,
         command: list[str],
         *,
+        process_label: str = "contained command",
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         credential_payload: str | None = None,
@@ -275,6 +277,13 @@ class JarvisCdProvider:
         on_timeout: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run a command and stream output chunks while retaining final output."""
+        normalized_process_label = process_label.strip()
+        if (
+            not normalized_process_label
+            or len(normalized_process_label) > 80
+            or any(character in normalized_process_label for character in "\x00\r\n")
+        ):
+            raise ValueError("process_label must be a bounded single-line label")
         try:
             process = process_containment.spawn_owned_process(
                 command,
@@ -290,7 +299,7 @@ class JarvisCdProvider:
                 bufsize=1,
             )
         except (OSError, RuntimeError) as exc:
-            raise RelayError(f"failed to execute JARVIS-CD: {exc}") from exc
+            raise RelayError(f"failed to execute {normalized_process_label}: {exc}") from exc
         stdout_tail = _BoundedTextTail()
         stderr_tail = _BoundedTextTail()
         stream_errors: list[BaseException] = []

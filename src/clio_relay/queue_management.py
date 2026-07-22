@@ -639,6 +639,8 @@ def _diagnose_job(
 
     if job.state in TERMINAL_STATES:
         reason = "terminal"
+    elif job.kind is JobKind.INPUT_INGEST and job.state is JobState.QUEUED:
+        reason = "input_ingest_in_progress"
     elif job.state == JobState.QUEUED:
         if not admission_complete:
             reason = "admission_analysis_incomplete"
@@ -919,6 +921,22 @@ def _queue_evidence(
     admission_snapshot: _AdmissionSnapshot,
 ) -> dict[str, object]:
     raw = _raw_queue_evidence(job, jobs, scan_truncated=scan_truncated)
+    if job.kind is JobKind.INPUT_INGEST and job.state is JobState.QUEUED:
+        admission: dict[str, object] = {
+            "analysis_complete": True,
+            "applicable": False,
+            "target_admissible_now": False,
+            "target_ineligibility": "internal_input_ingest",
+            "effective_blocking_job_ids": [],
+            "effective_blocking_job_ids_truncated": False,
+        }
+        return {
+            **raw,
+            "raw_submission_order": _raw_submission_payload(raw),
+            "blocking_job_ids": [],
+            "blocking_job_ids_truncated": False,
+            "admission": admission,
+        }
     if job.state != JobState.QUEUED:
         admission: dict[str, object] = {
             "analysis_complete": True,
@@ -1121,6 +1139,15 @@ def _queued_admission_evidence(
     target_ineligibility: str | None = None
     target_admissible = False
     for candidate in ordered[: target_index + 1]:
+        is_target = candidate.job_id == job.job_id
+        if candidate.kind is JobKind.INPUT_INGEST:
+            if is_target:
+                target_ineligibility = "internal_input_ingest"
+                break
+            skipped_predecessors.append(
+                {"job_id": candidate.job_id, "reason": "internal_input_ingest"}
+            )
+            continue
         cleanup_pending = queue.job_has_pending_execution_cleanup(
             candidate.job_id,
             cluster=candidate.cluster,
@@ -1129,7 +1156,6 @@ def _queued_admission_evidence(
         kind_saturated = (
             kind_limit is not None and simulated_counts.get(candidate.kind, 0) >= kind_limit
         )
-        is_target = candidate.job_id == job.job_id
         if cleanup_pending:
             if is_target:
                 target_ineligibility = "pending_execution_cleanup"

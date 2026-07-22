@@ -121,8 +121,10 @@ def monitor_job(
 def job_status(queue: ClioCoreQueue, job_id: str) -> dict[str, object]:
     """Return current job, relay queue, and scheduler status."""
     job = queue.get_job(job_id)
+    transform = queue.get_transform_ref(job_id)
     return {
         "job": job.model_dump(mode="json"),
+        "transform": None if transform is None else transform.model_dump(mode="json"),
         "relay_queue": relay_queue_status(queue, job),
         "scheduler": scheduler_status_for_job(queue, job_id),
         "terminal": job.state in TERMINAL_STATES,

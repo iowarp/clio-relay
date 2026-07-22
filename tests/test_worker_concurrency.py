@@ -166,6 +166,7 @@ def test_worker_status_reports_policy_usage_and_conflicts(tmp_path: Path) -> Non
         "jarvis": 0,
         "remote_agent": 1,
         "mcp_call": 0,
+        "input_ingest": 0,
     }
 
     queue.register_endpoint(

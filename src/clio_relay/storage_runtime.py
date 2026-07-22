@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Protocol
 from clio_relay.core_queue import (
     DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     MAX_ACTIVE_JOB_RECORDS,
+    MAX_INPUT_INGEST_RECOVERY_BATCH,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
     QueueSealRequiresExclusive,
@@ -30,6 +31,7 @@ from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictEr
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (
     TERMINAL_STATES,
+    InputArtifactIngestPolicy,
     JobKind,
     JobState,
     Lease,
@@ -509,6 +511,111 @@ class StorageManagedQueue(ClioCoreQueue):
             self._release_reservation(saved.job_id, terminal_job=saved)
         return saved
 
+    def begin_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str,
+        policy: InputArtifactIngestPolicy | None = None,
+    ) -> tuple[RelayJob, bool]:
+        """Claim an ingest, restoring storage admission for an exact failed retry."""
+        try:
+            with self.storage_runtime.policy.admission_lock():
+                current = self.get_job(job_id)
+                if current.state is not JobState.FAILED:
+                    if current.state not in TERMINAL_STATES:
+                        self._verify_existing_reservation(current)
+                    return super().begin_input_ingest(
+                        job_id,
+                        attempt_id=attempt_id,
+                        policy=policy,
+                    )
+
+                estimate = self.storage_runtime.estimate(current)
+                self.storage_runtime.ensure_new_intake_allowed()
+                decision = self.storage_runtime.policy.reserve(
+                    current.job_id,
+                    core_bytes=estimate.core_bytes,
+                    spool_bytes=estimate.spool_bytes,
+                )
+                if not decision.allowed:
+                    raise StorageAdmissionError(decision)
+                try:
+                    saved, changed = super().begin_input_ingest(
+                        job_id,
+                        attempt_id=attempt_id,
+                        policy=policy,
+                    )
+                except BaseException:
+                    self._release_reservation(current.job_id, terminal_job=None)
+                    raise
+                if saved.state in TERMINAL_STATES:
+                    self._release_reservation(saved.job_id, terminal_job=saved)
+                return saved, changed
+        except StoragePolicyError as exc:
+            raise StorageAdmissionError(_policy_error_decision(exc)) from exc
+
+    def fail_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str,
+        error: str,
+    ) -> tuple[RelayJob, bool]:
+        """Release reserved capacity after the exact ingest attempt fails."""
+        try:
+            with self.storage_runtime.policy.admission_lock():
+                saved, changed = super().fail_input_ingest(
+                    job_id,
+                    attempt_id=attempt_id,
+                    error=error,
+                )
+                if saved.state in TERMINAL_STATES:
+                    self._release_reservation(saved.job_id, terminal_job=saved)
+                return saved, changed
+        except StoragePolicyError as exc:
+            raise StorageAdmissionError(_policy_error_decision(exc)) from exc
+
+    def recover_abandoned_input_ingests(
+        self,
+        *,
+        cluster: str,
+        stale_before: datetime | None = None,
+        limit: int = MAX_INPUT_INGEST_RECOVERY_BATCH,
+    ) -> list[RelayJob]:
+        """Release capacity for bounded synchronous ingests recovered as failed."""
+        try:
+            with self.storage_runtime.policy.admission_lock():
+                recovered = super().recover_abandoned_input_ingests(
+                    cluster=cluster,
+                    stale_before=stale_before,
+                    limit=limit,
+                )
+                for job in recovered:
+                    if job.state in TERMINAL_STATES:
+                        self._release_reservation(job.job_id, terminal_job=job)
+                return recovered
+        except StoragePolicyError as exc:
+            raise StorageAdmissionError(_policy_error_decision(exc)) from exc
+
+    def complete_input_ingest(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str | None = None,
+    ) -> tuple[RelayJob, bool]:
+        """Release reserved capacity after atomic ingest completion or replay."""
+        try:
+            with self.storage_runtime.policy.admission_lock():
+                saved, changed = super().complete_input_ingest(
+                    job_id,
+                    attempt_id=attempt_id,
+                )
+                self._release_reservation(saved.job_id, terminal_job=saved)
+                return saved, changed
+        except StoragePolicyError as exc:
+            raise StorageAdmissionError(_policy_error_decision(exc)) from exc
+
     def cancel_job_if_active(
         self,
         job_id: str,
@@ -632,6 +739,8 @@ class StorageManagedQueue(ClioCoreQueue):
             ):
                 if queued.cluster != cluster or queued.state is not JobState.QUEUED:
                     continue
+                if queued.kind is JobKind.INPUT_INGEST:
+                    continue
                 if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
                     queued,
                     mcp_admission_class,
@@ -692,6 +801,8 @@ class StorageManagedQueue(ClioCoreQueue):
             job = self.get_job(job_id)
             if job.cluster != cluster or job.state is not JobState.QUEUED:
                 return None
+            if job.kind is JobKind.INPUT_INGEST:
+                return None
             if self._job_has_pending_execution_cleanup_unlocked(  # pyright: ignore[reportPrivateUsage]
                 job.cluster,
                 job.job_id,
@@ -721,6 +832,8 @@ class StorageManagedQueue(ClioCoreQueue):
         """Reserve outside the core lock, then attempt an exact controlled lease."""
         normalized = normalize_kind_concurrency(kind_concurrency)
         submitted = self.submit_job(job)
+        if submitted.kind is JobKind.INPUT_INGEST:
+            return submitted, None
         self.recover_stale_jobs(cluster=submitted.cluster, max_attempts=max_attempts)
         with self._acquire_lock_with_replay():
             self._require_index_migration_complete()  # pyright: ignore[reportPrivateUsage]

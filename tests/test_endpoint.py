@@ -1667,65 +1667,6 @@ def _write_direct_runtime_sidecar(env: dict[str, str] | None) -> None:
     )
 
 
-def _write_native_mcp_transport_runtime_sidecar(env: dict[str, str] | None) -> None:
-    """Write the native direct JARVIS record used to transport one MCP call."""
-    assert env is not None
-    intent = cast(
-        dict[str, object],
-        json.loads(env["CLIO_RELAY_RUNTIME_SUBMISSION_INTENT"]),
-    )
-    execution_id = cast(str, intent["execution_id"])
-    pipeline_id = "clio-relay-mcp-call"
-    runtime_metadata: dict[str, object] = {
-        "execution_handle": {
-            "schema_version": "jarvis.execution.handle.v1",
-            "execution_id": execution_id,
-            "pipeline_id": pipeline_id,
-            "mode": "direct",
-            "scheduler_provider": None,
-            "scheduler_native_id": None,
-            "cluster": None,
-        },
-        "execution_record": {
-            "schema_version": "jarvis.execution.record.v1",
-            "execution_id": execution_id,
-            "pipeline_id": pipeline_id,
-            "pipeline_name": pipeline_id,
-            "mode": "direct",
-            "scheduler_provider": None,
-            "scheduler_native_id": None,
-            "cluster": None,
-            "state": "completed",
-            "submitted": False,
-            "terminal": True,
-            "created_at": "2026-07-16T14:00:00Z",
-            "updated_at": "2026-07-16T14:00:01Z",
-            "return_code": 0,
-            "error": None,
-            "metadata": {},
-        },
-        "progress": {
-            "schema_version": "jarvis.execution.progress.v1",
-            "execution_id": execution_id,
-            "pipeline_id": pipeline_id,
-            "execution_state": "completed",
-            "terminal": True,
-            "packages": [],
-        },
-    }
-    Path(env["CLIO_RELAY_RUNTIME_METADATA_FILE"]).write_text(
-        json.dumps(
-            runtime_sidecar_record(
-                runtime_metadata,
-                key=env["CLIO_RELAY_RUNTIME_METADATA_TOKEN"],
-                sequence=1,
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def _signed_progress_sidecar_record(
     progress: Mapping[str, object],
     *,
@@ -3046,9 +2987,11 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
     assert "relay_progress_token" not in progress[0].metadata
 
 
-def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
+def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    registered: bool,
 ) -> None:
     install_site_progress_plugin(monkeypatch)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
@@ -3056,6 +2999,8 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
+    if registered:
+        server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
     job = queue.submit_job(
         RelayJob(
@@ -3065,25 +3010,29 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
+                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
             ),
-            idempotency_key="virtual-jarvis-live-progress",
+            idempotency_key=f"virtual-jarvis-live-progress-{registered}",
         )
     )
     execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
     observed_running_progress: list[list[bool]] = []
+    mcp_server_command = command
 
     class LiveMcpProgressProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -3092,8 +3041,9 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, on_stdout, on_stderr, should_cancel
+            del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
             assert on_poll is not None
@@ -3131,11 +3081,11 @@ def test_virtual_jarvis_progress_is_visible_while_outer_job_is_running(
             _write_completed_jarvis_mcp_result(
                 cwd,
                 job=job,
-                command=command,
+                command=mcp_server_command,
                 digest=digest,
                 server_artifact=server_artifact,
             )
-            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -3187,14 +3137,17 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
         )
     )
     execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
+    mcp_server_command = command
 
     class MismatchedMcpProgressProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -3203,8 +3156,9 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, on_stdout, on_stderr, should_cancel
+            del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
             if on_start is not None:
@@ -3235,11 +3189,11 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
             _write_completed_jarvis_mcp_result(
                 cwd,
                 job=job,
-                command=command,
+                command=mcp_server_command,
                 digest=digest,
                 server_artifact=server_artifact,
             )
-            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -3292,14 +3246,17 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
         )
     )
     execution_id = cast(str, cast(McpCallSpec, job.spec).arguments["execution_id"])
+    mcp_server_command = command
 
     class NativeMcpProgressProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -3308,8 +3265,9 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, on_stdout, on_stderr, should_cancel
+            del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
             if on_start is not None:
@@ -3333,11 +3291,11 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
             _write_completed_jarvis_mcp_result(
                 cwd,
                 job=job,
-                command=command,
+                command=mcp_server_command,
                 digest=digest,
                 server_artifact=server_artifact,
             )
-            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -3453,6 +3411,7 @@ def _native_mcp_result_document(
     execution_id: str | None = None,
     server_artifact: dict[str, Any],
     arguments: dict[str, object] | None = None,
+    expected_registered_contract: str | None = None,
     mode: str = "direct",
     scheduler_provider: str | None = None,
     scheduler_native_id: str | None = None,
@@ -3567,7 +3526,12 @@ def _native_mcp_result_document(
         "server": command[0],
         "server_args": command[1:],
         "expected_server_artifact_digest": digest,
-        "expected_jarvis_cd_lock_binding": (endpoint_module.jarvis_cd_lock_binding_expectation()),
+        "expected_registered_contract": expected_registered_contract,
+        "expected_jarvis_cd_lock_binding": (
+            None
+            if expected_registered_contract is not None
+            else endpoint_module.jarvis_cd_lock_binding_expectation()
+        ),
         "observed_server_artifact_digest": digest,
         "server_artifact": server_artifact,
         "operation": "tools/call",
@@ -3604,6 +3568,7 @@ def _write_completed_jarvis_mcp_result(
                 execution_id=execution_id,
                 server_artifact=server_artifact,
                 arguments=spec.arguments,
+                expected_registered_contract=spec.expected_registered_contract,
             )
         ),
         encoding="utf-8",
@@ -5794,15 +5759,19 @@ def test_worker_indexes_agent_result_artifacts(tmp_path: Path) -> None:
     assert "agent_last_message.available" in [event.event_type for event in events]
 
 
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
 def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    registered: bool,
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     command = ["clio-kit", "mcp-server", "jarvis"]
     server_args = command[1:]
     server_artifact = verified_jarvis_server_artifact()
+    if registered:
+        server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(
         endpoint_module,
@@ -5817,23 +5786,27 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
+                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "runtime-test"},
             ),
-            idempotency_key="structured-jarvis-runtime",
+            idempotency_key=f"structured-jarvis-runtime-{registered}",
         )
     )
+    mcp_server_command = command
 
     class RuntimeProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -5842,10 +5815,10 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del on_stderr, should_cancel, on_poll, timeout_seconds, on_timeout
-            self.runs.append(pipeline_path)
+            del command, env, credential_payload, on_stderr, should_cancel
+            del on_poll, timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
-            _write_native_mcp_transport_runtime_sidecar(env)
             if on_start is not None:
                 on_start(700)
             if on_stdout is not None:
@@ -5855,12 +5828,13 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             (cwd / "mcp-result.json").write_text(
                 json.dumps(
                     _native_mcp_result_document(
-                        command=command,
+                        command=mcp_server_command,
                         digest=digest,
                         pipeline_id="runtime-test",
                         execution_id=execution_id,
                         server_artifact=server_artifact,
                         arguments=job.spec.arguments,
+                        expected_registered_contract=job.spec.expected_registered_contract,
                         mode="scheduler",
                         scheduler_provider="test-scheduler",
                         scheduler_native_id="structured-42",
@@ -5869,7 +5843,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 ),
                 encoding="utf-8",
             )
-            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     scheduler = FakeSchedulerProvider(
         SchedulerStatus(
@@ -5912,15 +5886,9 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     detected = [event for event in events if event.event_type == "scheduler.job_detected"]
     assert [event.payload["metadata_source"] for event in detected] == ["jarvis_mcp"]
     assert task.metadata["scheduler_job_ownership"][0]["ownership_verified"] is True
-    transport_runtime = cast(
-        dict[str, object],
-        task.metadata["mcp_transport_runtime_metadata"],
-    )
-    assert transport_runtime["source"] == "jarvis_sidecar"
-    assert transport_runtime["scheduler_job_id"] is None
-    assert transport_runtime["execution_id"] != runtime["execution_id"]
     event_types = {event.event_type for event in events}
-    assert "runtime.transport_metadata_superseded" in event_types
+    assert "mcp_transport_runtime_metadata" not in task.metadata
+    assert "runtime.transport_metadata_superseded" not in event_types
     assert "runtime.metadata_refused" not in event_types
 
 
@@ -5962,14 +5930,17 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
             idempotency_key=idempotency_key,
         )
     )
+    mcp_server_command = command
 
     class NativeRuntimeProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -5978,8 +5949,9 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, env, on_stderr, should_cancel, on_poll
+            del command, env, credential_payload, on_stderr, should_cancel, on_poll
             del timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
                 on_start(701)
@@ -5988,7 +5960,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
             (cwd / "mcp-result.json").write_text(
                 json.dumps(
                     _native_mcp_result_document(
-                        command=command,
+                        command=mcp_server_command,
                         digest=digest,
                         pipeline_id="native-direct",
                         execution_id=execution_id,
@@ -5997,7 +5969,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                 ),
                 encoding="utf-8",
             )
-            return subprocess.CompletedProcess(["jarvis"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -6116,12 +6088,14 @@ def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
     )
 
     class GenericProvider(RecordingProvider):
-        def run_pipeline_streaming(
+        def run_command_streaming(
             self,
-            pipeline_path: Path,
+            command: list[str],
             *,
+            process_label: str = "JARVIS-CD",
             cwd: Path | None = None,
             env: dict[str, str] | None = None,
+            credential_payload: str | None = None,
             on_stdout: Callable[[str], None] | None = None,
             on_stderr: Callable[[str], None] | None = None,
             on_start: Callable[[int], None] | None = None,
@@ -6130,8 +6104,10 @@ def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
             timeout_seconds: int | None = None,
             on_timeout: Callable[[], None] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del pipeline_path, env, on_stdout, on_stderr, should_cancel, on_poll
+            del command, env, credential_payload, on_stdout, on_stderr
+            del should_cancel, on_poll
             del timeout_seconds, on_timeout
+            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
                 on_start(702)
@@ -6153,7 +6129,7 @@ def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
                 ),
                 encoding="utf-8",
             )
-            return subprocess.CompletedProcess(["operator-mcp"], 0, "", "")
+            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
 
     worker = EndpointWorker(
         role=EndpointRole.WORKER,

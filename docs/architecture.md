@@ -12,7 +12,7 @@ The system has three roles:
 
 The queue boundary is `clio-core`. The file-backed queue in this repository is a development backend for the same record model.
 
-The durable records are jobs, tasks, leases, events, cursors, artifacts, progress, checkpoints, endpoint registrations, and idempotency records. Per-job spool directories hold backing files such as `stdout.log`, `stderr.log`, `pipeline.yaml`, and `provenance.json`, but those files are not the queue. Durable stdout and stderr capture has independent per-stream and whole-job byte quotas. The worker preserves only complete UTF-8 prefixes, emits one explicit truncation event per affected stream, and records observed, persisted, and dropped byte counts in `log-capture.json` and execution provenance. Queue output events are also split into bounded records, so a single write cannot bypass the durable limit.
+The durable records are jobs, tasks, leases, events, cursors, artifacts, artifact-use edges, transforms, progress, checkpoints, endpoint registrations, and idempotency records. Per-job spool directories hold backing files such as `stdout.log`, `stderr.log`, `pipeline.yaml`, and `provenance.json`, but those files are not the queue. Durable stdout and stderr capture has independent per-stream and whole-job byte quotas. The worker preserves only complete UTF-8 prefixes, emits one explicit truncation event per affected stream, and records observed, persisted, and dropped byte counts in `log-capture.json` and execution provenance. Queue output events are also split into bounded records, so a single write cannot bypass the durable limit.
 
 Worker slots define total process capacity. Optional per-job-kind limits are
 durable queue-admission policy, not thread-local semaphores: active same-cluster
@@ -44,7 +44,13 @@ process is absent.
 
 ## Execution
 
-JARVIS-CD owns cluster execution. A relay job describes the desired work. The worker materializes that intent into JARVIS inputs, runs JARVIS, streams output while the job is active, and writes provenance when the run ends.
+JARVIS-CD owns application and scheduler execution. A JARVIS relay job describes
+the desired work; the worker materializes that intent into JARVIS inputs, runs
+JARVIS, streams output while the job is active, and writes provenance when the
+run ends. A generic remote MCP job is a control-plane exception: the endpoint
+executes its bounded stdio request directly under relay-owned containment, with
+no outer JARVIS pipeline or scheduler allocation. If the called MCP tool then
+submits JARVIS work, that returned native execution remains JARVIS-owned.
 
 Application behavior belongs in JARVIS packages or operator-selected application profiles. JARVIS core owns execution identity, durable progress events, and aggregate progress snapshots; an individual package owns only the application-specific interpretation used to produce those events. Generic bootstrap and worker code do not import application modules or infer application log paths. The generic bounded-command package stays generic.
 
@@ -98,6 +104,13 @@ Schema discovery is a durable
 provenance are cached on the operator desktop; local MCP `tools/list` never
 starts a cluster process.
 
+The cluster-side MCP client and registered server run directly under endpoint
+process containment. They retain normal relay leases, cooperative cancellation,
+timeouts, bounded logs, immutable result artifacts, and restart reconciliation,
+but do not use a JARVIS adapter merely to perform protocol transport. Specialized
+JARVIS semantics require the exact immutable registered contract; a generic MCP
+tool cannot claim them by name.
+
 Fresh equivalent schemas across clusters become one deterministic local alias
 with a `cluster` routing property. The property is added to a copy of the
 remote input schema and removed before submission, so it never changes the
@@ -105,6 +118,32 @@ remote contract. Stale, command-mismatched, unsafe, or non-allowlisted schemas
 are excluded. Alias collisions receive stable content-derived suffixes.
 Paginated discovery is bounded by page, unique-tool, and response-byte limits;
 cursor cycles and conflicting duplicate definitions fail the durable job.
+
+For exact JARVIS contract v3.6 routes, package descriptions may declare a closed
+`jarvis.configuration-input-binding.v1` setting. Only that schema declaration
+authorizes relay to snapshot a bounded regular file under the configured local
+workspace, ingest it through the authenticated owner-generation API, replace
+the argument with its cluster-local content-addressed path, and attach its
+content pin to the job. Successful add-step lineage is durable across MCP client
+restart and is keyed by the complete route, server artifact, pipeline, and
+owner-session identity. Unannotated path-like strings and other contracts are
+never interpreted as upload requests.
+
+## provenance records
+
+An `ArtifactUse` content pin may carry additive, bounded
+`clio-relay.artifact-use-provenance.v1` evidence. The complete object is copied
+unchanged into the immutable forward and reverse `used` edge records. Its
+absence preserves the legacy wire form and digest; its presence becomes part of
+the dependency identity, so evidence cannot be silently replaced.
+
+An optional `clio-relay.transform-ref.v1` records one immutable activity per
+job independently of how many artifacts it used. It separates mechanism,
+non-secret fixed-field environment identity, and replay claim from individual
+edge evidence. Internal content-pinned evidence must exactly cover the job's
+dependencies; authority-only and zero-input activities are allowed. Transform
+records are read through authenticated job/status APIs, are not mutable through
+the agent-facing MCP surface, and are garbage-collected with their job.
 
 ## Transport
 
@@ -154,6 +193,22 @@ closed records and emits fresh evidence instead of treating their absence from a
 active-session scan as proof. If a scheduler job completes naturally during a
 cancel race, teardown may close after recording the terminal disposition, but the
 validation report does not claim that the job was canceled.
+
+Session start is also a durable transition. Planning creates exact secret-free
+status and retry selectors before mutation. A bounded start or watch can return
+an accepted but unusable handle; only a fully verified `ready` result authorizes
+attachment or submission. A watch deadline detaches the observer without making
+the transition terminal. If startup fails before normal metadata commit,
+teardown proves process absence and file identities and replaces the incomplete
+state with an immutable `failed_cleaned` receipt. That cleanup retains jobs and
+the persistent endpoint service unless the corresponding destructive policies
+were explicit.
+
+The endpoint worker lifetime is independent of a desktop session. Its enabled
+systemd user unit uses lingering for logout persistence and restart policy for
+clean or failed process exits. An operator stop remains stopped and is distinct
+from a crash or unexpected inactive state. The read-only endpoint-service status
+contract reports that distinction without mutating queue or scheduler state.
 
 ## Scheduler providers
 

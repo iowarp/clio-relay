@@ -35,6 +35,7 @@ from clio_relay.models import (
     McpOperation,
     RelayJob,
     RemoteAgentTaskSpec,
+    TransformRef,
     deterministic_jarvis_execution_id,
     is_owned_jarvis_run_spec,
 )
@@ -230,6 +231,57 @@ def submit_owned_session_job(
     ):
         raise RelayError("owned session API did not retain the expected MCP artifact binding")
     return job
+
+
+def record_owned_session_transform(
+    *,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+    transform: TransformRef,
+    timeout_seconds: float = 30.0,
+) -> TransformRef:
+    """Record one immutable transform through an exact-generation session API."""
+    document = request_owned_session_json(
+        definition=definition,
+        settings=settings,
+        method="POST",
+        path=f"/jobs/{transform.job_id}/transform",
+        body=cast(dict[str, object], transform.model_dump(mode="json")),
+        timeout_seconds=timeout_seconds,
+    )
+    try:
+        recorded = TransformRef.model_validate(document)
+    except ValidationError as exc:
+        raise RelayError("owned session API returned an invalid transform ref") from exc
+    if recorded != transform:
+        raise RelayError("owned session API did not retain the exact transform ref")
+    return recorded
+
+
+def get_owned_session_transform(
+    *,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+    job_id: str,
+    timeout_seconds: float = 30.0,
+) -> TransformRef | None:
+    """Read one nullable transform through an exact-generation session API."""
+    document = request_owned_session_json(
+        definition=definition,
+        settings=settings,
+        method="GET",
+        path=f"/jobs/{job_id}/transform",
+        timeout_seconds=timeout_seconds,
+    )
+    if document is None:
+        return None
+    try:
+        transform = TransformRef.model_validate(document)
+    except ValidationError as exc:
+        raise RelayError("owned session API returned an invalid transform ref") from exc
+    if transform.job_id != job_id:
+        raise RelayError("owned session API returned a transform for a different job")
+    return transform
 
 
 def request_owned_session_json(

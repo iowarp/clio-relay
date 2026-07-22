@@ -395,7 +395,7 @@ class PackagedMcpAcceptanceEvidence(BaseModel):
 
 
 class SecureRuntimeAcceptanceEvidence(BaseModel):
-    """Complete secret-free proof for one v3.5 secure runtime lifecycle."""
+    """Complete secret-free proof for one v3.6 secure runtime lifecycle."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -2052,8 +2052,8 @@ def _verify_secure_runtime_acceptance(
     try:
         with _validation_check(
             recorder,
-            "secure-runtime.jarvis-v3.5-query",
-            "query one execution-owned service through the pinned JARVIS v3.5 contract",
+            "secure-runtime.jarvis-v3.6-query",
+            "query one execution-owned service through the pinned JARVIS v3.6 contract",
             forbidden_values=forbidden_values,
         ) as evidence:
             query_deadline = time.monotonic() + options.timeout_seconds
@@ -3065,7 +3065,7 @@ def _select_secure_runtime_handoff(
     _query_receipt_artifact_identity(query_result)
     raw_bindings = query_result.get("service_runtime_bindings")
     if not isinstance(raw_bindings, list):
-        raise RelayError("JARVIS v3.5 execution query omitted service_runtime_bindings")
+        raise RelayError("JARVIS v3.6 execution query omitted service_runtime_bindings")
     if not raw_bindings:
         return None
     bindings: list[JarvisServiceRuntimeHandoff] = []

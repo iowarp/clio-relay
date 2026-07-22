@@ -24,16 +24,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.5.23"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.6.2"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "a2fb747fb2cdf4fdfcfd7c1056bcee8a84b3ea7a06c63e5b2a12defb11ad2de5"
+    "96ce0f85bacad637b715704565be0c57df9d1891193c1c00c3c85dc2904725a4"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -47,12 +47,12 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d"
+    "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366"
+    "c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023"
 )
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.5.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.6.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",

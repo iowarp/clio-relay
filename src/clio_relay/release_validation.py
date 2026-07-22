@@ -210,7 +210,7 @@ def run_local_release_validation(
         _run_required_tests(
             recorder,
             check_id="local.secure-runtime-acceptance",
-            summary="execute v3.5 secure runtime lifecycle and evidence acceptance tests",
+            summary="execute v3.6 secure runtime lifecycle and evidence acceptance tests",
             node_ids=_SECURE_RUNTIME_ACCEPTANCE_TESTS,
             root=root,
             runner=command_runner,

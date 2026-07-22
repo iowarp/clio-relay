@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.config import RelaySettings
+from clio_relay.config import (
+    MAX_INPUT_FILE_MAX_BYTES,
+    MAX_INPUT_TOTAL_MAX_BYTES,
+    RelaySettings,
+)
 
 
 def test_relay_settings_load_log_capture_quotas_from_environment(
@@ -104,6 +108,14 @@ def test_relay_settings_reject_partial_owner_session_identity(
             owner_session_id=owner_session_id,
             owner_session_generation_id=owner_session_generation_id,
         )
+
+
+def test_relay_settings_enforce_absolute_input_staging_bounds() -> None:
+    """Operator configuration cannot remove the HTTP and snapshot memory ceiling."""
+    with pytest.raises(ValueError, match="less than or equal"):
+        RelaySettings(input_file_max_bytes=MAX_INPUT_FILE_MAX_BYTES + 1)
+    with pytest.raises(ValueError, match="less than or equal"):
+        RelaySettings(input_total_max_bytes=MAX_INPUT_TOTAL_MAX_BYTES + 1)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])

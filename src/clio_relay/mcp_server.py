@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any, TextIO, cast
 from uuid import uuid4
 
@@ -38,6 +39,17 @@ from clio_relay.filesystem_paths import logical_filesystem_text
 from clio_relay.identifiers import (
     durable_record_id_json_schema,
     validate_durable_record_id,
+)
+from clio_relay.input_staging import (
+    REGISTERED_JARVIS_CONTRACT_ID,
+    JarvisPackageInputContract,
+    jarvis_package_input_contract_from_record,
+    jarvis_package_input_contract_record,
+    jarvis_package_input_route,
+    jarvis_pipeline_input_route,
+    merge_artifact_uses,
+    parse_jarvis_package_input_contract,
+    stage_jarvis_add_step_inputs,
 )
 from clio_relay.jarvis_mcp import (
     JARVIS_MCP_CACHE_SERVER_NAME,
@@ -66,6 +78,7 @@ from clio_relay.models import (
     Cursor,
     GatewaySession,
     GatewaySessionState,
+    JarvisPackageInputRoute,
     JarvisRunSpec,
     JobKind,
     JobState,
@@ -81,6 +94,8 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     TaskEventStatus,
     TaskTimelineEvent,
+    artifact_use_payload,
+    validate_artifact_use_collection,
 )
 from clio_relay.owner_session_admission import owner_session_gateway_admission
 from clio_relay.pagination import (
@@ -213,6 +228,31 @@ def _artifact_use_refs_json_schema() -> JSON:
             "properties": {
                 "artifact_id": durable_record_id_json_schema(),
                 "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                "provenance": {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": {
+                            "type": "string",
+                            "const": "clio-relay.artifact-use-provenance.v1",
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "enum": [
+                                "schema-arg",
+                                "hash-pair",
+                                "lease-window",
+                                "authority",
+                                "assertion",
+                            ],
+                        },
+                        "authority": {"type": "string", "maxLength": 4096},
+                        "external_ref": {"type": "string", "maxLength": 4096},
+                        "arg": {"type": "string", "maxLength": 512},
+                        "note": {"type": "string", "maxLength": 512},
+                    },
+                    "required": ["evidence"],
+                    "additionalProperties": False,
+                },
             },
             "required": ["artifact_id", "sha256"],
             "additionalProperties": False,
@@ -230,11 +270,19 @@ class McpSessionState:
     remote_job_routes: dict[str, set[tuple[str, str]]] = field(
         default_factory=lambda: dict[str, set[tuple[str, str]]]()
     )
+    jarvis_package_input_contracts: dict[str, JarvisPackageInputContract] = field(
+        default_factory=lambda: dict[str, JarvisPackageInputContract]()
+    )
+    jarvis_pipeline_input_uses: dict[str, tuple[ArtifactUse, ...]] = field(
+        default_factory=lambda: dict[str, tuple[ArtifactUse, ...]]()
+    )
 
     def reset(self) -> None:
         """Forget catalogs and job routes observed before a new MCP initialization."""
         self.remote_mcp_catalog_revisions.clear()
         self.remote_job_routes.clear()
+        self.jarvis_package_input_contracts.clear()
+        self.jarvis_pipeline_input_uses.clear()
 
     def observe_remote_mcp_catalog(self, *, profile: str, revision: str) -> None:
         """Record the exact remote-tool catalog rendered by ``tools/list``."""
@@ -266,6 +314,29 @@ class McpSessionState:
                 "route_revision from the intended receipt"
             )
         return next(iter(routes))
+
+    def remember_jarvis_package_inputs(self, contract: JarvisPackageInputContract) -> None:
+        """Remember one structured package description for this initialized client."""
+        self.jarvis_package_input_contracts[contract.cache_key] = contract
+
+    def jarvis_package_inputs(self, cache_key: str) -> JarvisPackageInputContract | None:
+        """Return one exact structured package input contract, if it was observed."""
+        return self.jarvis_package_input_contracts.get(cache_key)
+
+    def remember_jarvis_pipeline_inputs(
+        self,
+        cache_key: str,
+        uses: tuple[ArtifactUse, ...],
+    ) -> None:
+        """Remember immutable inputs accepted by one exact JARVIS pipeline route."""
+        existing = self.jarvis_pipeline_input_uses.get(cache_key, ())
+        self.jarvis_pipeline_input_uses[cache_key] = tuple(
+            merge_artifact_uses(list(existing), uses)
+        )
+
+    def jarvis_pipeline_inputs(self, cache_key: str) -> tuple[ArtifactUse, ...]:
+        """Return immutable inputs previously accepted for one exact pipeline route."""
+        return self.jarvis_pipeline_input_uses.get(cache_key, ())
 
 
 @dataclass(frozen=True)
@@ -403,6 +474,7 @@ def render_agent_mcp_profile(
     resolved = settings or RelaySettings.from_env()
     registry_path = default_registry_path().expanduser().resolve()
     cache_path = default_remote_mcp_cache_path(registry_path=registry_path).expanduser().resolve()
+    input_workspace_root = (resolved.input_workspace_root or Path.cwd()).expanduser().resolve()
     return "\n".join(
         [
             "[mcp_servers.clio-relay]",
@@ -414,6 +486,19 @@ def render_agent_mcp_profile(
             f"CLIO_RELAY_SPOOL_DIR = {_toml_string(str(resolved.spool_dir))}",
             f"CLIO_RELAY_CLUSTER_REGISTRY = {_toml_string(str(registry_path))}",
             f"CLIO_RELAY_REMOTE_MCP_CACHE = {_toml_string(str(cache_path))}",
+            (f"CLIO_RELAY_INPUT_WORKSPACE_ROOT = {_toml_string(str(input_workspace_root))}"),
+            (
+                "CLIO_RELAY_INPUT_FILE_MAX_BYTES = "
+                f"{_toml_string(str(resolved.input_file_max_bytes))}"
+            ),
+            (
+                "CLIO_RELAY_INPUT_TOTAL_MAX_BYTES = "
+                f"{_toml_string(str(resolved.input_total_max_bytes))}"
+            ),
+            (
+                "CLIO_RELAY_INPUT_FILE_MAX_COUNT = "
+                f"{_toml_string(str(resolved.input_file_max_count))}"
+            ),
             "",
         ]
     )
@@ -454,12 +539,20 @@ def _tool_definitions_and_remote_catalog(
     profile: str | None = None,
 ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
     """Render tools and return the exact remote catalog used for this list."""
-    tools = _all_tool_definitions(clusters=_configured_cluster_names())
     normalized = _normalize_profile(profile or _mcp_profile_from_env())
+    reserved_names = static_mcp_tool_names()
     catalog = _remote_mcp_catalog(
         profile=normalized,
-        reserved_names={str(tool["name"]) for tool in tools},
+        reserved_names=reserved_names,
     )
+    configured_clusters = _configured_cluster_names()
+    jarvis_clusters = _bound_virtual_jarvis_clusters(catalog)
+    tools = _all_tool_definitions(
+        clusters=configured_clusters,
+        jarvis_clusters=jarvis_clusters,
+    )
+    if not jarvis_clusters:
+        tools = [tool for tool in tools if not is_virtual_jarvis_tool(str(tool["name"]))]
     if normalized in {"admin", "operator", "all"}:
         selected = tools
     else:
@@ -469,6 +562,16 @@ def _tool_definitions_and_remote_catalog(
             if tool["name"] in USER_MCP_TOOL_NAMES or is_virtual_jarvis_tool(str(tool["name"]))
         ]
     return [*selected, *catalog.tool_definitions()], catalog
+
+
+def _bound_virtual_jarvis_clusters(catalog: VirtualRemoteMcpCatalog) -> list[str]:
+    """Return clusters with an advertised, verified built-in JARVIS identity."""
+
+    return sorted(
+        cluster
+        for cluster, artifact_digest in catalog.jarvis_artifact_bindings.items()
+        if artifact_digest is not None and cluster in catalog.cluster_route_revisions
+    )
 
 
 def _authorized_static_tool_names(profile: str) -> set[str]:
@@ -487,7 +590,14 @@ def _authorized_static_tool_names(profile: str) -> set[str]:
     }
 
 
-def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
+def _all_tool_definitions(
+    *,
+    clusters: list[str] | None = None,
+    jarvis_clusters: list[str] | None = None,
+) -> list[JSON]:
+    """Return static tools with independent generic and built-in JARVIS routes."""
+
+    resolved_jarvis_clusters = clusters if jarvis_clusters is None else jarvis_clusters
     return [
         {
             "name": "relay_remote_mcp_context",
@@ -1561,7 +1671,7 @@ def _all_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
                 "additionalProperties": False,
             },
         },
-        *virtual_jarvis_tool_definitions(clusters=clusters),
+        *virtual_jarvis_tool_definitions(clusters=resolved_jarvis_clusters),
     ]
 
 
@@ -1679,6 +1789,136 @@ def _call_tool(
         route = catalog.resolve(name, cluster)
         forwarded_arguments = catalog.forwarded_arguments(name, arguments)
         relay_arguments = catalog.relay_arguments(name, arguments)
+        described_package_name: str | None = None
+        package_input_route: JarvisPackageInputRoute | None = None
+        package_cache_key: str | None = None
+        pipeline_cache_key: str | None = None
+        pipeline_input_route = None
+        automatic_input_uses: tuple[ArtifactUse, ...] = ()
+        staged_input_manifest_sha256: str | None = None
+        if route.contract == REGISTERED_JARVIS_CONTRACT_ID:
+            if session is None:
+                raise ValueError("registered JARVIS package semantics require an MCP session")
+            if route.remote_tool_name == "jarvis_describe":
+                # v3.6 descriptions are control queries whose structured result is part of
+                # the agent-facing contract. Reconcile them transparently even when the
+                # generated default is omitted or a legacy client sends false.
+                relay_arguments["wait_for_terminal"] = True
+                if forwarded_arguments.get("target") == "package":
+                    described_package_name = _required_str(forwarded_arguments, "package_name")
+                    package_input_route = jarvis_package_input_route(
+                        cluster=cluster,
+                        server_name=route.server_name,
+                        cluster_route_revision=route.cluster_route_revision,
+                        registration_revision=route.registration_revision,
+                        expected_server_artifact_digest=route.expected_server_artifact_digest,
+                        package_name=described_package_name,
+                    )
+                    package_cache_key = package_input_route.identity_sha256()
+            elif route.remote_tool_name == "jarvis_add_step":
+                package_name = _required_str(forwarded_arguments, "package_name")
+                package_input_route = jarvis_package_input_route(
+                    cluster=cluster,
+                    server_name=route.server_name,
+                    cluster_route_revision=route.cluster_route_revision,
+                    registration_revision=route.registration_revision,
+                    expected_server_artifact_digest=route.expected_server_artifact_digest,
+                    package_name=package_name,
+                )
+                package_cache_key = package_input_route.identity_sha256()
+                package_contract = session.jarvis_package_inputs(package_cache_key)
+                if package_contract is None:
+                    durable_contract = queue.get_jarvis_package_input_contract(package_input_route)
+                    if durable_contract is not None:
+                        package_contract = jarvis_package_input_contract_from_record(
+                            durable_contract
+                        )
+                        session.remember_jarvis_package_inputs(package_contract)
+                if package_contract is None:
+                    raise ValueError(
+                        "jarvis_add_step requires a successful jarvis_describe package call on "
+                        "this exact registered cluster route before package configuration"
+                    )
+                staged = stage_jarvis_add_step_inputs(
+                    forwarded_arguments,
+                    contract=package_contract,
+                    definition=_remote_cluster_definition(cluster),
+                    settings=settings,
+                )
+                forwarded_arguments = staged.arguments
+                automatic_input_uses = staged.artifact_uses
+                staged_input_manifest_sha256 = staged.manifest_sha256
+                if automatic_input_uses:
+                    # Staged inputs become durable pipeline lineage only after JARVIS accepts
+                    # this exact add-step. Never return an asynchronous receipt that can lose
+                    # that acceptance edge across an MCP restart.
+                    relay_arguments["wait_for_terminal"] = True
+                pipeline_input_route = jarvis_pipeline_input_route(
+                    cluster=cluster,
+                    server_name=route.server_name,
+                    cluster_route_revision=route.cluster_route_revision,
+                    registration_revision=route.registration_revision,
+                    expected_server_artifact_digest=route.expected_server_artifact_digest,
+                    pipeline_id=_required_str(forwarded_arguments, "pipeline_id"),
+                    owner_session_id=settings.owner_session_id,
+                    owner_session_generation_id=settings.owner_session_generation_id,
+                )
+                pipeline_cache_key = pipeline_input_route.identity_sha256()
+            elif route.remote_tool_name == "jarvis_run":
+                pipeline_input_route = jarvis_pipeline_input_route(
+                    cluster=cluster,
+                    server_name=route.server_name,
+                    cluster_route_revision=route.cluster_route_revision,
+                    registration_revision=route.registration_revision,
+                    expected_server_artifact_digest=route.expected_server_artifact_digest,
+                    pipeline_id=_required_str(forwarded_arguments, "pipeline_id"),
+                    owner_session_id=settings.owner_session_id,
+                    owner_session_generation_id=settings.owner_session_generation_id,
+                )
+                pipeline_cache_key = pipeline_input_route.identity_sha256()
+                durable_lineage = queue.get_jarvis_pipeline_input_lineage(pipeline_input_route)
+                durable_uses = () if durable_lineage is None else durable_lineage.artifact_uses
+                automatic_input_uses = tuple(
+                    merge_artifact_uses(
+                        list(session.jarvis_pipeline_inputs(pipeline_cache_key)),
+                        durable_uses,
+                    )
+                )
+        merged_input_uses = merge_artifact_uses(
+            _artifact_use_refs(relay_arguments),
+            automatic_input_uses,
+        )
+        if merged_input_uses:
+            relay_arguments["used_artifact_refs"] = [
+                artifact_use_payload(item) for item in merged_input_uses
+            ]
+        reconciliation_required = (
+            route.contract == REGISTERED_JARVIS_CONTRACT_ID
+            and route.remote_tool_name == "jarvis_describe"
+        ) or bool(automatic_input_uses)
+        reconciliation_idempotency_key = "mcp:virtual:reconcile:" + _stable_digest(
+            {
+                "cluster": cluster,
+                "server_name": route.server_name,
+                "cluster_route_revision": route.cluster_route_revision,
+                "registration_revision": route.registration_revision,
+                "expected_server_artifact_digest": route.expected_server_artifact_digest,
+                "tool": route.remote_tool_name,
+                "arguments": forwarded_arguments,
+                "used_artifact_refs": [artifact_use_payload(item) for item in merged_input_uses],
+            }
+        )
+        base_idempotency_key = str(
+            relay_arguments.get("idempotency_key")
+            or (
+                reconciliation_idempotency_key
+                if reconciliation_required
+                else (
+                    f"mcp:virtual:{cluster}:{route.server_name}:"
+                    f"{route.remote_tool_name}:{uuid4().hex}"
+                )
+            )
+        )
         result = _submit_mcp_call(
             {
                 "cluster": cluster,
@@ -1688,6 +1928,9 @@ def _call_tool(
                 "server_args": list(route.args),
                 "env_from": dict(route.env_from),
                 "expected_server_artifact_digest": route.expected_server_artifact_digest,
+                "expected_registered_contract": (
+                    route.contract if route.contract == REGISTERED_JARVIS_CONTRACT_ID else None
+                ),
                 "expected_cluster_route_revision": route.cluster_route_revision,
                 "registered_server_name": route.server_name,
                 "expected_remote_mcp_registration_revision": (route.registration_revision),
@@ -1702,22 +1945,82 @@ def _call_tool(
                 "arguments": forwarded_arguments,
                 "timeout_seconds": route.timeout_seconds,
                 **relay_arguments,
-                "idempotency_key": (
-                    relay_arguments.get("idempotency_key")
-                    or (
-                        f"mcp:virtual:{cluster}:{route.server_name}:"
-                        f"{route.remote_tool_name}:{uuid4().hex}"
-                    )
-                ),
+                "idempotency_key": base_idempotency_key,
             },
             queue=queue,
             settings=settings,
         )
+        if (
+            route.contract == REGISTERED_JARVIS_CONTRACT_ID
+            and route.remote_tool_name == "jarvis_describe"
+        ):
+            _require_terminal_staging_reconciliation(result, operation="jarvis_describe")
+        if described_package_name is not None and package_cache_key is not None:
+            assert session is not None
+            package_contract = parse_jarvis_package_input_contract(
+                result,
+                cache_key=package_cache_key,
+            )
+            if result.get("state") == "succeeded" and package_contract is None:
+                raise ValueError(
+                    "successful jarvis_describe package call omitted its package input contract"
+                )
+            if package_contract is not None:
+                if described_package_name not in package_contract.package_names:
+                    raise ValueError(
+                        "jarvis_describe returned a different package than the requested package"
+                    )
+                for package_name in package_contract.package_names:
+                    alias_route = jarvis_package_input_route(
+                        cluster=cluster,
+                        server_name=route.server_name,
+                        cluster_route_revision=route.cluster_route_revision,
+                        registration_revision=route.registration_revision,
+                        expected_server_artifact_digest=route.expected_server_artifact_digest,
+                        package_name=package_name,
+                    )
+                    alias_contract = JarvisPackageInputContract(
+                        cache_key=alias_route.identity_sha256(),
+                        package_names=package_contract.package_names,
+                        local_file_settings=package_contract.local_file_settings,
+                        settings_sha256=package_contract.settings_sha256,
+                    )
+                    saved_contract = queue.put_jarvis_package_input_contract(
+                        jarvis_package_input_contract_record(
+                            route=alias_route,
+                            contract=alias_contract,
+                        )
+                    )
+                    session.remember_jarvis_package_inputs(
+                        jarvis_package_input_contract_from_record(saved_contract)
+                    )
+        if route.remote_tool_name == "jarvis_add_step" and automatic_input_uses:
+            _require_terminal_staging_reconciliation(result, operation="jarvis_add_step")
+        if (
+            route.remote_tool_name == "jarvis_add_step"
+            and pipeline_cache_key is not None
+            and pipeline_input_route is not None
+            and automatic_input_uses
+            and staged_input_manifest_sha256 is not None
+            and result.get("state") == "succeeded"
+            and result.get("terminal") is True
+        ):
+            assert session is not None
+            durable_lineage = queue.merge_jarvis_pipeline_input_lineage(
+                pipeline_input_route,
+                automatic_input_uses,
+                manifest_sha256=staged_input_manifest_sha256,
+            )
+            session.remember_jarvis_pipeline_inputs(
+                pipeline_cache_key,
+                durable_lineage.artifact_uses,
+            )
         result["catalog_revision"] = catalog.revision
     elif name == "relay_get_job":
-        result = queue.get_job(_required_durable_record_id(arguments, "job_id")).model_dump(
-            mode="json"
-        )
+        job_id = _required_durable_record_id(arguments, "job_id")
+        result = queue.get_job(job_id).model_dump(mode="json")
+        transform = queue.get_transform_ref(job_id)
+        result["transform"] = None if transform is None else transform.model_dump(mode="json")
     elif name == "relay_get_job_status":
         result = job_status(queue, _required_durable_record_id(arguments, "job_id"))
     elif name == "relay_monitor_job":
@@ -3276,6 +3579,19 @@ def _attach_terminal_mcp_evidence(
 
 
 def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
+    jarvis_clusters = _bound_virtual_jarvis_clusters(catalog)
+    jarvis = (
+        render_virtual_jarvis_agent_context()
+        + " Built-in virtual JARVIS tools are available on: "
+        + ", ".join(jarvis_clusters)
+        + "."
+        if jarvis_clusters
+        else (
+            "Built-in virtual JARVIS tools are not advertised because no configured cluster "
+            "has a verified JARVIS MCP artifact binding. Use an available registered remote "
+            "MCP alias or ask an operator to refresh the built-in JARVIS discovery."
+        )
+    )
     generic = (
         " Registered remote MCP tools are exposed with remote_<server>_<tool> aliases; "
         "their cluster argument selects the execution target and is not forwarded to the "
@@ -3288,7 +3604,7 @@ def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:
     available = ""
     if catalog.tools:
         available = " Available registered aliases: " + ", ".join(sorted(catalog.tools)) + "."
-    return render_virtual_jarvis_agent_context() + generic + available
+    return jarvis + generic + available
 
 
 def _cancel_job(
@@ -3728,7 +4044,7 @@ def _submit_jarvis_pipeline(
     used_artifact_refs = _artifact_use_refs(arguments)
     digest = hashlib.sha256(pipeline_yaml.encode("utf-8")).hexdigest()
     dependency_digest = _stable_digest(
-        {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+        {"used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs]}
     )
     dependency_suffix = f":{dependency_digest}" if used_artifact_refs else ""
     idempotency_key = str(
@@ -3748,7 +4064,7 @@ def _submit_jarvis_pipeline(
                 "cluster": cluster,
                 "pipeline_yaml": pipeline_yaml,
                 "idempotency_key": idempotency_key,
-                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
+                "used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs],
             },
         )
         return _owned_session_submission_result(
@@ -3788,7 +4104,7 @@ def _submit_jarvis_job(
     wait_timeout_seconds = _jarvis_submission_wait_timeout_seconds(arguments)
     used_artifact_refs = _artifact_use_refs(arguments)
     dependency_digest = _stable_digest(
-        {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+        {"used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs]}
     )
     dependency_suffix = f":{dependency_digest}" if used_artifact_refs else ""
     definition = _optional_cluster_definition(cluster)
@@ -3808,7 +4124,7 @@ def _submit_jarvis_job(
                     "pipeline_name": pipeline_name,
                     "idempotency_key": idempotency_key,
                     "used_artifact_refs": [
-                        item.model_dump(mode="json") for item in used_artifact_refs
+                        artifact_use_payload(item) for item in used_artifact_refs
                     ],
                 },
             )
@@ -3838,7 +4154,7 @@ def _submit_jarvis_job(
             str(idempotency_key),
         ]
         for item in used_artifact_refs:
-            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
+            remote_args.extend(["--used-artifact", _artifact_use_cli_value(item)])
         output = run_remote_clio(definition, remote_args)
         return _remote_submission_result(output, kind=JobKind.JARVIS, definition=definition)
     pipeline_name = _required_str(arguments, "pipeline_name")
@@ -3886,9 +4202,7 @@ def _submit_remote_agent(
         "timeout_seconds": timeout_seconds,
     }
     if used_artifact_refs:
-        identity["used_artifact_refs"] = [
-            item.model_dump(mode="json") for item in used_artifact_refs
-        ]
+        identity["used_artifact_refs"] = [artifact_use_payload(item) for item in used_artifact_refs]
     idempotency_key = str(
         arguments.get("idempotency_key") or "mcp:remote-agent:" + _stable_digest(identity)
     )
@@ -3902,7 +4216,7 @@ def _submit_remote_agent(
             "cluster": cluster,
             "prompt_path": prompt_path,
             "idempotency_key": idempotency_key,
-            "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
+            "used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs],
         }
         for key, value in {
             "mcp_config_path": mcp_config_path,
@@ -3962,6 +4276,10 @@ def _submit_mcp_call(
         arguments,
         "expected_server_artifact_digest",
     )
+    expected_registered_contract = _optional_str(
+        arguments,
+        "expected_registered_contract",
+    )
     raw_expected_jarvis_cd_lock_binding = arguments.get("expected_jarvis_cd_lock_binding")
     expected_jarvis_cd_lock_binding = (
         _string_mapping(
@@ -3998,12 +4316,12 @@ def _submit_mcp_call(
     }
     if control_query_evidence is not None:
         identity["control_query_evidence"] = control_query_evidence.model_dump(mode="json")
+    if expected_registered_contract is not None:
+        identity["expected_registered_contract"] = expected_registered_contract
     if expected_jarvis_cd_lock_binding is not None:
         identity["expected_jarvis_cd_lock_binding"] = expected_jarvis_cd_lock_binding
     if used_artifact_refs:
-        identity["used_artifact_refs"] = [
-            item.model_dump(mode="json") for item in used_artifact_refs
-        ]
+        identity["used_artifact_refs"] = [artifact_use_payload(item) for item in used_artifact_refs]
     idempotency_key = str(
         arguments.get("idempotency_key") or "mcp:mcp-call:" + _stable_digest(identity)
     )
@@ -4054,6 +4372,12 @@ def _submit_mcp_call(
                 f"remote MCP registration changed for {cluster}/{registered_server_name}; "
                 "call tools/list again before submission"
             )
+        if expected_registered_contract is not None and (
+            current_registration.contract != expected_registered_contract
+        ):
+            raise ValueError("registered MCP semantic contract changed after discovery")
+    elif expected_registered_contract is not None:
+        raise ValueError("registered MCP semantic contract requires a registered remote route")
     if control_query_evidence is not None:
         if not registered_remote_mcp_route:
             raise ValueError("MCP control-query evidence requires a registered remote route")
@@ -4077,7 +4401,7 @@ def _submit_mcp_call(
                 "tool": tool,
                 "arguments": tool_arguments,
                 "idempotency_key": idempotency_key,
-                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
+                "used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs],
             }
             if control_query_evidence is not None:
                 payload["control_query_evidence"] = control_query_evidence.model_dump(mode="json")
@@ -4085,6 +4409,8 @@ def _submit_mcp_call(
                 payload["timeout_seconds"] = timeout_seconds
             if expected_server_artifact_digest is not None:
                 payload["expected_server_artifact_digest"] = expected_server_artifact_digest
+            if expected_registered_contract is not None:
+                payload["expected_registered_contract"] = expected_registered_contract
             job = submit_owned_session_job(
                 definition=definition,
                 settings=settings,
@@ -4142,8 +4468,10 @@ def _submit_mcp_call(
             remote_args.extend(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
+        if expected_registered_contract is not None:
+            remote_args.extend(["--expected-registered-contract", expected_registered_contract])
         for item in used_artifact_refs:
-            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
+            remote_args.extend(["--used-artifact", _artifact_use_cli_value(item)])
         try:
             write_remote_file(
                 definition,
@@ -4181,6 +4509,7 @@ def _submit_mcp_call(
             tool=tool,
             expected_server_artifact_digest=expected_server_artifact_digest,
             evidence=control_query_evidence,
+            expected_registered_contract=expected_registered_contract,
             timeout_seconds=timeout_seconds,
         )
     else:
@@ -4201,6 +4530,7 @@ def _submit_mcp_call(
                 server_args=server_args,
                 env_from=env_from,
                 expected_server_artifact_digest=expected_server_artifact_digest,
+                expected_registered_contract=expected_registered_contract,
                 expected_jarvis_cd_lock_binding=expected_jarvis_cd_lock_binding,
                 admission_class=admission_class,
                 operation=operation,
@@ -4446,6 +4776,23 @@ def _owned_session_submission_result(
     return result
 
 
+def _require_terminal_staging_reconciliation(result: JSON, *, operation: str) -> None:
+    """Refuse to lose package semantics or staged-input lineage after a bounded wait."""
+    if result.get("terminal") is True:
+        return
+    cluster = result.get("cluster")
+    job_id = result.get("job_id")
+    route_revision = result.get("route_revision")
+    handle = f"cluster={cluster!r}, job_id={job_id!r}, route_revision={route_revision!r}"
+    raise ValueError(
+        f"{operation} did not become terminal during bounded contract reconciliation; "
+        f"the durable relay job remains observable ({handle}). Use relay_wait on that exact "
+        "handle, then retry this call with identical arguments. Relay reuses the deterministic "
+        "reconciliation identity when idempotency_key was omitted. No package contract or "
+        "staged-input lineage was accepted locally."
+    )
+
+
 def _submit_local_job(
     queue: ClioCoreQueue,
     job: RelayJob,
@@ -4553,7 +4900,7 @@ def _submit_jarvis_mcp_call(
     dependency_suffix = (
         ":"
         + _stable_digest(
-            {"used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs]}
+            {"used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs]}
         )
         if used_artifact_refs
         else ""
@@ -4584,7 +4931,7 @@ def _submit_jarvis_mcp_call(
                 "arguments": tool_arguments,
                 "expected_server_artifact_digest": expected_server_artifact_digest,
                 "idempotency_key": idempotency_key,
-                "used_artifact_refs": [item.model_dump(mode="json") for item in used_artifact_refs],
+                "used_artifact_refs": [artifact_use_payload(item) for item in used_artifact_refs],
             }
             if timeout_seconds is not None:
                 payload["timeout_seconds"] = timeout_seconds
@@ -4628,7 +4975,7 @@ def _submit_jarvis_mcp_call(
                 ["--expected-server-artifact-digest", expected_server_artifact_digest]
             )
         for item in used_artifact_refs:
-            remote_args.extend(["--used-artifact", f"{item.artifact_id}={item.sha256}"])
+            remote_args.extend(["--used-artifact", _artifact_use_cli_value(item)])
         try:
             write_remote_file(
                 definition,
@@ -5160,7 +5507,21 @@ def _artifact_use_refs(arguments: JSON) -> list[ArtifactUse]:
     artifact_ids = [ref.artifact_id for ref in refs]
     if len(artifact_ids) != len(set(artifact_ids)):
         raise ValueError("used_artifact_refs must contain unique artifact_id values")
-    return sorted(refs, key=lambda ref: ref.artifact_id)
+    canonical = sorted(refs, key=lambda ref: ref.artifact_id)
+    validate_artifact_use_collection(canonical)
+    return canonical
+
+
+def _artifact_use_cli_value(ref: ArtifactUse) -> str:
+    """Render a legacy shorthand or canonical JSON dependency for remote CLI transport."""
+    if ref.provenance is None:
+        return f"{ref.artifact_id}={ref.sha256}"
+    return json.dumps(
+        artifact_use_payload(ref),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _log_limit(arguments: JSON) -> int:

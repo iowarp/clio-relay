@@ -4327,6 +4327,84 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
     assert starts[0]["start_operation_id"] == "start_cli_json"
 
 
+def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    definition = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").clusters["ares"]
+    route_revision = cluster_route_revision(definition)
+    release = _session_api_release_identity()
+
+    def verify_worker_compatibility(
+        _definition: ClusterDefinition,
+    ) -> SessionApiReleaseIdentity:
+        return release
+
+    def pending_start(**kwargs: object) -> session_lifecycle.OwnedSessionStartResult:
+        plan = cast(session_lifecycle.OwnedSessionStartPlan, kwargs["plan"])
+        status = OwnedSessionRecoveryStatus(
+            cluster=plan.cluster,
+            session_id=plan.session_id,
+            session_generation_id="generation-pending",
+            start_operation_id=plan.start_operation_id,
+            cluster_route_revision=plan.cluster_route_revision,
+            remote_api_port=plan.remote_api_port,
+            start_state="starting",
+            start_phase="admitted",
+            start_attempt_verified=True,
+            start_retryable=True,
+            start_replace=False,
+            start_require_token=False,
+            start_expected_api_release_identity_sha256=release.sha256(),
+        )
+        return session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            plan=plan,
+            status=status,
+            transport_deadline_exceeded=True,
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "_verify_session_start_worker_compatibility",
+        verify_worker_compatibility,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_finalize_completed_cleanup_receipt_before_start",
+        _fake_no_completed_cleanup,
+    )
+    monkeypatch.setattr(cli, "start_remote_session_durable", pending_start)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "session",
+            "start",
+            "--cluster",
+            "ares",
+            "--session-id",
+            "session-1",
+            "--start-operation-id",
+            "start_pending_json",
+            "--expected-cluster-route-revision",
+            route_revision,
+            "--expected-api-release-identity-sha256",
+            release.sha256(),
+            "--no-require-token",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["state"] == "starting"
+    assert payload["terminal"] is False
+    assert payload["usable"] is False
+    assert payload["status_selector"]["start_operation_id"] == "start_pending_json"
+
+
 @pytest.mark.parametrize("stale_selector", ["route", "release"])
 def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
     tmp_path: Path,
@@ -4392,11 +4470,26 @@ def test_cli_api_start_verifies_process_bound_release_identity(
     installation = _installation_identity()
     identity = _session_api_release_identity()
     launches: list[tuple[str, int]] = []
+    events: list[str] = []
+    bound_app = object()
+    late_app = object()
+    http_api_module = sys.modules["clio_relay.http_api"]
+    monkeypatch.setattr(http_api_module, "app", bound_app)
+    monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "a" * 64)
 
-    def launch(_application: str, *, host: str, port: int) -> None:
+    def publish() -> None:
+        events.append("publish")
+        os.environ.pop("CLIO_RELAY_SESSION_OWNER_TOKEN", None)
+        cast(Any, http_api_module).app = late_app
+
+    def launch(application: object, *, host: str, port: int) -> None:
+        assert application is bound_app
+        assert "CLIO_RELAY_SESSION_OWNER_TOKEN" not in os.environ
+        events.append("serve")
         launches.append((host, port))
 
     monkeypatch.setattr(cli, "installation_info", lambda: installation)
+    monkeypatch.setattr(cli, "publish_owned_session_api_startup_receipt", publish)
     monkeypatch.setattr(cli.uvicorn, "run", launch)
     monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", identity.sha256())
 
@@ -4404,6 +4497,7 @@ def test_cli_api_start_verifies_process_bound_release_identity(
 
     assert accepted.exit_code == 0, accepted.output
     assert launches == [("127.0.0.1", 9001)]
+    assert events == ["publish", "serve"]
 
     monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", "b" * 64)
     rejected = CliRunner().invoke(app, ["api", "start", "--port", "9002"])

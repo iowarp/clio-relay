@@ -66,10 +66,54 @@ installed unit without replacing its `ExecStart` or capacity policy, use:
 clio-relay cluster restart-endpoint-service --cluster my-cluster
 ```
 
+Inspect persistence and recovery without mutating the service, relay queue, or
+scheduler:
+
+```powershell
+clio-relay cluster endpoint-service-status --cluster my-cluster
+```
+
+The JSON result distinguishes `ready`, `recovering`, `intentional-stop`,
+`failed`, `inactive-unexpected`, `not-installed`, and `degraded`. A production
+unit is ready only when it is installed, enabled, active, configured for
+persistent crash recovery, and backed by systemd user lingering. A process
+crash is therefore observable as recovery or a failed restart rather than as a
+normal desktop detach. Conversely, an explicit `systemctl --user stop` is an
+`intentional-stop`; systemd respects that operator action and relay does not
+silently start it from a read-only status probe. Use the returned
+`operator_action` or the explicit restart command above when the unit should run
+again. Service restart preserves the durable relay queue and never cancels a
+scheduler job.
+
 The restart-only command verifies the installed unit's total, reserved-control,
 and per-kind capacity arguments against the persisted cluster policy before it
 restarts anything. A legacy or drifted unit is left untouched and must be
 reinstalled with `cluster install-endpoint-service`.
+
+### verify the execution interpreter and startup boundary
+
+Release bootstrap records both the lexical provider-interpreter path and its
+resolved file identity. Relay deliberately launches the lexical path inside the
+persistent `uv tool` environment instead of replacing it with the final symlink
+target. This preserves the tool environment's `sys.prefix`, distribution
+metadata, and imports while still verifying the interpreter digest and checking
+that its file identity does not change during spawn.
+
+An owned session API follows the same rule. Its containment broker establishes
+the exact systemd scope before releasing the generation-scoped child
+environment. The API imports and binds the process-local application while the
+one-time owner credential is available, publishes its signed startup receipt,
+and then removes `CLIO_RELAY_SESSION_OWNER_TOKEN` from the process environment.
+The already validated application retains the session identity needed for
+authenticated requests; later child processes cannot acquire that one-time
+credential from the environment.
+
+If startup fails, relay adds only a bounded tail of the owned `api.log` to the
+error as `api_log=...`. It replaces known secret values and assignments whose
+names identify tokens, secrets, passwords, credentials, API keys, or
+authorization before returning the diagnostic. This is defense in depth, not
+permission to log credentials: operators and application code must still keep
+secret values out of stdout and stderr.
 
 Service installation, restart, and managed bootstrap serialize an exact
 state/job preflight and optional enqueue under a short per-service `flock`.
@@ -284,6 +328,53 @@ generation. HTTP exposes `/jobs/{job_id}/used-artifacts` and
 `/artifacts/{artifact_id}/used-by`; MCP exposes both directions through
 `relay_artifact_lineage` by accepting exactly one of `job_id` or `artifact_id`.
 
+The `ARTIFACT_ID=SHA256` form remains the compatibility form and retains its
+existing wire identity and idempotency digest. To explain how the dependency was
+identified, pass the additive canonical JSON form instead:
+
+```powershell
+clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml `
+  --used-artifact '{"artifact_id":"artifact_input","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","provenance":{"schema_version":"clio-relay.artifact-use-provenance.v1","evidence":"schema-arg","arg":"script"}}'
+```
+
+Edge evidence can identify a schema argument, an explicit hash pair, a bounded
+lease window, an external authority, or an assertion. The complete provenance
+object is part of the immutable edge identity: the same artifact and digest
+cannot be resubmitted under the same job identity with changed evidence. Relay
+copies it unchanged into both the job-to-artifact `used` record and the reverse
+artifact-to-job index. Legacy records with no provenance remain valid and do not
+receive an invented explanation.
+
+### record transform activity
+
+An artifact edge says *what* a job consumed. The optional
+`clio-relay.transform-ref.v1` record says *what activity occurred*: one bounded
+activity id, mechanism, non-secret execution-environment identity, replay
+contract, and its used evidence. `reproducible` is a stronger claim than
+`re-runnable`; use `re-runnable` when mutable external authority or another
+uncontrolled input prevents byte-for-byte reproduction. Environment tiers are
+`declared`, `lockfile-hash`, and `image-digest`. The fixed environment fields
+can identify the launcher, provider/model, OS, architecture, Python, lockfile,
+or image, but the record does not accept arbitrary environment variables or
+secret-bearing metadata.
+
+There is at most one immutable transform per relay job. Internal artifact
+evidence must cover every content-pinned job dependency with the same artifact
+id, digest, and edge provenance. Authority-only evidence and zero-input
+activities are also valid, so a catalog lookup or generated output need not
+invent an internal artifact. An identical retry is idempotent; any changed
+record conflicts. The transform is collected with its terminal job and cannot
+outlive it.
+
+Transform mutation is an internal execution boundary rather than another
+agent-facing tool. An authenticated, exact-generation owned session API can
+`POST /jobs/{job_id}/transform` once and `GET /jobs/{job_id}/transform`; the GET
+returns JSON `null` until a transform exists. Both operations verify that the
+job belongs to the session, and the POST requires the session submission
+binding. Existing authenticated job/status reads and the admin MCP
+`relay_get_job`/`relay_get_job_status` projections include the nullable
+transform. There is deliberately no `relay_record_transform` MCP tool.
+
 For inline YAML, path, and command JARVIS runs, the endpoint captures and hashes
 the exact materialized pipeline bytes before launching that same spool file.
 Named JARVIS pipelines currently retain a name reference rather than a resolved,
@@ -336,7 +427,7 @@ For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
 `jarvis_run` MCP return is normalized to a terminal `completed` record even
 though that release labels the result `status=running`; the original status and
 completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.5.23 production path removes that ambiguity upstream and
+The pinned clio-kit 2.6.2 production path removes that ambiguity upstream and
 returns a structured durable execution handle immediately. The legacy normalization is
 diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
 submissions remain non-terminal and are observed through `jarvis_get_execution`.
@@ -584,7 +675,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.5.23/clio_kit-2.5.23-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.6.2/clio_kit-2.6.2-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 
@@ -1055,6 +1146,29 @@ one observation at a time. A start result has one of these states:
 - `not_current`: another operation owns the current transition, so this selector
   was never accepted or is no longer current; it is not retryable.
 
+Only `state="ready"` has `usable=true`. A nonterminal result may include a
+`session_generation_id` because teardown and exact recovery need to identify the
+accepted generation, but clients must treat it only as an opaque lifecycle
+handle until `usable` becomes true. They must not attach a connector, submit
+work, or present that generation as a live session. This rule also applies after
+a transport deadline: a discovered generation is not readiness evidence.
+
+`session start-status` performs one bounded observation. `session start-watch`
+repeats that exact observation for a caller-selected aggregate duration (120
+seconds by default, bounded to one hour) and can be invoked again with the same
+selector after any delay. A watch deadline returns the still-current handle with
+`watch_deadline_exceeded=true`, `terminal=false`, and `usable=false`; it does not
+change or cancel the remote transition. Exit status is 0 only for ready, 1 for a
+terminal failure/non-current selector, and 2 for a detached nonterminal watch.
+
+The default `session start --text` output remains the compatibility key/value
+surface. Ready output retains `session_started`, `session_generation_id`, and
+`remote_api_port`. Non-ready text explicitly includes
+`session_ready=false` and `session_start_handle_only=true`, and the command exits
+2 so older integrations cannot mistake the handle for a successfully attached
+API. New automation should use `session plan-start`, `session start --json`, and
+the returned secret-free status selector.
+
 There is deliberately no aggregate start wait deadline in the relay contract.
 Each SSH/status observation is bounded so a client remains responsive, but a
 deadline produces `starting` or `ambiguous`, never a fabricated terminal failure.
@@ -1091,6 +1205,20 @@ protected transition lock before reading metadata. Successful cleanup replaces
 secret-bearing metadata with a sanitized generation receipt, removes only the
 verified session PID, log, and cluster-registry files, and uses that receipt for
 same-policy idempotent retries.
+
+Failure before normal API metadata is committed follows the same fail-closed
+cleanup model. Teardown validates the start journal, exact generation admission,
+predeclared or contained systemd scope, bounded owned-job membership, and exact
+startup-file identities before stopping or deleting anything. It then persists
+a sanitized `clio-relay.owner-session-failed-cleaned-receipt.v1`; recovery
+reports this terminal internal state as `failed_cleaned`, while the public start
+result remains terminal `failed` and non-retryable. The receipt makes an
+identical cleanup retry safe and allows a later fresh start to distinguish a
+finished cleanup from abandoned startup state. This path preserves owned relay
+and scheduler jobs by default. It cancels relay jobs only with `--cancel-jobs`,
+cancels their proven scheduler jobs only with the additional
+`--cancel-scheduler-jobs`, and stops the persistent endpoint only with
+`--stop-worker`.
 
 Owned-session start/status is control-plane lifecycle only. It does not wait for,
 cancel, or assign a terminal deadline to scheduler or JARVIS work. A scheduler job

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import tomllib
 from dataclasses import replace
 from datetime import timedelta
 from io import StringIO
@@ -54,6 +55,7 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     RemoteMcpRoute,
     RemoteMcpToolSchema,
     VirtualRemoteMcpCatalog,
@@ -151,6 +153,53 @@ def _bind_virtual_jarvis_catalog(
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", bound_catalog)
 
 
+def _generic_jarvis_catalog(
+    *,
+    jarvis_artifact_bindings: dict[str, str | None],
+) -> VirtualRemoteMcpCatalog:
+    """Return a catalog with a generic JARVIS alias independent of the built-in route."""
+
+    cluster = "ares"
+    route_revision = "d" * 64
+    route = RemoteMcpRoute(
+        cluster=cluster,
+        server_name="jarvis-demo",
+        command="jarvis-mcp",
+        args=("--stdio",),
+        env_from=(),
+        expected_server_artifact_digest="e" * 64,
+        remote_tool_name="jarvis_describe",
+        timeout_seconds=300,
+        contract="clio-kit.jarvis.user.v3",
+        cluster_route_revision=route_revision,
+        registration_revision="c" * 64,
+    )
+    alias = "remote_jarvis_demo_jarvis_describe"
+    tool = VirtualRemoteMcpTool(
+        alias=alias,
+        namespace="jarvis-demo",
+        remote_tool=RemoteMcpToolSchema(
+            name="jarvis_describe",
+            description="Describe one registered JARVIS package.",
+            input_schema={
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        ),
+        routes={cluster: route},
+        arguments_wrapped=False,
+    )
+    return VirtualRemoteMcpCatalog(
+        revision="f" * 64,
+        tools={alias: tool},
+        issues=(),
+        cluster_route_revisions={name: route_revision for name in jarvis_artifact_bindings},
+        jarvis_artifact_bindings=jarvis_artifact_bindings,
+    )
+
+
 def test_mcp_session_remote_job_routes_are_collision_safe_and_reset() -> None:
     session = McpSessionState()
     job_id = "remote-job"
@@ -237,6 +286,8 @@ def test_mcp_session_remote_route_never_overrides_same_id_local_job(
 
 def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _configure_local_cluster(tmp_path, monkeypatch, "ares")
+    _bind_virtual_jarvis_catalog(monkeypatch, cluster="ares")
     queue = ClioCoreQueue(tmp_path / "core")
 
     response = handle_request(
@@ -372,7 +423,9 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_get_execution"
     )
     query_properties = query_tool["inputSchema"]["properties"]
-    assert query_properties["timeout_seconds"]["maximum"] == 60
+    assert (
+        query_properties["timeout_seconds"]["maximum"] == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
+    )
     assert "maximum" not in run_tool["inputSchema"]["properties"]["timeout_seconds"]
     assert query_tool["inputSchema"]["required"] == [
         "cluster",
@@ -442,6 +495,124 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert "package_search is discovery only" in add_step_tool["description"]
     assert "target='package'" in add_step_tool["description"]
     assert "package-owned settings contract rather than guessing" in add_step_tool["description"]
+
+
+@pytest.mark.parametrize("profile", ["user", "admin"])
+def test_mcp_omits_unbound_built_in_jarvis_but_keeps_registered_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    """Never advertise a built-in route that dispatch will reject for missing identity."""
+
+    catalog = _generic_jarvis_catalog(jarvis_artifact_bindings={"ares": None})
+
+    def selected_catalog(
+        *,
+        profile: str,
+        reserved_names: set[str],
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", lambda: ["ares"])
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+    queue = ClioCoreQueue(tmp_path / "core")
+    session = McpSessionState()
+
+    response = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=queue,
+        profile=profile,
+        session=session,
+    )
+
+    assert response is not None
+    names = {tool["name"] for tool in response["result"]["tools"]}
+    assert "remote_jarvis_demo_jarvis_describe" in names
+    assert not any(mcp_server_module.is_virtual_jarvis_tool(name) for name in names)
+
+    rejected = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "jarvis_describe",
+                "arguments": {"cluster": "ares", "target": "packages"},
+            },
+        },
+        queue=queue,
+        profile=profile,
+        session=session,
+    )
+    assert rejected is not None
+    assert "JARVIS MCP identity is not available" in rejected["error"]["message"]
+    assert queue.list_jobs() == []
+
+    context_response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "relay_remote_mcp_context", "arguments": {}},
+        },
+        queue=ClioCoreQueue(tmp_path / "context-core"),
+        profile=profile,
+        session=session,
+    )
+    assert context_response is not None
+    context = context_response["result"]["structuredContent"]["context"]
+    assert "Built-in virtual JARVIS tools are not advertised" in context
+    assert "remote_jarvis_demo_jarvis_describe" in context
+
+
+def test_mcp_limits_built_in_jarvis_schema_to_bound_clusters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep generic relay routes broad while narrowing built-in JARVIS to verified routes."""
+
+    catalog = _generic_jarvis_catalog(jarvis_artifact_bindings={"ares": None, "homelab": "a" * 64})
+
+    def selected_catalog(
+        *,
+        profile: str,
+        reserved_names: set[str],
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    monkeypatch.setattr(
+        mcp_server_module,
+        "_configured_cluster_names",
+        lambda: ["ares", "homelab"],
+    )
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+
+    response = handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        queue=ClioCoreQueue(tmp_path / "core"),
+        profile="user",
+    )
+
+    assert response is not None
+    tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+    describe = tools["jarvis_describe"]
+    assert describe["inputSchema"]["properties"]["cluster"]["enum"] == ["homelab"]
+    get_execution = tools["jarvis_get_execution"]
+    handoff_cluster = get_execution["outputSchema"]["properties"]["service_runtime_bindings"][
+        "items"
+    ]["properties"]["cluster"]
+    assert handoff_cluster["enum"] == ["homelab"]
+    bind_runtime = tools["relay_bind_jarvis_runtime"]
+    assert bind_runtime["inputSchema"]["properties"]["cluster"]["enum"] == [
+        "ares",
+        "homelab",
+    ]
+    assert bind_runtime["inputSchema"]["properties"]["binding"]["properties"]["cluster"][
+        "enum"
+    ] == ["ares", "homelab"]
 
 
 def test_user_mcp_schemas_avoid_root_unions_and_preserve_exclusive_forms(
@@ -742,7 +913,12 @@ def test_mcp_user_profile_rejects_direct_call_to_hidden_tool(tmp_path: Path) -> 
     assert queue.list_jobs() == []
 
 
-def test_mcp_remote_mcp_context_describes_virtual_tools(tmp_path: Path) -> None:
+def test_mcp_remote_mcp_context_describes_virtual_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_local_cluster(tmp_path, monkeypatch, "ares")
+    _bind_virtual_jarvis_catalog(monkeypatch, cluster="ares")
     queue = ClioCoreQueue(tmp_path / "core")
 
     response = handle_request(
@@ -4367,7 +4543,9 @@ def test_mcp_remote_agent_default_idempotency_includes_timeout(tmp_path: Path) -
     first_result = first["result"]["structuredContent"]
     second_result = second["result"]["structuredContent"]
     assert first_result["job_id"] != second_result["job_id"]
-    assert queue.get_job(second_result["job_id"]).spec.timeout_seconds == 30
+    second_job = queue.get_job(second_result["job_id"])
+    assert isinstance(second_job.spec, RemoteAgentTaskSpec)
+    assert second_job.spec.timeout_seconds == 30
 
 
 def test_mcp_call_default_idempotency_includes_timeout(tmp_path: Path) -> None:
@@ -4406,7 +4584,9 @@ def test_mcp_call_default_idempotency_includes_timeout(tmp_path: Path) -> None:
     first_result = first["result"]["structuredContent"]
     second_result = second["result"]["structuredContent"]
     assert first_result["job_id"] != second_result["job_id"]
-    assert queue.get_job(second_result["job_id"]).spec.timeout_seconds == 60
+    second_job = queue.get_job(second_result["job_id"])
+    assert isinstance(second_job.spec, McpCallSpec)
+    assert second_job.spec.timeout_seconds == 60
 
 
 def test_mcp_submit_is_idempotent(tmp_path: Path) -> None:
@@ -4657,7 +4837,14 @@ def test_mcp_lists_job_tasks(tmp_path: Path) -> None:
 
 def test_agent_mcp_profile_points_to_clio_relay_server() -> None:
     rendered = render_agent_mcp_profile(
-        settings=RelaySettings(core_dir=Path("/tmp/core"), spool_dir=Path("/tmp/spool"))
+        settings=RelaySettings(
+            core_dir=Path("/tmp/core"),
+            spool_dir=Path("/tmp/spool"),
+            input_workspace_root=Path("/tmp/science-workspace"),
+            input_file_max_bytes=2_048,
+            input_total_max_bytes=8_192,
+            input_file_max_count=7,
+        )
     )
 
     assert "[mcp_servers.clio-relay]" in rendered
@@ -4669,6 +4856,28 @@ def test_agent_mcp_profile_points_to_clio_relay_server() -> None:
     assert "core" in rendered
     assert "CLIO_RELAY_SPOOL_DIR =" in rendered
     assert "spool" in rendered
+    assert "CLIO_RELAY_INPUT_WORKSPACE_ROOT =" in rendered
+    assert "science-workspace" in rendered
+    assert 'CLIO_RELAY_INPUT_FILE_MAX_BYTES = "2048"' in rendered
+    assert 'CLIO_RELAY_INPUT_TOTAL_MAX_BYTES = "8192"' in rendered
+    assert 'CLIO_RELAY_INPUT_FILE_MAX_COUNT = "7"' in rendered
+
+
+def test_agent_mcp_profile_defaults_input_workspace_to_rendering_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generated profile is immediately usable without a separately injected root."""
+    monkeypatch.chdir(tmp_path)
+
+    rendered = render_agent_mcp_profile(
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    )
+
+    profile = tomllib.loads(rendered)
+    assert profile["mcp_servers"]["clio-relay"]["env"]["CLIO_RELAY_INPUT_WORKSPACE_ROOT"] == str(
+        tmp_path
+    )
 
 
 def test_codex_mcp_profile_alias_matches_generic_agent_profile() -> None:

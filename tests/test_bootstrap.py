@@ -48,14 +48,14 @@ from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
 
 def test_bootstrap_uses_exact_public_jarvis_cd_release_pin() -> None:
     """Keep bootstrap and the locked MCP child on the same public JARVIS wheel."""
-    assert JARVIS_CD_VERSION == "1.4.8"
-    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.4.8-py3-none-any.whl"
+    assert JARVIS_CD_VERSION == "1.6.0"
+    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.6.0-py3-none-any.whl"
     assert JARVIS_CD_WHEEL_URL == (
         "https://github.com/grc-iit/jarvis-cd/releases/download/"
-        "v1.4.8/jarvis_cd-1.4.8-py3-none-any.whl"
+        "v1.6.0/jarvis_cd-1.6.0-py3-none-any.whl"
     )
     assert JARVIS_CD_WHEEL_SHA256 == (
-        "ebf5e5f375b921f20c79075d461926431a5a017ca8b45e598878a89b229b3935"
+        "c4853138f3263715e806fcd794233d89f4aa58161e3c5fbab59e7f96d24f0e98"
     )
 
 

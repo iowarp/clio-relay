@@ -12,6 +12,7 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.http_api import JarvisMcpCallSubmitRequest, create_app
 from clio_relay.models import (
+    JobKind,
     McpCallSpec,
     RelayJob,
     deterministic_jarvis_execution_id,
@@ -95,6 +96,34 @@ def test_queue_persists_deterministic_execution_id(tmp_path: Path) -> None:
     assert "execution_id" not in _mcp_spec(submission).arguments
     assert _mcp_spec(accepted).arguments["execution_id"] == expected_execution_id
     assert _mcp_spec(persisted).arguments["execution_id"] == expected_execution_id
+
+
+def test_registered_v36_jarvis_run_persists_deterministic_execution_id(
+    tmp_path: Path,
+) -> None:
+    """An exact registered JARVIS route receives the same relay-owned handle."""
+    queue = ClioCoreQueue(tmp_path)
+    submission = RelayJob(
+        cluster="test-cluster",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="registered-clio-kit",
+            server_args=["mcp-server", "jarvis"],
+            expected_server_artifact_digest=_SERVER_ARTIFACT_DIGEST,
+            expected_registered_contract="clio-kit-jarvis-user-v3.6",
+            tool="jarvis_run",
+            arguments={"pipeline_id": "registered-science-pipeline"},
+        ),
+        idempotency_key="registered-deterministic-execution",
+    )
+
+    accepted = queue.submit_job(submission)
+
+    assert _mcp_spec(accepted).arguments["execution_id"] == deterministic_jarvis_execution_id(
+        cluster=accepted.cluster,
+        idempotency_key=accepted.idempotency_key,
+        job_id=accepted.job_id,
+    )
 
 
 def test_queue_preserves_matching_relay_owned_execution_id(tmp_path: Path) -> None:

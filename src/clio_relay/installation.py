@@ -49,7 +49,7 @@ JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v2"
-CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
+CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
 CLIO_KIT_MCP_CONTRACT_SCHEMA = "clio-kit.mcp-user-contract.v1"
 CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",

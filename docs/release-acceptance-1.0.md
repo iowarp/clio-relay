@@ -39,7 +39,7 @@ machine-readable inventory.
 | 16 | `homelab-transport` | `live-test` | relay and owned SSH transport |
 | 17 | `ares-gateway-start` | `gateway start-runtime` | grouped with report 18 by gateway session |
 | 18 | `ares-gateway-stop` | `gateway stop-runtime` | keeps scheduler job by default |
-| 19 | `ares-secure-runtime` | `live-test` | authenticated JARVIS v3.5 handoff, browser reconnect, and preserve-by-default teardown |
+| 19 | `ares-secure-runtime` | `live-test` | authenticated JARVIS v3.6 handoff, browser reconnect, and preserve-by-default teardown |
 
 Bootstrap of the homelab target and creation of cleanup-owned gateway fixtures
 also write diagnostic reports. Store those outside the policy report directory
@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.4.26"
+$Version = "1.5.0"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -954,7 +954,7 @@ cannot satisfy either requirement.
 
 ## Run the scientific catalog v1.1 contract
 
-Use the exact clio-kit 2.5.23 persistent executable installed and receipt-bound
+Use the exact clio-kit 2.6.2 persistent executable installed and receipt-bound
 by bootstrap. The catalog file is operator-owned site metadata supplied through
 `CLIO_RELAY_VALIDATION_ARES_SCIENTIFIC_CATALOG_FILE`; it is not copied into the
 relay release. This policy uses
@@ -1584,7 +1584,7 @@ probe extension. The extension is stripped before the pipeline is submitted to
 JARVIS. It selects a package/service and supplies one bounded command, but it
 does not supply a runtime host, port, credential, connector, scheduler id, or
 ParaView executable. The relay discovers those only from the authenticated
-JARVIS v3.5 execution query and private-authority binding.
+JARVIS v3.6 execution query and private-authority binding.
 
 The selected dataset and `builtin.paraview` are concrete release-evidence
 inputs, not relay-core behavior. To keep this stage tied to report 6, materialize

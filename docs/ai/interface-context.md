@@ -12,6 +12,7 @@ Core setup:
 - `clio-relay cluster bootstrap`
 - `clio-relay cluster install-endpoint-service`
 - `clio-relay cluster restart-endpoint-service`
+- `clio-relay cluster endpoint-service-status`
 - `clio-relay doctor`
 - `clio-relay live-test`
 - `clio-relay release validate-local`
@@ -26,8 +27,12 @@ Transport and sessions:
 - `clio-relay relay-host test-http-transport`
 - `clio-relay relay-host test-direct-transport`
 - `clio-relay relay-host test-ssh-transport`
+- `clio-relay session plan-start`
 - `clio-relay session start`
+- `clio-relay session start-status`
+- `clio-relay session start-watch`
 - `clio-relay session status`
+- `clio-relay session detach`
 - `clio-relay session teardown`
 
 Endpoint and job work:
@@ -103,6 +108,8 @@ The HTTP API exposes:
 - stdout and stderr reads by offset
 - artifact listing and reads
 - content-pinned used-artifact and reverse used-by lineage reads
+- authenticated exact-job transform record and nullable read
+- owner-generation input-artifact ingest
 - progress reads
 - gateway session create, list, read, update, and close
 - cancellation
@@ -122,6 +129,12 @@ Job POSTs to an owner-session-scoped API additionally require
 `X-Clio-Relay-Session-Generation-Id` for the exact live generation. The API
 rejects missing, stale, or mismatched bindings and rejects client-supplied
 ownership metadata; ownership is stamped only from the authenticated API process.
+`POST /input-artifacts/ingest` is owner-generation-only and accepts the bounded,
+hash-pinned payload used by schema-driven JARVIS input staging. `POST
+/jobs/{job_id}/transform` records one immutable execution-owned activity and
+`GET /jobs/{job_id}/transform` returns it or JSON `null`; both require normal API
+authentication and exact job ownership, while POST also requires the session
+submission binding.
 
 ## MCP Surfaces
 
@@ -154,8 +167,16 @@ MCP tools operate on the same durable records as CLI and HTTP calls.
 to list that job's immutable input edges or `artifact_id` to list downstream
 consumer jobs; cluster routes use the normal `cluster` plus `route_revision`
 pair. Submission tools accept `used_artifact_refs` as unique artifact-id/SHA-256
-pairs, and owned-session routes enforce an exact producer/consumer session
-generation match.
+pairs with optional bounded `clio-relay.artifact-use-provenance.v1` evidence,
+and owned-session routes enforce an exact producer/consumer session generation
+match. Existing admin job/status reads include the nullable transform. No MCP
+profile exposes transform mutation.
+
+Registered remote MCP calls execute the packaged stdio client and server in
+endpoint-owned process containment. They do not create an outer JARVIS pipeline
+or scheduler job. Exact `clio-kit-jarvis-user-v3.6` routes additionally support
+package-described local-file staging; other registered contracts remain generic
+pass-through.
 
 `relay_bind_jarvis_runtime` is in the user profile. A waited
 `jarvis_get_execution(include_service_runtimes=true)` response supplies compact
@@ -208,6 +229,10 @@ Important environment variables:
 - `CLIO_RELAY_AGENT_ARGS`
 - `CLIO_RELAY_CLI_MODE`
 - `CLIO_RELAY_REMOTE_MCP_CACHE`
+- `CLIO_RELAY_INPUT_WORKSPACE_ROOT`
+- `CLIO_RELAY_INPUT_FILE_MAX_BYTES`
+- `CLIO_RELAY_INPUT_TOTAL_MAX_BYTES`
+- `CLIO_RELAY_INPUT_FILE_MAX_COUNT`
 
 Local cluster registry data lives under `.clio-relay/clusters.json` by default. Secrets for unattended local runs can live in ignored `.clio-relay/secrets.json`.
 

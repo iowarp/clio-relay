@@ -78,6 +78,7 @@ from clio_relay.deployment import (
 )
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
+from clio_relay.endpoint_service_status import endpoint_service_readiness_over_ssh
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -146,6 +147,8 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
     TaskEventStatus,
     TaskTimelineEvent,
+    artifact_use_payload,
+    validate_artifact_use_collection,
 )
 from clio_relay.owner_session_admission import (
     assert_no_unscoped_desktop_admission_state as _assert_no_unscoped_desktop_admission_state,
@@ -283,6 +286,7 @@ from clio_relay.session_lifecycle import (
     start_remote_session_durable,
     status_remote_session,
     teardown_remote_session,
+    watch_remote_session_start,
 )
 from clio_relay.storage_runtime import (
     StorageAdmissionError,
@@ -3816,6 +3820,27 @@ def cluster_restart_endpoint_service(
     )
 
 
+@cluster_app.command("endpoint-service-status")
+def cluster_endpoint_service_status(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this read-only inspection."),
+    ] = None,
+) -> None:
+    """Return machine-readable endpoint persistence and recovery readiness."""
+    definition = _require_cluster(cluster)
+
+    def _status() -> None:
+        evidence = endpoint_service_readiness_over_ssh(
+            cluster=cluster,
+            ssh_host=ssh_host or definition.ssh_host,
+        )
+        typer.echo(evidence.model_dump_json(indent=2))
+
+    _run_or_exit(_status)
+
+
 @session_app.command("plan-start")
 def session_plan_start(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -3885,7 +3910,7 @@ def session_start(
         typer.Option("--json/--text", help="Emit the stable start-result JSON contract."),
     ] = False,
 ) -> None:
-    """Start an owned remote relay API session for detach/reattach workflows."""
+    """Start an owned API; exit 0 means ready and exit 2 means handle-only."""
     settings = RelaySettings.from_env()
     if require_token and settings.api_token is None:
         raise typer.BadParameter(
@@ -3950,6 +3975,11 @@ def session_start(
                 _echo_lines(result.compatibility_lines)
             if result.state in {"failed", "not_current"}:
                 raise typer.Exit(code=1)
+            if not result.usable:
+                # A durable operation handle is useful for status/retry/cleanup,
+                # but must never look like a successfully attached API session
+                # to integrations that key off the process exit status.
+                raise typer.Exit(code=2)
 
     _run_or_exit(action)
 
@@ -5101,6 +5131,67 @@ def session_start_status(
         typer.echo(
             query_remote_session_start(definition=definition, plan=plan).model_dump_json(indent=2)
         )
+
+    _run_or_exit(action)
+
+
+@session_app.command("start-watch")
+def session_start_watch(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    session_id: Annotated[str, typer.Option(help="Exact owned relay session id.")],
+    start_operation_id: Annotated[str, typer.Option(help="Exact planned start operation id.")],
+    cluster_route_revision: Annotated[
+        str,
+        typer.Option(help="Exact route revision from session plan-start."),
+    ],
+    remote_api_port: Annotated[int, typer.Option(help="Planned remote API port.")],
+    expected_api_release_identity_sha256: Annotated[
+        str,
+        typer.Option(help="Exact release digest from session plan-start."),
+    ],
+    replace: Annotated[
+        bool,
+        typer.Option("--replace/--no-replace", help="Planned replacement policy."),
+    ] = False,
+    require_token: Annotated[
+        bool,
+        typer.Option(help="Planned API token policy."),
+    ] = True,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(min=0.1, max=3600.0, help="Bounded aggregate watch duration."),
+    ] = 120.0,
+    poll_seconds: Annotated[
+        float,
+        typer.Option(min=0.05, max=60.0, help="Delay between exact status observations."),
+    ] = 0.5,
+) -> None:
+    """Watch a durable handle; exit 0 is ready, 1 failed, and 2 detached."""
+    definition = _require_cluster(cluster)
+
+    def action() -> None:
+        plan = plan_remote_session_start(
+            cluster=cluster,
+            definition=definition,
+            session_id=session_id,
+            remote_api_port=remote_api_port,
+            replace=replace,
+            require_token=require_token,
+            start_operation_id=start_operation_id,
+            expected_cluster_route_revision=cluster_route_revision,
+            expected_api_release_identity_sha256=expected_api_release_identity_sha256,
+        )
+        result = watch_remote_session_start(
+            definition=definition,
+            plan=plan,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        typer.echo(result.model_dump_json(indent=2))
+        if result.state in {"failed", "not_current"}:
+            raise typer.Exit(code=1)
+        if not result.usable:
+            raise typer.Exit(code=2)
 
     _run_or_exit(action)
 
@@ -7219,7 +7310,7 @@ def job_submit(
         list[str] | None,
         typer.Option(
             "--used-artifact",
-            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
         ),
     ] = None,
     exclusive: Annotated[
@@ -7255,8 +7346,8 @@ def job_submit(
             key,
             "--exclusive" if exclusive else "--shared",
         ]
-        for value in used_artifact or []:
-            remote_command.extend(["--used-artifact", value])
+        for ref in _artifact_use_refs(used_artifact):
+            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         _run_remote_or_exit(
             definition,
             remote_command,
@@ -7285,7 +7376,7 @@ def job_submit_pipeline(
         list[str] | None,
         typer.Option(
             "--used-artifact",
-            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
         ),
     ] = None,
 ) -> None:
@@ -7307,8 +7398,8 @@ def job_submit_pipeline(
             "--idempotency-key",
             key,
         ]
-        for value in used_artifact or []:
-            remote_command.extend(["--used-artifact", value])
+        for ref in _artifact_use_refs(used_artifact):
+            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         _run_remote_or_exit(
             definition,
             remote_command,
@@ -10504,7 +10595,7 @@ def agent_run(
         list[str] | None,
         typer.Option(
             "--used-artifact",
-            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
         ),
     ] = None,
 ) -> None:
@@ -10527,8 +10618,8 @@ def agent_run(
         ]
         if mcp_config is not None:
             args.extend(["--mcp-config", mcp_config])
-        for value in used_artifact or []:
-            args.extend(["--used-artifact", value])
+        for ref in _artifact_use_refs(used_artifact):
+            args.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         _run_remote_or_exit(definition, args)
         return
     job = RelayJob(
@@ -10583,7 +10674,7 @@ def mcp_call(
         list[str] | None,
         typer.Option(
             "--used-artifact",
-            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
         ),
     ] = None,
     timeout_seconds: Annotated[
@@ -10593,6 +10684,13 @@ def mcp_call(
     expected_server_artifact_digest: Annotated[
         str | None,
         typer.Option(help="Expected discovery-time MCP server artifact SHA-256 binding."),
+    ] = None,
+    expected_registered_contract: Annotated[
+        str | None,
+        typer.Option(
+            help="Internal expected operator-registered semantic contract.",
+            hidden=True,
+        ),
     ] = None,
     control_query_evidence_json: Annotated[
         str | None,
@@ -10674,8 +10772,10 @@ def mcp_call(
                     expected_server_artifact_digest,
                 ]
             )
-        for value in used_artifact or []:
-            remote_command.extend(["--used-artifact", value])
+        if expected_registered_contract is not None:
+            remote_command.extend(["--expected-registered-contract", expected_registered_contract])
+        for ref in _artifact_use_refs(used_artifact):
+            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         try:
             if remote_arguments_path is not None:
                 write_remote_file(
@@ -10715,6 +10815,7 @@ def mcp_call(
                 tool=tool,
                 expected_server_artifact_digest=expected_server_artifact_digest,
                 evidence=control_query_evidence,
+                expected_registered_contract=expected_registered_contract,
                 timeout_seconds=timeout_seconds,
             )
         except ValueError as exc:
@@ -10725,6 +10826,8 @@ def mcp_call(
             "env_from": environment_references,
             "expected_server_artifact_digest": expected_server_artifact_digest,
         }
+        if expected_registered_contract is not None:
+            admission_identity["expected_registered_contract"] = expected_registered_contract
         if (
             resolved_admission_class is McpAdmissionClass.CONTROL_QUERY
             or admission_authority is not None
@@ -10764,6 +10867,7 @@ def mcp_call(
                 server_args=server_args,
                 env_from=environment_references,
                 expected_server_artifact_digest=expected_server_artifact_digest,
+                expected_registered_contract=expected_registered_contract,
                 admission_class=resolved_admission_class,
                 operation=operation,
                 tool=tool,
@@ -10811,7 +10915,7 @@ def jarvis_mcp_call(
         list[str] | None,
         typer.Option(
             "--used-artifact",
-            help="Content-pinned dependency as ARTIFACT_ID=SHA256. Repeatable.",
+            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
         ),
     ] = None,
     timeout_seconds: Annotated[
@@ -10900,8 +11004,8 @@ def jarvis_mcp_call(
                     expected_server_artifact_digest,
                 ]
             )
-        for value in used_artifact or []:
-            remote_command.extend(["--used-artifact", value])
+        for ref in _artifact_use_refs(used_artifact):
+            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         try:
             if remote_args is not None:
                 write_remote_file(
@@ -11485,8 +11589,13 @@ def api_start(
         _require_process_bound_session_api_release()
     except ConfigurationError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    # Import the process-bound app while its one-time gated environment is intact.
+    # The startup receipt then scrubs the owner token from the environment, while
+    # the app retains the validated settings needed to prove this session's identity.
+    from clio_relay.http_api import app as relay_http_app
+
     publish_owned_session_api_startup_receipt()
-    uvicorn.run("clio_relay.http_api:app", host=host, port=port)
+    uvicorn.run(relay_http_app, host=host, port=port)
 
 
 @agent_app.command("render-mcp-config")
@@ -13980,11 +14089,19 @@ def _verified_recovered_owner_session_generation(
 ) -> str:
     """Return an exact generation only from complete recovery evidence."""
     generation_id = status.session_generation_id
+    committed_identity = status.metadata_verified
+    pre_metadata_identity = bool(
+        not status.metadata_verified
+        and not status.cleanup_receipt
+        and status.start_attempt_verified
+        and status.start_state in {"starting", "failed"}
+        and status.start_phase is not None
+    )
     if not (
         status.cluster == cluster
         and status.session_id == session_id
         and status.owner == "clio-relay"
-        and status.metadata_verified
+        and (committed_identity or pre_metadata_identity)
         and status.cluster_registry_verified
         and status.durable_generation_verified
         and status.ownership_verified
@@ -14625,6 +14742,13 @@ def _run_jarvis_remote_contract_discovery(
             "tools/list",
             "--idempotency-key",
             idempotency_key,
+            "--timeout-seconds",
+            str(
+                min(
+                    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
+                    max(1, math.ceil(wait_timeout_seconds)),
+                )
+            ),
         ]
         job_id = _last_nonempty_line(run_remote_clio(definition, remote_args))
         terminal = _json_output(
@@ -18509,17 +18633,19 @@ def _environment_references(items: list[str] | None) -> dict[str, str]:
 
 
 def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
-    """Parse repeatable ``ARTIFACT_ID=SHA256`` dependency bindings."""
+    """Parse legacy shorthand or canonical JSON artifact dependency bindings."""
     refs: list[ArtifactUse] = []
     for item in items or []:
-        artifact_id, separator, sha256 = item.partition("=")
-        if not separator or not artifact_id or not sha256:
-            raise typer.BadParameter(
-                "--used-artifact must use ARTIFACT_ID=SHA256",
-                param_hint="--used-artifact",
-            )
         try:
-            refs.append(ArtifactUse(artifact_id=artifact_id, sha256=sha256))
+            if item.lstrip().startswith("{"):
+                refs.append(ArtifactUse.model_validate_json(item))
+            else:
+                artifact_id, separator, sha256 = item.partition("=")
+                if not separator or not artifact_id or not sha256:
+                    raise ValueError(
+                        "dependency must use ARTIFACT_ID=SHA256 or a canonical JSON object"
+                    )
+                refs.append(ArtifactUse(artifact_id=artifact_id, sha256=sha256))
         except ValueError as exc:
             raise typer.BadParameter(
                 str(exc),
@@ -18531,14 +18657,31 @@ def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
             "--used-artifact values must have unique artifact IDs",
             param_hint="--used-artifact",
         )
-    return sorted(refs, key=lambda ref: ref.artifact_id)
+    canonical = sorted(refs, key=lambda ref: ref.artifact_id)
+    try:
+        validate_artifact_use_collection(canonical)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--used-artifact") from exc
+    return canonical
+
+
+def _artifact_use_cli_value(ref: ArtifactUse) -> str:
+    """Render legacy shorthand or canonical JSON for one CLI dependency."""
+    if ref.provenance is None:
+        return f"{ref.artifact_id}={ref.sha256}"
+    return json.dumps(
+        artifact_use_payload(ref),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
     """Return a stable suffix only when a submission has artifact dependencies."""
     if not refs:
         return ""
-    payload = [ref.model_dump(mode="json") for ref in refs]
+    payload = [artifact_use_payload(ref) for ref in refs]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f":uses-{hashlib.sha256(encoded).hexdigest()}"
 

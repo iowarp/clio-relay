@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from clio_relay.validation_report import LiveValidationReport, ValidationResource
 
 JSON = dict[str, Any]
-MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 60
+MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 600
 REMOTE_MCP_CACHE_ENV = "CLIO_RELAY_REMOTE_MCP_CACHE"
 REMOTE_MCP_CACHE_VERSION = 1
 REMOTE_MCP_CACHE_SOURCE = "durable_relay_mcp_tools_list"
@@ -90,7 +90,56 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.5.23"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
+CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
+CLIO_KIT_JARVIS_USER_CONTRACT_IDS = frozenset(
+    {
+        CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+        CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+    }
+)
+CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID = {
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID: (
+        "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
+    ),
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID: (
+        "9933815ca7ee913d56a7cb1081d7702474bc984efcc97bf16434980172d0469d"
+    ),
+}
+CLIO_KIT_JARVIS_USER_WIRE_SHA256_BY_ID = {
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID: (
+        "c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023"
+    ),
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID: (
+        "05f7d8a6286e211657ca40b64f0645bbd529e402fbf55770c845403695ddd366"
+    ),
+}
+CLIO_KIT_JARVIS_USER_ARTIFACT_SHA256_BY_ID = {
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID: (
+        "6e839f3ac975f247053ef4b6a048c53686882c2ab6a1b103f91dfc744ed29ed5"
+    ),
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID: (
+        "88f8a256262f4c27e0c23359cb3c86b6fb1b2d7c787f56c9c91e0a69e0e719af"
+    ),
+}
+CLIO_KIT_JARVIS_USER_CONTRACT_ARTIFACT_BY_ID = {
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID: "jarvis-user-v3.6.json",
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID: "jarvis-user-v3.5.json",
+}
+CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID[
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID
+]
+CLIO_KIT_JARVIS_USER_TOOL_NAMES = frozenset(
+    {
+        "jarvis_add_step",
+        "jarvis_create_pipeline",
+        "jarvis_describe",
+        "jarvis_edit_step",
+        "jarvis_get_execution",
+        "jarvis_run",
+    }
+)
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.6.2"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
@@ -104,7 +153,7 @@ CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
 # digest is intentionally not the relay contract.
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_CONTRACT_ID: (
-        "cc90789227aa0baea99d0e0379b320811c1dbd40c7fa66877d372309201be1c2"
+        "f1a62d96179012975f763402446571146e04e519f98df30583f9800f233216fc"
     ),
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
@@ -112,7 +161,7 @@ CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID = {
 }
 CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_CONTRACT_ID: (
-        "5f1d3aaf1d7311df84d9b25a66c3ed1987f3b84799658eaf8d9ccbbb79485ed2"
+        "e06bfa71153e19ea44f03ed55f03873bc643f42b4b25b96788c02892df719da8"
     ),
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "e575c901226a34a1f4286228b3f71966fe55b68d82bae5c6fd6582af0e43fd2d"
@@ -120,7 +169,7 @@ CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID = {
 }
 CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_CONTRACT_ID: (
-        "1bae2c8386a85e90fde674819c04a598033b360367745fd36bead97b5728d537"
+        "24f6e2b340ef5e2649241c10d7c2260b8d8cbbaa4e10f1a389c9249c2e7e6171"
     ),
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "6a254d2d6734b71d8069b6806a81a4e237cc682e3bf6dde4b76b61de7464701b"
@@ -133,7 +182,7 @@ CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
     CLIO_KIT_SPACK_USER_CONTRACT_ID
 ]
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.5.23"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.6.2"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(
@@ -1340,14 +1389,43 @@ class VirtualRemoteMcpTool:
         clusters = sorted(self.routes)
         input_schema = inject_cluster_argument(self.remote_tool.input_schema, clusters=clusters)
         description = self.remote_tool.description or f"Call {self.remote_tool.name}."
+        wait_guidance = (
+            "Set wait_for_terminal=true to return the bounded remote MCP result in this same "
+            "call; otherwise use relay job tools with the returned handle."
+        )
+        exact_v36_routes = bool(self.routes) and all(
+            route.contract == CLIO_KIT_JARVIS_USER_CONTRACT_ID for route in self.routes.values()
+        )
+        if exact_v36_routes and self.remote_tool.name == "jarvis_describe":
+            properties = cast(JSON, input_schema["properties"])
+            wait_schema = cast(JSON, properties["wait_for_terminal"])
+            wait_schema["default"] = True
+            wait_schema["description"] = (
+                "Always reconciled to a terminal result within the bounded local wait for the "
+                "registered JARVIS v3.6 contract. The bound never cancels or fails the durable "
+                "remote operation."
+            )
+            description += (
+                " Registered JARVIS v3.6 descriptions are transparently reconciled to a "
+                "terminal structured result so package semantics survive client restarts."
+            )
+            wait_guidance = (
+                "The terminal reconciliation is automatic; if its bound expires, relay "
+                "returns an error containing the still-observable durable job handle."
+            )
+        elif exact_v36_routes and self.remote_tool.name == "jarvis_add_step":
+            description += (
+                " When configuration contains a package-declared local-file input, relay "
+                "performs bounded terminal reconciliation before recording durable input "
+                "lineage; calls without staged local inputs retain ordinary asynchronous "
+                "semantics."
+            )
         definition: JSON = {
             "name": self.alias,
             "description": (
                 f"{description} Routed through registered remote MCP namespace "
                 f"'{self.namespace}' on the selected cluster. The call is submitted "
-                "as a durable relay job. Set wait_for_terminal=true to return the "
-                "bounded remote MCP result in this same call; otherwise use relay job "
-                "tools with the returned handle."
+                f"as a durable relay job. {wait_guidance}"
             ),
             "inputSchema": input_schema,
             "outputSchema": deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA),
@@ -1505,6 +1583,26 @@ def remote_mcp_server_artifact_digest(server_artifact: JSON) -> str:
     return _stable_digest({"server_artifact": server_artifact})
 
 
+def remote_mcp_server_artifact_binding_verified(
+    server_artifact: object,
+    *,
+    expected_digest: str | None,
+) -> bool:
+    """Verify one immutable registered-server artifact against discovery."""
+    if not isinstance(server_artifact, dict) or not _is_sha256(expected_digest):
+        return False
+    typed = cast(JSON, server_artifact)
+    return (
+        _server_artifact_verified(typed)
+        and _immutable_remote_mcp_install_verified(typed)
+        and _is_sha256(typed.get("install_artifact_sha256"))
+        and hmac.compare_digest(
+            remote_mcp_server_artifact_digest(typed),
+            cast(str, expected_digest).lower(),
+        )
+    )
+
+
 def cache_entry_from_discovery_artifact(
     *,
     cluster: str,
@@ -1615,6 +1713,7 @@ def resolve_registered_remote_mcp_admission(
     tool: str | None,
     expected_server_artifact_digest: str | None,
     evidence: McpControlQueryEvidence | None,
+    expected_registered_contract: str | None = None,
     timeout_seconds: int | None = None,
     now: datetime | None = None,
 ) -> tuple[McpAdmissionClass, McpAdmissionAuthority | None]:
@@ -1627,6 +1726,8 @@ def resolve_registered_remote_mcp_admission(
     if operation is McpOperation.TOOLS_LIST:
         if evidence is not None:
             raise ValueError("tools/list must not carry control-query route evidence")
+        if expected_registered_contract is not None:
+            raise ValueError("tools/list must not carry a registered semantic contract binding")
         if definition is None or definition.name != cluster:
             return McpAdmissionClass.WORKLOAD, None
         matches = [
@@ -1655,6 +1756,35 @@ def resolve_registered_remote_mcp_admission(
             ),
         )
     if evidence is None:
+        if expected_registered_contract is None:
+            return McpAdmissionClass.WORKLOAD, None
+        if definition is None or definition.name != cluster:
+            raise ValueError("registered semantic contract requires a configured cluster route")
+        matches = [
+            registration
+            for registration in definition.remote_mcp_servers.values()
+            if registration.enabled
+            and registration.command == server
+            and registration.args == server_args
+            and registration.env_from == env_from
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "registered semantic contract route must match exactly one operator registration"
+            )
+        registration = matches[0]
+        if registration.contract != expected_registered_contract:
+            raise ValueError("registered MCP semantic contract changed after discovery")
+        if not tool or not registration.allows_tool(tool):
+            raise ValueError("MCP tool is not allowlisted by its operator registration")
+        if registration.allow_mutable_artifact:
+            raise ValueError("registered semantic contracts require an immutable MCP artifact")
+        if expected_server_artifact_digest is None:
+            raise ValueError("registered semantic contract requires a server artifact binding")
+        if timeout_seconds is None or timeout_seconds <= 0:
+            raise ValueError("registered semantic contract requires an explicit positive timeout")
+        if timeout_seconds > registration.call_timeout_seconds:
+            raise ValueError("MCP call timeout exceeds the operator registration limit")
         return McpAdmissionClass.WORKLOAD, None
     if not tool:
         raise ValueError("control-query evidence requires one tools/call tool")
@@ -1685,6 +1815,11 @@ def resolve_registered_remote_mcp_admission(
         raise ValueError("MCP call route does not match its operator registration")
     if not registration.allows_tool(tool):
         raise ValueError("MCP tool is not allowlisted by its operator registration")
+    if (
+        expected_registered_contract is not None
+        and registration.contract != expected_registered_contract
+    ):
+        raise ValueError("registered MCP semantic contract changed after discovery")
     if registration.allow_mutable_artifact:
         raise ValueError("mutable MCP server artifacts cannot use reserved query capacity")
     if timeout_seconds is None:
@@ -4330,11 +4465,62 @@ def _declared_contract_check(
     registration: RemoteMcpServerConfig,
 ) -> RemoteMcpAcceptanceCheck:
     """Evaluate the semantic contract explicitly declared by an operator."""
+    if registration.contract in CLIO_KIT_JARVIS_USER_CONTRACT_IDS:
+        return _jarvis_user_contract_check(entry, registration)
     if registration.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS:
         return _spack_user_contract_check(entry, registration)
     if registration.contract in CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS:
         return _scientific_catalog_user_contract_check(entry, registration)
     raise ValueError(f"unsupported remote MCP semantic contract: {registration.contract}")
+
+
+def _jarvis_user_contract_check(
+    entry: RemoteMcpSchemaCacheEntry | None,
+    registration: RemoteMcpServerConfig,
+) -> RemoteMcpAcceptanceCheck:
+    """Require the exact six-tool JARVIS contract approved for desktop agents."""
+    tools = {tool.name: tool for tool in entry.tools} if entry is not None else {}
+    actual_names = set(tools)
+    allowed_names = {name for name in actual_names if registration.allows_tool(name)}
+    observed_digest = remote_mcp_schema_digest(list(tools.values()))
+    declared_contract = registration.contract
+    expected_contract_digest = CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID.get(
+        declared_contract or ""
+    )
+    passed = (
+        actual_names == set(CLIO_KIT_JARVIS_USER_TOOL_NAMES)
+        and allowed_names == set(CLIO_KIT_JARVIS_USER_TOOL_NAMES)
+        and "user" in registration.profiles
+        and registration.contract in CLIO_KIT_JARVIS_USER_CONTRACT_IDS
+        and observed_digest == expected_contract_digest
+    )
+    return RemoteMcpAcceptanceCheck(
+        name="remote-mcp.jarvis-user-contract",
+        passed=passed,
+        message=(
+            "JARVIS exposes the exact audited six-tool agent contract"
+            if passed
+            else "JARVIS user tools, allowlist, profile, or schemas drifted"
+        ),
+        evidence={
+            "declared_contract": declared_contract,
+            "expected_tool_names": sorted(CLIO_KIT_JARVIS_USER_TOOL_NAMES),
+            "remote_tool_names": sorted(actual_names),
+            "allowlisted_tool_names": sorted(allowed_names),
+            "profiles": registration.profiles,
+            "expected_contract_sha256": expected_contract_digest,
+            "expected_wire_sha256": CLIO_KIT_JARVIS_USER_WIRE_SHA256_BY_ID.get(
+                declared_contract or ""
+            ),
+            "expected_contract_artifact": CLIO_KIT_JARVIS_USER_CONTRACT_ARTIFACT_BY_ID.get(
+                declared_contract or ""
+            ),
+            "expected_contract_artifact_sha256": (
+                CLIO_KIT_JARVIS_USER_ARTIFACT_SHA256_BY_ID.get(declared_contract or "")
+            ),
+            "observed_contract_sha256": observed_digest,
+        },
+    )
 
 
 def _stdio_initialize_passed(evidence: JSON | None) -> bool:
@@ -4361,7 +4547,19 @@ def _stdio_initialize_passed(evidence: JSON | None) -> bool:
             "tools_list_sha256",
             "called_tool_schema_sha256",
             "jarvis_contract_sha256",
-            "jarvis_virtual_tools_sha256",
+        )
+        raw_tool_names = evidence.get("tool_names")
+        if not isinstance(raw_tool_names, list) or not all(
+            isinstance(name, str) and name for name in cast(list[object], raw_tool_names)
+        ):
+            return False
+        tool_names = set(cast(list[str], raw_tool_names))
+        advertised_jarvis_names = tool_names & CLIO_KIT_JARVIS_USER_TOOL_NAMES
+        jarvis_surface_sha256 = evidence.get("jarvis_virtual_tools_sha256")
+        jarvis_surface_valid = (not advertised_jarvis_names and jarvis_surface_sha256 is None) or (
+            advertised_jarvis_names == set(CLIO_KIT_JARVIS_USER_TOOL_NAMES)
+            and isinstance(jarvis_surface_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", jarvis_surface_sha256) is not None
         )
         return (
             evidence.get("schema_version") == "clio-relay.packaged-mcp-stdio-evidence.v1"
@@ -4373,6 +4571,9 @@ def _stdio_initialize_passed(evidence: JSON | None) -> bool:
             and bool(evidence.get("server_version"))
             and isinstance(evidence.get("containment_enforceable"), bool)
             and isinstance(evidence.get("containment_mode"), str)
+            and evidence.get("jarvis_contract_id") == CLIO_KIT_JARVIS_USER_CONTRACT_ID
+            and evidence.get("jarvis_contract_sha256") == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
+            and jarvis_surface_valid
             and expected_digest == observed_digest
             and all(
                 isinstance(evidence.get(name), str)

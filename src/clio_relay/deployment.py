@@ -782,6 +782,9 @@ def render_endpoint_user_service(
     return f"""[Unit]
 Description=clio-relay worker endpoint for {description_cluster}
 After=network-online.target
+# Never strand an enabled endpoint after repeated unexpected exits. Each start
+# remains bounded by TimeoutStartSec and retries are paced by RestartSec.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
