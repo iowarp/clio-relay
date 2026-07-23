@@ -489,6 +489,41 @@ class _BlockingLaneProvider(JarvisCdProvider):
         self.query_started = Event()
         self.release_source = Event()
 
+    def run_command_streaming(
+        self,
+        command: list[str],
+        *,
+        process_label: str = "contained command",
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        credential_payload: str | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
+        timeout_seconds: int | None = None,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Complete one endpoint-owned MCP query without invoking a real server."""
+        del (
+            process_label,
+            cwd,
+            env,
+            credential_payload,
+            on_stdout,
+            on_stderr,
+            should_cancel,
+            timeout_seconds,
+            on_timeout,
+        )
+        if on_start is not None:
+            on_start(1002)
+        self.query_started.set()
+        if on_poll is not None:
+            on_poll()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
     def run_pipeline_streaming(
         self,
         pipeline_path: Path,

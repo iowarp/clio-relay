@@ -30,6 +30,27 @@ def test_empty_command_evidence_records_exit_code() -> None:
     assert evidence.metadata["output_bytes"] == 0
 
 
+def test_pytest_failure_ids_survive_transcript_truncation() -> None:
+    """Every pytest failure node remains machine-readable when details are bounded."""
+    summary = "\n".join(
+        [
+            "==== short test summary info ====",
+            "FAILED tests/test_queue.py::test_atomic - AssertionError",
+            "FAILED tests/test_queue.py::test_second[param value] - RuntimeError",
+            "2 failed, 100 passed in 90.00s",
+        ]
+    )
+    output = "==== FAILURES ====\nfirst cause\n" + ("detail\n" * 50_000) + summary
+
+    evidence = command_evidence(output, None, exit_code=1)
+
+    assert evidence.metadata["truncated"] is True
+    assert evidence.metadata["failed_test_ids"] == [
+        "tests/test_queue.py::test_atomic",
+        "tests/test_queue.py::test_second[param value]",
+    ]
+
+
 def test_large_pytest_output_keeps_first_failure_and_summary() -> None:
     """Collection noise is discarded before the first causal pytest failure."""
     prelude = "collecting tests 🧪\n" * 2_000

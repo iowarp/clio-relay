@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -416,3 +417,38 @@ def test_pipeline_input_lineage_is_checksum_bound_and_route_exact(tmp_path: Path
     record_path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="checksum"):
         restarted.get_jarvis_pipeline_input_lineage(route)
+
+
+def test_pipeline_input_lineage_first_merge_uses_one_mutation_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first lineage write cannot observe creation after its update timestamp."""
+    mutation_at = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    later_model_default = mutation_at + timedelta(microseconds=1)
+    monkeypatch.setattr("clio_relay.core_queue.utc_now", lambda: mutation_at)
+    monkeypatch.setattr("clio_relay.models.utc_now", lambda: later_model_default)
+    route = jarvis_pipeline_input_route(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+
+    saved = ClioCoreQueue(tmp_path / "core").merge_jarvis_pipeline_input_lineage(
+        route,
+        (
+            ArtifactUse(
+                artifact_id="artifact_0123456789abcdef0123456789abcdef",
+                sha256="d" * 64,
+            ),
+        ),
+        manifest_sha256="e" * 64,
+    )
+
+    assert saved.created_at == mutation_at
+    assert saved.updated_at == mutation_at

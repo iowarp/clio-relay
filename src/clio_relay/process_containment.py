@@ -1281,7 +1281,10 @@ def terminate_recorded_process_tree(
             )
             if not existing_pids and not Path(cgroup_path).exists():
                 return
-        scope = Path(cgroup_path).resolve(strict=True)
+        recorded_scope = Path(cgroup_path)
+        if observed_identity is None and not recorded_scope.exists():
+            return
+        scope = recorded_scope.resolve(strict=True)
         if not exact_persistent_identity:
             cgroup_root = Path("/sys/fs/cgroup").resolve()
             try:

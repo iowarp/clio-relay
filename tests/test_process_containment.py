@@ -612,6 +612,37 @@ def test_recorded_scope_returns_only_exact_cgroup_members(
     ) == [4321, 4322]
 
 
+def test_recorded_transient_scope_absence_proves_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exited broker and removed transient cgroup are already fully cleaned."""
+
+    def missing_start_identity(_process_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(
+        process_containment,
+        "process_start_identity",
+        missing_start_identity,
+    )
+
+    def refuse_mutation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("already-absent transient scope was mutated")
+
+    monkeypatch.setattr(process_containment, "_terminate_linux_systemd_scope", refuse_mutation)
+    monkeypatch.setattr(process_containment, "_release_linux_systemd_scope", refuse_mutation)
+
+    process_containment.terminate_recorded_process_tree(
+        process_id=4312,
+        expected_start_identity="linux-proc-start:expected",
+        process_group_id=4312,
+        containment_mode="linux_systemd_scope",
+        systemd_unit="clio-relay-transient.scope",
+        cgroup_path=str(tmp_path / "already-removed.scope"),
+    )
+
+
 def test_windows_recorded_cleanup_accepts_taskkill_failure_only_after_pid_absence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -983,7 +1014,7 @@ def test_broker_readiness_timeout_kills_unacknowledged_child(
     pid_path = tmp_path / "unacknowledged.pid"
     shortened = cast(Any, process_containment)._BROKER_SCRIPT.replace(
         "HANDSHAKE_TIMEOUT_SECONDS = 5.0",
-        "HANDSHAKE_TIMEOUT_SECONDS = 0.2",
+        "HANDSHAKE_TIMEOUT_SECONDS = 1.0",
     )
     monkeypatch.setattr(process_containment, "_BROKER_SCRIPT", shortened)
     script = r"""
@@ -1002,7 +1033,10 @@ time.sleep(60)
 """
     started = time.monotonic()
 
-    with pytest.raises(RuntimeError, match="exited before child readiness"):
+    with pytest.raises(
+        process_containment.OwnedProcessSpawnError,
+        match="stage=credential_ack code=ack_timeout",
+    ) as captured:
         process_containment.spawn_owned_process(
             [sys.executable, "-I", "-S", "-c", script, str(pid_path)],
             credential_payload='{"schema_version":"test.v1"}',
@@ -1012,7 +1046,8 @@ time.sleep(60)
             stderr=subprocess.PIPE,
         )
 
-    assert time.monotonic() - started < 3
+    assert captured.value.cleanup_verified is True
+    assert time.monotonic() - started < 4
     child_pid = int(pid_path.read_text(encoding="ascii"))
     assert _wait_until_pid_exits(child_pid, timeout_seconds=3)
 

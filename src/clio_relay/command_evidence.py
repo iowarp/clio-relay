@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 EVIDENCE_EXCERPT_MAX_BYTES = 24_576
@@ -11,6 +12,8 @@ ERROR_DETAIL_SUMMARY_TAIL_BYTES = 1_024
 EXCERPT_STRATEGY = "diagnostic-head-summary-tail-v1"
 
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
+_PYTEST_FAILED_TEST_PATTERN = re.compile(r"(?m)^FAILED (?P<test_id>tests/.*?) - ")
+_MAX_FAILED_TEST_IDS = 1_000
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,7 @@ def command_evidence(
                 "error_detail_bytes": len(fallback.encode("utf-8")),
                 "diagnostic_marker": None,
                 "diagnostic_offset_bytes": None,
+                "failed_test_ids": [],
                 "omitted_prefix_bytes": 0,
                 "omitted_middle_bytes": 0,
                 "truncated": False,
@@ -80,6 +84,7 @@ def command_evidence(
             None if diagnostic_offset is None else len(output[:diagnostic_offset].encode("utf-8"))
         ),
         "exit_code": exit_code,
+        "failed_test_ids": _pytest_failed_test_ids(output),
         **excerpt_metadata,
     }
     return CommandEvidence(
@@ -103,6 +108,14 @@ def bounded_error_detail(value: str | None) -> str | None:
         diagnostic_offset=diagnostic_offset,
     )
     return bounded
+
+
+def _pytest_failed_test_ids(output: str) -> list[str]:
+    """Return bounded, ordered pytest node IDs from a failed command transcript."""
+    return [
+        match.group("test_id")
+        for match in list(_PYTEST_FAILED_TEST_PATTERN.finditer(output))[:_MAX_FAILED_TEST_IDS]
+    ]
 
 
 def _first_diagnostic(output: str) -> tuple[str | None, int | None]:

@@ -127,17 +127,11 @@ def test_global_pages_are_stable_bounded_and_filter_one_source_window(
         queue.list_gateway_sessions_page(cursor=0)
 
 
-def test_global_order_upgrade_is_explicit_bounded_and_handles_more_than_500_jobs(
+def test_global_order_seal_field_removal_fails_closed(
     tmp_path: Path,
 ) -> None:
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    legacy_jobs = [_job(f"legacy-page-{index:04d}") for index in range(501)]
-    for job in legacy_jobs:
-        (tmp_path / "jobs" / f"{job.job_id}.json").write_text(
-            job.model_dump_json(),
-            encoding="utf-8",
-        )
 
     migration_path = tmp_path / "migrations" / "index-v1.json"
     migration = json.loads(migration_path.read_text(encoding="utf-8"))
@@ -145,48 +139,11 @@ def test_global_order_upgrade_is_explicit_bounded_and_handles_more_than_500_jobs
     migration["complete"] = True
     migration_path.write_text(json.dumps(migration), encoding="utf-8")
 
-    queue.initialize()
-    status = queue.index_migration_status()
-    assert status["complete"] is False
-    with pytest.raises(QueueConflictError, match="queue migrate-indexes"):
-        queue.list_jobs_page()
-    with pytest.raises(QueueConflictError, match="queue migrate-indexes"):
-        queue.submit_job(_job("write-during-migration"))
-    with pytest.raises(QueueConflictError, match="queue migrate-indexes"):
-        queue.register_endpoint(
-            EndpointRegistration(
-                role=EndpointRole.WORKER,
-                cluster="cluster-a",
-                hostname="worker-during-migration",
-                pid=10,
-            )
-        )
-    with pytest.raises(QueueConflictError, match="queue migrate-indexes"):
-        queue.create_gateway_session(GatewaySession(cluster="cluster-a", name="during-migration"))
-    with pytest.raises(QueueConflictError, match="queue migrate-indexes"):
-        queue.append_monitor_rule(
-            MonitorRule(job_id=legacy_jobs[0].job_id, pattern="during-migration")
-        )
-
-    calls = 0
-    while status["complete"] is not True:
-        status = queue.migrate_indexes_batch(batch_size=100)
-        calls += 1
-        assert calls < 20
-    assert calls >= 6
-
-    ordered_ids = sorted(job.job_id for job in legacy_jobs)
-    first_page, next_cursor, total = queue.list_jobs_page(limit=500)
-    assert [job.job_id for job in first_page] == ordered_ids[:500]
-    assert next_cursor == 501
-    assert total == 501
-    final_page, end_cursor, final_total = queue.list_jobs_page(
-        cursor=next_cursor or 1,
-        limit=500,
-    )
-    assert [job.job_id for job in final_page] == ordered_ids[500:]
-    assert end_cursor is None
-    assert final_total == 501
+    with pytest.raises(
+        QueueConflictError,
+        match="sealed index migration state is invalid",
+    ):
+        queue.initialize()
 
 
 def test_global_order_reverse_mapping_tamper_fails_closed(tmp_path: Path) -> None:

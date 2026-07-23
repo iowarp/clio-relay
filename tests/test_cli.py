@@ -67,6 +67,7 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
+from clio_relay.remote_mcp import MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
 from clio_relay.scheduler_providers import SchedulerProvider
 from clio_relay.service_runtime import (
@@ -6831,7 +6832,16 @@ def test_cli_session_scheduler_cancellation_is_owned_and_canonical(
                     ownership_verified=True,
                     outcome="stopped",
                     verified_after_operation=True,
-                )
+                ),
+                CleanupResource(
+                    kind="remote_session_files",
+                    resource_id="session-1:generation-1",
+                    location="ares",
+                    action="close",
+                    ownership_verified=True,
+                    outcome="closed",
+                    verified_after_operation=True,
+                ),
             ],
         )
 
@@ -6872,7 +6882,7 @@ def test_cli_session_scheduler_cancellation_is_owned_and_canonical(
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, (result.output, result.exception)
     assert canceled_scheduler_ids == ["validation-123"]
     refreshed = ClioCoreQueue(core_dir)
     assert refreshed.get_job(owned.job_id).state is JobState.CANCELED
@@ -9434,12 +9444,12 @@ def test_cli_pinned_jarvis_control_query_rejects_oversized_timeout(
             "--operation",
             "tools/list",
             "--timeout-seconds",
-            "61",
+            str(MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS + 1),
         ],
     )
 
     assert result.exit_code == 2
-    assert "timeout exceeds 60 seconds" in result.output
+    assert f"timeout exceeds {MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds" in result.output
 
 
 def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
@@ -9844,7 +9854,7 @@ def test_target_side_jarvis_discovery_uses_receipt_without_cluster_registry(
     assert job.spec.operation.value == "tools/list"
     assert job.spec.tool is None
     assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert job.spec.timeout_seconds == 60
+    assert job.spec.timeout_seconds == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
     assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
 
 

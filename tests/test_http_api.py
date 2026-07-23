@@ -50,6 +50,7 @@ from clio_relay.models import (
 )
 from clio_relay.relay_ops import job_wait_result
 from clio_relay.remote_mcp import (
+    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     cache_entry_from_discovery_artifact,
     remote_mcp_registration_revision,
     remote_mcp_server_artifact_digest,
@@ -467,7 +468,16 @@ def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
     tmp_path: Path,
 ) -> None:
     """Reject caller lane claims and keep arbitrary tools/list on workload capacity."""
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        spool_max_log_bytes_per_stream=50,
+        spool_max_log_bytes_per_job=100,
+        storage_minimum_free_bytes=0,
+        storage_max_job_reservation_bytes=1_000,
+        storage_job_core_allowance_bytes=20,
+        storage_job_result_allowance_bytes=30,
+    )
     client = cast(Any, TestClient(create_app(settings)))
     raw_mcp = RelayJob(
         cluster="test-cluster",
@@ -520,7 +530,9 @@ def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
     )
 
     assert raw_response.status_code == 422
-    assert "must use /jobs/mcp-call" in raw_response.json()["detail"]
+    assert raw_response.json()["detail"] == (
+        "this job kind must use its dedicated authenticated internal route"
+    )
     assert metadata_response.status_code == 422
     assert "server-managed" in metadata_response.json()["detail"]
     assert generic_enum.status_code == 422
@@ -1515,6 +1527,12 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         owner_session_generation_id="generation-1",
         remote_cluster="test-cluster",
         session_owner_token="o" * 32,
+        spool_max_log_bytes_per_stream=50,
+        spool_max_log_bytes_per_job=100,
+        storage_minimum_free_bytes=0,
+        storage_max_job_reservation_bytes=1_000,
+        storage_job_core_allowance_bytes=20,
+        storage_job_result_allowance_bytes=30,
     )
     queue = ClioCoreQueue(settings.core_dir)
     queue.prepare_owner_session_start(
@@ -1570,7 +1588,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         json={
             **payload,
             "expected_server_artifact_digest": expected_digest,
-            "timeout_seconds": 61,
+            "timeout_seconds": MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS + 1,
             "idempotency_key": "owned-artifact-source-oversized",
         },
     )
@@ -1578,12 +1596,14 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
     assert omitted.status_code == 422
     assert accepted.status_code == 200
     assert oversized.status_code == 422
-    assert "timeout exceeds 60 seconds" in str(oversized.json())
+    assert f"timeout exceeds {MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds" in str(
+        oversized.json()
+    )
     job = queue.get_job(accepted.json()["job_id"])
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.expected_server_artifact_digest == expected_digest
     assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
-    assert job.spec.timeout_seconds == 60
+    assert job.spec.timeout_seconds == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
     metadata = dict(job.metadata)
     authority = McpAdmissionAuthority.model_validate(
         metadata.pop(MCP_ADMISSION_AUTHORITY_METADATA_KEY)

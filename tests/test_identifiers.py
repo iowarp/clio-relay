@@ -607,7 +607,7 @@ def test_runtime_canonical_scan_rejects_reparse_directory(tmp_path: Path) -> Non
     jobs.replace(backup)
     _make_directory_link(outside, jobs)
     try:
-        with pytest.raises(QueueConflictError, match="not a safe directory"):
+        with pytest.raises(QueueConflictError, match="not an owned directory"):
             queue.list_jobs()
         assert marker.read_text(encoding="utf-8") == "operator-owned"
     finally:

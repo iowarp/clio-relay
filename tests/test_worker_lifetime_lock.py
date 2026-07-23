@@ -711,9 +711,7 @@ def test_queue_seal_handoff_bounds_exclusive_wait_and_restores_shared(
     try:
         started = time.monotonic()
         with pytest.raises(WorkerLifetimeLockUnavailable, match="timed out acquiring"):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                candidate
-            )
+            storage_runtime_module.initialize_queue_with_shared_writer_fencing(candidate)
         assert time.monotonic() - started < 1
         assert candidate.acquired is True
         assert not (core_dir / "migrations").exists()
@@ -759,9 +757,7 @@ def test_queue_seal_handoff_bounds_shared_reacquire(
             WorkerLifetimeLockUnavailable,
             match="restoring shared writer ownership",
         ):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                candidate
-            )
+            storage_runtime_module.initialize_queue_with_shared_writer_fencing(candidate)
         assert time.monotonic() - started < 1
         assert candidate.acquired is False
         assert blockers and blockers[0].acquired

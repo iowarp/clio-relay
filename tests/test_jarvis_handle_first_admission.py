@@ -264,7 +264,7 @@ def test_raw_http_submission_cannot_select_jarvis_handle_identity(
 
     assert response.status_code == 422
     assert response.json()["detail"] == (
-        "MCP jobs must use /jobs/mcp-call or /jobs/jarvis-mcp-call"
+        "this job kind must use its dedicated authenticated internal route"
     )
     assert queue.list_jobs() == []
 

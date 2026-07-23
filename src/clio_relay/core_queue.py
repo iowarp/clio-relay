@@ -2650,6 +2650,7 @@ class ClioCoreQueue:
                     self._write_legacy_record_audit_marker_unlocked()
                 else:
                     self._upgrade_sealed_lease_operational_schema_unlocked()
+                    self._reconcile_sealed_lease_capacity_gate_unlocked()
                     self._read_sealed_index_migration_state()
                 self._initialized = True
         except QueueSealRequiresExclusive:
@@ -2747,6 +2748,14 @@ class ClioCoreQueue:
                     except FileNotFoundError:
                         missing = True
                         break
+                    except OSError as exc:
+                        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                            raise LegacyQueueStateError(
+                                family=relative_path.parts[0],
+                                path=self._storage_root / relative_path,
+                                reason="canonical family is not an owned directory",
+                            ) from exc
+                        raise
                     try:
                         os.set_inheritable(child_descriptor, False)
                     except BaseException:
@@ -2777,6 +2786,39 @@ class ClioCoreQueue:
             finally:
                 with suppress(OSError):
                     os.close(descriptor)
+
+    def _reconcile_sealed_lease_capacity_gate_unlocked(self) -> None:
+        """Downgrade a sealed migration gate when its fixed capacity pair is corrupt."""
+        state = self._read_index_migration_state()
+        raw_checkpoint = state.get("lease_capacity_aggregate")
+        if not isinstance(raw_checkpoint, dict):
+            return
+        checkpoint = cast(dict[str, object], raw_checkpoint)
+        if checkpoint.get("complete") is not True:
+            return
+        try:
+            current = self._read_lease_capacity_aggregate_unlocked()
+        except (OSError, QueueConflictError):
+            current = None
+        migrated_generation = checkpoint.get("generation")
+        valid = (
+            current is not None
+            and current.aggregate.epoch_id == checkpoint.get("epoch_id")
+            and isinstance(migrated_generation, int)
+            and not isinstance(migrated_generation, bool)
+            and current.aggregate.generation >= migrated_generation
+        )
+        if valid:
+            return
+        checkpoint.clear()
+        checkpoint.update(
+            {
+                "complete": False,
+                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+            }
+        )
+        state["complete"] = False
+        self._write_index_migration_state(state)
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -4369,6 +4411,7 @@ class ClioCoreQueue:
         path = directory / f"{route_sha256}.json"
         with self._lock:
             existing = self._read_optional(path, JarvisPipelineInputLineage)
+            mutation_at = utc_now()
             if existing is None:
                 count, over_capacity = _bounded_regular_json_count(
                     directory,
@@ -4381,7 +4424,7 @@ class ClioCoreQueue:
                     )
                 merged_uses = artifact_uses
                 manifests = (manifest_sha256,)
-                created_at = None
+                created_at = mutation_at
             else:
                 if existing.route != route or existing.route_sha256 != route_sha256:
                     raise QueueConflictError(
@@ -4405,7 +4448,7 @@ class ClioCoreQueue:
                 artifact_uses=merged_uses,
                 manifest_sha256s=manifests,
                 created_at=created_at,
-                updated_at=utc_now(),
+                updated_at=mutation_at,
             )
             self._write(path, record)
             return record
