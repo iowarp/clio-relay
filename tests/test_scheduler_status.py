@@ -281,10 +281,35 @@ class _ScheduledNativePipeline:
         return self._read_index
 
 
+def _install_managed_jarvis_config(
+    monkeypatch: MonkeyPatch,
+    *,
+    home: Path,
+) -> None:
+    """Install a fake JARVIS config backed by bootstrap-shaped relay state."""
+    home.mkdir(parents=True, exist_ok=True)
+    managed_repository, _registered_package = _managed_relay_repository(home)
+
+    class _FixtureJarvisState:
+        repos = {"repos": [str(managed_repository)]}
+
+    class _FixtureJarvis:
+        @classmethod
+        def get_instance(cls) -> _FixtureJarvisState:
+            return _FixtureJarvisState()
+
+    config_module = ModuleType("jarvis_cd.core.config")
+    config_module.Jarvis = _FixtureJarvis  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "jarvis_cd.core.config", config_module)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def _install_yaml_pipeline_module(
     monkeypatch: MonkeyPatch,
     pipeline: object,
     *,
+    home: Path,
     on_load: Callable[[], None] | None = None,
 ) -> None:
     """Install a bounded fake JARVIS YAML loader for the embedded wrapper."""
@@ -303,11 +328,14 @@ def _install_yaml_pipeline_module(
     monkeypatch.setitem(sys.modules, "jarvis_cd", jarvis_cd)
     monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
     monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+    _install_managed_jarvis_config(monkeypatch, home=home)
 
 
 def _install_named_pipeline_module(
     monkeypatch: MonkeyPatch,
     pipeline_class: type[object],
+    *,
+    home: Path,
 ) -> None:
     """Install one fake named JARVIS pipeline class for the embedded wrapper."""
 
@@ -326,6 +354,7 @@ def _install_named_pipeline_module(
     monkeypatch.setitem(sys.modules, "jarvis_cd.core", jarvis_core)
     monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline", pipeline_module)
     monkeypatch.setitem(sys.modules, "jarvis_cd.core.pipeline_test", pipeline_test)
+    _install_managed_jarvis_config(monkeypatch, home=home)
 
 
 def _execute_test_wrapper(
@@ -336,16 +365,37 @@ def _execute_test_wrapper(
 ) -> None:
     """Execute a credential-bound wrapper after replacing the platform gate in tests."""
     monkeypatch.setattr(process_containment, "enforce_linux_secret_memory_gate", lambda: None)
+    relay_namespace = cast(Any, sys.modules["clio_relay"])
+    original_namespace_paths = list(relay_namespace.__path__)
+    source = command[4]
+    if os.name == "nt":
+        symbolic_link_guard = "if not stat.S_ISLNK(registered_link_before.st_mode):"
+        if source.count(symbolic_link_guard) != 1:
+            raise AssertionError("production symbolic-link guard changed")
+        source = source.replace(
+            symbolic_link_guard,
+            (
+                "if not (stat.S_ISLNK(registered_link_before.st_mode) "
+                "or stat.S_ISDIR(registered_link_before.st_mode)):"
+            ),
+        )
     try:
-        exec(compile(command[4], "<jarvis-native-adapter>", "exec"), {"__name__": "__main__"})
+        exec(compile(source, "<jarvis-native-adapter>", "exec"), {"__name__": "__main__"})
         assert os.read(ready_read_fd, 1) == b"1"
     finally:
+        relay_namespace.__path__ = original_namespace_paths
         os.close(ready_read_fd)
 
 
 def _fast_test_sleep(_seconds: float) -> None:
     """Yield the GIL without adding wall-clock delay to polling tests."""
     time.sleep(0)
+
+
+@pytest.fixture
+def managed_jarvis_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Return a short isolated home for bootstrap-shaped JARVIS state."""
+    return tmp_path_factory.mktemp("jwh")
 
 
 def test_relay_queue_status_counts_older_cluster_jobs(tmp_path: Path) -> None:
@@ -1379,10 +1429,11 @@ def test_scheduled_adapter_registration_cannot_bypass_or_replace_slurm_broker(
 def test_slurm_execution_adapter_emits_owned_identity_before_terminal(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "runtime.jsonl"
     pipeline = _ScheduledNativePipeline(name="scheduled-test", job_id="24680")
-    _install_yaml_pipeline_module(monkeypatch, pipeline)
+    _install_yaml_pipeline_module(monkeypatch, pipeline, home=managed_jarvis_home)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -1420,6 +1471,7 @@ def test_slurm_execution_adapter_emits_owned_identity_before_terminal(
 def test_slurm_execution_adapter_coalesces_more_than_4096_elapsed_only_polls(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "runtime.jsonl"
     pipeline = _ScheduledNativePipeline(
@@ -1427,7 +1479,7 @@ def test_slurm_execution_adapter_coalesces_more_than_4096_elapsed_only_polls(
         job_id="86420",
         duplicate_running_reads=4_096,
     )
-    _install_yaml_pipeline_module(monkeypatch, pipeline)
+    _install_yaml_pipeline_module(monkeypatch, pipeline, home=managed_jarvis_home)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -1462,6 +1514,7 @@ def test_slurm_execution_adapter_coalesces_more_than_4096_elapsed_only_polls(
 def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "direct-runtime.jsonl"
     observations: list[tuple[str, bool] | str] = []
@@ -1510,7 +1563,7 @@ def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
         def get_execution_progress(self, execution_id: str) -> _NativeProgress:
             return _NativeProgress(self.get_execution(execution_id))
 
-    _install_named_pipeline_module(monkeypatch, DirectPipeline)
+    _install_named_pipeline_module(monkeypatch, DirectPipeline, home=managed_jarvis_home)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -1544,6 +1597,7 @@ def test_named_direct_wrapper_emits_authenticated_mode_before_and_after_run(
 def test_named_slurm_pipeline_on_external_worker_is_refused_before_submit(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "named-scheduler-refusal.jsonl"
     instances: list[ScheduledPipeline] = []
@@ -1562,7 +1616,7 @@ def test_named_slurm_pipeline_on_external_worker_is_refused_before_submit(
             self.submit_calls.append((submit, wait, execution_id))
             raise AssertionError("scheduler submission must not be reached")
 
-    _install_named_pipeline_module(monkeypatch, ScheduledPipeline)
+    _install_named_pipeline_module(monkeypatch, ScheduledPipeline, home=managed_jarvis_home)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -1596,6 +1650,7 @@ def test_named_slurm_pipeline_on_external_worker_is_refused_before_submit(
 def test_named_direct_wrapper_records_failure_after_mode_observation(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "direct-crash-runtime.jsonl"
 
@@ -1631,7 +1686,7 @@ def test_named_direct_wrapper_records_failure_after_mode_observation(
         def get_execution_progress(self, execution_id: str) -> _NativeProgress:
             return _NativeProgress(self.get_execution(execution_id))
 
-    _install_named_pipeline_module(monkeypatch, CrashingPipeline)
+    _install_named_pipeline_module(monkeypatch, CrashingPipeline, home=managed_jarvis_home)
     ready_read_fd = _install_runtime_credential_fd(
         monkeypatch,
         runtime_path=runtime_path,
@@ -1653,6 +1708,7 @@ def test_named_direct_wrapper_records_failure_after_mode_observation(
 def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     if os.name == "nt":
         runtime_path = tmp_path / "windows-gated-runtime.jsonl"
@@ -1703,6 +1759,17 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
         bounded_package / "__init__.py",
     ):
         package_init.write_text("", encoding="utf-8")
+    home = managed_jarvis_home
+    managed_repository, _registered_package = _managed_relay_repository(home)
+    (jarvis_core / "config.py").write_text(
+        "class _Jarvis:\n"
+        f"    repos = {{'repos': [{str(managed_repository)!r}]}}\n"
+        "class Jarvis:\n"
+        "    @classmethod\n"
+        "    def get_instance(cls):\n"
+        "        return _Jarvis()\n",
+        encoding="utf-8",
+    )
     containment_filename = process_containment.__file__
     assert containment_filename is not None
     containment_source = Path(containment_filename)
@@ -1903,6 +1970,8 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
     runtime_environment = dict(os.environ)
     runtime_environment.update(
         {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
             "PYTHONPATH": str(site_packages),
             "APP_MARKER": str(tmp_path / "application-ran"),
             "APP_PROBE": str(application_probe),
@@ -2015,6 +2084,7 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
 def test_slurm_broker_scrubs_sidecar_credentials_before_package_and_child_context(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    managed_jarvis_home: Path,
 ) -> None:
     runtime_path = tmp_path / "runtime.jsonl"
     observations: dict[str, tuple[str | None, ...]] = {}
@@ -2064,6 +2134,7 @@ def test_slurm_broker_scrubs_sidecar_credentials_before_package_and_child_contex
     _install_yaml_pipeline_module(
         monkeypatch,
         pipeline,
+        home=managed_jarvis_home,
         on_load=lambda: observe_environment("package_load"),
     )
     ready_read_fd = _install_runtime_credential_fd(

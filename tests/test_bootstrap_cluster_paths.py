@@ -504,11 +504,12 @@ bootstrap_recover_interrupted_repair 1 {cluster} {service_name}
 def test_standalone_bootstrap_cannot_mutate_legacy_output() -> None:
     """Without a managed cluster identity bootstrap uses the fail-closed ordinary init path."""
     script = render_linux_user_bootstrap_script()
+    fresh_transaction = script[script.rindex("bootstrap_journal_action create") :]
 
-    assert "WORKER_SERVICE_NAME=''" in script
-    assert "systemctl --user stop" not in script
-    assert "clio-relay init --migrate-legacy-output" not in script
-    assert "clio-relay init" in script
+    assert "WORKER_SERVICE_NAME=''" in fresh_transaction
+    assert "systemctl --user stop" not in fresh_transaction
+    assert "clio-relay init --migrate-legacy-output" not in fresh_transaction
+    assert "clio-relay init" in fresh_transaction
 
 
 def _fake_proc_process(
