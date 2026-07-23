@@ -265,7 +265,7 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_endpoint.py::test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points",
     ]
     assert pytest_commands[3][7:] == [
-        "tests/test_core_global_pagination.py::test_global_order_upgrade_is_explicit_bounded_and_handles_more_than_500_jobs",
+        "tests/test_core_global_pagination.py::test_global_order_seal_field_removal_fails_closed",
         "tests/test_core_index_safety.py::test_stale_recovery_uses_exact_scheduler_indexes_without_global_task_scan",
         "tests/test_core_index_safety.py::test_gateway_reverse_indexes_refuse_cardinality_overflow",
         "tests/test_core_retention.py::test_terminal_gc_scales_past_501_owned_and_unrelated_records",
