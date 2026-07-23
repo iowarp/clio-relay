@@ -43,6 +43,7 @@ _WINDOWS_GENERIC_READ = 0x80000000
 _WINDOWS_GENERIC_WRITE = 0x40000000
 _WINDOWS_DELETE = 0x00010000
 _WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
 _WINDOWS_CREATE_NEW = 1
 _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
@@ -1027,7 +1028,7 @@ def _open_windows_configuration_handle(
     raw_handle = create_file(
         str(internal_filesystem_path(path, force_extended=True)),
         desired_access,
-        _WINDOWS_FILE_SHARE_READ,
+        _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
         None,
         _WINDOWS_OPEN_EXISTING,
         flags,

@@ -106,6 +106,7 @@ from clio_relay.storage_runtime import (
     StorageManagedQueue,
     StorageRuntime,
     StorageRuntimeViolation,
+    initialize_queue_with_shared_writer_fencing,
     storage_managed_queue,
 )
 from clio_relay.worker_concurrency import (
@@ -302,12 +303,20 @@ class EndpointWorker:
         self._worker_lifetime_lock: WorkerLifetimeLock | None = None
         self._owned_managed_queue: StorageManagedQueue | None = None
         if self.role == EndpointRole.WORKER:
-            lifetime_core = queue.root if queue is not None else settings.core_dir
-            self._worker_lifetime_lock = WorkerLifetimeLock(
-                lifetime_core,
-                mode="shared",
-            ).acquire()
-            settings = settings.model_copy(update={"core_dir": self._worker_lifetime_lock.core_dir})
+            try:
+                lifetime_core = queue.root if queue is not None else settings.core_dir
+                self._worker_lifetime_lock = WorkerLifetimeLock(
+                    lifetime_core,
+                    mode="shared",
+                ).acquire()
+                if queue is not None:
+                    initialize_queue_with_shared_writer_fencing(self._worker_lifetime_lock)
+                settings = settings.model_copy(
+                    update={"core_dir": self._worker_lifetime_lock.core_dir}
+                )
+            except BaseException:
+                self.close()
+                raise
         self.settings = settings
         try:
             resolved_queue = (

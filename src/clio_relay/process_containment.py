@@ -59,6 +59,7 @@ _BROKER_STARTUP_STAGE_CODES: dict[str, frozenset[str]] = {
     "stdin_forward": frozenset({"child_exited", "internal_error"}),
 }
 _BROKER_EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
 class _ResourceModule(Protocol):
@@ -1272,6 +1273,10 @@ def terminate_recorded_process_tree(
         )
         if (systemd_invocation_id is None) is not (systemd_description is None):
             raise RuntimeError("recorded systemd execution has partial persistent identity")
+        recorded_scope = _validated_recorded_systemd_scope_path(
+            cgroup_path,
+            unit=systemd_unit,
+        )
         if exact_persistent_identity:
             existing_pids = recorded_linux_systemd_scope_process_ids(
                 unit=systemd_unit,
@@ -1279,15 +1284,11 @@ def terminate_recorded_process_tree(
                 invocation_id=cast(str, systemd_invocation_id),
                 description=cast(str, systemd_description),
             )
-            if not existing_pids and not Path(cgroup_path).exists():
+            if not existing_pids and not recorded_scope.exists():
                 return
-        scope = Path(cgroup_path).resolve(strict=True)
-        if not exact_persistent_identity:
-            cgroup_root = Path("/sys/fs/cgroup").resolve()
-            try:
-                scope.relative_to(cgroup_root)
-            except ValueError as exc:
-                raise RuntimeError(f"recorded cgroup is outside cgroup v2: {scope}") from exc
+        if observed_identity is None and not recorded_scope.exists():
+            return
+        scope = recorded_scope.resolve(strict=True)
         _terminate_linux_systemd_scope(systemd_unit, scope)
         residual = (
             recorded_linux_systemd_scope_process_ids(
@@ -1331,6 +1332,28 @@ def terminate_recorded_process_tree(
         )
     if residual:
         raise RuntimeError(f"recorded process tree survived cleanup: {residual}")
+
+
+def _validated_recorded_systemd_scope_path(cgroup_path: str, *, unit: str) -> Path:
+    """Validate a recorded cgroup path even after systemd removed the leaf scope."""
+    if "\x00" in cgroup_path or any(
+        part in {".", ".."} for part in re.split(r"[\\/]", cgroup_path)
+    ):
+        raise RuntimeError("recorded systemd execution has invalid cgroup path")
+    recorded = Path(cgroup_path)
+    if not recorded.is_absolute() or recorded.name != unit:
+        raise RuntimeError("recorded systemd execution has invalid cgroup path")
+    try:
+        root = _CGROUP_ROOT.resolve(strict=True)
+        if not root.is_dir():
+            raise RuntimeError("configured cgroup v2 root is not a directory")
+        candidate = recorded.resolve(strict=False)
+        candidate.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("recorded cgroup is outside cgroup v2") from exc
+    if candidate == root or candidate.name != unit:
+        raise RuntimeError("recorded systemd execution has invalid cgroup path")
+    return candidate
 
 
 def _register_owned_process(process_id: int, state: _OwnedProcessState) -> None:
@@ -2187,6 +2210,7 @@ def recorded_linux_systemd_scope_process_ids(
         or len(description.encode("utf-8")) > 512
     ):
         raise RuntimeError("recorded persistent systemd scope identity is invalid")
+    recorded_path = _validated_recorded_systemd_scope_path(cgroup_path, unit=unit)
     result = _systemctl_user(
         [
             "show",
@@ -2205,7 +2229,6 @@ def recorded_linux_systemd_scope_process_ids(
         )
     except RuntimeError:
         properties = {}
-    recorded_path = Path(cgroup_path)
     if result.returncode != 0 or properties.get("LoadState") == "not-found":
         if recorded_path.exists():
             raise RuntimeError("recorded systemd unit vanished while its cgroup remained")

@@ -248,6 +248,20 @@ def test_ci_matrix_pins_sync_probe_and_release_gate_to_each_declared_python() ->
     assert "--prebuilt-artifact-dir" not in primary
 
 
+def test_ci_uploads_failed_release_gate_reports_for_diagnosis() -> None:
+    """Keep bounded machine reports available when a long matrix gate fails."""
+    workflow = _workflow("ci.yml")
+    jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+    for job_name, step_name in (
+        ("build", "upload primary matrix report"),
+        ("validate", "upload matrix report"),
+    ):
+        steps = cast(list[dict[str, Any]], jobs[job_name]["steps"])
+        upload = next(step for step in steps if step.get("name") == step_name)
+        assert upload["if"] == "always()"
+        assert cast(dict[str, str], upload["with"])["if-no-files-found"] == "warn"
+
+
 def test_merge_queue_builds_once_main_skips_gate_and_tags_run_regression() -> None:
     workflow = _workflow("ci.yml")
     triggers = cast(dict[str, Any], workflow["on"])

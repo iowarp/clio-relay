@@ -299,6 +299,37 @@ def test_worker_lock_is_acquired_before_default_queue_construction(
     assert events == ["lock", "queue", "release"]
 
 
+def test_injected_queue_initialization_failure_releases_worker_lifetime_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed injected-queue seal handoff cannot retain shared writer ownership."""
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+
+    def fail_initialization(lifetime_lock: WorkerLifetimeLock) -> None:
+        assert lifetime_lock.acquired is True
+        assert lifetime_lock.mode == "shared"
+        raise RuntimeError("injected queue initialization failed")
+
+    monkeypatch.setattr(
+        endpoint_module,
+        "initialize_queue_with_shared_writer_fencing",
+        fail_initialization,
+    )
+
+    with pytest.raises(RuntimeError, match="injected queue initialization failed"):
+        endpoint_module.EndpointWorker(
+            role=EndpointRole.WORKER,
+            cluster="test",
+            settings=RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool"),
+            queue=queue,
+        )
+
+    exclusive = WorkerLifetimeLock(core_dir, mode="exclusive", timeout_seconds=0).acquire()
+    exclusive.release()
+
+
 def test_every_production_queue_holds_shared_writer_lifetime_ownership(
     tmp_path: Path,
 ) -> None:
@@ -711,9 +742,7 @@ def test_queue_seal_handoff_bounds_exclusive_wait_and_restores_shared(
     try:
         started = time.monotonic()
         with pytest.raises(WorkerLifetimeLockUnavailable, match="timed out acquiring"):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                candidate
-            )
+            storage_runtime_module.initialize_queue_with_shared_writer_fencing(candidate)
         assert time.monotonic() - started < 1
         assert candidate.acquired is True
         assert not (core_dir / "migrations").exists()
@@ -759,9 +788,7 @@ def test_queue_seal_handoff_bounds_shared_reacquire(
             WorkerLifetimeLockUnavailable,
             match="restoring shared writer ownership",
         ):
-            storage_runtime_module._initialize_queue_with_shared_writer_fencing(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                candidate
-            )
+            storage_runtime_module.initialize_queue_with_shared_writer_fencing(candidate)
         assert time.monotonic() - started < 1
         assert candidate.acquired is False
         assert blockers and blockers[0].acquired

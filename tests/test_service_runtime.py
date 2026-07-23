@@ -6305,9 +6305,10 @@ def test_local_health_probe_rejects_non_2xx_and_wrong_runtime_identity(
     with pytest.raises(RelayError, match=error):
         supervisor._wait_for_local_health(  # pyright: ignore[reportPrivateUsage]
             "http://127.0.0.1:28777/healthz",
-            0.03,
-            1.0,
+            2.0,
+            0.01,
             expected_body="runtime-nonce",
+            max_attempts=1,
         )
 
 

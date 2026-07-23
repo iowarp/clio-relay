@@ -216,6 +216,10 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
         assert path.name == "private.tmp"
         return "S-1-5-21-current"
 
+    def identity_internal_path(path: Path, *, force_extended: bool) -> Path:
+        del force_extended
+        return path
+
     monkeypatch.setattr(cluster_config.os, "name", "nt")
     monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
     monkeypatch.setattr(
@@ -224,6 +228,11 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
         build_descriptor,
     )
     monkeypatch.setattr(cluster_config, "_current_windows_user_sid", current_user_sid)
+    monkeypatch.setattr(
+        cluster_config,
+        "internal_filesystem_path",
+        identity_internal_path,
+    )
     monkeypatch.setattr(cluster_config, "_windows_last_error", last_error)
     monkeypatch.setattr(cluster_config, "_free_windows_local", free_descriptor)
     monkeypatch.setattr(cluster_config, "_windows_error", windows_error)
@@ -322,6 +331,7 @@ def test_windows_configuration_open_only_requests_owner_change_when_needed(
     monkeypatch: MonkeyPatch,
 ) -> None:
     requested_access: list[int] = []
+    requested_share_modes: list[int] = []
 
     class RecordingCreateFile:
         argtypes: list[object]
@@ -331,9 +341,11 @@ def test_windows_configuration_open_only_requests_owner_change_when_needed(
             self,
             _path: str,
             desired_access: int,
+            share_mode: int,
             *_args: object,
         ) -> int:
             requested_access.append(desired_access)
+            requested_share_modes.append(share_mode)
             return 100 + len(requested_access)
 
     kernel32 = SimpleNamespace(CreateFileW=RecordingCreateFile())
@@ -368,6 +380,14 @@ def test_windows_configuration_open_only_requests_owner_change_when_needed(
     assert requested_access[0] & cluster_config._WINDOWS_WRITE_DAC  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert not requested_access[0] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert requested_access[1] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert (
+        requested_share_modes
+        == [
+            cluster_config._WINDOWS_FILE_SHARE_READ  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            | cluster_config._WINDOWS_FILE_SHARE_WRITE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ]
+        * 2
+    )
 
 
 def test_configuration_read_rejects_foreign_or_group_writable_posix_file(

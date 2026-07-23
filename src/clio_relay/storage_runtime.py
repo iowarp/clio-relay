@@ -945,7 +945,7 @@ def storage_managed_queue(
     if not lifetime_lock.acquired or lifetime_lock.mode != "shared":
         raise ValueError("production queue requires acquired shared writer lifetime ownership")
     try:
-        _initialize_queue_with_shared_writer_fencing(lifetime_lock)
+        initialize_queue_with_shared_writer_fencing(lifetime_lock)
         pinned_settings = settings.model_copy(update={"core_dir": lifetime_lock.core_dir})
         # Audit and initialize before StorageRuntime or StoragePolicy can create
         # `.storage`. A normal startup that encounters legacy output remains a
@@ -967,7 +967,7 @@ def storage_managed_queue(
     return queue
 
 
-def _initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLock) -> None:
+def initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLock) -> None:
     """Create a missing queue seal under exclusive ownership, then restore shared ownership."""
     core_dir = lifetime_lock.core_dir
     try:

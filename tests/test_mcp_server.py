@@ -4573,7 +4573,7 @@ def test_mcp_virtual_jarvis_execution_query_routes_selectors_through_remote_job(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.tool == "jarvis_get_execution"
     assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert job.spec.timeout_seconds == 60
+    assert job.spec.timeout_seconds == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
     assert job.spec.arguments == {
         "pipeline_id": "example",
         "execution_id": "jarvis_execution_1",
@@ -4635,7 +4635,7 @@ def test_jarvis_default_key_changes_after_artifact_bound_control_resolution(
     assert unbound_job.spec.timeout_seconds is None
     assert bound_job.spec.expected_server_artifact_digest == "a" * 64
     assert bound_job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert bound_job.spec.timeout_seconds == 60
+    assert bound_job.spec.timeout_seconds == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
 
 
 def test_mcp_virtual_jarvis_run_is_fresh_unless_idempotency_is_explicit(

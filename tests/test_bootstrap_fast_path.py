@@ -1172,9 +1172,11 @@ with tempfile.TemporaryDirectory() as value:
         "storage:\n  nvme:\n    capacity: 100\n", encoding="utf-8"
     )
     managed_repo = home / ".local/share/clio-relay/clio_relay"
+    managed_builtin_repo = jarvis_root / "builtin"
     first_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
+        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1243,6 +1245,7 @@ with tempfile.TemporaryDirectory() as value:
     second_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
+        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1266,11 +1269,15 @@ with tempfile.TemporaryDirectory() as value:
     canonical_managed = str(
         canonical_home / ".local/share/clio-relay/clio_relay"
     )
+    canonical_builtin = str(canonical_home / ".ppi-jarvis/builtin")
     if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
         canonical_managed,
         "/operator/clio_relay",
+        canonical_builtin,
     ]:
-        raise SystemExit("repository registration did not retain one canonical stable path")
+        raise SystemExit(
+            "repository registration did not retain canonical managed paths"
+        )
 print("aliased-activation-noop-ok")
 """
     result = _run_posix_project_driver(driver, timeout_seconds=180)

@@ -239,6 +239,7 @@ ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3.2",
     "clio-kit-jarvis-user-v3.3",
     "clio-kit-jarvis-user-v3.4",
+    "clio-kit-jarvis-user-v3.5",
     "clio-kit-scientific-catalog-user-v1",
     "clio-kit-spack-user-v2",
 }

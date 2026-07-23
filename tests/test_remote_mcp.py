@@ -2212,6 +2212,8 @@ def test_mcp_session_rejects_cluster_route_rebind_and_recovers_after_relist(
     writes: list[str] = []
     remote_commands: list[tuple[str, list[str]]] = []
     removals: list[str] = []
+    registry_writes: list[tuple[str, str, bytes]] = []
+    registry_removals: list[tuple[str, str, bool]] = []
 
     def write_remote(
         _definition: ClusterDefinition,
@@ -2220,7 +2222,29 @@ def test_mcp_session_rejects_cluster_route_rebind_and_recovers_after_relist(
     ) -> None:
         writes.append(path)
 
-    def run_remote(definition: ClusterDefinition, args: list[str]) -> str:
+    def write_registry(
+        definition: ClusterDefinition,
+        path: str,
+        data: bytes,
+    ) -> None:
+        registry_writes.append((definition.ssh_host, path, data))
+
+    def remove_registry(
+        definition: ClusterDefinition,
+        path: str,
+        *,
+        remove_empty_parent: bool = False,
+    ) -> None:
+        registry_removals.append((definition.ssh_host, path, remove_empty_parent))
+
+    def run_remote(
+        definition: ClusterDefinition,
+        args: list[str],
+        *,
+        cluster_registry_path: str | None = None,
+    ) -> str:
+        assert registry_writes
+        assert cluster_registry_path == f"$HOME/{registry_writes[-1][1]}"
         remote_commands.append((definition.ssh_host, args))
         return "job-rebound-route\n"
 
@@ -2236,6 +2260,8 @@ def test_mcp_session_rejects_cluster_route_rebind_and_recovers_after_relist(
     monkeypatch.setattr("clio_relay.mcp_server.write_remote_file", write_remote)
     monkeypatch.setattr("clio_relay.mcp_server.run_remote_clio", run_remote)
     monkeypatch.setattr("clio_relay.mcp_server.remove_remote_file", remove_remote)
+    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
+    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
     call = {
         "jsonrpc": "2.0",
         "id": 2,
@@ -2275,6 +2301,12 @@ def test_mcp_session_rejects_cluster_route_rebind_and_recovers_after_relist(
     assert remote_commands[0][0] == "alpha-new"
     assert len(writes) == 1
     assert removals == writes
+    assert len(registry_writes) == 1
+    registry_host, registry_path, registry_payload = registry_writes[0]
+    assert registry_host == "alpha-new"
+    staged_registry = ClusterRegistry.model_validate_json(registry_payload)
+    assert staged_registry.require("alpha").ssh_host == "alpha-new"
+    assert registry_removals == [("alpha-new", registry_path, True)]
 
 
 def test_mcp_dispatch_rejects_registration_revocation_during_final_route_read(
@@ -5864,7 +5896,6 @@ def test_remote_acceptance_consumes_safe_packaged_session_projection() -> None:
         server_info_sha256="4" * 64,
         tools_list_sha256="5" * 64,
         called_tool_schema_sha256="6" * 64,
-        jarvis_virtual_tools_sha256="7" * 64,
         called_tool_name=alias,
         containment_mode="windows_job_object",
         containment_enforceable=True,
@@ -5872,6 +5903,7 @@ def test_remote_acceptance_consumes_safe_packaged_session_projection() -> None:
     evidence = session.evidence()
     private = cast(Any, remote_mcp)
 
+    assert evidence["jarvis_virtual_tools_sha256"] is None
     assert private._stdio_initialize_passed(evidence)
     assert private._stdio_listed_tool_names(evidence) == {alias}
     assert private._stdio_call_job_id(evidence) == job_id

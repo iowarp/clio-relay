@@ -226,6 +226,18 @@ class _TransientRecordReplacement(RuntimeError):
     """Signal that an atomic replacement invalidated one bounded read attempt."""
 
 
+class _UnsafeQueueDirectoryProtection(ConfigurationError):
+    """Pinned repair found a linked canonical family before queue initialization."""
+
+    def __init__(self, *, family: str, path: Path, cause: OSError) -> None:
+        self.family = family
+        self.path = path
+        super().__init__(
+            "queue directory protections cannot be repaired through the pinned root: "
+            f"{path}: {cause}"
+        )
+
+
 class LegacyQueueStateError(QueueConflictError):
     """Machine-readable refusal for unsafe pre-1.0 canonical queue state."""
 
@@ -2447,11 +2459,7 @@ class ClioCoreQueue:
             )
             return
         if migrate_legacy_output and not self._migration_lifetime_guarded:
-            with exclusive_migration_lifetime(self.root) as locked_core:
-                self.initialize(
-                    migrate_legacy_output=True,
-                    locked_core=locked_core,
-                )
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=True)
             return
         if self._initialized:
             with self._lock:
@@ -2467,11 +2475,7 @@ class ClioCoreQueue:
                 raise QueueSealRequiresExclusive(
                     "missing legacy-record audit seal requires exclusive writer-lifetime ownership"
                 )
-            with exclusive_migration_lifetime(self.root) as locked_core:
-                self.initialize(
-                    migrate_legacy_output=migrate_legacy_output,
-                    locked_core=locked_core,
-                )
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=migrate_legacy_output)
             return
         # The root and lock path are the only pre-lock filesystem state. A
         # missing seal is audited exactly once after taking that lock and before
@@ -2650,16 +2654,28 @@ class ClioCoreQueue:
                     self._write_legacy_record_audit_marker_unlocked()
                 else:
                     self._upgrade_sealed_lease_operational_schema_unlocked()
+                    self._reconcile_sealed_lease_capacity_gate_unlocked()
                     self._read_sealed_index_migration_state()
                 self._initialized = True
         except QueueSealRequiresExclusive:
             if not allow_exclusive_seal:
                 raise
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=migrate_legacy_output)
+
+    def _initialize_with_exclusive_lifetime(self, *, migrate_legacy_output: bool) -> None:
+        """Initialize under a pinned lifetime and preserve the public legacy-state contract."""
+        try:
             with exclusive_migration_lifetime(self.root) as locked_core:
                 self.initialize(
                     migrate_legacy_output=migrate_legacy_output,
                     locked_core=locked_core,
                 )
+        except _UnsafeQueueDirectoryProtection as exc:
+            raise LegacyQueueStateError(
+                family=exc.family,
+                path=exc.path,
+                reason="canonical family is not an owned directory",
+            ) from exc
 
     def _initialize_under_locked_core(
         self,
@@ -2770,6 +2786,12 @@ class ClioCoreQueue:
                 if stat.S_IMODE(details.st_mode) != 0o700:
                     os.fchmod(descriptor, 0o700)
             except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR} and relative_path.parts:
+                    raise _UnsafeQueueDirectoryProtection(
+                        family=relative_path.parts[0],
+                        path=self.root / relative_path,
+                        cause=exc,
+                    ) from exc
                 raise ConfigurationError(
                     "queue directory protections cannot be repaired through the pinned root: "
                     f"{self._storage_root / relative_path}: {exc}"
@@ -2777,6 +2799,39 @@ class ClioCoreQueue:
             finally:
                 with suppress(OSError):
                     os.close(descriptor)
+
+    def _reconcile_sealed_lease_capacity_gate_unlocked(self) -> None:
+        """Downgrade a sealed migration gate when its fixed capacity pair is corrupt."""
+        state = self._read_index_migration_state()
+        raw_checkpoint = state.get("lease_capacity_aggregate")
+        if not isinstance(raw_checkpoint, dict):
+            return
+        checkpoint = cast(dict[str, object], raw_checkpoint)
+        if checkpoint.get("complete") is not True:
+            return
+        try:
+            current = self._read_lease_capacity_aggregate_unlocked()
+        except (OSError, QueueConflictError):
+            current = None
+        migrated_generation = checkpoint.get("generation")
+        valid = (
+            current is not None
+            and current.aggregate.epoch_id == checkpoint.get("epoch_id")
+            and isinstance(migrated_generation, int)
+            and not isinstance(migrated_generation, bool)
+            and current.aggregate.generation >= migrated_generation
+        )
+        if valid:
+            return
+        checkpoint.clear()
+        checkpoint.update(
+            {
+                "complete": False,
+                "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
+            }
+        )
+        state["complete"] = False
+        self._write_index_migration_state(state)
 
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
@@ -4369,6 +4424,7 @@ class ClioCoreQueue:
         path = directory / f"{route_sha256}.json"
         with self._lock:
             existing = self._read_optional(path, JarvisPipelineInputLineage)
+            mutation_at = utc_now()
             if existing is None:
                 count, over_capacity = _bounded_regular_json_count(
                     directory,
@@ -4381,7 +4437,7 @@ class ClioCoreQueue:
                     )
                 merged_uses = artifact_uses
                 manifests = (manifest_sha256,)
-                created_at = None
+                created_at = mutation_at
             else:
                 if existing.route != route or existing.route_sha256 != route_sha256:
                     raise QueueConflictError(
@@ -4405,7 +4461,7 @@ class ClioCoreQueue:
                 artifact_uses=merged_uses,
                 manifest_sha256s=manifests,
                 created_at=created_at,
-                updated_at=utc_now(),
+                updated_at=mutation_at,
             )
             self._write(path, record)
             return record

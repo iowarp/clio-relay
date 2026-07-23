@@ -584,6 +584,7 @@ def test_legacy_canonical_reparse_family_fails_before_writes(tmp_path: Path) -> 
         with pytest.raises(LegacyQueueStateError) as raised:
             ClioCoreQueue(root).initialize()
         assert raised.value.report["family"] == "jobs"
+        assert raised.value.report["path"] == str(jobs)
         assert "owned directory" in raised.value.report["reason"]
         assert marker.read_text(encoding="utf-8") == "operator-owned"
         assert not (root / "migrations").exists()
@@ -607,7 +608,7 @@ def test_runtime_canonical_scan_rejects_reparse_directory(tmp_path: Path) -> Non
     jobs.replace(backup)
     _make_directory_link(outside, jobs)
     try:
-        with pytest.raises(QueueConflictError, match="not a safe directory"):
+        with pytest.raises(QueueConflictError, match="not an owned directory"):
             queue.list_jobs()
         assert marker.read_text(encoding="utf-8") == "operator-owned"
     finally:
