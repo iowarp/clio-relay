@@ -106,11 +106,12 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: upload primary matrix report
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: matrix-report-ubuntu-latest-3.12
           path: dist/reports/validation-local-ubuntu-latest-3.12.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 90
 
   validate:
@@ -193,11 +194,12 @@ jobs:
           --artifact-dir dist/validation-output
           --prebuilt-artifact-dir dist/prebuilt
       - name: upload matrix report
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: matrix-report-${{ matrix.os }}-${{ matrix.python-version }}
           path: dist/reports/validation-local-${{ matrix.os }}-${{ matrix.python-version }}.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 90
 
   seal:
