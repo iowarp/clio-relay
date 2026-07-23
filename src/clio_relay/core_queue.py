@@ -226,6 +226,18 @@ class _TransientRecordReplacement(RuntimeError):
     """Signal that an atomic replacement invalidated one bounded read attempt."""
 
 
+class _UnsafeQueueDirectoryProtection(ConfigurationError):
+    """Pinned repair found a linked canonical family before queue initialization."""
+
+    def __init__(self, *, family: str, path: Path, cause: OSError) -> None:
+        self.family = family
+        self.path = path
+        super().__init__(
+            "queue directory protections cannot be repaired through the pinned root: "
+            f"{path}: {cause}"
+        )
+
+
 class LegacyQueueStateError(QueueConflictError):
     """Machine-readable refusal for unsafe pre-1.0 canonical queue state."""
 
@@ -2447,11 +2459,7 @@ class ClioCoreQueue:
             )
             return
         if migrate_legacy_output and not self._migration_lifetime_guarded:
-            with exclusive_migration_lifetime(self.root) as locked_core:
-                self.initialize(
-                    migrate_legacy_output=True,
-                    locked_core=locked_core,
-                )
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=True)
             return
         if self._initialized:
             with self._lock:
@@ -2467,11 +2475,7 @@ class ClioCoreQueue:
                 raise QueueSealRequiresExclusive(
                     "missing legacy-record audit seal requires exclusive writer-lifetime ownership"
                 )
-            with exclusive_migration_lifetime(self.root) as locked_core:
-                self.initialize(
-                    migrate_legacy_output=migrate_legacy_output,
-                    locked_core=locked_core,
-                )
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=migrate_legacy_output)
             return
         # The root and lock path are the only pre-lock filesystem state. A
         # missing seal is audited exactly once after taking that lock and before
@@ -2656,11 +2660,22 @@ class ClioCoreQueue:
         except QueueSealRequiresExclusive:
             if not allow_exclusive_seal:
                 raise
+            self._initialize_with_exclusive_lifetime(migrate_legacy_output=migrate_legacy_output)
+
+    def _initialize_with_exclusive_lifetime(self, *, migrate_legacy_output: bool) -> None:
+        """Initialize under a pinned lifetime and preserve the public legacy-state contract."""
+        try:
             with exclusive_migration_lifetime(self.root) as locked_core:
                 self.initialize(
                     migrate_legacy_output=migrate_legacy_output,
                     locked_core=locked_core,
                 )
+        except _UnsafeQueueDirectoryProtection as exc:
+            raise LegacyQueueStateError(
+                family=exc.family,
+                path=exc.path,
+                reason="canonical family is not an owned directory",
+            ) from exc
 
     def _initialize_under_locked_core(
         self,
@@ -2771,6 +2786,12 @@ class ClioCoreQueue:
                 if stat.S_IMODE(details.st_mode) != 0o700:
                     os.fchmod(descriptor, 0o700)
             except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR} and relative_path.parts:
+                    raise _UnsafeQueueDirectoryProtection(
+                        family=relative_path.parts[0],
+                        path=self.root / relative_path,
+                        cause=exc,
+                    ) from exc
                 raise ConfigurationError(
                     "queue directory protections cannot be repaired through the pinned root: "
                     f"{self._storage_root / relative_path}: {exc}"
