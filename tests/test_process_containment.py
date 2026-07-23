@@ -28,6 +28,25 @@ def _focused_cooperative_capability(**_kwargs: object) -> dict[str, object]:
     }
 
 
+def _missing_process_start_identity(_process_id: int) -> None:
+    return None
+
+
+def _create_directory_alias(alias: Path, target: Path) -> None:
+    """Create a directory alias without requiring Windows symlink privilege."""
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stdout + result.stderr)
+        return
+    alias.symlink_to(target, target_is_directory=True)
+
+
 def test_embedded_containment_source_is_an_exact_isolated_runtime_mirror() -> None:
     root = Path(__file__).parents[1]
     source = root / "src" / "clio_relay" / "process_containment.py"
@@ -503,9 +522,16 @@ def test_deferred_credentials_are_built_after_persistent_scope_is_registered(
 
 
 def test_recorded_scope_rejects_invocation_reuse_before_reading_processes(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process_reads: list[Path] = []
+    cgroup_root = tmp_path / "cgroup"
+    scope_parent = cgroup_root / "user.slice"
+    scope_parent.mkdir(parents=True)
+    unit = "clio-relay-session-generation.scope"
+    recorded_scope = scope_parent / unit
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", cgroup_root)
 
     def systemctl_user(
         _arguments: list[str],
@@ -540,8 +566,8 @@ def test_recorded_scope_rejects_invocation_reuse_before_reading_processes(
 
     with pytest.raises(RuntimeError, match="drifted or was reused"):
         process_containment.recorded_linux_systemd_scope_process_ids(
-            unit="clio-relay-session-generation.scope",
-            cgroup_path="/sys/fs/cgroup/user.slice/test.scope",
+            unit=unit,
+            cgroup_path=str(recorded_scope),
             invocation_id="1" * 32,
             description="expected",
         )
@@ -556,6 +582,7 @@ def test_recorded_scope_returns_only_exact_cgroup_members(
     unit = "clio-relay-session-generation.scope"
     scope = tmp_path / unit
     scope.mkdir()
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", tmp_path)
     invocation = "1" * 32
     description = "expected"
 
@@ -633,14 +660,105 @@ def test_recorded_transient_scope_absence_proves_cleanup(
     monkeypatch.setattr(process_containment, "_terminate_linux_systemd_scope", refuse_mutation)
     monkeypatch.setattr(process_containment, "_release_linux_systemd_scope", refuse_mutation)
 
+    cgroup_root = tmp_path / "cgroup"
+    scope_parent = cgroup_root / "user.slice"
+    scope_parent.mkdir(parents=True)
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", cgroup_root)
+
     process_containment.terminate_recorded_process_tree(
         process_id=4312,
         expected_start_identity="linux-proc-start:expected",
         process_group_id=4312,
         containment_mode="linux_systemd_scope",
         systemd_unit="clio-relay-transient.scope",
-        cgroup_path=str(tmp_path / "already-removed.scope"),
+        cgroup_path=str(scope_parent / "clio-relay-transient.scope"),
     )
+
+
+def test_recorded_transient_scope_absence_rejects_untrusted_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent path outside cgroup v2 cannot masquerade as completed cleanup."""
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(
+        process_containment,
+        "process_start_identity",
+        _missing_process_start_identity,
+    )
+
+    with pytest.raises(RuntimeError, match="outside cgroup v2"):
+        process_containment.terminate_recorded_process_tree(
+            process_id=4312,
+            expected_start_identity="linux-proc-start:expected",
+            process_group_id=4312,
+            containment_mode="linux_systemd_scope",
+            systemd_unit="clio-relay-transient.scope",
+            cgroup_path=str(tmp_path / "outside" / "clio-relay-transient.scope"),
+        )
+
+
+@pytest.mark.parametrize(
+    "recorded_suffix",
+    (
+        "user.slice/../clio-relay-transient.scope",
+        "user.slice/not-the-recorded-unit.scope",
+    ),
+)
+def test_recorded_transient_scope_absence_rejects_invalid_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_suffix: str,
+) -> None:
+    """Traversal and a mismatched unit leaf cannot prove completed cleanup."""
+    cgroup_root = tmp_path / "cgroup"
+    (cgroup_root / "user.slice").mkdir(parents=True)
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(
+        process_containment,
+        "process_start_identity",
+        _missing_process_start_identity,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid cgroup path"):
+        process_containment.terminate_recorded_process_tree(
+            process_id=4312,
+            expected_start_identity="linux-proc-start:expected",
+            process_group_id=4312,
+            containment_mode="linux_systemd_scope",
+            systemd_unit="clio-relay-transient.scope",
+            cgroup_path=str(cgroup_root / recorded_suffix),
+        )
+
+
+def test_recorded_transient_scope_absence_rejects_symlink_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing ancestor alias cannot redirect an absent scope outside cgroup v2."""
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _create_directory_alias(cgroup_root / "user.slice", outside)
+    monkeypatch.setattr(process_containment, "_CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(
+        process_containment,
+        "process_start_identity",
+        _missing_process_start_identity,
+    )
+
+    with pytest.raises(RuntimeError, match="outside cgroup v2"):
+        process_containment.terminate_recorded_process_tree(
+            process_id=4312,
+            expected_start_identity="linux-proc-start:expected",
+            process_group_id=4312,
+            containment_mode="linux_systemd_scope",
+            systemd_unit="clio-relay-transient.scope",
+            cgroup_path=str(cgroup_root / "user.slice" / "clio-relay-transient.scope"),
+        )
 
 
 def test_windows_recorded_cleanup_accepts_taskkill_failure_only_after_pid_absence(

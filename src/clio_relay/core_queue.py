@@ -2748,14 +2748,6 @@ class ClioCoreQueue:
                     except FileNotFoundError:
                         missing = True
                         break
-                    except OSError as exc:
-                        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                            raise LegacyQueueStateError(
-                                family=relative_path.parts[0],
-                                path=self._storage_root / relative_path,
-                                reason="canonical family is not an owned directory",
-                            ) from exc
-                        raise
                     try:
                         os.set_inheritable(child_descriptor, False)
                     except BaseException:

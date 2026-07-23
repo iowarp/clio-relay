@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from clio_relay import pytest_release_gate as pytest_release_gate_module
 from clio_relay import release_validation as release_validation_module
+from clio_relay.command_evidence import (
+    PYTEST_FAILED_NODE_ID_MAX_BYTES,
+    PYTEST_FAILED_NODE_IDS_MAX_BYTES,
+    PYTEST_FAILED_NODE_IDS_MAX_COUNT,
+    PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES,
+    command_evidence,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.release_validation import (
@@ -506,3 +516,122 @@ def test_pytest_release_gate_accepts_only_clean_passes(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == int(pytest.ExitCode.OK), completed.stdout + completed.stderr
+    evidence = command_evidence(completed.stdout, completed.stderr, exit_code=completed.returncode)
+    assert evidence.metadata["failed_test_ids"] == []
+    assert evidence.metadata["failed_test_ids_truncated"] is False
+
+
+def test_pytest_release_gate_emits_exact_unique_parametrized_failure_id(
+    tmp_path: Path,
+) -> None:
+    """Call and teardown failures retain one exact node ID with delimiter text."""
+    (tmp_path / "test_outcome.py").write_text(
+        """
+import pytest
+
+
+@pytest.fixture
+def broken_cleanup():
+    yield
+    assert False, "teardown"
+
+
+@pytest.mark.parametrize("label", ["a - b"])
+def test_case(label, broken_cleanup):
+    del label, broken_cleanup
+    assert False, "call"
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "clio_relay.pytest_release_gate",
+            "-q",
+            "test_outcome.py",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == int(pytest.ExitCode.TESTS_FAILED), output
+    evidence = command_evidence(
+        completed.stdout,
+        completed.stderr,
+        exit_code=completed.returncode,
+    )
+    assert evidence.metadata["failed_test_ids"] == [
+        "test_outcome.py::test_case[a - b]",
+    ]
+    assert evidence.metadata["failed_test_ids_truncated"] is False
+
+
+def test_pytest_release_gate_emits_collection_failure_id(tmp_path: Path) -> None:
+    """Collection errors are represented by their exact collector node ID."""
+    (tmp_path / "test_broken.py").write_text(
+        'raise RuntimeError("collection failed")\n',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "clio_relay.pytest_release_gate",
+            "-q",
+            "test_broken.py",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == int(pytest.ExitCode.INTERRUPTED), output
+    evidence = command_evidence(
+        completed.stdout,
+        completed.stderr,
+        exit_code=completed.returncode,
+    )
+    assert evidence.metadata["failed_test_ids"] == ["test_broken.py"]
+    assert evidence.metadata["failed_test_ids_truncated"] is False
+
+
+def test_pytest_release_gate_bounds_failure_ids_before_serialization() -> None:
+    """The producer reapplies all durable bounds when emitting its JSON payload."""
+    failures = pytest_release_gate_module._FailedNodeIds()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    oversized = "tests/test_queue.py::test_" + ("x" * PYTEST_FAILED_NODE_ID_MAX_BYTES)
+    failures.add(oversized)
+    for index in range(PYTEST_FAILED_NODE_IDS_MAX_COUNT + 5):
+        failures.add(f"tests/test_queue.py::test_{index:04d}" + ("x" * 80))
+    failures.add("tests/test_queue.py::test_0000" + ("x" * 80))
+
+    payload_text = pytest_release_gate_module._failed_node_ids_payload(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        failures,
+    )
+    payload_object: object = json.loads(payload_text)
+    assert isinstance(payload_object, dict)
+    payload = cast(dict[str, object], payload_object)
+    node_ids_object = payload["node_ids"]
+    assert isinstance(node_ids_object, list)
+    node_id_objects = cast(list[object], node_ids_object)
+    assert all(isinstance(node_id, str) for node_id in node_id_objects)
+    node_ids = cast(list[str], node_id_objects)
+
+    assert len(payload_text.encode("utf-8")) <= PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES
+    assert payload["truncated"] is True
+    assert oversized not in node_ids
+    assert len(node_ids) <= PYTEST_FAILED_NODE_IDS_MAX_COUNT
+    assert sum(len(node_id.encode("utf-8")) for node_id in node_ids) <= (
+        PYTEST_FAILED_NODE_IDS_MAX_BYTES
+    )

@@ -299,6 +299,37 @@ def test_worker_lock_is_acquired_before_default_queue_construction(
     assert events == ["lock", "queue", "release"]
 
 
+def test_injected_queue_initialization_failure_releases_worker_lifetime_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed injected-queue seal handoff cannot retain shared writer ownership."""
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+
+    def fail_initialization(lifetime_lock: WorkerLifetimeLock) -> None:
+        assert lifetime_lock.acquired is True
+        assert lifetime_lock.mode == "shared"
+        raise RuntimeError("injected queue initialization failed")
+
+    monkeypatch.setattr(
+        endpoint_module,
+        "initialize_queue_with_shared_writer_fencing",
+        fail_initialization,
+    )
+
+    with pytest.raises(RuntimeError, match="injected queue initialization failed"):
+        endpoint_module.EndpointWorker(
+            role=EndpointRole.WORKER,
+            cluster="test",
+            settings=RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool"),
+            queue=queue,
+        )
+
+    exclusive = WorkerLifetimeLock(core_dir, mode="exclusive", timeout_seconds=0).acquire()
+    exclusive.release()
+
+
 def test_every_production_queue_holds_shared_writer_lifetime_ownership(
     tmp_path: Path,
 ) -> None:

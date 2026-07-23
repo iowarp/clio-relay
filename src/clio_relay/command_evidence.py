@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass
+from typing import cast
 
 EVIDENCE_EXCERPT_MAX_BYTES = 24_576
 EVIDENCE_SUMMARY_TAIL_BYTES = 8_192
 ERROR_DETAIL_MAX_BYTES = 4_096
 ERROR_DETAIL_SUMMARY_TAIL_BYTES = 1_024
 EXCERPT_STRATEGY = "diagnostic-head-summary-tail-v1"
+PYTEST_FAILED_NODE_IDS_MARKER = "CLIO_RELAY_PYTEST_FAILED_NODE_IDS_V1="
+PYTEST_FAILED_NODE_IDS_MAX_COUNT = 1_000
+PYTEST_FAILED_NODE_ID_MAX_BYTES = 4_096
+PYTEST_FAILED_NODE_IDS_MAX_BYTES = 64 * 1_024
+PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES = 512 * 1_024
 
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
-_PYTEST_FAILED_TEST_PATTERN = re.compile(r"(?m)^FAILED (?P<test_id>tests/.*?) - ")
-_MAX_FAILED_TEST_IDS = 1_000
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ def command_evidence(
                 "diagnostic_marker": None,
                 "diagnostic_offset_bytes": None,
                 "failed_test_ids": [],
+                "failed_test_ids_truncated": False,
                 "omitted_prefix_bytes": 0,
                 "omitted_middle_bytes": 0,
                 "truncated": False,
@@ -72,6 +77,7 @@ def command_evidence(
         tail_bytes=ERROR_DETAIL_SUMMARY_TAIL_BYTES,
         diagnostic_offset=diagnostic_offset,
     )
+    failed_test_ids, failed_test_ids_truncated = _pytest_failed_test_ids(normalized_stdout)
     metadata: dict[str, object] = {
         "excerpt_strategy": EXCERPT_STRATEGY,
         "stdout_bytes": len(normalized_stdout.encode("utf-8")),
@@ -84,7 +90,8 @@ def command_evidence(
             None if diagnostic_offset is None else len(output[:diagnostic_offset].encode("utf-8"))
         ),
         "exit_code": exit_code,
-        "failed_test_ids": _pytest_failed_test_ids(output),
+        "failed_test_ids": failed_test_ids,
+        "failed_test_ids_truncated": failed_test_ids_truncated,
         **excerpt_metadata,
     }
     return CommandEvidence(
@@ -110,12 +117,73 @@ def bounded_error_detail(value: str | None) -> str | None:
     return bounded
 
 
-def _pytest_failed_test_ids(output: str) -> list[str]:
-    """Return bounded, ordered pytest node IDs from a failed command transcript."""
-    return [
-        match.group("test_id")
-        for match in list(_PYTEST_FAILED_TEST_PATTERN.finditer(output))[:_MAX_FAILED_TEST_IDS]
-    ]
+def _pytest_failed_test_ids(output: str) -> tuple[list[str], bool]:
+    """Return bounded node IDs from the pytest release-gate JSON sentinel."""
+    marker_offset = _last_line_marker_offset(output, PYTEST_FAILED_NODE_IDS_MARKER)
+    if marker_offset is None:
+        return [], False
+    payload_start = marker_offset + len(PYTEST_FAILED_NODE_IDS_MARKER)
+    payload_end = output.find("\n", payload_start)
+    if payload_end < 0:
+        payload_end = len(output)
+    payload_text = output[payload_start:payload_end].removesuffix("\r")
+    try:
+        payload_bytes = payload_text.encode("utf-8")
+    except UnicodeEncodeError:
+        return [], True
+    if len(payload_bytes) > PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES:
+        return [], True
+    try:
+        payload_object: object = json.loads(payload_text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return [], True
+    if not isinstance(payload_object, dict):
+        return [], True
+    payload = cast(dict[object, object], payload_object)
+    if set(payload) != {"node_ids", "truncated"}:
+        return [], True
+    raw_node_ids = payload["node_ids"]
+    declared_truncated = payload["truncated"]
+    if not isinstance(raw_node_ids, list) or type(declared_truncated) is not bool:
+        return [], True
+    node_id_objects = cast(list[object], raw_node_ids)
+
+    test_ids: list[str] = []
+    seen: set[str] = set()
+    aggregate_bytes = 0
+    truncated = declared_truncated
+    for test_id in node_id_objects:
+        if not isinstance(test_id, str):
+            return [], True
+        if test_id in seen:
+            continue
+        if len(test_ids) >= PYTEST_FAILED_NODE_IDS_MAX_COUNT:
+            truncated = True
+            break
+        try:
+            test_id_bytes = len(test_id.encode("utf-8"))
+        except UnicodeEncodeError:
+            truncated = True
+            continue
+        if test_id_bytes > PYTEST_FAILED_NODE_ID_MAX_BYTES:
+            truncated = True
+            continue
+        if aggregate_bytes + test_id_bytes > PYTEST_FAILED_NODE_IDS_MAX_BYTES:
+            truncated = True
+            continue
+        test_ids.append(test_id)
+        seen.add(test_id)
+        aggregate_bytes += test_id_bytes
+    return test_ids, truncated
+
+
+def _last_line_marker_offset(output: str, marker: str) -> int | None:
+    """Return the last marker that begins a transcript line."""
+    first_offset = 0 if output.startswith(marker) else None
+    later_offset = output.rfind(f"\n{marker}")
+    if later_offset >= 0:
+        return later_offset + 1
+    return first_offset
 
 
 def _first_diagnostic(output: str) -> tuple[str | None, int | None]:

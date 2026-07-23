@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+import json
+from typing import cast
+
 from clio_relay.command_evidence import (
     ERROR_DETAIL_MAX_BYTES,
     EVIDENCE_EXCERPT_MAX_BYTES,
+    PYTEST_FAILED_NODE_ID_MAX_BYTES,
+    PYTEST_FAILED_NODE_IDS_MARKER,
+    PYTEST_FAILED_NODE_IDS_MAX_BYTES,
+    PYTEST_FAILED_NODE_IDS_MAX_COUNT,
     bounded_error_detail,
     command_evidence,
 )
+
+
+def _pytest_failure_sentinel(node_ids: list[str], *, truncated: bool = False) -> str:
+    """Return one exact machine-readable pytest failure sentinel."""
+    payload = json.dumps(
+        {"node_ids": node_ids, "truncated": truncated},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"{PYTEST_FAILED_NODE_IDS_MARKER}{payload}"
 
 
 def test_short_unicode_command_evidence_is_exact() -> None:
@@ -32,12 +49,17 @@ def test_empty_command_evidence_records_exit_code() -> None:
 
 def test_pytest_failure_ids_survive_transcript_truncation() -> None:
     """Every pytest failure node remains machine-readable when details are bounded."""
+    node_ids = [
+        "tests/test_queue.py::test_atomic",
+        "tests/test_queue.py::test_second[param - value]",
+    ]
     summary = "\n".join(
         [
             "==== short test summary info ====",
             "FAILED tests/test_queue.py::test_atomic - AssertionError",
-            "FAILED tests/test_queue.py::test_second[param value] - RuntimeError",
+            "FAILED tests/test_queue.py::test_second[param - value] - RuntimeError",
             "2 failed, 100 passed in 90.00s",
+            _pytest_failure_sentinel(node_ids),
         ]
     )
     output = "==== FAILURES ====\nfirst cause\n" + ("detail\n" * 50_000) + summary
@@ -45,10 +67,64 @@ def test_pytest_failure_ids_survive_transcript_truncation() -> None:
     evidence = command_evidence(output, None, exit_code=1)
 
     assert evidence.metadata["truncated"] is True
-    assert evidence.metadata["failed_test_ids"] == [
-        "tests/test_queue.py::test_atomic",
-        "tests/test_queue.py::test_second[param value]",
+    assert evidence.metadata["failed_test_ids"] == node_ids
+    assert evidence.metadata["failed_test_ids_truncated"] is False
+
+
+def test_pytest_failure_id_metadata_has_count_and_byte_bounds() -> None:
+    """Hostile pytest summaries cannot make validation metadata unbounded."""
+    oversized = "tests/test_queue.py::test_" + ("x" * PYTEST_FAILED_NODE_ID_MAX_BYTES)
+    ordinary = [
+        f"tests/test_queue.py::test_case_{index:04d}" + ("x" * 80)
+        for index in range(PYTEST_FAILED_NODE_IDS_MAX_COUNT + 5)
     ]
+    output = _pytest_failure_sentinel([oversized, *ordinary])
+
+    evidence = command_evidence(output, None, exit_code=1)
+
+    failed_test_ids_value = evidence.metadata["failed_test_ids"]
+    assert isinstance(failed_test_ids_value, list)
+    failed_test_id_objects = cast(list[object], failed_test_ids_value)
+    assert all(isinstance(node_id, str) for node_id in failed_test_id_objects)
+    failed_test_ids = cast(list[str], failed_test_id_objects)
+    assert oversized not in failed_test_ids
+    assert len(failed_test_ids) <= PYTEST_FAILED_NODE_IDS_MAX_COUNT
+    assert sum(len(node_id.encode("utf-8")) for node_id in failed_test_ids) <= (
+        PYTEST_FAILED_NODE_IDS_MAX_BYTES
+    )
+    assert evidence.metadata["failed_test_ids_truncated"] is True
+
+
+def test_human_pytest_summary_is_not_treated_as_structured_node_ids() -> None:
+    """Ambiguous human summaries cannot forge or truncate parametrized IDs."""
+    output = "FAILED tests/test_queue.py::test_case[a - b] - AssertionError\n1 failed in 0.01s"
+
+    evidence = command_evidence(output, None, exit_code=1)
+
+    assert evidence.metadata["failed_test_ids"] == []
+    assert evidence.metadata["failed_test_ids_truncated"] is False
+
+
+def test_malformed_pytest_failure_sentinel_fails_closed() -> None:
+    """An invalid machine sentinel cannot be mistaken for complete evidence."""
+    output = f'{PYTEST_FAILED_NODE_IDS_MARKER}{{"node_ids":"not-a-list","truncated":false}}'
+
+    evidence = command_evidence(output, None, exit_code=1)
+
+    assert evidence.metadata["failed_test_ids"] == []
+    assert evidence.metadata["failed_test_ids_truncated"] is True
+
+
+def test_stderr_cannot_override_authoritative_pytest_failure_ids() -> None:
+    """Only the pytest terminal reporter's stdout channel can publish node IDs."""
+    expected = ["tests/test_queue.py::test_authoritative[a - b]"]
+    stdout = _pytest_failure_sentinel(expected)
+    stderr = _pytest_failure_sentinel([])
+
+    evidence = command_evidence(stdout, stderr, exit_code=1)
+
+    assert evidence.metadata["failed_test_ids"] == expected
+    assert evidence.metadata["failed_test_ids_truncated"] is False
 
 
 def test_large_pytest_output_keeps_first_failure_and_summary() -> None:
