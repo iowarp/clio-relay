@@ -803,7 +803,8 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         "open_owned_session_transaction",
         _fake_transaction_opener(transaction),
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
     retried = session_lifecycle.execute_owned_session_teardown(
         teardown,
         home=tmp_path / "home",
@@ -1085,7 +1086,8 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
     mutation_attempted = False
 
     def refuse_mutation(*_args: object, **_kwargs: object) -> None:
@@ -1161,7 +1163,8 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
 
     def completed_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         return OwnedSessionRecoveryStatus(
@@ -1501,7 +1504,8 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    effective_uid = getattr(os, "geteuid", lambda: 0)()
+    monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
 
     def legacy_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         return _legacy_existing_status(
