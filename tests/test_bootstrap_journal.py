@@ -49,7 +49,7 @@ def _owned_paths(home: Path) -> dict[str, dict[str, str]]:
 
 
 @pytest.mark.parametrize("failed_after", _REVERSIBLE_BOUNDARIES)
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_fresh_failure_injection_discards_owned_paths_and_reruns(
     tmp_path: Path,
     failed_after: str,
@@ -207,7 +207,7 @@ def test_hardlinked_journal_is_rejected(tmp_path: Path) -> None:
         load_journal(journal_path)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="descriptor topology is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_preexisting_private_real_journal_parent_is_supported(tmp_path: Path) -> None:
     """A legitimate existing private directory topology remains supported."""
     parent = tmp_path / ".local/share/clio-relay"
@@ -229,7 +229,7 @@ def test_preexisting_private_real_journal_parent_is_supported(tmp_path: Path) ->
     assert created["state"] == "locked"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="descriptor topology is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_journal_parent_swap_during_create_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -301,7 +301,7 @@ def _reversible_owned_journal(
     return journal_path
 
 
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_parent_swap_after_journal_open_never_reaches_replacement_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -338,7 +338,7 @@ def test_parent_swap_after_journal_open_never_reaches_replacement_tree(
     assert (relocated_local / "share/clio-relay/owned").is_dir()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_target_swap_to_symlink_is_rejected_without_following(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -382,7 +382,7 @@ def test_target_swap_to_symlink_is_rejected_without_following(
     assert sentinel.read_text(encoding="utf-8") == "operator\n"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 @pytest.mark.parametrize("kind", ("directory", "file", "symlink"))
 def test_operator_replacement_at_owned_name_is_retained(
     tmp_path: Path,
@@ -416,7 +416,7 @@ def test_operator_replacement_at_owned_name_is_retained(
     assert target.exists() or target.is_symlink()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_nested_symlink_and_hardlink_cleanup_preserves_external_objects(tmp_path: Path) -> None:
     """Recursive cleanup unlinks entries but never follows links outside its root."""
     target = tmp_path / ".local/share/clio-relay/owned"
@@ -439,7 +439,7 @@ def test_nested_symlink_and_hardlink_cleanup_preserves_external_objects(tmp_path
     assert outside_file.read_text(encoding="utf-8") == "hardlink\n"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="full bootstrap recovery is POSIX-only")
+@pytest.mark.release_platform("posix")
 def test_interrupted_discard_is_idempotently_resumed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -479,7 +479,7 @@ def test_interrupted_discard_is_idempotently_resumed(
     assert not target.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="owned path publication is POSIX-only")
+@pytest.mark.release_platform("posix")
 @pytest.mark.parametrize("kind", ("directory", "file", "symlink"))
 def test_owned_publication_never_claims_a_racing_replacement(
     tmp_path: Path,

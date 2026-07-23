@@ -69,7 +69,12 @@ _PACKAGED_MCP_BOUNDARY_TESTS = (
     "tests/test_process_containment.py",
     "tests/test_mcp_stdio_validation.py",
 )
-_PYTEST_RELEASE_GATE_ARGUMENTS = ("-p", "clio_relay.pytest_release_gate")
+_PYTEST_RELEASE_GATE_ARGUMENTS = (
+    "-p",
+    "clio_relay.pytest_platform_partition",
+    "-p",
+    "clio_relay.pytest_release_gate",
+)
 
 
 class ReleaseCommandRunner(Protocol):
@@ -163,7 +168,10 @@ def run_local_release_validation(
         _run_check(
             recorder,
             "local.pytest",
-            "full pytest suite with no failed, skipped, xfailed, xpassed, or deselected tests",
+            (
+                "native-platform pytest partition with no failed, skipped, xfailed, "
+                "xpassed, or deselected tests"
+            ),
             [
                 "uv",
                 "run",
