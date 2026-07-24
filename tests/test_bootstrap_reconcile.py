@@ -306,10 +306,10 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before} == before
 
 
-def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
+def test_managed_repository_converges_home_alias_to_one_lexical_stable_path(
     tmp_path: Path,
 ) -> None:
-    """Repository migration neither loses nor duplicates a stable path through HOME aliases."""
+    """Repository migration retains the stable HOME spelling required at execution."""
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
     canonical_home = tmp_path / "canonical-home"
     canonical_home.mkdir()
@@ -320,36 +320,54 @@ def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
     previous = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
     previous.mkdir(parents=True)
     operator = "/operator/clio_relay"
+    lexical_managed = str(managed.absolute())
+    canonical_managed = str(canonical_home / ".local/share/clio-relay/clio_relay")
+    canonical_previous = str(canonical_home / ".local/src/clio-relay/jarvis-packages/clio_relay")
+    lexical_builtin = str((root / "builtin").absolute())
+    canonical_builtin = str(canonical_home / ".ppi-jarvis/builtin")
     repos_file = root / "repos.yaml"
     repos_file.write_text(
         yaml.safe_dump(
-            {"repos": [str(managed.absolute()), str(previous.absolute()), operator]},
+            {
+                "repos": [
+                    canonical_managed,
+                    canonical_previous,
+                    operator,
+                    canonical_builtin,
+                ]
+            },
             sort_keys=False,
         ),
         encoding="utf-8",
     )
+    before = inspect_jarvis_state(desired, home=lexical_home)
+    assert before.managed_repo_registered is False
+    assert before.managed_builtin_repo_registered is False
 
     evidence = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
+        managed_builtin_repo=root / "builtin",
         previous_managed_repos=(previous,),
         exchange_identity=desired.fingerprint,
     )
 
-    canonical_managed = str(canonical_home / ".local/share/clio-relay/clio_relay")
-    canonical_previous = str(canonical_home / ".local/src/clio-relay/jarvis-packages/clio_relay")
     assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
-        canonical_managed,
+        lexical_managed,
         operator,
+        lexical_builtin,
     ]
-    assert evidence["managed_repo"] == canonical_managed
-    assert evidence["added_managed_repos"] == [canonical_managed]
+    assert evidence["managed_repo"] == lexical_managed
+    assert evidence["added_managed_repos"] == [lexical_managed, lexical_builtin]
     assert evidence["removed_previous_managed_repos"] == [canonical_previous]
-    assert inspect_jarvis_state(desired, home=lexical_home).managed_repo_registered is True
+    after = inspect_jarvis_state(desired, home=lexical_home)
+    assert after.managed_repo_registered is True
+    assert after.managed_builtin_repo_registered is True
 
     repeated = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
+        managed_builtin_repo=root / "builtin",
         previous_managed_repos=(previous,),
         exchange_identity=desired.fingerprint,
     )
@@ -357,13 +375,24 @@ def test_managed_repository_converges_home_alias_to_one_canonical_stable_path(
 
     repos_file.write_text(
         yaml.safe_dump(
-            {"repos": [str(managed.absolute()), canonical_managed, operator]},
+            {
+                "repos": [
+                    lexical_managed,
+                    canonical_managed,
+                    operator,
+                    lexical_builtin,
+                ]
+            },
             sort_keys=False,
         ),
         encoding="utf-8",
     )
     with pytest.raises(ConfigurationError, match="multiple path aliases"):
-        reconcile_managed_jarvis_repository(repos_file, managed)
+        reconcile_managed_jarvis_repository(
+            repos_file,
+            managed,
+            managed_builtin_repo=root / "builtin",
+        )
 
 
 def test_matching_receipt_with_tampered_runtime_is_not_a_noop(

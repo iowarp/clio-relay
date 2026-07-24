@@ -1278,17 +1278,15 @@ with tempfile.TemporaryDirectory() as value:
         raise SystemExit("warm activation was not a no-op")
     if first_repository["action"] != "updated" or second_repository["action"] != "reused":
         raise SystemExit("repository alias did not converge exactly once")
-    canonical_managed = str(
-        canonical_home / ".local/share/clio-relay/clio_relay"
-    )
-    canonical_builtin = str(canonical_home / ".ppi-jarvis/builtin")
+    lexical_managed = str(home / ".local/share/clio-relay/clio_relay")
+    lexical_builtin = str(home / ".ppi-jarvis/builtin")
     if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
-        canonical_managed,
+        lexical_managed,
         "/operator/clio_relay",
-        canonical_builtin,
+        lexical_builtin,
     ]:
         raise SystemExit(
-            "repository registration did not retain canonical managed paths"
+            "repository registration did not retain stable lexical managed paths"
         )
 print("aliased-activation-noop-ok")
 """

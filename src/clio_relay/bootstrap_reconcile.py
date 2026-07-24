@@ -986,13 +986,15 @@ def inspect_jarvis_state(
     ):
         raise ConfigurationError("JARVIS repositories must contain a string list")
     managed_repo_path = _expand_home(desired.managed_jarvis_repo, lexical_home)
-    managed_repo = str(_canonical_path_preserving_final(managed_repo_path))
-    managed_aliases = {str(managed_repo_path.absolute()), managed_repo}
+    lexical_managed_repo = str(Path(os.path.abspath(managed_repo_path.expanduser())))
+    canonical_managed_repo = str(_canonical_path_preserving_final(managed_repo_path))
+    managed_aliases = {lexical_managed_repo, canonical_managed_repo}
     managed_builtin_path = jarvis_root / "builtin"
-    managed_builtin = str(_canonical_path_preserving_final(managed_builtin_path))
+    lexical_managed_builtin = str(Path(os.path.abspath(managed_builtin_path.expanduser())))
+    canonical_managed_builtin = str(_canonical_path_preserving_final(managed_builtin_path))
     managed_builtin_aliases = {
-        str(Path(os.path.abspath(managed_builtin_path.expanduser()))),
-        managed_builtin,
+        lexical_managed_builtin,
+        canonical_managed_builtin,
     }
     repo_values = cast(list[str], raw_repo_values)
     managed_matches = [value for value in repo_values if value in managed_aliases]
@@ -1012,8 +1014,8 @@ def inspect_jarvis_state(
         config_sha256=hashlib.sha256(raw_config).hexdigest(),
         repos_sha256=hashlib.sha256(raw_repos).hexdigest(),
         resource_graph_sha256=hashlib.sha256(raw_graph).hexdigest(),
-        managed_repo_registered=len(managed_matches) == 1,
-        managed_builtin_repo_registered=len(managed_builtin_matches) == 1,
+        managed_repo_registered=managed_matches == [lexical_managed_repo],
+        managed_builtin_repo_registered=managed_builtin_matches == [lexical_managed_builtin],
     )
 
 
@@ -1285,10 +1287,9 @@ def finish_staged_activation(
         expected=expected_managed_target,
         label="relay-managed repository",
     )
-    canonical_home = lexical_home.resolve(strict=True)
-    reported_managed_repo = _expand_home(desired.managed_jarvis_repo, canonical_home)
+    reported_managed_repo = _expand_home(desired.managed_jarvis_repo, lexical_home)
     reported_managed_target = (
-        canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+        lexical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
     )
     actions = activation.get("actions")
     if not isinstance(actions, dict):  # pragma: no cover - produced above
@@ -2768,9 +2769,9 @@ def reconcile_managed_jarvis_repository(
         raise ConfigurationError(
             "relay-managed JARVIS repository basename must match its clio_relay namespace"
         )
-    lexical_managed = str(Path(os.path.abspath(managed_repo.expanduser())))
-    managed = str(_canonical_path_preserving_final(managed_repo))
-    managed_aliases = {lexical_managed, managed}
+    managed = str(Path(os.path.abspath(managed_repo.expanduser())))
+    canonical_managed = str(_canonical_path_preserving_final(managed_repo))
+    managed_aliases = {managed, canonical_managed}
     managed_builtin: str | None = None
     managed_builtin_aliases: set[str] = set()
     if managed_builtin_repo is not None:
@@ -2785,8 +2786,8 @@ def reconcile_managed_jarvis_repository(
             raise ConfigurationError(
                 "JARVIS-managed builtin repository must be the exact active root slot"
             )
-        managed_builtin = str(canonical_builtin_path)
-        managed_builtin_aliases = {str(lexical_builtin_path), managed_builtin}
+        managed_builtin = str(lexical_builtin_path)
+        managed_builtin_aliases = {managed_builtin, str(canonical_builtin_path)}
     managed_alias_union = managed_aliases | managed_builtin_aliases
     previous_aliases: dict[str, str] = {}
     previous_builtin_aliases: set[str] = set()
@@ -3029,12 +3030,11 @@ def repair_managed_jarvis_binding(
         ),
         exchange_identity=desired.fingerprint,
     )
-    canonical_home = lexical_home.resolve(strict=True)
     return {
         "link_action": link_action,
-        "link": str(_expand_home(desired.managed_jarvis_repo, canonical_home)),
+        "link": str(_expand_home(desired.managed_jarvis_repo, lexical_home)),
         "target": str(
-            canonical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
+            lexical_home / ".local/share/clio-relay/current/source/jarvis-packages/clio_relay"
         ),
         "repositories": repo_evidence,
     }
