@@ -16,6 +16,7 @@ from typing import Any, Protocol, cast
 import pytest
 from click import unstyle
 from jsonschema import Draft4Validator, Draft201909Validator, Draft202012Validator
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
@@ -37,6 +38,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
     jarvis_user_contract,
+    virtual_jarvis_job_output_schema,
 )
 from clio_relay.mcp_server import McpSessionState, handle_request, serve_stdio
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
@@ -933,6 +935,31 @@ def test_discovery_artifact_creates_fresh_provenance_cache_entry(tmp_path: Path)
     assert entry.tools[0].input_schema["required"] == ["path"]
 
 
+def test_remote_mcp_cache_invalidates_only_one_cluster_atomically(tmp_path: Path) -> None:
+    registration = _registration()
+    cache_path = tmp_path / "remote-mcp-cache.json"
+    alpha_science = _entry(registration, cluster="alpha", server_name="science")
+    alpha_jarvis = _entry(
+        registration,
+        cluster="alpha",
+        server_name=JARVIS_MCP_CACHE_SERVER_NAME,
+    )
+    beta_science = _entry(registration, cluster="beta", server_name="science")
+    for entry in (alpha_science, alpha_jarvis, beta_science):
+        RemoteMcpSchemaCache.update_entry(cache_path, entry)
+
+    updated, removed_server_names = RemoteMcpSchemaCache.invalidate_cluster_entries(
+        cache_path,
+        "alpha",
+    )
+
+    assert removed_server_names == (JARVIS_MCP_CACHE_SERVER_NAME, "science")
+    assert updated == RemoteMcpSchemaCache.load(cache_path)
+    assert updated.entry_for("alpha", "science") is None
+    assert updated.entry_for("alpha", JARVIS_MCP_CACHE_SERVER_NAME) is None
+    assert updated.entry_for("beta", "science") == beta_science
+
+
 def test_remote_mcp_cache_rejects_oversized_or_non_regular_files(tmp_path: Path) -> None:
     oversized = tmp_path / "oversized-cache.json"
     oversized.write_bytes(b" " * (MAX_REMOTE_MCP_CACHE_BYTES + 1))
@@ -1348,6 +1375,138 @@ def test_registered_jarvis_v36_describe_advertises_terminal_reconciliation_defau
 
     assert definition["inputSchema"]["properties"]["wait_for_terminal"]["default"] is True
     assert "transparently reconciled" in definition["description"]
+
+
+def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema() -> None:
+    """An audited registered JARVIS route accepts relay-derived service handoffs."""
+    contract_artifact = cast(
+        dict[str, object],
+        json.loads(
+            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.6.json").read_text(
+                encoding="utf-8"
+            )
+        ),
+    )
+    tools = cast(list[dict[str, object]], contract_artifact["tools"])
+    tool_names = [cast(str, tool["name"]) for tool in tools]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/wheels/clio_kit-2.6.2-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "jarvis",
+        ],
+        namespace="jarvis-demo",
+        allow_tools=tool_names,
+        profiles=["user"],
+        contract="clio-kit-jarvis-user-v3.6",
+    )
+    registry = ClusterRegistry(
+        clusters={
+            "alpha": _cluster("alpha", {"jarvis": registration}),
+            "beta": _cluster("beta", {"jarvis": registration}),
+        }
+    )
+    cache = RemoteMcpSchemaCache(
+        entries=[
+            _entry(registration, cluster="alpha", server_name="jarvis", tools=tools),
+            _entry(registration, cluster="beta", server_name="jarvis", tools=tools),
+        ]
+    )
+
+    catalog = build_virtual_remote_mcp_catalog(registry, cache, profile="user", now=NOW)
+    reversed_catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters=dict(reversed(list(registry.clusters.items())))),
+        RemoteMcpSchemaCache(entries=list(reversed(cache.entries))),
+        profile="user",
+        now=NOW,
+    )
+    advertised = catalog.tools["remote_jarvis_demo_jarvis_get_execution"].definition()[
+        "outputSchema"
+    ]
+    reversed_advertised = reversed_catalog.tools[
+        "remote_jarvis_demo_jarvis_get_execution"
+    ].definition()["outputSchema"]
+
+    assert advertised == virtual_jarvis_job_output_schema(
+        "jarvis_get_execution",
+        clusters=["alpha", "beta"],
+    )
+    assert advertised == reversed_advertised
+    assert catalog.revision == reversed_catalog.revision
+    assert (
+        hashlib.sha256(
+            json.dumps(advertised, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        == hashlib.sha256(
+            json.dumps(reversed_advertised, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    cast(_SchemaValidator, Draft202012Validator(advertised)).validate(
+        {
+            "cluster": "alpha",
+            "job_id": "job_registered_jarvis_query",
+            "state": "succeeded",
+            "kind": "mcp_call",
+            "terminal": True,
+            "route_revision": "a" * 64,
+            "catalog_revision": catalog.revision,
+            "service_runtime_bindings": [
+                {
+                    "cluster": "alpha",
+                    "source_job_id": "job_registered_jarvis_query",
+                    "source_artifact_id": "artifact_registered_jarvis_query",
+                    "package_id": "paraview",
+                    "package_name": "builtin.paraview",
+                    "service_instance_id": "service-paraview-1",
+                }
+            ],
+        }
+    )
+
+
+def test_arbitrary_registered_remote_mcp_output_forbids_jarvis_runtime_handoffs() -> None:
+    """JARVIS-like server and tool names cannot grant JARVIS-specific result fields."""
+    registration = _registration(namespace="jarvis-demo", profiles=["user"]).model_copy(
+        update={"allow_tools": ["jarvis_get_execution"]}
+    )
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"jarvis": registration})}),
+        RemoteMcpSchemaCache(
+            entries=[
+                _entry(
+                    registration,
+                    cluster="alpha",
+                    server_name="jarvis",
+                    tools=[_tool("jarvis_get_execution")],
+                )
+            ]
+        ),
+        profile="user",
+        now=NOW,
+    )
+    advertised = catalog.tools["remote_jarvis_demo_jarvis_get_execution"].definition()[
+        "outputSchema"
+    ]
+    result: dict[str, object] = {
+        "cluster": "alpha",
+        "job_id": "job_science_query",
+        "state": "succeeded",
+        "kind": "mcp_call",
+        "terminal": True,
+        "route_revision": "a" * 64,
+        "catalog_revision": catalog.revision,
+        "service_runtime_bindings": [],
+    }
+
+    assert advertised == VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA
+    validator = cast(_SchemaValidator, Draft202012Validator(advertised))
+    with pytest.raises(JsonSchemaValidationError) as error:
+        validator.validate(result)
+    assert "Additional properties are not allowed" in error.value.message
+    assert "service_runtime_bindings" in error.value.message
 
 
 def test_cluster_injection_wraps_nonempty_root_id_without_changing_remote_schema() -> None:

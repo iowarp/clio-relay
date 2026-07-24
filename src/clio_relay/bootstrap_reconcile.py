@@ -3056,6 +3056,77 @@ def _is_generation_repository_target(path: Path, *, home: Path) -> bool:
     )
 
 
+def proven_active_generation_mismatch(
+    desired: BootstrapDesiredState,
+    *,
+    home: Path | None = None,
+) -> str | None:
+    """Return a safely identified active generation only when it differs.
+
+    This deliberately proves only that the stable ``current`` pointer names a
+    different relay-managed generation.  It never proves an exact deployment
+    match, so callers may use it solely to request normal payload
+    reconciliation before performing the comparatively expensive runtime
+    identity inspection.
+    """
+    lexical_home = Path(os.path.abspath((home or Path.home()).expanduser()))
+    share = lexical_home / ".local/share/clio-relay"
+    generations_path = share / "generations"
+    current = share / "current"
+    try:
+        before = current.lstat()
+        if not stat.S_ISLNK(before.st_mode):
+            return None
+        raw_target = os.readlink(current)
+        if not raw_target or any(character in raw_target for character in "\x00\r\n"):
+            return None
+        target = Path(raw_target)
+        if not target.is_absolute():
+            target = current.parent / target
+        generations_before = generations_path.lstat()
+        if not stat.S_ISDIR(generations_before.st_mode) or _path_is_directory_alias(
+            generations_path
+        ):
+            return None
+        generations = generations_path.resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+        relative = resolved_target.relative_to(generations)
+        generation = relative.name
+        generation_path = generations_path / generation
+        generation_before = generation_path.lstat()
+        if (
+            not stat.S_ISDIR(generation_before.st_mode)
+            or _path_is_directory_alias(generation_path)
+            or generation_path.resolve(strict=True) != resolved_target
+        ):
+            return None
+        after = current.lstat()
+        generations_after = generations_path.lstat()
+        generation_after = generation_path.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        _stat_identity(after) != _stat_identity(before)
+        or _stat_identity(generations_after) != _stat_identity(generations_before)
+        or _stat_identity(generation_after) != _stat_identity(generation_before)
+        or len(relative.parts) != 1
+        or len(generation) != 64
+        or any(character not in "0123456789abcdef" for character in generation)
+        or generation == desired.fingerprint
+    ):
+        return None
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and any(
+        details.st_uid != getuid()
+        for details in (
+            generations_after,
+            generation_after,
+        )
+    ):
+        return None
+    return generation
+
+
 def _inspect_installation_identity(
     desired: BootstrapDesiredState,
     info: dict[str, object],

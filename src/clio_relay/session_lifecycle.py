@@ -4251,36 +4251,17 @@ def _run_bounded_command(
 
 def _current_session_api_release_identity() -> SessionApiReleaseIdentity:
     """Return the exact locally installed release identity for an API child."""
-    from clio_relay.installation import installation_info
+    from clio_relay.installation import verified_session_api_install_receipt
 
-    info = installation_info()
-    raw_receipt = info.get("receipt")
-    receipt = (
-        {str(key): value for key, value in cast(dict[object, object], raw_receipt).items()}
-        if isinstance(raw_receipt, dict)
-        else None
+    receipt = verified_session_api_install_receipt()
+    artifact_sha256 = receipt.artifact_sha256
+    if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
+        raise RelayError("session API installation identity is incomplete")
+    return SessionApiReleaseIdentity(
+        distribution_version=receipt.distribution_version,
+        artifact_sha256=artifact_sha256,
+        software=receipt.software,
     )
-    software = info.get("software")
-    identity: dict[str, object] = {
-        "schema_version": "clio-relay.session-api-release.v1",
-        "distribution_version": info.get("distribution_version"),
-        "artifact_sha256": (receipt.get("artifact_sha256") if receipt is not None else None),
-        "software": software,
-    }
-    try:
-        validated = SessionApiReleaseIdentity.model_validate(identity)
-    except ValueError as exc:
-        raise RelayError("session API installation identity is incomplete") from exc
-    if (
-        info.get("schema_version") != "clio-relay.installation-info.v1"
-        or info.get("receipt_matches_install") is not True
-        or receipt is None
-        or receipt.get("schema_version") != "clio-relay.install-receipt.v1"
-        or receipt.get("distribution_version") != validated.distribution_version
-        or receipt.get("software") != validated.software.model_dump(mode="json")
-    ):
-        raise RelayError("session API installation receipt does not match the running package")
-    return validated
 
 
 def _validated_start_registry(
@@ -7502,9 +7483,6 @@ def start_remote_session_durable(
         if observed.state != "ambiguous":
             return observed
         return observed.model_copy(update={"error": str(exc)[:_MAX_SESSION_START_ERROR_CHARS]})
-    except RelayError:
-        observed = query_remote_session_start(definition=definition, plan=plan)
-        return observed
     values: dict[str, str] = {}
     for line in lines:
         if "=" not in line:

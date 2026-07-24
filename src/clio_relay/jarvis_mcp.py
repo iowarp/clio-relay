@@ -11,27 +11,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
-    VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     RemoteMcpSchemaCache,
     RemoteMcpSchemaCacheEntry,
     default_remote_mcp_cache_path,
     remote_mcp_server_artifact_digest,
+    virtual_jarvis_job_output_schema,
+)
+from clio_relay.remote_mcp import (
+    jarvis_service_runtime_handoff_json_schema as jarvis_service_runtime_handoff_json_schema,
 )
 
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.6.2"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.6.5"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "96ce0f85bacad637b715704565be0c57df9d1891193c1c00c3c85dc2904725a4"
+    "15a24746453041009f5b3618a72ea8b1c044927def46395ba383eb444ee9c82d"
 )
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
 DEFAULT_JARVIS_MCP_COMMAND = [
@@ -627,65 +629,6 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
             }
         )
     return tools
-
-
-def jarvis_service_runtime_handoff_json_schema(
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact agent-facing JARVIS service handoff schema."""
-    return {
-        "type": "object",
-        "properties": {
-            "cluster": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256,
-                **({"enum": sorted(clusters)} if clusters is not None else {}),
-            },
-            "source_job_id": durable_record_id_json_schema(),
-            "source_artifact_id": durable_record_id_json_schema(),
-            "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
-            "service_instance_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512,
-            },
-        },
-        "required": [
-            "cluster",
-            "source_job_id",
-            "source_artifact_id",
-            "package_id",
-            "package_name",
-            "service_instance_id",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def virtual_jarvis_job_output_schema(
-    remote_tool: str,
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact relay job receipt schema for one virtual JARVIS tool."""
-    if remote_tool not in _VIRTUAL_JARVIS_TOOLS:
-        raise ValueError(f"unknown virtual JARVIS tool: {remote_tool}")
-    output_schema = deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
-    if remote_tool == "jarvis_get_execution":
-        output_properties = cast(JSON, output_schema["properties"])
-        output_properties["service_runtime_bindings"] = {
-            "type": "array",
-            "description": (
-                "Ready-service handoffs derived from the verified durable MCP result. "
-                "Pass one item unchanged as relay_bind_jarvis_runtime.binding."
-            ),
-            "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
-            "maxItems": 4_096,
-        }
-    return output_schema
 
 
 def jarvis_user_contract() -> dict[str, JSON]:

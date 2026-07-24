@@ -17,12 +17,14 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn, cast
 
 import pytest
 from typer.testing import CliRunner
 
 import clio_relay.bootstrap as bootstrap
+import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.cli as cli
 from clio_relay import __version__
 from clio_relay.bootstrap_reconcile import (
@@ -34,6 +36,7 @@ from clio_relay.bootstrap_reconcile import (
     JarvisStateEvidence,
     execution_environment_identity,
     make_bootstrap_receipt,
+    proven_active_generation_mismatch,
 )
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.errors import ConfigurationError, RelayError
@@ -1413,6 +1416,160 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
     assert operations["payload_transfer_bytes"] == 0
 
 
+def test_bootstrap_preflight_quotes_its_multiline_remote_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSH receives one quoted command whose Bash payload retains its line boundaries."""
+    identity = bootstrap.bootstrap_relay_identity(
+        source_root=tmp_path / "release",
+        relay_wheel=None,
+        relay_artifact_sha256="a" * 64,
+    )
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=identity,
+        cluster="ares",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    observed: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "bootstrap_preflight_unsupported=not_installed\n",
+            "",
+        )
+
+    monkeypatch.setattr(bootstrap, "_run", run)
+    result = bootstrap._bootstrap_preflight_over_ssh(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ssh_host="ares",
+        invocation_id="bootstrap_test",
+        desired=desired,
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        repair=False,
+        timeout_seconds=30,
+    )
+
+    assert result.action == "payload_required"
+    assert len(observed) == 1
+    assert observed[0][:2] == ["ssh", "ares"]
+    assert len(observed[0]) == 3
+    ssh_remote_command = " ".join(observed[0][2:])
+    remote_argv = shlex.split(ssh_remote_command, posix=True)
+    exec_index = remote_argv.index("exec")
+    assert remote_argv[:4] == ["if", "[", "-n", "${BASH_VERSION-}"]
+    assert remote_argv[exec_index : exec_index + 3] == ["exec", "bash", "-c"]
+    assert len(remote_argv) == exec_index + 4
+    assert remote_argv[exec_index + 3].startswith("set -u\n")
+    assert remote_argv[exec_index + 3].endswith("printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\"")
+
+
+def test_pinned_local_bootstrap_artifact_copy_is_bounded_and_digest_verified(
+    tmp_path: Path,
+) -> None:
+    """A pre-staged candidate is copied only from its managed digest-pinned root."""
+    candidate_root = tmp_path / "candidate-wheels"
+    candidate_root.mkdir()
+    source = candidate_root / "jarvis-candidate.whl"
+    payload = b"real candidate wheel bytes"
+    source.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    destination = tmp_path / "staging.whl"
+    destination.touch()
+    program = bootstrap._BOOTSTRAP_PINNED_LOCAL_ARTIFACT_COPY_SOURCE  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            source.as_uri(),
+            expected_sha256,
+            str(destination),
+            str(candidate_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert destination.read_bytes() == payload
+
+    escaped_source = tmp_path / "outside.whl"
+    escaped_source.write_bytes(payload)
+    escaped_destination = tmp_path / "escaped-staging.whl"
+    escaped_destination.touch()
+    escaped = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            escaped_source.as_uri(),
+            expected_sha256,
+            str(escaped_destination),
+            str(candidate_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert escaped.returncode != 0
+    assert escaped_destination.read_bytes() == b""
+
+    mismatched_destination = tmp_path / "mismatched-staging.whl"
+    mismatched_destination.touch()
+    mismatched = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            source.as_uri(),
+            "f" * 64,
+            str(mismatched_destination),
+            str(candidate_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert mismatched.returncode != 0
+    assert mismatched_destination.read_bytes() == b""
+
+
+def test_bootstrap_uses_exact_fetcher_for_jarvis_artifacts() -> None:
+    """Rendered bootstrap accepts only HTTPS or managed file staging for JARVIS."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+
+    assert "bootstrap_fetch_exact_artifact() {" in script
+    assert "file://*)" in script
+    assert "https://*)" in script
+    assert '"$HOME/.local/share/clio-relay/candidate-wheels"' in script
+    assert (
+        "bootstrap_fetch_exact_artifact \\\n"
+        '  "$JARVIS_CD_WHEEL_URL" "$JARVIS_CD_WHEEL_SHA256" "$JARVIS_CD_STAGING"' in script
+    )
+    assert 'curl -L --fail --retry 3 -o "$JARVIS_CD_STAGING"' not in script
+
+
 @pytest.mark.release_platform("posix")
 def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     tmp_path: Path,
@@ -1469,8 +1626,10 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     assert "bootstrap_preflight_unsupported=legacy_relay_provider" in remote_script
     assert 'if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(' in remote_script
     assert "python3 -I -" in remote_script
-    sanitizer = remote_script.index("while IFS= read -r bootstrap_environment_name")
-    assert 'LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name"' in remote_script
+    sanitizer = remote_script.index(
+        'for bootstrap_environment_name in "${!LD_@}" "${!PYTHON@}" BASH_ENV ENV'
+    )
+    assert 'unset "$bootstrap_environment_name"' in remote_script
     assert sanitizer < remote_script.index("python3 -I -")
     assert sanitizer < remote_script.index("timeout --signal=TERM")
     assert "env -u PYTHONPATH" not in remote_script
@@ -2011,6 +2170,251 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
 
     assert result.exit_code != 0
     assert "repair did not converge" in result.output
+    assert "bootstrap_preflight_json=" not in result.output
+
+
+def test_proven_active_generation_mismatch_requires_one_managed_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a stable canonical generation directory can trigger the fast path."""
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=bootstrap.BootstrapRelayIdentity(
+            install_spec=f"clio-relay=={__version__}",
+            transport_install_spec=f"clio-relay=={__version__}",
+            source_identity=f"release:clio-relay=={__version__}:sha256:{'a' * 64}",
+            deployment_artifact_sha256="a" * 64,
+        ),
+        cluster="cluster-a",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    share = tmp_path / ".local/share/clio-relay"
+    generations = share / "generations"
+    active = generations / ("b" * 64)
+    active.mkdir(parents=True)
+    current = share / "current"
+    current.write_text("test-only link placeholder", encoding="utf-8")
+    current_details = current.lstat()
+    simulated_link_details = SimpleNamespace(
+        st_dev=current_details.st_dev,
+        st_ino=current_details.st_ino,
+        st_mode=0o120777,
+        st_size=current_details.st_size,
+        st_mtime_ns=current_details.st_mtime_ns,
+        st_ctime_ns=current_details.st_ctime_ns,
+    )
+    path_type = type(current)
+    original_lstat = path_type.lstat
+    original_readlink = os.readlink
+    original_is_directory_alias = bootstrap_reconcile._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    raw_target = str(active)
+    simulate_current_race = False
+    current_lstat_calls = 0
+
+    def simulated_lstat(path: Path) -> os.stat_result:
+        nonlocal current_lstat_calls
+        if path == current:
+            current_lstat_calls += 1
+            if simulate_current_race and current_lstat_calls == 2:
+                return cast(
+                    os.stat_result,
+                    SimpleNamespace(
+                        **{
+                            **vars(simulated_link_details),
+                            "st_ino": simulated_link_details.st_ino + 1,
+                        }
+                    ),
+                )
+            return cast(os.stat_result, simulated_link_details)
+        return original_lstat(path)
+
+    def simulated_readlink(path: str | os.PathLike[str]) -> str:
+        if Path(path) == current:
+            return raw_target
+        return original_readlink(path)
+
+    monkeypatch.setattr(path_type, "lstat", simulated_lstat)
+    monkeypatch.setattr(bootstrap_reconcile.os, "readlink", simulated_readlink)
+
+    assert proven_active_generation_mismatch(desired, home=tmp_path) == "b" * 64
+
+    desired_generation = generations / desired.fingerprint
+    desired_generation.mkdir()
+    raw_target = str(desired_generation)
+    assert proven_active_generation_mismatch(desired, home=tmp_path) is None
+
+    malformed = generations / "not-a-generation"
+    malformed.mkdir()
+    raw_target = str(malformed)
+    assert proven_active_generation_mismatch(desired, home=tmp_path) is None
+
+    outside = tmp_path / ("c" * 64)
+    outside.mkdir()
+    raw_target = str(outside)
+    assert proven_active_generation_mismatch(desired, home=tmp_path) is None
+
+    raw_target = str(active)
+
+    def aliased_generations(path: Path) -> bool:
+        return path == generations or original_is_directory_alias(path)
+
+    monkeypatch.setattr(
+        bootstrap_reconcile,
+        "_path_is_directory_alias",
+        aliased_generations,
+    )
+    assert proven_active_generation_mismatch(desired, home=tmp_path) is None
+    monkeypatch.setattr(
+        bootstrap_reconcile,
+        "_path_is_directory_alias",
+        original_is_directory_alias,
+    )
+
+    current_lstat_calls = 0
+    simulate_current_race = True
+    assert proven_active_generation_mismatch(desired, home=tmp_path) is None
+
+
+@pytest.mark.parametrize("repair", [False, True])
+def test_payload_free_inspector_short_circuits_proven_generation_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repair: bool,
+) -> None:
+    """A different managed generation requests payload without deep inspection."""
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=bootstrap.BootstrapRelayIdentity(
+            install_spec=f"clio-relay=={__version__}",
+            transport_install_spec=f"clio-relay=={__version__}",
+            source_identity=f"release:clio-relay=={__version__}:sha256:{'a' * 64}",
+            deployment_artifact_sha256="a" * 64,
+        ),
+        cluster="cluster-a",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    monkeypatch.setenv(
+        "CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64",
+        base64.b64encode(desired.model_dump_json().encode()).decode(),
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("generation mismatch performed an expensive inspection")
+
+    def invocation_lock(**_kwargs: object) -> nullcontext[Path]:
+        return nullcontext(tmp_path / "bootstrap.lock")
+
+    def mismatched_generation(_desired: BootstrapDesiredState) -> str:
+        return "b" * 64
+
+    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(
+        cli,
+        "proven_active_generation_mismatch",
+        mismatched_generation,
+    )
+    monkeypatch.setattr(cli, "installation_info", unexpected)
+    monkeypatch.setattr(cli, "ClioCoreQueue", unexpected)
+    monkeypatch.setattr(cli, "run_bounded_process", unexpected)
+    monkeypatch.setattr(cli, "worker_runtime_info", unexpected)
+    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", unexpected)
+    monkeypatch.setattr(cli, "write_bootstrap_receipt", unexpected)
+    arguments = [
+        "bootstrap-inspect",
+        "--invocation-id",
+        f"bootstrap_mismatch_{repair}",
+        "--repair" if repair else "--inspect-only",
+    ]
+
+    result = CliRunner().invoke(cli.app, arguments)
+
+    assert result.exit_code == 0, result.output
+    payload_line = next(
+        line for line in result.output.splitlines() if line.startswith("bootstrap_preflight_json=")
+    )
+    payload = json.loads(payload_line.partition("=")[2])
+    assert payload == {
+        "action": "payload_required",
+        "desired_fingerprint": desired.fingerprint,
+        "exact_match": False,
+        "reasons": ["active generation differs from desired fingerprint"],
+        "receipt": None,
+        "schema_version": "clio-relay.bootstrap-preflight.v1",
+    }
+
+
+def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching pointer remains subject to the complete identity inspection."""
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=bootstrap.BootstrapRelayIdentity(
+            install_spec=f"clio-relay=={__version__}",
+            transport_install_spec=f"clio-relay=={__version__}",
+            source_identity=f"release:clio-relay=={__version__}:sha256:{'a' * 64}",
+            deployment_artifact_sha256="a" * 64,
+        ),
+        cluster="cluster-a",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    monkeypatch.setenv(
+        "CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64",
+        base64.b64encode(desired.model_dump_json().encode()).decode(),
+    )
+
+    def invocation_lock(**_kwargs: object) -> nullcontext[Path]:
+        return nullcontext(tmp_path / "bootstrap.lock")
+
+    def deep_inspection() -> dict[str, object]:
+        raise ConfigurationError("deep inspection reached")
+
+    def matching_generation(_desired: BootstrapDesiredState) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(cli, "proven_active_generation_mismatch", matching_generation)
+    monkeypatch.setattr(cli, "installation_info", deep_inspection)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "bootstrap-inspect",
+            "--invocation-id",
+            "bootstrap_matching_generation",
+            "--inspect-only",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "deep inspection reached" in result.output
     assert "bootstrap_preflight_json=" not in result.output
 
 
@@ -2799,8 +3203,10 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert 'receipt_document.get("deployment_manifest")' in script
     assert "staged install receipt omitted its desired state" in script
     assert "journal-phase prepared_manifest" in script
-    assert provider_function.index("compgen -e") < provider_function.index("exec python3 -I -c")
-    assert 'LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name"' in provider_function
+    assert provider_function.index(
+        'for bootstrap_environment_name in "${!LD_@}" "${!PYTHON@}" BASH_ENV ENV'
+    ) < provider_function.index("exec python3 -I -c")
+    assert 'unset "$bootstrap_environment_name"' in provider_function
     assert activation < finish < verify < activated < migration
     assert "bootstrap_candidate_action finish-activation" in recovery
     assert "phase_identities" in recovery

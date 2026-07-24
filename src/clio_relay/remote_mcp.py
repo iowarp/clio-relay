@@ -50,7 +50,9 @@ from clio_relay.cluster_config import (
     read_bounded_configuration_bytes,
 )
 from clio_relay.errors import NotFoundError, RelayError
+from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.models import (
+    REGISTERED_JARVIS_USER_CONTRACT,
     JobKind,
     JobState,
     McpAdmissionAuthority,
@@ -90,7 +92,7 @@ MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = REGISTERED_JARVIS_USER_CONTRACT
 CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID = "clio-kit-jarvis-user-v3.5"
 CLIO_KIT_JARVIS_USER_CONTRACT_IDS = frozenset(
     {
@@ -139,7 +141,7 @@ CLIO_KIT_JARVIS_USER_TOOL_NAMES = frozenset(
         "jarvis_run",
     }
 )
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.6.2"
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.6.5"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
@@ -182,7 +184,7 @@ CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
     CLIO_KIT_SPACK_USER_CONTRACT_ID
 ]
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.6.2"
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.6.5"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(
@@ -411,6 +413,65 @@ VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
     ],
     "additionalProperties": False,
 }
+
+
+def jarvis_service_runtime_handoff_json_schema(
+    *,
+    clusters: list[str] | None = None,
+) -> JSON:
+    """Return the exact agent-facing JARVIS service handoff schema."""
+    return {
+        "type": "object",
+        "properties": {
+            "cluster": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                **({"enum": sorted(clusters)} if clusters is not None else {}),
+            },
+            "source_job_id": durable_record_id_json_schema(),
+            "source_artifact_id": durable_record_id_json_schema(),
+            "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "service_instance_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+            },
+        },
+        "required": [
+            "cluster",
+            "source_job_id",
+            "source_artifact_id",
+            "package_id",
+            "package_name",
+            "service_instance_id",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def virtual_jarvis_job_output_schema(
+    remote_tool: str,
+    *,
+    clusters: list[str] | None = None,
+) -> JSON:
+    """Return the exact relay job receipt schema for one verified JARVIS tool."""
+    if remote_tool not in CLIO_KIT_JARVIS_USER_TOOL_NAMES:
+        raise ValueError(f"unknown virtual JARVIS tool: {remote_tool}")
+    output_schema = deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
+    if remote_tool == "jarvis_get_execution":
+        output_properties = cast(JSON, output_schema["properties"])
+        output_properties["service_runtime_bindings"] = {
+            "type": "array",
+            "description": (
+                "Ready-service handoffs derived from the verified durable MCP result. "
+                "Pass one item unchanged as relay_bind_jarvis_runtime.binding."
+            ),
+            "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
+            "maxItems": 4_096,
+        }
+    return output_schema
 
 
 class RemoteMcpToolSchema(BaseModel):
@@ -645,6 +706,25 @@ class RemoteMcpSchemaCache(BaseModel):
             )
             updated._write_atomic(path)
             return updated
+
+    @classmethod
+    def invalidate_cluster_entries(
+        cls,
+        path: Path,
+        cluster: str,
+    ) -> tuple[RemoteMcpSchemaCache, tuple[str, ...]]:
+        """Atomically invalidate every cached server schema for one cluster."""
+        ensure_private_configuration_directory(path.parent)
+        with FileLock(f"{path}.lock"):
+            cache = cls.load(path)
+            removed_server_names = tuple(
+                sorted(entry.server_name for entry in cache.entries if entry.cluster == cluster)
+            )
+            if not removed_server_names:
+                return cache, removed_server_names
+            updated = cls(entries=[entry for entry in cache.entries if entry.cluster != cluster])
+            updated._write_atomic(path)
+            return updated, removed_server_names
 
     def _write_atomic(self, path: Path) -> None:
         payload = (self.model_dump_json(indent=2) + "\n").encode("utf-8")
@@ -1394,7 +1474,12 @@ class VirtualRemoteMcpTool:
             "call; otherwise use relay job tools with the returned handle."
         )
         exact_v36_routes = bool(self.routes) and all(
-            route.contract == CLIO_KIT_JARVIS_USER_CONTRACT_ID for route in self.routes.values()
+            route.contract == REGISTERED_JARVIS_USER_CONTRACT for route in self.routes.values()
+        )
+        output_schema = (
+            virtual_jarvis_job_output_schema(self.remote_tool.name, clusters=clusters)
+            if exact_v36_routes and self.remote_tool.name in CLIO_KIT_JARVIS_USER_TOOL_NAMES
+            else deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
         )
         if exact_v36_routes and self.remote_tool.name == "jarvis_describe":
             properties = cast(JSON, input_schema["properties"])
@@ -1435,7 +1520,7 @@ class VirtualRemoteMcpTool:
                 f"as a durable relay job. {wait_guidance}"
             ),
             "inputSchema": input_schema,
-            "outputSchema": deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA),
+            "outputSchema": output_schema,
         }
         if self.remote_tool.title is not None:
             definition["title"] = self.remote_tool.title

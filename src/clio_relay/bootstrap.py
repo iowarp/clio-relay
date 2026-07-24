@@ -71,24 +71,68 @@ UV_LINUX_AMD64_EXECUTABLE_SHA256 = (
     "1cb9cd0a1749debf6049d7d2bb933882cc52d81016326ee6d99a786d6c988b03"
 )
 JARVIS_UTIL_COMMIT = "c91bfdc9bba802e4b03bfb1babe614ffa3e09644"
-JARVIS_CD_VERSION = "1.6.0"
+JARVIS_CD_VERSION = "1.7.0"
 JARVIS_CD_WHEEL_FILENAME = f"jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
 JARVIS_CD_WHEEL_URL = (
     "https://github.com/grc-iit/jarvis-cd/releases/download/"
     f"v{JARVIS_CD_VERSION}/{JARVIS_CD_WHEEL_FILENAME}"
 )
-JARVIS_CD_WHEEL_SHA256 = "c4853138f3263715e806fcd794233d89f4aa58161e3c5fbab59e7f96d24f0e98"
+JARVIS_CD_WHEEL_SHA256 = "f61d2c9b01af1794263013b9045916230c36c318c2984ba4f35d82d8c994e9bb"
 DEFAULT_REMOTE_CORE_DIR = "$HOME/.local/share/clio-relay/core"
 DEFAULT_REMOTE_SPOOL_DIR = "$HOME/.local/share/clio-relay/spool"
 
 
 _STAGED_PROVIDER_ENVIRONMENT_SANITIZER = r"""
-while IFS= read -r bootstrap_environment_name; do
-  case "$bootstrap_environment_name" in
-    LD_*|PYTHON*|BASH_ENV|ENV) unset "$bootstrap_environment_name" ;;
-  esac
-done < <(compgen -e)
+for bootstrap_environment_name in "${!LD_@}" "${!PYTHON@}" BASH_ENV ENV; do
+  unset "$bootstrap_environment_name"
+done
 """.strip()
+_POSIX_REMOTE_SHELL_STARTUP_ENVIRONMENT_NAMES = (
+    "BASH_ENV",
+    "ENV",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_HWCAP_MASK",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_POINTER_GUARD",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "LD_TRACE_PRELINKING",
+    "LD_USE_LOAD_BIAS",
+    "LD_VERBOSE",
+    "LD_WARN",
+    "PYTHONCASEOK",
+    "PYTHONDEBUG",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONEXECUTABLE",
+    "PYTHONFAULTHANDLER",
+    "PYTHONHASHSEED",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONIOENCODING",
+    "PYTHONMALLOC",
+    "PYTHONNOUSERSITE",
+    "PYTHONOPTIMIZE",
+    "PYTHONPATH",
+    "PYTHONPROFILEIMPORTTIME",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONSAFEPATH",
+    "PYTHONSTARTUP",
+    "PYTHONTRACEMALLOC",
+    "PYTHONUNBUFFERED",
+    "PYTHONUSERBASE",
+    "PYTHONUTF8",
+    "PYTHONWARNDEFAULTENCODING",
+    "PYTHONWARNINGS",
+)
 _STAGED_PROVIDER_EXEC_PROGRAM = r"""
 import ctypes
 import fcntl
@@ -872,6 +916,132 @@ finally:
     os.close(root_descriptor)
     os.close(source_descriptor)
 print(root / "pinned-uv")"""
+_BOOTSTRAP_PINNED_LOCAL_ARTIFACT_COPY_SOURCE = r"""import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def cross_handle_identity(details):
+    if os.name == "nt":
+        return (
+            details.st_dev,
+            details.st_ino,
+            stat.S_IFMT(details.st_mode),
+            details.st_size,
+            details.st_mtime_ns,
+        )
+    return identity(details)
+
+
+source_url, expected_sha256, destination_value, allowed_root_value = sys.argv[1:]
+parsed = urlsplit(source_url)
+source_path_value = unquote(parsed.path)
+if os.name == "nt" and len(source_path_value) > 2 and source_path_value[0] == "/":
+    source_path_value = source_path_value[1:]
+if (
+    parsed.scheme != "file"
+    or parsed.netloc
+    or parsed.query
+    or parsed.fragment
+    or not source_path_value
+    or any(character in source_path_value for character in "\x00\r\n")
+    or len(expected_sha256) != 64
+    or any(character not in "0123456789abcdef" for character in expected_sha256)
+):
+    raise SystemExit("pinned local artifact arguments are invalid")
+
+source = Path(source_path_value)
+destination = Path(destination_value)
+allowed_root = Path(allowed_root_value)
+if not source.is_absolute() or not destination.is_absolute() or not allowed_root.is_absolute():
+    raise SystemExit("pinned local artifact paths must be absolute")
+try:
+    allowed_root_before = allowed_root.lstat()
+    source_before = source.lstat()
+    destination_before = destination.lstat()
+    resolved_allowed_root = allowed_root.resolve(strict=True)
+    resolved_source = source.resolve(strict=True)
+    resolved_source.relative_to(resolved_allowed_root)
+except (OSError, RuntimeError, ValueError) as exc:
+    raise SystemExit("pinned local artifact escaped its managed staging root") from exc
+getuid = getattr(os, "getuid", None)
+if (
+    not stat.S_ISDIR(allowed_root_before.st_mode)
+    or allowed_root.is_symlink()
+    or not stat.S_ISREG(source_before.st_mode)
+    or source.is_symlink()
+    or not 1 <= source_before.st_size <= 256 * 1024 * 1024
+    or not stat.S_ISREG(destination_before.st_mode)
+    or destination.is_symlink()
+    or destination_before.st_nlink != 1
+    or destination_before.st_size != 0
+    or (callable(getuid) and allowed_root_before.st_uid != getuid())
+    or (callable(getuid) and source_before.st_uid != getuid())
+    or (callable(getuid) and destination_before.st_uid != getuid())
+):
+    raise SystemExit("pinned local artifact paths are not owned bounded files")
+
+read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+write_flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+source_descriptor = os.open(source, read_flags)
+destination_descriptor = os.open(destination, write_flags)
+try:
+    source_opened = os.fstat(source_descriptor)
+    destination_opened = os.fstat(destination_descriptor)
+    if (
+        identity(source_opened) != identity(source_before)
+        or identity(destination_opened) != identity(destination_before)
+    ):
+        raise SystemExit("pinned local artifact changed before copying")
+    digest = hashlib.sha256()
+    copied = 0
+    while chunk := os.read(source_descriptor, 1024 * 1024):
+        copied += len(chunk)
+        if copied > 256 * 1024 * 1024:
+            raise SystemExit("pinned local artifact exceeded its copy bound")
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_descriptor, view)
+            if written < 1:
+                raise SystemExit("pinned local artifact copy made no progress")
+            view = view[written:]
+    os.fsync(destination_descriptor)
+    source_after = os.fstat(source_descriptor)
+    destination_after = os.fstat(destination_descriptor)
+    if (
+        copied != source_opened.st_size
+        or digest.hexdigest() != expected_sha256
+        or identity(source_after) != identity(source_opened)
+        or identity(source.lstat()) != identity(source_opened)
+        or destination_after.st_size != copied
+        or destination_after.st_nlink != 1
+        or (destination_after.st_dev, destination_after.st_ino)
+        == (source_opened.st_dev, source_opened.st_ino)
+    ):
+        os.ftruncate(destination_descriptor, 0)
+        os.fsync(destination_descriptor)
+        raise SystemExit("pinned local artifact changed or did not match its digest")
+finally:
+    os.close(destination_descriptor)
+    os.close(source_descriptor)
+
+if cross_handle_identity(destination.lstat()) != cross_handle_identity(destination_after):
+    raise SystemExit("pinned local artifact destination changed after copying")"""
 _BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE = r"""import base64
 import ctypes
 import csv
@@ -2436,10 +2606,17 @@ def _bootstrap_preflight_over_ssh(
             "printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\"",
         ]
     )
-    result = _run(
-        ["ssh", ssh_host, "bash", "-c", command],
-        timeout_seconds=timeout_seconds,
+    remote_command = "\n".join(
+        [
+            'if [ -n "${BASH_VERSION-}" ]; then',
+            f"  eval {shlex.quote(_STAGED_PROVIDER_ENVIRONMENT_SANITIZER)}",
+            "else",
+            "  unset " + " ".join(_POSIX_REMOTE_SHELL_STARTUP_ENVIRONMENT_NAMES),
+            "fi",
+            f"exec bash -c {shlex.quote(command)}",
+        ]
     )
+    result = _run(["ssh", ssh_host, remote_command], timeout_seconds=timeout_seconds)
     lines = result.stdout.splitlines()
     payload_lines = [
         line.removeprefix("bootstrap_preflight_json=")
@@ -3758,6 +3935,44 @@ def _worker_upgrade_fence_script(
     return fence, recheck, "clio-relay init --migrate-legacy-output", restart
 
 
+def _pinned_artifact_fetch_shell_function() -> str:
+    """Render the digest-pinned HTTPS or managed local artifact fetcher."""
+    local_copy_program = shlex.quote(_BOOTSTRAP_PINNED_LOCAL_ARTIFACT_COPY_SOURCE)
+    return f"""bootstrap_fetch_exact_artifact() {{
+  local source_url="$1"
+  local expected_sha256="$2"
+  local destination="$3"
+  case "$expected_sha256" in
+    (*[!0-9a-f]*|'')
+      echo "bootstrap artifact digest is invalid" >&2
+      return 1
+      ;;
+  esac
+  if [ "${{#expected_sha256}}" -ne 64 ]; then
+    echo "bootstrap artifact digest has an invalid length" >&2
+    return 1
+  fi
+  case "$source_url" in
+    file://*)
+      python3 -I -c {local_copy_program} \
+        "$source_url" "$expected_sha256" "$destination" \
+        "$HOME/.local/share/clio-relay/candidate-wheels"
+      ;;
+    https://*)
+      curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 3 --retry-all-errors --retry-max-time 180 \
+        --connect-timeout 20 --max-time 180 \
+        --output "$destination" "$source_url"
+      echo "$expected_sha256 *$destination" | sha256sum --check --strict -
+      ;;
+    *)
+      echo "bootstrap artifact URL must use HTTPS or managed file staging" >&2
+      return 1
+      ;;
+  esac
+}}"""
+
+
 def _relay_only_reconcile_script(
     *,
     worker_fence: str,
@@ -4553,10 +4768,10 @@ bootstrap_relay_only_reconcile() {{
         "$HOME/.local/src/jarvis-util"
 
       mkdir -m 0700 "$BOOTSTRAP_GENERATION/artifacts"
-      curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --retry 3 --retry-all-errors --retry-max-time 180 \
-        --connect-timeout 20 --max-time 180 \
-        --output "$JARVIS_CD_WHEEL" "{JARVIS_CD_WHEEL_URL}"
+      JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
+      bootstrap_fetch_exact_artifact \\
+        "{JARVIS_CD_WHEEL_URL}" "{JARVIS_CD_WHEEL_SHA256}" "$JARVIS_CD_STAGING"
+      mv "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL"
       echo "{JARVIS_CD_WHEEL_SHA256} *$JARVIS_CD_WHEEL" | \
         sha256sum --check --strict -
       BOOTSTRAP_JARVIS_CD_DOWNLOAD_COUNT=1
@@ -5717,6 +5932,7 @@ def render_linux_user_bootstrap_script(
     preparing_root_program = shlex.quote(_BOOTSTRAP_PREPARING_ROOT_SOURCE)
     pinned_uv_copy_program = shlex.quote(_BOOTSTRAP_PINNED_UV_COPY_SOURCE)
     candidate_uv_install_program = shlex.quote(_BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE)
+    artifact_fetch_function = _pinned_artifact_fetch_shell_function()
     candidate_package_sha256 = {
         name: hashlib.sha256(payload).hexdigest()
         for name, payload in candidate_package_sources.items()
@@ -5767,6 +5983,7 @@ while IFS= read -r variable_name; do
   esac
 done < <(compgen -e)
 mkdir -p "$HOME/.local/bin" "$HOME/.local/src" "$HOME/.local/share/clio-relay"
+{artifact_fetch_function}
 bootstrap_active_generation_identity() {{
   local current target prefix identity
   current="$HOME/.local/share/clio-relay/current"
@@ -7031,7 +7248,8 @@ JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"
 mkdir -m 0700 -p "$(dirname "$JARVIS_CD_WHEEL_DIR")"
 bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_cd_wheels
 JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
-curl -L --fail --retry 3 -o "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL_URL"
+bootstrap_fetch_exact_artifact \\
+  "$JARVIS_CD_WHEEL_URL" "$JARVIS_CD_WHEEL_SHA256" "$JARVIS_CD_STAGING"
 BOOTSTRAP_JARVIS_CD_DOWNLOADED=1
 echo "$JARVIS_CD_WHEEL_SHA256 *$JARVIS_CD_STAGING" | sha256sum --check --strict -
 mv "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL"

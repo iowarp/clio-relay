@@ -1080,16 +1080,47 @@ def _path_within(path: Path, root: Path) -> bool:
         return False
 
 
-def installation_info(path: Path | None = None) -> dict[str, object]:
-    """Return current package identity together with its durable install receipt."""
+def _current_install_receipt(
+    path: Path | None = None,
+) -> tuple[InstallReceipt, Literal["bootstrap", "uv-tool"], InstallSource | None]:
+    """Load the durable receipt that owns the current relay installation."""
     receipt_path = path or default_install_receipt_path()
-    receipt_origin = "bootstrap"
+    receipt_origin: Literal["bootstrap", "uv-tool"] = "bootstrap"
     install_source: InstallSource | None = None
     if receipt_path.exists() or path is not None or os.environ.get(INSTALL_RECEIPT_PATH_ENV):
         receipt = load_install_receipt(receipt_path)
     else:
         receipt, install_source = _persistent_uv_tool_install_receipt()
         receipt_origin = "uv-tool"
+    return receipt, receipt_origin, install_source
+
+
+def verified_session_api_install_receipt(path: Path | None = None) -> InstallReceipt:
+    """Return the durable relay receipt verified against this API process.
+
+    Session API identity depends only on the relay distribution version,
+    embedded software identity, and relay artifact digest. Component runtime
+    probes validate separate execution surfaces and can launch expensive child
+    processes, so they are deliberately excluded from this startup-critical
+    check.
+    """
+    receipt, _receipt_origin, _install_source = _current_install_receipt(path)
+    current_software = detect_software_identity()
+    current_version = metadata.version("clio-relay")
+    if (
+        receipt.distribution_version != current_version
+        or receipt.software != current_software
+        or receipt.artifact_sha256 is None
+    ):
+        raise ConfigurationError(
+            "session API installation receipt does not match the running package"
+        )
+    return receipt
+
+
+def installation_info(path: Path | None = None) -> dict[str, object]:
+    """Return current package identity together with its durable install receipt."""
+    receipt, receipt_origin, install_source = _current_install_receipt(path)
     current_software = detect_software_identity()
     current_version = metadata.version("clio-relay")
     component_runtime = _component_runtime_identity(receipt)
