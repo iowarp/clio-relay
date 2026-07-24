@@ -14594,11 +14594,19 @@ def _gateway_direct_job_ids(session: GatewaySession) -> set[str]:
 
 
 def _gateway_direct_artifact_ids(session: GatewaySession) -> set[str]:
-    artifact_ids = {artifact_id for artifact_id in session.artifacts if artifact_id}
+    artifact_ids: set[str] = set()
+    candidates = list(session.artifacts)
     for provenance in _gateway_source_provenance(session):
         value = provenance.get("source_relay_artifact_id")
         if isinstance(value, str) and value:
-            artifact_ids.add(value)
+            candidates.append(value)
+    for candidate in candidates:
+        try:
+            artifact_ids.add(validate_durable_record_id(candidate))
+        except ValueError:
+            # Gateway artifacts may be external URIs. Only relay artifact IDs
+            # participate in canonical artifact and retention indexes.
+            continue
     return artifact_ids
 
 

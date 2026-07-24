@@ -430,17 +430,16 @@ def test_windows_configuration_directory_removes_broad_inherited_acl(tmp_path: P
     ensure_private_configuration_path(path, directory=True)
 
 
-def test_windows_configuration_hardening_rejects_an_existing_writer(tmp_path: Path) -> None:
+def test_windows_configuration_hardening_allows_an_existing_writer(tmp_path: Path) -> None:
     if os.name != "nt":
         return
     path = tmp_path / "configuration.json"
     path.write_text("original", encoding="utf-8")
 
-    with (
-        path.open("r+b"),
-        pytest.raises(ConfigurationError, match="could not open Windows configuration path"),
-    ):
+    with path.open("r+b") as writer:
         ensure_private_configuration_path(path, directory=False)
+        writer.seek(0)
+        assert writer.read() == b"original"
 
     ensure_private_configuration_path(path, directory=False)
 

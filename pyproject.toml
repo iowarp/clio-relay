@@ -1,6 +1,6 @@
 [project]
 name = "clio-relay"
-version = "1.5.4"
+version = "1.5.5"
 description = "Cluster relay endpoints backed by clio-core and JARVIS-CD."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -87,4 +87,7 @@ include = ["src", "jarvis-packages", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -p clio_relay.pytest_platform_partition"
+markers = [
+    "release_platform(platform): test is executed only on its named native platform and is covered by the release matrix",
+]

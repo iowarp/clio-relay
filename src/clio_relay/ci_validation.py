@@ -337,6 +337,96 @@ def verify_ci_status(
             raise ProvenanceError(f"CI receipt {field} is invalid")
 
 
+def _matrix_pytest_platform_partition(
+    report: dict[str, object],
+    *,
+    path_name: str,
+    expected_platform: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return one report's exact native-platform marked-test partition."""
+    pytest_checks = [
+        check
+        for raw in _list(report.get("checks"), f"matrix report checks {path_name}")
+        if (check := _mapping(raw, f"matrix report check {path_name}")).get("check_id")
+        == "local.pytest"
+    ]
+    if len(pytest_checks) != 1:
+        raise ProvenanceError(
+            f"matrix report must contain exactly one local.pytest check: {path_name}"
+        )
+    command_evidence = [
+        evidence
+        for raw in _list(
+            pytest_checks[0].get("evidence"),
+            f"matrix report local.pytest evidence {path_name}",
+        )
+        if (evidence := _mapping(raw, f"matrix report local.pytest evidence {path_name}")).get(
+            "kind"
+        )
+        == "command"
+    ]
+    if len(command_evidence) != 1:
+        raise ProvenanceError(
+            "matrix report local.pytest must contain exactly one command evidence entry: "
+            f"{path_name}"
+        )
+    metadata = _mapping(
+        command_evidence[0].get("metadata"),
+        f"matrix report local.pytest command metadata {path_name}",
+    )
+    platform = _nonempty_string(
+        metadata.get("pytest_platform"),
+        f"matrix report pytest platform {path_name}",
+    )
+    if platform != expected_platform:
+        raise ProvenanceError(f"matrix report pytest platform differs from its job: {path_name}")
+    if metadata.get("platform_test_ids_truncated") is not False:
+        raise ProvenanceError(f"matrix report pytest platform partition is truncated: {path_name}")
+    selected = _canonical_string_list(
+        metadata.get("platform_selected_test_ids"),
+        f"matrix report selected platform tests {path_name}",
+    )
+    excluded = _canonical_string_list(
+        metadata.get("platform_excluded_test_ids"),
+        f"matrix report excluded platform tests {path_name}",
+    )
+    if set(selected).intersection(excluded):
+        raise ProvenanceError(f"matrix report pytest platform partition overlaps: {path_name}")
+    return tuple(selected), tuple(excluded)
+
+
+def _validate_matrix_pytest_platform_partitions(
+    *,
+    posix_platform_partitions: list[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]]],
+    windows_platform_partitions: list[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]]],
+) -> None:
+    """Require all six jobs to prove one complementary marked-test partition."""
+    if len(posix_platform_partitions) != 3 or len(windows_platform_partitions) != 3:
+        raise ProvenanceError("matrix reports do not prove all release-platform partitions")
+    expected_posix = posix_platform_partitions[0][1]
+    expected_windows = windows_platform_partitions[0][1]
+    if any(partition != expected_posix for _job, partition in posix_platform_partitions[1:]):
+        raise ProvenanceError("POSIX matrix reports disagree on their platform-test partition")
+    if any(partition != expected_windows for _job, partition in windows_platform_partitions[1:]):
+        raise ProvenanceError("Windows matrix reports disagree on their platform-test partition")
+    posix_selected, posix_excluded = expected_posix
+    windows_selected, windows_excluded = expected_windows
+    if posix_selected != windows_excluded or posix_excluded != windows_selected:
+        raise ProvenanceError(
+            "Windows and POSIX matrix reports do not prove complementary platform-test partitions"
+        )
+    if not posix_selected and not windows_selected:
+        raise ProvenanceError("matrix reports prove no release-platform marked tests")
+
+
+def _canonical_string_list(value: object, field: str) -> list[str]:
+    """Return an exact canonical set from a duplicate-free JSON string list."""
+    items = _string_list(value, field)
+    if len(items) != len(set(items)):
+        raise ProvenanceError(f"{field} must contain no duplicates")
+    return sorted(items)
+
+
 def build_candidate_build_receipt(
     candidate_dir: Path,
     reports_dir: Path,
@@ -403,6 +493,8 @@ def build_candidate_build_receipt(
     if {path.name for path in report_paths} != set(expected_reports):
         raise ProvenanceError("matrix validation report set is missing, extra, or renamed")
     reports: list[dict[str, object]] = []
+    posix_platform_partitions: list[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]]] = []
+    windows_platform_partitions: list[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]]] = []
     for path in report_paths:
         report = _mapping(_load_json(path), f"matrix validation report {path.name}")
         if (
@@ -430,11 +522,21 @@ def build_candidate_build_receipt(
             observed_digests[cast(str, name)] = digest
         if observed_digests != distribution_digests:
             raise ProvenanceError(f"matrix report artifact digests differ: {path.name}")
+        job = expected_reports[path.name]
+        expected_platform = "windows" if job.startswith("windows-latest") else "posix"
+        platform_partition = _matrix_pytest_platform_partition(
+            report,
+            path_name=path.name,
+            expected_platform=expected_platform,
+        )
+        if expected_platform == "windows":
+            windows_platform_partitions.append((job, platform_partition))
+        else:
+            posix_platform_partitions.append((job, platform_partition))
         checks = {
             _mapping(raw, f"matrix report check {path.name}").get("check_id")
             for raw in _list(report.get("checks"), f"matrix report checks {path.name}")
         }
-        job = expected_reports[path.name]
         primary = job == "ubuntu-latest / python 3.12"
         if primary:
             if "local.build" not in checks or "local.sdist-smoke" not in checks:
@@ -459,6 +561,10 @@ def build_candidate_build_receipt(
                 "artifact_sha256": distribution_digests,
             }
         )
+    _validate_matrix_pytest_platform_partitions(
+        posix_platform_partitions=posix_platform_partitions,
+        windows_platform_partitions=windows_platform_partitions,
+    )
     reports.sort(key=lambda item: REQUIRED_MATRIX_JOBS.index(cast(str, item["job"])))
     receipt: dict[str, object] = {
         "schema_version": "clio-relay.candidate-build.v1",

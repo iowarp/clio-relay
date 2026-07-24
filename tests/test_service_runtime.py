@@ -5,7 +5,6 @@ import errno
 import gzip
 import hashlib
 import json
-import os
 import shlex
 import signal
 import socket
@@ -724,12 +723,11 @@ __CLIO_TEST_SUBMISSION_SIDECARS__
 {script}
 """
         if sys.platform == "win32":
-            wsl = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "wsl.exe"
-            if not wsl.is_file():
-                return self._emulate_verifier_result(command, script)
-            shell_command = [str(wsl), "-e", "bash", "-s"]
-        else:
-            shell_command = ["bash", "-s"]
+            # Windows runners expose wsl.exe even when no distribution is
+            # installed. Emulate the POSIX verifier response deterministically;
+            # Linux CI exercises the generated shell verifier itself.
+            return self._emulate_verifier_result(command, script)
+        shell_command = ["bash", "-s"]
         completed = subprocess.run(  # noqa: S603
             shell_command,
             input=wrapper.encode("utf-8"),

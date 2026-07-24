@@ -129,6 +129,7 @@ def _run_posix_project_driver(
     )
 
 
+@pytest.mark.release_platform("posix")
 def test_receipt_classifier_accepts_stable_generation_symlink() -> None:
     """Warm bootstraps classify the supported stable receipt link without following others."""
     driver = r"""
@@ -178,6 +179,7 @@ print("stable-receipt-ok")
     assert result.stdout.strip() == "stable-receipt-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_preparing_root_and_uv_copy_recover_without_following_links() -> None:
     """Power-loss scratch is reclaimed fd-relatively and uv executes from a private copy."""
     driver = r"""
@@ -267,6 +269,7 @@ print("scratch-and-uv-ok")
     assert result.stdout.strip() == "scratch-and-uv-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_fd_bound_candidate_verifier_rejects_swapped_wheel_install() -> None:
     """Installed relay bytes must match the wheel fd held across uv installation."""
     driver = r"""
@@ -381,6 +384,7 @@ print("swapped-wheel-rejected")
     assert result.stdout.strip() == "swapped-wheel-rejected"
 
 
+@pytest.mark.release_platform("posix")
 def test_candidate_verifier_accepts_pinned_uv_metadata_subset_only() -> None:
     """Pinned uv metadata and long-path launchers verify while unknown members fail closed."""
     driver = r"""
@@ -533,6 +537,7 @@ print("bounded-uv-metadata-ok")
     assert result.stdout.strip() == "bounded-uv-metadata-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_candidate_coordinator_rejects_provider_path_swap_after_open() -> None:
     """A provider pathname replacement cannot execute after its coordinator opens it."""
     driver = r"""
@@ -730,6 +735,7 @@ print("provider-swap-rejected")
     assert result.stdout.strip() == "provider-swap-rejected"
 
 
+@pytest.mark.release_platform("posix")
 def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path) -> None:
     """The staged provider is executed from sealed bytes with lexical venv semantics."""
     if sys.platform != "linux":
@@ -873,6 +879,7 @@ def test_staged_provider_exec_is_hash_bound_sealed_and_venv_aware(tmp_path: Path
     assert preload_marker.read_bytes() == b""
 
 
+@pytest.mark.release_platform("posix")
 def test_active_generation_identity_accepts_lexical_home_alias() -> None:
     """A managed generation and provider survive a lexical HOME mount alias."""
     script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
@@ -937,6 +944,7 @@ print("active-generation-alias-ok")
     assert result.stdout.strip() == "active-generation-alias-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_execution_boundary_round_trips_real_uv_venv_through_home_alias() -> None:
     """A real uv Python symlink remains inside the lexical venv boundary."""
     function_source = inspect.getsource(execution_environment_identity)
@@ -1014,6 +1022,7 @@ print("uv-venv-alias-ok")
     assert result.stdout.strip() == "uv-venv-alias-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_aliased_home_generation_activation_reaches_exact_noop() -> None:
     """Real Linux links activate once and then inspect as an exact warm no-op."""
     driver = r"""
@@ -1404,6 +1413,7 @@ def test_exact_remote_bootstrap_never_reads_or_builds_payload(
     assert operations["payload_transfer_bytes"] == 0
 
 
+@pytest.mark.release_platform("posix")
 def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1533,6 +1543,7 @@ print("legacy-preflight-ok")
     assert execution.stdout.strip() == "legacy-preflight-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_preflight_allows_only_exact_repairable_queue_permission_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1666,6 +1677,7 @@ print("repairable-preflight-ok")
     assert execution.stdout.strip() == "repairable-preflight-ok"
 
 
+@pytest.mark.release_platform("posix")
 def test_locked_recovery_privatizes_legacy_cursor_directory_on_posix() -> None:
     """Recovery repairs the fixed legacy-only cursor family before auditing it."""
     driver = r"""
@@ -2819,6 +2831,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert "scancel" not in script
 
 
+@pytest.mark.release_platform("posix")
 def test_forward_recovery_fence_is_idempotent_after_prior_restart() -> None:
     """A crash after restart is fenced again before forward migration resumes."""
     script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")

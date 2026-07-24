@@ -7,11 +7,13 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from clio_relay import pytest_platform_partition as pytest_platform_partition_module
 from clio_relay import pytest_release_gate as pytest_release_gate_module
 from clio_relay import release_validation as release_validation_module
 from clio_relay.command_evidence import (
@@ -19,6 +21,10 @@ from clio_relay.command_evidence import (
     PYTEST_FAILED_NODE_IDS_MAX_BYTES,
     PYTEST_FAILED_NODE_IDS_MAX_COUNT,
     PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES,
+    PYTEST_PLATFORM_NODE_ID_MAX_BYTES,
+    PYTEST_PLATFORM_NODE_IDS_MAX_BYTES,
+    PYTEST_PLATFORM_NODE_IDS_MAX_COUNT,
+    PYTEST_PLATFORM_PARTITION_PAYLOAD_MAX_BYTES,
     command_evidence,
 )
 from clio_relay.errors import ConfigurationError, RelayError
@@ -28,6 +34,27 @@ from clio_relay.release_validation import (
     run_local_release_validation,
 )
 from clio_relay.validation_report import ValidationStatus, load_validation_report
+
+_PYTEST_PLATFORM_PLUGIN = (
+    "-p",
+    "clio_relay.pytest_platform_partition",
+)
+_PYTEST_RELEASE_PLUGINS = (
+    *_PYTEST_PLATFORM_PLUGIN,
+    "-p",
+    "clio_relay.pytest_release_gate",
+)
+
+
+def test_pytest_configuration_loads_only_platform_partition_globally() -> None:
+    """Ordinary pytest runs partition platforms without enabling the strict gate."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert project["tool"]["pytest"]["ini_options"]["addopts"] == (
+        "-q -p clio_relay.pytest_platform_partition"
+    )
 
 
 def test_release_subprocess_preserves_logical_short_working_directory(
@@ -242,11 +269,9 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         command for command in commands if command[:4] == ["uv", "run", "--no-sync", "pytest"]
     ]
     assert len(pytest_commands) == 6
-    assert all(
-        command[4:6] == ["-p", "clio_relay.pytest_release_gate"] for command in pytest_commands
-    )
+    assert all(command[4:8] == list(_PYTEST_RELEASE_PLUGINS) for command in pytest_commands)
     assert all("--collect-only" not in command for command in pytest_commands)
-    assert pytest_commands[1][7:] == [
+    assert pytest_commands[1][9:] == [
         "tests/test_process_containment.py::test_enforceable_provider_rejects_and_kills_background_escape",
         "tests/test_endpoint.py::test_hard_crashed_worker_is_reconciled_before_cancellation_acknowledgment",
         "tests/test_endpoint.py::test_hard_crash_before_broker_release_never_starts_workload_and_reconciles",
@@ -255,7 +280,7 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_storage_process_guard.py::test_runtime_storage_violation_terminates_owned_child_tree",
         "tests/test_storage_managed_queue.py::test_hard_crash_reservation_is_reconciled_before_canonical_retry",
     ]
-    assert pytest_commands[2][7:] == [
+    assert pytest_commands[2][9:] == [
         "tests/test_endpoint.py::test_pending_execution_cleanup_processes_truncated_batches_automatically",
         "tests/test_endpoint.py::test_cleanup_batch_reaches_expired_marker_after_live_lease_markers",
         "tests/test_endpoint.py::test_execution_cleanup_marker_is_durable_before_task_metadata_update",
@@ -264,7 +289,7 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_endpoint.py::test_execution_sidecar_cleanup_removes_only_owned_non_directory_entries",
         "tests/test_endpoint.py::test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points",
     ]
-    assert pytest_commands[3][7:] == [
+    assert pytest_commands[3][9:] == [
         "tests/test_core_global_pagination.py::test_global_order_seal_field_removal_fails_closed",
         "tests/test_core_index_safety.py::test_stale_recovery_uses_exact_scheduler_indexes_without_global_task_scan",
         "tests/test_core_index_safety.py::test_gateway_reverse_indexes_refuse_cardinality_overflow",
@@ -276,11 +301,11 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "tests/test_storage_managed_queue.py::test_managed_queue_recovers_crash_reserved_canonical_id_without_leak",
         "tests/test_surface_pagination.py::test_sparse_job_filters_return_empty_source_page_with_next_cursor",
     ]
-    assert pytest_commands[4][7:] == [
+    assert pytest_commands[4][9:] == [
         "tests/test_process_containment.py",
         "tests/test_mcp_stdio_validation.py",
     ]
-    assert pytest_commands[5][7:] == [
+    assert pytest_commands[5][9:] == [
         "tests/test_live_acceptance.py::test_secure_runtime_probe_config_is_generic_strict_and_bounded",
         "tests/test_live_acceptance.py::test_secure_runtime_secret_scanner_rejects_capabilities_without_key_false_positives",
         "tests/test_live_acceptance.py::test_secure_runtime_browser_http_is_direct_strict_bounded_and_deadlined",
@@ -475,8 +500,7 @@ def test_pytest_release_gate_rejects_non_clean_structured_outcomes(
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "clio_relay.pytest_release_gate",
+            *_PYTEST_RELEASE_PLUGINS,
             "-q",
             *extra_arguments,
             "test_outcome.py",
@@ -504,8 +528,7 @@ def test_pytest_release_gate_accepts_only_clean_passes(tmp_path: Path) -> None:
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "clio_relay.pytest_release_gate",
+            *_PYTEST_RELEASE_PLUGINS,
             "-q",
             "test_outcome.py",
         ],
@@ -519,6 +542,170 @@ def test_pytest_release_gate_accepts_only_clean_passes(tmp_path: Path) -> None:
     evidence = command_evidence(completed.stdout, completed.stderr, exit_code=completed.returncode)
     assert evidence.metadata["failed_test_ids"] == []
     assert evidence.metadata["failed_test_ids_truncated"] is False
+    assert evidence.metadata["pytest_platform"] == ("windows" if os.name == "nt" else "posix")
+    assert evidence.metadata["platform_selected_test_ids"] == []
+    assert evidence.metadata["platform_excluded_test_ids"] == []
+    assert evidence.metadata["platform_test_ids_truncated"] is False
+
+
+def test_pytest_platform_partition_selects_marked_tests_by_actual_platform(
+    tmp_path: Path,
+) -> None:
+    """Only incompatible marked tests are excluded, with exact durable evidence."""
+    current_platform = "windows" if os.name == "nt" else "posix"
+    other_platform = "posix" if os.name == "nt" else "windows"
+    (tmp_path / "test_outcome.py").write_text(
+        f"""
+import pytest
+
+
+@pytest.mark.release_platform({current_platform!r})
+def test_selected():
+    assert True
+
+
+@pytest.mark.release_platform({other_platform!r})
+def test_excluded():
+    assert False, "an incompatible platform test must not execute"
+
+
+def test_unmarked():
+    assert True
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *_PYTEST_RELEASE_PLUGINS,
+            "-q",
+            "test_outcome.py",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == int(pytest.ExitCode.OK), output
+    assert "skipped" not in output
+    assert "deselected" not in output
+    evidence = command_evidence(
+        completed.stdout,
+        completed.stderr,
+        exit_code=completed.returncode,
+    )
+    assert evidence.metadata["pytest_platform"] == current_platform
+    assert evidence.metadata["platform_selected_test_ids"] == ["test_outcome.py::test_selected"]
+    assert evidence.metadata["platform_excluded_test_ids"] == ["test_outcome.py::test_excluded"]
+    assert evidence.metadata["platform_test_ids_truncated"] is False
+
+
+def test_pytest_platform_partition_allows_ordinary_focused_deselection(
+    tmp_path: Path,
+) -> None:
+    """The always-on partition plugin does not turn a normal -k filter into failure."""
+    (tmp_path / "test_outcome.py").write_text(
+        "def test_keep():\n    assert True\n\n"
+        "def test_drop():\n    assert False, 'filtered test must not execute'\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *_PYTEST_PLATFORM_PLUGIN,
+            "-q",
+            "-k",
+            "keep",
+            "test_outcome.py",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == int(pytest.ExitCode.OK), output
+    assert "release gate rejected outcomes" not in output
+    evidence = command_evidence(
+        completed.stdout,
+        completed.stderr,
+        exit_code=completed.returncode,
+    )
+    assert evidence.metadata["pytest_platform"] == ("windows" if os.name == "nt" else "posix")
+    assert evidence.metadata["platform_selected_test_ids"] == []
+    assert evidence.metadata["platform_excluded_test_ids"] == []
+
+
+@pytest.mark.parametrize(
+    ("decorators", "expected_error"),
+    [
+        (
+            "@pytest.mark.release_platform",
+            "requires exactly one positional string argument",
+        ),
+        (
+            "@pytest.mark.release_platform(123)",
+            "requires exactly one positional string argument",
+        ),
+        (
+            "@pytest.mark.release_platform('linux')",
+            "value 'linux' is unsupported",
+        ),
+        (
+            "@pytest.mark.release_platform('posix', reason='invalid')",
+            "requires exactly one positional string argument",
+        ),
+        (
+            "@pytest.mark.release_platform('posix')\n@pytest.mark.release_platform('windows')",
+            "must appear exactly once",
+        ),
+    ],
+)
+def test_pytest_platform_partition_rejects_invalid_markers(
+    tmp_path: Path,
+    decorators: str,
+    expected_error: str,
+) -> None:
+    """Malformed or unknown platform markers fail collection explicitly."""
+    (tmp_path / "test_outcome.py").write_text(
+        f"import pytest\n\n{decorators}\ndef test_case():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *_PYTEST_RELEASE_PLUGINS,
+            "-q",
+            "test_outcome.py",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == int(pytest.ExitCode.USAGE_ERROR), output
+    assert expected_error in output
+    evidence = command_evidence(
+        completed.stdout,
+        completed.stderr,
+        exit_code=completed.returncode,
+    )
+    assert evidence.metadata["failed_test_ids"] == []
+    assert evidence.metadata["pytest_platform"] in {"posix", "windows"}
 
 
 def test_pytest_release_gate_emits_exact_unique_parametrized_failure_id(
@@ -549,8 +736,7 @@ def test_case(label, broken_cleanup):
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "clio_relay.pytest_release_gate",
+            *_PYTEST_RELEASE_PLUGINS,
             "-q",
             "test_outcome.py",
         ],
@@ -585,8 +771,7 @@ def test_pytest_release_gate_emits_collection_failure_id(tmp_path: Path) -> None
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "clio_relay.pytest_release_gate",
+            *_PYTEST_RELEASE_PLUGINS,
             "-q",
             "test_broken.py",
         ],
@@ -634,4 +819,37 @@ def test_pytest_release_gate_bounds_failure_ids_before_serialization() -> None:
     assert len(node_ids) <= PYTEST_FAILED_NODE_IDS_MAX_COUNT
     assert sum(len(node_id.encode("utf-8")) for node_id in node_ids) <= (
         PYTEST_FAILED_NODE_IDS_MAX_BYTES
+    )
+
+
+def test_pytest_platform_partition_bounds_ids_before_serialization() -> None:
+    """The producer bounds both platform partitions before emitting its sentinel."""
+    partition = pytest_platform_partition_module._PlatformPartition()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    partition.reset("windows")
+    oversized = "tests/test_queue.py::test_" + ("x" * PYTEST_PLATFORM_NODE_ID_MAX_BYTES)
+    partition.selected.add(oversized)
+    for index in range(PYTEST_PLATFORM_NODE_IDS_MAX_COUNT + 5):
+        partition.selected.add(f"tests/test_queue.py::test_{index:04d}" + ("x" * 80))
+    partition.excluded.add("tests/test_bootstrap.py::test_posix_only")
+
+    payload_text = pytest_platform_partition_module._platform_partition_payload(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        partition,
+    )
+    payload_object: object = json.loads(payload_text)
+    assert isinstance(payload_object, dict)
+    payload = cast(dict[str, object], payload_object)
+    selected_object = payload["selected_node_ids"]
+    assert isinstance(selected_object, list)
+    selected_objects = cast(list[object], selected_object)
+    assert all(isinstance(node_id, str) for node_id in selected_objects)
+    selected = cast(list[str], selected_objects)
+
+    assert len(payload_text.encode("utf-8")) <= PYTEST_PLATFORM_PARTITION_PAYLOAD_MAX_BYTES
+    assert payload["platform"] == "windows"
+    assert payload["excluded_node_ids"] == ["tests/test_bootstrap.py::test_posix_only"]
+    assert payload["truncated"] is True
+    assert oversized not in selected
+    assert len(selected) <= PYTEST_PLATFORM_NODE_IDS_MAX_COUNT
+    assert sum(len(node_id.encode("utf-8")) for node_id in selected) <= (
+        PYTEST_PLATFORM_NODE_IDS_MAX_BYTES
     )

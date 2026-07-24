@@ -392,9 +392,15 @@ def test_ci_status_rejects_a_caller_supplied_non_push_or_wrong_sha_run() -> None
         select_ci_run(runs, repository=REPOSITORY, source_commit=TESTED_COMMIT)
 
 
-def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
+_POSIX_PLATFORM_TEST_IDS = (
+    "tests/test_bootstrap_fast_path.py::test_receipt_classifier_accepts_stable_generation_symlink",
+    "tests/test_bootstrap_journal.py::test_recovery_after_prepared_journal",
+)
+
+
+def _write_candidate_build_inputs(
     tmp_path: Path,
-) -> None:
+) -> tuple[Path, Path, dict[str, str]]:
     candidate = tmp_path / "candidate"
     reports = tmp_path / "reports"
     candidate.mkdir()
@@ -419,12 +425,31 @@ def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
         checks = (
             ["local.build", "local.sdist-smoke"] if index == 0 else ["local.prebuilt-artifacts"]
         )
+        platform = "windows" if job.startswith("windows-latest") else "posix"
+        selected = [] if platform == "windows" else list(_POSIX_PLATFORM_TEST_IDS)
+        excluded = list(_POSIX_PLATFORM_TEST_IDS) if platform == "windows" else []
         document = {
             "status": "passed",
             "scenario": "local-release",
             "cluster": "local",
             "software": {"commit": TESTED_COMMIT, "dirty": False},
-            "checks": [{"check_id": check_id} for check_id in checks],
+            "checks": [{"check_id": check_id} for check_id in checks]
+            + [
+                {
+                    "check_id": "local.pytest",
+                    "evidence": [
+                        {
+                            "kind": "command",
+                            "metadata": {
+                                "pytest_platform": platform,
+                                "platform_selected_test_ids": selected,
+                                "platform_excluded_test_ids": excluded,
+                                "platform_test_ids_truncated": False,
+                            },
+                        }
+                    ],
+                }
+            ],
             "resources": [
                 {
                     "resource_id": name,
@@ -434,6 +459,13 @@ def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
             ],
         }
         (reports / filename).write_text(json.dumps(document), encoding="utf-8")
+    return candidate, reports, distribution_digests
+
+
+def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
+    tmp_path: Path,
+) -> None:
+    candidate, reports, distribution_digests = _write_candidate_build_inputs(tmp_path)
 
     receipt = build_candidate_build_receipt(
         candidate,
@@ -456,6 +488,66 @@ def test_candidate_build_receipt_proves_one_build_and_five_exact_reuses(
     cast(list[dict[str, object]], changed["resources"])[0]["metadata"] = {"sha256": "0" * 64}
     (reports / cast(str, matrix[-1]["filename"])).write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(ProvenanceError, match="artifact digests differ"):
+        build_candidate_build_receipt(
+            candidate,
+            reports,
+            repository=REPOSITORY,
+            source_commit=TESTED_COMMIT,
+            source_tree=TREE,
+            event="merge_group",
+            run_id=1001,
+            run_attempt=2,
+            head_ref="refs/heads/gh-readonly-queue/main/pr-23-deadbeef",
+            base_ref="refs/heads/main",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_message"),
+    [
+        ("missing", "must be a JSON array"),
+        ("matrix-mismatch", "Windows matrix reports disagree"),
+        ("mirror-mismatch", "do not prove complementary"),
+        ("truncation", "platform partition is truncated"),
+    ],
+)
+def test_candidate_build_receipt_rejects_incomplete_platform_partition_evidence(
+    tmp_path: Path,
+    mutation: str,
+    expected_message: str,
+) -> None:
+    candidate, reports, _distribution_digests = _write_candidate_build_inputs(tmp_path)
+    report_path = reports / "validation-local-windows-latest-3.13.json"
+    document = cast(dict[str, object], json.loads(report_path.read_text(encoding="utf-8")))
+    checks = cast(list[dict[str, object]], document["checks"])
+    pytest_check = next(check for check in checks if check["check_id"] == "local.pytest")
+    evidence = cast(list[dict[str, object]], pytest_check["evidence"])
+    metadata = cast(dict[str, object], evidence[0]["metadata"])
+    if mutation == "missing":
+        metadata.pop("platform_excluded_test_ids")
+    elif mutation == "matrix-mismatch":
+        metadata["platform_excluded_test_ids"] = list(_POSIX_PLATFORM_TEST_IDS[:-1])
+    elif mutation == "mirror-mismatch":
+        for version in ("3.12", "3.13", "3.14"):
+            windows_path = reports / f"validation-local-windows-latest-{version}.json"
+            windows_document = cast(
+                dict[str, object],
+                json.loads(windows_path.read_text(encoding="utf-8")),
+            )
+            windows_checks = cast(list[dict[str, object]], windows_document["checks"])
+            windows_pytest = next(
+                check for check in windows_checks if check["check_id"] == "local.pytest"
+            )
+            windows_evidence = cast(list[dict[str, object]], windows_pytest["evidence"])
+            windows_metadata = cast(dict[str, object], windows_evidence[0]["metadata"])
+            windows_metadata["platform_excluded_test_ids"] = list(_POSIX_PLATFORM_TEST_IDS[:-1])
+            windows_path.write_text(json.dumps(windows_document), encoding="utf-8")
+    else:
+        metadata["platform_test_ids_truncated"] = True
+    if mutation != "mirror-mismatch":
+        report_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ProvenanceError, match=expected_message):
         build_candidate_build_receipt(
             candidate,
             reports,
@@ -1699,7 +1791,7 @@ def test_release_report_asset_manifest_enforces_exact_ordered_matrix() -> None:
     ]
     matrix = validate_release_acceptance_matrix(raw_matrix)
     assert matrix["matrix_sha256"] == (
-        "584250bd61425ec05a7cf661157b7ea1a899d4f77aa72960d711f34137806116"
+        "bb1f6d1f50f98a19c74700ab5dc4a36cc1749f033d5d4f434a6ffd584344fb7c"
     )
     reports = cast(list[dict[str, object]], matrix["reports"])
     report_ids = [cast(str, item["id"]) for item in reports]

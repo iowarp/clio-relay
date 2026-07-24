@@ -16,6 +16,11 @@ PYTEST_FAILED_NODE_IDS_MAX_COUNT = 1_000
 PYTEST_FAILED_NODE_ID_MAX_BYTES = 4_096
 PYTEST_FAILED_NODE_IDS_MAX_BYTES = 64 * 1_024
 PYTEST_FAILED_NODE_IDS_PAYLOAD_MAX_BYTES = 512 * 1_024
+PYTEST_PLATFORM_PARTITION_MARKER = "CLIO_RELAY_PYTEST_PLATFORM_PARTITION_V1="
+PYTEST_PLATFORM_NODE_IDS_MAX_COUNT = 1_000
+PYTEST_PLATFORM_NODE_ID_MAX_BYTES = 4_096
+PYTEST_PLATFORM_NODE_IDS_MAX_BYTES = 64 * 1_024
+PYTEST_PLATFORM_PARTITION_PAYLOAD_MAX_BYTES = 512 * 1_024
 
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
 
@@ -57,6 +62,10 @@ def command_evidence(
                 "diagnostic_offset_bytes": None,
                 "failed_test_ids": [],
                 "failed_test_ids_truncated": False,
+                "pytest_platform": None,
+                "platform_selected_test_ids": [],
+                "platform_excluded_test_ids": [],
+                "platform_test_ids_truncated": False,
                 "omitted_prefix_bytes": 0,
                 "omitted_middle_bytes": 0,
                 "truncated": False,
@@ -78,6 +87,12 @@ def command_evidence(
         diagnostic_offset=diagnostic_offset,
     )
     failed_test_ids, failed_test_ids_truncated = _pytest_failed_test_ids(normalized_stdout)
+    (
+        pytest_platform,
+        platform_selected_test_ids,
+        platform_excluded_test_ids,
+        platform_test_ids_truncated,
+    ) = _pytest_platform_partition(normalized_stdout)
     metadata: dict[str, object] = {
         "excerpt_strategy": EXCERPT_STRATEGY,
         "stdout_bytes": len(normalized_stdout.encode("utf-8")),
@@ -92,6 +107,10 @@ def command_evidence(
         "exit_code": exit_code,
         "failed_test_ids": failed_test_ids,
         "failed_test_ids_truncated": failed_test_ids_truncated,
+        "pytest_platform": pytest_platform,
+        "platform_selected_test_ids": platform_selected_test_ids,
+        "platform_excluded_test_ids": platform_excluded_test_ids,
+        "platform_test_ids_truncated": platform_test_ids_truncated,
         **excerpt_metadata,
     }
     return CommandEvidence(
@@ -175,6 +194,95 @@ def _pytest_failed_test_ids(output: str) -> tuple[list[str], bool]:
         seen.add(test_id)
         aggregate_bytes += test_id_bytes
     return test_ids, truncated
+
+
+def _pytest_platform_partition(
+    output: str,
+) -> tuple[str | None, list[str], list[str], bool]:
+    """Return the exact bounded platform partition from the pytest sentinel."""
+    marker_offset = _last_line_marker_offset(output, PYTEST_PLATFORM_PARTITION_MARKER)
+    if marker_offset is None:
+        return None, [], [], False
+    payload_start = marker_offset + len(PYTEST_PLATFORM_PARTITION_MARKER)
+    payload_end = output.find("\n", payload_start)
+    if payload_end < 0:
+        payload_end = len(output)
+    payload_text = output[payload_start:payload_end].removesuffix("\r")
+    try:
+        payload_bytes = payload_text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, [], [], True
+    if len(payload_bytes) > PYTEST_PLATFORM_PARTITION_PAYLOAD_MAX_BYTES:
+        return None, [], [], True
+    try:
+        payload_object: object = json.loads(payload_text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, [], [], True
+    if not isinstance(payload_object, dict):
+        return None, [], [], True
+    payload = cast(dict[object, object], payload_object)
+    if set(payload) != {
+        "excluded_node_ids",
+        "platform",
+        "selected_node_ids",
+        "truncated",
+    }:
+        return None, [], [], True
+    platform = payload["platform"]
+    raw_selected = payload["selected_node_ids"]
+    raw_excluded = payload["excluded_node_ids"]
+    declared_truncated = payload["truncated"]
+    if (
+        not isinstance(platform, str)
+        or platform not in {"posix", "windows"}
+        or not isinstance(raw_selected, list)
+        or not isinstance(raw_excluded, list)
+        or type(declared_truncated) is not bool
+    ):
+        return None, [], [], True
+    selected, selected_truncated = _bounded_platform_node_ids(cast(list[object], raw_selected))
+    excluded, excluded_truncated = _bounded_platform_node_ids(cast(list[object], raw_excluded))
+    if selected is None or excluded is None or set(selected).intersection(excluded):
+        return None, [], [], True
+    return (
+        platform,
+        selected,
+        excluded,
+        declared_truncated or selected_truncated or excluded_truncated,
+    )
+
+
+def _bounded_platform_node_ids(
+    node_id_objects: list[object],
+) -> tuple[list[str] | None, bool]:
+    """Validate and bound one platform-partition node-ID collection."""
+    node_ids: list[str] = []
+    seen: set[str] = set()
+    aggregate_bytes = 0
+    truncated = False
+    for node_id in node_id_objects:
+        if not isinstance(node_id, str):
+            return None, True
+        if node_id in seen:
+            continue
+        if len(node_ids) >= PYTEST_PLATFORM_NODE_IDS_MAX_COUNT:
+            truncated = True
+            break
+        try:
+            node_id_bytes = len(node_id.encode("utf-8"))
+        except UnicodeEncodeError:
+            truncated = True
+            continue
+        if node_id_bytes > PYTEST_PLATFORM_NODE_ID_MAX_BYTES:
+            truncated = True
+            continue
+        if aggregate_bytes + node_id_bytes > PYTEST_PLATFORM_NODE_IDS_MAX_BYTES:
+            truncated = True
+            continue
+        node_ids.append(node_id)
+        seen.add(node_id)
+        aggregate_bytes += node_id_bytes
+    return node_ids, truncated
 
 
 def _last_line_marker_offset(output: str, marker: str) -> int | None:
