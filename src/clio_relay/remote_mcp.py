@@ -1420,6 +1420,13 @@ class VirtualRemoteMcpTool:
                 "lineage; calls without staged local inputs retain ordinary asynchronous "
                 "semantics."
             )
+        elif exact_v36_routes and self.remote_tool.name == "jarvis_run":
+            description += (
+                " On each genuinely new run identity, relay securely reconciles every tracked "
+                "local-file setting and pins the execution to an immutable input manifest. "
+                "Retrying the same idempotency key reuses that admitted manifest without "
+                "rescanning mutable Host files."
+            )
         definition: JSON = {
             "name": self.alias,
             "description": (

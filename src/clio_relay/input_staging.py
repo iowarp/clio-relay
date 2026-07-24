@@ -26,7 +26,10 @@ from clio_relay.models import (
     JarvisPackageInputContractRecord,
     JarvisPackageInputRoute,
     JarvisPackageLocalFileInput,
+    JarvisPipelineInputBinding,
+    JarvisPipelineInputBindings,
     JarvisPipelineInputRoute,
+    JarvisRunInputResolution,
     JobKind,
     RelayJob,
     deterministic_input_artifact_id,
@@ -59,6 +62,23 @@ class StagedJarvisInputs:
     arguments: JSON
     artifact_uses: tuple[ArtifactUse, ...]
     manifest_sha256: str | None
+    bindings: tuple[JarvisPipelineInputBinding, ...]
+    removed_binding_identities: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _InputSnapshot:
+    """One securely captured workspace input awaiting immutable ingestion."""
+
+    step_id: str
+    canonical_setting: str
+    accepted_names: tuple[str, ...]
+    supplied_setting: str
+    workspace_relative_path: str
+    logical_name: str
+    data: bytes
+    size_bytes: int
+    sha256: str
 
 
 def jarvis_package_input_cache_key(
@@ -283,7 +303,11 @@ def stage_jarvis_add_step_inputs(
     rewritten = copy.deepcopy(arguments)
     config = copy.deepcopy(cast(JSON, raw_config))
     rewritten["config"] = config
-    requested: list[tuple[str, Path, str]] = []
+    requested: list[tuple[str, tuple[str, ...], str, Path, str]] = []
+    raw_step_id = arguments.get("step_id")
+    if raw_step_id is not None and (not isinstance(raw_step_id, str) or not raw_step_id):
+        raise ValueError("jarvis_add_step step_id must be a non-empty string when supplied")
+    step_id = raw_step_id if raw_step_id is not None else package_name.rsplit(".", 1)[-1]
     for local_file_input in contract.local_file_settings:
         supplied = [
             (setting_name, config[setting_name])
@@ -302,14 +326,224 @@ def stage_jarvis_add_step_inputs(
         setting_name, raw_value = supplied[0]
         if not isinstance(raw_value, str):
             raise ValueError(f"local-file setting {setting_name!r} must be a path string")
-        requested.append((setting_name, _workspace_path(raw_value, settings=settings), raw_value))
+        requested.append(
+            (
+                local_file_input.canonical_name,
+                local_file_input.accepted_names,
+                setting_name,
+                _workspace_path(raw_value, settings=settings),
+                raw_value,
+            )
+        )
     if not requested:
         return StagedJarvisInputs(
             arguments=rewritten,
             artifact_uses=(),
             manifest_sha256=None,
+            bindings=(),
         )
-    if settings.input_workspace_root is None:
+    snapshots = _snapshot_inputs(
+        step_id=step_id,
+        requested=requested,
+        settings=settings,
+    )
+    bindings: list[JarvisPipelineInputBinding] = []
+    with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+        for snapshot in snapshots:
+            binding = _ingest_input_snapshot(
+                snapshot,
+                client=client,
+                definition=definition,
+                settings=settings,
+            )
+            config[snapshot.supplied_setting] = binding.remote_path
+            bindings.append(binding)
+    artifact_uses = tuple(
+        sorted((item.artifact_use for item in bindings), key=lambda item: item.artifact_id)
+    )
+    return StagedJarvisInputs(
+        arguments=rewritten,
+        artifact_uses=artifact_uses,
+        manifest_sha256=_stable_digest(
+            {"inputs": [item.model_dump(mode="json") for item in bindings]}
+        ),
+        bindings=tuple(sorted(bindings, key=lambda item: item.identity())),
+    )
+
+
+def stage_jarvis_edit_step_inputs(
+    arguments: JSON,
+    *,
+    current: JarvisPipelineInputBindings,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+) -> StagedJarvisInputs:
+    """Stage changed logical paths for tracked settings on one edited JARVIS step."""
+    rewritten = copy.deepcopy(arguments)
+    step_id = _required_string(arguments, "step_id")
+    operation = arguments.get("operation", "edit")
+    tracked = tuple(item for item in current.bindings if item.step_id == step_id)
+    if operation == "remove":
+        return StagedJarvisInputs(
+            arguments=rewritten,
+            artifact_uses=(),
+            manifest_sha256=None,
+            bindings=(),
+            removed_binding_identities=tuple(item.identity() for item in tracked),
+        )
+    if operation != "edit":
+        raise ValueError("jarvis_edit_step operation must be edit or remove")
+    raw_config = arguments.get("config")
+    if not isinstance(raw_config, dict):
+        raise ValueError("jarvis_edit_step config must be an object for operation='edit'")
+    config = copy.deepcopy(cast(JSON, raw_config))
+    rewritten["config"] = config
+    requested: list[tuple[str, tuple[str, ...], str, Path, str]] = []
+    removed: list[tuple[str, str]] = []
+    for binding in tracked:
+        supplied = [(name, config[name]) for name in binding.accepted_names if name in config]
+        if not supplied:
+            continue
+        if len(supplied) > 1:
+            raise ValueError(
+                "local-file setting was supplied through more than one canonical name or alias: "
+                f"{binding.canonical_setting!r}"
+            )
+        setting_name, raw_value = supplied[0]
+        if raw_value is None or raw_value == "":
+            removed.append(binding.identity())
+            continue
+        if not isinstance(raw_value, str):
+            raise ValueError(f"local-file setting {setting_name!r} must be a path string")
+        requested.append(
+            (
+                binding.canonical_setting,
+                binding.accepted_names,
+                setting_name,
+                _workspace_path(raw_value, settings=settings),
+                raw_value,
+            )
+        )
+    snapshots = _snapshot_inputs(
+        step_id=step_id,
+        requested=requested,
+        settings=settings,
+    )
+    bindings: list[JarvisPipelineInputBinding] = []
+    if snapshots:
+        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+            for snapshot in snapshots:
+                binding = _ingest_input_snapshot(
+                    snapshot,
+                    client=client,
+                    definition=definition,
+                    settings=settings,
+                )
+                config[snapshot.supplied_setting] = binding.remote_path
+                bindings.append(binding)
+    artifact_uses = tuple(
+        sorted((item.artifact_use for item in bindings), key=lambda item: item.artifact_id)
+    )
+    return StagedJarvisInputs(
+        arguments=rewritten,
+        artifact_uses=artifact_uses,
+        manifest_sha256=(
+            _stable_digest({"inputs": [item.model_dump(mode="json") for item in bindings]})
+            if bindings
+            else None
+        ),
+        bindings=tuple(sorted(bindings, key=lambda item: item.identity())),
+        removed_binding_identities=tuple(sorted(removed)),
+    )
+
+
+def reconcile_jarvis_run_inputs(
+    current: JarvisPipelineInputBindings,
+    *,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+) -> tuple[JarvisRunInputResolution, ...]:
+    """Resolve every tracked logical path to immutable bytes for one new execution."""
+    snapshots = _snapshot_inputs_by_binding(current=current, settings=settings)
+    existing_by_identity = {item.identity(): item for item in current.bindings}
+    resolutions: list[JarvisRunInputResolution] = []
+    changed = [
+        snapshot
+        for snapshot in snapshots
+        if existing_by_identity[(snapshot.step_id, snapshot.canonical_setting)].sha256
+        != snapshot.sha256
+    ]
+    updated_by_identity: dict[tuple[str, str], JarvisPipelineInputBinding] = {}
+    if changed:
+        with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+            for snapshot in changed:
+                updated = _ingest_input_snapshot(
+                    snapshot,
+                    client=client,
+                    definition=definition,
+                    settings=settings,
+                )
+                updated_by_identity[updated.identity()] = updated
+    for snapshot in snapshots:
+        identity = (snapshot.step_id, snapshot.canonical_setting)
+        previous = existing_by_identity[identity]
+        updated = updated_by_identity.get(identity, previous)
+        resolutions.append(
+            JarvisRunInputResolution(
+                binding=updated,
+                disposition=("reused" if updated.sha256 == previous.sha256 else "updated"),
+                previous_sha256=previous.sha256,
+            )
+        )
+    return tuple(sorted(resolutions, key=lambda item: item.binding.identity()))
+
+
+def _snapshot_inputs(
+    *,
+    step_id: str,
+    requested: list[tuple[str, tuple[str, ...], str, Path, str]],
+    settings: RelaySettings,
+) -> tuple[_InputSnapshot, ...]:
+    """Capture a bounded set of requested settings for one pipeline step."""
+    return _snapshot_input_requests(
+        [
+            (step_id, canonical, accepted, supplied, local_path, model_path)
+            for canonical, accepted, supplied, local_path, model_path in requested
+        ],
+        settings=settings,
+    )
+
+
+def _snapshot_inputs_by_binding(
+    *,
+    current: JarvisPipelineInputBindings,
+    settings: RelaySettings,
+) -> tuple[_InputSnapshot, ...]:
+    """Capture the stable logical path held by every current pipeline binding."""
+    return _snapshot_input_requests(
+        [
+            (
+                binding.step_id,
+                binding.canonical_setting,
+                binding.accepted_names,
+                binding.canonical_setting,
+                _workspace_path(binding.workspace_relative_path, settings=settings),
+                binding.workspace_relative_path,
+            )
+            for binding in current.bindings
+        ],
+        settings=settings,
+    )
+
+
+def _snapshot_input_requests(
+    requested: list[tuple[str, str, tuple[str, ...], str, Path, str]],
+    *,
+    settings: RelaySettings,
+) -> tuple[_InputSnapshot, ...]:
+    """Securely snapshot exact workspace-relative requests with aggregate limits."""
+    root = settings.input_workspace_root
+    if root is None:
         raise ValueError(
             "local JARVIS inputs require CLIO_RELAY_INPUT_WORKSPACE_ROOT to be configured"
         )
@@ -317,17 +551,14 @@ def stage_jarvis_add_step_inputs(
         raise ValueError(
             f"JARVIS input count exceeds the configured limit of {settings.input_file_max_count}"
         )
-    owner_session_id = settings.owner_session_id
-    owner_session_generation_id = settings.owner_session_generation_id
-    if owner_session_id is None or owner_session_generation_id is None:
+    if settings.owner_session_id is None or settings.owner_session_generation_id is None:
         raise ValueError("local JARVIS inputs require an active relay-owned remote session")
-
-    snapshots: list[tuple[str, str, bytes, int, str]] = []
+    snapshots: list[_InputSnapshot] = []
     total_bytes = 0
-    for setting_name, local_path, model_path in requested:
+    for step_id, canonical, accepted, supplied, local_path, model_path in requested:
         snapshot = snapshot_owned_regular_file(
             local_path,
-            owned_root=settings.input_workspace_root,
+            owned_root=root,
             max_bytes=settings.input_file_max_bytes,
             capture_data=True,
         )
@@ -340,75 +571,91 @@ def stage_jarvis_add_step_inputs(
                 f"{settings.input_total_max_bytes}"
             )
         snapshots.append(
-            (
-                setting_name,
-                _logical_name(model_path),
-                snapshot.data,
-                snapshot.size_bytes,
-                snapshot.sha256,
+            _InputSnapshot(
+                step_id=step_id,
+                canonical_setting=canonical,
+                accepted_names=accepted,
+                supplied_setting=supplied,
+                workspace_relative_path=_workspace_relative_path(local_path, root=root),
+                logical_name=_logical_name(model_path),
+                data=snapshot.data,
+                size_bytes=snapshot.size_bytes,
+                sha256=snapshot.sha256,
             )
         )
+    return tuple(
+        sorted(
+            snapshots,
+            key=lambda item: (item.step_id, item.canonical_setting),
+        )
+    )
 
-    artifact_uses: list[ArtifactUse] = []
-    manifest: list[JSON] = []
-    with OwnedSessionApiClient(definition=definition, settings=settings) as client:
-        for setting_name, logical_name, data, size_bytes, sha256 in snapshots:
-            ingest_key = "input-ingest:" + _stable_digest(
-                {
-                    "cluster": definition.name,
-                    "owner_session_id": owner_session_id,
-                    "owner_session_generation_id": str(owner_session_generation_id),
-                    "logical_name": logical_name,
-                    "size_bytes": size_bytes,
-                    "sha256": sha256,
-                }
-            )
-            raw_response = client.request_json(
-                method="POST",
-                path="/input-artifacts/ingest",
-                body={
-                    "schema_version": INPUT_INGEST_SCHEMA,
-                    "cluster": definition.name,
-                    "logical_name": logical_name,
-                    "size_bytes": size_bytes,
-                    "sha256": sha256,
-                    "data_base64": base64.b64encode(data).decode("ascii"),
-                    "idempotency_key": ingest_key,
-                },
-            )
-            artifact, producer = _validated_ingest_response(
-                raw_response,
-                definition=definition,
-                settings=settings,
-                logical_name=logical_name,
-                size_bytes=size_bytes,
-                sha256=sha256,
-                idempotency_key=ingest_key,
-            )
-            config[setting_name] = _cluster_path_from_file_uri(artifact.uri)
-            assert artifact.sha256 is not None
-            use = ArtifactUse(
-                artifact_id=artifact.artifact_id,
-                sha256=artifact.sha256,
-                provenance=ArtifactUseProvenance(
-                    evidence=ArtifactUseEvidence.SCHEMA_ARG,
-                    arg=setting_name,
-                ),
-            )
-            artifact_uses.append(use)
-            manifest.append(
-                {
-                    "setting": setting_name,
-                    "artifact_id": artifact.artifact_id,
-                    "producer_job_id": producer.job_id,
-                    "size_bytes": artifact.size_bytes,
-                    "sha256": artifact.sha256,
-                }
-            )
-    return StagedJarvisInputs(
-        arguments=rewritten,
-        artifact_uses=tuple(sorted(artifact_uses, key=lambda item: item.artifact_id)),
-        manifest_sha256=_stable_digest({"inputs": manifest}),
+
+def _ingest_input_snapshot(
+    snapshot: _InputSnapshot,
+    *,
+    client: OwnedSessionApiClient,
+    definition: ClusterDefinition,
+    settings: RelaySettings,
+) -> JarvisPipelineInputBinding:
+    """Ingest one immutable snapshot and return its exact durable binding."""
+    owner_session_id = settings.owner_session_id
+    owner_session_generation_id = settings.owner_session_generation_id
+    if owner_session_id is None or owner_session_generation_id is None:
+        raise ValueError("local JARVIS inputs require an active relay-owned remote session")
+    ingest_key = "input-ingest:" + _stable_digest(
+        {
+            "cluster": definition.name,
+            "owner_session_id": owner_session_id,
+            "owner_session_generation_id": str(owner_session_generation_id),
+            "step_id": snapshot.step_id,
+            "canonical_setting": snapshot.canonical_setting,
+            "workspace_relative_path": snapshot.workspace_relative_path,
+            "logical_name": snapshot.logical_name,
+            "size_bytes": snapshot.size_bytes,
+            "sha256": snapshot.sha256,
+        }
+    )
+    raw_response = client.request_json(
+        method="POST",
+        path="/input-artifacts/ingest",
+        body={
+            "schema_version": INPUT_INGEST_SCHEMA,
+            "cluster": definition.name,
+            "logical_name": snapshot.logical_name,
+            "size_bytes": snapshot.size_bytes,
+            "sha256": snapshot.sha256,
+            "data_base64": base64.b64encode(snapshot.data).decode("ascii"),
+            "idempotency_key": ingest_key,
+        },
+    )
+    artifact, _producer = _validated_ingest_response(
+        raw_response,
+        definition=definition,
+        settings=settings,
+        logical_name=snapshot.logical_name,
+        size_bytes=snapshot.size_bytes,
+        sha256=snapshot.sha256,
+        idempotency_key=ingest_key,
+    )
+    assert artifact.sha256 is not None
+    return JarvisPipelineInputBinding(
+        step_id=snapshot.step_id,
+        canonical_setting=snapshot.canonical_setting,
+        accepted_names=snapshot.accepted_names,
+        workspace_relative_path=snapshot.workspace_relative_path,
+        logical_name=snapshot.logical_name,
+        size_bytes=snapshot.size_bytes,
+        sha256=artifact.sha256,
+        remote_path=_cluster_path_from_file_uri(artifact.uri),
+        artifact_use=ArtifactUse(
+            artifact_id=artifact.artifact_id,
+            sha256=artifact.sha256,
+            provenance=ArtifactUseProvenance(
+                evidence=ArtifactUseEvidence.SCHEMA_ARG,
+                arg=snapshot.canonical_setting,
+            ),
+        ),
     )
 
 
@@ -488,6 +735,18 @@ def _workspace_path(value: str, *, settings: RelaySettings) -> Path:
         )
     supplied = Path(value)
     return supplied if supplied.is_absolute() else root / supplied
+
+
+def _workspace_relative_path(value: Path, *, root: Path) -> str:
+    """Return one normalized private-root-relative path without leaking the Host root."""
+    try:
+        relative = value.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ValueError("local JARVIS input is not within the configured workspace") from exc
+    rendered = relative.as_posix()
+    if not rendered or rendered in {".", ".."} or rendered.startswith("../"):
+        raise ValueError("local JARVIS input has no safe workspace-relative path")
+    return rendered
 
 
 def _logical_name(value: str) -> str:

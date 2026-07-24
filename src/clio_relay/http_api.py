@@ -68,6 +68,7 @@ from clio_relay.jarvis_service_runtime import (
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
+    REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactRef,
     ArtifactUse,
     Cursor,
@@ -75,6 +76,7 @@ from clio_relay.models import (
     GatewaySessionState,
     InputArtifactIngestPolicy,
     InputArtifactSpec,
+    JarvisRunInputManifest,
     JarvisRunSpec,
     JobKind,
     JobState,
@@ -641,6 +643,7 @@ class McpCallSubmitRequest(BaseModel):
     operation: McpOperation = McpOperation.TOOLS_CALL
     tool: str | None = None
     arguments: dict[str, object] = Field(default_factory=dict)
+    jarvis_input_manifest: JarvisRunInputManifest | None = None
     control_query_evidence: McpControlQueryEvidence | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     idempotency_key: str
@@ -661,6 +664,14 @@ class McpCallSubmitRequest(BaseModel):
         if self.operation is McpOperation.TOOLS_CALL:
             if not self.tool:
                 raise ValueError("tool is required for tools/call")
+            if self.jarvis_input_manifest is not None and (
+                self.tool != "jarvis_run"
+                or self.expected_registered_contract != REGISTERED_JARVIS_USER_CONTRACT
+                or self.arguments.get("pipeline_id") != self.jarvis_input_manifest.route.pipeline_id
+            ):
+                raise ValueError(
+                    "JARVIS input manifests require the exact registered jarvis_run pipeline"
+                )
             return self
         if self.tool is not None:
             raise ValueError("tool must be omitted for tools/list")
@@ -672,6 +683,8 @@ class McpCallSubmitRequest(BaseModel):
             raise ValueError("tools/list must not carry a registered semantic contract binding")
         if self.control_query_evidence is not None:
             raise ValueError("tools/list must not carry control-query route evidence")
+        if self.jarvis_input_manifest is not None:
+            raise ValueError("tools/list must not carry a JARVIS input manifest")
         return self
 
 
@@ -1497,6 +1510,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     operation=request.operation,
                     tool=request.tool,
                     arguments=request.arguments,
+                    jarvis_input_manifest=request.jarvis_input_manifest,
                     timeout_seconds=request.timeout_seconds,
                 ),
                 idempotency_key=request.idempotency_key,

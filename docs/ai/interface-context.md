@@ -175,8 +175,12 @@ profile exposes transform mutation.
 Registered remote MCP calls execute the packaged stdio client and server in
 endpoint-owned process containment. They do not create an outer JARVIS pipeline
 or scheduler job. Exact `clio-kit-jarvis-user-v3.6` routes additionally support
-package-described local-file staging; other registered contracts remain generic
-pass-through.
+package-described local-file staging. Accepted bindings retain only
+workspace-relative Host paths and immutable cluster artifact identities. A new
+`jarvis_run` admission reconciles those paths into a checksum-bound input
+manifest; the endpoint MCP runner materializes the manifest before the final
+run call, while the same idempotency key reuses its original manifest without a
+new snapshot. Other registered contracts remain generic pass-through.
 
 `relay_bind_jarvis_runtime` is in the user profile. A waited
 `jarvis_get_execution(include_service_runtimes=true)` response supplies compact

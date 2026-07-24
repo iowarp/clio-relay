@@ -21,12 +21,19 @@ from clio_relay.input_staging import (
     jarvis_package_input_route,
     jarvis_pipeline_input_route,
     parse_jarvis_package_input_contract,
+    reconcile_jarvis_run_inputs,
     stage_jarvis_add_step_inputs,
 )
 from clio_relay.models import (
     ArtifactRef,
     ArtifactUse,
+    ArtifactUseEvidence,
+    ArtifactUseProvenance,
     InputArtifactSpec,
+    JarvisPipelineInputBinding,
+    JarvisPipelineInputBindings,
+    JarvisRunInputManifest,
+    JarvisRunInputResolution,
     JobKind,
     JobState,
     RelayJob,
@@ -86,6 +93,34 @@ def _contract() -> JarvisPackageInputContract:
     )
     assert result is not None
     return result
+
+
+def _tracked_binding(
+    *,
+    step_id: str = "simulation",
+    sha256: str = "d" * 64,
+    artifact_id: str = "artifact_0123456789abcdef0123456789abcdef",
+    remote_path: str = "/srv/clio-relay/v1/inputs/in.lj",
+) -> JarvisPipelineInputBinding:
+    """Return one exact tracked local-file setting."""
+    return JarvisPipelineInputBinding(
+        step_id=step_id,
+        canonical_setting="script",
+        accepted_names=("script", "input_script"),
+        workspace_relative_path=f"{step_id}/in.lj",
+        logical_name="in.lj",
+        size_bytes=12,
+        sha256=sha256,
+        remote_path=remote_path,
+        artifact_use=ArtifactUse(
+            artifact_id=artifact_id,
+            sha256=sha256,
+            provenance=ArtifactUseProvenance(
+                evidence=ArtifactUseEvidence.SCHEMA_ARG,
+                arg="script",
+            ),
+        ),
+    )
 
 
 def test_package_description_declares_local_file_without_name_inference() -> None:
@@ -452,3 +487,240 @@ def test_pipeline_input_lineage_first_merge_uses_one_mutation_timestamp(
 
     assert saved.created_at == mutation_at
     assert saved.updated_at == mutation_at
+
+
+def test_run_reconciliation_reuses_unchanged_and_restages_changed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each new run snapshots the logical path but uploads only changed bytes."""
+    workspace = tmp_path / "workspace"
+    local_input = workspace / "simulation" / "in.lj"
+    local_input.parent.mkdir(parents=True)
+    original = b"units lj\nrun 1\n"
+    local_input.write_bytes(original)
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    binding = _tracked_binding(sha256=original_sha256)
+    route = jarvis_pipeline_input_route(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+    current = JarvisPipelineInputBindings.create(route=route, bindings=(binding,))
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+        input_workspace_root=workspace,
+    )
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+
+    class UnexpectedClient:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("unchanged input must not be ingested again")
+
+    monkeypatch.setattr("clio_relay.input_staging.OwnedSessionApiClient", UnexpectedClient)
+    reused = reconcile_jarvis_run_inputs(
+        current,
+        definition=definition,
+        settings=settings,
+    )
+    assert reused[0].disposition == "reused"
+    assert reused[0].binding == binding
+
+    changed = b"units lj\nrun 2\n"
+    local_input.write_bytes(changed)
+    changed_sha256 = hashlib.sha256(changed).hexdigest()
+
+    class IngestClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> IngestClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            body: dict[str, object],
+        ) -> object:
+            assert method == "POST"
+            assert path == "/input-artifacts/ingest"
+            assert body["sha256"] == changed_sha256
+            producer = RelayJob(
+                cluster="ares",
+                kind=JobKind.INPUT_INGEST,
+                state=JobState.SUCCEEDED,
+                spec=InputArtifactSpec(
+                    logical_name="in.lj",
+                    size_bytes=len(changed),
+                    sha256=changed_sha256,
+                ),
+                idempotency_key=str(body["idempotency_key"]),
+                metadata={
+                    "owner": "clio-relay",
+                    "owner_session_id": "desktop-session",
+                    "owner_session_generation_id": ("generation_0123456789abcdef0123456789abcdef"),
+                },
+            )
+            artifact = ArtifactRef(
+                artifact_id=deterministic_input_artifact_id(producer.job_id),
+                job_id=producer.job_id,
+                uri=f"file:///srv/clio-relay/{producer.job_id}/inputs/in.lj",
+                kind="input",
+                size_bytes=len(changed),
+                sha256=changed_sha256,
+            )
+            return {
+                "job": producer.model_dump(mode="json"),
+                "artifact": artifact.model_dump(mode="json"),
+            }
+
+    monkeypatch.setattr("clio_relay.input_staging.OwnedSessionApiClient", IngestClient)
+    updated = reconcile_jarvis_run_inputs(
+        current,
+        definition=definition,
+        settings=settings,
+    )
+    assert updated[0].disposition == "updated"
+    assert updated[0].previous_sha256 == original_sha256
+    assert updated[0].binding.sha256 == changed_sha256
+    assert updated[0].binding.remote_path.endswith("/inputs/in.lj")
+
+
+def test_run_reconciliation_rejects_missing_or_mutating_tracked_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsafe snapshots fail before any remote run can be admitted."""
+    workspace = tmp_path / "workspace"
+    local_input = workspace / "simulation" / "in.lj"
+    local_input.parent.mkdir(parents=True)
+    local_input.write_text("run 1\n", encoding="utf-8")
+    route = jarvis_pipeline_input_route(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+    current = JarvisPipelineInputBindings.create(
+        route=route,
+        bindings=(
+            _tracked_binding(
+                sha256=hashlib.sha256(local_input.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+        input_workspace_root=workspace,
+    )
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    local_input.unlink()
+    with pytest.raises((OSError, RuntimeError), match="exist|regular|open|find"):
+        reconcile_jarvis_run_inputs(current, definition=definition, settings=settings)
+
+    local_input.write_text("run 2\n", encoding="utf-8")
+
+    def changed_during_snapshot(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("local input changed during snapshot")
+
+    monkeypatch.setattr(
+        "clio_relay.input_staging.snapshot_owned_regular_file",
+        changed_during_snapshot,
+    )
+    with pytest.raises(RuntimeError, match="changed during snapshot"):
+        reconcile_jarvis_run_inputs(current, definition=definition, settings=settings)
+
+
+def test_run_manifest_is_restart_safe_idempotent_and_step_setting_exact(
+    tmp_path: Path,
+) -> None:
+    """The first admitted run key wins and two steps cannot overwrite each other."""
+    route = jarvis_pipeline_input_route(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+    first = _tracked_binding(step_id="analysis")
+    second = _tracked_binding(
+        step_id="simulation",
+        sha256="e" * 64,
+        artifact_id="artifact_fedcba9876543210fedcba9876543210",
+        remote_path="/srv/clio-relay/v2/inputs/in.lj",
+    )
+    queue = ClioCoreQueue(tmp_path / "core")
+    saved_bindings = queue.update_jarvis_pipeline_input_bindings(
+        route,
+        upserts=(second, first),
+    )
+    assert [item.identity() for item in saved_bindings.bindings] == [
+        ("analysis", "script"),
+        ("simulation", "script"),
+    ]
+    manifest = JarvisRunInputManifest.create(
+        route=route,
+        idempotency_key="new-run-1",
+        resolutions=tuple(
+            JarvisRunInputResolution(
+                binding=item,
+                disposition="reused",
+                previous_sha256=item.sha256,
+            )
+            for item in saved_bindings.bindings
+        ),
+    )
+    admitted = queue.put_jarvis_run_input_manifest(manifest)
+    changed_second = second.model_copy(
+        update={
+            "sha256": "f" * 64,
+            "artifact_use": second.artifact_use.model_copy(update={"sha256": "f" * 64}),
+        }
+    )
+    competing = JarvisRunInputManifest.create(
+        route=route,
+        idempotency_key="new-run-1",
+        resolutions=(
+            JarvisRunInputResolution(
+                binding=first,
+                disposition="reused",
+                previous_sha256=first.sha256,
+            ),
+            JarvisRunInputResolution(
+                binding=changed_second,
+                disposition="updated",
+                previous_sha256=second.sha256,
+            ),
+        ),
+    )
+    assert queue.put_jarvis_run_input_manifest(competing) == admitted
+    assert (
+        ClioCoreQueue(tmp_path / "core").get_jarvis_run_input_manifest(
+            route,
+            idempotency_key="new-run-1",
+        )
+        == admitted
+    )

@@ -99,9 +99,14 @@ same-call terminal observation when staging/lineage is needed. Relay snapshots
 only a stable regular file under
 `CLIO_RELAY_INPUT_WORKSPACE_ROOT`, applies the configured per-file, aggregate,
 and count bounds, ingests through the authenticated owner-generation API,
-rewrites the package argument, and records schema-argument provenance. Pipeline
-lineage is durable and bound to route, server artifact, pipeline, and session
-generation. Other schemas and path-looking arguments are pass-through.
+rewrites the package argument, and records schema-argument provenance. Each
+accepted binding is durable and exact to route, server artifact, pipeline,
+step, canonical setting, and session generation. Every genuinely new
+`jarvis_run` snapshots the stable logical paths again, reuses unchanged
+artifacts, ingests changed bytes, and admits one immutable per-run input
+manifest before the worker materializes those settings and calls JARVIS.
+Idempotent retries reuse that manifest without rescanning Host state. Other
+schemas and path-looking arguments are pass-through.
 
 ## Transports
 

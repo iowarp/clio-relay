@@ -168,6 +168,11 @@ class JarvisCdProvider:
                     "operation": spec.operation.value,
                     "tool": spec.tool,
                     "arguments": spec.arguments or None,
+                    "jarvis_input_manifest": (
+                        spec.jarvis_input_manifest.model_dump(mode="json")
+                        if spec.jarvis_input_manifest is not None
+                        else None
+                    ),
                     "timeout_seconds": spec.timeout_seconds,
                 }
             ],

@@ -808,6 +808,8 @@ def _lstat_owned_directory(path: Path) -> os.stat_result:
 def _stat_at(directory_descriptor: int, name: str, *, path: Path) -> os.stat_result:
     try:
         return os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"owned path does not exist: {path}") from exc
     except OSError as exc:
         raise RuntimeError(f"cannot inspect owned path {path}: {exc}") from exc
 
