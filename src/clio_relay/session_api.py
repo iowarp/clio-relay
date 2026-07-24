@@ -417,6 +417,7 @@ def _validate_submission_receipt(
             "operation": operation.value,
             "tool": payload.get("tool"),
             "arguments": expected_arguments,
+            "jarvis_input_manifest": payload.get("jarvis_input_manifest"),
             "timeout_seconds": payload.get("timeout_seconds"),
         }
         observed = {
@@ -429,6 +430,11 @@ def _validate_submission_receipt(
             "operation": job.spec.operation.value,
             "tool": job.spec.tool,
             "arguments": job.spec.arguments,
+            "jarvis_input_manifest": (
+                job.spec.jarvis_input_manifest.model_dump(mode="json")
+                if job.spec.jarvis_input_manifest is not None
+                else None
+            ),
             "timeout_seconds": job.spec.timeout_seconds,
         }
         if observed != expected:

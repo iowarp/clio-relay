@@ -27,6 +27,7 @@ from clio_relay.models import (
     ArtifactRef,
     ArtifactUse,
     InputArtifactSpec,
+    JarvisRunInputManifest,
     JobKind,
     JobState,
     McpCallSpec,
@@ -44,6 +45,7 @@ from clio_relay.remote_mcp import (
 JSON = dict[str, Any]
 DESCRIBE_ALIAS = "remote_jarvis_demo_jarvis_describe"
 ADD_STEP_ALIAS = "remote_jarvis_demo_jarvis_add_step"
+EDIT_STEP_ALIAS = "remote_jarvis_demo_jarvis_edit_step"
 RUN_ALIAS = "remote_jarvis_demo_jarvis_run"
 GET_EXECUTION_ALIAS = "remote_jarvis_demo_jarvis_get_execution"
 
@@ -90,6 +92,11 @@ class _McpFlowHarness:
                 ),
                 tool=cast(str, payload["tool"]),
                 arguments=copy.deepcopy(cast(JSON, payload["arguments"])),
+                jarvis_input_manifest=(
+                    JarvisRunInputManifest.model_validate(payload["jarvis_input_manifest"])
+                    if payload.get("jarvis_input_manifest") is not None
+                    else None
+                ),
                 timeout_seconds=cast(int | None, payload.get("timeout_seconds")),
             ),
             idempotency_key=idempotency_key,
@@ -120,6 +127,8 @@ class _McpFlowHarness:
             assert wait_for_terminal_result is True
         if job.spec.tool == "jarvis_add_step" and job.used_artifact_refs:
             assert wait_for_terminal_result is True
+        if job.spec.tool == "jarvis_edit_step" and job.used_artifact_refs:
+            assert wait_for_terminal_result is True
         if job.spec.tool in self.nonterminal_tools:
             return {
                 "cluster": definition.name,
@@ -142,6 +151,21 @@ class _McpFlowHarness:
         }
         if job.spec.tool == "jarvis_describe":
             result["mcp_result"] = _describe_mcp_result()
+        elif job.spec.tool == "jarvis_add_step":
+            package_name = cast(str, job.spec.arguments["package_name"])
+            result["mcp_result"] = {
+                "tool": "jarvis_add_step",
+                "structured_result": {
+                    "result": {
+                        "pipeline_id": job.spec.arguments["pipeline_id"],
+                        "appended": package_name,
+                        "step_id": job.spec.arguments.get("step_id")
+                        or package_name.rsplit(".", 1)[-1],
+                        "configured": True,
+                        "config": job.spec.arguments.get("config", {}),
+                    }
+                },
+            }
         return result
 
     def ingest(self, body: JSON) -> JSON:
@@ -276,6 +300,9 @@ def test_registered_jarvis_input_flows_from_describe_through_run(
             "cluster": "ares",
             "owner_session_id": "desktop-session",
             "owner_session_generation_id": "generation_0123456789abcdef0123456789abcdef",
+            "step_id": "lammps",
+            "canonical_setting": "script",
+            "workspace_relative_path": "in.lj",
             "logical_name": "in.lj",
             "size_bytes": source.stat().st_size,
             "sha256": source_sha256,
@@ -305,6 +332,55 @@ def test_registered_jarvis_input_flows_from_describe_through_run(
     assert run_payload["tool"] == "jarvis_run"
     assert run_payload["expected_registered_contract"] == REGISTERED_JARVIS_CONTRACT_ID
     assert run_payload["used_artifact_refs"] == add_payload["used_artifact_refs"]
+    first_manifest = cast(JSON, run_payload["jarvis_input_manifest"])
+    assert first_manifest["resolutions"][0]["disposition"] == "reused"
+    assert first_manifest["resolutions"][0]["binding"]["sha256"] == source_sha256
+
+    source.write_text("units lj\nrun 6000\n", encoding="utf-8")
+    changed_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    second = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=RUN_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "science-run",
+            "idempotency_key": "run-lammps-input-v2",
+        },
+    )
+    assert "error" not in second
+    second_payload = copy.deepcopy(harness.submitted_payloads[-1])
+    second_manifest = cast(JSON, second_payload["jarvis_input_manifest"])
+    assert second_manifest["resolutions"][0]["disposition"] == "updated"
+    assert second_manifest["resolutions"][0]["previous_sha256"] == source_sha256
+    assert second_manifest["resolutions"][0]["binding"]["sha256"] == changed_sha256
+    assert cast(list[JSON], second_payload["used_artifact_refs"])[0]["sha256"] == changed_sha256
+    assert len(harness.ingest_bodies) == 2
+
+    # The same admitted run key must not inspect mutable Host state again.
+    source.write_text("units lj\nrun 7000\n", encoding="utf-8")
+    retried = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=RUN_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "science-run",
+            "idempotency_key": "run-lammps-input-v2",
+        },
+    )
+    assert "error" not in retried
+    assert harness.submitted_payloads[-1] == second_payload
+    assert len(harness.ingest_bodies) == 2
+    assert [payload["tool"] for payload in harness.submitted_payloads] == [
+        "jarvis_describe",
+        "jarvis_add_step",
+        "jarvis_run",
+        "jarvis_run",
+        "jarvis_run",
+    ]
 
 
 def test_legacy_jarvis_contract_does_not_activate_transparent_staging(
@@ -353,6 +429,113 @@ def test_legacy_jarvis_contract_does_not_activate_transparent_staging(
     payload = harness.submitted_payloads[-1]
     assert cast(JSON, payload["arguments"])["config"] == {"script": "in.lj"}
     assert payload.get("used_artifact_refs", []) == []
+
+
+def test_tracked_edit_replaces_binding_and_remove_clears_future_run_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tracked edits stay transparent and removing the step clears its live binding."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "first.lj"
+    second = workspace / "second.lj"
+    first.write_text("run 1\n", encoding="utf-8")
+    second.write_text("run 2\n", encoding="utf-8")
+    settings, definition, catalog, harness = _configured_flow(tmp_path, workspace=workspace)
+    _patch_flow(
+        monkeypatch,
+        current_catalog={"value": catalog},
+        definition=definition,
+        harness=harness,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    session = McpSessionState()
+    _advertise(queue, settings=settings, session=session)
+    _describe_package(queue, settings=settings, session=session)
+    added = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=ADD_STEP_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "edited-pipeline",
+            "package_name": "lammps",
+            "config": {"script": "first.lj"},
+            "idempotency_key": "edited-add",
+        },
+    )
+    assert "error" not in added
+
+    edited = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=EDIT_STEP_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "edited-pipeline",
+            "step_id": "lammps",
+            "config": {"script": "second.lj"},
+            "operation": "edit",
+            "idempotency_key": "edited-v2",
+        },
+    )
+    assert "error" not in edited
+    edit_payload = harness.submitted_payloads[-1]
+    edit_config = cast(JSON, cast(JSON, edit_payload["arguments"])["config"])
+    assert edit_config["script"].endswith("/inputs/second.lj")
+    assert cast(list[JSON], edit_payload["used_artifact_refs"])[0]["sha256"] == (
+        hashlib.sha256(second.read_bytes()).hexdigest()
+    )
+
+    ran = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=RUN_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "edited-pipeline",
+            "idempotency_key": "edited-run",
+        },
+    )
+    assert "error" not in ran
+    assert (
+        cast(JSON, harness.submitted_payloads[-1]["jarvis_input_manifest"])["resolutions"][0][
+            "binding"
+        ]["workspace_relative_path"]
+        == "second.lj"
+    )
+
+    removed = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=EDIT_STEP_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "edited-pipeline",
+            "step_id": "lammps",
+            "operation": "remove",
+            "idempotency_key": "edited-remove",
+        },
+    )
+    assert "error" not in removed
+    after_remove = _call(
+        queue,
+        settings=settings,
+        session=session,
+        name=RUN_ALIAS,
+        arguments={
+            "cluster": "ares",
+            "pipeline_id": "edited-pipeline",
+            "idempotency_key": "edited-run-after-remove",
+        },
+    )
+    assert "error" not in after_remove
+    assert harness.submitted_payloads[-1].get("jarvis_input_manifest") is None
 
 
 def test_durable_pipeline_inputs_do_not_cross_server_artifact_revision(
@@ -713,6 +896,7 @@ def _configured_flow(
         allow_tools=[
             "jarvis_describe",
             "jarvis_add_step",
+            "jarvis_edit_step",
             "jarvis_run",
             "jarvis_get_execution",
         ],
@@ -767,6 +951,20 @@ def _catalog(
                     "config": {"type": "object"},
                 },
                 "required": ["pipeline_id", "package_name"],
+                "additionalProperties": False,
+            },
+        ),
+        EDIT_STEP_ALIAS: RemoteMcpToolSchema(
+            name="jarvis_edit_step",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pipeline_id": {"type": "string"},
+                    "step_id": {"type": "string"},
+                    "config": {"type": "object"},
+                    "operation": {"type": "string"},
+                },
+                "required": ["pipeline_id", "step_id"],
                 "additionalProperties": False,
             },
         ),

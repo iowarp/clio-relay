@@ -26,6 +26,15 @@ from clio_relay.bootstrap import (
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
 )
+from clio_relay.models import (
+    ArtifactUse,
+    ArtifactUseEvidence,
+    ArtifactUseProvenance,
+    JarvisPipelineInputBinding,
+    JarvisPipelineInputRoute,
+    JarvisRunInputManifest,
+    JarvisRunInputResolution,
+)
 
 
 class McpCallRunnerModule(Protocol):
@@ -483,6 +492,116 @@ for line in sys.stdin:
     assert result.returncode == 0
     assert "threaded-test-server" in result.stdout
     assert result.stderr == ""
+
+
+def test_mcp_session_materializes_input_manifest_before_jarvis_run(tmp_path: Path) -> None:
+    """The worker edits exact resolved paths before it can submit the scheduler run."""
+    runner = _load_runner()
+    server_path = tmp_path / "input_reconciliation_server.py"
+    server_path.write_text(
+        """import json
+import sys
+
+calls = []
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "input-test", "version": "1.0"},
+            },
+        }), flush=True)
+    elif method == "tools/call":
+        calls.append(message["params"])
+        name = message["params"]["name"]
+        if name == "jarvis_edit_step":
+            structured = {"configured": message["params"]["arguments"]["step_id"]}
+        else:
+            structured = {"pipeline_id": "science-run", "calls": calls}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"structuredContent": structured, "content": []},
+        }), flush=True)
+        if name == "jarvis_run":
+            break
+""",
+        encoding="utf-8",
+    )
+    route = JarvisPipelineInputRoute(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+    use = ArtifactUse(
+        artifact_id="artifact_0123456789abcdef0123456789abcdef",
+        sha256="d" * 64,
+        provenance=ArtifactUseProvenance(
+            evidence=ArtifactUseEvidence.SCHEMA_ARG,
+            arg="script",
+        ),
+    )
+    binding = JarvisPipelineInputBinding(
+        step_id="simulation",
+        canonical_setting="script",
+        accepted_names=("script",),
+        workspace_relative_path="in.lj",
+        logical_name="in.lj",
+        size_bytes=12,
+        sha256="d" * 64,
+        remote_path="/srv/clio-relay/v2/inputs/in.lj",
+        artifact_use=use,
+    )
+    manifest = JarvisRunInputManifest.create(
+        route=route,
+        idempotency_key="run-v2",
+        resolutions=(
+            JarvisRunInputResolution(
+                binding=binding,
+                disposition="reused",
+                previous_sha256=binding.sha256,
+            ),
+        ),
+    )
+
+    result = cast(Any, runner)._run_mcp_session(
+        [sys.executable, str(server_path)],
+        tool="jarvis_run",
+        arguments={"pipeline_id": "science-run"},
+        timeout=10,
+        env_from={},
+        jarvis_input_manifest=manifest.model_dump(mode="json"),
+    )
+    protocol_result = cast(Any, runner)._response_result(
+        result.stdout,
+        response_id="clio-relay-mcp-call",
+    )
+    structured = cast(Any, runner)._structured_result(
+        protocol_result,
+        operation="tools/call",
+    )
+
+    assert result.returncode == 0
+    assert [call["name"] for call in structured["calls"]] == [
+        "jarvis_edit_step",
+        "jarvis_run",
+    ]
+    assert structured["calls"][0]["arguments"] == {
+        "pipeline_id": "science-run",
+        "step_id": "simulation",
+        "config": {"script": "/srv/clio-relay/v2/inputs/in.lj"},
+        "operation": "edit",
+    }
 
 
 def test_direct_console_launcher_binds_real_distribution_record_and_detects_mutation(

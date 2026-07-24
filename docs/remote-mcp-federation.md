@@ -299,12 +299,26 @@ pipeline lineage. The resulting job dependency has
 `clio-relay.artifact-use-provenance.v1` evidence `schema-arg` naming the exact
 package setting.
 
-After the add-step call succeeds, relay records the input lineage against the
-exact cluster route revision, MCP registration revision, immutable server
-artifact, pipeline id, and owner-session generation. A later `jarvis_run`
-inherits those content pins even after the desktop MCP process reconnects. A
-changed route, registration, artifact, pipeline, session generation, checksum,
-or provenance fails closed rather than reusing stale bytes.
+After the add-step call succeeds, relay records each stable workspace-relative
+logical path against the exact cluster route revision, MCP registration
+revision, immutable server artifact, pipeline id, step id, canonical setting,
+and owner-session generation. Tracked `jarvis_edit_step` calls replace or remove
+those exact bindings only after JARVIS accepts the edit.
+
+On the first admission of every genuinely new `jarvis_run`, relay securely
+snapshots every tracked path again. Unchanged content reuses its immutable
+artifact; changed content is ingested as a new artifact. Relay persists a
+checksum-bound per-run manifest and the cluster worker materializes its exact
+step settings before invoking `jarvis_run`, so failure during reconciliation
+cannot reach scheduler submission. The relay job's artifact dependencies and
+private MCP result retain machine-readable reused/updated evidence, while
+earlier executions keep their original hashes. Retrying the same run
+idempotency key reuses the already admitted manifest without rescanning the
+mutable workspace. A missing, unsafe, oversized, or concurrently changing file
+fails before run submission.
+
+A changed route, registration, artifact, pipeline, session generation,
+checksum, or provenance fails closed rather than reusing stale bytes.
 
 Settings without the exact declaration are passed through unchanged; a
 path-looking name is never sufficient authority to read a local file. Legacy or
