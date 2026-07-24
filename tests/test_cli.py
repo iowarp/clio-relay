@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import stat
@@ -4474,7 +4475,7 @@ def test_cli_api_start_verifies_process_bound_release_identity(
     events: list[str] = []
     bound_app = object()
     late_app = object()
-    http_api_module = sys.modules["clio_relay.http_api"]
+    http_api_module = importlib.import_module("clio_relay.http_api")
     monkeypatch.setattr(http_api_module, "app", bound_app)
     monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "a" * 64)
 
@@ -4489,7 +4490,13 @@ def test_cli_api_start_verifies_process_bound_release_identity(
         events.append("serve")
         launches.append((host, port))
 
-    monkeypatch.setattr(cli, "installation_info", lambda: installation)
+    receipt = cli.InstallReceipt.model_validate(installation["receipt"])
+    monkeypatch.setattr(cli, "verified_session_api_install_receipt", lambda: receipt)
+
+    def unexpected_full_installation_probe() -> dict[str, object]:
+        raise AssertionError("API startup must not run full component installation probes")
+
+    monkeypatch.setattr(cli, "installation_info", unexpected_full_installation_probe)
     monkeypatch.setattr(cli, "publish_owned_session_api_startup_receipt", publish)
     monkeypatch.setattr(cli.uvicorn, "run", launch)
     monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", identity.sha256())
@@ -5897,6 +5904,17 @@ def test_cli_session_teardown_failure_writes_canonical_report(
         raise RelayError("remote process identity changed")
 
     monkeypatch.setattr(cli, "teardown_remote_session", fail_teardown)
+    monkeypatch.setattr(
+        cli,
+        "_observe_worker_before_cleanup",
+        _fake_no_worker_observation,
+    )
+    monkeypatch.setattr(cli, "status_remote_session", _fake_owned_session_status)
+    monkeypatch.setattr(
+        cli,
+        "_cleanup_owned_runtime_sessions",
+        _fake_empty_runtime_cleanup,
+    )
     report_path = tmp_path / "teardown-failed.json"
 
     result = CliRunner().invoke(
@@ -10313,6 +10331,135 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     assert captured["relay_wheel"] == wheel
     assert captured["jarvis_resource_graph_profile"] == "ares"
     assert captured["allow_jarvis_resource_graph_build"] is True
+
+
+def test_bootstrap_same_generation_preserves_remote_mcp_cache(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def reject_invalidation(
+        _cls: type[object],
+        _path: Path,
+        _cluster: str,
+    ) -> tuple[object, tuple[str, ...]]:
+        raise AssertionError("same-generation bootstrap must preserve cached MCP schemas")
+
+    monkeypatch.setattr(
+        cli.RemoteMcpSchemaCache,
+        "invalidate_cluster_entries",
+        classmethod(reject_invalidation),
+    )
+
+    evidence = cli._invalidate_remote_mcp_cache_after_bootstrap(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster="ares",
+        receipt={
+            "generation": {
+                "previous": "a" * 64,
+                "active": "a" * 64,
+            }
+        },
+        registry_path=tmp_path / "clusters.json",
+    )
+
+    assert evidence == {
+        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
+        "cluster": "ares",
+        "previous_generation": "a" * 64,
+        "active_generation": "a" * 64,
+        "generation_changed": False,
+        "action": "preserved",
+        "removed_server_count": 0,
+        "removed_server_names": [],
+    }
+
+
+def test_cluster_bootstrap_invalidates_cache_before_target_validation_and_records_evidence(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    report_path = tmp_path / "bootstrap-report.json"
+    events: list[str] = []
+
+    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
+        receipt = {
+            "schema_version": "clio-relay.bootstrap-receipt.v2",
+            "outcome": "reconciled",
+            "invocation_id": "bootstrap_generation_changed",
+            "generation": {
+                "previous": "a" * 64,
+                "active": "b" * 64,
+            },
+        }
+        return [
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+        ]
+
+    def invalidate_cluster_entries(
+        cls: type[cli.RemoteMcpSchemaCache],
+        path: Path,
+        cluster: str,
+    ) -> tuple[cli.RemoteMcpSchemaCache, tuple[str, ...]]:
+        events.append("cache-invalidated")
+        assert path == (tmp_path / ".clio-relay" / "remote-mcp-cache.json").resolve()
+        assert cluster == "ares"
+        return cls(), ("__builtin_jarvis__", "jarvis-demo")
+
+    def fake_remote_target_identity(
+        _definition: ClusterDefinition,
+    ) -> dict[str, object]:
+        assert events == ["cache-invalidated"]
+        events.append("target-validated")
+        return {"verified": True}
+
+    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "package")
+    monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli.RemoteMcpSchemaCache,
+        "invalidate_cluster_entries",
+        classmethod(invalidate_cluster_entries),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "bootstrap",
+            "--cluster",
+            "ares",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == ["cache-invalidated", "target-validated"]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    bootstrap_check = cast(dict[str, object], report["checks"][0])
+    evidence = cast(list[dict[str, object]], bootstrap_check["evidence"])
+    cache_evidence = next(
+        item for item in evidence if item["kind"] == "remote_mcp_cache_invalidation"
+    )
+    assert cache_evidence["metadata"] == {
+        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
+        "cluster": "ares",
+        "previous_generation": "a" * 64,
+        "active_generation": "b" * 64,
+        "generation_changed": True,
+        "action": "invalidated",
+        "removed_server_count": 2,
+        "removed_server_names": ["__builtin_jarvis__", "jarvis-demo"],
+    }
+    bootstrap_resource = next(
+        resource for resource in report["resources"] if resource["kind"] == "bootstrap_invocation"
+    )
+    assert (
+        bootstrap_resource["metadata"]["remote_mcp_cache_invalidation"]
+        == cache_evidence["metadata"]
+    )
 
 
 def test_cli_remote_task_event_passthrough_uses_cluster_core(

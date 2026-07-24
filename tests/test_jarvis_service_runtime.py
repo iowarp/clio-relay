@@ -49,6 +49,7 @@ from clio_relay.jarvis_service_runtime import (
 )
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
+    REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactRef,
     GatewaySession,
     GatewaySessionState,
@@ -955,6 +956,142 @@ def test_model_facing_mcp_projection_redacts_runtime_bearer_token() -> None:
     assert token not in json.dumps(projected, sort_keys=True)
 
 
+@pytest.mark.parametrize(
+    "expected_registered_contract",
+    [None, REGISTERED_JARVIS_USER_CONTRACT],
+    ids=["built-in", "registered"],
+)
+def test_verified_jarvis_wait_preserves_public_bearer_fingerprint(
+    tmp_path: Path,
+    expected_registered_contract: str | None,
+) -> None:
+    """Exact built-in and registered JARVIS waits preserve the public runtime hash."""
+
+    _queue, _definition, job, _artifact, envelope = _source_result(
+        tmp_path,
+        expected_registered_contract=expected_registered_contract,
+    )
+    artifact = ArtifactRef.model_validate(envelope["artifact"])
+    parsed = mcp_server_module._decode_verified_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        envelope,
+        artifact=artifact.model_dump(mode="json"),
+        job_id=job.job_id,
+    )
+    receipt: dict[str, Any] = {}
+
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+
+    original = cast(
+        dict[str, Any],
+        parsed.document["structured_result"]["service_runtimes"]["service_runtimes"][0],
+    )
+    projected = cast(
+        dict[str, Any],
+        receipt["mcp_result"]["structured_result"]["service_runtimes"]["service_runtimes"][0],
+    )
+    assert (
+        projected["authorization"]
+        == original["authorization"]
+        == {
+            "scheme": "bearer",
+            "token_sha256": hashlib.sha256(("a" * 64).encode("ascii")).hexdigest(),
+        }
+    )
+    assert projected == original
+    assert (
+        hashlib.sha256(
+            json.dumps(projected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        == hashlib.sha256(
+            json.dumps(original, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    assert (
+        len(
+            json.dumps(
+                receipt["mcp_result"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= mcp_server_module.MAX_INLINE_MCP_RESULT_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        {"scheme": "bearer", "token": "a" * 64},
+        {
+            "scheme": "bearer",
+            "token_sha256": "b" * 64,
+            "audience": "paraview",
+        },
+        {"scheme": "bearer", "token_sha256": "not-a-canonical-sha256"},
+        {"scheme": "basic", "token_sha256": "b" * 64},
+    ],
+    ids=["raw-token", "extra-key", "wrong-hash", "wrong-scheme"],
+)
+def test_jarvis_authorization_restore_rejects_non_public_descriptors(
+    authorization: dict[str, str],
+) -> None:
+    """Even a trusted projection flag cannot restore a secret or widened shape."""
+
+    projected = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {
+            "structured_result": {
+                "service_runtimes": {
+                    "service_runtimes": [
+                        {
+                            "schema_version": "jarvis.service-runtime.v2",
+                            "authorization": authorization,
+                        }
+                    ]
+                }
+            }
+        },
+        preserve_verified_jarvis_authorization_descriptors=True,
+    )
+
+    runtime = projected["structured_result"]["service_runtimes"]["service_runtimes"][0]
+    assert runtime["authorization"] == "<redacted>"
+    assert projected["sensitive_values_redacted"] is True
+    if "token" in authorization:
+        assert authorization["token"] not in json.dumps(projected, sort_keys=True)
+
+
+def test_arbitrary_mcp_cannot_expose_jarvis_shaped_authorization() -> None:
+    """A lookalike authorization stays redacted without exact JARVIS source proof."""
+
+    projected = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {
+            "structured_result": {
+                "service_runtimes": {
+                    "service_runtimes": [
+                        {
+                            "schema_version": "jarvis.service-runtime.v2",
+                            "authorization": {
+                                "scheme": "bearer",
+                                "token_sha256": "b" * 64,
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    runtime = projected["structured_result"]["service_runtimes"]["service_runtimes"][0]
+    assert runtime["authorization"] == "<redacted>"
+    assert projected["sensitive_values_redacted"] is True
+
+
 def test_waited_execution_exposes_compact_verified_binding_before_large_result(
     tmp_path: Path,
 ) -> None:
@@ -1000,7 +1137,6 @@ def test_waited_execution_exposes_compact_verified_binding_before_large_result(
         receipt
     )
     assert "a" * 64 not in serialized
-    assert '"sensitive_values_redacted": true' in serialized
     assert serialized.index('"service_runtime_bindings":') < serialized.index(
         '"mcp_result_artifact":'
     )
@@ -1866,6 +2002,145 @@ def test_service_runtime_source_rejects_generic_unmarked_jarvis_call(
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
 
     with pytest.raises(ValueError, match="JARVIS-CD lock pin"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_registered_service_runtime_source_binds_exact_durable_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator-registered JARVIS route uses its contract and artifact proof."""
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        server="/opt/operator/bin/registered-jarvis-mcp",
+        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
+    )
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    verified = resolve_jarvis_service_runtime(
+        queue=queue,
+        definition=definition,
+        source_job_id=job.job_id,
+        source_artifact_id=artifact.artifact_id,
+        package_id="paraview-1",
+        package_name="builtin.paraview",
+    )
+
+    assert verified.binding.source_relay_job_id == job.job_id
+    assert verified.binding.source_relay_artifact_id == artifact.artifact_id
+    assert verified.binding.jarvis_execution_id == "execution-1"
+    assert verified.runtime.service_instance_id == "paraview-live-1"
+
+
+def test_registered_service_runtime_source_rejects_wrong_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        expected_registered_contract="clio-kit-jarvis-user-v3.5",
+    )
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="supported JARVIS contract"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_registered_service_runtime_source_rejects_mixed_builtin_lock_pin(
+    tmp_path: Path,
+) -> None:
+    _queue, definition, job, _artifact, _envelope = _source_result(
+        tmp_path,
+        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
+    )
+    spec = cast(McpCallSpec, job.spec).model_copy(
+        update={"expected_jarvis_cd_lock_binding": jarvis_cd_lock_binding_expectation()}
+    )
+    mixed_job = job.model_copy(update={"spec": spec})
+
+    with pytest.raises(ValueError, match="also supplied a built-in JARVIS-CD lock pin"):
+        runtime_binding._validate_source_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            mixed_job,
+            cluster=definition.name,
+        )
+
+
+def test_registered_service_runtime_source_rejects_result_contract_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
+    )
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    document["expected_registered_contract"] = None
+    _replace_envelope_document(envelope, document)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="result registered contract"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_registered_service_runtime_source_rejects_mismatched_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
+    )
+    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
+    document["server_artifact"]["install_artifact_sha256"] = "c" * 64
+    _replace_envelope_document(envelope, document)
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="not the immutable registered route"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
+
+
+def test_registered_service_runtime_source_rejects_unverified_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_artifact = _registered_jarvis_server_artifact()
+    server_artifact["verified"] = False
+    queue, definition, job, artifact, envelope = _source_result(
+        tmp_path,
+        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
+        server_artifact=server_artifact,
+    )
+    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
+
+    with pytest.raises(ValueError, match="not the immutable registered route"):
         resolve_jarvis_service_runtime(
             queue=queue,
             definition=definition,
@@ -4427,11 +4702,18 @@ def _source_result(
     include_service_runtimes: bool | None = True,
     server: str = "/home/cluster/.local/bin/clio-kit",
     bind_relay_jarvis: bool = True,
+    expected_registered_contract: str | None = None,
     server_artifact: dict[str, Any] | None = None,
 ) -> tuple[ClioCoreQueue, ClusterDefinition, RelayJob, ArtifactRef, dict[str, Any]]:
     queue = ClioCoreQueue(tmp_path / "core")
     resolved_server_artifact = (
-        verified_jarvis_server_artifact() if server_artifact is None else server_artifact
+        (
+            _registered_jarvis_server_artifact()
+            if expected_registered_contract is not None
+            else verified_jarvis_server_artifact()
+        )
+        if server_artifact is None
+        else server_artifact
     )
     digest = remote_mcp_server_artifact_digest(resolved_server_artifact)
     job = queue.submit_job(
@@ -4442,8 +4724,11 @@ def _source_result(
                 server=server,
                 server_args=["mcp-server", "jarvis"],
                 expected_server_artifact_digest=digest,
+                expected_registered_contract=expected_registered_contract,
                 expected_jarvis_cd_lock_binding=(
-                    jarvis_cd_lock_binding_expectation() if bind_relay_jarvis else None
+                    jarvis_cd_lock_binding_expectation()
+                    if bind_relay_jarvis and expected_registered_contract is None
+                    else None
                 ),
                 tool=tool,
                 arguments={
@@ -4574,6 +4859,7 @@ def _mcp_result_document(
         "server_args": spec.server_args,
         "env_from": spec.env_from,
         "expected_server_artifact_digest": digest,
+        "expected_registered_contract": spec.expected_registered_contract,
         "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
         "observed_server_artifact_digest": digest,
         "server_artifact": server_artifact,
@@ -4585,6 +4871,14 @@ def _mcp_result_document(
         "protocol_error": None,
         "structured_result": structured,
         "protocol_result": {"structuredContent": structured, "isError": False},
+    }
+
+
+def _registered_jarvis_server_artifact() -> dict[str, Any]:
+    """Return an immutable discovered artifact for an operator-registered route."""
+    return {
+        **verified_jarvis_server_artifact(),
+        "install_spec": "/releases/clio_kit-2.6.2-py3-none-any.whl",
     }
 
 

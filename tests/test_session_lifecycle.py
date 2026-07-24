@@ -15,6 +15,7 @@ from typing import Literal, cast
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.installation as installation_module
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import __version__
 from clio_relay.cluster_config import (
@@ -25,6 +26,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
+from clio_relay.installation import InstallReceipt
 from clio_relay.session_lifecycle import (
     SESSION_CONNECTORS_CHECK_ID,
     SESSION_GATEWAY_CHECK_ID,
@@ -66,6 +68,40 @@ def _api_release_identity() -> SessionApiReleaseIdentity:
                 "dirty": False,
             },
         }
+    )
+
+
+def test_session_start_release_identity_uses_verified_relay_receipt(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    expected = _api_release_identity()
+    receipt = InstallReceipt(
+        installed_at=datetime.now(UTC),
+        install_spec=f"clio-relay=={expected.distribution_version}",
+        requested_source="pypi",
+        artifact_filename=(f"clio_relay-{expected.distribution_version}-py3-none-any.whl"),
+        artifact_sha256=expected.artifact_sha256,
+        distribution_version=expected.distribution_version,
+        software=expected.software,
+    )
+    monkeypatch.setattr(
+        installation_module,
+        "verified_session_api_install_receipt",
+        lambda: receipt,
+    )
+
+    def unexpected_full_installation_probe() -> dict[str, object]:
+        raise AssertionError("session start must not run full component installation probes")
+
+    monkeypatch.setattr(
+        installation_module,
+        "installation_info",
+        unexpected_full_installation_probe,
+    )
+
+    assert (
+        session_lifecycle._current_session_api_release_identity()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        == expected
     )
 
 

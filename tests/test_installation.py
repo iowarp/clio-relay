@@ -31,6 +31,7 @@ from clio_relay.installation import (
     installation_info,
     load_install_receipt,
     probe_clio_kit_native_execution_contract,
+    verified_session_api_install_receipt,
     verify_distribution_file_source,
     verify_remote_clio_kit_native_execution_component,
     verify_remote_native_jarvis_component,
@@ -753,6 +754,67 @@ def test_install_receipt_binds_running_package_to_wheel_bytes(tmp_path: Path) ->
     assert loaded.component_artifacts["clio-kit"].requested_source == "pypi"
     assert info["receipt_matches_install"] is True
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_session_api_receipt_skips_unrelated_component_runtime_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "clio_relay-session-api-py3-none-any.whl"
+    wheel.write_bytes(b"session-api-wheel")
+    receipt_path = tmp_path / "install-receipt.json"
+    expected = write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=receipt_path,
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                distribution_version="2.4.7",
+                install_spec="clio-kit==2.4.7",
+                requested_source="pypi",
+                artifact_filename="clio_kit-2.4.7-py3-none-any.whl",
+                artifact_sha256="c" * 64,
+            )
+        },
+    )
+
+    def unexpected_probe(_receipt: InstallReceipt) -> dict[str, object]:
+        raise AssertionError("session API startup must not probe component runtimes")
+
+    monkeypatch.setattr(
+        installation_module,
+        "_component_runtime_identity",
+        unexpected_probe,
+    )
+
+    assert verified_session_api_install_receipt(receipt_path) == expected
+
+
+def test_session_api_receipt_remains_bound_to_running_software(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "clio_relay-session-api-py3-none-any.whl"
+    wheel.write_bytes(b"session-api-wheel")
+    receipt_path = tmp_path / "install-receipt.json"
+    write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=receipt_path,
+    )
+    current = installation_module.detect_software_identity()
+    monkeypatch.setattr(
+        installation_module,
+        "detect_software_identity",
+        lambda: current.model_copy(update={"commit": "f" * 40}),
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="receipt does not match the running package",
+    ):
+        verified_session_api_install_receipt(receipt_path)
 
 
 def test_install_receipt_labels_exact_version_spec_as_pypi(tmp_path: Path) -> None:

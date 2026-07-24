@@ -48,14 +48,14 @@ from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
 
 def test_bootstrap_uses_exact_public_jarvis_cd_release_pin() -> None:
     """Keep bootstrap and the locked MCP child on the same public JARVIS wheel."""
-    assert JARVIS_CD_VERSION == "1.6.0"
-    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.6.0-py3-none-any.whl"
+    assert JARVIS_CD_VERSION == "1.7.0"
+    assert JARVIS_CD_WHEEL_FILENAME == "jarvis_cd-1.7.0-py3-none-any.whl"
     assert JARVIS_CD_WHEEL_URL == (
         "https://github.com/grc-iit/jarvis-cd/releases/download/"
-        "v1.6.0/jarvis_cd-1.6.0-py3-none-any.whl"
+        "v1.7.0/jarvis_cd-1.7.0-py3-none-any.whl"
     )
     assert JARVIS_CD_WHEEL_SHA256 == (
-        "c4853138f3263715e806fcd794233d89f4aa58161e3c5fbab59e7f96d24f0e98"
+        "f61d2c9b01af1794263013b9045916230c36c318c2984ba4f35d82d8c994e9bb"
     )
 
 
@@ -186,7 +186,8 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert f'JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"' in script
     assert 'fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"' in script
     assert 'fetch --depth 1 origin "$JARVIS_CD_COMMIT"' not in script
-    assert 'curl -L --fail --retry 3 -o "$JARVIS_CD_STAGING" "$JARVIS_CD_WHEEL_URL"' in script
+    assert "bootstrap_fetch_exact_artifact" in script
+    assert '"$JARVIS_CD_WHEEL_URL" "$JARVIS_CD_WHEEL_SHA256" "$JARVIS_CD_STAGING"' in script
     assert (
         'echo "$JARVIS_CD_WHEEL_SHA256 *$JARVIS_CD_STAGING" | sha256sum --check --strict -'
     ) in script

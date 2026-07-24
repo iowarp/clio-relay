@@ -68,6 +68,8 @@ from clio_relay.jarvis_mcp import (
     virtual_jarvis_tool_definitions,
 )
 from clio_relay.jarvis_service_runtime import (
+    JARVIS_SERVICE_RUNTIME_SCHEMA_V2,
+    JarvisServiceAuthorization,
     JarvisServiceRuntimeHandoff,
     derive_jarvis_service_runtime_handoffs,
     resolve_jarvis_service_runtime,
@@ -2361,7 +2363,7 @@ def _call_tool(
     return {
         "content": [{"type": "text", "text": _serialize_tool_result(result)}],
         "structuredContent": result,
-        "isError": _mcp_result_delivery_failed(result),
+        "isError": _mcp_tool_result_failed(result),
     }
 
 
@@ -3559,7 +3561,11 @@ def _mcp_result_artifact(artifacts: list[JSON], *, job_id: str) -> JSON | None:
     return matches[0] if matches else None
 
 
-def _bounded_mcp_result(result: JSON) -> JSON:
+def _bounded_mcp_result(
+    result: JSON,
+    *,
+    preserve_verified_jarvis_authorization_descriptors: bool = False,
+) -> JSON:
     """Return a bounded agent projection while the artifact retains full protocol evidence."""
 
     original = copy.deepcopy(result)
@@ -3567,8 +3573,22 @@ def _bounded_mcp_result(result: JSON) -> JSON:
     if not isinstance(sanitized, dict):
         raise ValueError("MCP result redaction did not preserve its object shape")
     projected = cast(JSON, sanitized)
+    if preserve_verified_jarvis_authorization_descriptors:
+        _restore_jarvis_service_authorization_descriptors(
+            original=original,
+            projected=projected,
+        )
     sensitive_values_redacted = projected != result
-    if projected.get("structured_result") is not None and "protocol_result" in projected:
+    protocol_result = projected.get("protocol_result")
+    protocol_result_is_error = (
+        isinstance(protocol_result, dict)
+        and cast(dict[str, object], protocol_result).get("isError") is True
+    )
+    if (
+        projected.get("structured_result") is not None
+        and "protocol_result" in projected
+        and not protocol_result_is_error
+    ):
         projected.pop("protocol_result")
         projected["protocol_result_omitted"] = "redundant_with_structured_result"
     if sensitive_values_redacted:
@@ -3607,13 +3627,93 @@ def _bounded_mcp_result(result: JSON) -> JSON:
     return failure
 
 
-def _mcp_result_delivery_failed(result: JSON) -> bool:
-    """Return whether a terminal MCP result could not be delivered to the agent."""
+def _restore_jarvis_service_authorization_descriptors(
+    *,
+    original: JSON,
+    projected: JSON,
+) -> None:
+    """Restore only exact public JARVIS bearer fingerprints after source verification.
+
+    The caller enables this only after the durable MCP artifact has passed the
+    exact built-in or registered JARVIS contract validation. This second,
+    deliberately narrow check accepts only service-runtime v2 authorization
+    descriptors with the strict public shape defined by JARVIS. Raw bearer
+    capabilities, additional keys, and malformed digests remain redacted.
+    """
+
+    original_runtimes = _jarvis_service_runtime_items(original)
+    projected_runtimes = _jarvis_service_runtime_items(projected)
+    if original_runtimes is None or projected_runtimes is None:
+        return
+    if len(original_runtimes) != len(projected_runtimes):
+        return
+    for original_runtime, projected_runtime in zip(
+        original_runtimes,
+        projected_runtimes,
+        strict=True,
+    ):
+        if (
+            original_runtime.get("schema_version") != JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+            or projected_runtime.get("schema_version") != JARVIS_SERVICE_RUNTIME_SCHEMA_V2
+        ):
+            continue
+        raw_authorization = original_runtime.get("authorization")
+        try:
+            authorization = JarvisServiceAuthorization.model_validate(raw_authorization)
+        except ValidationError:
+            continue
+        descriptor = authorization.model_dump(mode="json")
+        if raw_authorization != descriptor:
+            continue
+        projected_runtime["authorization"] = descriptor
+
+
+def _jarvis_service_runtime_items(result: JSON) -> list[JSON] | None:
+    """Return the exact execution-v2 service-runtime list, if structurally present."""
+
+    structured = result.get("structured_result")
+    if not isinstance(structured, dict):
+        return None
+    snapshot = cast(dict[str, object], structured).get("service_runtimes")
+    if not isinstance(snapshot, dict):
+        return None
+    raw_runtimes = cast(dict[str, object], snapshot).get("service_runtimes")
+    if not isinstance(raw_runtimes, list):
+        return None
+    typed_runtimes = cast(list[object], raw_runtimes)
+    if not all(isinstance(runtime, dict) for runtime in typed_runtimes):
+        return None
+    return [cast(JSON, runtime) for runtime in typed_runtimes]
+
+
+def _mcp_tool_result_failed(result: JSON) -> bool:
+    """Keep failed terminal remote MCP operations failed at the agent tool boundary."""
+
+    if (
+        result.get("kind") == JobKind.MCP_CALL.value
+        and result.get("terminal") is True
+        and result.get("state") in {JobState.FAILED.value, JobState.CANCELED.value}
+    ):
+        return True
 
     mcp_result = result.get("mcp_result")
     if not isinstance(mcp_result, dict):
         return False
-    delivery = cast(dict[str, object], mcp_result).get("delivery")
+    typed_result = cast(dict[str, object], mcp_result)
+    returncode = typed_result.get("returncode")
+    if (
+        typed_result.get("timed_out") is True
+        or isinstance(typed_result.get("protocol_error"), str)
+        or (isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0)
+    ):
+        return True
+    protocol_result = typed_result.get("protocol_result")
+    if (
+        isinstance(protocol_result, dict)
+        and cast(dict[str, object], protocol_result).get("isError") is True
+    ):
+        return True
+    delivery = typed_result.get("delivery")
     if not isinstance(delivery, dict):
         return False
     typed_delivery = cast(dict[str, object], delivery)
@@ -3669,6 +3769,7 @@ def _attach_terminal_mcp_evidence(
     if artifact is None:
         raise ValueError(f"verified MCP result for {source_job.job_id} has no durable artifact")
     receipt["mcp_result_artifact"] = _public_mcp_result_artifact(artifact)
+    verified_jarvis_authorization_descriptors = False
     if (
         source_job.state is JobState.SUCCEEDED
         and isinstance(source_job.spec, McpCallSpec)
@@ -3676,16 +3777,22 @@ def _attach_terminal_mcp_evidence(
         and source_job.spec.arguments.get("include_service_runtimes") is True
     ):
         source_artifact = ArtifactRef.model_validate(artifact)
+        service_runtime_handoffs = derive_jarvis_service_runtime_handoffs(
+            cluster=source_job.cluster,
+            source_job=source_job,
+            source_artifact=source_artifact,
+            document=parsed_result.document,
+        )
         receipt["service_runtime_bindings"] = [
-            handoff.model_dump(mode="json")
-            for handoff in derive_jarvis_service_runtime_handoffs(
-                cluster=source_job.cluster,
-                source_job=source_job,
-                source_artifact=source_artifact,
-                document=parsed_result.document,
-            )
+            handoff.model_dump(mode="json") for handoff in service_runtime_handoffs
         ]
-    receipt["mcp_result"] = _bounded_mcp_result(parsed_result.public)
+        verified_jarvis_authorization_descriptors = True
+    receipt["mcp_result"] = _bounded_mcp_result(
+        parsed_result.public,
+        preserve_verified_jarvis_authorization_descriptors=(
+            verified_jarvis_authorization_descriptors
+        ),
+    )
 
 
 def _render_remote_mcp_context(catalog: VirtualRemoteMcpCatalog) -> str:

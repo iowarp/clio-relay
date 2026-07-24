@@ -47,6 +47,7 @@ from clio_relay.bootstrap_reconcile import (
     bootstrap_invocation_lock,
     inspect_exact_bootstrap_noop,
     make_bootstrap_receipt,
+    proven_active_generation_mismatch,
     write_bootstrap_receipt,
 )
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
@@ -94,6 +95,7 @@ from clio_relay.installation import (
     attach_verified_worker_identity,
     default_install_receipt_path,
     installation_info,
+    verified_session_api_install_receipt,
     verify_remote_worker_info,
     worker_runtime_info,
 )
@@ -3482,6 +3484,56 @@ print(json.dumps({
 """.strip()
 
 
+def _invalidate_remote_mcp_cache_after_bootstrap(
+    *,
+    cluster: str,
+    receipt: dict[str, object],
+    registry_path: Path | None = None,
+) -> dict[str, object]:
+    """Invalidate cluster-scoped MCP schemas when bootstrap changes its generation."""
+    raw_generation = receipt.get("generation")
+    if not isinstance(raw_generation, dict):
+        return {
+            "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
+            "cluster": cluster,
+            "previous_generation": None,
+            "active_generation": None,
+            "generation_changed": None,
+            "action": "generation_unreported",
+            "removed_server_count": 0,
+            "removed_server_names": [],
+        }
+    generation = cast(dict[str, object], raw_generation)
+    previous_generation = generation.get("previous")
+    active_generation = generation.get("active")
+    if previous_generation is not None and (
+        not isinstance(previous_generation, str) or not previous_generation
+    ):
+        raise RelayError("bootstrap receipt has an invalid previous generation identity")
+    if not isinstance(active_generation, str) or not active_generation:
+        raise RelayError("bootstrap receipt has an invalid active generation identity")
+    generation_changed = previous_generation != active_generation
+    removed_server_names: tuple[str, ...] = ()
+    if generation_changed:
+        cache_path = default_remote_mcp_cache_path(
+            registry_path=registry_path or default_registry_path()
+        )
+        _cache, removed_server_names = RemoteMcpSchemaCache.invalidate_cluster_entries(
+            cache_path,
+            cluster,
+        )
+    return {
+        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
+        "cluster": cluster,
+        "previous_generation": previous_generation,
+        "active_generation": active_generation,
+        "generation_changed": generation_changed,
+        "action": "invalidated" if generation_changed else "preserved",
+        "removed_server_count": len(removed_server_names),
+        "removed_server_names": list(removed_server_names),
+    }
+
+
 @cluster_app.command("bootstrap")
 @_acceptance_report_command
 def cluster_bootstrap(
@@ -3601,6 +3653,17 @@ def cluster_bootstrap(
                     receipt_lines[0].partition("=")[2],
                     "bootstrap invocation receipt",
                 )
+                cache_invalidation = _invalidate_remote_mcp_cache_after_bootstrap(
+                    cluster=cluster,
+                    receipt=receipt,
+                )
+                evidence.append(
+                    EvidenceReference(
+                        kind="remote_mcp_cache_invalidation",
+                        reference=f"remote-mcp-cache:{cluster}",
+                        metadata=cache_invalidation,
+                    )
+                )
                 invocation_id = receipt.get("invocation_id")
                 if not isinstance(invocation_id, str) or not invocation_id.startswith("bootstrap_"):
                     raise RelayError("bootstrap receipt omitted its unique invocation identity")
@@ -3624,6 +3687,7 @@ def cluster_bootstrap(
                             "ssh_host": ssh_host or definition.ssh_host,
                             "bootstrap_profile": definition.bootstrap_profile,
                             "output_sha256": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+                            "remote_mcp_cache_invalidation": cache_invalidation,
                         },
                     )
                 )
@@ -5074,9 +5138,14 @@ def _require_process_bound_session_api_release() -> None:
         return
     if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
         raise ConfigurationError("session API release identity marker is invalid")
-    observed = _session_api_release_identity_from_installation(
-        installation_info(),
-        label="session API",
+    receipt = verified_session_api_install_receipt()
+    artifact_sha256 = receipt.artifact_sha256
+    if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
+        raise ConfigurationError("session API installation identity is incomplete")
+    observed = SessionApiReleaseIdentity(
+        distribution_version=receipt.distribution_version,
+        artifact_sha256=artifact_sha256,
+        software=receipt.software,
     )
     if observed.sha256() != expected_sha256:
         raise ConfigurationError("session API release identity does not match running package")
@@ -11662,6 +11731,23 @@ def bootstrap_inspect(
             desired = BootstrapDesiredState.model_validate_json(raw)
         except (binascii.Error, UnicodeError, ValidationError, ValueError) as exc:
             raise ConfigurationError("bootstrap desired state is invalid") from exc
+        active_generation = proven_active_generation_mismatch(desired)
+        if active_generation is not None:
+            payload: dict[str, object] = {
+                "schema_version": "clio-relay.bootstrap-preflight.v1",
+                "exact_match": False,
+                "desired_fingerprint": desired.fingerprint,
+                "reasons": [
+                    "active generation differs from desired fingerprint",
+                ],
+                "receipt": None,
+                "action": "payload_required",
+            }
+            typer.echo(
+                "bootstrap_preflight_json="
+                + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            )
+            return
         started_at = datetime.now(UTC)
         started = monotonic()
         deadline = started + (

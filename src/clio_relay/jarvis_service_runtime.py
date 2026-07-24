@@ -23,6 +23,7 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
+    REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactRef,
     JobKind,
     JobState,
@@ -36,6 +37,7 @@ from clio_relay.remote_cli import (
     run_remote_jarvis_runtime_authority,
     should_execute_on_cluster,
 )
+from clio_relay.remote_mcp import remote_mcp_server_artifact_binding_verified
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments, native_execution_documents
 from clio_relay.session_api import OwnedSessionApiClient
 
@@ -948,18 +950,30 @@ def _validate_source_job(job: RelayJob, *, cluster: str) -> McpCallSpec:
         raise ValueError("JARVIS service source job is not an MCP call")
     if job.spec.operation is not McpOperation.TOOLS_CALL or job.spec.tool != "jarvis_get_execution":
         raise ValueError("JARVIS service source must be jarvis_get_execution")
-    server_name = job.spec.server.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
-    if server_name not in {"clio-kit", "clio-kit.exe"} or job.spec.server_args != [
-        "mcp-server",
-        "jarvis",
-    ]:
-        raise ValueError("JARVIS service source does not use the configured clio-kit JARVIS MCP")
     if job.spec.arguments.get("include_service_runtimes") is not True:
         raise ValueError(
             "jarvis_get_execution service source must set include_service_runtimes=true"
         )
-    if job.spec.expected_jarvis_cd_lock_binding != jarvis_cd_lock_binding_expectation():
-        raise ValueError("JARVIS service source did not enforce the relay JARVIS-CD lock pin")
+    if job.spec.expected_registered_contract is not None:
+        if job.spec.expected_registered_contract != REGISTERED_JARVIS_USER_CONTRACT:
+            raise ValueError(
+                "registered JARVIS service source does not use the supported JARVIS contract"
+            )
+        if job.spec.expected_jarvis_cd_lock_binding is not None:
+            raise ValueError(
+                "registered JARVIS service source also supplied a built-in JARVIS-CD lock pin"
+            )
+    else:
+        server_name = job.spec.server.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
+        if server_name not in {"clio-kit", "clio-kit.exe"} or job.spec.server_args != [
+            "mcp-server",
+            "jarvis",
+        ]:
+            raise ValueError(
+                "JARVIS service source does not use the configured clio-kit JARVIS MCP"
+            )
+        if job.spec.expected_jarvis_cd_lock_binding != jarvis_cd_lock_binding_expectation():
+            raise ValueError("JARVIS service source did not enforce the relay JARVIS-CD lock pin")
     if job.spec.expected_server_artifact_digest is None:
         raise ValueError("JARVIS service source is not bound to a discovered server artifact")
     return job.spec
@@ -980,6 +994,8 @@ def _validate_mcp_result(
         or document.get("env_from") != spec.env_from
     ):
         raise ValueError("JARVIS MCP result route did not match its durable relay job")
+    if document.get("expected_registered_contract") != spec.expected_registered_contract:
+        raise ValueError("JARVIS MCP result registered contract did not match")
     if document.get("expected_jarvis_cd_lock_binding") != spec.expected_jarvis_cd_lock_binding:
         raise ValueError("JARVIS MCP result JARVIS-CD lock pin did not match")
     if (
@@ -987,11 +1003,22 @@ def _validate_mcp_result(
         or document.get("observed_server_artifact_digest") != spec.expected_server_artifact_digest
     ):
         raise ValueError("JARVIS MCP result server artifact binding did not match")
-    if not jarvis_mcp_server_artifact_binding_verified(
-        document.get("server_artifact"),
-        expected_digest=spec.expected_server_artifact_digest,
-    ):
-        raise ValueError("JARVIS MCP result server artifact identity is not the exact release pin")
+    if spec.expected_registered_contract is not None:
+        artifact_verified = remote_mcp_server_artifact_binding_verified(
+            document.get("server_artifact"),
+            expected_digest=spec.expected_server_artifact_digest,
+        )
+        artifact_failure = (
+            "JARVIS MCP result server artifact identity is not the immutable registered route"
+        )
+    else:
+        artifact_verified = jarvis_mcp_server_artifact_binding_verified(
+            document.get("server_artifact"),
+            expected_digest=spec.expected_server_artifact_digest,
+        )
+        artifact_failure = "JARVIS MCP result server artifact identity is not the exact release pin"
+    if not artifact_verified:
+        raise ValueError(artifact_failure)
     if (
         document.get("returncode") != 0
         or document.get("timed_out") is True

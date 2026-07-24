@@ -3111,6 +3111,7 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
     )
 
     assert response is not None and "error" not in response
+    assert response["result"]["isError"] is True
     result = response["result"]["structuredContent"]
     advertised = next(tool for tool in listed["result"]["tools"] if tool["name"] == "jarvis_run")
     cast(_SchemaValidator, Draft202012Validator(advertised["outputSchema"])).validate(result)
@@ -3244,6 +3245,39 @@ def test_under_limit_terminal_mcp_result_returns_complete_structured_result() ->
     assert bounded["structured_result"] == {"dataset_id": "asteroid-first-five"}
     assert bounded["protocol_result_omitted"] == "redundant_with_structured_result"
     assert "delivery" not in bounded
+
+
+def test_bounded_mcp_error_preserves_exact_protocol_content_with_structured_result() -> None:
+    """Structured failures retain the remote server's exact human-readable error."""
+
+    exact_error = (
+        "Error calling tool 'update_visualization': ParaView runtime returned HTTP 409 "
+        "(revision_conflict): expected_revision does not match authoritative state"
+    )
+    bounded = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]
+        {
+            "operation": "tools/call",
+            "tool": "update_visualization",
+            "returncode": 1,
+            "timed_out": False,
+            "protocol_error": "tools/call returned isError=true",
+            "structured_result": {
+                "error": {
+                    "code": "revision_conflict",
+                    "message": "the requested revision is stale",
+                }
+            },
+            "protocol_result": {
+                "content": [{"type": "text", "text": exact_error}],
+                "isError": True,
+            },
+        }
+    )
+
+    protocol_result = cast(dict[str, Any], bounded["protocol_result"])
+    assert protocol_result["isError"] is True
+    assert protocol_result["content"] == [{"type": "text", "text": exact_error}]
+    assert "protocol_result_omitted" not in bounded
 
 
 def test_oversized_terminal_mcp_result_fails_closed_without_partial_payload() -> None:
@@ -4011,6 +4045,8 @@ def test_virtual_remote_mcp_idempotency_replays_exactly_and_conflicts_on_drift(
     conflict = invoke(4, 2)
 
     assert first is not None and replay is not None and conflict is not None
+    assert first["result"]["isError"] is False
+    assert first["result"]["structuredContent"]["terminal"] is False
     first_job_id = first["result"]["structuredContent"]["job_id"]
     assert replay["result"]["structuredContent"]["job_id"] == first_job_id
     assert "idempotency" in conflict["error"]["message"].lower()
@@ -4019,6 +4055,121 @@ def test_virtual_remote_mcp_idempotency_replays_exactly_and_conflicts_on_drift(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.arguments == {"value": 1}
     assert job.idempotency_key == "agent-retry-1"
+
+
+def test_generated_remote_mcp_alias_propagates_exact_fastmcp_tool_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generated remote alias remains failed with the exact inner MCP error."""
+
+    route = RemoteMcpRoute(
+        cluster="ares",
+        server_name="vigil",
+        command="vigil-mcp",
+        args=("--stdio",),
+        env_from=(),
+        expected_server_artifact_digest="e" * 64,
+        remote_tool_name="update_visualization",
+        timeout_seconds=300,
+        contract=None,
+        cluster_route_revision="d" * 64,
+        registration_revision="c" * 64,
+    )
+    alias = "remote_vigil_update_visualization"
+    catalog = VirtualRemoteMcpCatalog(
+        revision="f" * 64,
+        tools={
+            alias: VirtualRemoteMcpTool(
+                alias=alias,
+                namespace="vigil",
+                remote_tool=RemoteMcpToolSchema(
+                    name="update_visualization",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"expected_revision": {"type": "integer", "minimum": 0}},
+                        "required": ["expected_revision"],
+                        "additionalProperties": False,
+                    },
+                ),
+                routes={"ares": route},
+                arguments_wrapped=False,
+            )
+        },
+        issues=(),
+        cluster_route_revisions={"ares": "d" * 64},
+    )
+
+    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names
+        return catalog
+
+    exact_error = (
+        "Error calling tool 'update_visualization': ParaView runtime returned HTTP 409 "
+        "(revision_conflict): expected_revision does not match authoritative state"
+    )
+    mcp_result = mcp_server_module._bounded_mcp_result(  # pyright: ignore[reportPrivateUsage]
+        {
+            "operation": "tools/call",
+            "tool": "update_visualization",
+            "returncode": 1,
+            "timed_out": False,
+            "protocol_error": "tools/call returned isError=true",
+            "structured_result": None,
+            "protocol_result": {
+                "content": [{"type": "text", "text": exact_error}],
+                "isError": True,
+            },
+        }
+    )
+    receipt: dict[str, Any] = {
+        "cluster": "ares",
+        "job_id": "job_remote_fastmcp_error",
+        "state": "failed",
+        "kind": "mcp_call",
+        "terminal": True,
+        "remote": True,
+        "route_revision": "d" * 64,
+        "last_error": "exit code 1",
+        "mcp_result": mcp_result,
+    }
+
+    def submit(
+        arguments: dict[str, Any],
+        *,
+        queue: ClioCoreQueue,
+        settings: RelaySettings,
+    ) -> dict[str, Any]:
+        del queue, settings
+        assert arguments["tool"] == "update_visualization"
+        assert arguments["arguments"] == {"expected_revision": 1}
+        return receipt
+
+    monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
+    monkeypatch.setattr(mcp_server_module, "_submit_mcp_call", submit)
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": alias,
+                "arguments": {"cluster": "ares", "expected_revision": 1},
+            },
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    assert exact_error in cast(list[dict[str, str]], tool_result["content"])[0]["text"]
+    structured = cast(dict[str, Any], tool_result["structuredContent"])
+    protocol_result = cast(dict[str, Any], structured["mcp_result"]["protocol_result"])
+    assert protocol_result["isError"] is True
+    assert protocol_result["content"] == [{"type": "text", "text": exact_error}]
 
 
 def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaking(
@@ -4194,6 +4345,7 @@ def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaki
     )
 
     assert response is not None and "error" not in response, response
+    assert response["result"]["isError"] is False
     result = response["result"]["structuredContent"]
     cast(_SchemaValidator, Draft202012Validator(advertised["outputSchema"])).validate(result)
     assert result["terminal"] is True
