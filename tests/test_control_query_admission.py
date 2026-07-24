@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -321,33 +320,35 @@ def test_reserved_query_finishes_while_workload_keeps_lease_and_state(
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             source_future = executor.submit(workload_worker.run_once)
-            assert provider.source_started.wait(timeout=10)
-            source_lease = _lease_for_job(queue, source.job_id)
-            assert source_lease is not None
-            assert queue.get_job(source.job_id).state is JobState.RUNNING
+            try:
+                assert provider.source_started.wait(timeout=10)
+                source_lease = _lease_for_job(queue, source.job_id)
+                assert source_lease is not None
+                assert queue.get_job(source.job_id).state is JobState.RUNNING
 
-            query_result = control_worker.run_once(
-                mcp_admission_class=McpAdmissionClass.CONTROL_QUERY,
-                mcp_admission_limit=1,
-            )
+                query_result = control_worker.run_once(
+                    mcp_admission_class=McpAdmissionClass.CONTROL_QUERY,
+                    mcp_admission_limit=1,
+                )
 
-            assert query_result is not None
-            assert query_result.job_id == query.job_id
-            assert query_result.state is JobState.SUCCEEDED
-            assert provider.query_started.is_set()
-            live_source = queue.get_job(source.job_id)
-            renewed_source_lease = _lease_for_job(queue, source.job_id)
-            assert live_source.state is JobState.RUNNING
-            assert live_source.leased_by == source_lease.endpoint_id
-            assert "cancellation_request" not in live_source.metadata
-            assert renewed_source_lease is not None
-            assert renewed_source_lease.lease_id == source_lease.lease_id
-            assert renewed_source_lease.expires_at >= source_lease.expires_at
-            assert _lease_for_job(queue, query.job_id) is None
+                assert query_result is not None
+                assert query_result.job_id == query.job_id
+                assert query_result.state is JobState.SUCCEEDED
+                assert provider.query_started.is_set()
+                live_source = queue.get_job(source.job_id)
+                renewed_source_lease = _lease_for_job(queue, source.job_id)
+                assert live_source.state is JobState.RUNNING
+                assert live_source.leased_by == source_lease.endpoint_id
+                assert "cancellation_request" not in live_source.metadata
+                assert renewed_source_lease is not None
+                assert renewed_source_lease.lease_id == source_lease.lease_id
+                assert renewed_source_lease.expires_at >= source_lease.expires_at
+                assert _lease_for_job(queue, query.job_id) is None
 
-            source_events, _ = queue.read_event_page(source.job_id, limit=100)
-            assert all("cancel" not in event.event_type for event in source_events)
-            provider.release_source.set()
+                source_events, _ = queue.read_event_page(source.job_id, limit=100)
+                assert all("cancel" not in event.event_type for event in source_events)
+            finally:
+                provider.release_source.set()
             source_result = source_future.result(timeout=10)
 
         assert source_result is not None
@@ -549,12 +550,9 @@ class _BlockingLaneProvider(JarvisCdProvider):
             return subprocess.CompletedProcess(["jarvis"], 0, "", "")
 
         self.source_started.set()
-        deadline = time.monotonic() + 10
         while not self.release_source.wait(0.01):
             if should_cancel is not None and should_cancel():
                 return subprocess.CompletedProcess(["jarvis"], -15, "", "")
-            if time.monotonic() >= deadline:
-                return subprocess.CompletedProcess(["jarvis"], 124, "", "timed out")
             if on_poll is not None:
                 on_poll()
         return subprocess.CompletedProcess(["jarvis"], 0, "", "")
