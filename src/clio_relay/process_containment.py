@@ -1474,14 +1474,26 @@ def _release_broker(
         daemon=True,
     )
     writer.start()
-    if not completed.wait(max(0.0, startup_deadline - time.monotonic())):
+    while not completed.is_set():
+        remaining = startup_deadline - time.monotonic()
+        if remaining > 0:
+            completed.wait(remaining)
+            continue
         if process.poll() is None:
             process.kill()
-        with suppress(OSError):
-            os.close(setup_channel.fileno())
-        process.stdin = None
         process.wait(timeout=TERMINATION_TIMEOUT_SECONDS)
+        writer.join(timeout=TERMINATION_TIMEOUT_SECONDS)
+        if writer.is_alive():
+            with suppress(OSError):
+                setup_channel.close()
+            writer.join(timeout=TERMINATION_TIMEOUT_SECONDS)
+        process.stdin = None
+        if writer.is_alive():
+            raise RuntimeError("containment broker setup writer remained active after timeout")
+        with suppress(OSError):
+            setup_channel.close()
         raise RuntimeError("containment broker setup write timed out")
+    writer.join()
     if errors:
         setup_channel.close()
         process.stdin = None

@@ -243,6 +243,99 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
     assert events == ["create", "last-error", "free", "error"]
 
 
+def test_windows_private_descriptor_retries_transient_open_denial(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A stable file survives a bounded antivirus or sharing race."""
+    if os.name != "nt":
+        return
+    path = tmp_path / "private.json"
+    path.write_bytes(b"{}")
+    original_lstat = os.lstat
+    before = original_lstat(path)
+
+    class TransientCreateFile:
+        argtypes: list[object]
+        restype: object
+        attempts = 0
+        requested_access: list[int] = []
+
+        def __call__(
+            self,
+            _path: object,
+            desired_access: int,
+            *_args: object,
+        ) -> int | None:
+            self.attempts += 1
+            self.requested_access.append(desired_access)
+            if self.attempts < 3:
+                return ctypes.c_void_p(-1).value
+            return 123
+
+    transient_create = TransientCreateFile()
+
+    class GetFileInformation:
+        argtypes: list[object]
+        restype: object
+
+        def __call__(
+            self,
+            _handle: ctypes.c_void_p,
+            raw_information: Any,
+        ) -> int:
+            information = ctypes.cast(
+                raw_information,
+                ctypes.POINTER(cluster_config._WindowsFileInformation),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ).contents
+            information.attributes = 0
+            information.number_of_links = before.st_nlink
+            information.file_index_high = before.st_ino >> 32
+            information.file_index_low = before.st_ino & 0xFFFFFFFF
+            return 1
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=transient_create,
+        GetFileInformationByHandle=GetFileInformation(),
+    )
+
+    def accept_private_acl(
+        _path: Path,
+        *,
+        handle: ctypes.c_void_p,
+        directory: bool,
+    ) -> None:
+        assert handle.value == 123
+        assert directory is False
+
+    def load_library(_name: str) -> object:
+        return kernel32
+
+    def open_os_file_handle(_handle: int, _flags: int) -> int:
+        return os.open(path, os.O_RDONLY)
+
+    monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
+    monkeypatch.setattr(cluster_config, "_windows_last_error", lambda: 5)
+    monkeypatch.setattr(
+        cluster_config,
+        "ensure_private_configuration_windows_handle",
+        accept_private_acl,
+    )
+    monkeypatch.setattr(
+        cluster_config,
+        "_open_windows_os_file_handle",
+        open_os_file_handle,
+    )
+
+    descriptor = cluster_config.open_private_configuration_windows_descriptor(path)
+    os.close(descriptor)
+
+    assert transient_create.attempts == 3
+    assert transient_create.requested_access[0] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert not transient_create.requested_access[1] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert transient_create.requested_access[2] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
 def test_configuration_directory_is_created_with_private_protection(tmp_path: Path) -> None:
     path = tmp_path / "new-state" / "private"
 

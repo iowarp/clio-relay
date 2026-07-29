@@ -93,6 +93,18 @@ clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
 
+The MCP server is native FastMCP and can project long-running relay operations
+through standard SEP-2663 task handles without introducing a second scheduler.
+Stdio is the default. Authenticated Streamable HTTP is also available:
+
+```powershell
+$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
+clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
+```
+
+See [MCP background tasks](docs/mcp-tasks.md) for official FastMCP client usage,
+reconnect, cancellation, input, and security semantics.
+
 Operators can expose selected tools from any cluster-side stdio MCP server
 through the same local relay MCP. Registration is allowlisted, and schema
 discovery is an explicit durable job:

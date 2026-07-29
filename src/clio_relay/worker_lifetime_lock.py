@@ -564,12 +564,16 @@ def exclusive_migration_lifetime(
             mode="exclusive",
             timeout_seconds=effective_timeout,
         ) as lifetime_lock:
-            locked_stat = os.stat(lifetime_lock.core_dir)
+            locked_root = internal_filesystem_path(
+                lifetime_lock.core_dir,
+                force_extended=True,
+            )
+            locked_stat = os.stat(locked_root)
             descriptor = lifetime_lock.descriptor
             if descriptor is None:
                 raise ConfigurationError("exclusive migration lifetime lock is not acquired")
             identity = _locked_core_identity(
-                lifetime_lock.core_dir,
+                locked_root,
                 locked_stat,
                 guard_fd=descriptor,
             )

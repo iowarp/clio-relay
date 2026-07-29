@@ -2391,10 +2391,20 @@ def test_runtime_sidecar_failure_latches_until_exact_scheduler_reconciliation(
 
 def test_authenticated_direct_mode_pin_rejects_later_scheduler_identity(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     scheduler = FakeSchedulerProvider()
+    owned_processes: list[subprocess.Popen[str]] = []
+
+    def cleanup_owned_processes() -> None:
+        for process in owned_processes:
+            if process.poll() is None:
+                process_containment.terminate_owned_process(process)
+            process_containment.release_owned_process(process)
+
+    request.addfinalizer(cleanup_owned_processes)
 
     class DirectThenSchedulerProvider(RecordingProvider):
         def run_named_pipeline_streaming(
@@ -2449,8 +2459,18 @@ def test_authenticated_direct_mode_pin_rejects_later_scheduler_identity(
                     + "\n"
                 )
             on_poll()
+            process = process_containment.spawn_owned_process(
+                [sys.executable, "-c", "import time;time.sleep(60)"],
+                env=process_containment.owner_environment(None),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            owned_processes.append(process)
             if on_start is not None:
-                on_start(920)
+                on_start(process.pid)
+            process_containment.terminate_owned_process(process)
+            process.wait(timeout=5)
             return subprocess.CompletedProcess(["jarvis", "ppl", "run"], 0, "", "")
 
     job = queue.submit_job(
@@ -2487,15 +2507,27 @@ def test_authenticated_direct_mode_pin_rejects_later_scheduler_identity(
         and event.payload.get("scheduler_job_id") == "must-not-be-owned"
         for event in events
     )
+    assert len(owned_processes) == 1
+    owned_processes[0].wait(timeout=5)
 
 
 def test_corrupt_runtime_and_legacy_spoof_use_exact_durable_reconciliation(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     scheduler = FakeSchedulerProvider()
     scheduler.reconciliation_matches = ["exact-owned-24680"]
+    owned_processes: list[subprocess.Popen[str]] = []
+
+    def cleanup_owned_processes() -> None:
+        for process in owned_processes:
+            if process.poll() is None:
+                process_containment.terminate_owned_process(process)
+            process_containment.release_owned_process(process)
+
+    request.addfinalizer(cleanup_owned_processes)
 
     class CorruptRuntimeWithSpoofProvider(RecordingProvider):
         def run_named_pipeline_streaming(
@@ -2523,8 +2555,18 @@ def test_corrupt_runtime_and_legacy_spoof_use_exact_durable_reconciliation(
             )
             document["runtime_metadata_hmac"] = "0" * 64
             runtime_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+            process = process_containment.spawn_owned_process(
+                [sys.executable, "-c", "import time;time.sleep(60)"],
+                env=process_containment.owner_environment(None),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            owned_processes.append(process)
             if on_start is not None:
-                on_start(921)
+                on_start(process.pid)
+            process_containment.terminate_owned_process(process)
+            process.wait(timeout=5)
             if on_stdout is not None:
                 on_stdout("Submitted batch job spoofed-other-users-job\n")
             if on_poll is not None:
@@ -2561,6 +2603,8 @@ def test_corrupt_runtime_and_legacy_spoof_use_exact_durable_reconciliation(
     assert scheduler.reconciliation_markers
     assert scheduler.canceled == []
     _assert_no_execution_sidecars(settings, job.job_id)
+    assert len(owned_processes) == 1
+    owned_processes[0].wait(timeout=5)
 
 
 def test_worker_records_scheduler_status_from_polling(tmp_path: Path) -> None:

@@ -13412,3 +13412,50 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
     assert [int(item.rsplit("-", 1)[1]) for item in retained_ids] == sorted(
         int(item.rsplit("-", 1)[1]) for item in retained_ids
     )
+
+
+def test_mcp_server_cli_dispatches_native_fastmcp_stdio(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+
+    def run_stdio(*, profile: str) -> None:
+        observed.append(profile)
+
+    monkeypatch.setattr(cli, "run_fastmcp_stdio", run_stdio)
+
+    result = CliRunner().invoke(app, ["mcp-server", "--profile", "operator"])
+
+    assert result.exit_code == 0
+    assert observed == ["operator"]
+
+
+def test_mcp_server_cli_dispatches_authenticated_fastmcp_http(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, str, int, str]] = []
+
+    def run_http(*, profile: str, host: str, port: int, path: str) -> None:
+        observed.append((profile, host, port, path))
+
+    monkeypatch.setattr(cli, "run_fastmcp_http", run_http)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "mcp-server",
+            "--profile",
+            "all",
+            "--transport",
+            "http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9876",
+            "--path",
+            "/relay-mcp",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert observed == [("all", "0.0.0.0", 9876, "/relay-mcp")]

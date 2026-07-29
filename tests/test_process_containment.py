@@ -75,6 +75,72 @@ def test_owned_process_forwards_exact_bounded_stdin_payload() -> None:
         process_containment.release_owned_process(process)
 
 
+def test_broker_setup_timeout_joins_writer_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out setup writer cannot survive to corrupt a reused pipe handle."""
+    private = cast(Any, process_containment)
+    read_descriptor, write_descriptor = os.pipe()
+    setup_channel = os.fdopen(write_descriptor, "wb", buffering=0)
+    kill_observed = threading.Event()
+    allow_writer_exit = threading.Event()
+
+    class TimedOutBroker:
+        pid = 424242
+        stdin = setup_channel
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+            kill_observed.set()
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == process_containment.TERMINATION_TIMEOUT_SECONDS
+            assert self.returncode == -9
+            return -9
+
+    broker = TimedOutBroker()
+    original_write = os.write
+
+    def blocked_write(descriptor: int, payload: object) -> int:
+        if descriptor != write_descriptor:
+            return original_write(descriptor, cast(bytes, payload))
+        assert kill_observed.wait(timeout=1)
+        assert allow_writer_exit.wait(timeout=1)
+        raise BrokenPipeError("simulated timed-out broker pipe")
+
+    def release_writer() -> None:
+        assert kill_observed.wait(timeout=1)
+        time.sleep(0.05)
+        allow_writer_exit.set()
+
+    releaser = threading.Thread(target=release_writer, daemon=True)
+    releaser.start()
+    monkeypatch.setattr(process_containment.os, "write", blocked_write)
+    try:
+        with pytest.raises(RuntimeError, match="broker setup write timed out"):
+            private._release_broker(
+                broker,
+                readiness=SimpleNamespace(token="test-readiness"),
+                startup_deadline=time.monotonic() + 0.01,
+            )
+        writer_alive_after_return = any(
+            thread.name == f"clio-relay-broker-release-{broker.pid}" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+    finally:
+        allow_writer_exit.set()
+        releaser.join(timeout=1)
+        setup_channel.close()
+        os.close(read_descriptor)
+
+    assert broker.stdin is None
+    assert not writer_alive_after_return
+
+
 def test_linux_containment_discovery_uses_one_absolute_startup_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

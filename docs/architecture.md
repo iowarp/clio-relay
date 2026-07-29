@@ -32,6 +32,14 @@ generation converge.
 
 Tasks can also have structured timeline events. A remote agent can record discovery, planning, warnings, commands, scheduler decisions, and completion as resumable task-scoped records. These events are separate from raw stdout so a UI can show meaningful work before the final answer exists.
 
+The local MCP server exposes long-running relay operations through the
+SEP-2663 tasks extension. This is a protocol projection, not another task
+backend: the standardized task ID is the existing relay job ID, and canonical
+job, route, cancellation, event, and artifact records remain authoritative.
+The bounded `clio-relay.mcp-task-projection.v1` record retains only the protocol
+state needed for standard client polling, input updates, and reconnect.
+FastMCP's Docket-backed task executor is not started.
+
 Gateway sessions are durable records for scheduler-backed services such as interactive visualization servers, data streams, remote MCP servers, or long-running agent services. A session records the scheduler job, queue state, allocated node, logs, forwarded endpoint metadata, health hints, and close state. This lets the desktop detach, reconnect, and mark the session closed without treating it as an anonymous process. The package or scheduler integration remains responsible for stopping the actual remote service.
 
 Before a gateway launches scheduler or connector work, it records an exact

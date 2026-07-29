@@ -8,7 +8,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,6 +34,11 @@ MAX_JARVIS_RUN_INPUT_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_TRANSFORM_ENVIRONMENT_BYTES = 16 * 1024
 MAX_TRANSFORM_REF_BYTES = 192 * 1024
 MAX_TRANSFORM_USED_EVIDENCE = 1_000
+MAX_MCP_TASK_ARGUMENT_BYTES = 512 * 1024
+MAX_MCP_TASK_INPUT_ROUND_BYTES = 256 * 1024
+MAX_MCP_TASK_PROJECTION_BYTES = 768 * 1024
+MAX_MCP_TASK_JSON_DEPTH = 64
+MAX_MCP_TASK_JSON_NODES = 100_000
 REGISTERED_JARVIS_USER_CONTRACT = "clio-kit-jarvis-user-v3.6"
 
 
@@ -1590,6 +1595,147 @@ def prepare_owned_jarvis_run_submission(job: RelayJob) -> RelayJob:
             )
         }
     )
+
+
+def _require_bounded_mcp_task_json(
+    value: object,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> None:
+    """Require one finite, bounded JSON tree before durable task persistence."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_MCP_TASK_JSON_NODES:
+            raise ValueError(f"{label} exceeds {MAX_MCP_TASK_JSON_NODES} JSON nodes")
+        if depth > MAX_MCP_TASK_JSON_DEPTH:
+            raise ValueError(f"{label} exceeds {MAX_MCP_TASK_JSON_DEPTH} nesting levels")
+        if isinstance(current, dict):
+            for key, item in cast(dict[object, object], current).items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{label} contains a non-string JSON object key")
+                stack.append((item, depth + 1))
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in cast(list[object], current))
+        elif not isinstance(current, str | int | float | bool | None):
+            raise ValueError(f"{label} contains a non-JSON value")
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain finite JSON values") from exc
+    if len(encoded) > maximum_bytes:
+        raise ValueError(f"{label} exceeds {maximum_bytes} UTF-8 bytes")
+
+
+class RelayMcpInputRound(BaseModel):
+    """Durable outstanding input for one re-entrant MCP task leg."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    leg: int = Field(ge=1)
+    outstanding: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    answered: dict[str, Any] = Field(default_factory=dict)
+    request_state: str | None = Field(default=None, max_length=65_536)
+
+    @model_validator(mode="after")
+    def input_round_must_be_bounded(self) -> RelayMcpInputRound:
+        """Bound the complete round, including untrusted request payloads and answers."""
+        _require_bounded_mcp_task_json(
+            self.model_dump(mode="json"),
+            label="MCP task input round",
+            maximum_bytes=MAX_MCP_TASK_INPUT_ROUND_BYTES,
+        )
+        return self
+
+
+class RelayMcpTaskProjection(BaseModel):
+    """Typed SEP-2663 projection attached to an existing durable relay job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.mcp-task-projection.v1"] = (
+        "clio-relay.mcp-task-projection.v1"
+    )
+    tool_name: str = Field(min_length=1, max_length=512)
+    profile: str = Field(min_length=1, max_length=64)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    catalog_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    initial_result: dict[str, Any]
+    issued_input_keys: list[str] = Field(default_factory=list, max_length=1_000)
+    input_round: RelayMcpInputRound | None = None
+    completed_result: dict[str, Any] | None = None
+    protocol_error: dict[str, Any] | None = None
+
+    @field_validator("issued_input_keys")
+    @classmethod
+    def input_keys_must_be_unique(cls, value: list[str]) -> list[str]:
+        """Reject ambiguous replay identities for task input requests."""
+        if len(value) != len(set(value)):
+            raise ValueError("issued_input_keys must be unique")
+        if any(not key or len(key) > 512 for key in value):
+            raise ValueError("issued_input_keys must contain bounded non-empty strings")
+        return value
+
+    @model_validator(mode="after")
+    def projection_must_be_bounded(self) -> RelayMcpTaskProjection:
+        """Require one unambiguous, finite projection below its record limit."""
+        if self.input_round is not None:
+            issued = set(self.issued_input_keys)
+            outstanding = set(self.input_round.outstanding)
+            answered = set(self.input_round.answered)
+            if not (outstanding | answered) <= issued:
+                raise ValueError("MCP task input round contains an unissued request key")
+            if outstanding & answered:
+                raise ValueError("MCP task input request cannot be outstanding and answered")
+        outcome_count = sum(
+            (
+                self.protocol_error is not None,
+                self.completed_result is not None,
+                self.input_round is not None and bool(self.input_round.outstanding),
+            )
+        )
+        if outcome_count > 1:
+            raise ValueError("MCP task projection contains conflicting result states")
+        _require_bounded_mcp_task_json(
+            self.arguments,
+            label="MCP task arguments",
+            maximum_bytes=MAX_MCP_TASK_ARGUMENT_BYTES,
+        )
+        _require_bounded_mcp_task_json(
+            self.model_dump(mode="json"),
+            label="MCP task projection",
+            maximum_bytes=MAX_MCP_TASK_PROJECTION_BYTES,
+        )
+        return self
+
+
+class RelayMcpTaskRecord(BaseModel):
+    """Durable MCP task handle projecting one local or federated relay job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: DurableRecordId
+    job_id: DurableRecordId
+    state: JobState
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    projection: RelayMcpTaskProjection
+
+    @model_validator(mode="after")
+    def task_id_must_project_job_id(self) -> RelayMcpTaskRecord:
+        """Keep the standardized task handle identical to the relay job handle."""
+        if self.task_id != self.job_id:
+            raise ValueError("MCP task_id must equal its projected relay job_id")
+        return self
 
 
 class RelayTask(BaseModel):

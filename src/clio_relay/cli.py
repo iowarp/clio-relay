@@ -86,6 +86,7 @@ from clio_relay.errors import (
     ObservationTimeoutError,
     RelayError,
 )
+from clio_relay.fastmcp_server import run_fastmcp_http, run_fastmcp_stdio
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
@@ -120,7 +121,6 @@ from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptanc
 from clio_relay.mcp_server import (
     load_registered_remote_mcp_catalog,
     render_agent_mcp_profile,
-    serve_stdio,
     static_mcp_tool_names,
 )
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession, run_packaged_mcp_stdio_session
@@ -11649,9 +11649,28 @@ def mcp_server(
         str,
         typer.Option(help="MCP tool profile: user, admin, operator, or all."),
     ] = "user",
+    transport: Annotated[
+        Literal["stdio", "http"],
+        typer.Option(help="MCP transport: stdio or authenticated Streamable HTTP."),
+    ] = "stdio",
+    host: Annotated[
+        str,
+        typer.Option(help="HTTP bind address; ignored for stdio."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(help="HTTP bind port; ignored for stdio."),
+    ] = 8766,
+    path: Annotated[
+        str,
+        typer.Option(help="Streamable HTTP MCP path; ignored for stdio."),
+    ] = "/mcp",
 ) -> None:
-    """Serve relay job tools over stdio MCP."""
-    serve_stdio(profile=profile)
+    """Serve relay tools with native FastMCP and relay-backed SEP-2663 tasks."""
+    if transport == "stdio":
+        run_fastmcp_stdio(profile=profile)
+        return
+    run_fastmcp_http(profile=profile, host=host, port=port, path=path)
 
 
 @api_app.command("start")

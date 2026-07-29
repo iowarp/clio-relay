@@ -49,6 +49,13 @@ Job submission is asynchronous by default. Submit returns a `job_id`, state, kin
 Remote agent jobs should usually submit child cluster work asynchronously and return the child `job_id`. A cluster worker running a parent agent job cannot also execute a child job if it is waiting synchronously inside the parent.
 
 Cancellation is durable and cooperative. A cancel request records queue events and the worker terminates the running process group. For scheduler-backed packages, package code should capture scheduler job ids and cancel through the scheduler when needed.
+
+The native FastMCP server implements SEP-2663 with a custom
+`RelayTasksExtension`. Its task ID equals the existing relay job ID. The
+projection record is protocol state only; clio-core/relay remains the sole
+execution, scheduling, recovery, artifact, and cancellation authority.
+FastMCP's stock Docket-backed `TasksExtension` is not enabled and
+`FastMCP.docket` remains `None`.
 Session teardown quiesces the exact owner-session generation before discovery. With
 `--cancel-jobs`, it waits boundedly for worker cleanup acknowledgment of leased and
 running jobs before gateway or API cleanup. It stops the API to seal intake, rescans

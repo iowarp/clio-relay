@@ -342,15 +342,22 @@ class StorageManagedQueue(ClioCoreQueue):
         lock_timeout_seconds: float = DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     ) -> None:
         self._closed = False
-        if Path(root).absolute() != storage_runtime.config.core_root.absolute():
+        if logical_filesystem_path(Path(root).absolute()) != logical_filesystem_path(
+            storage_runtime.config.core_root.absolute()
+        ):
             raise ValueError("managed queue root must match the storage runtime core root")
         if owns_writer_lifetime_lock and writer_lifetime_lock is None:
             raise ValueError("an owned writer lifetime lock must be provided")
         if writer_lifetime_lock is not None:
             if not writer_lifetime_lock.acquired or writer_lifetime_lock.mode != "shared":
                 raise ValueError("managed queue writer lifetime lock must hold shared ownership")
-            root_stat = os.stat(root)
-            lock_stat = os.stat(writer_lifetime_lock.core_dir)
+            root_stat = os.stat(internal_filesystem_path(Path(root), force_extended=True))
+            lock_stat = os.stat(
+                internal_filesystem_path(
+                    writer_lifetime_lock.core_dir,
+                    force_extended=True,
+                )
+            )
             if (root_stat.st_dev, root_stat.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
                 raise ValueError("managed queue root must match its writer lifetime lock")
         super().__init__(root, lock_timeout_seconds=lock_timeout_seconds)
@@ -970,12 +977,13 @@ def storage_managed_queue(
 def initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLock) -> None:
     """Create a missing queue seal under exclusive ownership, then restore shared ownership."""
     core_dir = lifetime_lock.core_dir
+    internal_core_dir = internal_filesystem_path(core_dir, force_extended=True)
     try:
         ClioCoreQueue(core_dir).initialize(allow_exclusive_seal=False)
         return
     except QueueSealRequiresExclusive:
         try:
-            original_stat = os.stat(core_dir)
+            original_stat = os.stat(internal_core_dir)
         except OSError as exc:
             raise ConfigurationError(
                 f"queue root identity cannot be captured before seal fencing: {exc}"
@@ -1007,7 +1015,12 @@ def initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLoc
                 ) from exc
 
     try:
-        reacquired_stat = os.stat(lifetime_lock.core_dir)
+        reacquired_stat = os.stat(
+            internal_filesystem_path(
+                lifetime_lock.core_dir,
+                force_extended=True,
+            )
+        )
     except OSError as exc:
         raise ConfigurationError(
             f"queue root identity cannot be verified after seal fencing: {exc}"
