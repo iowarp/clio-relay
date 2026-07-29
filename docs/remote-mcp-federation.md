@@ -389,6 +389,16 @@ relay's exact JARVIS-CD release pin. That dependency edge is recorded in the
 install receipt and call result. Operator-registered MCP servers remain bound
 by their own discovery artifact and are not constrained to the relay's
 JARVIS-CD version.
+
+For a verified `clio-kit.locked-server.v4` launcher, the worker withholds the
+MCP `initialize` message until clio-kit's typed post-build cache event proves
+that the locked environment sync has finished. This prevents a preparatory
+subprocess from consuming protocol input. The request-scoped launch sets
+`CLIO_KIT_UV_CACHE_PRUNE=0`: cache-wide pruning can wait behind another live
+clio-kit server and is not part of an individual MCP call's bounded startup.
+The locked sync and safe superseded-environment eviction still run; operators
+can perform explicit clio-kit cache GC outside a served MCP session.
+
 The release gate requires that exact 2.6.5 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.

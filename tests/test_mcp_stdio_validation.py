@@ -85,8 +85,17 @@ def _fake_transcript(*, version: str = __version__, tools: list[JSON] | None = N
             "id": "clio-relay-validation-initialize",
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                "capabilities": {
+                    "logging": {},
+                    "prompts": {"listChanged": False},
+                    "resources": {"listChanged": False, "subscribe": False},
+                    "tools": {"listChanged": True},
+                },
                 "serverInfo": {"name": "clio-relay", "version": version},
+                "instructions": (
+                    "Durable relay operations. Relay jobs remain the sole execution "
+                    "and cancellation authority."
+                ),
             },
         },
         {
@@ -558,7 +567,9 @@ def test_packaged_stdio_session_requires_exact_initialize_capabilities(
     monkeypatch: MonkeyPatch,
 ) -> None:
     transcript = _fake_transcript().replace(
-        b'"capabilities":{"tools":{}}',
+        b'"capabilities":{"logging":{},"prompts":{"listChanged":false},'
+        b'"resources":{"listChanged":false,"subscribe":false},'
+        b'"tools":{"listChanged":true}}',
         b'"capabilities":{}',
     )
     executable = _write_fake_executable(

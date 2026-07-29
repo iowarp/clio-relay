@@ -163,6 +163,13 @@ The MCP server exposes relay tools for:
 
 MCP tools operate on the same durable records as CLI and HTTP calls.
 
+`clio-relay mcp-server` uses native FastMCP over stdio or authenticated
+Streamable HTTP. On MCP `2026-07-28`, it advertises
+`io.modelcontextprotocol/tasks` and binds `tasks/get`, `tasks/update`, and
+`tasks/cancel`. Standard task IDs equal relay job IDs. Virtual remote/JARVIS
+operations may return tasks; low-level submit/status/read/cancel tools remain
+immediate. The server does not run Docket. See `docs/mcp-tasks.md`.
+
 `relay_artifact_lineage` is the single user-profile lineage query. Pass `job_id`
 to list that job's immutable input edges or `artifact_id` to list downstream
 consumer jobs; cluster routes use the normal `cluster` plus `route_revision`

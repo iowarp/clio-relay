@@ -17,6 +17,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, BinaryIO, cast
 
+from mcp_types import ToolAnnotations
+
 from clio_relay import __version__
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import ObservationTimeoutError, RelayError
@@ -889,12 +891,24 @@ def _validate_protocol_contract(
 def _validate_initialize_contract(initialize_response: JSON) -> JSON:
     """Validate the exact packaged relay initialization contract before activation."""
     initialize_result = _required_result(initialize_response, label="initialize")
-    if set(initialize_result) != {"protocolVersion", "capabilities", "serverInfo"}:
+    if set(initialize_result) - {
+        "protocolVersion",
+        "capabilities",
+        "serverInfo",
+        "instructions",
+    }:
         raise RelayError("packaged MCP initialize result contained unexpected fields")
     if initialize_result.get("protocolVersion") != _EXPECTED_PROTOCOL_VERSION:
         raise RelayError("packaged MCP initialize protocol version did not match")
-    if initialize_result.get("capabilities") != {"tools": {}}:
+    capabilities = _mapping(initialize_result.get("capabilities"))
+    tools_capability = None if capabilities is None else _mapping(capabilities.get("tools"))
+    if capabilities is None or tools_capability is None:
         raise RelayError("packaged MCP initialize capabilities did not match")
+    if tools_capability.get("listChanged") is not True:
+        raise RelayError("packaged MCP initialize did not advertise live tool catalogs")
+    instructions = initialize_result.get("instructions")
+    if not isinstance(instructions, str) or "sole execution" not in instructions:
+        raise RelayError("packaged MCP initialize omitted relay execution authority")
     server_info = _mapping(initialize_result.get("serverInfo"))
     if server_info is None or server_info.get("name") != "clio-relay":
         raise RelayError("packaged MCP initialize serverInfo name did not match")
@@ -1005,9 +1019,72 @@ def _validate_pinned_jarvis_contract(tools: list[JSON]) -> str | None:
         cast(str, definition["name"]): definition
         for definition in virtual_jarvis_tool_definitions(clusters=clusters)
     }
-    if actual != expected:
-        raise RelayError("packaged MCP JARVIS v3.6 agent-facing schema did not match its pin")
+    contract_fields = (
+        "name",
+        "description",
+        "inputSchema",
+        "outputSchema",
+    )
+    normalized_expected_annotations = {
+        name: _normalized_tool_annotations(definition.get("annotations")) or {}
+        for name, definition in expected.items()
+    }
+    for name, definition in actual.items():
+        actual_annotations = _normalized_tool_annotations(definition.get("annotations")) or {}
+        expected_annotations = normalized_expected_annotations[name]
+        annotation_differences = {
+            key: {
+                "actual": actual_annotations.get(key),
+                "expected": value,
+            }
+            for key, value in expected_annotations.items()
+            if actual_annotations.get(key) != value
+        }
+        if annotation_differences:
+            raise RelayError(
+                "packaged MCP JARVIS v3.6 annotation semantics did not match its pin: "
+                f"{name} {annotation_differences}"
+            )
+    actual_contract = {
+        name: {
+            **{field: definition.get(field) for field in contract_fields},
+            "annotations": normalized_expected_annotations[name],
+        }
+        for name, definition in actual.items()
+    }
+    expected_contract = {
+        name: {
+            **{field: definition.get(field) for field in contract_fields},
+            "annotations": normalized_expected_annotations[name],
+        }
+        for name, definition in expected.items()
+    }
+    if actual_contract != expected_contract:
+        differing_fields = {
+            name: [
+                field
+                for field in (*contract_fields, "annotations")
+                if actual_contract[name].get(field) != expected_contract[name].get(field)
+            ]
+            for name in sorted(actual_contract)
+            if actual_contract[name] != expected_contract[name]
+        }
+        raise RelayError(
+            "packaged MCP JARVIS v3.6 agent-facing schema did not match its pin: "
+            f"{differing_fields}"
+        )
     return _tools_digest([actual[name] for name in sorted(actual)])
+
+
+def _normalized_tool_annotations(value: object) -> JSON | None:
+    """Normalize MCP annotation defaults before comparing a pinned catalog."""
+    if value is None:
+        return None
+    return ToolAnnotations.model_validate(value).model_dump(
+        by_alias=True,
+        mode="json",
+        exclude_none=True,
+    )
 
 
 def _required_result(response: JSON, *, label: str) -> JSON:

@@ -2676,9 +2676,14 @@ async def _monitor_stream_payloads(
             raise TypeError("monitor payload next_cursor was not an integer")
         next_cursor = raw_next_cursor
         yield _public_payload({"event": "monitor", "data": payload})
-        job = queue.get_job(job_id)
-        if stop_on_terminal and job.state.value in {"succeeded", "failed", "canceled"}:
-            yield {"event": "terminal", "data": {"job_id": job_id, "state": job.state.value}}
+        raw_job = payload.get("job")
+        if not isinstance(raw_job, dict):
+            raise TypeError("monitor payload job was not an object")
+        raw_state = cast(dict[str, object], raw_job).get("state")
+        if not isinstance(raw_state, str):
+            raise TypeError("monitor payload job state was not a string")
+        if stop_on_terminal and payload.get("terminal") is True:
+            yield {"event": "terminal", "data": {"job_id": job_id, "state": raw_state}}
             return
         await asyncio.sleep(poll_seconds)
 

@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.5.8` uses a release-first patch process. A maintainer builds the
+> Version `1.5.9` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -92,6 +92,18 @@ Expose relay tools to an agent:
 clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
+
+The MCP server is native FastMCP and can project long-running relay operations
+through standard SEP-2663 task handles without introducing a second scheduler.
+Stdio is the default. Authenticated Streamable HTTP is also available:
+
+```powershell
+$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
+clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
+```
+
+See [MCP background tasks](docs/mcp-tasks.md) for official FastMCP client usage,
+reconnect, cancellation, input, and security semantics.
 
 Operators can expose selected tools from any cluster-side stdio MCP server
 through the same local relay MCP. Registration is allowlisted, and schema

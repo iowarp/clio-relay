@@ -71,6 +71,8 @@ from clio_relay.models import (
     ProgressRecord,
     RelayEvent,
     RelayJob,
+    RelayMcpTaskProjection,
+    RelayMcpTaskRecord,
     RelayTask,
     SchedulerCancelDisposition,
     SchedulerCancelDispositionState,
@@ -207,6 +209,7 @@ RECORD_FAMILY_MAX_BYTES: dict[str, int] = {
     "migrations": 262_144,
     "monitor_rules": 262_144,
     "monitor_rules_by_job": 262_144,
+    "mcp_tasks": 1_048_576,
     "owner_sessions": 65_536,
     "owner_session_jobs": 65_536,
     "owner_session_legacy_jobs": 65_536,
@@ -354,7 +357,7 @@ _INITIALIZED_QUEUE_FAMILIES = (
     "gc_trash",
     "global_order",
 )
-_ADDITIVE_QUEUE_FAMILIES = ("transforms",)
+_ADDITIVE_QUEUE_FAMILIES = ("transforms", "mcp_tasks")
 _LEGACY_ONLY_QUEUE_FAMILIES = ("cursors",)
 _GC_TERMINAL_SCHEDULER_PHASES = {
     SchedulerPhase.COMPLETED.value,
@@ -7449,6 +7452,87 @@ class ClioCoreQueue:
             )
         return saved
 
+    def put_mcp_task(self, task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        """Durably create or replay one MCP projection of a relay job."""
+        task = RelayMcpTaskRecord.model_validate(task.model_dump(mode="python"))
+        self._require_durable_record_id(task.task_id, field="task_id")
+        self._require_durable_record_id(task.job_id, field="job_id")
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            path = self._storage_root / "mcp_tasks" / f"{task.task_id}.json"
+            existing = self._read_optional(path, RelayMcpTaskRecord)
+            if existing is not None:
+                requested = task.projection
+                persisted = existing.projection
+                route_fields = ("remote", "cluster", "route_revision")
+                if (
+                    existing.task_id != task.task_id
+                    or existing.job_id != task.job_id
+                    or persisted.tool_name != requested.tool_name
+                    or persisted.profile != requested.profile
+                    or persisted.arguments != requested.arguments
+                    or persisted.catalog_revision != requested.catalog_revision
+                    or {field: persisted.initial_result.get(field) for field in route_fields}
+                    != {field: requested.initial_result.get(field) for field in route_fields}
+                ):
+                    raise QueueConflictError(
+                        f"MCP task identity was reused with different semantics: {task.task_id}"
+                    )
+                return existing
+            self._write(path, task)
+            return task
+
+    def update_mcp_task_projection(
+        self,
+        task_id: str,
+        projection: RelayMcpTaskProjection,
+        *,
+        expected_updated_at: datetime | None = None,
+        state: JobState | None = None,
+    ) -> RelayMcpTaskRecord:
+        """Atomically replace one typed MCP projection with optional CAS protection."""
+        projection = RelayMcpTaskProjection.model_validate(projection.model_dump(mode="python"))
+        task_id = self._require_durable_record_id(task_id, field="task_id")
+        self.initialize()
+        with self._lock:
+            self._recover_pending_transitions_unlocked()
+            path = self._storage_root / "mcp_tasks" / f"{task_id}.json"
+            task = self._read_optional(path, RelayMcpTaskRecord)
+            if task is None:
+                raise NotFoundError(f"MCP task not found: {task_id}")
+            if task.task_id != task_id or task.job_id != task_id:
+                raise QueueConflictError(f"canonical MCP task identity mismatch: {path}")
+            if expected_updated_at is not None and task.updated_at != expected_updated_at:
+                raise QueueConflictError(f"MCP task changed during update: {task_id}")
+            updates: dict[str, object] = {
+                "updated_at": utc_now(),
+                "projection": projection,
+            }
+            if state is not None:
+                updates["state"] = state
+            updated = RelayMcpTaskRecord.model_validate(
+                {
+                    **task.model_dump(mode="python"),
+                    **updates,
+                }
+            )
+            self._write(path, updated)
+            return updated
+
+    def get_mcp_task(self, task_id: str) -> RelayMcpTaskRecord:
+        """Return one durable MCP task projection by its relay job handle."""
+        task_id = self._require_durable_record_id(task_id, field="task_id")
+        task = self._read_optional(
+            self._storage_root / "mcp_tasks" / f"{task_id}.json",
+            RelayMcpTaskRecord,
+        )
+        if task is None:
+            raise NotFoundError(f"MCP task not found: {task_id}")
+        if task.task_id != task_id or task.job_id != task_id:
+            raise QueueConflictError(f"canonical MCP task identity mismatch: {task_id}")
+        return task
+
     def update_task_state(
         self,
         task_id: str,
@@ -12742,6 +12826,7 @@ class ClioCoreQueue:
                 ("jobs_queued", f"{job_id}.json"),
                 ("job_indexes", f"{safe_job_id}.json"),
                 ("transforms", f"{job_id}.json"),
+                ("mcp_tasks", f"{job_id}.json"),
             )
         )
         actions = 0

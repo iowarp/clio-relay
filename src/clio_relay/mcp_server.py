@@ -354,6 +354,71 @@ class _VerifiedMcpResult:
     public: JSON
 
 
+def normalize_mcp_profile(profile: str) -> str:
+    """Normalize a public MCP tool-profile name."""
+    return _normalize_profile(profile)
+
+
+def mcp_tool_definitions_and_remote_catalog(
+    *,
+    profile: str,
+) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+    """Return the complete static and dynamic MCP tool catalog."""
+    return _tool_definitions_and_remote_catalog(profile=profile)
+
+
+def call_mcp_tool(
+    params: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+    profile: str,
+    session: McpSessionState | None,
+    observed_remote_mcp_catalog_revision: str | None,
+    require_advertised_remote_mcp_catalog: bool,
+) -> JSON:
+    """Call one established relay MCP tool through its shared dispatcher."""
+    return _call_tool(
+        params,
+        queue=queue,
+        settings=settings,
+        profile=profile,
+        session=session,
+        observed_remote_mcp_catalog_revision=observed_remote_mcp_catalog_revision,
+        require_advertised_remote_mcp_catalog=require_advertised_remote_mcp_catalog,
+    )
+
+
+def status_mcp_job(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
+    """Read one local or routed relay job through MCP handle semantics."""
+    return _status_job(arguments, queue=queue, settings=settings)
+
+
+def wait_mcp_job(
+    arguments: JSON,
+    *,
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> JSON:
+    """Boundedly reconcile one local or routed MCP job."""
+    return _wait_job(arguments, queue=queue, settings=settings)
+
+
+def serialize_mcp_tool_result(result: JSON) -> str:
+    """Serialize a bounded human-readable relay tool result."""
+    return _serialize_tool_result(result)
+
+
+def mcp_tool_result_failed(result: JSON) -> bool:
+    """Return whether a relay result maps to CallToolResult.isError."""
+    return _mcp_tool_result_failed(result)
+
+
 def serve_stdio(
     *,
     stdin: TextIO = sys.stdin,

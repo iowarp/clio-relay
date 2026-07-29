@@ -1728,18 +1728,52 @@ def open_private_configuration_windows_descriptor(
         ctypes.c_void_p,
     ]
     create_file.restype = ctypes.c_void_p
-    raw_handle = create_file(
-        str(storage_path),
-        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER,
-        0 if exclusive else _WINDOWS_FILE_SHARE_READ,
-        None,
-        _WINDOWS_OPEN_EXISTING,
-        _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
-        None,
+    full_access = (
+        _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER
     )
-    if raw_handle in (None, ctypes.c_void_p(-1).value):
+    owner_preserving_access = full_access & ~_WINDOWS_WRITE_OWNER
+    raw_handle: int | None = None
+    for attempt in range(MAX_CONFIG_READ_ATTEMPTS):
+        candidate_handle = create_file(
+            str(storage_path),
+            full_access,
+            0 if exclusive else _WINDOWS_FILE_SHARE_READ,
+            None,
+            _WINDOWS_OPEN_EXISTING,
+            _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if candidate_handle not in (None, ctypes.c_void_p(-1).value):
+            raw_handle = cast(int, candidate_handle)
+            break
         error = _windows_last_error()
-        raise ConfigurationError(f"could not open private Windows file ({error}): {path}")
+        if error == 5:
+            candidate_handle = create_file(
+                str(storage_path),
+                owner_preserving_access,
+                0 if exclusive else _WINDOWS_FILE_SHARE_READ,
+                None,
+                _WINDOWS_OPEN_EXISTING,
+                _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+            if candidate_handle not in (None, ctypes.c_void_p(-1).value):
+                raw_handle = cast(int, candidate_handle)
+                break
+            error = _windows_last_error()
+        if error not in {5, 32, 33} or attempt + 1 >= MAX_CONFIG_READ_ATTEMPTS:
+            raise ConfigurationError(f"could not open private Windows file ({error}): {path}")
+        observed = os.lstat(storage_path)
+        if not (
+            stat.S_ISREG(observed.st_mode)
+            and not _is_reparse_stat(observed)
+            and observed.st_nlink == expected_nlink
+            and os.path.samestat(before, observed)
+        ):
+            raise ConfigurationError(f"private Windows file changed while awaiting access: {path}")
+        time.sleep(CONFIG_READ_RETRY_SECONDS)
+    if raw_handle is None:  # pragma: no cover - loop exits by success or exception
+        raise ConfigurationError(f"could not open private Windows file: {path}")
     handle = ctypes.c_void_p(raw_handle)
     try:
         get_information = kernel32.GetFileInformationByHandle
@@ -1772,7 +1806,7 @@ def open_private_configuration_windows_descriptor(
         if not os.path.samestat(after, confirmed) or confirmed.st_nlink != expected_nlink:
             raise ConfigurationError(f"private Windows file changed while securing: {path}")
         descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        descriptor = _open_windows_os_file_handle(cast(int, raw_handle), descriptor_flags)
+        descriptor = _open_windows_os_file_handle(raw_handle, descriptor_flags)
         raw_handle = None
         return descriptor
     finally:

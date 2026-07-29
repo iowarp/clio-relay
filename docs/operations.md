@@ -669,6 +669,32 @@ clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
 
 Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
 
+## serve MCP background tasks
+
+The relay MCP server uses native FastMCP. Stdio remains the default:
+
+```powershell
+clio-relay mcp-server --profile user
+```
+
+To expose authenticated Streamable HTTP on loopback:
+
+```powershell
+$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
+clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
+```
+
+HTTP refuses to start without the relay API token. Modern FastMCP clients can
+use ordinary `call_tool` for transparent polling or `call_tool_task` for an
+immediate standard task handle. Closing the client does not cancel the relay
+job; reconnect with the retained task ID. Cancellation remains a separate
+explicit operation.
+
+The server implements SEP-2663 over existing relay jobs and does not start
+FastMCP's Docket execution backend. See [MCP background
+tasks](mcp-tasks.md) for status mapping, input rounds, limits, client examples,
+and protocol-version behavior.
+
 ## Use Remote JARVIS MCP
 
 Install the cluster-side server once, then launch its persistent executable:

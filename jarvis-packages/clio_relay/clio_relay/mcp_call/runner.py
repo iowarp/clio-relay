@@ -24,6 +24,7 @@ import tomllib
 import zipfile
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
+from functools import partial
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
@@ -160,6 +161,20 @@ _STREAM_READ_CHARS = 64 * 1024
 _TOOLS_LIST_PAGINATION_KEY = "_clioRelayPagination"
 _CLIO_KIT_LOCKED_SERVER_SCHEMA = "clio-kit.locked-server.v4"
 _CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY = "uv-run:materialized:frozen:no-editable:no-dev:v3"
+_CLIO_KIT_CACHE_EVENT_SCHEMA = "clio-kit.cache-event.v1"
+_CLIO_KIT_POST_BUILD_EVENTS = frozenset(
+    {
+        "uv_cache_prune",
+        "cache_maintenance_failed",
+        "cache_maintenance_skipped",
+    }
+)
+_CLIO_KIT_REQUEST_ENV_OVERRIDES = {
+    # A cache-wide uv prune waits behind other live clio-kit servers. It must not
+    # become part of one bounded relay request's startup path; explicit cache GC
+    # remains available outside the served MCP session.
+    "CLIO_KIT_UV_CACHE_PRUNE": "0",
+}
 _JARVIS_CD_LOCK_BINDING_SCHEMA = "clio-relay.jarvis-cd-lock-binding.v1"
 # These values intentionally mirror clio_relay.bootstrap. A focused release test
 # prevents either copy from moving independently. The JARVIS package also runs as
@@ -1857,12 +1872,19 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
             server_artifact=server_artifact,
         ) as prepared:
             launch_command, execution_artifact = prepared
+            wait_for_locked_launcher = _requires_locked_launcher_readiness(server_artifact)
+            run_session = _run_mcp_session
+            if wait_for_locked_launcher:
+                run_session = partial(
+                    _run_mcp_session,
+                    wait_for_locked_launcher=True,
+                )
             if (
                 operation == "tools/call"
                 and progress_bridge is None
                 and jarvis_input_manifest is None
             ):
-                process = _run_mcp_session(
+                process = run_session(
                     launch_command,
                     tool=tool,
                     arguments=arguments,
@@ -1870,7 +1892,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
                     env_from=env_from,
                 )
             elif operation == "tools/call" and jarvis_input_manifest is None:
-                process = _run_mcp_session(
+                process = run_session(
                     launch_command,
                     tool=tool,
                     arguments=arguments,
@@ -1879,7 +1901,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
                     progress_bridge=progress_bridge,
                 )
             elif operation == "tools/call":
-                process = _run_mcp_session(
+                process = run_session(
                     launch_command,
                     tool=tool,
                     arguments=arguments,
@@ -1889,7 +1911,7 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
                     jarvis_input_manifest=jarvis_input_manifest,
                 )
             else:
-                process = _run_mcp_session(
+                process = run_session(
                     launch_command,
                     tool=None,
                     arguments={},
@@ -4771,8 +4793,15 @@ def _run_mcp_session(
     env_from: dict[str, str] | None = None,
     progress_bridge: _McpProgressBridge | None = None,
     jarvis_input_manifest: dict[str, Any] | None = None,
+    wait_for_locked_launcher: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    process = _open_process(command, env_from=env_from or {})
+    process = _open_process(
+        command,
+        env_from=env_from or {},
+        environment_overrides=(
+            _CLIO_KIT_REQUEST_ENV_OVERRIDES if wait_for_locked_launcher else None
+        ),
+    )
     previous_handlers = _install_parent_termination_handlers(process)
     stdout_queue: Queue[_StreamEvent] = Queue()
     stderr_queue: Queue[_StreamEvent] = Queue()
@@ -4793,6 +4822,14 @@ def _run_mcp_session(
     started_at = time.monotonic()
     deadline = None if timeout is None else started_at + timeout
     try:
+        if wait_for_locked_launcher:
+            _wait_for_locked_launcher_readiness(
+                stderr_queue,
+                stderr_lines,
+                process=process,
+                deadline=deadline,
+                command=command,
+            )
         _write_message(process, _initialize_message())
         _wait_for_response(
             stdout_queue,
@@ -4887,6 +4924,60 @@ def _run_mcp_session(
         stdout="".join(stdout_lines),
         stderr="".join(stderr_lines),
     )
+
+
+def _requires_locked_launcher_readiness(server_artifact: dict[str, Any]) -> bool:
+    """Return whether a verified nested clio-kit launcher needs its stdin gate."""
+    raw_runtime = server_artifact.get("nested_runtime")
+    runtime = cast(dict[str, Any], raw_runtime) if isinstance(raw_runtime, dict) else None
+    return bool(
+        server_artifact.get("verified") is True
+        and server_artifact.get("nested_launcher") is True
+        and runtime is not None
+        and runtime.get("schema_version") == _CLIO_KIT_LOCKED_SERVER_SCHEMA
+        and runtime.get("locked_runtime_verified") is True
+    )
+
+
+def _wait_for_locked_launcher_readiness(
+    queue: Queue[_StreamEvent],
+    lines: list[str],
+    *,
+    process: subprocess.Popen[str],
+    deadline: float | None,
+    command: list[str],
+) -> None:
+    """Withhold MCP stdin until the verified clio-kit launcher finishes its build."""
+    while True:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout=0)
+        try:
+            line = queue.get(timeout=0.2 if remaining is None else min(0.2, remaining))
+        except Empty:
+            continue
+        if line is None:
+            returncode = process.poll()
+            if returncode is None:
+                try:
+                    returncode = process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    returncode = None
+            detail = f" with return code {returncode}" if returncode is not None else ""
+            raise _McpProtocolFailure(
+                "verified clio-kit launcher stderr closed before its post-build "
+                f"readiness event{detail}"
+            )
+        if isinstance(line, _StreamLimit):
+            raise _McpProtocolFailure(line.message)
+        lines.append(line)
+        message = _decoded_json_object(line)
+        if (
+            message is not None
+            and message.get("schema_version") == _CLIO_KIT_CACHE_EVENT_SCHEMA
+            and message.get("event") in _CLIO_KIT_POST_BUILD_EVENTS
+        ):
+            return
 
 
 def _run_jarvis_input_reconciliation(
@@ -5170,9 +5261,14 @@ def _drain_available(queue: Queue[_StreamEvent], lines: list[str]) -> None:
 
 
 def _open_process(
-    command: list[str], *, env_from: dict[str, str] | None = None
+    command: list[str],
+    *,
+    env_from: dict[str, str] | None = None,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.Popen[str]:
     child_env = _child_env(env_from) if env_from else _scrubbed_env()
+    if environment_overrides is not None:
+        child_env.update(environment_overrides)
     return subprocess.Popen(
         command,
         env=child_env,
