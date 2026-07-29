@@ -2679,7 +2679,7 @@ async def _monitor_stream_payloads(
         raw_job = payload.get("job")
         if not isinstance(raw_job, dict):
             raise TypeError("monitor payload job was not an object")
-        raw_state = raw_job.get("state")
+        raw_state = cast(dict[str, object], raw_job).get("state")
         if not isinstance(raw_state, str):
             raise TypeError("monitor payload job state was not a string")
         if stop_on_terminal and payload.get("terminal") is True:
