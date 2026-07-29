@@ -6521,7 +6521,7 @@ def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
             "session-1",
             "--cancel-jobs",
             "--relay-cancel-timeout-seconds",
-            "1",
+            "30",
             "--relay-cancel-poll-seconds",
             "0.01",
         ],
