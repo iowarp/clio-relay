@@ -59,7 +59,7 @@ around by moving the protected tag.
 
 ```powershell
 $ErrorActionPreference = "Stop"
-$Version = "1.5.9"
+$Version = "1.5.10"
 $Tag = "v$Version"
 $Stage = "candidate" # Use "released" for the second complete pass.
 if ($Stage -notin @("candidate", "released")) { throw "invalid stage" }
@@ -925,7 +925,7 @@ Invoke-JarvisSetupTool "jarvis_add_step" "lammps-add" @{
   step_id = "lammps"
   config = @{
     deploy_mode = "default"; nprocs = 1; ppn = 1; script = $RemoteLammpsInput
-    lmp_bin = "lmp -nonbuf"; out = "$AresRemoteRoot/lammps/out"; kokkos_gpu = $false
+    out = "$AresRemoteRoot/lammps/out"; kokkos_gpu = $false
     progress = @{ adapter = "lammps"; log_visibility = "shared"; total_steps = 10000 }
   }
 }
