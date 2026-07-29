@@ -494,6 +494,152 @@ for line in sys.stdin:
     assert result.stderr == ""
 
 
+def test_mcp_session_withholds_initialize_until_locked_launcher_is_ready(
+    tmp_path: Path,
+) -> None:
+    """A nested launcher's preparation phase cannot consume the MCP handshake."""
+    runner = _load_runner()
+    server_path = tmp_path / "locked_launcher.py"
+    server_path.write_text(
+        """import json
+import os
+import queue
+import sys
+import threading
+import time
+
+received = queue.Queue()
+
+def read_initialize():
+    received.put(sys.stdin.readline())
+
+reader = threading.Thread(target=read_initialize, daemon=True)
+reader.start()
+print(json.dumps({
+    "schema_version": "clio-kit.cache-event.v0",
+    "event": "uv_cache_prune",
+}), file=sys.stderr, flush=True)
+print(json.dumps({
+    "schema_version": "clio-kit.cache-event.v1",
+    "event": "cache_config_rejected",
+}), file=sys.stderr, flush=True)
+time.sleep(0.4)
+if not received.empty():
+    print("initialize arrived during locked environment preparation", file=sys.stderr, flush=True)
+    raise SystemExit(91)
+print(json.dumps({
+    "schema_version": "clio-kit.cache-event.v1",
+    "event": "uv_cache_prune",
+    "ran": False,
+    "ok": True,
+    "prune_config": os.environ.get("CLIO_KIT_UV_CACHE_PRUNE"),
+}), file=sys.stderr, flush=True)
+
+def respond(message):
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "locked-test-server", "version": "1.0"},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "tools/list":
+        result = {"tools": []}
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+        return True
+    return False
+
+first = received.get(timeout=5)
+if first:
+    respond(json.loads(first))
+for line in sys.stdin:
+    if respond(json.loads(line)):
+        break
+""",
+        encoding="utf-8",
+    )
+
+    result = cast(Any, runner)._run_mcp_session(
+        [sys.executable, str(server_path)],
+        tool=None,
+        arguments={},
+        timeout=10,
+        operation="tools/list",
+        env_from={},
+        wait_for_locked_launcher=True,
+    )
+
+    assert result.returncode == 0
+    assert "locked-test-server" in result.stdout
+    assert "arrived during locked environment preparation" not in result.stderr
+    assert '"schema_version": "clio-kit.cache-event.v0"' in result.stderr
+    assert '"schema_version": "clio-kit.cache-event.v1"' in result.stderr
+    assert '"prune_config": "0"' in result.stderr
+
+
+def test_mcp_session_locked_launcher_readiness_obeys_session_timeout(
+    tmp_path: Path,
+) -> None:
+    """The launch preparation gate remains inside the request timeout."""
+    runner = _load_runner()
+    server_path = tmp_path / "silent_locked_launcher.py"
+    server_path.write_text(
+        "import time\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    started = time.monotonic()
+    with raises(subprocess.TimeoutExpired):
+        cast(Any, runner)._run_mcp_session(
+            [sys.executable, str(server_path)],
+            tool=None,
+            arguments={},
+            timeout=1,
+            operation="tools/list",
+            env_from={},
+            wait_for_locked_launcher=True,
+        )
+
+    assert time.monotonic() - started < 5
+
+
+def test_locked_launcher_readiness_requires_verified_v4_nested_runtime() -> None:
+    """Only the exact verified nested-launcher identity enables the stdin gate."""
+    runner = _load_runner()
+    artifact: dict[str, Any] = {
+        "verified": True,
+        "nested_launcher": True,
+        "nested_runtime": {
+            "schema_version": "clio-kit.locked-server.v4",
+            "locked_runtime_verified": True,
+        },
+    }
+
+    assert cast(Any, runner)._requires_locked_launcher_readiness(artifact) is True
+    mutations: tuple[dict[str, Any], ...] = (
+        {"verified": False},
+        {"nested_launcher": False},
+        {"nested_runtime": None},
+        {
+            "nested_runtime": {
+                "schema_version": "clio-kit.locked-server.v5",
+                "locked_runtime_verified": True,
+            }
+        },
+        {
+            "nested_runtime": {
+                "schema_version": "clio-kit.locked-server.v4",
+                "locked_runtime_verified": False,
+            }
+        },
+    )
+    for mutation in mutations:
+        candidate = deepcopy(artifact)
+        candidate.update(mutation)
+        assert cast(Any, runner)._requires_locked_launcher_readiness(candidate) is False
+
+
 def test_mcp_session_materializes_input_manifest_before_jarvis_run(tmp_path: Path) -> None:
     """The worker edits exact resolved paths before it can submit the scheduler run."""
     runner = _load_runner()
@@ -1772,9 +1918,11 @@ def test_mcp_call_runner_executes_private_snapshot_during_swap_and_restore(
         arguments: dict[str, object],
         timeout: int | None,
         env_from: dict[str, str],
+        wait_for_locked_launcher: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal snapshot_path
         del tool, arguments, timeout, env_from
+        assert wait_for_locked_launcher is True
         from_index = command.index("--from")
         snapshot_path = Path(command[from_index + 1])
         assert snapshot_path != wheel

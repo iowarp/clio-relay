@@ -1142,6 +1142,13 @@ def _exchange_tools_list(
     with tempfile.TemporaryFile() as stderr:
         process = subprocess.Popen(
             command,
+            env={
+                **os.environ,
+                # Contract probing validates the locked MCP surface, not
+                # cache-wide maintenance. A prune can wait behind another live
+                # clio-kit server and must not serialize independent probes.
+                "CLIO_KIT_UV_CACHE_PRUNE": "0",
+            },
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
