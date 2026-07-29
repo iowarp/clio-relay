@@ -9,8 +9,8 @@ pkgs:
     deploy_mode: default
     nprocs: 1
     ppn: 1
-    script: $HOME/.local/share/clio-relay/live-tests/{run_id}/in.lj
-    out: $HOME/.local/share/clio-relay/live-tests/{run_id}/lammps-out
+    script: /mnt/common/$USER/.local/share/clio-relay/live-tests/{run_id}/in.lj
+    out: /mnt/common/$USER/.local/share/clio-relay/live-tests/{run_id}/lammps-out
     kokkos_gpu: false
     progress:
       adapter: lammps
