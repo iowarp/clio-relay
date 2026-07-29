@@ -47,6 +47,7 @@ from clio_relay import __version__
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.jarvis_mcp import is_virtual_jarvis_tool
 from clio_relay.mcp_server import (
     McpSessionState,
     call_mcp_tool,
@@ -548,8 +549,10 @@ class RelayToolProvider(Provider):
                 catalog_revision=(
                     None if cast(str, definition["name"]) in static_names else revision
                 ),
-                task_capable=cast(str, definition["name"]) not in static_names
-                or definition["name"] == "relay_call_jarvis_mcp",
+                task_capable=_task_capable_tool_name(
+                    cast(str, definition["name"]),
+                    static_names,
+                ),
             )
             for definition in definitions
         ]
@@ -570,9 +573,16 @@ class RelayToolProvider(Provider):
                 definition,
                 runtime=self._runtime,
                 catalog_revision=None if name in static_names else revision,
-                task_capable=name not in static_names or name == "relay_call_jarvis_mcp",
+                task_capable=_task_capable_tool_name(name, static_names),
             )
         return None
+
+
+def _task_capable_tool_name(name: str, static_names: set[str]) -> bool:
+    """Return whether one admitted-job tool supports SEP-2663 task projection."""
+    return (
+        name not in static_names or name == "relay_call_jarvis_mcp" or is_virtual_jarvis_tool(name)
+    )
 
 
 def _definitions_with_revision(profile: str) -> tuple[list[JSON], str]:

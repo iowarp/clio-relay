@@ -278,6 +278,67 @@ def test_fastmcp_provider_exposes_dynamic_catalog_revision(
     asyncio.run(scenario())
 
 
+def test_fastmcp_factory_tasks_virtual_jarvis_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    definitions, catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    submit_definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
+    virtual_definition = {**submit_definition, "name": "jarvis_describe"}
+    original_call = fastmcp_server_module.call_mcp_tool
+
+    def virtual_catalog(*, profile: str) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+        assert profile == "user"
+        return (
+            [virtual_definition],
+            VirtualRemoteMcpCatalog(
+                revision="b" * 64,
+                tools={},
+                issues=catalog.issues,
+            ),
+        )
+
+    def virtual_call(params: JSON, **kwargs: Any) -> JSON:
+        assert params["name"] == "jarvis_describe"
+        return original_call(
+            {
+                "name": "relay_submit_agent",
+                "arguments": params.get("arguments", {}),
+            },
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        fastmcp_server_module,
+        "mcp_tool_definitions_and_remote_catalog",
+        virtual_catalog,
+    )
+    monkeypatch.setattr(fastmcp_server_module, "call_mcp_tool", virtual_call)
+
+    async def scenario() -> None:
+        server = create_fastmcp_server(settings=settings, queue=queue)
+        component = await server.get_tool("jarvis_describe")
+        assert component is not None
+        assert component.task_config.mode == "optional"
+        async with Client(
+            server,
+            mode="auto",
+        ) as client:
+            task = await call_tool_task(
+                client,
+                "jarvis_describe",
+                _submit_arguments(tmp_path, "factory-virtual"),
+            )
+            assert task.task_id == queue.list_jobs()[0].job_id
+
+    asyncio.run(scenario())
+
+
 def test_official_fastmcp_tool_task_projects_job_and_survives_reopen(
     tmp_path: Path,
 ) -> None:
