@@ -34,8 +34,11 @@ from clio_relay.live_acceptance import (
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
     _http_json,  # pyright: ignore[reportPrivateUsage]
+    _native_progress_attestation,  # pyright: ignore[reportPrivateUsage]
     _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
+    _progress_attestation_identity,  # pyright: ignore[reportPrivateUsage]
     _require_secure_runtime_control_capacity,  # pyright: ignore[reportPrivateUsage]
+    _runtime_metadata_from_job_status,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
     _select_secure_runtime_handoff,  # pyright: ignore[reportPrivateUsage]
     _validated_secure_runtime_pending_bind,  # pyright: ignore[reportPrivateUsage]
@@ -138,6 +141,102 @@ def _structured_live_runtime_metadata() -> dict[str, object]:
             "pipeline_id": "jarvis_mcp",
             "scheduler_provider": "jarvis_mcp",
             "scheduler_job_id": "jarvis_mcp",
+        },
+    }
+
+
+def _native_progress_runtime_metadata(
+    *,
+    terminal: bool = False,
+) -> dict[str, object]:
+    """Build one strictly valid JARVIS-native progress observation."""
+    execution_state = "completed" if terminal else "running"
+    progress_state = "completed" if terminal else "running"
+    current = 10.0 if terminal else 3.0
+    return {
+        "schema_version": "clio-relay.jarvis-runtime.v1",
+        "source": "jarvis_sidecar",
+        "execution_id": "execution-native-41",
+        "pipeline_id": "pipeline-native-41",
+        "terminal": {
+            "state": execution_state,
+            "terminal": terminal,
+            "returncode": 0 if terminal else None,
+            "started_at": "2026-07-29T20:00:00Z",
+            "finished_at": "2026-07-29T20:01:00Z" if terminal else None,
+        },
+        "details": {
+            "native_execution": {
+                "execution_handle": {
+                    "schema_version": "jarvis.execution.handle.v1",
+                    "execution_id": "execution-native-41",
+                    "pipeline_id": "pipeline-native-41",
+                    "mode": "direct",
+                    "scheduler_provider": None,
+                    "scheduler_native_id": None,
+                    "cluster": None,
+                },
+                "execution_record": {
+                    "schema_version": "jarvis.execution.record.v1",
+                    "execution_id": "execution-native-41",
+                    "pipeline_id": "pipeline-native-41",
+                    "pipeline_name": "pipeline-native-41",
+                    "mode": "direct",
+                    "scheduler_provider": None,
+                    "scheduler_native_id": None,
+                    "cluster": None,
+                    "state": execution_state,
+                    "submitted": False,
+                    "terminal": terminal,
+                    "created_at": "2026-07-29T20:00:00Z",
+                    "updated_at": "2026-07-29T20:01:00Z",
+                    "return_code": 0 if terminal else None,
+                    "error": None,
+                    "metadata": {},
+                },
+                "progress": {
+                    "schema_version": "jarvis.execution.progress.v1",
+                    "execution_id": "execution-native-41",
+                    "pipeline_id": "pipeline-native-41",
+                    "execution_state": execution_state,
+                    "terminal": terminal,
+                    "packages": [
+                        {
+                            "package_id": "simulation",
+                            "package_name": "site.simulation",
+                            "event_count": 2,
+                            "latest": {
+                                "schema_version": "jarvis.progress.v1",
+                                "package_name": "site.simulation",
+                                "package_id": "simulation",
+                                "execution_id": "execution-native-41",
+                                "label": "timestep",
+                                "state": progress_state,
+                                "current": current,
+                                "total": 10.0,
+                                "unit": "step",
+                                "message": f"step {int(current)} of 10",
+                                "sequence": 2,
+                                "observed_at_epoch": 1785360000.0,
+                                "determinate": True,
+                                "metadata": {
+                                    "adapter": "site-progress",
+                                    "package_version": "3.4.5",
+                                },
+                            },
+                        }
+                    ],
+                },
+            },
+            "producer_contract": {
+                "requested_source": "jarvis_sidecar",
+                "contract_kind": "native_execution",
+                "producer_schema_version": "jarvis.execution.record.v1",
+                "handle_schema_version": "jarvis.execution.handle.v1",
+                "progress_schema_version": "jarvis.execution.progress.v1",
+                "trusted": True,
+                "reason": "exact native JARVIS execution documents matched",
+            },
         },
     }
 
@@ -1124,6 +1223,112 @@ def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -
         timeout_seconds=1,
         poll_seconds=0.01,
         runner=fake_runner,
+    )
+
+
+def test_live_acceptance_accepts_nonterminal_native_jarvis_progress() -> None:
+    runtime = _native_progress_runtime_metadata()
+
+    def fake_runner(
+        command: list[str],
+        *,
+        input: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        script = command[-1]
+        if "job monitor" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "events": [
+                            {"event_type": "job.queued"},
+                            {"event_type": "job.running"},
+                            {"event_type": "jarvis.started"},
+                        ]
+                    }
+                ),
+            )
+        if "job progress" in script:
+            return _completed(command, json.dumps([]))
+        if "job status" in script:
+            return _completed(
+                command,
+                json.dumps(
+                    {
+                        "job": {
+                            "job_id": "job_test",
+                            "metadata": {"runtime_metadata": runtime},
+                        }
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    _verify_live_package_progress(
+        ClusterDefinition(name="test-cluster", ssh_host="test-host"),
+        "job_test",
+        "site-progress",
+        package_name="site.simulation",
+        timeout_seconds=1,
+        poll_seconds=0.01,
+        runner=fake_runner,
+    )
+
+
+def test_native_jarvis_progress_requires_trusted_matching_nonterminal_documents() -> None:
+    runtime = _native_progress_runtime_metadata()
+    attestation = _native_progress_attestation(
+        cast(dict[str, Any], runtime),
+        "site-progress",
+        package_name="site.simulation",
+        require_nonterminal=True,
+    )
+
+    assert attestation is not None
+    assert attestation["source"] == "jarvis_execution"
+    assert attestation["progress_event_count"] == 2
+    assert (
+        _progress_attestation_identity(attestation)
+        == "jarvis-native:3.4.5:site.simulation:simulation:site-progress"
+    )
+    status_runtime = _runtime_metadata_from_job_status(
+        {
+            "job": {
+                "job_id": "job_test",
+                "metadata": {"runtime_metadata": runtime},
+            }
+        },
+        job_id="job_test",
+    )
+    assert status_runtime is not None
+    assert (
+        _native_progress_attestation(
+            status_runtime,
+            "wrong-adapter",
+            package_name="site.simulation",
+            require_nonterminal=True,
+        )
+        is None
+    )
+    terminal = _native_progress_runtime_metadata(terminal=True)
+    assert (
+        _native_progress_attestation(
+            cast(dict[str, Any], terminal),
+            "site-progress",
+            package_name="site.simulation",
+            require_nonterminal=True,
+        )
+        is None
+    )
+    assert (
+        _native_progress_attestation(
+            cast(dict[str, Any], terminal),
+            "site-progress",
+            package_name="site.simulation",
+            require_nonterminal=False,
+        )
+        is not None
     )
 
 

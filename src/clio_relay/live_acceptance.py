@@ -69,6 +69,7 @@ from clio_relay.runtime_metadata import (
     RUNTIME_METADATA_SCHEMA,
     JarvisRuntimeMetadata,
     RuntimeMetadataSource,
+    native_execution_documents,
 )
 from clio_relay.service_runtime import ServiceRuntimeStopResult, ServiceRuntimeSupervisor
 from clio_relay.session_api import (
@@ -4405,6 +4406,27 @@ def _verify_live_package_progress(
             ):
                 raise RelayError("package progress was recorded before job.running")
             return
+        status = _remote_clio_json(
+            definition,
+            ["job", "status", job_id],
+            runner=runner,
+        )
+        runtime_metadata = _runtime_metadata_from_job_status(status, job_id=job_id)
+        native_attestation = _native_progress_attestation(
+            runtime_metadata,
+            expected_adapter,
+            package_name=package_name,
+            require_nonterminal=True,
+        )
+        if native_attestation is not None:
+            if not saw_running and not _remote_job_has_event(
+                definition,
+                job_id,
+                "job.running",
+                runner=runner,
+            ):
+                raise RelayError("package progress was recorded before job.running")
+            return
         if event_types & {"job.succeeded", "job.failed", "job.canceled"}:
             break
         time.sleep(poll_seconds)
@@ -4617,6 +4639,18 @@ def _verify_completed_job(
             job_id=job_id,
             package_name=expected_progress_package,
         )
+        native_progress = (
+            None
+            if runtime_metadata is None
+            else _native_progress_attestation(
+                runtime_metadata.document,
+                expected_progress_adapter,
+                package_name=expected_progress_package,
+                require_nonterminal=False,
+            )
+        )
+        if provider_metadata is None:
+            provider_metadata = native_progress
         if provider_metadata is None:
             raise RelayError(
                 f"expected package progress adapter was not recorded: {expected_progress_adapter}"
@@ -4624,27 +4658,22 @@ def _verify_completed_job(
         lines.append(f"{line_prefix}.progress_adapter={expected_progress_adapter}")
         lines.append("package-progress.provider=verified")
         lines.append("package-progress.acceptance=verified")
-        lines.append(
-            "package-progress.identity="
-            f"{provider_metadata['provider_distribution']}:"
-            f"{provider_metadata['provider_distribution_version']}:"
-            f"{provider_metadata['provider_entry_point']}:"
-            f"{provider_metadata['adapter']}"
-        )
+        progress_identity = _progress_attestation_identity(provider_metadata)
+        lines.append(f"package-progress.identity={progress_identity}")
         if recorder is not None:
             recorder.add_resource(
                 ValidationResource(
                     kind="package_progress_provider",
-                    resource_id=(
-                        f"{provider_metadata['provider_distribution']}:"
-                        f"{provider_metadata['provider_distribution_version']}:"
-                        f"{provider_metadata['provider_entry_point']}:"
-                        f"{provider_metadata['adapter']}"
-                    ),
+                    resource_id=progress_identity,
                     role="jarvis_package_progress",
                     cluster=definition.name,
                     state="verified",
-                    provider=str(provider_metadata["provider_distribution"]),
+                    provider=str(
+                        provider_metadata.get(
+                            "provider_distribution",
+                            "jarvis-native-execution",
+                        )
+                    ),
                     metadata=dict(provider_metadata),
                 )
             )
@@ -4901,6 +4930,129 @@ def _progress_provider_attestation(
                 continue
             return dict(typed_metadata)
     return None
+
+
+def _runtime_metadata_from_job_status(
+    status: dict[str, Any],
+    *,
+    job_id: str,
+) -> dict[str, Any] | None:
+    """Return validated runtime metadata from one exact relay job status response."""
+    raw_job = status.get("job")
+    if not isinstance(raw_job, dict):
+        return None
+    typed_job = cast(dict[str, Any], raw_job)
+    if typed_job.get("job_id") != job_id:
+        return None
+    raw_job_metadata = typed_job.get("metadata")
+    if not isinstance(raw_job_metadata, dict):
+        return None
+    typed_job_metadata = cast(dict[str, Any], raw_job_metadata)
+    raw_runtime = typed_job_metadata.get("runtime_metadata")
+    if not isinstance(raw_runtime, dict):
+        return None
+    try:
+        validated = JarvisRuntimeMetadata.model_validate(raw_runtime)
+    except ValueError:
+        return None
+    return validated.model_dump(mode="json")
+
+
+def _native_progress_attestation(
+    runtime_metadata: dict[str, Any] | None,
+    expected_adapter: str,
+    *,
+    package_name: str | None,
+    require_nonterminal: bool,
+) -> dict[str, Any] | None:
+    """Return trusted JARVIS-native package progress from runtime metadata."""
+    if runtime_metadata is None:
+        return None
+    try:
+        runtime = JarvisRuntimeMetadata.model_validate(runtime_metadata)
+    except ValueError:
+        return None
+    if runtime.source not in {
+        RuntimeMetadataSource.JARVIS_MCP,
+        RuntimeMetadataSource.JARVIS_SIDECAR,
+    }:
+        return None
+    raw_contract = runtime.details.get("producer_contract")
+    if not isinstance(raw_contract, dict):
+        return None
+    typed_contract = cast(dict[str, Any], raw_contract)
+    if (
+        typed_contract.get("contract_kind") != "native_execution"
+        or typed_contract.get("trusted") is not True
+    ):
+        return None
+    raw_documents = runtime.details.get("native_execution")
+    if not isinstance(raw_documents, dict):
+        return None
+    try:
+        documents = native_execution_documents(cast(dict[str, Any], raw_documents))
+    except ValueError:
+        return None
+    if documents is None:
+        return None
+    snapshot = documents.progress
+    if require_nonterminal and snapshot.terminal:
+        return None
+    terminal_progress_states = {"completed", "failed", "canceled"}
+    for package in snapshot.packages:
+        latest = package.latest
+        if latest is None:
+            continue
+        if package_name is not None and package.package_name != package_name:
+            continue
+        if latest.metadata.get("adapter") != expected_adapter:
+            continue
+        if require_nonterminal and latest.state in terminal_progress_states:
+            continue
+        package_version = latest.metadata.get("package_version")
+        return {
+            "source": "jarvis_execution",
+            "adapter": expected_adapter,
+            "package_name": package.package_name,
+            "package_id": package.package_id,
+            "package_version": (
+                package_version
+                if isinstance(package_version, str) and package_version
+                else "native"
+            ),
+            "execution_id": snapshot.execution_id,
+            "pipeline_id": snapshot.pipeline_id,
+            "execution_state": snapshot.execution_state,
+            "execution_terminal": snapshot.terminal,
+            "progress_state": latest.state,
+            "progress_sequence": latest.sequence,
+            "progress_event_count": package.event_count,
+            "current": latest.current,
+            "total": latest.total,
+            "unit": latest.unit,
+            "producer_contract": "native_execution",
+            "producer_validated": True,
+            "acceptance_validated": True,
+        }
+    return None
+
+
+def _progress_attestation_identity(metadata: dict[str, Any]) -> str:
+    """Return a stable evidence identity for provider or native progress."""
+    if metadata.get("source") == "jarvis_execution":
+        return (
+            "jarvis-native:"
+            f"{metadata['package_version']}:"
+            f"{metadata['package_name']}:"
+            f"{metadata['package_id']}:"
+            f"{metadata['adapter']}"
+        )
+    return (
+        f"{metadata['provider_distribution']}:"
+        f"{metadata['provider_distribution_version']}:"
+        f"{metadata['provider_entry_point']}:"
+        f"{metadata['adapter']}"
+    )
 
 
 def _verify_progress_monitor(
