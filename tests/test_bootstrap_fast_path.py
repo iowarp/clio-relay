@@ -1553,6 +1553,80 @@ def test_pinned_local_bootstrap_artifact_copy_is_bounded_and_digest_verified(
     assert mismatched_destination.read_bytes() == b""
 
 
+def test_pinned_local_bootstrap_artifact_copy_ignores_cross_open_ctime_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows ctime churn is ignored without weakening real identity pins."""
+    candidate_root = tmp_path / "candidate-wheels"
+    candidate_root.mkdir()
+    source = candidate_root / "jarvis-candidate.whl"
+    payload = b"ctime-stable candidate wheel bytes"
+    source.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    program = bootstrap._BOOTSTRAP_PINNED_LOCAL_ARTIFACT_COPY_SOURCE  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_fstat = os.fstat
+    source_inode = source.stat().st_ino
+
+    def perturbed_fstat(
+        descriptor: int,
+        *,
+        changed_field: str | None = None,
+    ) -> os.stat_result:
+        details = original_fstat(descriptor)
+        changes = {"st_ctime_ns": details.st_ctime_ns + 1}
+        if details.st_ino == source_inode and changed_field is not None:
+            changes[changed_field] = getattr(details, changed_field) + 1
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=details.st_dev,
+                st_ino=changes.get("st_ino", details.st_ino),
+                st_mode=details.st_mode,
+                st_nlink=details.st_nlink,
+                st_uid=details.st_uid,
+                st_size=details.st_size,
+                st_mtime_ns=changes.get("st_mtime_ns", details.st_mtime_ns),
+                st_ctime_ns=changes["st_ctime_ns"],
+            ),
+        )
+
+    def run_copy(destination: Path) -> None:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "pinned-local-artifact-copy",
+                source.as_uri(),
+                expected_sha256,
+                str(destination),
+                str(candidate_root),
+            ],
+        )
+        exec(compile(program, "<pinned-local-artifact-copy>", "exec"), {})
+
+    destination = tmp_path / "ctime-only.whl"
+    destination.touch()
+    monkeypatch.setattr(os, "fstat", perturbed_fstat)
+    run_copy(destination)
+    assert destination.read_bytes() == payload
+
+    for changed_field in ("st_ino", "st_mtime_ns"):
+        changed_destination = tmp_path / f"changed-{changed_field}.whl"
+        changed_destination.touch()
+
+        def identity_changed_fstat(
+            descriptor: int,
+            field: str = changed_field,
+        ) -> os.stat_result:
+            return perturbed_fstat(descriptor, changed_field=field)
+
+        monkeypatch.setattr(os, "fstat", identity_changed_fstat)
+        with pytest.raises(SystemExit, match="pinned local artifact changed before copying"):
+            run_copy(changed_destination)
+        assert changed_destination.read_bytes() == b""
+
+
 def test_bootstrap_uses_exact_fetcher_for_jarvis_artifacts() -> None:
     """Rendered bootstrap accepts only HTTPS or managed file staging for JARVIS."""
     script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
