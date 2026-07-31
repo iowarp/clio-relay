@@ -559,7 +559,7 @@ import sys
 from pathlib import Path
 
 
-def identity(details):
+def change_identity(details):
     return (
         details.st_dev,
         details.st_ino,
@@ -567,6 +567,19 @@ def identity(details):
         details.st_size,
         details.st_mtime_ns,
         details.st_ctime_ns,
+    )
+
+
+def cross_open_identity(details):
+    # Windows may change ctime when this file is opened. Device, inode, mode,
+    # size, and mtime still pin the cross-open object; the bounded read and
+    # receipt validation protect its payload.
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
     )
 
 
@@ -624,7 +637,7 @@ flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 descriptor = os.open(read_path, flags)
 try:
     opened = os.fstat(descriptor)
-    if identity(opened) != identity(details):
+    if cross_open_identity(opened) != cross_open_identity(details):
         raise SystemExit("bootstrap install receipt changed before reading")
     with os.fdopen(descriptor, "rb", closefd=False) as stream:
         payload = stream.read(4 * 1024 * 1024 + 1)
@@ -633,9 +646,18 @@ finally:
     os.close(descriptor)
 if (
     len(payload) > 4 * 1024 * 1024
-    or identity(after) != identity(opened)
-    or identity(read_path.lstat()) != identity(details)
-    or identity(path.lstat()) != identity(stable_details)
+    or change_identity(after) != change_identity(opened)
+    or cross_open_identity(read_path.lstat()) != cross_open_identity(details)
+    or (
+        change_identity(path.lstat())
+        if stable_target is not None
+        else cross_open_identity(path.lstat())
+    )
+    != (
+        change_identity(stable_details)
+        if stable_target is not None
+        else cross_open_identity(stable_details)
+    )
 ):
     raise SystemExit("bootstrap install receipt changed while reading")
 if stable_target is not None:
@@ -644,7 +666,7 @@ if stable_target is not None:
     assert current_target_text is not None
     if (
         os.readlink(path) != stable_target
-        or identity(current.lstat()) != identity(current_details)
+        or change_identity(current.lstat()) != change_identity(current_details)
         or os.readlink(current) != current_target_text
     ):
         raise SystemExit("bootstrap generation links changed while reading the receipt")
@@ -665,13 +687,14 @@ from pathlib import Path
 
 
 def identity(details):
+    # Opening a Windows directory may churn ctime. Device, inode, mode, size,
+    # and mtime still pin the exact directory across the open boundary.
     return (
         details.st_dev,
         details.st_ino,
         details.st_mode,
         details.st_size,
         details.st_mtime_ns,
-        details.st_ctime_ns,
     )
 
 
@@ -779,7 +802,7 @@ import sys
 from pathlib import Path
 
 
-def identity(details):
+def change_identity(details):
     return (
         details.st_dev,
         details.st_ino,
@@ -787,6 +810,18 @@ def identity(details):
         details.st_size,
         details.st_mtime_ns,
         details.st_ctime_ns,
+    )
+
+
+def cross_open_identity(details):
+    # Opening or copying a Windows file may churn ctime. Device, inode, mode,
+    # size, and mtime plus the SHA-256 digest retain the complete integrity pin.
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
     )
 
 
@@ -824,7 +859,7 @@ destination_created = False
 try:
     source_opened = os.fstat(source_descriptor)
     root_opened = os.fstat(root_descriptor)
-    if identity(source_opened) != identity(source_before):
+    if cross_open_identity(source_opened) != cross_open_identity(source_before):
         raise SystemExit("candidate uv source changed before its pinned copy")
     if object_identity(root_opened) != object_identity(root_before) or (
         not stat.S_ISDIR(root_opened.st_mode)
@@ -867,8 +902,8 @@ try:
     if (
         copied != source_opened.st_size
         or digest.hexdigest() != expected_sha256
-        or identity(source_after) != identity(source_opened)
-        or identity(source_linked_after) != identity(source_opened)
+        or change_identity(source_after) != change_identity(source_opened)
+        or cross_open_identity(source_linked_after) != cross_open_identity(source_opened)
         or destination_written.st_size != copied
         or destination_written.st_nlink != 1
         or stat.S_IMODE(destination_written.st_mode) != 0o500
@@ -881,7 +916,9 @@ try:
     verification_descriptor = os.open("pinned-uv", flags, dir_fd=root_descriptor)
     try:
         verification_opened = os.fstat(verification_descriptor)
-        if identity(verification_opened) != identity(destination_written):
+        if cross_open_identity(verification_opened) != cross_open_identity(
+            destination_written
+        ):
             raise SystemExit("candidate uv private copy changed before verification")
         verified_digest = hashlib.sha256()
         verified_size = 0
@@ -895,8 +932,8 @@ try:
     if (
         verified_size != copied
         or verified_digest.hexdigest() != expected_sha256
-        or identity(verification_after) != identity(verification_opened)
-        or identity(linked_copy) != identity(verification_opened)
+        or change_identity(verification_after) != change_identity(verification_opened)
+        or cross_open_identity(linked_copy) != cross_open_identity(verification_opened)
     ):
         raise SystemExit("candidate uv private copy did not retain its pinned identity")
     os.fsync(root_descriptor)
@@ -924,7 +961,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 
-def identity(details):
+def change_identity(details):
     return (
         details.st_dev,
         details.st_ino,
@@ -935,16 +972,16 @@ def identity(details):
     )
 
 
-def cross_handle_identity(details):
-    if os.name == "nt":
-        return (
-            details.st_dev,
-            details.st_ino,
-            stat.S_IFMT(details.st_mode),
-            details.st_size,
-            details.st_mtime_ns,
-        )
-    return identity(details)
+def cross_open_identity(details):
+    # Opening or copying a Windows file may churn ctime. Device, inode, mode,
+    # size, and mtime plus the SHA-256 digest retain the complete integrity pin.
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+    )
 
 
 source_url, expected_sha256, destination_value, allowed_root_value = sys.argv[1:]
@@ -1003,8 +1040,9 @@ try:
     source_opened = os.fstat(source_descriptor)
     destination_opened = os.fstat(destination_descriptor)
     if (
-        identity(source_opened) != identity(source_before)
-        or identity(destination_opened) != identity(destination_before)
+        cross_open_identity(source_opened) != cross_open_identity(source_before)
+        or cross_open_identity(destination_opened)
+        != cross_open_identity(destination_before)
     ):
         raise SystemExit("pinned local artifact changed before copying")
     digest = hashlib.sha256()
@@ -1026,8 +1064,8 @@ try:
     if (
         copied != source_opened.st_size
         or digest.hexdigest() != expected_sha256
-        or identity(source_after) != identity(source_opened)
-        or identity(source.lstat()) != identity(source_opened)
+        or change_identity(source_after) != change_identity(source_opened)
+        or cross_open_identity(source.lstat()) != cross_open_identity(source_opened)
         or destination_after.st_size != copied
         or destination_after.st_nlink != 1
         or (destination_after.st_dev, destination_after.st_ino)
@@ -1040,7 +1078,7 @@ finally:
     os.close(destination_descriptor)
     os.close(source_descriptor)
 
-if cross_handle_identity(destination.lstat()) != cross_handle_identity(destination_after):
+if cross_open_identity(destination.lstat()) != cross_open_identity(destination_after):
     raise SystemExit("pinned local artifact destination changed after copying")"""
 _BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE = r"""import base64
 import ctypes
@@ -1284,7 +1322,7 @@ def exec_candidate_provider(
             os.close(runtime_library_memfd)
 
 
-def identity(details):
+def change_identity(details):
     return (
         details.st_dev,
         details.st_ino,
@@ -1292,6 +1330,19 @@ def identity(details):
         details.st_size,
         details.st_mtime_ns,
         details.st_ctime_ns,
+    )
+
+
+def cross_open_identity(details):
+    # Opening a Windows file may churn ctime. Device, inode, mode, size, and
+    # mtime still pin the object across open; payload SHA-256 or RECORD digests
+    # retain the byte-integrity pin.
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
     )
 
 
@@ -1313,7 +1364,7 @@ def read_descriptor(descriptor, maximum, label):
     if (
         len(payload) != before.st_size
         or len(payload) > maximum
-        or identity(after) != identity(before)
+        or change_identity(after) != change_identity(before)
     ):
         raise SystemExit(f"{label} changed while it was pinned")
     return payload, before
@@ -1327,7 +1378,10 @@ def read_path(path, maximum, label):
         payload, opened = read_descriptor(descriptor, maximum, label)
     finally:
         os.close(descriptor)
-    if identity(opened) != identity(before) or identity(path.lstat()) != identity(opened):
+    if (
+        cross_open_identity(opened) != cross_open_identity(before)
+        or cross_open_identity(path.lstat()) != cross_open_identity(opened)
+    ):
         raise SystemExit(f"{label} path changed while it was pinned")
     return payload
 
@@ -1355,9 +1409,9 @@ def read_path_allow_empty(path, maximum, label):
     if (
         len(payload) != opened.st_size
         or len(payload) > maximum
-        or identity(before) != identity(opened)
-        or identity(after) != identity(opened)
-        or identity(path.lstat()) != identity(opened)
+        or cross_open_identity(before) != cross_open_identity(opened)
+        or change_identity(after) != change_identity(opened)
+        or cross_open_identity(path.lstat()) != cross_open_identity(opened)
     ):
         raise SystemExit(f"{label} changed while it was pinned")
     return payload
@@ -1445,8 +1499,8 @@ try:
         "candidate relay wheel",
     )
     if (
-        identity(uv_before) != identity(uv_opened)
-        or identity(wheel_before) != identity(wheel_opened)
+        cross_open_identity(uv_before) != cross_open_identity(uv_opened)
+        or cross_open_identity(wheel_before) != cross_open_identity(wheel_opened)
         or hashlib.sha256(uv_payload).hexdigest() != expected_uv_sha256
         or hashlib.sha256(wheel_payload).hexdigest() != expected_wheel_sha256
     ):
@@ -1676,8 +1730,8 @@ try:
             ):
                 raise SystemExit("installed candidate differs from the pinned wheel fd")
     if (
-        identity(os.fstat(uv_descriptor)) != identity(uv_opened)
-        or identity(os.fstat(wheel_descriptor)) != identity(wheel_opened)
+        change_identity(os.fstat(uv_descriptor)) != change_identity(uv_opened)
+        or change_identity(os.fstat(wheel_descriptor)) != change_identity(wheel_opened)
     ):
         raise SystemExit("candidate uv or wheel descriptor changed during installation")
     assert provider_descriptor is not None
@@ -1690,9 +1744,10 @@ try:
         source_provider = os.path.realpath(f"/proc/self/fd/{provider_descriptor}")
         source_details = os.stat(source_provider, follow_symlinks=False)
         if (
-            identity(provider_before) != identity(provider_opened)
+            cross_open_identity(provider_before) != cross_open_identity(provider_opened)
             or provider_location.resolve(strict=True) != provider_target
-            or identity(provider_target.lstat()) != identity(provider_opened)
+            or cross_open_identity(provider_target.lstat())
+            != cross_open_identity(provider_opened)
             or (source_details.st_dev, source_details.st_ino)
             != (provider_opened.st_dev, provider_opened.st_ino)
             or provider_opened.st_mode & 0o111 == 0
@@ -2672,6 +2727,20 @@ def _bootstrap_preflight_over_ssh(
     return BootstrapPreflightResult(action="exact", receipt=receipt, lines=lines)
 
 
+def _read_stability_identity(details: os.stat_result) -> tuple[int, ...]:
+    """Return a before/after-read identity with stable Windows semantics."""
+    identity = (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+    )
+    if os.name == "nt" and stat.S_ISREG(details.st_mode):
+        return identity
+    return (*identity, details.st_ctime_ns)
+
+
 def _sha256_regular_file(path: Path) -> str:
     """Hash one regular file without loading it into memory."""
     digest = hashlib.sha256()
@@ -2685,22 +2754,10 @@ def _sha256_regular_file(path: Path) -> str:
         after = path.lstat()
     except OSError as exc:
         raise ConfigurationError(f"bootstrap payload could not be hashed: {path}") from exc
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    identity_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
+    # Opening a Windows file may churn ctime. Device, inode, mode, size, and
+    # mtime still detect real cross-open changes; the computed SHA-256 pins bytes.
+    identity_before = _read_stability_identity(before)
+    identity_after = _read_stability_identity(after)
     if identity_after != identity_before:
         raise ConfigurationError("bootstrap payload changed while hashing")
     return digest.hexdigest()
@@ -8526,14 +8583,10 @@ def _add_canonical_archive_member(
         details = source.lstat()
     except OSError as exc:
         raise ConfigurationError(f"bootstrap archive member is unavailable: {source}") from exc
-    identity = (
-        details.st_dev,
-        details.st_ino,
-        details.st_mode,
-        details.st_size,
-        details.st_mtime_ns,
-        details.st_ctime_ns,
-    )
+    # Opening a Windows regular file may churn ctime. Device, inode, mode, size,
+    # and mtime still detect real changes, and the final source-archive SHA-256
+    # pins the emitted bytes; directory comparisons continue to include ctime.
+    identity = _read_stability_identity(details)
     if source.is_symlink() or not (stat.S_ISREG(details.st_mode) or stat.S_ISDIR(details.st_mode)):
         raise ConfigurationError(f"bootstrap archive member is not a regular file: {source}")
     info = tar.gettarinfo(str(source), arcname=arcname.as_posix())
@@ -8555,14 +8608,7 @@ def _add_canonical_archive_member(
                 f"bootstrap archive member could not be read: {source}"
             ) from exc
     after = source.lstat()
-    if (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ) != identity:
+    if _read_stability_identity(after) != identity:
         raise ConfigurationError(f"bootstrap archive member changed while reading: {source}")
 
 
