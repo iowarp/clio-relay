@@ -26,6 +26,7 @@ RELAY_CREDENTIAL_ENV_NAMES = frozenset(
 )
 MCP_ADMISSION_AUTHORITY_METADATA_KEY = "mcp_admission_authority"
 INPUT_INGEST_POLICY_METADATA_KEY = "input_ingest_policy"
+CLIO_PROVENANCE_METADATA_KEY = "clio.provenance.v1"
 MAX_ARTIFACT_USE_PROVENANCE_BYTES = 8 * 1024
 MAX_ARTIFACT_USE_AGGREGATE_BYTES = 256 * 1024
 MAX_JARVIS_PACKAGE_INPUT_CONTRACT_BYTES = 256 * 1024
@@ -1893,7 +1894,14 @@ class TaskTimelineEvent(BaseModel):
 
 
 class ArtifactRef(BaseModel):
-    """A durable artifact index entry."""
+    """A durable artifact index entry.
+
+    Clio projections may carry relay fields in the versioned
+    ``metadata["clio.provenance.v1"]`` envelope. Validation lifts those fields,
+    plus clio's existing metadata ``kind``, only when their relay top-level
+    counterparts are absent. The metadata remains unchanged so the clio
+    provenance round-trips without permitting unknown top-level fields.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1906,6 +1914,31 @@ class ArtifactRef(BaseModel):
     sha256: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def lift_clio_provenance_fields(cls, value: Any) -> Any:
+        """Lift relay fields from a versioned clio metadata envelope."""
+        if not isinstance(value, dict):
+            return value
+        values = cast(dict[str, Any], value)
+        raw_metadata = values.get("metadata")
+        if not isinstance(raw_metadata, dict):
+            return values
+        metadata = cast(dict[str, Any], raw_metadata)
+        lifted = dict(values)
+        if "kind" not in lifted and "kind" in metadata:
+            lifted["kind"] = metadata["kind"]
+
+        raw_provenance = metadata.get(CLIO_PROVENANCE_METADATA_KEY)
+        if not isinstance(raw_provenance, dict):
+            return lifted
+        provenance = cast(dict[str, Any], raw_provenance)
+
+        for field in ("job_id", "sequence", "uri", "size_bytes", "created_at"):
+            if field not in lifted and field in provenance:
+                lifted[field] = provenance[field]
+        return lifted
 
 
 class ProgressRecord(BaseModel):
