@@ -8,7 +8,7 @@ import json
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import mcp_types
 from fastmcp import FastMCP
@@ -80,6 +80,39 @@ TASK_POLL_INTERVAL_MS = 1_000
 TASK_TTL_MS = 30 * 24 * 60 * 60 * 1_000
 MAX_TASK_ARGUMENT_BYTES = MAX_MCP_TASK_ARGUMENT_BYTES
 _TASK_METHOD_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
+
+type McpTaskStatus = Literal[
+    "working",
+    "input_required",
+    "completed",
+    "failed",
+    "cancelled",
+]
+type RelayStateMapRow = tuple[tuple[str, ...], McpTaskStatus, bool | None]
+
+# Cross-repo federation contract: keep this table identical to clio-agent's
+# RELAY_STATE_MAP. The source rationale is docs/mcp-tasks.md:99-114.
+RELAY_STATE_MAP: Final[tuple[RelayStateMapRow, ...]] = (
+    (("queued", "leased", "running"), "working", None),
+    (("durable_input_round",), "input_required", None),
+    (("succeeded",), "completed", False),
+    (("tool_failure",), "completed", True),
+    (("protocol_error",), "failed", None),
+    (("canceled",), "cancelled", None),
+)
+_RELAY_STATE_PROJECTIONS: Final[dict[str, tuple[McpTaskStatus, bool | None]]] = {
+    observation: (status, is_error)
+    for observations, status, is_error in RELAY_STATE_MAP
+    for observation in observations
+}
+
+
+def _relay_state_projection(observation: str) -> tuple[McpTaskStatus, bool | None]:
+    """Return the committed MCP task projection for one relay observation."""
+    try:
+        return _RELAY_STATE_PROJECTIONS[observation]
+    except KeyError as exc:
+        raise ValueError(f"relay observation has no MCP task projection: {observation}") from exc
 
 
 def _session_to_json(session: McpSessionState) -> JSON:
@@ -289,16 +322,24 @@ class RelayMcpRuntime:
             "poll_interval_ms": TASK_POLL_INTERVAL_MS,
         }
         if projection.protocol_error is not None:
-            return GetTaskResult(status="failed", error=projection.protocol_error, **common)
+            status, _ = _relay_state_projection("protocol_error")
+            return GetTaskResult(status=status, error=projection.protocol_error, **common)
         if projection.input_round is not None and projection.input_round.outstanding:
+            status, _ = _relay_state_projection("durable_input_round")
             return GetTaskResult(
-                status="input_required",
+                status=status,
                 input_requests=projection.input_round.outstanding,
                 **common,
             )
         if projection.completed_result is not None:
+            observation = (
+                "tool_failure"
+                if projection.completed_result.get("isError") is True
+                else "succeeded"
+            )
+            status, _ = _relay_state_projection(observation)
             return GetTaskResult(
-                status="completed",
+                status=status,
                 result=projection.completed_result,
                 **common,
             )
@@ -319,15 +360,17 @@ class RelayMcpRuntime:
         else:
             job = await asyncio.to_thread(self.queue.get_job, record.job_id)
         if job.state is JobState.CANCELED:
+            status, _ = _relay_state_projection(job.state.value)
             return GetTaskResult(
-                status="cancelled",
+                status=status,
                 status_message=job.last_error,
                 last_updated_at=job.updated_at.isoformat(),
                 **{key: value for key, value in common.items() if key != "last_updated_at"},
             )
         if job.state not in TERMINAL_STATES:
+            status, _ = _relay_state_projection(job.state.value)
             return GetTaskResult(
-                status="working",
+                status=status,
                 status_message=f"Relay job is {job.state.value}",
                 last_updated_at=job.updated_at.isoformat(),
                 **{key: value for key, value in common.items() if key != "last_updated_at"},
@@ -366,8 +409,10 @@ class RelayMcpRuntime:
             if updated.projection.completed_result is None:
                 raise
             final = updated.projection.completed_result
+        observation = "tool_failure" if final.get("isError") is True else "succeeded"
+        status, _ = _relay_state_projection(observation)
         return GetTaskResult(
-            status="completed",
+            status=status,
             result=final,
             status_message=f"Relay job {job.state.value}",
             last_updated_at=job.updated_at.isoformat(),

@@ -1,0 +1,1019 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "issue": "iowarp/clio-agent#1121 P2.3",
+  "models": {
+    "ArtifactRef": {
+      "disposition": "clio-schemas projection reference",
+      "json_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "job_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "uri",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "reference": "clio-schemas v0.2.0 ArtifactVersion.to_artifact_ref; tests/fixtures/clio_schemas_v0_2_0_projections.json"
+    },
+    "ArtifactUse": {
+      "disposition": "clio-schemas projection reference",
+      "json_schema": {
+        "$defs": {
+          "ArtifactUseEvidence": {
+            "enum": [
+              "schema-arg",
+              "hash-pair",
+              "lease-window",
+              "authority",
+              "assertion"
+            ],
+            "type": "string"
+          },
+          "ArtifactUseProvenance": {
+            "additionalProperties": false,
+            "properties": {
+              "arg": {
+                "default": "",
+                "maxLength": 512,
+                "type": "string"
+              },
+              "authority": {
+                "default": "",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "evidence": {
+                "$ref": "#/$defs/ArtifactUseEvidence"
+              },
+              "external_ref": {
+                "default": "",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "note": {
+                "default": "",
+                "maxLength": 512,
+                "type": "string"
+              },
+              "schema_version": {
+                "const": "clio-relay.artifact-use-provenance.v1",
+                "default": "clio-relay.artifact-use-provenance.v1",
+                "type": "string"
+              }
+            },
+            "required": [
+              "evidence"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "type": "string"
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ArtifactUseProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "reference": "clio-schemas v0.2.0 ProvEdge.to_artifact_use; tests/fixtures/clio_schemas_v0_2_0_projections.json"
+    },
+    "RelayJob": {
+      "disposition": "relay-owned committed golden",
+      "json_schema": {
+        "$defs": {
+          "ArtifactUse": {
+            "additionalProperties": false,
+            "properties": {
+              "artifact_id": {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+                "type": "string"
+              },
+              "provenance": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ArtifactUseProvenance"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "sha256": {
+                "maxLength": 64,
+                "minLength": 64,
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_id",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "ArtifactUseEvidence": {
+            "enum": [
+              "schema-arg",
+              "hash-pair",
+              "lease-window",
+              "authority",
+              "assertion"
+            ],
+            "type": "string"
+          },
+          "ArtifactUseProvenance": {
+            "additionalProperties": false,
+            "properties": {
+              "arg": {
+                "default": "",
+                "maxLength": 512,
+                "type": "string"
+              },
+              "authority": {
+                "default": "",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "evidence": {
+                "$ref": "#/$defs/ArtifactUseEvidence"
+              },
+              "external_ref": {
+                "default": "",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "note": {
+                "default": "",
+                "maxLength": 512,
+                "type": "string"
+              },
+              "schema_version": {
+                "const": "clio-relay.artifact-use-provenance.v1",
+                "default": "clio-relay.artifact-use-provenance.v1",
+                "type": "string"
+              }
+            },
+            "required": [
+              "evidence"
+            ],
+            "type": "object"
+          },
+          "InputArtifactSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "logical_name": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "schema_version": {
+                "const": "clio-relay.input-artifact.v1",
+                "default": "clio-relay.input-artifact.v1",
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "size_bytes": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "logical_name",
+              "size_bytes",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "JarvisPipelineInputBinding": {
+            "additionalProperties": false,
+            "properties": {
+              "accepted_names": {
+                "items": {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              "artifact_use": {
+                "$ref": "#/$defs/ArtifactUse"
+              },
+              "canonical_setting": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "logical_name": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "remote_path": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "size_bytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "step_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "workspace_relative_path": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "step_id",
+              "canonical_setting",
+              "accepted_names",
+              "workspace_relative_path",
+              "logical_name",
+              "size_bytes",
+              "sha256",
+              "remote_path",
+              "artifact_use"
+            ],
+            "type": "object"
+          },
+          "JarvisPipelineInputRoute": {
+            "additionalProperties": false,
+            "properties": {
+              "cluster": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "cluster_route_revision": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "contract": {
+                "const": "clio-kit-jarvis-user-v3.6",
+                "default": "clio-kit-jarvis-user-v3.6",
+                "type": "string"
+              },
+              "expected_server_artifact_digest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "owner_session_generation_id": {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+                "type": "string"
+              },
+              "owner_session_id": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "pipeline_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "registration_revision": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "schema_version": {
+                "const": "clio-relay.jarvis-pipeline-input-route.v1",
+                "default": "clio-relay.jarvis-pipeline-input-route.v1",
+                "type": "string"
+              },
+              "server_name": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cluster",
+              "server_name",
+              "cluster_route_revision",
+              "registration_revision",
+              "expected_server_artifact_digest",
+              "pipeline_id",
+              "owner_session_id",
+              "owner_session_generation_id"
+            ],
+            "type": "object"
+          },
+          "JarvisRunInputManifest": {
+            "additionalProperties": false,
+            "properties": {
+              "artifact_uses": {
+                "items": {
+                  "$ref": "#/$defs/ArtifactUse"
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              "created_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "document_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "idempotency_key": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "manifest_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "resolutions": {
+                "items": {
+                  "$ref": "#/$defs/JarvisRunInputResolution"
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              "route": {
+                "$ref": "#/$defs/JarvisPipelineInputRoute"
+              },
+              "route_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "schema_version": {
+                "const": "clio-relay.jarvis-run-input-manifest.v1",
+                "default": "clio-relay.jarvis-run-input-manifest.v1",
+                "type": "string"
+              }
+            },
+            "required": [
+              "route",
+              "route_sha256",
+              "idempotency_key",
+              "resolutions",
+              "artifact_uses",
+              "manifest_sha256",
+              "created_at",
+              "document_sha256"
+            ],
+            "type": "object"
+          },
+          "JarvisRunInputResolution": {
+            "additionalProperties": false,
+            "properties": {
+              "binding": {
+                "$ref": "#/$defs/JarvisPipelineInputBinding"
+              },
+              "disposition": {
+                "enum": [
+                  "reused",
+                  "updated"
+                ],
+                "type": "string"
+              },
+              "previous_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "binding",
+              "disposition",
+              "previous_sha256"
+            ],
+            "type": "object"
+          },
+          "JarvisRunSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "env": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "package": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "pipeline_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "pipeline_path": {
+                "anyOf": [
+                  {
+                    "format": "path",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "pipeline_yaml": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "progress": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "timeout_seconds": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "workdir": {
+                "anyOf": [
+                  {
+                    "format": "path",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              }
+            },
+            "type": "object"
+          },
+          "JobKind": {
+            "enum": [
+              "jarvis",
+              "remote_agent",
+              "mcp_call",
+              "input_ingest"
+            ],
+            "type": "string"
+          },
+          "JobState": {
+            "enum": [
+              "queued",
+              "leased",
+              "running",
+              "succeeded",
+              "failed",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "McpAdmissionClass": {
+            "enum": [
+              "workload",
+              "control_query"
+            ],
+            "type": "string"
+          },
+          "McpCallSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "admission_class": {
+                "$ref": "#/$defs/McpAdmissionClass",
+                "default": "workload"
+              },
+              "arguments": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "env_from": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "expected_jarvis_cd_lock_binding": {
+                "anyOf": [
+                  {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "expected_registered_contract": {
+                "anyOf": [
+                  {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "expected_server_artifact_digest": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "jarvis_input_manifest": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/JarvisRunInputManifest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "operation": {
+                "$ref": "#/$defs/McpOperation",
+                "default": "tools/call"
+              },
+              "server": {
+                "type": "string"
+              },
+              "server_args": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "timeout_seconds": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "tool": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              }
+            },
+            "required": [
+              "server"
+            ],
+            "type": "object"
+          },
+          "McpOperation": {
+            "enum": [
+              "tools/call",
+              "tools/list"
+            ],
+            "type": "string"
+          },
+          "RemoteAgentTaskSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "context": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "mcp_config_path": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "model": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "prompt_path": {
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "workdir": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              }
+            },
+            "required": [
+              "prompt_path"
+            ],
+            "type": "object"
+          },
+          "StorageReservationEstimate": {
+            "additionalProperties": false,
+            "properties": {
+              "core_bytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "spool_bytes": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "core_bytes",
+              "spool_bytes"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "type": "integer"
+          },
+          "cluster": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "job_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/$defs/JobKind"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "leased_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "spec": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/JarvisRunSpec"
+              },
+              {
+                "$ref": "#/$defs/RemoteAgentTaskSpec"
+              },
+              {
+                "$ref": "#/$defs/McpCallSpec"
+              },
+              {
+                "$ref": "#/$defs/InputArtifactSpec"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/$defs/JobState",
+            "default": "queued"
+          },
+          "storage_reservation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/StorageReservationEstimate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "submission_digest": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "used_artifact_refs": {
+            "items": {
+              "$ref": "#/$defs/ArtifactUse"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          }
+        },
+        "required": [
+          "cluster",
+          "kind",
+          "spec",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "reference": "clio_relay.models.RelayJob"
+    },
+    "TaskTimelineEvent": {
+      "disposition": "relay-owned committed golden",
+      "json_schema": {
+        "$defs": {
+          "TaskEventStatus": {
+            "enum": [
+              "planned",
+              "running",
+              "succeeded",
+              "warning",
+              "error",
+              "canceled"
+            ],
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "artifact_refs": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "path_refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "seq": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/$defs/TaskEventStatus",
+            "default": "running"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "task_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "event_type",
+          "label",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "reference": "clio_relay.models.TaskTimelineEvent"
+    }
+  },
+  "runtime_dependency_policy": "No clio-schemas runtime dependency; release audit requires hashed requirements.",
+  "schema_version": "clio-relay.cross-repo-schema-equality.v1"
+}

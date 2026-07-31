@@ -1,0 +1,35 @@
+{
+  "_source": "docs/mcp-tasks.md:99-114; cross-repo counterpart clio_agent.gact.agents.invoker.RELAY_STATE_MAP (iowarp/clio-agent#1121 P2.3)",
+  "rows": [
+    {
+      "relay_observations": ["queued", "leased", "running"],
+      "mcp_task_status": "working",
+      "isError": null
+    },
+    {
+      "relay_observations": ["durable_input_round"],
+      "mcp_task_status": "input_required",
+      "isError": null
+    },
+    {
+      "relay_observations": ["succeeded"],
+      "mcp_task_status": "completed",
+      "isError": false
+    },
+    {
+      "relay_observations": ["tool_failure"],
+      "mcp_task_status": "completed",
+      "isError": true
+    },
+    {
+      "relay_observations": ["protocol_error"],
+      "mcp_task_status": "failed",
+      "isError": null
+    },
+    {
+      "relay_observations": ["canceled"],
+      "mcp_task_status": "cancelled",
+      "isError": null
+    }
+  ]
+}
