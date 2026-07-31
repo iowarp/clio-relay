@@ -321,6 +321,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "clio-schemas" },
     { name = "hatchling" },
     { name = "pip-audit" },
     { name = "pyright" },
@@ -349,6 +350,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "clio-schemas", git = "https://github.com/iowarp/clio-schemas.git?tag=v0.2.0" },
     { name = "hatchling", specifier = "==1.31.0" },
     { name = "pip-audit", specifier = ">=2.10.0" },
     { name = "pyright", specifier = ">=1.1.390" },
@@ -356,6 +358,14 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "twine", specifier = ">=6.2.0" },
+]
+
+[[package]]
+name = "clio-schemas"
+version = "0.2.0"
+source = { git = "https://github.com/iowarp/clio-schemas.git?tag=v0.2.0#acadd62168630f65ecb60b831cf88a5f65073386" }
+dependencies = [
+    { name = "pydantic" },
 ]
 
 [[package]]

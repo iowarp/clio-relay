@@ -67,8 +67,16 @@ clio-relay = "clio_relay.cli:app"
 [tool.uv]
 prerelease = "allow"
 
+[tool.uv.sources]
+clio-schemas = { git = "https://github.com/iowarp/clio-schemas.git", tag = "v0.2.0" }
+
 [dependency-groups]
 dev = [
+    # Test-only: the convergence acceptance tests exercise clio's projections
+    # against relay models. NOT a runtime dependency — the wheel must stay
+    # PyPI-resolvable and clio-schemas has no PyPI presence (git tag only);
+    # runtime adoption revisits when clio-schemas publishes (clio-relay#144).
+    "clio-schemas==0.2.0",
     "hatchling==1.31.0",
     "pip-audit>=2.10.0",
     "pyright>=1.1.390",
