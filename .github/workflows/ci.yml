@@ -54,6 +54,8 @@ jobs:
           python-version: "3.12"
       - name: install dependencies
         run: uv sync --python "3.12" --locked --all-groups
+      - name: check committed cross-repo schema goldens
+        run: uv run --no-sync python -m tests.generate_schema_equality_goldens --check
       - name: stage exact clio-kit release wheel
         shell: bash
         env:
