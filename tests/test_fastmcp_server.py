@@ -409,9 +409,13 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
         "clio_relay.core_queue.open_private_atomic_file",
         _open_atomic,
     )
+
+    def _no_cluster(_cluster: str) -> None:
+        return None
+
     monkeypatch.setattr(
         "clio_relay.mcp_server._optional_cluster_definition",
-        lambda _cluster: None,
+        _no_cluster,
     )
     settings = RelaySettings(
         core_dir=tmp_path / "core",
