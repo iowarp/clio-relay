@@ -304,6 +304,7 @@ name = "clio-relay"
 version = "1.5.10"
 source = { editable = "." }
 dependencies = [
+    { name = "clio-schemas" },
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "fastmcp-slim", extra = ["client", "server"] },
@@ -332,6 +333,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "clio-schemas", specifier = "==0.2.1" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastmcp", specifier = "==4.0.0b1" },
     { name = "fastmcp-slim", extras = ["client", "server"], specifier = "==4.0.0b1" },
@@ -356,6 +358,18 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "twine", specifier = ">=6.2.0" },
+]
+
+[[package]]
+name = "clio-schemas"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/f8/55288e50c25c764660c47da54dc28ae9c488a7f4558cd9ff87f2eb9eaba9/clio_schemas-0.2.1.tar.gz", hash = "sha256:cc04536410e7f220a623058205ca8a7c72d7e307b4427ed79102ee4d8911f950", size = 37210, upload-time = "2026-08-01T15:56:58.598Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/44/12e4685f17d8cfe72a18e433ac04fa61c16f76cbffd6754e624c6c1d4cf4/clio_schemas-0.2.1-py3-none-any.whl", hash = "sha256:f1f46462298476b7d4d21b7f4af4f57824d4bee93c5702daf39123e6b4271c1e", size = 25092, upload-time = "2026-08-01T15:56:57.704Z" },
 ]
 
 [[package]]
