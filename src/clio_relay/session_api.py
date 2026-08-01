@@ -23,6 +23,10 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
 from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
+from clio_relay.job_identity import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+)
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     REGISTERED_JARVIS_USER_CONTRACT,
@@ -46,8 +50,6 @@ from clio_relay.session_lifecycle import (
     status_remote_session,
 )
 
-OWNER_SESSION_ID_HEADER: Final = "X-Clio-Relay-Owner-Session-Id"
-SESSION_GENERATION_ID_HEADER: Final = "X-Clio-Relay-Session-Generation-Id"
 SESSION_IDENTITY_SCHEMA: Final = "clio-relay.session-identity.v1"
 MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 # Leave part of clio-agent's ordinary 30-second transport budget available for
@@ -219,7 +221,9 @@ def submit_owned_session_job(
         raise RelayError("owned session API returned a job for a different cluster")
     _validate_submission_receipt(job, path=path, payload=payload)
     if (
-        job.metadata.get("owner") != "clio-relay"
+        job.owner_session_id != session_id
+        or job.owner_session_generation_id != generation_id
+        or job.metadata.get("owner") != "clio-relay"
         or job.metadata.get("owner_session_id") != session_id
         or job.metadata.get("owner_session_generation_id") != generation_id
         or "owner_session_admission_id" in job.metadata

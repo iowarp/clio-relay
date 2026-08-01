@@ -65,6 +65,14 @@ from clio_relay.jarvis_service_runtime import (
     resolve_local_verified_jarvis_service_runtime_authority,
     reverify_jarvis_service_runtime,
 )
+from clio_relay.job_identity import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    JobOwnerSessionIdentity,
+    OwnerSessionIdentityError,
+    parse_job_owner_session_identity,
+    require_job_owner_session_identity,
+)
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
@@ -134,11 +142,7 @@ from clio_relay.remote_mcp import (
     resolve_registered_remote_mcp_admission,
 )
 from clio_relay.retention import TerminalRetentionCoordinator
-from clio_relay.session_api import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
-    session_identity_document,
-)
+from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
@@ -1046,6 +1050,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     auth_dependency = Depends(_require_api_token(resolved))
     session_submission_dependency = Depends(_require_session_submission_binding(resolved))
+    job_identity_parameter = cast(
+        JobOwnerSessionIdentity | None,
+        Depends(_job_owner_session_identity()),
+    )
 
     def ensure_intake_open() -> None:
         if resolved.owner_session_id is None:
@@ -1093,6 +1101,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def submit_owned(
         job: RelayJob,
         *,
+        owner_session_identity: JobOwnerSessionIdentity | None = None,
         mcp_admission_authority: McpAdmissionAuthority | None = None,
         input_ingest_policy: InputArtifactIngestPolicy | None = None,
     ) -> RelayJob:
@@ -1123,6 +1132,21 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     + ", ".join(protected)
                 ),
             )
+        if job.owner_session_id is not None or job.owner_session_generation_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "job owner-session identity is server-managed and must be "
+                    "supplied through headers"
+                ),
+            )
+        try:
+            owner_session_identity = require_job_owner_session_identity(
+                job.kind,
+                owner_session_identity,
+            )
+        except OwnerSessionIdentityError as exc:
+            raise HTTPException(status_code=422, detail=exc.detail) from exc
         if job.kind is JobKind.MCP_CALL:
             if not isinstance(job.spec, McpCallSpec):
                 raise HTTPException(status_code=422, detail="MCP job has an invalid specification")
@@ -1171,7 +1195,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         # Job ids crossing HTTP are caller-controlled, including on the raw
         # /jobs route. Generate new-admission entropy inside the server; an
         # idempotent retry is still canonicalized by the durable key record.
-        job = job.model_copy(update={"job_id": new_id("job")})
+        job_updates: dict[str, object] = {"job_id": new_id("job")}
+        if owner_session_identity is not None:
+            job_updates.update(
+                {
+                    "owner_session_id": owner_session_identity.owner_session_id,
+                    "owner_session_generation_id": (
+                        owner_session_identity.owner_session_generation_id
+                    ),
+                }
+            )
+        job = job.model_copy(update=job_updates)
         try:
             return _public_record(queue.submit_job(job.model_copy(update={"metadata": metadata})))
         except ValueError as exc:
@@ -1399,22 +1433,28 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     @app.post(
         "/jobs",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_job(job: RelayJob) -> RelayJob:
+    def submit_job(
+        job: RelayJob,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         if job.kind in {JobKind.MCP_CALL, JobKind.INPUT_INGEST}:
             raise HTTPException(
                 status_code=422,
                 detail=("this job kind must use its dedicated authenticated internal route"),
             )
-        return submit_owned(job)
+        return submit_owned(job, owner_session_identity=owner_session_identity)
 
     @app.post(
         "/jobs/jarvis",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_jarvis(request: JarvisSubmitRequest) -> RelayJob:
+    def submit_jarvis(
+        request: JarvisSubmitRequest,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -1422,15 +1462,19 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 spec=JarvisRunSpec(pipeline_yaml=request.pipeline_yaml),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
-            )
+            ),
+            owner_session_identity=owner_session_identity,
         )
 
     @app.post(
         "/jobs/jarvis-pipeline",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_jarvis_pipeline(request: JarvisPipelineSubmitRequest) -> RelayJob:
+    def submit_jarvis_pipeline(
+        request: JarvisPipelineSubmitRequest,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -1438,15 +1482,19 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 spec=JarvisRunSpec(pipeline_name=request.pipeline_name),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
-            )
+            ),
+            owner_session_identity=owner_session_identity,
         )
 
     @app.post(
         "/jobs/remote-agent",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_remote_agent(request: RemoteAgentSubmitRequest) -> RelayJob:
+    def submit_remote_agent(
+        request: RemoteAgentSubmitRequest,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -1460,15 +1508,19 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 ),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
-            )
+            ),
+            owner_session_identity=owner_session_identity,
         )
 
     @app.post(
         "/jobs/mcp-call",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_mcp_call(request: McpCallSubmitRequest) -> RelayJob:
+    def submit_mcp_call(
+        request: McpCallSubmitRequest,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         registry_path = default_registry_path()
         try:
             definition = (
@@ -1516,15 +1568,19 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
             ),
+            owner_session_identity=owner_session_identity,
             mcp_admission_authority=admission_authority,
         )
 
     @app.post(
         "/jobs/jarvis-mcp-call",
         response_model=RelayJob,
-        dependencies=[auth_dependency, session_submission_dependency],
+        dependencies=[auth_dependency],
     )
-    def submit_jarvis_mcp_call(request: JarvisMcpCallSubmitRequest) -> RelayJob:
+    def submit_jarvis_mcp_call(
+        request: JarvisMcpCallSubmitRequest,
+        owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
+    ) -> RelayJob:
         expected_digest = request.expected_server_artifact_digest
         try:
             admission_class, admission_authority = resolve_pinned_mcp_admission(
@@ -1591,6 +1647,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
             ),
+            owner_session_identity=owner_session_identity,
             mcp_admission_authority=admission_authority,
         )
 
@@ -2711,14 +2768,6 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
         expected_session_id = settings.owner_session_id
         expected_generation_id = settings.owner_session_generation_id
         if expected_session_id is None:
-            if (
-                x_clio_relay_owner_session_id is not None
-                or x_clio_relay_session_generation_id is not None
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="relay API is not bound to an owner session",
-                )
             return
         if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
             raise HTTPException(
@@ -2736,6 +2785,30 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
                 status_code=409,
                 detail="owner session or generation does not match this API process",
             )
+
+    return dependency
+
+
+def _job_owner_session_identity() -> Callable[..., Awaitable[JobOwnerSessionIdentity | None]]:
+    """Parse optional attribution headers independently from bearer admission."""
+
+    async def dependency(
+        x_clio_relay_owner_session_id: Annotated[
+            str | None,
+            Header(alias=OWNER_SESSION_ID_HEADER),
+        ] = None,
+        x_clio_relay_session_generation_id: Annotated[
+            str | None,
+            Header(alias=SESSION_GENERATION_ID_HEADER),
+        ] = None,
+    ) -> JobOwnerSessionIdentity | None:
+        try:
+            return parse_job_owner_session_identity(
+                x_clio_relay_owner_session_id,
+                x_clio_relay_session_generation_id,
+            )
+        except OwnerSessionIdentityError as exc:
+            raise HTTPException(status_code=422, detail=exc.detail) from exc
 
     return dependency
 

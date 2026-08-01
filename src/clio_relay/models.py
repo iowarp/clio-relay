@@ -1501,6 +1501,8 @@ class RelayJob(BaseModel):
     state: JobState = JobState.QUEUED
     spec: JobSpec
     idempotency_key: str
+    owner_session_id: str | None = Field(default=None, min_length=1, max_length=256)
+    owner_session_generation_id: DurableRecordId | None = None
     used_artifact_refs: list[ArtifactUse] = Field(
         default_factory=_empty_artifact_uses,
         max_length=1_000,
@@ -1513,6 +1515,15 @@ class RelayJob(BaseModel):
     last_error: str | None = None
     storage_reservation: StorageReservationEstimate | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def owner_session_identity_must_be_complete(self) -> Self:
+        """Require the explicit scheduler-attribution identity as one complete pair."""
+        if (self.owner_session_id is None) != (self.owner_session_generation_id is None):
+            raise ValueError(
+                "owner_session_id and owner_session_generation_id must be supplied together"
+            )
+        return self
 
     @field_validator("used_artifact_refs")
     @classmethod
