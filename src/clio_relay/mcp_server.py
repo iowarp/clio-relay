@@ -695,6 +695,14 @@ def _all_tool_definitions(
                     "model": {"type": "string"},
                     "workdir": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "request_followup_message": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "After durable admission, park one bounded message round that "
+                            "resumes through tasks/update."
+                        ),
+                    },
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
@@ -931,6 +939,14 @@ def _all_tool_definitions(
                     "model": {"type": "string"},
                     "workdir": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "request_followup_message": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "After durable admission, park one bounded message round that "
+                            "resumes through tasks/update."
+                        ),
+                    },
                     "idempotency_key": {"type": "string"},
                     "used_artifact_refs": _artifact_use_refs_json_schema(),
                     "wait_for_terminal": {"type": "boolean", "default": False},
@@ -4475,6 +4491,11 @@ def _submit_remote_agent(
     model = _optional_str(arguments, "model")
     workdir = _optional_str(arguments, "workdir")
     timeout_seconds = _optional_int(arguments, "timeout_seconds")
+    request_followup_message = _boolean_argument(
+        arguments,
+        "request_followup_message",
+        default=False,
+    )
     identity: dict[str, object] = {
         "cluster": cluster,
         "prompt_path": prompt_path,
@@ -4483,6 +4504,8 @@ def _submit_remote_agent(
         "workdir": workdir,
         "timeout_seconds": timeout_seconds,
     }
+    if request_followup_message:
+        identity["request_followup_message"] = True
     if used_artifact_refs:
         identity["used_artifact_refs"] = [artifact_use_payload(item) for item in used_artifact_refs]
     idempotency_key = str(

@@ -60,6 +60,26 @@ executes its bounded stdio request directly under relay-owned containment, with
 no outer JARVIS pipeline or scheduler allocation. If the called MCP tool then
 submits JARVIS work, that returned native execution remains JARVIS-owned.
 
+### job owner-session attribution
+
+HTTP job submissions use one complete attribution pair:
+`X-Clio-Relay-Owner-Session-Id` and
+`X-Clio-Relay-Session-Generation-Id`. The API records the pair directly as
+`RelayJob.owner_session_id` and `RelayJob.owner_session_generation_id`.
+These headers never replace `CLIO_RELAY_API_TOKEN`; the shared bearer remains
+the single admission credential.
+
+| job lane | identity policy | attribution rationale |
+|---|---|---|
+| `jarvis` | required | The job directly represents application work whose JARVIS execution may carry scheduler `native_id` provenance. |
+| `remote_agent` | required | The parent agent and any scheduler work it initiates need one durable owning session generation. |
+| `mcp_call` | optional, recorded when present | A generic call runs in endpoint containment without an outer scheduler allocation. If the called tool creates JARVIS work, its returned native handle and record remain the scheduler authority. |
+
+Supplying only one header is always a typed refusal. An owner-session-scoped
+API additionally verifies that the pair matches its exact live generation.
+Older lifecycle ownership metadata remains readable for teardown compatibility,
+but the direct `RelayJob` fields are the scheduler-attribution wire contract.
+
 Application behavior belongs in JARVIS packages or operator-selected application profiles. JARVIS core owns execution identity, durable progress events, and aggregate progress snapshots; an individual package owns only the application-specific interpretation used to produce those events. Generic bootstrap and worker code do not import application modules or infer application log paths. The generic bounded-command package stays generic.
 
 The production boundary is the native JARVIS contract. Every run returns exact
