@@ -149,6 +149,8 @@ def _job(expected_digest: str) -> RelayJob:
             timeout_seconds=60,
         ),
         idempotency_key="owned-session-client",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
         metadata={
             "owner": "clio-relay",
             "owner_session_id": "desktop-session-1",
@@ -187,6 +189,8 @@ def _admitted_jarvis_run_job(
             arguments={"pipeline_id": pipeline_id},
         ),
         idempotency_key="owned-session-client",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
         metadata={
             "owner": "clio-relay",
             "owner_session_id": "desktop-session-1",
@@ -336,6 +340,8 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
         payload=payload,
     )
 
+    assert job.owner_session_id == "desktop-session-1"
+    assert job.owner_session_generation_id == "generation-1"
     assert job.metadata["owner_session_generation_id"] == "generation-1"
     assert len(connections) == 1
     proof_headers = captured[0]["headers"]
@@ -429,6 +435,8 @@ def test_owned_session_submission_accepts_registered_jarvis_execution_identity(
             arguments={"pipeline_id": "science-pipeline"},
         ),
         idempotency_key="owned-session-client",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
         metadata={
             "owner": "clio-relay",
             "owner_session_id": "desktop-session-1",
