@@ -381,9 +381,14 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     client = cast(Any, TestClient(create_app(settings)))
     prompt_path = tmp_path / "prompt.md"
     mcp_config_path = tmp_path / "mcp.toml"
+    identity_headers = {
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
 
     jarvis_response = client.post(
         "/jobs/jarvis",
+        headers=identity_headers,
         json={
             "cluster": "test-cluster",
             "pipeline_yaml": "name: generic\npkgs: []\n",
@@ -392,6 +397,7 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     )
     jarvis_pipeline_response = client.post(
         "/jobs/jarvis-pipeline",
+        headers=identity_headers,
         json={
             "cluster": "test-cluster",
             "pipeline_name": "site_simulation_4node",
@@ -400,6 +406,7 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     )
     agent_response = client.post(
         "/jobs/remote-agent",
+        headers=identity_headers,
         json={
             "cluster": "test-cluster",
             "prompt_path": str(prompt_path),
@@ -462,6 +469,211 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert jarvis_mcp.spec.server_args == ["mcp-server", "jarvis"]
     assert jarvis_mcp.spec.tool == "jarvis_describe"
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
+
+
+def test_http_remote_agent_submission_requires_typed_owner_session_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schedulable agent lane must refuse missing attribution as typed data."""
+    jobs: list[RelayJob] = []
+
+    class SubmissionQueue:
+        closed = False
+
+        def initialize(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+        def submit_job(self, job: RelayJob) -> RelayJob:
+            jobs.append(job)
+            return job
+
+    def submission_queue(_settings: RelaySettings) -> SubmissionQueue:
+        return SubmissionQueue()
+
+    monkeypatch.setattr(
+        http_api_module,
+        "storage_managed_queue",
+        submission_queue,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="shared-admission-token",
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+    payload = {
+        "cluster": "test-cluster",
+        "prompt_path": "/remote/prompt.md",
+        "idempotency_key": "missing-owner-session-identity",
+    }
+
+    response = client.post(
+        "/jobs/remote-agent",
+        headers={"Authorization": "Bearer shared-admission-token"},
+        json=payload,
+    )
+    jarvis_response = client.post(
+        "/jobs/jarvis-pipeline",
+        headers={"Authorization": "Bearer shared-admission-token"},
+        json={
+            "cluster": "test-cluster",
+            "pipeline_name": "site-simulation",
+            "idempotency_key": "missing-jarvis-owner-session-identity",
+        },
+    )
+    identity_without_bearer = client.post(
+        "/jobs/remote-agent",
+        headers={
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
+        json={**payload, "idempotency_key": "identity-is-not-admission"},
+    )
+
+    assert response.status_code == 422
+    assert jarvis_response.status_code == 422
+    assert jarvis_response.json()["detail"]["code"] == "owner_session_identity_required"
+    assert jarvis_response.json()["detail"]["job_kind"] == "jarvis"
+    assert identity_without_bearer.status_code == 401
+    assert response.json()["detail"] == {
+        "schema": "clio-relay.owner-session-identity-error.v1",
+        "code": "owner_session_identity_required",
+        "job_kind": "remote_agent",
+        "required_headers": [
+            OWNER_SESSION_ID_HEADER,
+            SESSION_GENERATION_ID_HEADER,
+        ],
+        "message": "remote_agent submissions require owner-session identity headers",
+    }
+    assert jobs == []
+
+
+def test_http_job_lanes_record_owner_session_identity_when_supplied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required and optional job lanes retain the exact attribution pair."""
+    jobs: list[RelayJob] = []
+
+    class SubmissionQueue:
+        closed = False
+
+        def initialize(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+        def submit_job(self, job: RelayJob) -> RelayJob:
+            jobs.append(job)
+            return job
+
+    queue = SubmissionQueue()
+
+    def submission_queue(_settings: RelaySettings) -> SubmissionQueue:
+        return queue
+
+    def resolve_admission(
+        **_kwargs: object,
+    ) -> tuple[McpAdmissionClass, None]:
+        return McpAdmissionClass.WORKLOAD, None
+
+    monkeypatch.setattr(
+        http_api_module,
+        "storage_managed_queue",
+        submission_queue,
+    )
+    monkeypatch.setattr(
+        http_api_module,
+        "resolve_registered_remote_mcp_admission",
+        resolve_admission,
+    )
+    monkeypatch.setattr(
+        http_api_module,
+        "default_registry_path",
+        lambda: tmp_path / "missing-clusters.json",
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="shared-admission-token",
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+    identity_headers = {
+        "Authorization": "Bearer shared-admission-token",
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+
+    jarvis = client.post(
+        "/jobs/jarvis-pipeline",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "pipeline_name": "site-simulation",
+            "idempotency_key": "attributed-jarvis",
+        },
+    )
+    agent = client.post(
+        "/jobs/remote-agent",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "prompt_path": "/remote/prompt.md",
+            "idempotency_key": "attributed-agent",
+        },
+    )
+    attributed_mcp = client.post(
+        "/jobs/mcp-call",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "tool": "inspect",
+            "idempotency_key": "attributed-mcp",
+        },
+    )
+    unattributed_mcp = client.post(
+        "/jobs/mcp-call",
+        headers={"Authorization": "Bearer shared-admission-token"},
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "tool": "inspect",
+            "idempotency_key": "unattributed-mcp",
+        },
+    )
+    incomplete_mcp = client.post(
+        "/jobs/mcp-call",
+        headers={
+            "Authorization": "Bearer shared-admission-token",
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        },
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "tool": "inspect",
+            "idempotency_key": "incomplete-mcp",
+        },
+    )
+
+    assert [
+        jarvis.status_code,
+        agent.status_code,
+        attributed_mcp.status_code,
+        unattributed_mcp.status_code,
+    ] == [200, 200, 200, 200]
+    for job in jobs[:3]:
+        assert job.owner_session_id == "desktop-session-1"
+        assert job.owner_session_generation_id == "generation-1"
+    assert jobs[3].owner_session_id is None
+    assert jobs[3].owner_session_generation_id is None
+    assert incomplete_mcp.status_code == 422
+    assert incomplete_mcp.json()["detail"]["code"] == "owner_session_identity_incomplete"
 
 
 def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
@@ -1396,6 +1608,8 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     assert submitted.status_code == 200
     assert forged.status_code == 422
     assert "server-managed" in forged.json()["detail"]
+    assert submitted.json()["owner_session_id"] == "desktop-session-1"
+    assert submitted.json()["owner_session_generation_id"] == "generation-1"
     assert submitted.json()["metadata"] == {
         "owner": "clio-relay",
         "owner_session_id": "desktop-session-1",
@@ -1411,7 +1625,7 @@ def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
     assert patched.json()["metadata"]["phase"] == "ready"
 
 
-def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
+def test_session_job_submission_rejects_missing_and_stale_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1509,8 +1723,9 @@ def test_session_job_submission_rejects_missing_stale_and_unbound_identity(
         },
         json=payload,
     )
-    assert unbound.status_code == 409
-    assert "not bound" in unbound.json()["detail"]
+    assert unbound.status_code == 200
+    assert unbound.json()["owner_session_id"] == "desktop-session-1"
+    assert unbound.json()["owner_session_generation_id"] == "generation-1"
 
 
 def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cache(

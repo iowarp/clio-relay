@@ -21,7 +21,11 @@ from clio_relay.cluster_config import (
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
-from clio_relay.http_api import create_app
+from clio_relay.http_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    create_app,
+)
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
@@ -545,6 +549,10 @@ def test_http_submission_and_lineage_queries_share_the_content_pin(tmp_path: Pat
 
     submitted = client.post(
         "/jobs/jarvis",
+        headers={
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
         json={
             "cluster": "test-cluster",
             "pipeline_yaml": "name: lineage-http\npkgs: []\n",

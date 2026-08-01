@@ -11,7 +11,11 @@ from typer.testing import CliRunner
 from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.config import RelaySettings
-from clio_relay.http_api import create_app
+from clio_relay.http_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    create_app,
+)
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.storage_runtime import storage_managed_queue
@@ -104,6 +108,10 @@ def test_http_storage_status_and_507_decision_are_machine_readable(tmp_path: Pat
     status = client.get("/storage/status")
     first = client.post(
         "/jobs/jarvis",
+        headers={
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
         json={
             "cluster": "configured-target",
             "pipeline_yaml": "name: first\npkgs: []\n",
@@ -112,6 +120,10 @@ def test_http_storage_status_and_507_decision_are_machine_readable(tmp_path: Pat
     )
     denied = client.post(
         "/jobs/jarvis",
+        headers={
+            OWNER_SESSION_ID_HEADER: "desktop-session-1",
+            SESSION_GENERATION_ID_HEADER: "generation-1",
+        },
         json={
             "cluster": "configured-target",
             "pipeline_yaml": "name: second\npkgs: []\n",
