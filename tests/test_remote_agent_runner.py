@@ -5,11 +5,14 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, cast
 
 from pytest import MonkeyPatch
+
+from clio_relay.models import ArtifactRef
 
 
 class RemoteAgentRunnerModule(Protocol):
@@ -59,6 +62,7 @@ def test_exec_adapter_runs_configured_agent_with_templates(
 
     return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
         {
+            "relay_job_id": "job_00000000000000000000000000000000",
             "agent_bin": "python",
             "agent_adapter": "exec",
             "agent_args": [
@@ -106,6 +110,134 @@ def test_exec_adapter_runs_configured_agent_with_templates(
     assert captured_agent["frp_token"] is None
     assert captured_agent["stcp_secret"] is None
     assert captured_agent["owner_token"] is None
+
+
+def test_exec_adapter_mints_converged_final_answer_projection(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("finish the child turn", encoding="utf-8")
+    agent_script = tmp_path / "agent.py"
+    agent_script.write_text(
+        (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text('durable final answer\\n', encoding='utf-8')\n"
+        ),
+        encoding="utf-8",
+    )
+
+    return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+        {
+            "relay_job_id": "job_11111111111111111111111111111111",
+            "agent_bin": sys.executable,
+            "agent_adapter": "exec",
+            "agent_args": [str(agent_script), "{output_path}"],
+            "prompt_path": str(prompt_path),
+        }
+    )
+
+    result = json.loads((tmp_path / "agent-result.json").read_text(encoding="utf-8"))
+    projection = cast(dict[str, Any], result["final_answer_artifact_ref"])
+    artifact = ArtifactRef(**projection)
+    answer_bytes = (tmp_path / "agent-last-message.txt").read_bytes()
+
+    assert return_code == 0
+    assert artifact.job_id == "job_11111111111111111111111111111111"
+    assert artifact.kind == "report"
+    assert artifact.uri == (tmp_path / "agent-last-message.txt").as_uri()
+    assert artifact.size_bytes == len(answer_bytes)
+    assert artifact.sha256 is not None
+    assert artifact.metadata["mechanism"] == "model"
+    assert artifact.metadata["clio.provenance.v1"] == {
+        "job_id": artifact.job_id,
+        "uri": artifact.uri,
+        "size_bytes": artifact.size_bytes,
+        "created_at": artifact.created_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def test_gact_adapter_matches_exec_terminal_shape(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    assert cast(Any, runner)._gact_command(
+        agent_bin="uv",
+        agent_args=[],
+        prompt_text="answer through clio",
+    ) == [
+        "uv",
+        "run",
+        "--no-sync",
+        "clio-agent",
+        "--query",
+        "answer through clio",
+        "--json",
+    ]
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("answer through clio", encoding="utf-8")
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_document = "mcp_servers:\n  relay:\n    command: clio-relay\n"
+    mcp_path.write_text(mcp_document, encoding="utf-8")
+    fake_clio = tmp_path / "fake_clio.py"
+    fake_clio.write_text(
+        (
+            "import json, os, sys\n"
+            "assert sys.argv[1:3] == ['--query', 'answer through clio']\n"
+            "assert sys.argv[3] == '--json'\n"
+            "assert os.environ['CLIO_LM_MODEL'] == 'claude-native-model'\n"
+            "from pathlib import Path\n"
+            "mcp = Path(os.environ['XDG_CONFIG_HOME']) / 'clio-agent' / 'mcp.yaml'\n"
+            f"assert mcp.read_text(encoding='utf-8') == {mcp_document!r}\n"
+            "print(json.dumps({'answer': 'gact final answer', 'error_info': None}))\n"
+        ),
+        encoding="utf-8",
+    )
+
+    terminal_shapes: dict[str, set[str]] = {}
+    for adapter in ("exec", "gact"):
+        run_dir = tmp_path / adapter
+        run_dir.mkdir()
+        monkeypatch.chdir(run_dir)
+        if adapter == "exec":
+            exec_script = run_dir / "exec_agent.py"
+            exec_script.write_text(
+                (
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "Path(sys.argv[1]).write_text('exec final answer', encoding='utf-8')\n"
+                ),
+                encoding="utf-8",
+            )
+            agent_args = [str(exec_script), "{output_path}"]
+        else:
+            agent_args = [str(fake_clio)]
+        return_code = cast(RemoteAgentRunnerModule, runner).run_remote_agent_from_params(
+            {
+                "relay_job_id": "job_22222222222222222222222222222222",
+                "agent_bin": sys.executable,
+                "agent_adapter": adapter,
+                "agent_args": agent_args,
+                "prompt_path": str(prompt_path),
+                "model": "claude-native-model",
+                **({"mcp_config_path": str(mcp_path)} if adapter == "gact" else {}),
+            }
+        )
+        result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+        assert return_code == 0
+        assert result["returncode"] == 0
+        assert result["last_message_path"] == str(run_dir / "agent-last-message.txt")
+        assert "final_answer_artifact_ref" in result
+        terminal_shapes[adapter] = set(result)
+
+    assert (tmp_path / "gact" / "agent-last-message.txt").read_text(encoding="utf-8") == (
+        "gact final answer"
+    )
+    assert terminal_shapes["gact"] == terminal_shapes["exec"]
 
 
 def test_codex_adapter_disables_interactive_approvals(

@@ -20,6 +20,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+from clio_relay import core_queue as core_queue_module
 from clio_relay import endpoint as endpoint_module
 from clio_relay import process_containment
 from clio_relay.config import RelaySettings
@@ -30,6 +31,7 @@ from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesy
 from clio_relay.jarvis_execution import run_native_jarvis_broker
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
+    ArtifactRef,
     Cursor,
     EndpointRegistration,
     EndpointRole,
@@ -52,6 +54,7 @@ from clio_relay.queue_management import cleanup_stale_jobs, diagnose_job
 from clio_relay.relay_ops import cancel_job
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.runtime_metadata import runtime_sidecar_record
+from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 from tests.plugin_fakes import SiteSimulationProgressAdapter, install_site_progress_plugin
 
@@ -5742,65 +5745,112 @@ def test_worker_poll_rejects_replaced_endpoint_generation(tmp_path: Path) -> Non
     assert preserved.registered_at != endpoint.registered_at
 
 
-def test_worker_indexes_agent_result_artifacts(tmp_path: Path) -> None:
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    queue = ClioCoreQueue(settings.core_dir)
-    prompt = tmp_path / "prompt.md"
-    prompt.write_text("submit the configured pipeline", encoding="utf-8")
-    job = queue.submit_job(
-        RelayJob(
-            cluster="ares",
-            kind=JobKind.REMOTE_AGENT,
-            spec=RemoteAgentTaskSpec(prompt_path=str(prompt)),
-            idempotency_key="agent-artifacts",
-        )
-    )
-
-    class ArtifactProvider(RecordingProvider):
-        def run_pipeline_streaming(
-            self,
-            pipeline_path: Path,
-            *,
-            cwd: Path | None = None,
-            env: dict[str, str] | None = None,
-            on_stdout: Callable[[str], None] | None = None,
-            on_stderr: Callable[[str], None] | None = None,
-            on_start: Callable[[int], None] | None = None,
-            should_cancel: Callable[[], bool] | None = None,
-            on_poll: Callable[[], None] | None = None,
-            timeout_seconds: int | None = None,
-            on_timeout: Callable[[], None] | None = None,
-        ) -> subprocess.CompletedProcess[str]:
-            del on_stdout, on_stderr, should_cancel, on_poll, timeout_seconds, on_timeout
-            self.runs.append(pipeline_path)
-            assert cwd is not None
-            (cwd / "agent-result.json").write_text('{"returncode": 0}', encoding="utf-8")
-            (cwd / "agent-last-message.txt").write_text("submitted job_abc", encoding="utf-8")
-            if on_start is not None:
-                on_start(321)
-            return subprocess.CompletedProcess(args=["jarvis"], returncode=0, stdout="", stderr="")
-
-    worker = EndpointWorker(
-        role=EndpointRole.WORKER,
-        settings=settings,
+def test_worker_indexes_agent_result_artifacts(
+    tmp_path: Path,
+) -> None:
+    job = RelayJob(
         cluster="ares",
-        queue=queue,
-        provider=ArtifactProvider(),
+        kind=JobKind.REMOTE_AGENT,
+        spec=RemoteAgentTaskSpec(prompt_path="prompt.md"),
+        idempotency_key="agent-artifacts",
     )
-    worker.register()
+    spool = JobSpool(tmp_path / "spool", job)
+    spool.initialize()
+    answer = b"submitted job_abc"
+    answer_path = spool.path / "agent-last-message.txt"
+    answer_path.write_bytes(answer)
+    projection = {
+        "artifact_id": "artifact_33333333333333333333333333333333",
+        "sha256": hashlib.sha256(answer).hexdigest(),
+        "metadata": {
+            "kind": "report",
+            "version": 1,
+            "custody": "workspace-referenced",
+            "mechanism": "model",
+            "evidence_class": "hashed-at-use",
+            "clio.provenance.v1": {
+                "job_id": job.job_id,
+                "uri": answer_path.as_uri(),
+                "size_bytes": len(answer),
+                "created_at": "2026-08-01T12:00:00Z",
+            },
+        },
+    }
+    (spool.path / "agent-result.json").write_text(
+        json.dumps({"returncode": 0, "final_answer_artifact_ref": projection}),
+        encoding="utf-8",
+    )
 
-    result = worker.run_once()
-    artifacts = queue.list_artifacts(job.job_id)
-    events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=50)
+    artifacts: list[ArtifactRef] = []
+    event_types: list[str] = []
 
-    assert result is not None
-    assert result.state == JobState.SUCCEEDED
+    class RecordingArtifactQueue:
+        def list_artifacts_page(
+            self,
+            _job_id: str,
+            *,
+            cursor: int | None,
+            limit: int,
+        ) -> tuple[list[ArtifactRef], int | None, int]:
+            del cursor, limit
+            return list(artifacts), None, len(artifacts)
+
+        def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
+            saved = cast(Any, core_queue_module)._artifact_with_sequence(
+                artifact,
+                len(artifacts) + 1,
+            )
+            artifacts.append(saved)
+            return saved
+
+        def append_event(
+            self,
+            _job_id: str,
+            event_type: str,
+            _message: str,
+            *,
+            payload: dict[str, object],
+        ) -> None:
+            del payload
+            event_types.append(event_type)
+
+    worker = object.__new__(EndpointWorker)
+    cast(Any, worker).queue = RecordingArtifactQueue()
+    cast(Any, worker)._append_optional_result_artifacts(job, spool)
+
     assert {artifact.kind for artifact in artifacts} >= {
         "agent_result",
-        "agent_last_message",
+        "report",
     }
-    assert "agent_result.available" in [event.event_type for event in events]
-    assert "agent_last_message.available" in [event.event_type for event in events]
+    final_answer = next(
+        artifact
+        for artifact in artifacts
+        if artifact.artifact_id == "artifact_33333333333333333333333333333333"
+    )
+    serialized = final_answer.model_dump(mode="json")
+    projected = ArtifactRef.model_validate(
+        {
+            "artifact_id": final_answer.artifact_id,
+            "sha256": final_answer.sha256,
+            "metadata": final_answer.metadata,
+        }
+    )
+    assert final_answer.artifact_id == "artifact_33333333333333333333333333333333"
+    assert final_answer.kind == "report"
+    assert projected.job_id == job.job_id
+    assert projected.sequence == final_answer.sequence
+    assert projected.uri == final_answer.uri
+    assert projected.size_bytes == final_answer.size_bytes
+    assert projected.created_at == final_answer.created_at
+    assert serialized["metadata"]["clio.provenance.v1"] == {
+        "job_id": job.job_id,
+        "sequence": final_answer.sequence,
+        "uri": final_answer.uri,
+        "size_bytes": final_answer.size_bytes,
+        "created_at": "2026-08-01T12:00:00Z",
+    }
+    assert "agent_result.available" in event_types
+    assert "agent_last_message.available" in event_types
 
 
 @pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
