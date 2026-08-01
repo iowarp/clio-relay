@@ -187,13 +187,10 @@ def _requests_document(result: mcp_types.InputRequiredResult) -> dict[str, JSON]
     """Serialize one bounded guard result for the durable task projection."""
     requests = result.input_requests or {}
     return {
-        key: cast(
-            JSON,
-            request.model_dump(
-                by_alias=True,
-                mode="json",
-                exclude_none=True,
-            ),
+        key: request.model_dump(
+            by_alias=True,
+            mode="json",
+            exclude_none=True,
         )
         for key, request in requests.items()
     }
