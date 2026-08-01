@@ -20,6 +20,8 @@ from fastmcp_tasks.client_models import (
     ClientGetTaskResult,
     GetTaskRequest,
     GetTaskRequestParams,
+    UpdateTaskRequest,
+    UpdateTaskRequestParams,
 )
 from fastmcp_tasks.models import MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp.shared.exceptions import MCPError
@@ -371,6 +373,141 @@ def test_official_fastmcp_tool_task_projects_job_and_survives_reopen(
             assert result.structured_content is not None
             assert result.structured_content["job"]["job_id"] == job.job_id
             assert (await task.status()).status == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_test_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+
+    def accept_test_path(path: Path, *, directory: bool) -> None:
+        if directory:
+            create_test_directory(path)
+
+    for module_name in (
+        "clio_relay.cluster_config",
+        "clio_relay.core_queue",
+        "clio_relay.worker_lifetime_lock",
+    ):
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_directory",
+            create_test_directory,
+        )
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_path",
+            accept_test_path,
+        )
+    monkeypatch.setattr(
+        "clio_relay.core_queue.open_private_atomic_file",
+        lambda path: path.open("xb"),
+    )
+    monkeypatch.setattr(
+        "clio_relay.mcp_server._optional_cluster_definition",
+        lambda _cluster: None,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    async def update_task(
+        client: Client[FastMCPTransport],
+        task_id: str,
+        responses: dict[str, Any],
+    ) -> None:
+        await client.session.send_request(
+            UpdateTaskRequest(
+                params=UpdateTaskRequestParams(
+                    task_id=task_id,
+                    input_responses=responses,
+                )
+            ),
+            mcp_types.Result,
+        )
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue),
+            mode="auto",
+        ) as client:
+            task = await call_tool_task(
+                client,
+                "relay_submit_agent",
+                {
+                    **_submit_arguments(tmp_path, "post-admission-input"),
+                    "request_followup_message": True,
+                },
+            )
+            assert queue.get_job(task.task_id).job_id == task.task_id
+
+            parked = await task.status()
+            assert parked.status == "input_required"
+            assert parked.input_requests is not None
+            assert set(parked.input_requests) == {"agent_message"}
+
+            accepted = {
+                "action": "accept",
+                "content": {"message": "Use the new boundary condition."},
+            }
+            update_projection = queue.update_mcp_task_projection
+            cas_attempts = 0
+
+            def conflict_once(*args: Any, **kwargs: Any) -> RelayMcpTaskRecord:
+                nonlocal cas_attempts
+                cas_attempts += 1
+                if cas_attempts == 1:
+                    raise QueueConflictError("forced acceptance CAS conflict")
+                return update_projection(*args, **kwargs)
+
+            monkeypatch.setattr(queue, "update_mcp_task_projection", conflict_once)
+            await update_task(client, task.task_id, {"agent_message": accepted})
+            assert cas_attempts == 2
+
+            resumed = await task.status()
+            assert resumed.status == "working"
+            persisted = queue.get_mcp_task(task.task_id)
+            input_round = persisted.projection.input_round
+            assert input_round is not None
+            assert input_round.leg == 2
+            assert input_round.outstanding == {}
+            assert input_round.answered == {"agent_message": accepted}
+            assert input_round.request_state is None
+
+            consumed_at = persisted.updated_at
+            await update_task(
+                client,
+                task.task_id,
+                {
+                    "agent_message": {
+                        "action": "accept",
+                        "content": {"message": "duplicate must not replace the answer"},
+                    },
+                    "unknown": {"action": "decline"},
+                },
+            )
+            replayed = queue.get_mcp_task(task.task_id)
+            assert replayed.updated_at == consumed_at
+            assert replayed.projection.input_round == input_round
+
+            queue.update_job_state(task.task_id, JobState.SUCCEEDED)
+            result = await task.result()
+            assert result.is_error is False
+
+            ordinary = await client.call_tool(
+                "relay_submit_agent",
+                _submit_arguments(tmp_path, "ordinary-agent"),
+            )
+            assert ordinary.is_error is False
+            assert ordinary.structured_content is not None
+            ordinary_job_id = ordinary.structured_content["job_id"]
+            assert queue.get_job(ordinary_job_id).job_id == ordinary_job_id
+            with pytest.raises(NotFoundError):
+                queue.get_mcp_task(ordinary_job_id)
 
     asyncio.run(scenario())
 
