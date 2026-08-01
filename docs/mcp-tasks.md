@@ -125,17 +125,18 @@ Foreground guard tools may return `InputRequiredResult`. The FastMCP client
 answers that request and re-enters the tool; only the leg that admits a durable
 relay job becomes a task.
 
-A running relay operation may expose a durable input round through
-`input_required`. Answers arrive through `tasks/update`. Unknown or stale keys
-are ignored, partial answers are retained, repeated answers are replay-safe,
-and concurrent updates use compare-and-swap retry. Input request identities,
-answers, arguments, and the complete projection are finite, depth-bounded, and
-size-bounded before persistence.
+A remote-agent submission can opt into one post-admission message round with
+`request_followup_message: true`. The relay admits the job first, then the
+operation returns `InputRequiredResult` and durably projects the
+`agent_message` request as `input_required`. The matching `tasks/update`
+re-enters the guard with `ctx.input_responses` and `ctx.request_state`; after it
+consumes the answer, ordinary relay-state projection resumes. The JARVIS lane
+does not invent equivalent application input semantics.
 
-The current built-in relay catalog does not originate a parked input round
-after admission. The durable projection and standard client update path are
-available for operation providers that add that state; built-in interactive
-validation currently exercises the pre-admission guard flow.
+Unknown or stale keys are ignored, partial answers are retained, repeated
+answers are replay-safe, and concurrent updates use compare-and-swap retry.
+Input request identities, answers, arguments, and the complete projection are
+finite, depth-bounded, and size-bounded before persistence.
 
 Imperative `await ctx.elicit(...)` is not supported inside background work. It
 would hold a worker open for a client round trip. Background-capable tools use

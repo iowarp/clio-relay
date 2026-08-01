@@ -80,6 +80,10 @@ TASK_POLL_INTERVAL_MS = 1_000
 TASK_TTL_MS = 30 * 24 * 60 * 60 * 1_000
 MAX_TASK_ARGUMENT_BYTES = MAX_MCP_TASK_ARGUMENT_BYTES
 _TASK_METHOD_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
+_AGENT_TASK_TOOL_NAMES = frozenset({"relay_submit_agent", "relay_submit_remote_agent"})
+_AGENT_INPUT_KEY = "agent_message"
+_AGENT_INPUT_REQUEST_STATE_SCHEMA = "clio-relay.agent-message-input.v1"
+_MAX_AGENT_INPUT_MESSAGE_BYTES = 128 * 1_024
 
 type McpTaskStatus = Literal[
     "working",
@@ -113,6 +117,88 @@ def _relay_state_projection(observation: str) -> tuple[McpTaskStatus, bool | Non
         return _RELAY_STATE_PROJECTIONS[observation]
     except KeyError as exc:
         raise ValueError(f"relay observation has no MCP task projection: {observation}") from exc
+
+
+def _agent_input_request_state(task_id: str) -> str:
+    """Bind one post-admission agent input round to its durable relay task."""
+    return json.dumps(
+        {
+            "schema_version": _AGENT_INPUT_REQUEST_STATE_SCHEMA,
+            "task_id": task_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _post_admission_agent_input_guard(
+    ctx: Context,
+    *,
+    task_id: str,
+) -> mcp_types.InputRequiredResult | mcp_types.ElicitResult:
+    """Ask for one follow-up agent message, then consume it on guarded re-entry."""
+    responses = ctx.input_responses
+    if responses is None:
+        return mcp_types.InputRequiredResult(
+            input_requests={
+                _AGENT_INPUT_KEY: mcp_types.ElicitRequest(
+                    params=mcp_types.ElicitRequestFormParams(
+                        message="Send a follow-up message to the running remote agent.",
+                        requested_schema={
+                            "type": "object",
+                            "properties": {
+                                "message": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 32_768,
+                                }
+                            },
+                            "required": ["message"],
+                            "additionalProperties": False,
+                        },
+                    )
+                )
+            },
+            request_state=_agent_input_request_state(task_id),
+        )
+    if ctx.request_state != _agent_input_request_state(task_id):
+        raise ValueError("post-admission agent input lost its durable request state")
+    raw_response = responses.get(_AGENT_INPUT_KEY)
+    if raw_response is None:
+        raise ValueError("post-admission agent input omitted its requested response")
+    response = (
+        raw_response
+        if isinstance(raw_response, mcp_types.ElicitResult)
+        else mcp_types.ElicitResult.model_validate(raw_response)
+    )
+    if response.action == "accept":
+        content = response.content
+        if not isinstance(content, dict):
+            raise ValueError("accepted post-admission agent input omitted its content")
+        message = content.get("message")
+        if not isinstance(message, str) or not message:
+            raise ValueError("accepted post-admission agent input omitted its message")
+        if len(message.encode("utf-8")) > _MAX_AGENT_INPUT_MESSAGE_BYTES:
+            raise ValueError("post-admission agent input message exceeds its byte limit")
+    return response
+
+
+def _requests_document(result: mcp_types.InputRequiredResult) -> dict[str, JSON]:
+    """Serialize one bounded guard result for the durable task projection."""
+    requests = result.input_requests or {}
+    return {
+        key: request.model_dump(
+            by_alias=True,
+            mode="json",
+            exclude_none=True,
+        )
+        for key, request in requests.items()
+    }
+
+
+def _agent_input_enabled(tool_name: str, arguments: JSON) -> bool:
+    """Return whether an agent task explicitly opted into one follow-up round."""
+    return tool_name in _AGENT_TASK_TOOL_NAMES and arguments.get("request_followup_message") is True
 
 
 def _session_to_json(session: McpSessionState) -> JSON:
@@ -263,6 +349,7 @@ class RelayMcpRuntime:
         tool: RelayTool,
         arguments: JSON,
         result: ToolResult,
+        context: Context | None = None,
     ) -> RelayMcpTaskRecord | None:
         """Create a durable SEP task when a tool returned a relay job receipt."""
         structured = result.structured_content
@@ -275,6 +362,11 @@ class RelayMcpRuntime:
         try:
             state = JobState(state_value)
         except ValueError:
+            return None
+        if tool.task_requires_post_admission_input and not _agent_input_enabled(
+            tool.name,
+            arguments,
+        ):
             return None
         encoded_arguments = json.dumps(
             arguments,
@@ -297,7 +389,56 @@ class RelayMcpRuntime:
             state=state,
             projection=projection,
         )
-        return await asyncio.to_thread(self.queue.put_mcp_task, record)
+        saved = await asyncio.to_thread(self.queue.put_mcp_task, record)
+        if not _agent_input_enabled(tool.name, arguments):
+            return saved
+        if context is None:
+            raise ValueError("post-admission agent input requires an MCP task context")
+        return await self._park_agent_input(saved, context)
+
+    async def _park_agent_input(
+        self,
+        record: RelayMcpTaskRecord,
+        context: Context,
+    ) -> RelayMcpTaskRecord:
+        """Persist the guard's first post-admission leg with CAS retry."""
+        candidate = record
+        for _attempt in range(8):
+            if candidate.projection.input_round is not None:
+                return candidate
+            outcome = _post_admission_agent_input_guard(context, task_id=candidate.task_id)
+            if not isinstance(outcome, mcp_types.InputRequiredResult):
+                raise ValueError("post-admission agent input did not originate an input round")
+            outstanding = _requests_document(outcome)
+            if set(outstanding) != {_AGENT_INPUT_KEY}:
+                raise ValueError("post-admission agent input produced an unexpected request set")
+            issued_keys = [*candidate.projection.issued_input_keys, *outstanding]
+            projection = RelayMcpTaskProjection.model_validate(
+                {
+                    **candidate.projection.model_dump(mode="python"),
+                    "issued_input_keys": issued_keys,
+                    "input_round": RelayMcpInputRound(
+                        leg=1,
+                        outstanding=outstanding,
+                        request_state=outcome.request_state,
+                    ),
+                }
+            )
+            try:
+                return await asyncio.to_thread(
+                    self.queue.update_mcp_task_projection,
+                    candidate.task_id,
+                    projection,
+                    expected_updated_at=candidate.updated_at,
+                )
+            except QueueConflictError:
+                candidate = await asyncio.to_thread(
+                    self.queue.get_mcp_task,
+                    candidate.task_id,
+                )
+        raise QueueConflictError(
+            f"MCP task input could not park after concurrent updates: {record.task_id}"
+        )
 
     @staticmethod
     def _route_arguments(record: RelayMcpTaskRecord) -> JSON:
@@ -439,6 +580,16 @@ class RelayMcpRuntime:
                     "answered": {**current.answered, **matched},
                 }
             )
+            if (
+                not outstanding
+                and current.leg == 1
+                and current.request_state is not None
+                and _agent_input_enabled(
+                    candidate.projection.tool_name,
+                    candidate.projection.arguments,
+                )
+            ):
+                updated_round = self._resume_agent_input(candidate.task_id, updated_round)
             projection = RelayMcpTaskProjection.model_validate(
                 {
                     **candidate.projection.model_dump(mode="python"),
@@ -460,6 +611,40 @@ class RelayMcpRuntime:
                 )
         raise QueueConflictError(
             f"MCP task input could not converge after concurrent updates: {record.task_id}"
+        )
+
+    @staticmethod
+    def _resume_agent_input(
+        task_id: str,
+        input_round: RelayMcpInputRound,
+    ) -> RelayMcpInputRound:
+        """Re-enter the guard with durable answers without blocking a worker."""
+        context = get_context()
+        task_context = cast(Any, context)
+        previous_task_id = task_context._task_id
+        previous_request_state = task_context._task_request_state
+        previous_input_responses = task_context._task_input_responses
+        typed_responses = {
+            key: mcp_types.ElicitResult.model_validate(value)
+            for key, value in input_round.answered.items()
+        }
+        try:
+            task_context._task_id = task_id
+            task_context._task_request_state = input_round.request_state
+            task_context._task_input_responses = typed_responses
+            outcome = _post_admission_agent_input_guard(context, task_id=task_id)
+        finally:
+            task_context._task_id = previous_task_id
+            task_context._task_request_state = previous_request_state
+            task_context._task_input_responses = previous_input_responses
+        if isinstance(outcome, mcp_types.InputRequiredResult):
+            raise ValueError("post-admission agent input did not consume its answer")
+        return RelayMcpInputRound.model_validate(
+            {
+                **input_round.model_dump(mode="python"),
+                "leg": input_round.leg + 1,
+                "request_state": None,
+            }
         )
 
     async def cancel_task(self, record: RelayMcpTaskRecord) -> None:
@@ -520,6 +705,7 @@ class RelayTool(Tool):
 
     _runtime: RelayMcpRuntime = PrivateAttr()
     _catalog_revision: str | None = PrivateAttr(default=None)
+    _task_requires_post_admission_input: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -528,6 +714,7 @@ class RelayTool(Tool):
         runtime: RelayMcpRuntime,
         catalog_revision: str | None,
         task_capable: bool,
+        task_requires_post_admission_input: bool = False,
     ) -> None:
         meta = dict(cast(dict[str, Any], definition.get("_meta") or {}))
         if catalog_revision is not None:
@@ -553,11 +740,17 @@ class RelayTool(Tool):
         )
         self._runtime = runtime
         self._catalog_revision = catalog_revision
+        self._task_requires_post_admission_input = task_requires_post_admission_input
 
     @property
     def catalog_revision(self) -> str | None:
         """Return the exact dynamic catalog revision bound at dispatch."""
         return self._catalog_revision
+
+    @property
+    def task_requires_post_admission_input(self) -> bool:
+        """Return whether task admission requires the explicit agent-input opt-in."""
+        return self._task_requires_post_admission_input
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the established relay dispatcher without a second tool runtime."""
@@ -598,6 +791,9 @@ class RelayToolProvider(Provider):
                     cast(str, definition["name"]),
                     static_names,
                 ),
+                task_requires_post_admission_input=(
+                    cast(str, definition["name"]) in _AGENT_TASK_TOOL_NAMES
+                ),
             )
             for definition in definitions
         ]
@@ -619,6 +815,7 @@ class RelayToolProvider(Provider):
                 runtime=self._runtime,
                 catalog_revision=None if name in static_names else revision,
                 task_capable=_task_capable_tool_name(name, static_names),
+                task_requires_post_admission_input=name in _AGENT_TASK_TOOL_NAMES,
             )
         return None
 
@@ -626,7 +823,10 @@ class RelayToolProvider(Provider):
 def _task_capable_tool_name(name: str, static_names: set[str]) -> bool:
     """Return whether one admitted-job tool supports SEP-2663 task projection."""
     return (
-        name not in static_names or name == "relay_call_jarvis_mcp" or is_virtual_jarvis_tool(name)
+        name not in static_names
+        or name == "relay_call_jarvis_mcp"
+        or name in _AGENT_TASK_TOOL_NAMES
+        or is_virtual_jarvis_tool(name)
     )
 
 
@@ -795,13 +995,17 @@ class RelayTasksExtension(ServerExtension):
             tool=tool,
             arguments=dict(params.arguments or {}),
             result=outcome,
+            context=context,
         )
         if task is None:
             return outcome
         return CreateTaskResult(
             task_id=task.task_id,
             status=(
-                "cancelled"
+                "input_required"
+                if task.projection.input_round is not None
+                and task.projection.input_round.outstanding
+                else "cancelled"
                 if task.state is JobState.CANCELED
                 else "completed"
                 if task.state in TERMINAL_STATES

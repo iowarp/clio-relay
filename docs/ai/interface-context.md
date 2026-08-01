@@ -124,6 +124,12 @@ owner-session-scoped APIs.
 
 When `CLIO_RELAY_API_TOKEN` is set and the API is started with `--require-token`, clients must send either `Authorization: Bearer <token>` or `X-Clio-Relay-Token: <token>`. `/healthz` stays open for local process checks.
 
+`jarvis` and `remote_agent` HTTP submissions require the complete
+`X-Clio-Relay-Owner-Session-Id` /
+`X-Clio-Relay-Session-Generation-Id` attribution pair. Generic `mcp_call`
+submissions accept the pair optionally and retain it when present. The pair is
+recorded in explicit `RelayJob` fields and is not an admission credential.
+
 Job POSTs to an owner-session-scoped API additionally require
 `X-Clio-Relay-Owner-Session-Id` and
 `X-Clio-Relay-Session-Generation-Id` for the exact live generation. The API
