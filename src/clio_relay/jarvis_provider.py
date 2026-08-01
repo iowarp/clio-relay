@@ -127,7 +127,12 @@ class JarvisCdProvider:
         }
         return yaml.safe_dump(_drop_none(document), sort_keys=False)
 
-    def render_remote_agent_task_yaml(self, spec: RemoteAgentTaskSpec) -> str:
+    def render_remote_agent_task_yaml(
+        self,
+        spec: RemoteAgentTaskSpec,
+        *,
+        relay_job_id: str | None = None,
+    ) -> str:
         """Render a JARVIS pipeline for a remote agent task."""
         document: dict[str, Any] = {
             "name": "clio-relay-remote-agent",
@@ -135,6 +140,7 @@ class JarvisCdProvider:
                 {
                     "pkg_type": "clio_relay.remote_agent",
                     "pkg_name": "remote_agent",
+                    "relay_job_id": relay_job_id,
                     "agent_bin": self.agent_bin,
                     "agent_adapter": self.agent_adapter,
                     "agent_args": self.agent_args,
