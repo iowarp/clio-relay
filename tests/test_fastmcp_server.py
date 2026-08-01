@@ -401,6 +401,7 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
             f"{module_name}.ensure_private_configuration_path",
             accept_test_path,
         )
+
     def _open_atomic(path: Path) -> BinaryIO:
         return path.open("xb")
 
