@@ -574,6 +574,27 @@ class _LegacyOutputRecord:
     representation: Literal["payload_text", "archive"]
 
 
+def _artifact_with_sequence(artifact: ArtifactRef, sequence: int) -> ArtifactRef:
+    """Return an indexed artifact with relay order mirrored into CLIO provenance."""
+    metadata = artifact.metadata
+    raw_clio_provenance = metadata.get("clio.provenance.v1")
+    if isinstance(raw_clio_provenance, dict):
+        clio_provenance = cast(dict[str, Any], raw_clio_provenance)
+        recorded_sequence = clio_provenance.get("sequence")
+        if recorded_sequence is not None and recorded_sequence != sequence:
+            raise QueueConflictError("CLIO artifact provenance sequence does not match relay order")
+        metadata = {
+            **metadata,
+            "clio.provenance.v1": {
+                **clio_provenance,
+                "sequence": sequence,
+            },
+        }
+    payload = artifact.model_dump(mode="python")
+    payload.update(sequence=sequence, metadata=metadata)
+    return ArtifactRef.model_validate(payload)
+
+
 class ClioCoreQueue:
     """Durable queue facade for endpoint, job, task, lease, event, cursor, and artifact records."""
 
@@ -8378,7 +8399,7 @@ class ClioCoreQueue:
         with self._lock:
             self.get_job(artifact.job_id)
             sequence = self._next_job_record_sequence_unlocked(artifact.job_id, "artifact_count")
-            saved = artifact.model_copy(update={"sequence": sequence})
+            saved = _artifact_with_sequence(artifact, sequence)
             self._write(self._storage_root / "artifacts" / f"{saved.artifact_id}.json", saved)
             self._write(
                 self._job_record_path("artifacts_by_job", saved.job_id, saved.artifact_id),

@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
+
+from clio_schemas import ArtifactKind, ArtifactVersion, Custody, IdentityEvidence, Mechanism
 
 from clio_relay.process_containment import nested_popen_kwargs, terminate_nested_process
 
 CODEX_PROFILE_MAX_BYTES = 1_048_576
 AGENT_PROMPT_MAX_BYTES = 4 * 1_048_576
+AGENT_FINAL_ANSWER_MAX_BYTES = 16 * 1_048_576
 RELAY_SIDE_CHANNEL_ENV_NAMES = frozenset(
     {
         "CLIO_RELAY_PROGRESS_FILE",
@@ -28,6 +34,9 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
     output_path = Path.cwd() / "agent-last-message.txt"
     result_path = Path.cwd() / "agent-result.json"
     cleanup_path: Path | None = None
+    gact_config_root: Path | None = None
+    gact_env: dict[str, str] = {}
+    relay_job_id = _safe_optional_str(params.get("relay_job_id"))
     agent_bin = str(params.get("agent_bin", ""))
     adapter = str(params.get("agent_adapter", "exec"))
     prompt_path = _safe_optional_path(params.get("prompt_path"))
@@ -73,11 +82,32 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
                 mcp_config_path=mcp_config_path,
                 model=rendered_model,
             )
+        elif adapter == "gact":
+            command = _gact_command(
+                agent_bin=agent_bin,
+                agent_args=agent_args,
+                prompt_text=prompt_text,
+            )
+            gact_env, gact_config_root = _gact_environment(
+                mcp_config_path=mcp_config_path,
+                model=rendered_model,
+            )
         else:
             raise ValueError(f"unsupported agent_adapter: {adapter}")
 
         try:
-            result = _run_process(command, cwd=workdir, timeout=timeout)
+            if adapter == "gact":
+                result = _run_process(
+                    command,
+                    cwd=workdir,
+                    timeout=timeout,
+                    capture_stdout=True,
+                    env_overrides=gact_env,
+                )
+                if result.returncode == 0:
+                    _write_gact_last_message(result.stdout, output_path=output_path)
+            else:
+                result = _run_process(command, cwd=workdir, timeout=timeout)
             returncode = result.returncode
             timed_out = False
         except subprocess.TimeoutExpired:
@@ -93,6 +123,17 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
         else:
             error_type = None
             error_message = None
+        final_answer_artifact_ref = (
+            _mint_final_answer_artifact_ref(
+                output_path,
+                relay_job_id=relay_job_id,
+                adapter=adapter,
+                agent_bin=agent_bin,
+                model=rendered_model,
+            )
+            if returncode == 0 and output_path.exists()
+            else None
+        )
         _write_agent_result(
             result_path=result_path,
             agent_bin=agent_bin,
@@ -107,6 +148,7 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
             output_path=output_path,
             error_type=error_type,
             error_message=error_message,
+            final_answer_artifact_ref=final_answer_artifact_ref,
         )
         return returncode
     except (OSError, ValueError) as exc:
@@ -124,11 +166,14 @@ def run_remote_agent_from_params(params: dict[str, Any]) -> int:
             output_path=output_path,
             error_type=type(exc).__name__,
             error_message=str(exc),
+            final_answer_artifact_ref=None,
         )
         return 2
     finally:
         if cleanup_path is not None:
             cleanup_path.unlink(missing_ok=True)
+        if gact_config_root is not None:
+            _remove_gact_config_root(gact_config_root)
 
 
 def _codex_command(
@@ -223,26 +268,120 @@ def _exec_command(
     return [agent_bin, *rendered]
 
 
+def _gact_command(
+    *,
+    agent_bin: str,
+    agent_args: list[str],
+    prompt_text: str,
+) -> list[str]:
+    """Build the non-interactive CLIO/GACT command executed through uv."""
+    prefix = agent_args or ["run", "--no-sync", "clio-agent"]
+    return [agent_bin, *prefix, "--query", prompt_text, "--json"]
+
+
+def _gact_environment(
+    *,
+    mcp_config_path: Path | None,
+    model: str | None,
+) -> tuple[dict[str, str], Path | None]:
+    """Build CLIO overrides and stage its private user MCP configuration."""
+    overrides = {"CLIO_LM_MODEL": model} if model is not None else {}
+    if mcp_config_path is None:
+        return overrides, None
+    root = Path(tempfile.mkdtemp(prefix="clio-relay-gact-"))
+    try:
+        config_dir = root / "clio-agent"
+        config_dir.mkdir(mode=0o700)
+        target = config_dir / "mcp.yaml"
+        payload = _read_bytes_bounded(
+            mcp_config_path,
+            limit=CODEX_PROFILE_MAX_BYTES,
+            label="CLIO MCP configuration",
+        )
+        try:
+            payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("CLIO MCP configuration must be UTF-8") from exc
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags, 0o600)
+        try:
+            _write_all(descriptor, payload)
+        finally:
+            os.close(descriptor)
+        target.chmod(0o600)
+    except (OSError, ValueError):
+        _remove_gact_config_root(root)
+        raise
+    overrides["XDG_CONFIG_HOME"] = str(root)
+    return overrides, root
+
+
+def _remove_gact_config_root(root: Path) -> None:
+    """Remove only the exact private CLIO profile tree created by this run."""
+    config_dir = root / "clio-agent"
+    (config_dir / "mcp.yaml").unlink(missing_ok=True)
+    if config_dir.exists():
+        config_dir.rmdir()
+    if root.exists():
+        root.rmdir()
+
+
 def _run_process(
     command: list[str],
     *,
     cwd: Path | None,
     timeout: int | None,
+    capture_stdout: bool = False,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     child_env = _scrubbed_env()
+    if env_overrides is not None:
+        child_env.update(env_overrides)
     process = subprocess.Popen(
         command,
         cwd=cwd,
         env=child_env,
         text=True,
+        stdout=subprocess.PIPE if capture_stdout else None,
         **nested_popen_kwargs(child_env),
     )
     try:
-        returncode = process.wait(timeout=timeout)
+        if capture_stdout:
+            stdout, _stderr = process.communicate(timeout=timeout)
+            returncode = process.returncode
+        else:
+            returncode = process.wait(timeout=timeout)
+            stdout = None
     except subprocess.TimeoutExpired:
         _terminate_process_tree(process)
         raise
-    return subprocess.CompletedProcess(command, returncode)
+    return subprocess.CompletedProcess(command, returncode, stdout=stdout)
+
+
+def _write_gact_last_message(stdout: str | None, *, output_path: Path) -> None:
+    """Extract CLIO's JSON answer and preserve its raw terminal output."""
+    if stdout is None:
+        raise ValueError("gact adapter did not capture CLIO output")
+    print(stdout, end="" if stdout.endswith("\n") else "\n", flush=True)
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("gact adapter expected one CLIO JSON result") from exc
+    if not isinstance(value, dict):
+        raise ValueError("gact adapter CLIO result must be an object")
+    answer = cast(dict[str, object], value).get("answer")
+    if not isinstance(answer, str):
+        raise ValueError("gact adapter CLIO result omitted its answer")
+    _require_text_within_limit(
+        answer,
+        limit=AGENT_FINAL_ANSWER_MAX_BYTES,
+        label="gact final answer",
+    )
+    output_path.write_text(answer, encoding="utf-8")
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -272,6 +411,7 @@ def _write_agent_result(
     output_path: Path,
     error_type: str | None,
     error_message: str | None,
+    final_answer_artifact_ref: dict[str, Any] | None,
 ) -> None:
     finished_at = time.time()
     result = {
@@ -289,8 +429,58 @@ def _write_agent_result(
         "error_message": error_message,
         "error_type": error_type,
         "last_message_path": str(output_path) if output_path.exists() else None,
+        "final_answer_artifact_ref": final_answer_artifact_ref,
     }
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _mint_final_answer_artifact_ref(
+    output_path: Path,
+    *,
+    relay_job_id: str | None,
+    adapter: str,
+    agent_bin: str,
+    model: str | None,
+) -> dict[str, Any]:
+    """Mint the child's final answer through CLIO's converged projection."""
+    if relay_job_id is None:
+        raise ValueError("relay_job_id is required to mint the final answer artifact")
+    payload = _read_bytes_bounded(
+        output_path,
+        limit=AGENT_FINAL_ANSWER_MAX_BYTES,
+        label="agent final answer",
+    )
+    created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    version = ArtifactVersion(
+        kind=ArtifactKind.REPORT,
+        custody=Custody.WORKSPACE_REFERENCED,
+        mechanism=Mechanism.MODEL,
+        evidence=IdentityEvidence.hashed_at_use(
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload),
+            mtime=output_path.stat().st_mtime,
+        ),
+        producer={
+            "adapter": adapter,
+            "agent_bin": agent_bin,
+            "model": model,
+        },
+        path=str(output_path),
+        created_at=created_at,
+        annotation="Remote agent final answer",
+    )
+    projection = version.to_artifact_ref()
+    raw_metadata = projection.get("metadata")
+    if not isinstance(raw_metadata, dict):
+        raise ValueError("clio final answer projection omitted metadata")
+    metadata = cast(dict[str, Any], raw_metadata)
+    metadata["clio.provenance.v1"] = {
+        "job_id": relay_job_id,
+        "uri": output_path.as_uri(),
+        "size_bytes": len(payload),
+        "created_at": created_at,
+    }
+    return projection
 
 
 def _required_str(params: dict[str, Any], key: str) -> str:
@@ -310,6 +500,10 @@ def _optional_path(value: Any) -> Path | None:
 
 def _safe_optional_path(value: Any) -> Path | None:
     return Path(value) if isinstance(value, str) and value else None
+
+
+def _safe_optional_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _optional_int(value: Any) -> int | None:

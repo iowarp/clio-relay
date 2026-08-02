@@ -51,7 +51,9 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
+    CLIO_PROVENANCE_METADATA_KEY,
     REGISTERED_JARVIS_USER_CONTRACT,
+    ArtifactRef,
     EndpointRegistration,
     EndpointRole,
     JarvisRunSpec,
@@ -189,6 +191,7 @@ MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA = "clio-relay.jarvis-execution-recovery.v1"
 MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS = 60
 MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS = 75
 MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES = 16 * 1024 * 1024
+AGENT_RESULT_MAX_BYTES = 1024 * 1024
 MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS = 5
 MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS = 300
 MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS = 5
@@ -1396,7 +1399,10 @@ class EndpointWorker:
         if job.kind == JobKind.JARVIS and isinstance(job.spec, JarvisRunSpec):
             return self.provider.render_bounded_command_yaml(job.spec)
         if job.kind == JobKind.REMOTE_AGENT and isinstance(job.spec, RemoteAgentTaskSpec):
-            return self.provider.render_remote_agent_task_yaml(job.spec)
+            return self.provider.render_remote_agent_task_yaml(
+                job.spec,
+                relay_job_id=job.job_id,
+            )
         if job.kind == JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
             return self.provider.render_mcp_call_yaml(job.spec)
         raise ConfigurationError(f"job kind/spec mismatch for {job.job_id}")
@@ -5450,11 +5456,19 @@ class EndpointWorker:
             "mcp_result": spool.path / "mcp-result.json",
         }
         for kind, path in candidates.items():
-            if internal_filesystem_path(path).exists() and self._append_spool_artifact_once(
+            if not internal_filesystem_path(path).exists():
+                continue
+            candidate = (
+                self._remote_agent_final_artifact(job, spool, path)
+                if kind == "agent_last_message" and job.kind is JobKind.REMOTE_AGENT
+                else None
+            )
+            if self._append_spool_artifact_once(
                 job,
                 spool,
                 path,
                 kind=kind,
+                candidate=candidate,
             ):
                 self.queue.append_event(
                     job.job_id,
@@ -5463,6 +5477,67 @@ class EndpointWorker:
                     payload={"path": str(path)},
                 )
 
+    def _remote_agent_final_artifact(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        path: Path,
+    ) -> ArtifactRef:
+        """Verify the package-minted CLIO projection against final-answer bytes."""
+        result_path = spool.path / "agent-result.json"
+        try:
+            result_snapshot = read_owned_regular_file_bytes(
+                result_path,
+                owned_root=spool.path,
+                max_bytes=AGENT_RESULT_MAX_BYTES,
+            )
+            assert result_snapshot.data is not None
+            result = json.loads(result_snapshot.data.decode("utf-8"))
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            raise RelayError(f"invalid remote-agent terminal record: {exc}") from exc
+        if not isinstance(result, dict):
+            raise RelayError("remote-agent terminal record must be an object")
+        raw_projection = cast(dict[str, object], result).get("final_answer_artifact_ref")
+        if not isinstance(raw_projection, dict):
+            raise RelayError("remote-agent terminal record omitted final_answer_artifact_ref")
+        try:
+            projection = ArtifactRef.model_validate(raw_projection)
+        except ValueError as exc:
+            raise RelayError(f"invalid remote-agent final-answer ArtifactRef: {exc}") from exc
+        owned = spool.artifact_for(path, kind="agent_last_message")
+        if projection.sequence is not None:
+            raise RelayError("remote-agent package must not assign the relay artifact sequence")
+        if projection.job_id != job.job_id:
+            raise RelayError("remote-agent final-answer artifact job lineage did not match")
+        if projection.kind != "report":
+            raise RelayError("remote-agent final-answer CLIO kind must be report")
+        if (
+            projection.uri != owned.uri
+            or projection.size_bytes != owned.size_bytes
+            or projection.sha256 != owned.sha256
+        ):
+            raise RelayError("remote-agent final-answer artifact content lineage did not match")
+        required_metadata = {
+            "kind": "report",
+            "version": 1,
+            "custody": "workspace-referenced",
+            "mechanism": "model",
+            "evidence_class": "hashed-at-use",
+        }
+        if any(projection.metadata.get(key) != value for key, value in required_metadata.items()):
+            raise RelayError("remote-agent final-answer CLIO projection metadata did not match")
+        return projection.model_copy(
+            update={
+                "metadata": {**projection.metadata, **owned.metadata},
+            }
+        )
+
     def _append_spool_artifact_once(
         self,
         job: RelayJob,
@@ -5470,9 +5545,10 @@ class EndpointWorker:
         path: Path,
         *,
         kind: str,
+        candidate: ArtifactRef | None = None,
     ) -> bool:
         """Index one immutable spool artifact, tolerating restart replay."""
-        candidate = spool.artifact_for(path, kind=kind)
+        candidate = candidate or spool.artifact_for(path, kind=kind)
         cursor: int | None = 1
         while cursor is not None:
             artifacts, cursor, _total = self.queue.list_artifacts_page(
@@ -5481,7 +5557,7 @@ class EndpointWorker:
                 limit=100,
             )
             for existing in artifacts:
-                if existing.kind != kind or existing.uri != candidate.uri:
+                if existing.kind != candidate.kind or existing.uri != candidate.uri:
                     continue
                 if (
                     existing.sha256 != candidate.sha256
@@ -5489,6 +5565,13 @@ class EndpointWorker:
                 ):
                     raise RelayError(
                         f"indexed {kind} artifact changed during restart recovery: {path}"
+                    )
+                if (
+                    CLIO_PROVENANCE_METADATA_KEY in candidate.metadata
+                    and existing.artifact_id != candidate.artifact_id
+                ):
+                    raise RelayError(
+                        f"indexed {kind} artifact lost its package-minted identity: {path}"
                     )
                 return False
         self.queue.append_artifact(candidate)

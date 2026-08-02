@@ -470,12 +470,14 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
             prompt_path=str(tmp_path / "prompt.md"),
             mcp_config_path=str(tmp_path / "mcp.json"),
             context={"source_event_seq": 7, "match_groups": {"step": "50"}},
-        )
+        ),
+        relay_job_id="job_11111111111111111111111111111111",
     )
     document = yaml.safe_load(rendered)
 
     package = document["pkgs"][0]
     assert package["pkg_type"] == "clio_relay.remote_agent"
+    assert package["relay_job_id"] == "job_11111111111111111111111111111111"
     assert package["agent_bin"] == "/opt/agent/bin/current-agent"
     assert package["agent_adapter"] == "exec"
     assert package["agent_args"] == ["--prompt", "{prompt_path}"]
