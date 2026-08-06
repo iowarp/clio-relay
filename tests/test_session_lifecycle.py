@@ -4220,12 +4220,15 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
 def test_start_remote_session_rejects_legacy_key_value_output(monkeypatch: MonkeyPatch) -> None:
     """A readable legacy line stream cannot substitute for the typed receipt."""
 
+    def fake_ssh(_definition: ClusterDefinition, _script: str) -> str:
+        return (
+            "session_started=session-1\nsession_generation_id=generation-1\nremote_api_port=9001\n"
+        )
+
     monkeypatch.setattr(
         session_lifecycle,
         "_ssh_script",
-        lambda _definition, _script: (
-            "session_started=session-1\nsession_generation_id=generation-1\nremote_api_port=9001\n"
-        ),
+        fake_ssh,
     )
 
     with pytest.raises(RelayError, match="start receipt is invalid"):
