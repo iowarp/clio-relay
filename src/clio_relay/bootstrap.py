@@ -1825,8 +1825,10 @@ import errno
 import json
 import os
 import posixpath
+import shlex
 import socket
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1835,6 +1837,9 @@ MAX_OWNED_PROCESSES = 65_536
 MAX_PROC_FILE_BYTES = 1_048_576
 MAX_ENDPOINT_RECORDS = 10_000
 MAX_ENDPOINT_TOTAL_BYTES = 64 * 1_048_576
+MAX_SYSTEMD_OUTPUT_BYTES = 64 * 1024
+SYSTEMD_TIMEOUT_SECONDS = 5.0
+PERMISSION_DENIED = object()
 
 
 def fail(message: str) -> "NoReturn":
@@ -1847,7 +1852,7 @@ def vanished(error: OSError) -> bool:
     return error.errno in {errno.ENOENT, errno.ESRCH}
 
 
-def read_bounded(path: Path) -> bytes | None:
+def read_bounded(path: Path, *, expose_permission_denied: bool = False):
     """Read one proc pseudo-file without accepting an unbounded value."""
     try:
         with path.open("rb") as stream:
@@ -1855,6 +1860,8 @@ def read_bounded(path: Path) -> bytes | None:
     except OSError as error:
         if vanished(error):
             return None
+        if expose_permission_denied and error.errno in {errno.EACCES, errno.EPERM}:
+            return PERMISSION_DENIED
         fail(f"cannot inspect {path}: {error}")
     if len(value) > MAX_PROC_FILE_BYTES:
         fail(f"{path} exceeds the bounded inspection size")
@@ -1903,6 +1910,84 @@ def environment(value: bytes) -> dict[str, str]:
             continue
         key, raw_value = item.split(b"=", 1)
         parsed[os.fsdecode(key)] = os.fsdecode(raw_value)
+    return parsed
+
+
+def systemd_process_environment(process: Path, pid: int) -> dict[str, str] | None:
+    """Resolve a protected process environment from its exact user service."""
+    raw_cgroup = read_bounded(process / "cgroup")
+    if raw_cgroup is None:
+        return None
+    try:
+        cgroup_lines = raw_cgroup.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"cannot decode {process / 'cgroup'}: {error}")
+    unified_groups = []
+    for line in cgroup_lines:
+        hierarchy, separator, remainder = line.partition(":")
+        controllers, second_separator, control_group = remainder.partition(":")
+        if separator and second_separator and hierarchy == "0" and controllers == "":
+            unified_groups.append(control_group)
+    if len(unified_groups) != 1:
+        fail(f"protected relay pid={pid} has no exact unified cgroup")
+    control_group = unified_groups[0]
+    unit = posixpath.basename(control_group)
+    if (
+        not unit.endswith(".service")
+        or len(unit) > 256
+        or any(not (character.isalnum() or character in "_.@:-") for character in unit)
+    ):
+        fail(f"protected relay pid={pid} is not owned by one bounded user service")
+    try:
+        completed = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--no-pager",
+                "--property=MainPID",
+                "--property=ControlGroup",
+                "--property=Environment",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=SYSTEMD_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        fail(f"cannot inspect protected relay service for pid={pid}: {type(error).__name__}")
+    if (
+        completed.returncode != 0
+        or len(completed.stdout) > MAX_SYSTEMD_OUTPUT_BYTES
+        or len(completed.stderr) > MAX_SYSTEMD_OUTPUT_BYTES
+    ):
+        fail(f"cannot inspect protected relay service for pid={pid}")
+    try:
+        output = completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"protected relay service metadata for pid={pid} is not UTF-8: {error}")
+    properties: dict[str, str] = {}
+    for line in output.splitlines():
+        name, separator, value = line.partition("=")
+        if not separator or name not in {"MainPID", "ControlGroup", "Environment"}:
+            fail(f"protected relay service metadata for pid={pid} is malformed")
+        if name in properties:
+            fail(f"protected relay service metadata for pid={pid} is ambiguous")
+        properties[name] = value
+    if set(properties) != {"MainPID", "ControlGroup", "Environment"}:
+        fail(f"protected relay service metadata for pid={pid} is incomplete")
+    if properties["MainPID"] != str(pid) or properties["ControlGroup"] != control_group:
+        fail(f"protected relay service identity for pid={pid} did not match")
+    try:
+        assignments = shlex.split(properties["Environment"], posix=True)
+    except ValueError as error:
+        fail(f"protected relay service environment for pid={pid} is malformed: {error}")
+    parsed: dict[str, str] = {}
+    for assignment in assignments:
+        name, separator, value = assignment.partition("=")
+        if not separator or not name or name in parsed:
+            fail(f"protected relay service environment for pid={pid} is ambiguous")
+        parsed[name] = value
     return parsed
 
 
@@ -2226,12 +2311,24 @@ def prove_no_writer(cluster: str, expected_core: str, proc_root: Path) -> None:
                 writer_kind = "mcp-server"
                 options = command[1:]
             process_cluster = option_value(options, "--cluster")
-            raw_environment = read_bounded(process / "environ")
+            raw_environment = read_bounded(
+                process / "environ",
+                expose_permission_denied=True,
+            )
             if raw_environment is None:
                 continue
+            if raw_environment is PERMISSION_DENIED:
+                process_environment = systemd_process_environment(
+                    process,
+                    int(entry.name),
+                )
+                if process_environment is None:
+                    continue
+            else:
+                process_environment = environment(raw_environment)
             candidates = process_core_candidates(
                 process,
-                environment(raw_environment),
+                process_environment,
                 process_uid,
             )
             if candidates is None:

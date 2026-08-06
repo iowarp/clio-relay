@@ -583,6 +583,7 @@ def _run_writer_proof(
     *,
     cluster: str,
     core_dir: Path | PurePosixPath,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute the exact Python source embedded in managed bootstrap scripts."""
     return subprocess.run(
@@ -597,6 +598,7 @@ def _run_writer_proof(
         capture_output=True,
         text=True,
         check=False,
+        env=environment,
     )
 
 
@@ -994,6 +996,68 @@ def test_embedded_writer_proof_allows_other_cluster_worker_on_different_core(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "relay_worker_writer_proof=clear"
+
+
+@pytest.mark.release_platform("posix")
+def test_embedded_writer_proof_resolves_non_dumpable_systemd_service_core(
+    tmp_path: Path,
+) -> None:
+    """A protected Relay remains attributable to one exact user service and core."""
+    proc_root = tmp_path / "proc"
+    process_id = 1735
+    _fake_proc_process(
+        proc_root,
+        pid=process_id,
+        argv=[
+            "/home/operator/.local/bin/clio-relay",
+            "endpoint",
+            "start",
+            "--role=worker",
+            "--cluster=protected",
+        ],
+        environment={"HOME": str(tmp_path)},
+    )
+    process = proc_root / str(process_id)
+    process.joinpath("environ").chmod(0)
+    control_group = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/clio-relay-protected.service"
+    )
+    process.joinpath("cgroup").write_text(f"0::{control_group}\n", encoding="utf-8")
+    executable_root = tmp_path / "bin"
+    executable_root.mkdir()
+    systemctl = executable_root / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' 'MainPID={process_id}' "
+        f"'ControlGroup={control_group}' "
+        '"Environment=HOME=$HOME CLIO_RELAY_CORE_DIR=$PROTECTED_CORE"\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    expected_core = tmp_path / "expected-core"
+    proof_environment = {
+        **os.environ,
+        "PATH": str(executable_root) + os.pathsep + os.environ.get("PATH", ""),
+        "PROTECTED_CORE": str(tmp_path / "different-core"),
+    }
+
+    isolated = _run_writer_proof(
+        proc_root,
+        cluster="custom",
+        core_dir=expected_core,
+        environment=proof_environment,
+    )
+    proof_environment["PROTECTED_CORE"] = str(expected_core)
+    colliding = _run_writer_proof(
+        proc_root,
+        cluster="custom",
+        core_dir=expected_core,
+        environment=proof_environment,
+    )
+
+    assert isolated.returncode == 0, isolated.stderr
+    assert colliding.returncode != 0
+    assert f"live endpoint pid={process_id}" in colliding.stderr
 
 
 def test_embedded_writer_proof_fails_closed_on_oversized_proc_value(tmp_path: Path) -> None:
