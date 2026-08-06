@@ -6,6 +6,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay.config import (
+    ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV,
     MAX_INPUT_FILE_MAX_BYTES,
     MAX_INPUT_TOTAL_MAX_BYTES,
     RelaySettings,
@@ -83,6 +84,29 @@ def test_relay_settings_load_owner_session_generation_from_environment(
     assert settings.owner_session_cluster == "ares"
     assert settings.resolved_owner_session_cluster() == "ares"
     assert settings.remote_cluster is None
+
+
+def test_relay_settings_load_explicit_unauthenticated_owned_session_policy(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_ID", "desktop-session")
+    monkeypatch.setenv("CLIO_RELAY_SESSION_GENERATION_ID", "generation-1")
+    monkeypatch.setenv(ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV, "1")
+
+    settings = RelaySettings.from_env()
+
+    assert settings.allow_unauthenticated_owned_session is True
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", ""])
+def test_relay_settings_reject_ambiguous_unauthenticated_owned_session_policy(
+    monkeypatch: MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV, value)
+
+    with pytest.raises(ValueError, match="must be either 0 or 1"):
+        RelaySettings.from_env()
 
 
 def test_relay_settings_reject_mismatched_owner_and_process_clusters() -> None:

@@ -24,6 +24,7 @@ from clio_relay.cluster_config import (
     ClusterRegistry,
     RemoteMcpServerConfig,
 )
+from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.installation import InstallReceipt
@@ -1534,6 +1535,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     assert child_environment["CLIO_RELAY_INPUT_FILE_MAX_BYTES"] == "8388608"
     assert child_environment["CLIO_RELAY_INPUT_TOTAL_MAX_BYTES"] == "33554432"
     assert child_environment["CLIO_RELAY_INPUT_FILE_MAX_COUNT"] == "24"
+    assert child_environment[ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV] == "1"
     assert launch_commands[0][0] == str(provider_interpreter.absolute())
     assert f"start_operation_id={request.start_operation_id}" in lines
     assert f"remote_api_port={request.remote_api_port}" in lines

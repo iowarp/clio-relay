@@ -986,6 +986,7 @@ def test_owned_session_api_allows_explicit_unauthenticated_loopback_session(
         owner_session_generation_id="generation-1",
         owner_session_cluster="test-cluster",
         session_owner_token="o" * 32,
+        allow_unauthenticated_owned_session=True,
     )
 
     response = cast(Any, TestClient(create_app(settings))).get("/healthz")

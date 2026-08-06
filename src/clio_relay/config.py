@@ -29,6 +29,7 @@ DEFAULT_INPUT_TOTAL_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_INPUT_FILE_MAX_COUNT = 16
 MAX_INPUT_FILE_MAX_BYTES = 64 * 1024 * 1024
 MAX_INPUT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV = "CLIO_RELAY_ALLOW_UNAUTHENTICATED_OWNED_SESSION"
 
 
 class RelaySettings(BaseModel):
@@ -114,6 +115,7 @@ class RelaySettings(BaseModel):
     owner_session_cluster: str | None = None
     remote_cluster: str | None = None
     session_owner_token: str | None = None
+    allow_unauthenticated_owned_session: bool = False
     agent_bin: str = "agent"
     agent_adapter: str = "exec"
     agent_args: list[str] = Field(default_factory=list)
@@ -149,6 +151,15 @@ class RelaySettings(BaseModel):
             raise ValueError(
                 "owner_session_cluster and remote_cluster must match when both are configured"
             )
+        if self.allow_unauthenticated_owned_session:
+            if self.owner_session_id is None:
+                raise ValueError(
+                    "allow_unauthenticated_owned_session requires an owned session identity"
+                )
+            if self.api_token is not None:
+                raise ValueError(
+                    "allow_unauthenticated_owned_session cannot be combined with an API token"
+                )
         return self
 
     def resolved_owner_session_cluster(self) -> str | None:
@@ -281,6 +292,10 @@ class RelaySettings(BaseModel):
             owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
             remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
             session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
+            allow_unauthenticated_owned_session=_boolean_env(
+                ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV,
+                False,
+            ),
             agent_bin=os.getenv(
                 "CLIO_RELAY_AGENT_BIN",
                 "agent",
@@ -369,6 +384,18 @@ def _optional_path_env(name: str) -> Path | None:
     if value is None or value.strip() == "":
         return None
     return Path(value).expanduser().resolve()
+
+
+def _boolean_env(name: str, default: bool) -> bool:
+    """Return one explicit zero-or-one boolean environment value."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if raw == "1":
+        return True
+    if raw == "0":
+        return False
+    raise ValueError(f"{name} must be either 0 or 1")
 
 
 def _positive_int_env(name: str, default: int) -> int:

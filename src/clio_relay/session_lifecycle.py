@@ -36,6 +36,7 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import (
+    ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV,
     DEFAULT_INPUT_FILE_MAX_BYTES,
     DEFAULT_INPUT_FILE_MAX_COUNT,
     DEFAULT_INPUT_TOTAL_MAX_BYTES,
@@ -5807,6 +5808,8 @@ def execute_owned_session_start(
                 "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
                 **request.input_policy.environment(),
             }
+            if not request.require_token:
+                child_environment[ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV] = "1"
             if api_token is not None:
                 child_environment["CLIO_RELAY_API_TOKEN"] = api_token
             environment = dict(os.environ)
@@ -5826,6 +5829,7 @@ def execute_owned_session_start(
                     )
                 )
             )
+            environment.pop(ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV, None)
             for name in child_environment:
                 environment.pop(name, None)
             provider_interpreter = Path(sys.executable).absolute()
