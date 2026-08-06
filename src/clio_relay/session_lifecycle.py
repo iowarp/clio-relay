@@ -46,6 +46,7 @@ from clio_relay.config import (
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
+from clio_relay.remote_values import render_remote_shell_value
 from clio_relay.validation_report import SoftwareIdentity
 
 if TYPE_CHECKING:
@@ -7880,6 +7881,15 @@ def detach_remote_session(
     )
 
 
+def _owned_session_relay_executable(definition: ClusterDefinition) -> str:
+    """Render the route-pinned Relay executable for cluster-local lifecycle calls."""
+
+    return render_remote_shell_value(
+        definition.relay_executable,
+        field="relay_executable",
+    )
+
+
 def _start_script(
     *,
     cluster: str,
@@ -7917,13 +7927,14 @@ def _start_script(
         else ""
     )
     request_json = request.model_dump_json()
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
         f"{token_export}"
         f"printf '%s' {_shell_single_quote(request_json)} | "
-        "clio-relay session start-owned\n"
+        f"{relay_executable} session start-owned\n"
     )
 
 
@@ -7961,10 +7972,11 @@ def _owned_status_script(
 ) -> str:
     """Use the bounded, lock-coordinated recovery contract for public status."""
     probe_argument = " --pre-start-cleanup-probe" if pre_start_cleanup_probe else ""
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
-        f"clio-relay session recovery-status --cluster {shlex.quote(cluster)} "
+        f"{relay_executable} session recovery-status --cluster {shlex.quote(cluster)} "
         f"--session-id {shlex.quote(session_id)}{probe_argument}\n"
     )
 
@@ -7975,10 +7987,12 @@ def _owned_start_status_script(
     selector: OwnedSessionStartStatusSelector,
 ) -> str:
     """Render the nonblocking exact-operation start-status command."""
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
-        f"clio-relay session start-status-owned --cluster {shlex.quote(selector.cluster)} "
+        f"{relay_executable} session start-status-owned "
+        f"--cluster {shlex.quote(selector.cluster)} "
         f"--session-id {shlex.quote(selector.session_id)} "
         f"--start-operation-id {shlex.quote(selector.start_operation_id)} "
         "--cluster-route-revision "
@@ -8000,12 +8014,13 @@ def _owned_identity_challenge_script(
         session_generation_id=session_generation_id,
         nonce=nonce,
     )
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
         f"printf '%s' {_shell_single_quote(request.model_dump_json())} | "
-        "clio-relay session challenge-owned\n"
+        f"{relay_executable} session challenge-owned\n"
     )
 
 
@@ -8014,21 +8029,23 @@ def _owned_cleanup_finalize_script(
     definition: ClusterDefinition,
 ) -> str:
     """Run the bounded coordinator-report finalizer with SSH stdin left intact."""
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        "clio-relay session finalize-cleanup-owned\n"
+        f"{relay_executable} session finalize-cleanup-owned\n"
     )
 
 
 def _owned_cleanup_report_read_script(*, definition: ClusterDefinition) -> str:
     """Run the pinned coordinator-report reader with SSH stdin left intact."""
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        "clio-relay session read-cleanup-report-owned\n"
+        f"{relay_executable} session read-cleanup-report-owned\n"
     )
 
 
@@ -8056,12 +8073,13 @@ def _owned_teardown_script(
         cancel_jobs=cancel_jobs,
         cancel_scheduler_jobs=cancel_scheduler_jobs,
     )
+    relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
         f"printf '%s' {_shell_single_quote(request.model_dump_json())} | "
-        "clio-relay session teardown-owned\n"
+        f"{relay_executable} session teardown-owned\n"
     )
 
 
