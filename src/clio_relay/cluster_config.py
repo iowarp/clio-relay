@@ -556,9 +556,7 @@ class ClusterDefinition(BaseModel):
                 "relay installation paths must be absolute or start with $HOME/"
             ) from error
         if value != value.strip() or ".." in PurePosixPath(value).parts:
-            raise ValueError(
-                "relay installation paths must be absolute or start with $HOME/"
-            )
+            raise ValueError("relay installation paths must be absolute or start with $HOME/")
         return value
 
     @model_validator(mode="after")

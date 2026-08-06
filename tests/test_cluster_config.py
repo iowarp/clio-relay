@@ -874,9 +874,7 @@ def test_cluster_relay_receipt_is_an_optional_exact_remote_path() -> None:
         relay_install_receipt="/srv/releases/relay-1.5.13/install-receipt.json",
     )
 
-    assert definition.relay_install_receipt == (
-        "/srv/releases/relay-1.5.13/install-receipt.json"
-    )
+    assert definition.relay_install_receipt == ("/srv/releases/relay-1.5.13/install-receipt.json")
     with pytest.raises(ValueError, match="absolute"):
         ClusterDefinition(
             name="site-cluster",
