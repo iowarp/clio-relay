@@ -9300,7 +9300,7 @@ def test_cli_remote_mcp_call_stages_exact_route_authority_for_one_invocation(
     assert len(shell_scripts) == 1
     assert f'export CLIO_RELAY_CLUSTER_REGISTRY="$HOME/{registry_path}";' in shell_scripts[0]
     assert "export CLIO_RELAY_CLI_MODE=local;" in shell_scripts[0]
-    assert f"clio-relay mcp-call --cluster {definition.name}" in shell_scripts[0]
+    assert f'"$HOME/.local/bin/clio-relay" mcp-call --cluster {definition.name}' in shell_scripts[0]
     assert removals[-1] == ("registry", registry_path, True)
     if expected_tool_arguments is None:
         assert argument_writes == []
@@ -10071,7 +10071,7 @@ pkgs:
             remote_path = command[2].split("cat > ", maxsplit=1)[1].split(" &&", maxsplit=1)[0]
             writes[remote_path.strip("'")] = input or b""
             return subprocess.CompletedProcess(command, 0, b"", b"")
-        if "clio-relay job submit" in command[2]:
+        if '"$HOME/.local/bin/clio-relay" job submit' in command[2]:
             assert "CLIO_RELAY_CLI_MODE=local" in command[2]
             assert 'CLIO_RELAY_CORE_DIR="/remote/core"' in command[2]
             return subprocess.CompletedProcess(command, 0, b"job_remote\n", b"")
@@ -10102,7 +10102,7 @@ pkgs:
     )
     assert "x_clio_relay" not in staged_yaml
     assert ".local/share/clio-relay/live-tests/pipeline-" in staged_yaml
-    assert any("clio-relay job submit" in command[2] for command in commands)
+    assert any('"$HOME/.local/bin/clio-relay" job submit' in command[2] for command in commands)
 
 
 def test_cli_remote_wait_passthrough_uses_cluster_core(
@@ -10163,7 +10163,7 @@ def test_cli_remote_wait_passthrough_uses_cluster_core(
     assert observed["job_id"] == remote_job.job_id
     assert observed["observation"]["outcome"] == "observation_unknown"
     assert len(commands) == 1
-    assert f"clio-relay job wait {remote_job.job_id}" in commands[0][2]
+    assert f'"$HOME/.local/bin/clio-relay" job wait {remote_job.job_id}' in commands[0][2]
 
 
 def test_cli_remote_wait_transport_expiry_reobserves_exact_status(
@@ -10195,9 +10195,9 @@ def test_cli_remote_wait_transport_expiry_reobserves_exact_status(
         timeouts.append(timeout)
         assert capture_output is True
         assert check is False
-        if "clio-relay job wait" in command[2]:
+        if '"$HOME/.local/bin/clio-relay" job wait' in command[2]:
             raise subprocess.TimeoutExpired(command, timeout or 0)
-        if "clio-relay job status" in command[2]:
+        if '"$HOME/.local/bin/clio-relay" job status' in command[2]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -10627,7 +10627,7 @@ def test_cli_remote_task_event_passthrough_uses_cluster_core(
     assert json.loads(result.output)["seq"] == 1
     assert len(commands) == 1
     assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
-    assert "clio-relay job record-task-event task_remote" in commands[0][2]
+    assert '"$HOME/.local/bin/clio-relay" job record-task-event task_remote' in commands[0][2]
     assert "--path-ref /mnt/common/datasets/example_001" in commands[0][2]
     assert "cli-file" in commands[0][2]
 
@@ -10698,10 +10698,10 @@ def test_cli_remote_gateway_passthrough_uses_cluster_core(
         "gateway_remote",
         "gateway_remote",
     ]
-    assert "clio-relay gateway create" in commands[0][2]
+    assert '"$HOME/.local/bin/clio-relay" gateway create' in commands[0][2]
     assert "remote_port" in commands[0][2]
-    assert "clio-relay gateway update gateway_remote" in commands[1][2]
-    assert "clio-relay gateway close gateway_remote" in commands[2][2]
+    assert '"$HOME/.local/bin/clio-relay" gateway update gateway_remote' in commands[1][2]
+    assert '"$HOME/.local/bin/clio-relay" gateway close gateway_remote' in commands[2][2]
 
 
 @pytest.mark.parametrize(
