@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO, cast
 
-from clio_relay._jarvis_api import Application
+from clio_relay._jarvis_api import Application, ConfigurationInputBinding
 from clio_relay.bounded_command.progress import adapter_from_config, append_progress_record
 from clio_relay.process_containment import nested_popen_kwargs, terminate_nested_process
 
@@ -120,6 +120,21 @@ class BoundedCommand(Application):
                 "type": dict,
                 "default": {"adapter": "none"},
             },
+            {
+                "name": "script",
+                "msg": (
+                    "Caller-local script staged onto the cluster and appended to 'command' "
+                    "as its final argument. The relay snapshots this file, ingests it as an "
+                    "immutable input artifact, and rewrites this setting to the staged "
+                    "cluster path before JARVIS records the step."
+                ),
+                "type": str,
+                "default": "",
+                "input_binding": ConfigurationInputBinding(
+                    kind="local_file",
+                    structure="regular_file",
+                ).to_dict(),
+            },
         ]
 
     def _configure(self, **kwargs: Any) -> None:
@@ -131,6 +146,9 @@ class BoundedCommand(Application):
     def start(self) -> None:
         """Run the configured command."""
         command_args = _command_arguments(self.config.get("command"))
+        staged_script = _optional_script(self.config.get("script"))
+        if staged_script is not None:
+            command_args = [*command_args, staged_script]
         env = os.environ.copy()
         supplied_env = self.config.get("env", {})
         if isinstance(supplied_env, dict):
@@ -167,6 +185,15 @@ def _command_arguments(value: object) -> list[str]:
     if not all(isinstance(item, str) for item in raw_command):
         raise ValueError("command must be a string array")
     return [cast(str, item) for item in raw_command]
+
+
+def _optional_script(value: object) -> str | None:
+    """Return the staged script path appended to the command, or None when unset."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("script must be a path string")
+    return value
 
 
 def _optional_timeout(value: object) -> int | None:

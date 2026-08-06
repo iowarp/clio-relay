@@ -82,12 +82,13 @@ def test_configure_menu_declares_every_configured_setting(monkeypatch: MonkeyPat
     package = _load_bounded_package(monkeypatch)
     menu = _configure_menu(package)
 
-    assert set(menu) == {"command", "workdir", "env", "timeout_seconds", "progress"}
+    assert set(menu) == {"command", "workdir", "env", "timeout_seconds", "progress", "script"}
     assert menu["command"]["type"] is list
     assert menu["workdir"]["type"] is str
     assert menu["env"]["type"] is dict
     assert menu["timeout_seconds"]["type"] is int
     assert menu["progress"]["type"] is dict
+    assert menu["script"]["type"] is str
     for name, option in menu.items():
         message = option.get("msg")
         assert isinstance(message, str) and message, f"{name} declares no description"
@@ -100,8 +101,74 @@ def test_configure_menu_marks_only_the_command_as_required(monkeypatch: MonkeyPa
     menu = _configure_menu(package)
 
     assert "default" not in menu["command"]
-    for name in ("workdir", "env", "timeout_seconds", "progress"):
+    for name in ("workdir", "env", "timeout_seconds", "progress", "script"):
         assert menu[name].get("default") is not None, f"{name} would become required"
+
+
+def test_script_setting_declares_the_relay_local_file_input_binding(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    # clio_relay.input_staging.parse_jarvis_package_input_contract stages a setting
+    # only when its describe output carries exactly this binding object, and rejects
+    # any other key set as "unsupported or malformed". Without it the relay forwards
+    # the caller's bare path to JARVIS unchanged and the file never reaches the job.
+    package = _load_bounded_package(monkeypatch)
+    menu = _configure_menu(package)
+
+    assert menu["script"]["input_binding"] == {
+        "schema_version": "jarvis.configuration-input-binding.v1",
+        "kind": "local_file",
+        "structure": "regular_file",
+    }
+    for name in ("command", "workdir", "env", "timeout_seconds", "progress"):
+        assert "input_binding" not in menu[name], f"{name} must not be staged as a file"
+
+
+def test_staged_script_is_appended_to_the_command(monkeypatch: MonkeyPatch) -> None:
+    # The relay rewrites 'script' to the staged cluster path before JARVIS records
+    # the step, so start() must execute that path rather than the caller's own.
+    package = _load_bounded_package(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def capture(command: list[str], **kwargs: object) -> Any:
+        captured["command"] = command
+        del kwargs
+        return cast(Any, package).subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(package, "_run_streaming", capture)
+    command = cast(Any, package).BoundedCommand()
+    command.config = {"command": ["bash"], "script": "/staged/inputs/smoke.sh"}
+
+    command.start()
+
+    assert captured["command"] == ["bash", "/staged/inputs/smoke.sh"]
+
+
+def test_unset_script_leaves_the_command_untouched(monkeypatch: MonkeyPatch) -> None:
+    package = _load_bounded_package(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def capture(command: list[str], **kwargs: object) -> Any:
+        captured["command"] = command
+        del kwargs
+        return cast(Any, package).subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(package, "_run_streaming", capture)
+    command = cast(Any, package).BoundedCommand()
+    command.config = {"command": ["hostname"], "script": ""}
+
+    command.start()
+
+    assert captured["command"] == ["hostname"]
+
+
+def test_non_string_script_is_rejected(monkeypatch: MonkeyPatch) -> None:
+    package = _load_bounded_package(monkeypatch)
+    command = cast(Any, package).BoundedCommand()
+    command.config = {"command": ["bash"], "script": ["smoke.sh"]}
+
+    with raises(ValueError):
+        command.start()
 
 
 def test_menu_defaults_execute_a_command_without_limit_or_workdir(
@@ -121,7 +188,7 @@ def test_menu_defaults_execute_a_command_without_limit_or_workdir(
         for name, option in _configure_menu(package).items()
         if "default" in option
     }
-    assert set(command.config) == {"workdir", "env", "timeout_seconds", "progress"}
+    assert set(command.config) == {"workdir", "env", "timeout_seconds", "progress", "script"}
     command.config["command"] = [sys.executable, "-c", "print('menu-default-run')"]
 
     command.start()
@@ -190,8 +257,23 @@ def _load_bounded_package(monkeypatch: MonkeyPatch) -> ModuleType:
     class Application:
         config: dict[str, Any]
 
+    class ConfigurationInputBinding:
+        """Mirror of the JARVIS-CD binding whose exact dict the relay parses."""
+
+        def __init__(self, *, kind: str, structure: str) -> None:
+            self.kind = kind
+            self.structure = structure
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "schema_version": "jarvis.configuration-input-binding.v1",
+                "kind": self.kind,
+                "structure": self.structure,
+            }
+
     jarvis_api = ModuleType("clio_relay._jarvis_api")
     cast(Any, jarvis_api).Application = Application
+    cast(Any, jarvis_api).ConfigurationInputBinding = ConfigurationInputBinding
     progress = ModuleType("clio_relay.bounded_command.progress")
 
     def no_progress_adapter(config: object) -> None:
