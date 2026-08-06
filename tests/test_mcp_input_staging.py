@@ -380,6 +380,56 @@ def test_registered_jarvis_input_flows_from_describe_through_run(
     ]
 
 
+def test_registered_jarvis_describe_default_idempotency_is_owner_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generated reconciliation key must not collide across owner sessions."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings, definition, catalog, harness = _configured_flow(
+        tmp_path,
+        workspace=workspace,
+    )
+    _patch_flow(
+        monkeypatch,
+        current_catalog={"value": catalog},
+        definition=definition,
+        harness=harness,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    def describe(selected_settings: RelaySettings) -> None:
+        session = McpSessionState()
+        _advertise(queue, settings=selected_settings, session=session)
+        response = _call(
+            queue,
+            settings=selected_settings,
+            session=session,
+            name=DESCRIBE_ALIAS,
+            arguments={
+                "cluster": "ares",
+                "target": "package",
+                "package_name": "lammps",
+            },
+        )
+        assert "error" not in response, response
+
+    describe(settings)
+    describe(
+        settings.model_copy(
+            update={
+                "owner_session_id": "other-desktop-session",
+                "owner_session_generation_id": ("generation_fedcba9876543210fedcba9876543210"),
+            }
+        )
+    )
+
+    keys = [cast(str, payload["idempotency_key"]) for payload in harness.submitted_payloads]
+    assert len(keys) == 2
+    assert keys[0] != keys[1]
+
+
 def test_legacy_jarvis_contract_does_not_activate_transparent_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

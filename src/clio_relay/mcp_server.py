@@ -2059,6 +2059,8 @@ def _call_tool(
                 "cluster_route_revision": route.cluster_route_revision,
                 "registration_revision": route.registration_revision,
                 "expected_server_artifact_digest": route.expected_server_artifact_digest,
+                "owner_session_id": settings.owner_session_id,
+                "owner_session_generation_id": settings.owner_session_generation_id,
                 "tool": route.remote_tool_name,
                 "arguments": forwarded_arguments,
                 "used_artifact_refs": [artifact_use_payload(item) for item in merged_input_uses],
