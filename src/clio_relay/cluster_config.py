@@ -431,6 +431,7 @@ class ClusterDefinition(BaseModel):
     bootstrap_profile: str = "linux-user"
     core_dir: str = "$HOME/.local/share/clio-relay/core"
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
+    relay_executable: str = "$HOME/.local/bin/clio-relay"
     jarvis_bin: str | None = None
     jarvis_resource_graph_profile: str | None = None
     allow_jarvis_resource_graph_build: bool = Field(default=False, strict=True)
@@ -539,6 +540,21 @@ class ClusterDefinition(BaseModel):
         if value != value.strip() or ".." in PurePosixPath(value).parts:
             raise ValueError(
                 "spack_executable must be one absolute remote path or start with $HOME/"
+            )
+        return value
+
+    @field_validator("relay_executable")
+    @classmethod
+    def _validate_relay_executable(cls, value: str) -> str:
+        try:
+            validate_remote_path(value, field="relay_executable")
+        except ConfigurationError as error:
+            raise ValueError(
+                "relay_executable must be one absolute remote path or start with $HOME/"
+            ) from error
+        if value != value.strip() or ".." in PurePosixPath(value).parts:
+            raise ValueError(
+                "relay_executable must be one absolute remote path or start with $HOME/"
             )
         return value
 

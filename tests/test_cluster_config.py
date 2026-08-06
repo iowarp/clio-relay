@@ -851,6 +851,22 @@ def test_cluster_spack_executable_is_explicit_site_configuration() -> None:
         )
 
 
+def test_cluster_relay_executable_is_an_exact_remote_path() -> None:
+    definition = ClusterDefinition(
+        name="site-cluster",
+        ssh_host="site-login",
+        relay_executable="/srv/releases/relay-1.5.12/bin/clio-relay",
+    )
+
+    assert definition.relay_executable == "/srv/releases/relay-1.5.12/bin/clio-relay"
+    with pytest.raises(ValueError, match="absolute remote path"):
+        ClusterDefinition(
+            name="site-cluster",
+            ssh_host="site-login",
+            relay_executable="clio-relay",
+        )
+
+
 def _registry(name: str) -> ClusterRegistry:
     return ClusterRegistry(
         clusters={name: ClusterDefinition(name=name, ssh_host=f"{name}.example.invalid")}
