@@ -1507,6 +1507,10 @@ class VirtualRemoteMcpTool:
             )
         elif exact_v36_routes and self.remote_tool.name == "jarvis_run":
             description += (
+                " Before running, inspect every selected package deployment contract. For each "
+                "unavailable runtime with a Spack provider resolution, locate it and pass the "
+                "returned immutable load_spec in spack_specs; presence in a site store does not "
+                "place the runtime on the execution PATH."
                 " On each genuinely new run identity, relay securely reconciles every tracked "
                 "local-file setting and pins the execution to an immutable input manifest. "
                 "Retrying the same idempotency key reuses that admitted manifest without "
@@ -2145,15 +2149,22 @@ def build_virtual_remote_mcp_catalog(
                     )
                 )
                 continue
-            server_artifact_verified = _server_artifact_verified(entry.provenance.server_artifact)
+            discovery_server_artifact = entry.provenance.server_artifact
+            discovery_server_artifact_digest = remote_mcp_server_artifact_digest(
+                discovery_server_artifact
+            )
+            server_artifact_verified = remote_mcp_server_artifact_binding_verified(
+                discovery_server_artifact,
+                expected_digest=discovery_server_artifact_digest,
+            )
             if not server_artifact_verified and not registration.allow_mutable_artifact:
                 record_issue(
                     RemoteMcpCatalogIssue(
                         cluster=cluster_name,
                         server_name=server_name,
                         reason=(
-                            "discovery server artifact identity is unverified; refresh from an "
-                            "immutable executable or exact artifact"
+                            "discovery server artifact identity is unverified or mutable; "
+                            "refresh from an immutable wheel-backed installation"
                         ),
                     )
                 )
@@ -2231,7 +2242,7 @@ def build_virtual_remote_mcp_catalog(
                         base_alias=base_alias,
                         identity=identity,
                         expected_server_artifact_digest=(
-                            remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+                            discovery_server_artifact_digest
                             if not registration.allow_mutable_artifact
                             else None
                         ),

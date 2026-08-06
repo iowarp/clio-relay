@@ -403,6 +403,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "const": "mcp_call",
     }
     run_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_run")
+    assert "deployment contract reports an unavailable runtime" in run_tool["description"]
+    assert "immutable load_spec in spack_specs" in run_tool["description"]
     spack_specs = run_tool["inputSchema"]["properties"]["spack_specs"]
     assert spack_specs["default"] is None
     assert spack_specs["anyOf"][0] == {
@@ -934,6 +936,7 @@ def test_mcp_remote_mcp_context_describes_virtual_tools(
     assert response is not None
     context = response["result"]["structuredContent"]["context"]
     assert "jarvis_create_pipeline" in context
+    assert "do not assume software found in a site store" in context
     assert "cluster argument" in context
 
 
