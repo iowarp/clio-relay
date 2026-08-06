@@ -1279,7 +1279,6 @@ class OwnedSessionStartResult(BaseModel):
     error: str | None = Field(default=None, max_length=_MAX_SESSION_START_ERROR_CHARS)
     status_selector: OwnedSessionStartStatusSelector
     retry_selector: OwnedSessionStartRetrySelector
-    compatibility_lines: list[str] = Field(default_factory=list[str], max_length=32)
 
     @model_validator(mode="after")
     def _validate_start_result(self) -> OwnedSessionStartResult:
@@ -1338,6 +1337,39 @@ class OwnedSessionStartResult(BaseModel):
                 raise ValueError("non-current owned-session selector is incomplete")
         elif not self.terminal or self.retryable or self.error is None:
             raise ValueError("failed owned-session start result is incomplete")
+        return self
+
+
+class OwnedSessionStartReceipt(BaseModel):
+    """Typed cluster-local receipt for one committed owned-session start."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["clio-relay.owner-session-start-receipt.v1"] = (
+        "clio-relay.owner-session-start-receipt.v1"
+    )
+    cluster: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    start_operation_id: DurableRecordId
+    cluster_route_revision: str = Field(min_length=1)
+    session_generation_id: DurableRecordId
+    remote_api_port: int = Field(gt=0, le=65_535)
+    api_pid: int = Field(gt=0)
+    outcome: Literal["started", "already_running", "recovered"]
+    ready_seconds: float | None = Field(default=None, ge=0)
+    running: Literal[True] = True
+    ownership_verified: Literal[True] = True
+    recovery_verified: Literal[True] = True
+    start_phase: Literal["contained"] = "contained"
+
+    @model_validator(mode="after")
+    def _validate_ready_observation(self) -> OwnedSessionStartReceipt:
+        """Require a readiness duration only when this operation observed startup."""
+
+        if self.outcome == "already_running" and self.ready_seconds is not None:
+            raise ValueError("ready_seconds must be absent for an already-running session")
+        if self.outcome != "already_running" and self.ready_seconds is None:
+            raise ValueError("ready_seconds is required for a started or recovered session")
         return self
 
 
@@ -4980,7 +5012,7 @@ def _promote_resumable_contained_start(
     queue: _OwnedSessionQueue,
     proc_root: Path,
     home: Path | None,
-) -> list[str] | None:
+) -> OwnedSessionStartReceipt | None:
     """Commit ready metadata when an exact crash-surviving API already exists."""
     if attempt.get("start_phase") != "contained" or attempt.get("error") is not None:
         return None
@@ -5084,15 +5116,17 @@ def _promote_resumable_contained_start(
         and promoted_status.start_attempt_verified
     ):
         raise RelayError("recovered owned API did not pass post-commit identity verification")
-    return [
-        f"remote_api_ready_seconds={ready_seconds:.3f}",
-        f"session_started={request.session_id}",
-        f"start_operation_id={request.start_operation_id}",
-        f"api_pid={process_identity.pid}",
-        f"session_generation_id={generation_id}",
-        f"remote_api_port={request.remote_api_port}",
-        f"metadata={transaction.path / 'metadata.json'}",
-    ]
+    return OwnedSessionStartReceipt(
+        cluster=request.cluster,
+        session_id=request.session_id,
+        start_operation_id=request.start_operation_id,
+        cluster_route_revision=request.cluster_route_revision,
+        session_generation_id=generation_id,
+        remote_api_port=request.remote_api_port,
+        api_pid=process_identity.pid,
+        outcome="recovered",
+        ready_seconds=ready_seconds,
+    )
 
 
 def execute_owned_session_identity_challenge(
@@ -5171,7 +5205,7 @@ def execute_owned_session_start(
     home: Path | None = None,
     core_dir: Path | None = None,
     proc_root: Path = Path("/proc"),
-) -> list[str]:
+) -> OwnedSessionStartReceipt:
     """Execute one exact cluster-local start under the pinned session transaction."""
     from clio_relay.config import RelaySettings
     from clio_relay.core_queue import ClioCoreQueue
@@ -5523,13 +5557,18 @@ def execute_owned_session_start(
                         request.session_id,
                         session_generation_id=recorded_generation,
                     )
-                    return [
-                        f"session_already_running={request.session_id}",
-                        f"start_operation_id={request.start_operation_id}",
-                        f"api_pid={existing_status.api_pid}",
-                        f"session_generation_id={recorded_generation}",
-                        f"remote_api_port={request.remote_api_port}",
-                    ]
+                    if existing_status.api_pid is None:
+                        raise RelayError("verified existing owned session omitted its API pid")
+                    return OwnedSessionStartReceipt(
+                        cluster=request.cluster,
+                        session_id=request.session_id,
+                        start_operation_id=request.start_operation_id,
+                        cluster_route_revision=request.cluster_route_revision,
+                        session_generation_id=recorded_generation,
+                        remote_api_port=request.remote_api_port,
+                        api_pid=existing_status.api_pid,
+                        outcome="already_running",
+                    )
                 if not registry_matches:
                     raise RelayError(
                         "an owned generation cannot change cluster authority during restart"
@@ -6000,15 +6039,17 @@ def execute_owned_session_start(
                 request.session_id,
                 session_generation_id=selected_generation,
             )
-            return [
-                f"remote_api_ready_seconds={ready_seconds:.3f}",
-                f"session_started={request.session_id}",
-                f"start_operation_id={request.start_operation_id}",
-                f"api_pid={process_identity.pid}",
-                f"session_generation_id={selected_generation}",
-                f"remote_api_port={request.remote_api_port}",
-                f"metadata={transaction.path / 'metadata.json'}",
-            ]
+            return OwnedSessionStartReceipt(
+                cluster=request.cluster,
+                session_id=request.session_id,
+                start_operation_id=request.start_operation_id,
+                cluster_route_revision=request.cluster_route_revision,
+                session_generation_id=selected_generation,
+                remote_api_port=request.remote_api_port,
+                api_pid=process_identity.pid,
+                outcome="started",
+                ready_seconds=ready_seconds,
+            )
         except BaseException as exc:
             if not metadata_committed:
                 startup_detail = _owned_api_startup_log_detail(
@@ -7212,8 +7253,8 @@ def start_remote_session(
     replace: bool = False,
     start_operation_id: str | None = None,
     expected_cluster_route_revision: str | None = None,
-) -> list[str]:
-    """Start a cluster-side relay API owned by a session id."""
+) -> OwnedSessionStartReceipt:
+    """Start a cluster-side relay API and validate its typed receipt."""
     plan = plan_remote_session_start(
         cluster=cluster,
         definition=definition,
@@ -7230,7 +7271,7 @@ def start_remote_session(
             else None
         ),
     )
-    result = _ssh_script(
+    output = _ssh_script(
         definition,
         _start_script(
             cluster=cluster,
@@ -7245,7 +7286,19 @@ def start_remote_session(
             expected_cluster_route_revision=plan.cluster_route_revision,
         ),
     )
-    return result.splitlines()
+    try:
+        receipt = OwnedSessionStartReceipt.model_validate_json(output)
+    except ValueError as exc:
+        raise RelayError(f"owned-session start receipt is invalid: {exc}") from exc
+    if not (
+        receipt.cluster == plan.cluster
+        and receipt.session_id == plan.session_id
+        and receipt.start_operation_id == plan.start_operation_id
+        and receipt.cluster_route_revision == plan.cluster_route_revision
+        and receipt.remote_api_port == plan.remote_api_port
+    ):
+        raise RelayError("owned-session start receipt changed its exact plan identity")
+    return receipt
 
 
 def status_remote_session(
@@ -7319,7 +7372,6 @@ def _owned_session_start_result(
     retryable: bool,
     transition_accepted: bool | None,
     transport_deadline_exceeded: bool,
-    compatibility_lines: list[str],
     session_generation_id: str | None = None,
     running: bool = False,
     ownership_verified: bool = False,
@@ -7348,7 +7400,6 @@ def _owned_session_start_result(
         error=error,
         status_selector=plan.status_selector,
         retry_selector=plan.retry_selector,
-        compatibility_lines=compatibility_lines,
     )
 
 
@@ -7370,12 +7421,6 @@ def _session_start_result_from_status(
             transition_accepted=None,
             transport_deadline_exceeded=transport_deadline_exceeded,
             error=detail[:_MAX_SESSION_START_ERROR_CHARS],
-            compatibility_lines=[
-                "session_start_state=not_current",
-                f"session_id={plan.session_id}",
-                f"start_operation_id={plan.start_operation_id}",
-                "session_generation_id=",
-            ],
         )
     if status.start_attempt_verified and not (
         status.start_replace is plan.retry_selector.replace
@@ -7393,12 +7438,6 @@ def _session_start_result_from_status(
             transition_accepted=None,
             transport_deadline_exceeded=transport_deadline_exceeded,
             error="remote start journal does not match the persisted retry selector",
-            compatibility_lines=[
-                "session_start_state=failed",
-                f"session_id={plan.session_id}",
-                f"start_operation_id={plan.start_operation_id}",
-                "session_generation_id=",
-            ],
         )
     if (
         status.recovery_verified
@@ -7419,13 +7458,6 @@ def _session_start_result_from_status(
             ownership_verified=True,
             recovery_verified=True,
             start_phase=status.start_phase,
-            compatibility_lines=[
-                "session_start_state=ready",
-                f"session_started={plan.session_id}",
-                f"start_operation_id={plan.start_operation_id}",
-                f"session_generation_id={generation_id}",
-                f"remote_api_port={plan.remote_api_port}",
-            ],
         )
     if status.start_attempt_verified and generation_id is not None:
         if status.start_state in {"failed", "failed_cleaned"}:
@@ -7440,13 +7472,6 @@ def _session_start_result_from_status(
                 transport_deadline_exceeded=transport_deadline_exceeded,
                 start_phase=status.start_phase,
                 error=detail,
-                compatibility_lines=[
-                    "session_start_state=failed",
-                    f"session_id={plan.session_id}",
-                    f"start_operation_id={plan.start_operation_id}",
-                    f"session_generation_id={generation_id}",
-                    f"error={detail}",
-                ],
             )
         return _owned_session_start_result(
             plan=plan,
@@ -7457,14 +7482,6 @@ def _session_start_result_from_status(
             transition_accepted=True,
             transport_deadline_exceeded=transport_deadline_exceeded,
             start_phase=status.start_phase,
-            compatibility_lines=[
-                "session_start_state=starting",
-                "session_ready=false",
-                "session_start_handle_only=true",
-                f"session_id={plan.session_id}",
-                f"start_operation_id={plan.start_operation_id}",
-                f"session_generation_id={generation_id}",
-            ],
         )
     detail = "; ".join(status.errors) or "remote start transition is not yet observable"
     return _owned_session_start_result(
@@ -7475,14 +7492,6 @@ def _session_start_result_from_status(
         transition_accepted=None,
         transport_deadline_exceeded=transport_deadline_exceeded,
         error=detail[:_MAX_SESSION_START_ERROR_CHARS],
-        compatibility_lines=[
-            "session_start_state=ambiguous",
-            "session_ready=false",
-            "session_start_handle_only=true",
-            f"session_id={plan.session_id}",
-            f"start_operation_id={plan.start_operation_id}",
-            "session_generation_id=",
-        ],
     )
 
 
@@ -7550,12 +7559,6 @@ def watch_remote_session_start(
                 update={
                     "watch_deadline_exceeded": True,
                     "error": detail[-_MAX_SESSION_START_ERROR_CHARS:],
-                    "compatibility_lines": [
-                        *result.compatibility_lines,
-                        "session_ready=false",
-                        "session_start_handle_only=true",
-                        "session_start_watch_detached=true",
-                    ],
                 }
             )
         sleep(min(poll_seconds, remaining))
@@ -7567,7 +7570,7 @@ def start_remote_session_durable(
     plan: OwnedSessionStartPlan,
     api_token: str | None,
     expected_api_release_identity: SessionApiReleaseIdentity | None = None,
-    starter: Callable[..., list[str]] | None = None,
+    starter: Callable[..., OwnedSessionStartReceipt] | None = None,
 ) -> OwnedSessionStartResult:
     """Start or recover one exact remote transition without erasing deadline ambiguity."""
     if (api_token is not None) is not plan.retry_selector.require_token:
@@ -7581,7 +7584,7 @@ def start_remote_session_durable(
         raise RelayError("owned-session start release identity changed after planning")
     start_callable = starter or start_remote_session
     try:
-        lines = start_callable(
+        receipt = start_callable(
             cluster=plan.cluster,
             definition=definition,
             session_id=plan.session_id,
@@ -7612,45 +7615,32 @@ def start_remote_session_durable(
         if observed.state != "ambiguous":
             return observed
         return observed.model_copy(update={"error": str(exc)[:_MAX_SESSION_START_ERROR_CHARS]})
-    values: dict[str, str] = {}
-    for line in lines:
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key in values and values[key] != value:
-            return query_remote_session_start(definition=definition, plan=plan)
-        values[key] = value
-    generation = values.get("session_generation_id")
-    marker = values.get("session_started") or values.get("session_already_running")
-    try:
-        validated_generation = validate_durable_record_id(generation)
-    except (TypeError, ValueError):
-        return query_remote_session_start(definition=definition, plan=plan)
     if (
-        marker != plan.session_id
-        or values.get("start_operation_id") != plan.start_operation_id
-        or values.get("remote_api_port") != str(plan.remote_api_port)
+        receipt.cluster != plan.cluster
+        or receipt.session_id != plan.session_id
+        or receipt.start_operation_id != plan.start_operation_id
+        or receipt.cluster_route_revision != plan.cluster_route_revision
+        or receipt.remote_api_port != plan.remote_api_port
     ):
-        return query_remote_session_start(definition=definition, plan=plan)
+        raise RelayError("owned-session start receipt changed its exact plan identity")
     return OwnedSessionStartResult(
         cluster=plan.cluster,
         session_id=plan.session_id,
         start_operation_id=plan.start_operation_id,
         cluster_route_revision=plan.cluster_route_revision,
-        session_generation_id=validated_generation,
+        session_generation_id=receipt.session_generation_id,
         remote_api_port=plan.remote_api_port,
         state="ready",
         terminal=True,
         retryable=False,
         usable=True,
         transition_accepted=True,
-        running=True,
-        ownership_verified=True,
-        recovery_verified=True,
-        start_phase="contained",
+        running=receipt.running,
+        ownership_verified=receipt.ownership_verified,
+        recovery_verified=receipt.recovery_verified,
+        start_phase=receipt.start_phase,
         status_selector=plan.status_selector,
         retry_selector=plan.retry_selector,
-        compatibility_lines=["session_start_state=ready", *lines],
     )
 
 

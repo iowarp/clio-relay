@@ -996,6 +996,38 @@ def test_embedded_writer_proof_allows_other_cluster_worker_on_different_core(
     assert result.stdout.strip() == "relay_worker_writer_proof=clear"
 
 
+@pytest.mark.release_platform("posix")
+def test_embedded_writer_proof_fails_closed_when_environment_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Bootstrap never substitutes service metadata for an unreadable process contract."""
+    proc_root = tmp_path / "proc"
+    process_id = 1735
+    _fake_proc_process(
+        proc_root,
+        pid=process_id,
+        argv=[
+            "/home/operator/.local/bin/clio-relay",
+            "endpoint",
+            "start",
+            "--role=worker",
+            "--cluster=protected",
+        ],
+        environment={"HOME": str(tmp_path)},
+    )
+    process = proc_root / str(process_id)
+    process.joinpath("environ").chmod(0)
+
+    result = _run_writer_proof(
+        proc_root,
+        cluster="custom",
+        core_dir=tmp_path / "expected-core",
+    )
+
+    assert result.returncode != 0
+    assert f"cannot inspect {process / 'environ'}" in result.stderr
+
+
 def test_embedded_writer_proof_fails_closed_on_oversized_proc_value(tmp_path: Path) -> None:
     """The proof never accepts an argv value beyond its explicit read bound."""
     proc_root = tmp_path / "proc"

@@ -451,6 +451,26 @@ def _session_api_release_identity() -> SessionApiReleaseIdentity:
     )
 
 
+def _start_receipt(
+    arguments: dict[str, object],
+    *,
+    generation_id: str = "generation-1",
+) -> session_lifecycle.OwnedSessionStartReceipt:
+    """Build the typed cluster-local receipt consumed by durable start tests."""
+
+    return session_lifecycle.OwnedSessionStartReceipt(
+        cluster=cast(str, arguments["cluster"]),
+        session_id=cast(str, arguments["session_id"]),
+        start_operation_id=cast(str, arguments["start_operation_id"]),
+        cluster_route_revision=cast(str, arguments["expected_cluster_route_revision"]),
+        session_generation_id=generation_id,
+        remote_api_port=cast(int, arguments["remote_api_port"]),
+        api_pid=123,
+        outcome="started",
+        ready_seconds=0.125,
+    )
+
+
 def _verified_teardown_report(
     *,
     cluster: str = "ares",
@@ -1840,14 +1860,9 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     torn_down: list[dict[str, object]] = []
     remote_calls: list[list[str]] = []
 
-    def fake_start(**kwargs: object) -> list[str]:
+    def fake_start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         started.append(kwargs)
-        return [
-            "session_started=session-1",
-            f"start_operation_id={kwargs['start_operation_id']}",
-            "session_generation_id=generation-1",
-            f"remote_api_port={kwargs['remote_api_port']}",
-        ]
+        return _start_receipt(kwargs)
 
     def fake_status(**kwargs: object) -> dict[str, object]:
         return _owned_session_status(session_id=cast(str, kwargs["session_id"]))
@@ -1884,7 +1899,7 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     monkeypatch.setattr("clio_relay.cli.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.cli.run_remote_clio", fake_run_remote_clio)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_compatibility", accept_worker_compatibility
+        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
     )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -1924,7 +1939,7 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     )
 
     assert start_result.exit_code == 0
-    assert "session_started=session-1" in start_result.output
+    assert json.loads(start_result.output)["session_id"] == "session-1"
     assert started[0]["api_token"] == "api-token"
     assert started[0]["replace"] is True
     assert remote_calls == []
@@ -4056,7 +4071,7 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
     monkeypatch.setattr(cli, "start_remote_session", fail_start)
     monkeypatch.setattr(cli, "run_remote_clio", record_remote)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_compatibility", accept_worker_compatibility
+        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
     )
 
     result = CliRunner().invoke(
@@ -4094,9 +4109,9 @@ def test_cli_session_start_rejects_incompatible_worker_before_remote_mutation(
     )
     starts: list[dict[str, object]] = []
 
-    def record_start(**kwargs: object) -> list[str]:
+    def record_start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         starts.append(kwargs)
-        return ["session_started=session-1"]
+        return _start_receipt(kwargs)
 
     def remote_worker_info(_definition: ClusterDefinition) -> dict[str, object]:
         return _worker_runtime_identity(
@@ -4163,15 +4178,10 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
         events.append("remote-worker")
         return _worker_runtime_identity(installation)
 
-    def start(**kwargs: object) -> list[str]:
+    def start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         assert isinstance(kwargs["expected_api_release_identity"], SessionApiReleaseIdentity)
         events.append("start-remote-session")
-        return [
-            "session_started=session-1",
-            f"start_operation_id={kwargs['start_operation_id']}",
-            "session_generation_id=generation-1",
-            f"remote_api_port={kwargs['remote_api_port']}",
-        ]
+        return _start_receipt(kwargs)
 
     monkeypatch.setattr(cli, "_session_transition_lock", transition_lock)
     monkeypatch.setattr(cli, "installation_info", local_info)
@@ -4224,18 +4234,13 @@ def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_pr
             errors=["owned session transition is not currently observable"],
         ).model_dump(mode="json")
 
-    def start(**kwargs: object) -> list[str]:
+    def start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         events.append("start")
-        return [
-            "session_started=fresh-session",
-            f"start_operation_id={kwargs['start_operation_id']}",
-            "session_generation_id=generation-fresh",
-            f"remote_api_port={kwargs['remote_api_port']}",
-        ]
+        return _start_receipt(kwargs, generation_id="generation-fresh")
 
     monkeypatch.setattr(
         cli,
-        "_verify_session_start_worker_compatibility",
+        "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(cli, "status_remote_session", observe_fresh_session)
@@ -4247,12 +4252,13 @@ def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_pr
     )
 
     assert result.exit_code == 0, result.output
-    assert "session_started=fresh-session" in result.output
-    assert "session_generation_id=generation-fresh" in result.output
+    start_payload = json.loads(result.output)
+    assert start_payload["session_id"] == "fresh-session"
+    assert start_payload["session_generation_id"] == "generation-fresh"
     assert events == ["probe", "start"]
 
 
-def test_cli_session_start_json_returns_self_contained_current_selector(
+def test_cli_session_start_returns_self_contained_current_selector(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -4263,14 +4269,9 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
     release = _session_api_release_identity()
     starts: list[dict[str, object]] = []
 
-    def start(**kwargs: object) -> list[str]:
+    def start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         starts.append(kwargs)
-        return [
-            "session_started=session-1",
-            f"start_operation_id={kwargs['start_operation_id']}",
-            "session_generation_id=generation-1",
-            f"remote_api_port={kwargs['remote_api_port']}",
-        ]
+        return _start_receipt(kwargs)
 
     def verify_worker_compatibility(
         _definition: ClusterDefinition,
@@ -4280,7 +4281,7 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
     monkeypatch.setattr(cli, "start_remote_session", start)
     monkeypatch.setattr(
         cli,
-        "_verify_session_start_worker_compatibility",
+        "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
@@ -4307,7 +4308,6 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
             "--expected-api-release-identity-sha256",
             release.sha256(),
             "--no-require-token",
-            "--json",
         ],
     )
 
@@ -4377,7 +4377,7 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
 
     monkeypatch.setattr(
         cli,
-        "_verify_session_start_worker_compatibility",
+        "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
@@ -4403,7 +4403,6 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
             "--expected-api-release-identity-sha256",
             release.sha256(),
             "--no-require-token",
-            "--json",
         ],
     )
 
@@ -4444,7 +4443,7 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
 
     monkeypatch.setattr(
         cli,
-        "_verify_session_start_worker_compatibility",
+        "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
@@ -4465,7 +4464,6 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
             "--expected-api-release-identity-sha256",
             "b" * 64 if stale_selector == "release" else release.sha256(),
             "--no-require-token",
-            "--json",
         ],
     )
 

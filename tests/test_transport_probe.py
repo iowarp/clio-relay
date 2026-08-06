@@ -40,19 +40,26 @@ def _frp_cluster_definition() -> ClusterDefinition:
     )
 
 
-def _ready_owned_session_start_lines(kwargs: dict[str, object]) -> list[str]:
+def _ready_owned_session_start_receipt(
+    kwargs: dict[str, object],
+) -> session_lifecycle.OwnedSessionStartReceipt:
     operation_id = cast(str, kwargs["start_operation_id"])
     session_id = cast(str, kwargs["session_id"])
     remote_api_port = cast(int, kwargs["remote_api_port"])
     assert operation_id.startswith("start_")
-    assert kwargs["expected_cluster_route_revision"]
-    return [
-        f"session_started={session_id}",
-        f"start_operation_id={operation_id}",
-        "session_generation_id=generation-1",
-        f"remote_api_port={remote_api_port}",
-        "api_pid=123",
-    ]
+    route_revision = cast(str, kwargs["expected_cluster_route_revision"])
+    assert route_revision
+    return session_lifecycle.OwnedSessionStartReceipt(
+        cluster=cast(str, kwargs["cluster"]),
+        session_id=session_id,
+        start_operation_id=operation_id,
+        cluster_route_revision=route_revision,
+        session_generation_id="generation-1",
+        remote_api_port=remote_api_port,
+        api_pid=123,
+        outcome="started",
+        ready_seconds=0.125,
+    )
 
 
 def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: MonkeyPatch) -> None:
@@ -537,11 +544,11 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
     teardowns: list[str] = []
     http_bindings: list[tuple[str, str, str]] = []
 
-    def fake_start(**kwargs: object) -> list[str]:
+    def fake_start(**kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         assert kwargs["session_id"] == "session-1"
         assert kwargs["remote_api_port"] == 9001
         assert kwargs["api_token"] == "token"
-        return _ready_owned_session_start_lines(kwargs)
+        return _ready_owned_session_start_receipt(kwargs)
 
     def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardowns.append(str(kwargs["session_id"]))
@@ -626,8 +633,8 @@ def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPat
     teardowns: list[str] = []
     detaches: list[str] = []
 
-    def fake_start(**_kwargs: object) -> list[str]:
-        return _ready_owned_session_start_lines(_kwargs)
+    def fake_start(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        return _ready_owned_session_start_receipt(_kwargs)
 
     def fake_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardowns.append(str(kwargs["session_id"]))
@@ -787,8 +794,8 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
 def test_ssh_forward_http_probe_rejects_residual_remote_session(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    def fake_start(**_kwargs: object) -> list[str]:
-        return _ready_owned_session_start_lines(_kwargs)
+    def fake_start(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        return _ready_owned_session_start_receipt(_kwargs)
 
     def fake_teardown(**_kwargs: object) -> SessionLifecycleReport:
         return SessionLifecycleReport(

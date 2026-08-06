@@ -732,6 +732,25 @@ def _durable_start_status(
     )
 
 
+def _durable_start_receipt(
+    plan: OwnedSessionStartPlan,
+    *,
+    outcome: Literal["started", "already_running", "recovered"] = "started",
+    remote_api_port: int | None = None,
+) -> session_lifecycle.OwnedSessionStartReceipt:
+    return session_lifecycle.OwnedSessionStartReceipt(
+        cluster=plan.cluster,
+        session_id=plan.session_id,
+        start_operation_id=plan.start_operation_id,
+        cluster_route_revision=plan.cluster_route_revision,
+        session_generation_id="generation-start",
+        remote_api_port=remote_api_port or plan.remote_api_port,
+        api_pid=123,
+        outcome=outcome,
+        ready_seconds=None if outcome == "already_running" else 0.125,
+    )
+
+
 def _write_owned_generation_process(
     *,
     proc_root: Path,
@@ -1513,7 +1532,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", receipt)
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.125))
 
-    lines = execute_owned_session_start(
+    start_receipt = execute_owned_session_start(
         request,
         home=home,
         core_dir=queue.root,
@@ -1537,8 +1556,9 @@ def test_executor_replaces_exact_legacy_old_release_session(
     assert child_environment["CLIO_RELAY_INPUT_FILE_MAX_COUNT"] == "24"
     assert child_environment[ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV] == "1"
     assert launch_commands[0][0] == str(provider_interpreter.absolute())
-    assert f"start_operation_id={request.start_operation_id}" in lines
-    assert f"remote_api_port={request.remote_api_port}" in lines
+    assert start_receipt.start_operation_id == request.start_operation_id
+    assert start_receipt.remote_api_port == request.remote_api_port
+    assert start_receipt.outcome == "started"
 
 
 def test_executor_refuses_mismatched_legacy_journal_without_mutation(
@@ -1796,7 +1816,7 @@ def test_durable_start_deadline_observes_late_ready_transition(
 ) -> None:
     definition, release, plan = _durable_start_plan()
 
-    def deadline(**_kwargs: object) -> list[str]:
+    def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
@@ -1822,19 +1842,16 @@ def test_durable_start_deadline_observes_late_ready_transition(
     assert result.terminal is True
     assert result.transport_deadline_exceeded is True
     assert result.session_generation_id == "generation-start"
+    assert "compatibility_lines" not in result.model_dump()
 
 
-def test_synchronous_start_output_must_bind_exact_remote_port(
+def test_typed_start_receipt_must_bind_exact_remote_port(
     monkeypatch: MonkeyPatch,
 ) -> None:
     definition, release, plan = _durable_start_plan()
 
-    def incomplete(**_kwargs: object) -> list[str]:
-        return [
-            f"session_started={plan.session_id}",
-            f"start_operation_id={plan.start_operation_id}",
-            "session_generation_id=generation-start",
-        ]
+    def wrong_port(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        return _durable_start_receipt(plan, remote_api_port=plan.remote_api_port + 1)
 
     def unavailable(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise RelayError("status unavailable")
@@ -1845,16 +1862,14 @@ def test_synchronous_start_output_must_bind_exact_remote_port(
         unavailable,
     )
 
-    result = session_lifecycle.start_remote_session_durable(
-        definition=definition,
-        plan=plan,
-        api_token=None,
-        expected_api_release_identity=release,
-        starter=incomplete,
-    )
-
-    assert result.state == "ambiguous"
-    assert result.recovery_verified is False
+    with pytest.raises(RelayError, match="receipt changed its exact plan identity"):
+        session_lifecycle.start_remote_session_durable(
+            definition=definition,
+            plan=plan,
+            api_token=None,
+            expected_api_release_identity=release,
+            starter=wrong_port,
+        )
 
 
 def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeout(
@@ -1863,7 +1878,7 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
     definition, release, plan = _durable_start_plan()
     observations = 0
 
-    def deadline(**_kwargs: object) -> list[str]:
+    def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
@@ -2038,7 +2053,7 @@ def test_durable_start_status_transport_failure_is_ambiguous(
 ) -> None:
     definition, release, plan = _durable_start_plan()
 
-    def deadline(**_kwargs: object) -> list[str]:
+    def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
@@ -2075,7 +2090,7 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
         error="owned session transition lock timed out",
     )
 
-    def rejected(**_kwargs: object) -> list[str]:
+    def rejected(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         raise session_lifecycle._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             rejection
         )
@@ -2138,7 +2153,7 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
 ) -> None:
     definition, release, plan = _durable_start_plan()
 
-    def deadline(**_kwargs: object) -> list[str]:
+    def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
         raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
@@ -2387,7 +2402,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", verify_receipt)
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
-    lines = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    start_receipt = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         attempt=attempt,
         request=request,
@@ -2398,8 +2413,9 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
     )
 
     assert receipt_checks == 2
-    assert lines is not None
-    assert f"session_generation_id={generation}" in lines
+    assert start_receipt is not None
+    assert start_receipt.session_generation_id == generation
+    assert start_receipt.outcome == "recovered"
     metadata = transaction.read_json("metadata.json")
     assert metadata is not None
     assert metadata["api_pid"] == 4321
@@ -4144,16 +4160,26 @@ def test_scheduler_cancellation_evidence_accepts_a_linked_gateway_cleanup() -> N
 
 def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyPatch) -> None:
     scripts: list[str] = []
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    plan = session_lifecycle.plan_remote_session_start(
+        cluster="ares",
+        definition=definition,
+        session_id="session-1",
+        remote_api_port=9001,
+        replace=False,
+        require_token=True,
+        start_operation_id="start_receipt",
+    )
 
     def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
         scripts.append(script)
-        return "session_started=session-1\napi_pid=123\nremote_api_port=9001\n"
+        return _durable_start_receipt(plan).model_dump_json()
 
     monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
-    lines = start_remote_session(
+    receipt = start_remote_session(
         cluster="ares",
-        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        definition=definition,
         session_id="session-1",
         remote_api_port=9001,
         api_token="token",
@@ -4163,9 +4189,12 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
             file_max_count=32,
         ),
         expected_api_release_identity=_api_release_identity(),
+        start_operation_id=plan.start_operation_id,
+        expected_cluster_route_revision=plan.cluster_route_revision,
     )
 
-    assert "session_started=session-1" in lines
+    assert receipt.session_id == "session-1"
+    assert receipt.outcome == "started"
     script = scripts[0]
     assert "CLIO_RELAY_API_TOKEN='token'" in script
     assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
@@ -4186,6 +4215,32 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "last_cleanup" not in script
     assert "\x00" not in script
     assert "pkill" not in script
+
+
+def test_start_remote_session_rejects_legacy_key_value_output(monkeypatch: MonkeyPatch) -> None:
+    """A readable legacy line stream cannot substitute for the typed receipt."""
+
+    def fake_ssh(_definition: ClusterDefinition, _script: str) -> str:
+        return (
+            "session_started=session-1\nsession_generation_id=generation-1\nremote_api_port=9001\n"
+        )
+
+    monkeypatch.setattr(
+        session_lifecycle,
+        "_ssh_script",
+        fake_ssh,
+    )
+
+    with pytest.raises(RelayError, match="start receipt is invalid"):
+        start_remote_session(
+            cluster="ares",
+            definition=ClusterDefinition(name="ares", ssh_host="ares"),
+            session_id="session-1",
+            remote_api_port=9001,
+            api_token="token",
+            expected_api_release_identity=_api_release_identity(),
+            start_operation_id="start_no_compatibility",
+        )
 
 
 def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
@@ -4262,21 +4317,33 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
     monkeypatch: MonkeyPatch,
 ) -> None:
     scripts: list[str] = []
+    definition = ClusterDefinition(name="ares", ssh_host="ares")
+    plan = session_lifecycle.plan_remote_session_start(
+        cluster="ares",
+        definition=definition,
+        session_id="session-1",
+        remote_api_port=9001,
+        replace=False,
+        require_token=True,
+        start_operation_id="start_existing",
+    )
 
     def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
         scripts.append(script)
-        return "session_already_running=session-1\n"
+        return _durable_start_receipt(plan, outcome="already_running").model_dump_json()
 
     monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="ares",
-        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        definition=definition,
         session_id="session-1",
         remote_api_port=9001,
         api_token="token",
         expected_api_release_identity=_api_release_identity(),
         replace=False,
+        start_operation_id=plan.start_operation_id,
+        expected_cluster_route_revision=plan.cluster_route_revision,
     )
 
     script = scripts[0]
@@ -4290,29 +4357,42 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
     monkeypatch: MonkeyPatch,
 ) -> None:
     scripts: list[str] = []
-
-    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
-        scripts.append(script)
-        return "session_started=session-1\n"
-
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
     registration = RemoteMcpServerConfig(
         command="science-mcp",
         args=[f"{index:03d}-" + ("x" * 4_000) for index in range(40)],
         allow_tools=["inspect"],
     )
 
+    definition = ClusterDefinition(
+        name="alpha",
+        ssh_host="alpha",
+        remote_mcp_servers={"science": registration},
+    )
+    plan = session_lifecycle.plan_remote_session_start(
+        cluster="alpha",
+        definition=definition,
+        session_id="session-1",
+        remote_api_port=9001,
+        replace=False,
+        require_token=True,
+        start_operation_id="start_large_registry",
+    )
+
+    def fake_ssh(_definition: ClusterDefinition, script: str) -> str:
+        scripts.append(script)
+        return _durable_start_receipt(plan).model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
     start_remote_session(
         cluster="alpha",
-        definition=ClusterDefinition(
-            name="alpha",
-            ssh_host="alpha",
-            remote_mcp_servers={"science": registration},
-        ),
+        definition=definition,
         session_id="session-1",
         remote_api_port=9001,
         api_token="token",
         expected_api_release_identity=_api_release_identity(),
+        start_operation_id=plan.start_operation_id,
+        expected_cluster_route_revision=plan.cluster_route_revision,
     )
 
     script = scripts[0]

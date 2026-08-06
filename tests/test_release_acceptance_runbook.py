@@ -53,7 +53,7 @@ def test_release_identity_is_consistent_across_package_policy_matrix_and_runbook
     init_source = (ROOT / "src" / "clio_relay" / "__init__.py").read_text(encoding="utf-8")
     release_process = RELEASE_PROCESS.read_text(encoding="utf-8")
 
-    assert version == "1.5.14"
+    assert version == "1.5.15"
     assert relay_lock["version"] == version
     assert f'__version__ = "{version}"' in init_source
     assert policy["release_version"] == version
@@ -461,9 +461,11 @@ def test_owned_session_helper_isolates_command_output_from_its_return_value(
                 "  param([Parameter(ValueFromRemainingArguments=$true)] [object[]] $Command)",
                 "  $global:LASTEXITCODE = 0",
                 "  if (($Command -join ' ') -like 'session start *') {",
-                "    'session_started=owned-session'",
-                "    'api_pid=123'",
-                "    'remote_api_port=9001'",
+                (
+                    '    \'{"schema_version":'
+                    '"clio-relay.owner-session-start-result.v1",'
+                    '"session_id":"owned-session","state":"ready"}\''
+                ),
                 "    return",
                 "  }",
                 "  if (($Command -join ' ') -like 'session status *') {",
@@ -501,11 +503,11 @@ def test_owned_session_helper_isolates_command_output_from_its_return_value(
 
     assert result.returncode == 0, result.stderr
     output_lines = [line for line in result.stdout.splitlines() if line.strip()]
-    assert output_lines[:3] == [
-        "session_started=owned-session",
-        "api_pid=123",
-        "remote_api_port=9001",
-    ]
+    assert json.loads(output_lines[0]) == {
+        "schema_version": "clio-relay.owner-session-start-result.v1",
+        "session_id": "owned-session",
+        "state": "ready",
+    }
     assert json.loads(output_lines[-1]) == {"count": 1, "value": "generation-123"}
 
 

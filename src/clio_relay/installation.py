@@ -2650,6 +2650,8 @@ print(json.dumps({
 
 _PYTHON_RECORD_CLOSURE_SAFE_ERRORS = frozenset(
     {
+        "execution data path is outside its environment",
+        "execution environment has no data installation path",
         "execution environment has no scripts installation path",
         "execution scripts path is outside its environment",
         "installed console script is not a canonical declared wrapper",
@@ -2661,6 +2663,8 @@ _PYTHON_RECORD_CLOSURE_SAFE_ERRORS = frozenset(
         "installed wheel script is not executable",
         "installed wheel script is not owned by distribution RECORD",
         "installed wheel script must not be a symbolic link",
+        "installed wheel data file is not owned by distribution RECORD",
+        "installed wheel data file must not be a symbolic link",
         "wheel script does not use an exact #!python shebang",
         "wheel script has an ambiguous console_scripts declaration",
         "wheel script has an unsafe member name",
@@ -2668,12 +2672,13 @@ _PYTHON_RECORD_CLOSURE_SAFE_ERRORS = frozenset(
         "wheel script console_scripts target is not canonical",
         "wheel script exceeds the byte bound",
         "wheel scripts must use one flat member name",
+        "wheel data file is not installed in the execution environment",
     }
 )
 
 
 def _python_record_closure_error_code(error: str) -> str:
-    """Return a bounded public diagnostic code for one known script error."""
+    """Return a bounded public diagnostic code for one known closure error."""
     if error not in _PYTHON_RECORD_CLOSURE_SAFE_ERRORS:
         return "unclassified-record-closure-error"
     return error.replace("#!", "hashbang-").replace("_", "-").replace(" ", "-")
@@ -2945,6 +2950,28 @@ def verify_wheel_script(archive, info, member, path):
         "entry_point": entry_point,
     }
 
+
+def locate_wheel_data_file(path):
+    relative = PurePosixPath(*path.parts[2:])
+    data_value = sysconfig.get_path("data")
+    if not isinstance(data_value, str) or not data_value:
+        raise SystemExit("execution environment has no data installation path")
+    data_root = Path(data_value).resolve(strict=True)
+    if not within(data_root, (environment_prefix,)):
+        raise SystemExit("execution data path is outside its environment")
+    candidate = data_root.joinpath(*relative.parts)
+    if candidate.is_symlink():
+        raise SystemExit("installed wheel data file must not be a symbolic link")
+    installed_location = candidate.resolve(strict=True)
+    if (
+        not within(installed_location, (data_root, environment_prefix))
+        or not installed_location.is_file()
+    ):
+        raise SystemExit("wheel data file is not installed in the execution environment")
+    if os.path.normcase(str(installed_location)) not in installed_record_locations:
+        raise SystemExit("installed wheel data file is not owned by distribution RECORD")
+    return installed_location
+
 wheel_closure = hashlib.sha256()
 wheel_bytes = 0
 wheel_members = 0
@@ -3013,6 +3040,7 @@ with zipfile.ZipFile(wheel) as archive:
             raise SystemExit("retained wheel member digest does not match RECORD")
         parts = path.parts
         script_transform = None
+        installed_location = None
         if parts and parts[0].endswith(".data"):
             if len(parts) < 3:
                 raise SystemExit("retained wheel uses an unsupported installation scheme")
@@ -3021,14 +3049,17 @@ with zipfile.ZipFile(wheel) as archive:
                 wheel_script_transforms.append(script_transform)
             elif parts[1] in {"purelib", "platlib"}:
                 installed_relative = PurePosixPath(*parts[2:])
+            elif parts[1] == "data":
+                installed_location = locate_wheel_data_file(path)
             else:
                 raise SystemExit("retained wheel uses an unsupported installation scheme")
         else:
             installed_relative = path
         if script_transform is None:
-            installed_location = Path(
-                installed.locate_file(str(installed_relative))
-            ).resolve(strict=True)
+            if installed_location is None:
+                installed_location = Path(
+                    installed.locate_file(str(installed_relative))
+                ).resolve(strict=True)
             if not within(installed_location, allowed_roots) or not installed_location.is_file():
                 raise SystemExit("wheel-owned distribution member is not installed")
             with installed_location.open("rb") as stream:
