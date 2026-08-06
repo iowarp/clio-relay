@@ -8,7 +8,7 @@
 
 It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
 
-> Version `1.5.14` uses a release-first patch process. A maintainer builds the
+> Version `1.5.15` uses a release-first patch process. A maintainer builds the
 > wheel and source distribution once, attaches those exact bytes and their
 > checksums to a GitHub Release, and publishes the release immediately. Tag
 > regression jobs and the trusted PyPI upload then run asynchronously; they do
@@ -232,7 +232,7 @@ clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
 
 Automation that must recover an interrupted start should persist the JSON from
-`session plan-start`, invoke `session start --json` with those exact selectors,
+`session plan-start`, invoke `session start` with those exact selectors,
 and query the returned current-transition `status_selector`. Per-observation
 transport deadlines never imply terminal failure, and session lifecycle operations
 never cancel or time out queued scheduler/JARVIS jobs.

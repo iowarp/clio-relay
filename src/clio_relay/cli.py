@@ -3950,7 +3950,7 @@ def session_plan_start(
     settings = RelaySettings.from_env()
 
     def action() -> None:
-        release_identity = _verify_session_start_worker_compatibility(definition)
+        release_identity = _verify_session_start_worker_release_identity(definition)
         typer.echo(
             plan_remote_session_start(
                 cluster=cluster,
@@ -3993,25 +3993,12 @@ def session_start(
         str | None,
         typer.Option(help="Exact release digest from session plan-start."),
     ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json/--text", help="Emit the stable start-result JSON contract."),
-    ] = False,
 ) -> None:
     """Start an owned API; exit 0 means ready and exit 2 means handle-only."""
     settings = RelaySettings.from_env()
     if require_token and settings.api_token is None:
         raise typer.BadParameter(
             "CLIO_RELAY_API_TOKEN is required unless --no-require-token is explicit"
-        )
-    if json_output and (
-        start_operation_id is None
-        or expected_cluster_route_revision is None
-        or expected_api_release_identity_sha256 is None
-    ):
-        raise typer.BadParameter(
-            "--json requires persisted operation, route, and release selectors from "
-            "session plan-start"
         )
     definition = _require_cluster(cluster)
 
@@ -4029,7 +4016,7 @@ def session_start(
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
         )
         with _session_transition_lock(cluster=cluster, session_id=session_id):
-            api_release_identity = _verify_session_start_worker_compatibility(definition)
+            api_release_identity = _verify_session_start_worker_release_identity(definition)
             if (
                 expected_api_release_identity_sha256 is not None
                 and api_release_identity.sha256() != expected_api_release_identity_sha256
@@ -4059,10 +4046,7 @@ def session_start(
                 expected_api_release_identity=api_release_identity,
                 starter=start_remote_session,
             )
-            if json_output:
-                typer.echo(result.model_dump_json(indent=2))
-            else:
-                _echo_lines(result.compatibility_lines)
+            typer.echo(result.model_dump_json(indent=2))
             if result.state in {"failed", "not_current"}:
                 raise typer.Exit(code=1)
             if not result.usable:
@@ -5094,7 +5078,7 @@ def _persist_verified_cleanup_report_before_closure(
     return finalized_report, finalized_status
 
 
-def _verify_session_start_worker_compatibility(
+def _verify_session_start_worker_release_identity(
     definition: ClusterDefinition,
 ) -> SessionApiReleaseIdentity:
     """Require one exact live worker/install identity before session mutation."""
@@ -5495,8 +5479,7 @@ def session_start_owned() -> None:
         except ValueError as exc:
             raise RelayError(f"owned session start request is invalid: {exc}") from exc
         try:
-            for line in execute_owned_session_start(request):
-                typer.echo(line)
+            typer.echo(execute_owned_session_start(request).model_dump_json())
         except RelayError as exc:
             typer.echo(
                 OwnedSessionStartRejection(

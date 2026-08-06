@@ -453,7 +453,13 @@ def run_ssh_forward_http_probe(
         or not start_result.recovery_verified
     ):
         raise RelayError("ready remote session start omitted its verified generation identity")
-    start_lines = start_result.compatibility_lines
+    start_lines = [
+        f"session_start_state={start_result.state}",
+        f"session_started={start_result.session_id}",
+        f"start_operation_id={start_result.start_operation_id}",
+        f"session_generation_id={session_generation_id}",
+        f"remote_api_port={start_result.remote_api_port}",
+    ]
     factory = process_factory or _popen
     forward: ManagedProcess | None = None
     lines: list[str] = []

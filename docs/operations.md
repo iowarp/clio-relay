@@ -1158,7 +1158,7 @@ clio-relay session teardown --cluster my-cluster --session-id desktop-session
 
 For a recorder or other client that must survive loss of the initiating process,
 run `session plan-start` first and persist its JSON. Pass the plan's operation id,
-route revision, and release digest to `session start --json`. The returned
+route revision, and release digest to `session start`. The returned
 `status_selector` is self-contained and can be submitted to `session start-status`
 one observation at a time. A start result has one of these states:
 
@@ -1187,13 +1187,13 @@ selector after any delay. A watch deadline returns the still-current handle with
 change or cancel the remote transition. Exit status is 0 only for ready, 1 for a
 terminal failure/non-current selector, and 2 for a detached nonterminal watch.
 
-The default `session start --text` output remains the compatibility key/value
-surface. Ready output retains `session_started`, `session_generation_id`, and
-`remote_api_port`. Non-ready text explicitly includes
-`session_ready=false` and `session_start_handle_only=true`, and the command exits
-2 so older integrations cannot mistake the handle for a successfully attached
-API. New automation should use `session plan-start`, `session start --json`, and
-the returned secret-free status selector.
+`session start` always emits the closed `owner-session-start-result.v1` JSON
+contract. The cluster-local mutation returns one closed
+`owner-session-start-receipt.v1` JSON object that is validated before the public
+result is built. No key/value output parser or alternate text result can infer
+readiness. Exit status is 2 for a nonterminal handle so callers cannot mistake it
+for an attached API. Automation should persist the returned secret-free status
+selector.
 
 There is deliberately no aggregate start wait deadline in the relay contract.
 Each SSH/status observation is bounded so a client remains responsive, but a
