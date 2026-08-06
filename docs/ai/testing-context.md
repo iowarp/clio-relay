@@ -63,6 +63,11 @@ evidence must also prove the relevant boundary before it is claimed:
   `outer_jarvis_pipeline=false` and creates no scheduler allocation;
 - a package-declared v3.6 local file is hash-pinned, ingested, rewritten, and
   inherited by the exact later JARVIS run after an MCP reconnect; and
+- a nondefault input policy survives session start, status/retry reconstruction,
+  API launch, and reconnect, while a changed policy is rejected without explicit
+  replacement;
+- default teardown preserves and reports many exact scheduler identities through
+  bounded provider batches rather than one remote process per job;
 - edge provenance and any transform record round-trip through the authenticated
   released API without changing legacy dependency identities.
 

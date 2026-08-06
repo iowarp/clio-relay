@@ -1186,6 +1186,27 @@ def test_owned_session_api_fails_closed_without_cluster_or_owner_token(tmp_path:
         )
 
 
+def test_owned_session_api_allows_explicit_unauthenticated_loopback_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+        allow_unauthenticated_owned_session=True,
+    )
+
+    response = cast(Any, TestClient(create_app(settings))).get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "auth": False}
+
+
 def test_owned_session_api_fails_closed_without_exact_process_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

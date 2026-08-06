@@ -209,6 +209,33 @@ def test_managed_queue_never_scans_storage_while_core_lock_is_held(
     assert saved.job_id == intent.job_id
 
 
+def test_managed_queue_never_scans_storage_while_admission_lock_is_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = storage_managed_queue(_settings(tmp_path))
+    intent = _job("storage-scan-lock-order")
+    _resolve_as(
+        queue,
+        monkeypatch,
+        state="new",
+        canonical_job_id=intent.job_id,
+        existing_job=None,
+    )
+    real_scan_tree = storage_module.scan_tree
+
+    def checked_scan(*args: object, **kwargs: object) -> object:
+        with queue.storage_runtime.policy.admission_lock():
+            pass
+        return real_scan_tree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(storage_module, "scan_tree", checked_scan)
+
+    saved = queue.submit_job(intent)
+
+    assert saved.job_id == intent.job_id
+
+
 def test_managed_queue_releases_provisional_reservation_after_submit_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

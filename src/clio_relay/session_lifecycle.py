@@ -35,6 +35,14 @@ from clio_relay.cluster_config import (
     ClusterRegistry,
     cluster_route_revision,
 )
+from clio_relay.config import (
+    ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV,
+    DEFAULT_INPUT_FILE_MAX_BYTES,
+    DEFAULT_INPUT_FILE_MAX_COUNT,
+    DEFAULT_INPUT_TOTAL_MAX_BYTES,
+    MAX_INPUT_FILE_MAX_BYTES,
+    MAX_INPUT_TOTAL_MAX_BYTES,
+)
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
@@ -903,6 +911,42 @@ class SessionApiReleaseIdentity(BaseModel):
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
 
+class OwnedSessionInputPolicy(BaseModel):
+    """Bounded input-ingestion policy projected into one owned API generation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["clio-relay.owner-session-input-policy.v1"] = (
+        "clio-relay.owner-session-input-policy.v1"
+    )
+    file_max_bytes: int = Field(
+        default=DEFAULT_INPUT_FILE_MAX_BYTES,
+        ge=1,
+        le=MAX_INPUT_FILE_MAX_BYTES,
+    )
+    total_max_bytes: int = Field(
+        default=DEFAULT_INPUT_TOTAL_MAX_BYTES,
+        ge=1,
+        le=MAX_INPUT_TOTAL_MAX_BYTES,
+    )
+    file_max_count: int = Field(default=DEFAULT_INPUT_FILE_MAX_COUNT, ge=1, le=1_000)
+
+    @model_validator(mode="after")
+    def _validate_total(self) -> OwnedSessionInputPolicy:
+        if self.total_max_bytes < self.file_max_bytes:
+            raise ValueError("input policy total_max_bytes must cover file_max_bytes")
+        return self
+
+    def environment(self) -> dict[str, str]:
+        """Return the exact child-process environment projection."""
+
+        return {
+            "CLIO_RELAY_INPUT_FILE_MAX_BYTES": str(self.file_max_bytes),
+            "CLIO_RELAY_INPUT_TOTAL_MAX_BYTES": str(self.total_max_bytes),
+            "CLIO_RELAY_INPUT_FILE_MAX_COUNT": str(self.file_max_count),
+        }
+
+
 class OwnedSessionStartRequest(BaseModel):
     """Exact stdin contract for one cluster-local owned-session start."""
 
@@ -914,6 +958,7 @@ class OwnedSessionStartRequest(BaseModel):
     remote_api_port: int = Field(gt=0, le=65_535)
     replace: bool = False
     require_token: bool = True
+    input_policy: OwnedSessionInputPolicy = Field(default_factory=OwnedSessionInputPolicy)
     expected_api_release_identity: SessionApiReleaseIdentity | None = None
     cluster_registry: dict[str, object]
     cluster_registry_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -949,6 +994,7 @@ class OwnedSessionStartStatusSelector(BaseModel):
     remote_api_port: int = Field(gt=0, le=65_535)
     replace: bool
     require_token: bool
+    input_policy: OwnedSessionInputPolicy = Field(default_factory=OwnedSessionInputPolicy)
     expected_api_release_identity_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -968,6 +1014,7 @@ class OwnedSessionStartRetrySelector(BaseModel):
     remote_api_port: int = Field(gt=0, le=65_535)
     replace: bool
     require_token: bool
+    input_policy: OwnedSessionInputPolicy = Field(default_factory=OwnedSessionInputPolicy)
     expected_api_release_identity_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -1184,6 +1231,7 @@ class OwnedSessionRecoveryStatus(BaseModel):
     start_retryable: bool = False
     start_replace: bool | None = None
     start_require_token: bool | None = None
+    start_input_policy: OwnedSessionInputPolicy | None = None
     start_expected_api_release_identity_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -1243,6 +1291,7 @@ class OwnedSessionStartResult(BaseModel):
             and self.status_selector.remote_api_port == self.remote_api_port
             and self.status_selector.replace == self.retry_selector.replace
             and self.status_selector.require_token == self.retry_selector.require_token
+            and self.status_selector.input_policy == self.retry_selector.input_policy
             and self.status_selector.expected_api_release_identity_sha256
             == self.retry_selector.expected_api_release_identity_sha256
             and self.retry_selector.cluster == self.cluster
@@ -1304,6 +1353,7 @@ class OwnedSessionStartPlan(BaseModel):
     start_operation_id: DurableRecordId
     cluster_route_revision: str = Field(min_length=1)
     remote_api_port: int = Field(gt=0, le=65_535)
+    input_policy: OwnedSessionInputPolicy = Field(default_factory=OwnedSessionInputPolicy)
     expected_api_release_identity_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -1322,6 +1372,9 @@ class OwnedSessionStartPlan(BaseModel):
             and self.status_selector.remote_api_port == self.remote_api_port
             and self.status_selector.replace == self.retry_selector.replace
             and self.status_selector.require_token == self.retry_selector.require_token
+            and self.status_selector.input_policy == self.retry_selector.input_policy
+            and self.status_selector.input_policy == self.input_policy
+            and self.retry_selector.input_policy == self.input_policy
             and self.status_selector.expected_api_release_identity_sha256
             == self.expected_api_release_identity_sha256
             and self.retry_selector.cluster == self.cluster
@@ -1839,6 +1892,11 @@ def _inspect_owned_session_start_attempt_status(
         start_retryable=bool(attempt_verified and start_error is None),
         start_replace=cast(bool, attempt["replace"]),
         start_require_token=cast(bool, attempt["require_token"]),
+        start_input_policy=(
+            OwnedSessionInputPolicy.model_validate(attempt["input_policy"])
+            if "input_policy" in attempt
+            else None
+        ),
         start_expected_api_release_identity_sha256=cast(
             str | None,
             attempt["expected_api_release_identity_sha256"],
@@ -2273,6 +2331,11 @@ def _inspect_owned_session_failed_cleaned_receipt(
         start_retryable=False,
         start_replace=(cast(bool, attempt["replace"]) if attempt is not None else None),
         start_require_token=(cast(bool, attempt["require_token"]) if attempt is not None else None),
+        start_input_policy=(
+            OwnedSessionInputPolicy.model_validate(attempt["input_policy"])
+            if attempt is not None and "input_policy" in attempt
+            else None
+        ),
         start_expected_api_release_identity_sha256=(
             cast(str | None, attempt["expected_api_release_identity_sha256"])
             if attempt is not None
@@ -2450,11 +2513,20 @@ def inspect_owned_session_recovery_status(
     containment_broker_start = document.get("containment_broker_start_identity")
     startup_receipt_path_raw = document.get("api_startup_receipt_path")
     startup_receipt_sha256 = document.get("api_startup_receipt_sha256")
+    raw_input_policy = document.get("input_policy")
 
     try:
         validated_release = SessionApiReleaseIdentity.model_validate(release_identity)
     except ValueError:
         validated_release = None
+    try:
+        validated_input_policy = (
+            OwnedSessionInputPolicy.model_validate(raw_input_policy)
+            if "input_policy" in document
+            else None
+        )
+    except ValueError:
+        validated_input_policy = None
     try:
         parsed_started_at = (
             datetime.fromisoformat(started_at) if isinstance(started_at, str) else None
@@ -2495,8 +2567,9 @@ def inspect_owned_session_recovery_status(
         "started_at",
         "owner",
     }
+    current_metadata_keys = expected_metadata_keys | {"input_policy"}
     metadata_verified = bool(
-        set(document) == expected_metadata_keys
+        frozenset(document) in {frozenset(expected_metadata_keys), frozenset(current_metadata_keys)}
         and owner == "clio-relay"
         and document.get("session_id") == session_id
         and recorded_cluster == cluster
@@ -2527,6 +2600,7 @@ def inspect_owned_session_recovery_status(
         and len(release_sha256) == 64
         and all(character in "0123456789abcdef" for character in release_sha256)
         and validated_release.sha256() == release_sha256
+        and ("input_policy" not in document or validated_input_policy is not None)
         and containment_mode == "linux_systemd_scope"
         and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
         and isinstance(systemd_cgroup_path, str)
@@ -2807,6 +2881,7 @@ def inspect_owned_session_recovery_status(
     start_attempt_verified = False
     start_replace: bool | None = None
     start_require_token: bool | None = None
+    start_input_policy: OwnedSessionInputPolicy | None = None
     start_expected_release_sha256: str | None = None
     start_attempt_release_sha256: str | None = None
     start_error: str | None = None
@@ -2835,6 +2910,7 @@ def inspect_owned_session_recovery_status(
             start_attempt_verified = True
             start_replace = attempt_status.start_replace
             start_require_token = attempt_status.start_require_token
+            start_input_policy = attempt_status.start_input_policy
             start_expected_release_sha256 = (
                 attempt_status.start_expected_api_release_identity_sha256
             )
@@ -2925,6 +3001,7 @@ def inspect_owned_session_recovery_status(
         start_retryable=bool(recovery_verified and replacement_in_progress),
         start_replace=start_replace,
         start_require_token=start_require_token,
+        start_input_policy=start_input_policy,
         start_expected_api_release_identity_sha256=start_expected_release_sha256,
         start_error=start_error,
         errors=errors,
@@ -4302,7 +4379,7 @@ def _write_session_attempt(
     """Write one atomic, resumable owner-session attempt record."""
     document = {
         "schema_version": (
-            "clio-relay.owner-session-attempt.v2"
+            "clio-relay.owner-session-attempt.v3"
             if operation == "start"
             else "clio-relay.owner-session-attempt.v1"
         ),
@@ -4544,6 +4621,7 @@ def _validated_start_attempt(
     remote_api_port: int | None = None,
     replace: bool | None = None,
     require_token: bool | None = None,
+    input_policy: OwnedSessionInputPolicy | None = None,
     expected_api_release_identity_sha256: str | None = None,
     allow_legacy: bool = False,
 ) -> dict[str, object] | None:
@@ -4568,6 +4646,7 @@ def _validated_start_attempt(
         "remote_api_port",
         "replace",
         "require_token",
+        "input_policy",
         "start_phase",
         "systemd_unit",
         "systemd_description",
@@ -4578,13 +4657,23 @@ def _validated_start_attempt(
         "observed_at",
         "error",
     }
-    legacy_keys = expected_keys - {
+    pre_policy_keys = expected_keys - {"input_policy"}
+    legacy_keys = pre_policy_keys - {
         "start_operation_id",
         "expected_api_release_identity_sha256",
         "replace",
         "require_token",
     }
     legacy = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
+    pre_policy = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v2"
+    current = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v3"
+    raw_input_policy = attempt.get("input_policy")
+    try:
+        recorded_input_policy = (
+            OwnedSessionInputPolicy.model_validate(raw_input_policy) if current else None
+        )
+    except ValueError:
+        recorded_input_policy = None
     generation = attempt.get("session_generation_id")
     operation_id = attempt.get("start_operation_id")
     observed_at = attempt.get("observed_at")
@@ -4618,11 +4707,9 @@ def _validated_start_attempt(
         else None
     )
     if not (
-        set(attempt) == (legacy_keys if legacy else expected_keys)
-        and (
-            attempt.get("schema_version") == "clio-relay.owner-session-attempt.v2"
-            or (allow_legacy and legacy)
-        )
+        set(attempt)
+        == (legacy_keys if legacy else pre_policy_keys if pre_policy else expected_keys)
+        and (current or pre_policy or (allow_legacy and legacy))
         and attempt.get("operation") == "start"
         and attempt.get("cluster") == cluster
         and attempt.get("session_id") == session_id
@@ -4688,6 +4775,8 @@ def _validated_start_attempt(
         and (
             require_token is None or (not legacy and attempt.get("require_token") is require_token)
         )
+        and (not current or recorded_input_policy is not None)
+        and (input_policy is None or (current and recorded_input_policy == input_policy))
         and start_phase in {"pending", "admitted", "scope_bound", "contained"}
         and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
         and isinstance(systemd_description, str)
@@ -4758,6 +4847,7 @@ def _validated_resumable_start_attempt(
         remote_api_port=request.remote_api_port,
         replace=request.replace,
         require_token=request.require_token,
+        input_policy=request.input_policy,
         expected_api_release_identity_sha256=expected_release_sha256,
     )
     if attempt is not None and (
@@ -4824,7 +4914,7 @@ def _migrate_legacy_start_attempt(
         remote_api_port=request.remote_api_port,
         allow_legacy=True,
     )
-    if attempt is None or attempt.get("schema_version") != ("clio-relay.owner-session-attempt.v1"):
+    if attempt is None or attempt.get("schema_version") == "clio-relay.owner-session-attempt.v3":
         return attempt
     release_changed = attempt.get("api_release_identity_sha256") != release_identity_sha256
     if release_changed and not (request.replace and replacement_identity_verified):
@@ -4847,6 +4937,7 @@ def _migrate_legacy_start_attempt(
             ),
             "replace": request.replace,
             "require_token": request.require_token,
+            "input_policy": request.input_policy.model_dump(mode="json"),
         }
     )
     _write_session_attempt(transaction, operation="start", identity=identity)
@@ -4956,6 +5047,7 @@ def _promote_resumable_contained_start(
         "cluster_registry_sha256": request.cluster_registry_sha256,
         "cluster_route_revision": request.cluster_route_revision,
         "cluster_authority_verified": True,
+        "input_policy": request.input_policy.model_dump(mode="json"),
         "process_start_ticks": process_identity.start_ticks,
         "containment_mode": "linux_systemd_scope",
         "systemd_unit": attempt["systemd_unit"],
@@ -5112,7 +5204,11 @@ def execute_owned_session_start(
         raw_attempt = transaction.read_json("start-attempt.json", required=False)
         legacy_migrated = bool(
             raw_attempt is not None
-            and raw_attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
+            and raw_attempt.get("schema_version")
+            in {
+                "clio-relay.owner-session-attempt.v1",
+                "clio-relay.owner-session-attempt.v2",
+            }
         )
         if legacy_migrated:
             legacy_attempt = _validated_start_attempt(
@@ -5128,6 +5224,11 @@ def execute_owned_session_start(
                 raise RelayError("legacy owned-session start attempt disappeared")
             replacement_identity_verified = False
             if existing is not None:
+                if not request.replace:
+                    raise RelayError(
+                        "a pre-policy owned session requires --replace before input policy "
+                        "can be proven"
+                    )
                 legacy_status = inspect_owned_session_recovery_status(
                     cluster=request.cluster,
                     session_id=request.session_id,
@@ -5281,6 +5382,7 @@ def execute_owned_session_start(
                     "start_operation_id": request.start_operation_id,
                     "replace": request.replace,
                     "require_token": request.require_token,
+                    "input_policy": request.input_policy.model_dump(mode="json"),
                     "expected_api_release_identity_sha256": (
                         request.expected_api_release_identity.sha256()
                         if request.expected_api_release_identity is not None
@@ -5353,6 +5455,9 @@ def execute_owned_session_start(
                 )
                 release_matches = existing_release == release_identity
                 port_matches = existing_status.remote_api_port == request.remote_api_port
+                input_policy_matches = existing.get("input_policy") == (
+                    request.input_policy.model_dump(mode="json")
+                )
                 if existing_status.running and existing_status.leader_process_state != (
                     "owned_running"
                 ):
@@ -5362,7 +5467,12 @@ def execute_owned_session_start(
                             "use --replace"
                         )
                 elif existing_status.running and not request.replace:
-                    if not (registry_matches and release_matches and port_matches):
+                    if not (
+                        registry_matches
+                        and release_matches
+                        and port_matches
+                        and input_policy_matches
+                    ):
                         raise RelayError("existing owned session identity differs; use --replace")
                     if (
                         prior_attempt is None
@@ -5396,6 +5506,7 @@ def execute_owned_session_start(
                             "remote_api_port": request.remote_api_port,
                             "replace": request.replace,
                             "require_token": request.require_token,
+                            "input_policy": request.input_policy.model_dump(mode="json"),
                             "start_phase": "contained",
                             "systemd_unit": existing["systemd_unit"],
                             "systemd_description": existing["systemd_description"],
@@ -5565,6 +5676,7 @@ def execute_owned_session_start(
                     "remote_api_port": request.remote_api_port,
                     "replace": request.replace,
                     "require_token": request.require_token,
+                    "input_policy": request.input_policy.model_dump(mode="json"),
                     "start_phase": "pending",
                     "systemd_unit": systemd_unit,
                     "systemd_description": systemd_description,
@@ -5646,6 +5758,7 @@ def execute_owned_session_start(
                 "remote_api_port": request.remote_api_port,
                 "replace": request.replace,
                 "require_token": request.require_token,
+                "input_policy": request.input_policy.model_dump(mode="json"),
                 "start_phase": "admitted",
                 "systemd_unit": systemd_unit,
                 "systemd_description": systemd_description,
@@ -5693,7 +5806,10 @@ def execute_owned_session_start(
                 "CLIO_RELAY_OWNER_SESSION_ID": request.session_id,
                 "CLIO_RELAY_OWNER_SESSION_CLUSTER": request.cluster,
                 "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
+                **request.input_policy.environment(),
             }
+            if not request.require_token:
+                child_environment[ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV] = "1"
             if api_token is not None:
                 child_environment["CLIO_RELAY_API_TOKEN"] = api_token
             environment = dict(os.environ)
@@ -5713,6 +5829,7 @@ def execute_owned_session_start(
                     )
                 )
             )
+            environment.pop(ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV, None)
             for name in child_environment:
                 environment.pop(name, None)
             provider_interpreter = Path(sys.executable).absolute()
@@ -5856,6 +5973,7 @@ def execute_owned_session_start(
                 "cluster_registry_sha256": request.cluster_registry_sha256,
                 "cluster_route_revision": request.cluster_route_revision,
                 "cluster_authority_verified": True,
+                "input_policy": request.input_policy.model_dump(mode="json"),
                 "process_start_ticks": process_identity.start_ticks,
                 "containment_mode": "linux_systemd_scope",
                 "systemd_unit": containment_identity["systemd_unit"],
@@ -7027,6 +7145,7 @@ def plan_remote_session_start(
     remote_api_port: int,
     replace: bool,
     require_token: bool,
+    input_policy: OwnedSessionInputPolicy | None = None,
     start_operation_id: str | None = None,
     expected_cluster_route_revision: str | None = None,
     expected_api_release_identity_sha256: str | None = None,
@@ -7044,6 +7163,7 @@ def plan_remote_session_start(
         raise RelayError("owned-session start plan route revision changed")
     operation_id = start_operation_id or f"start_{uuid4().hex}"
     _validate_durable_session_identity(operation_id, field="start_operation_id")
+    resolved_input_policy = input_policy or OwnedSessionInputPolicy()
     status_selector = OwnedSessionStartStatusSelector(
         cluster=cluster,
         session_id=session_id,
@@ -7052,6 +7172,7 @@ def plan_remote_session_start(
         remote_api_port=remote_api_port,
         replace=replace,
         require_token=require_token,
+        input_policy=resolved_input_policy,
         expected_api_release_identity_sha256=expected_api_release_identity_sha256,
     )
     retry_selector = OwnedSessionStartRetrySelector(
@@ -7062,6 +7183,7 @@ def plan_remote_session_start(
         remote_api_port=remote_api_port,
         replace=replace,
         require_token=require_token,
+        input_policy=resolved_input_policy,
         expected_api_release_identity_sha256=expected_api_release_identity_sha256,
     )
     return OwnedSessionStartPlan(
@@ -7070,6 +7192,7 @@ def plan_remote_session_start(
         start_operation_id=operation_id,
         cluster_route_revision=route_revision,
         remote_api_port=remote_api_port,
+        input_policy=resolved_input_policy,
         expected_api_release_identity_sha256=expected_api_release_identity_sha256,
         status_selector=status_selector,
         retry_selector=retry_selector,
@@ -7083,6 +7206,7 @@ def start_remote_session(
     session_id: str,
     remote_api_port: int,
     api_token: str | None,
+    input_policy: OwnedSessionInputPolicy | None = None,
     expected_api_release_identity: SessionApiReleaseIdentity | None = None,
     replace: bool = False,
     start_operation_id: str | None = None,
@@ -7096,6 +7220,7 @@ def start_remote_session(
         remote_api_port=remote_api_port,
         replace=replace,
         require_token=api_token is not None,
+        input_policy=input_policy,
         start_operation_id=start_operation_id,
         expected_cluster_route_revision=expected_cluster_route_revision,
         expected_api_release_identity_sha256=(
@@ -7114,6 +7239,7 @@ def start_remote_session(
             remote_api_port=remote_api_port,
             api_token=api_token,
             expected_api_release_identity=expected_api_release_identity,
+            input_policy=plan.input_policy,
             replace=replace,
             expected_cluster_route_revision=plan.cluster_route_revision,
         ),
@@ -7253,6 +7379,7 @@ def _session_start_result_from_status(
     if status.start_attempt_verified and not (
         status.start_replace is plan.retry_selector.replace
         and status.start_require_token is plan.retry_selector.require_token
+        and status.start_input_policy == plan.input_policy
         and status.start_expected_api_release_identity_sha256
         == plan.expected_api_release_identity_sha256
         and status.remote_api_port == plan.remote_api_port
@@ -7459,6 +7586,7 @@ def start_remote_session_durable(
             session_id=plan.session_id,
             remote_api_port=plan.remote_api_port,
             api_token=api_token,
+            input_policy=plan.input_policy,
             expected_api_release_identity=expected_api_release_identity,
             replace=plan.retry_selector.replace,
             start_operation_id=plan.start_operation_id,
@@ -7761,6 +7889,7 @@ def _start_script(
     remote_api_port: int,
     api_token: str | None,
     expected_api_release_identity: SessionApiReleaseIdentity | None,
+    input_policy: OwnedSessionInputPolicy,
     replace: bool,
     expected_cluster_route_revision: str,
 ) -> str:
@@ -7776,6 +7905,7 @@ def _start_script(
         remote_api_port=remote_api_port,
         replace=replace,
         require_token=api_token is not None,
+        input_policy=input_policy,
         expected_api_release_identity=expected_api_release_identity,
         cluster_registry=cast(dict[str, object], json.loads(cluster_registry_json)),
         cluster_registry_sha256=cluster_registry_sha256,

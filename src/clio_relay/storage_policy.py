@@ -236,6 +236,14 @@ class TreeUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageTreeSnapshot:
+    """One stable bounded observation captured before admission serialization."""
+
+    core: TreeUsage
+    spool: TreeUsage
+
+
+@dataclass(frozen=True, slots=True)
 class VolumeStatus:
     """Free-space accounting for one filesystem volume."""
 
@@ -547,9 +555,14 @@ class StoragePolicy:
     def status(self) -> StorageDecision:
         """Return current bounded usage, reservations, and admission health."""
         try:
+            tree_snapshot = self.capture_admission_snapshot()
             with self._ledger_lock():
                 ledger = self._read_ledger()
-                snapshot = self._snapshot(ledger.reservations, ledger.generation)
+                snapshot = self._snapshot(
+                    ledger.reservations,
+                    ledger.generation,
+                    tree_snapshot=tree_snapshot,
+                )
             return StorageDecision(
                 allowed=snapshot.healthy,
                 reason=snapshot.reason,
@@ -563,7 +576,20 @@ class StoragePolicy:
         except StoragePolicyError as exc:
             return _error_decision(exc)
 
-    def reserve(self, job_id: str, *, core_bytes: int, spool_bytes: int) -> StorageDecision:
+    def capture_admission_snapshot(self) -> StorageTreeSnapshot:
+        """Scan bounded storage trees without holding an admission or ledger lock."""
+
+        core, spool = self._stable_tree_snapshot()
+        return StorageTreeSnapshot(core=core, spool=spool)
+
+    def reserve(
+        self,
+        job_id: str,
+        *,
+        core_bytes: int,
+        spool_bytes: int,
+        tree_snapshot: StorageTreeSnapshot | None = None,
+    ) -> StorageDecision:
         """Atomically reserve expected core and spool growth for one job.
 
         Repeating the same request is idempotent. Reusing a job id with different
@@ -572,6 +598,7 @@ class StoragePolicy:
         try:
             _validate_job_id(job_id)
             _validate_reservation_bytes(core_bytes, spool_bytes, self.limits)
+            resolved_tree_snapshot = tree_snapshot or self.capture_admission_snapshot()
             with self._ledger_lock():
                 ledger = self._read_ledger()
                 by_job = {record.job_id: record for record in ledger.reservations}
@@ -584,7 +611,11 @@ class StoragePolicy:
                             message="job already has a different durable storage reservation",
                             details={"reservation": existing.to_dict()},
                         )
-                    snapshot = self._snapshot(ledger.reservations, ledger.generation)
+                    snapshot = self._snapshot(
+                        ledger.reservations,
+                        ledger.generation,
+                        tree_snapshot=resolved_tree_snapshot,
+                    )
                     if not snapshot.healthy:
                         return StorageDecision(
                             allowed=False,
@@ -622,7 +653,11 @@ class StoragePolicy:
                 proposed = tuple(
                     sorted((*ledger.reservations, record), key=lambda item: item.job_id)
                 )
-                snapshot = self._snapshot(proposed, ledger.generation + 1)
+                snapshot = self._snapshot(
+                    proposed,
+                    ledger.generation + 1,
+                    tree_snapshot=resolved_tree_snapshot,
+                )
                 if not snapshot.healthy:
                     return StorageDecision(
                         allowed=False,
@@ -1149,9 +1184,21 @@ class StoragePolicy:
                     temporary.unlink(missing_ok=True)
 
     def _snapshot(
-        self, reservations: tuple[ReservationRecord, ...], ledger_generation: int
+        self,
+        reservations: tuple[ReservationRecord, ...],
+        ledger_generation: int,
+        *,
+        tree_snapshot: StorageTreeSnapshot | None = None,
     ) -> StorageStatus:
-        core, spool = self._stable_tree_snapshot()
+        if tree_snapshot is None:
+            core, spool = self._stable_tree_snapshot()
+        else:
+            core, spool = tree_snapshot.core, tree_snapshot.spool
+            if core.root != str(self.core_root) or spool.root != str(self.spool_root):
+                raise StoragePolicyError(
+                    StorageReason.INVALID_REQUEST,
+                    "storage tree snapshot belongs to different configured roots",
+                )
         reserved_core = sum(record.core_bytes for record in reservations)
         reserved_spool = sum(record.spool_bytes for record in reservations)
         volumes = self._volume_status(reserved_core, reserved_spool)

@@ -1018,7 +1018,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             raise ConfigurationError(
                 "owned relay session API requires a session owner token of at least 32 bytes"
             )
-        if not resolved.api_token:
+        if not (resolved.api_token or resolved.allow_unauthenticated_owned_session):
             raise ConfigurationError("owned relay session API requires CLIO_RELAY_API_TOKEN")
     owner_session_cluster_definition = _bound_owner_session_cluster_definition(
         owner_session_id=resolved.owner_session_id,

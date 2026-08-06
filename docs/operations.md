@@ -1255,6 +1255,8 @@ explicit teardown flags documented below; the default remains to preserve jobs.
 `session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
 the remote API when it is absent. An unauthenticated API requires the explicit
 `--no-require-token` operator choice and must not be used for release acceptance.
+That restricted loopback mode exposes health and identity diagnostics only;
+session-scoped submissions and private authority resolution remain unavailable.
 Owner-bound desktop clients set `CLIO_RELAY_OWNER_SESSION_CLUSTER` to the selected
 cluster. `CLIO_RELAY_REMOTE_CLUSTER` identifies the cluster where the current
 process is running and must not be set on the desktop merely to select an owned

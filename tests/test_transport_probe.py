@@ -735,6 +735,7 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
             start_retryable=True,
             start_replace=selector.replace if attempt_verified else None,
             start_require_token=selector.require_token if attempt_verified else None,
+            start_input_policy=selector.input_policy if attempt_verified else None,
             start_expected_api_release_identity_sha256=(
                 selector.expected_api_release_identity_sha256 if attempt_verified else None
             ),

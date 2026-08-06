@@ -146,6 +146,7 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
     SchedulerPhase,
+    SchedulerStatus,
     ServiceRuntimeSpec,
     TaskEventStatus,
     TaskTimelineEvent,
@@ -262,6 +263,7 @@ from clio_relay.session_lifecycle import (
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
     OwnedSessionIdentityChallengeRequest,
+    OwnedSessionInputPolicy,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartRejection,
     OwnedSessionStartRequest,
@@ -323,7 +325,19 @@ from clio_relay.validation_report import (
 )
 from clio_relay.worker_concurrency import parse_kind_concurrency_options
 
+
+def _owned_session_input_policy(settings: RelaySettings) -> OwnedSessionInputPolicy:
+    """Project the coordinator's validated input limits into one session plan."""
+
+    return OwnedSessionInputPolicy(
+        file_max_bytes=settings.input_file_max_bytes,
+        total_max_bytes=settings.input_total_max_bytes,
+        file_max_count=settings.input_file_max_count,
+    )
+
+
 MAX_INTERNAL_COLLECTION_RECORDS = 10_000
+MAX_SCHEDULER_STATUS_BATCH = 256
 MAX_OWNER_GATEWAY_CLEANUP_PASSES = 4
 DEFAULT_RELAY_CANCEL_TIMEOUT_SECONDS = 30.0
 DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
@@ -3933,6 +3947,7 @@ def session_plan_start(
 ) -> None:
     """Emit a read-only exact plan that can survive loss of the start client."""
     definition = _require_cluster(cluster)
+    settings = RelaySettings.from_env()
 
     def action() -> None:
         release_identity = _verify_session_start_worker_compatibility(definition)
@@ -3944,6 +3959,7 @@ def session_plan_start(
                 remote_api_port=remote_api_port,
                 replace=replace,
                 require_token=require_token,
+                input_policy=_owned_session_input_policy(settings),
                 start_operation_id=start_operation_id,
                 expected_api_release_identity_sha256=release_identity.sha256(),
             ).model_dump_json(indent=2)
@@ -4007,6 +4023,7 @@ def session_start(
             remote_api_port=remote_api_port,
             replace=replace,
             require_token=require_token,
+            input_policy=_owned_session_input_policy(settings),
             start_operation_id=start_operation_id,
             expected_cluster_route_revision=expected_cluster_route_revision,
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
@@ -4025,6 +4042,7 @@ def session_start(
                 remote_api_port=remote_api_port,
                 replace=replace,
                 require_token=require_token,
+                input_policy=preliminary_plan.input_policy,
                 start_operation_id=preliminary_plan.start_operation_id,
                 expected_cluster_route_revision=preliminary_plan.cluster_route_revision,
                 expected_api_release_identity_sha256=api_release_identity.sha256(),
@@ -5192,6 +5210,7 @@ def session_start_status(
 ) -> None:
     """Query one exact start once without imposing an aggregate wait deadline."""
     definition = _require_cluster(cluster)
+    settings = RelaySettings.from_env()
 
     def action() -> None:
         plan = plan_remote_session_start(
@@ -5201,6 +5220,7 @@ def session_start_status(
             remote_api_port=remote_api_port,
             replace=replace,
             require_token=require_token,
+            input_policy=_owned_session_input_policy(settings),
             start_operation_id=start_operation_id,
             expected_cluster_route_revision=cluster_route_revision,
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
@@ -5245,6 +5265,7 @@ def session_start_watch(
 ) -> None:
     """Watch a durable handle; exit 0 is ready, 1 failed, and 2 detached."""
     definition = _require_cluster(cluster)
+    settings = RelaySettings.from_env()
 
     def action() -> None:
         plan = plan_remote_session_start(
@@ -5254,6 +5275,7 @@ def session_start_watch(
             remote_api_port=remote_api_port,
             replace=replace,
             require_token=require_token,
+            input_policy=_owned_session_input_policy(settings),
             start_operation_id=start_operation_id,
             expected_cluster_route_revision=cluster_route_revision,
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
@@ -8852,6 +8874,55 @@ def scheduler_status_command(
             provider_for_scheduler(selected).poll(scheduler_job_id).model_dump_json(indent=2)
         )
     )
+
+
+@scheduler_app.command("status-batch", hidden=True)
+def scheduler_status_batch_command(
+    scheduler_job_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--scheduler-job-id",
+            help="Exact scheduler job identity to query; repeat for a bounded batch.",
+        ),
+    ],
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    provider: Annotated[
+        str | None,
+        typer.Option(help="Override the cluster's explicit scheduler provider."),
+    ] = None,
+) -> None:
+    """Read a bounded exact scheduler batch through one cluster invocation."""
+    if not scheduler_job_ids or len(scheduler_job_ids) > MAX_SCHEDULER_STATUS_BATCH:
+        raise typer.BadParameter(f"provide 1-{MAX_SCHEDULER_STATUS_BATCH} scheduler job ids")
+    if len(set(scheduler_job_ids)) != len(scheduler_job_ids):
+        raise typer.BadParameter("scheduler job ids cannot contain duplicates")
+    definition = _require_cluster(cluster)
+    selected = provider or definition.scheduler_provider
+    args = ["scheduler", "status-batch", "--cluster", cluster, "--provider", selected]
+    for scheduler_job_id in scheduler_job_ids:
+        args.extend(["--scheduler-job-id", scheduler_job_id])
+    if should_execute_on_cluster(definition):
+        _run_remote_or_exit(definition, args)
+        return
+
+    def action() -> None:
+        scheduler = provider_for_scheduler(selected)
+        statuses = [
+            scheduler.poll(scheduler_job_id).model_dump(mode="json")
+            for scheduler_job_id in scheduler_job_ids
+        ]
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": "clio-relay.scheduler-status-batch.v1",
+                    "scheduler": selected,
+                    "statuses": statuses,
+                },
+                indent=2,
+            )
+        )
+
+    _run_or_exit(action)
 
 
 @scheduler_app.command("cancel")
@@ -13442,6 +13513,18 @@ def _owned_job_cleanup_resources(
     post_operation_jobs: list[_OwnedRelayJob] | None = None,
 ) -> list[CleanupResource]:
     resources: list[CleanupResource] = []
+    scheduler_phases = (
+        _scheduler_phases_after_operation(
+            definition,
+            tuple(
+                (job.scheduler_provider, scheduler_job_id)
+                for job in jobs
+                for scheduler_job_id in job.scheduler_job_ids
+            ),
+        )
+        if not cancel_scheduler_jobs
+        else {}
+    )
     post_by_id = {
         job.job_id: job for job in (post_operation_jobs if post_operation_jobs is not None else [])
     }
@@ -13523,11 +13606,7 @@ def _owned_job_cleanup_resources(
             phase: str | None = None
             status_error: str | None = None
             if not cancel_scheduler_jobs:
-                phase, status_error = _scheduler_phase_after_operation(
-                    definition,
-                    scheduler_job_id,
-                    provider=job.scheduler_provider,
-                )
+                phase, status_error = scheduler_phases[(job.scheduler_provider, scheduler_job_id)]
                 scheduler_verified = phase in {
                     "submitted",
                     "pending",
@@ -13633,6 +13712,75 @@ def _scheduler_phase_after_operation(
         return status.phase.value, None
     except (RelayError, json.JSONDecodeError) as exc:
         return None, str(exc)
+
+
+def _scheduler_phases_after_operation(
+    definition: ClusterDefinition,
+    identities: tuple[tuple[str, str], ...],
+) -> dict[tuple[str, str], tuple[str | None, str | None]]:
+    """Observe exact scheduler identities with bounded remote process reuse."""
+    unique_identities = tuple(dict.fromkeys(identities))
+    if not should_execute_on_cluster(definition):
+        return {
+            identity: _scheduler_phase_after_operation(
+                definition,
+                identity[1],
+                provider=identity[0],
+            )
+            for identity in unique_identities
+        }
+
+    by_provider: dict[str, list[str]] = {}
+    for provider, scheduler_job_id in unique_identities:
+        by_provider.setdefault(provider, []).append(scheduler_job_id)
+    observations: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+    for provider, scheduler_job_ids in by_provider.items():
+        for offset in range(0, len(scheduler_job_ids), MAX_SCHEDULER_STATUS_BATCH):
+            batch = scheduler_job_ids[offset : offset + MAX_SCHEDULER_STATUS_BATCH]
+            args = [
+                "scheduler",
+                "status-batch",
+                "--cluster",
+                definition.name,
+                "--provider",
+                provider,
+            ]
+            for scheduler_job_id in batch:
+                args.extend(["--scheduler-job-id", scheduler_job_id])
+            try:
+                raw = cast(object, json.loads(run_remote_clio(definition, args)))
+                if not isinstance(raw, dict):
+                    raise RelayError("scheduler status batch did not return a JSON object")
+                document = cast(dict[str, object], raw)
+                raw_statuses = document.get("statuses")
+                if (
+                    document.get("schema_version") != "clio-relay.scheduler-status-batch.v1"
+                    or document.get("scheduler") != provider
+                    or not isinstance(raw_statuses, list)
+                ):
+                    raise RelayError("scheduler status batch envelope is invalid")
+                statuses: dict[str, SchedulerStatus] = {}
+                for raw_status in cast(list[object], raw_statuses):
+                    status = SchedulerStatus.model_validate(raw_status)
+                    if status.scheduler != provider or status.scheduler_job_id in statuses:
+                        raise RelayError("scheduler status batch identity is invalid")
+                    statuses[status.scheduler_job_id] = status
+                if set(statuses) != set(batch):
+                    raise RelayError("scheduler status batch omitted or added job identities")
+                for scheduler_job_id in batch:
+                    status = statuses[scheduler_job_id]
+                    phase = (
+                        "missing"
+                        if status.phase is SchedulerPhase.UNKNOWN
+                        and status.active_record_found is False
+                        else status.phase.value
+                    )
+                    observations[(provider, scheduler_job_id)] = (phase, None)
+            except (RelayError, ValueError, json.JSONDecodeError) as exc:
+                error = str(exc)
+                for scheduler_job_id in batch:
+                    observations[(provider, scheduler_job_id)] = (None, error)
+    return observations
 
 
 def _cancel_owned_scheduler_jobs(
