@@ -513,6 +513,69 @@ def _create_wheel_scripts_fixture(
     return invoked_python, executable, wheel, installed_scripts, record_members
 
 
+def _create_wheel_data_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    environment = tmp_path / "environment"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
+    invoked_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    completed = subprocess.run(
+        [
+            str(invoked_python),
+            "-I",
+            "-c",
+            (
+                "import json, sysconfig; "
+                "print(json.dumps({'purelib': sysconfig.get_path('purelib'), "
+                "'data': sysconfig.get_path('data')}))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    paths = cast(dict[str, str], json.loads(completed.stdout))
+    site_packages = Path(paths["purelib"])
+    data_root = Path(paths["data"])
+    metadata_root = "fixture_jarvis-1.0.dist-info"
+    record_name = f"{metadata_root}/RECORD"
+    wheel_data_name = "fixture_jarvis-1.0.data/data/wfcommons-schema.json"
+    data_payload = b'{"schema": "fixture"}\n'
+    installed_data = data_root / "wfcommons-schema.json"
+    installed_data.parent.mkdir(parents=True, exist_ok=True)
+    installed_data.write_bytes(data_payload)
+    members = {
+        "fixture_jarvis/__init__.py": b'"""Fixture package."""\n',
+        f"{metadata_root}/METADATA": (
+            b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
+        ),
+        f"{metadata_root}/WHEEL": (
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
+        ),
+    }
+    installed_record_rows: list[str] = []
+    for relative, payload in sorted(members.items()):
+        destination = site_packages / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        installed_record_rows.append(_record_row(relative, payload))
+    installed_data_relative = os.path.relpath(installed_data, site_packages).replace("\\", "/")
+    installed_record_rows.append(_record_row(installed_data_relative, data_payload))
+    installed_record_rows.append(f"{record_name},,")
+    installed_record = site_packages / record_name
+    installed_record.write_text("\n".join(installed_record_rows) + "\n", encoding="utf-8")
+
+    wheel_members = {**members, wheel_data_name: data_payload}
+    wheel_record_rows = [
+        _record_row(relative, payload) for relative, payload in sorted(wheel_members.items())
+    ]
+    wheel_record_rows.append(f"{record_name},,")
+    wheel = tmp_path / "fixture_jarvis-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative, payload in wheel_members.items():
+            archive.writestr(relative, payload)
+        archive.writestr(record_name, ("\n".join(wheel_record_rows) + "\n").encode())
+    return invoked_python, wheel, installed_record, installed_data
+
+
 def _refresh_installed_record_member(
     python: Path,
     distribution_name: str,
@@ -574,6 +637,29 @@ def test_native_jarvis_record_closure_verifies_standard_wheel_scripts(
     )
     assert console["launcher"] == expected_launcher
     assert resource["launcher"] == expected_launcher
+
+
+def test_native_jarvis_record_closure_verifies_standard_wheel_data(
+    tmp_path: Path,
+) -> None:
+    python, wheel, installed_record, installed_data = _create_wheel_data_fixture(tmp_path)
+    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    verified = probe(str(python), "fixture-jarvis", wheel)
+
+    assert verified["verified"] is True
+    assert verified["wheel_payload_file_count"] == 4
+
+    relative = os.path.relpath(installed_data, installed_record.parent.parent).replace("\\", "/")
+    rows = installed_record.read_text(encoding="utf-8").splitlines()
+    installed_record.write_text(
+        "\n".join(row for row in rows if not row.startswith(relative + ",")) + "\n",
+        encoding="utf-8",
+    )
+    unowned = probe(str(python), "fixture-jarvis", wheel)
+
+    assert unowned["verified"] is False
+    assert unowned["error_code"] == "installed-wheel-data-file-is-not-owned-by-distribution-RECORD"
 
 
 @pytest.mark.parametrize("tamper", ["resource-body", "console-wrapper", "trampoline"])
