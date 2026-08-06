@@ -4168,7 +4168,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "session_started=session-1" in lines
     script = scripts[0]
     assert "CLIO_RELAY_API_TOKEN='token'" in script
-    assert "clio-relay session start-owned" in script
+    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
     assert "umask 077" in script
     assert '"cluster":"ares"' in script
     assert '"session_id":"session-1"' in script
@@ -4186,6 +4186,76 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert "last_cleanup" not in script
     assert "\x00" not in script
     assert "pkill" not in script
+
+
+def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
+    pinned = "/opt/clio-relay/releases/1.5.14/bin/clio-relay"
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares",
+        relay_executable=pinned,
+    )
+    release = _api_release_identity()
+    plan = session_lifecycle.plan_remote_session_start(
+        cluster="ares",
+        definition=definition,
+        session_id="session-pinned",
+        remote_api_port=18_765,
+        replace=False,
+        require_token=True,
+        start_operation_id="start_pinned",
+        expected_api_release_identity_sha256=release.sha256(),
+    )
+    scripts = (
+        session_lifecycle._start_script(  # pyright: ignore[reportPrivateUsage]
+            cluster="ares",
+            definition=definition,
+            session_id="session-pinned",
+            start_operation_id=plan.start_operation_id,
+            remote_api_port=plan.remote_api_port,
+            api_token="pinned-token",
+            expected_api_release_identity=release,
+            input_policy=plan.input_policy,
+            replace=False,
+            expected_cluster_route_revision=plan.cluster_route_revision,
+        ),
+        session_lifecycle._owned_status_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+            cluster="ares",
+            session_id="session-pinned",
+        ),
+        session_lifecycle._owned_start_status_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+            selector=plan.status_selector,
+        ),
+        session_lifecycle._owned_identity_challenge_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+            cluster="ares",
+            session_id="session-pinned",
+            session_generation_id="generation-pinned",
+            nonce="1" * 64,
+        ),
+        session_lifecycle._owned_cleanup_finalize_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+        ),
+        session_lifecycle._owned_cleanup_report_read_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+        ),
+        session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]
+            definition=definition,
+            session_id="session-pinned",
+            expected_session_generation_id="generation-pinned",
+            expected_cleanup_operation_id="cleanup_pinned",
+            stop_worker=False,
+            cancel_jobs=False,
+            cancel_scheduler_jobs=False,
+            cluster="ares",
+        ),
+    )
+
+    assert all(pinned in script for script in scripts)
+    assert all("\nclio-relay session" not in script for script in scripts)
+    assert all("| clio-relay session" not in script for script in scripts)
 
 
 def test_start_remote_session_checks_existing_api_release_before_reuse(
@@ -4210,7 +4280,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
     )
 
     script = scripts[0]
-    assert "clio-relay session start-owned" in script
+    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
     assert '"replace":false' in script
     assert '"expected_api_release_identity"' in script
     assert "exec 9>" not in script
@@ -4248,7 +4318,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
     script = scripts[0]
     assert len(script.encode("utf-8")) > 128 * 1024
     assert "printf '%s'" in script
-    assert "clio-relay session start-owned" in script
+    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
     assert "python3 -" not in script
 
 
@@ -4301,7 +4371,7 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
 
     assert status == {"session_id": "session-1", "running": True}
     script = scripts[0]
-    command_index = script.index("clio-relay session recovery-status")
+    command_index = script.index('"$HOME/.local/bin/clio-relay" session recovery-status')
     for export in (
         'export PATH="$HOME/.local/bin:$PATH";',
         "export CLIO_RELAY_CLI_MODE=local;",
@@ -4340,7 +4410,7 @@ def test_status_remote_session_marks_pre_start_cleanup_probe_explicitly(
     assert status["cleanup_receipt"] is False
     assert status["recovery_verified"] is False
     assert (
-        "clio-relay session recovery-status --cluster ares "
+        '"$HOME/.local/bin/clio-relay" session recovery-status --cluster ares '
         "--session-id fresh-session --pre-start-cleanup-probe"
     ) in scripts[0]
 
@@ -4371,7 +4441,7 @@ def test_remote_session_start_status_uses_cluster_environment(
 
     assert observed == expected
     script = scripts[0]
-    command_index = script.index("clio-relay session start-status-owned")
+    command_index = script.index('"$HOME/.local/bin/clio-relay" session start-status-owned')
     for export in (
         'export PATH="$HOME/.local/bin:$PATH";',
         "export CLIO_RELAY_CLI_MODE=local;",
@@ -4411,7 +4481,7 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
     assert observed == expected
     script = scripts[0]
-    assert "clio-relay session challenge-owned" in script
+    assert '"$HOME/.local/bin/clio-relay" session challenge-owned' in script
     assert '"session_generation_id":"generation-1"' in script
     assert f'"nonce":"{nonce}"' in script
     assert "metadata.json" not in script
@@ -4724,7 +4794,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert report.resources[0].outcome == "stopped"
     assert report.resources[1].resource_id == "clio-relay-worker-ares.service"
     assert report.to_cleanup_evidence(stop_worker=True).stop_worker is True
-    assert "clio-relay session teardown-owned" in scripts[0]
+    assert '"$HOME/.local/bin/clio-relay" session teardown-owned' in scripts[0]
     assert '"expected_cleanup_operation_id":"cleanup-test"' in scripts[0]
     assert '"expected_session_generation_id":"generation-1"' in scripts[0]
     assert '"stop_worker":true' in scripts[0]
@@ -4754,7 +4824,7 @@ def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
         cluster="ares",
     )
 
-    assert "clio-relay session teardown-owned" in script
+    assert '"$HOME/.local/bin/clio-relay" session teardown-owned' in script
     assert '"expected_session_generation_id":"generation-1"' in script
     assert '"expected_cleanup_operation_id":"cleanup-test"' in script
     assert "os.killpg" not in script
