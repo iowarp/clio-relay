@@ -5,7 +5,7 @@
 schema_version: "1.0"
 release_version: "1.5.11"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: 4b140a6d634d91d98824c5d7c96d9555a91ca0703ebf3021a2bb19c47afbe8e2
+acceptance_matrix_sha256: 52b34d7d816c6d970300a7f3a9342b965f8d543b754ad712cf84a3295dbdc260
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
