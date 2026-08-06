@@ -10,6 +10,7 @@ from clio_relay.remote_cli import (
     remote_command_timeout,
     remote_env,
     remove_remote_file,
+    run_remote_clio,
     run_remote_shell,
     write_remote_file,
 )
@@ -27,6 +28,31 @@ def test_remote_env_exports_operator_configured_jarvis_spack_executable() -> Non
     assert 'export JARVIS_MCP_SPACK_COMMAND="/home/operator/spack/bin/spack";' in rendered
     assert 'export UV="$HOME/.local/bin/uv";' in rendered
     assert 'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="$HOME/.local/bin/clio-relay";' in rendered
+
+
+def test_remote_clio_uses_the_configured_digest_bound_executable(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares-login",
+        relay_executable="/srv/releases/relay-a1b2/bin/clio-relay",
+    )
+    observed: list[str] = []
+
+    def run_shell(_definition: ClusterDefinition, script: str) -> str:
+        observed.append(script)
+        return "{}"
+
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
+
+    assert run_remote_clio(definition, ["queue", "list"]) == "{}"
+    assert observed == [
+        remote_env(definition) + ' "/srv/releases/relay-a1b2/bin/clio-relay" queue list'
+    ]
+    assert (
+        'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="/srv/releases/relay-a1b2/bin/clio-relay";'
+    ) in observed[0]
 
 
 def test_remote_env_forwards_nonsecret_validation_provenance(

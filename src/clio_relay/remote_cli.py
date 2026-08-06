@@ -90,7 +90,11 @@ def run_remote_clio(
             field="staged cluster registry path",
         )
         environment = f"{environment} export {CLUSTER_REGISTRY_ENV}={rendered_registry_path};"
-    return run_remote_shell(definition, f"{environment} clio-relay {rendered_args}")
+    relay_executable = render_remote_shell_value(
+        definition.relay_executable,
+        field="relay_executable",
+    )
+    return run_remote_shell(definition, f"{environment} {relay_executable} {rendered_args}")
 
 
 def run_remote_jarvis_runtime_authority(
@@ -102,7 +106,11 @@ def run_remote_jarvis_runtime_authority(
 ) -> str:
     """Resolve private JARVIS authority through a bounded, output-safe SSH transport."""
     rendered_args = " ".join(shlex.quote(arg) for arg in ["jarvis-runtime-authority", *args])
-    script = f"{remote_env(definition)} clio-relay {rendered_args}"
+    relay_executable = render_remote_shell_value(
+        definition.relay_executable,
+        field="relay_executable",
+    )
+    script = f"{remote_env(definition)} {relay_executable} {rendered_args}"
     command = ["ssh", definition.ssh_host, f"bash -lc {shlex.quote(script)}"]
     payload = _run_bounded_private_command(
         command,
@@ -337,13 +345,17 @@ def remote_env(definition: ClusterDefinition) -> str:
     agent_bin = _cluster_agent_bin(definition)
     rendered_core_dir = render_remote_shell_path(definition.core_dir, field="core_dir")
     rendered_spool_dir = render_remote_shell_path(definition.spool_dir, field="spool_dir")
+    rendered_relay_executable = render_remote_shell_value(
+        definition.relay_executable,
+        field="relay_executable",
+    )
     rendered_jarvis_bin = render_remote_shell_value(jarvis_bin, field="jarvis_bin")
     rendered_frpc_bin = render_remote_shell_value(frpc_bin, field="frpc_bin")
     rendered_agent_bin = render_remote_shell_value(agent_bin, field="agent_bin")
     exports = [
         'export PATH="$HOME/.local/bin:$PATH";',
         'export UV="$HOME/.local/bin/uv";',
-        'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="$HOME/.local/bin/clio-relay";',
+        f"export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE={rendered_relay_executable};",
         "export CLIO_RELAY_CLI_MODE=local;",
         f"export CLIO_RELAY_REMOTE_CLUSTER={shlex.quote(definition.name)};",
         f"export CLIO_RELAY_CORE_DIR={rendered_core_dir};",
