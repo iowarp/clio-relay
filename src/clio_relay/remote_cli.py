@@ -365,6 +365,15 @@ def remote_env(definition: ClusterDefinition) -> str:
         f"export CLIO_RELAY_AGENT_BIN={rendered_agent_bin};",
         f"export CLIO_RELAY_AGENT_ADAPTER={shlex.quote(definition.agent_adapter)};",
     ]
+    if definition.relay_install_receipt is not None:
+        exports.append(
+            "export CLIO_RELAY_INSTALL_RECEIPT="
+            + render_remote_shell_path(
+                definition.relay_install_receipt,
+                field="relay_install_receipt",
+            )
+            + ";"
+        )
     if definition.agent_args:
         exports.append(
             f"export CLIO_RELAY_AGENT_ARGS={shlex.quote(shlex.join(definition.agent_args))};"
