@@ -66,22 +66,71 @@ class BoundedCommand(Application):
         """Initialize package state."""
 
     def _configure_menu(self) -> list[dict[str, Any]]:
-        """Return JARVIS configurator options."""
-        return []
+        """Return the JARVIS configurator options this package accepts.
+
+        JARVIS validates every configuration key against this menu before a
+        package is added to a pipeline, so an undeclared setting is rejected
+        even though the package would consume it.  Each option that may be
+        omitted declares a concrete default: JARVIS treats a menu entry whose
+        default is ``None`` as a required parameter.
+        """
+        return [
+            {
+                "name": "command",
+                "msg": (
+                    "Argument vector to execute, starting with the program. No shell is "
+                    "interposed, so shell syntax needs an explicit interpreter entry."
+                ),
+                "type": list,
+            },
+            {
+                "name": "workdir",
+                "msg": (
+                    "Working directory for the command. An empty string runs it in the "
+                    "directory JARVIS selected for the package."
+                ),
+                "type": str,
+                "default": "",
+            },
+            {
+                "name": "env",
+                "msg": (
+                    "Environment variables added to the inherited environment. Relay-owned "
+                    "capability variables are always removed before the command starts."
+                ),
+                "type": dict,
+                "default": {},
+            },
+            {
+                "name": "timeout_seconds",
+                "msg": (
+                    "Wall-clock limit in seconds after which the command tree is terminated. "
+                    "Zero means no limit."
+                ),
+                "type": int,
+                "default": 0,
+            },
+            {
+                "name": "progress",
+                "msg": (
+                    "Structured progress extraction from stdout: {'adapter': 'regex', "
+                    "'pattern': ...} publishes progress records, {'adapter': 'none'} "
+                    "publishes none."
+                ),
+                "type": dict,
+                "default": {"adapter": "none"},
+            },
+        ]
 
     def _configure(self, **kwargs: Any) -> None:
-        """Store configuration provided by the pipeline YAML."""
+        """Store configuration provided by the pipeline YAML or the configurator."""
+        if "command" in kwargs:
+            _command_arguments(kwargs["command"])
         self.config.update(kwargs)
 
     def start(self) -> None:
         """Run the configured command."""
-        command = self.config.get("command")
-        if not isinstance(command, list):
-            raise ValueError("command must be a string array")
-        raw_command = cast(list[object], command)
-        if not all(isinstance(item, str) for item in raw_command):
-            raise ValueError("command must be a string array")
-        command_args = [cast(str, item) for item in raw_command]
+        command_args = _command_arguments(self.config.get("command"))
         env = os.environ.copy()
         supplied_env = self.config.get("env", {})
         if isinstance(supplied_env, dict):
@@ -89,9 +138,8 @@ class BoundedCommand(Application):
             env.update({str(key): str(value) for key, value in typed_env.items()})
         env = _scrub_relay_environment(env)
         workdir_value = self.config.get("workdir")
-        workdir = Path(workdir_value) if isinstance(workdir_value, str) else None
-        timeout_value = self.config.get("timeout_seconds")
-        timeout = int(timeout_value) if timeout_value is not None else None
+        workdir = Path(workdir_value) if isinstance(workdir_value, str) and workdir_value else None
+        timeout = _optional_timeout(self.config.get("timeout_seconds"))
         result = _run_streaming(
             command_args,
             cwd=workdir,
@@ -107,6 +155,31 @@ class BoundedCommand(Application):
 
     def clean(self) -> None:
         """Clean hook for bounded commands."""
+
+
+def _command_arguments(value: object) -> list[str]:
+    """Return the configured command as an argument vector."""
+    if not isinstance(value, list):
+        raise ValueError("command must be a string array")
+    raw_command = cast(list[object], value)
+    if not raw_command:
+        raise ValueError("command must be a non-empty string array")
+    if not all(isinstance(item, str) for item in raw_command):
+        raise ValueError("command must be a string array")
+    return [cast(str, item) for item in raw_command]
+
+
+def _optional_timeout(value: object) -> int | None:
+    """Return the configured wall-clock limit, or None when no limit applies."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("timeout_seconds must be an integer number of seconds")
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise ValueError("timeout_seconds must be an integer number of seconds") from exc
+    return seconds if seconds > 0 else None
 
 
 def _run_streaming(
