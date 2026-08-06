@@ -1377,6 +1377,51 @@ def test_registered_jarvis_v36_describe_advertises_terminal_reconciliation_defau
     assert "transparently reconciled" in definition["description"]
 
 
+def test_registered_jarvis_run_explains_runtime_activation_obligation() -> None:
+    """The agent-facing run tool connects package requirements to provider activation."""
+    route = remote_mcp.RemoteMcpRoute(
+        cluster="alpha",
+        server_name="jarvis",
+        command="clio-kit",
+        args=("mcp-server", "jarvis"),
+        env_from=(),
+        expected_server_artifact_digest="a" * 64,
+        remote_tool_name="jarvis_run",
+        timeout_seconds=300,
+        contract=remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+        cluster_route_revision="b" * 64,
+        registration_revision="c" * 64,
+    )
+    virtual = remote_mcp.VirtualRemoteMcpTool(
+        alias="remote_jarvis_jarvis_run",
+        namespace="remote_jarvis",
+        remote_tool=RemoteMcpToolSchema(
+            name="jarvis_run",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pipeline_id": {"type": "string"},
+                    "spack_specs": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["pipeline_id"],
+                "additionalProperties": False,
+            },
+        ),
+        routes={"alpha": route},
+        arguments_wrapped=False,
+    )
+
+    description = cast(str, virtual.definition()["description"])
+
+    assert "inspect every selected package deployment contract" in description
+    assert "immutable load_spec in spack_specs" in description
+
+
 def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema() -> None:
     """An audited registered JARVIS route accepts relay-derived service handoffs."""
     contract_artifact = cast(
@@ -1956,6 +2001,38 @@ def test_catalog_hides_stale_changed_and_wrong_profile_entries() -> None:
         f"schema cache expired at {(NOW - timedelta(hours=1)).isoformat()}",
     }
     assert admin_catalog.tools == {}
+
+
+def test_catalog_hides_verified_but_mutable_server_installation() -> None:
+    """A route that recovery can never trust must not be advertised to an agent."""
+    registration = _registration(profiles=["user"])
+    entry = _entry(registration, cluster="alpha", server_name="science")
+    mutable_artifact: dict[str, object] = {
+        **entry.provenance.server_artifact,
+        "install_spec": None,
+        "install_source": None,
+        "install_artifact_sha256": None,
+        "input_files": [],
+    }
+    entry = entry.model_copy(
+        update={
+            "provenance": entry.provenance.model_copy(update={"server_artifact": mutable_artifact})
+        }
+    )
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    assert catalog.tools == {}
+    assert len(catalog.issues) == 1
+    assert catalog.issues[0].reason == (
+        "discovery server artifact identity is unverified or mutable; "
+        "refresh from an immutable wheel-backed installation"
+    )
 
 
 def test_mcp_server_reloads_catalog_and_routes_without_forwarding_cluster(
