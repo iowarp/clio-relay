@@ -36,6 +36,7 @@ from clio_relay.session_lifecycle import (
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
     OwnedSessionCleanupTarget,
+    OwnedSessionInputPolicy,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartPlan,
     OwnedSessionStartRequest,
@@ -505,6 +506,7 @@ def _failed_start_fixture(
             "remote_api_port": request.remote_api_port,
             "replace": request.replace,
             "require_token": request.require_token,
+            "input_policy": request.input_policy.model_dump(mode="json"),
             "start_phase": "admitted",
             "systemd_unit": f"clio-relay-session-{generation}.scope",
             "systemd_description": (
@@ -718,6 +720,7 @@ def _durable_start_status(
         start_retryable=state == "starting",
         start_replace=plan.retry_selector.replace if verified else None,
         start_require_token=plan.retry_selector.require_token if verified else None,
+        start_input_policy=plan.input_policy if verified else None,
         start_expected_api_release_identity_sha256=(
             plan.expected_api_release_identity_sha256 if verified else None
         ),
@@ -1041,6 +1044,7 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
             "remote_api_port": request.remote_api_port,
             "replace": request.replace,
             "require_token": request.require_token,
+            "input_policy": request.input_policy.model_dump(mode="json"),
             "start_phase": phase,
             "systemd_unit": f"clio-relay-session-{generation}.scope",
             "systemd_description": (
@@ -1096,6 +1100,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         "remote_api_port": original_request.remote_api_port,
         "replace": original_request.replace,
         "require_token": original_request.require_token,
+        "input_policy": original_request.input_policy.model_dump(mode="json"),
         "start_phase": "pending",
         "systemd_unit": f"clio-relay-session-{generation}.scope",
         "systemd_description": (
@@ -1172,6 +1177,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         "remote_api_port": request.remote_api_port,
         "replace": request.replace,
         "require_token": request.require_token,
+        "input_policy": request.input_policy.model_dump(mode="json"),
         "start_phase": "contained",
         "systemd_unit": f"clio-relay-session-{generation}.scope",
         "systemd_description": (
@@ -1300,7 +1306,7 @@ def test_legacy_start_attempt_migrates_only_to_caller_planned_v2_operation(
     )
 
     assert migrated is not None
-    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v3"
     assert migrated["start_operation_id"] == request.start_operation_id
     assert migrated["replace"] is False
     assert migrated["require_token"] is False
@@ -1364,7 +1370,7 @@ def test_legacy_old_release_replacement_requires_exact_identity_proof(
     )
 
     assert migrated is not None
-    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v3"
     assert migrated["start_operation_id"] == request.start_operation_id
     assert migrated["api_release_identity_sha256"] == current_release_sha256
     assert migrated["replace"] is True
@@ -1375,6 +1381,15 @@ def test_executor_replaces_exact_legacy_old_release_session(
     monkeypatch: MonkeyPatch,
 ) -> None:
     request, transaction, metadata, old_release, queue = _legacy_existing_start_fixture(tmp_path)
+    request = request.model_copy(
+        update={
+            "input_policy": OwnedSessionInputPolicy(
+                file_max_bytes=8_388_608,
+                total_max_bytes=33_554_432,
+                file_max_count=24,
+            )
+        }
+    )
     current_release = _api_release_identity()
     home = tmp_path / "home"
     proc_root = tmp_path / "proc"
@@ -1428,6 +1443,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
             start_attempt_verified=True,
             start_replace=True,
             start_require_token=request.require_token,
+            start_input_policy=request.input_policy,
             start_expected_api_release_identity_sha256=current_release.sha256(),
         )
 
@@ -1452,6 +1468,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     )
 
     launch_commands: list[list[str]] = []
+    credential_payloads: list[dict[str, object]] = []
 
     def spawn(command: list[str], **kwargs: object) -> object:
         launch_commands.append(command)
@@ -1467,9 +1484,13 @@ def test_executor_replaces_exact_legacy_old_release_session(
             7000,
             containment,
         )
-        cast(Callable[[int, dict[str, object]], str], kwargs["credential_payload_factory"])(
-            7000,
-            containment,
+        credential_payloads.append(
+            json.loads(
+                cast(Callable[[int, dict[str, object]], str], kwargs["credential_payload_factory"])(
+                    7000,
+                    containment,
+                )
+            )
         )
         return SimpleNamespace(
             pid=7000,
@@ -1501,13 +1522,18 @@ def test_executor_replaces_exact_legacy_old_release_session(
     attempt = transaction.read_json("start-attempt.json")
     assert attempt is not None
     assert inspection_count == 2
-    assert attempt["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert attempt["schema_version"] == "clio-relay.owner-session-attempt.v3"
     assert attempt["start_operation_id"] == request.start_operation_id
     assert attempt["api_release_identity_sha256"] == current_release.sha256()
     committed = transaction.read_json("metadata.json")
     assert committed is not None
     assert committed["api_release_identity_sha256"] == current_release.sha256()
     assert committed["api_pid"] == 7001
+    assert committed["input_policy"] == request.input_policy.model_dump(mode="json")
+    child_environment = cast(dict[str, str], credential_payloads[0]["environment"])
+    assert child_environment["CLIO_RELAY_INPUT_FILE_MAX_BYTES"] == "8388608"
+    assert child_environment["CLIO_RELAY_INPUT_TOTAL_MAX_BYTES"] == "33554432"
+    assert child_environment["CLIO_RELAY_INPUT_FILE_MAX_COUNT"] == "24"
     assert launch_commands[0][0] == str(provider_interpreter.absolute())
     assert f"start_operation_id={request.start_operation_id}" in lines
     assert f"remote_api_port={request.remote_api_port}" in lines
@@ -1716,7 +1742,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
 
     migrated = transaction.read_json("start-attempt.json")
     assert migrated is not None
-    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v2"
+    assert migrated["schema_version"] == "clio-relay.owner-session-attempt.v3"
     assert migrated["api_release_identity_sha256"] == current_release.sha256()
     status = inspect_owned_session_recovery_status(
         cluster=request.cluster,
@@ -2326,6 +2352,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
         "remote_api_port": request.remote_api_port,
         "replace": request.replace,
         "require_token": request.require_token,
+        "input_policy": request.input_policy.model_dump(mode="json"),
         "start_phase": "contained",
         "systemd_unit": recovered_metadata["systemd_unit"],
         "systemd_description": recovered_metadata["systemd_description"],
@@ -4128,6 +4155,11 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
         session_id="session-1",
         remote_api_port=9001,
         api_token="token",
+        input_policy=OwnedSessionInputPolicy(
+            file_max_bytes=2_097_152,
+            total_max_bytes=8_388_608,
+            file_max_count=32,
+        ),
         expected_api_release_identity=_api_release_identity(),
     )
 
@@ -4140,6 +4172,9 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert '"session_id":"session-1"' in script
     assert '"remote_api_port":9001' in script
     assert '"require_token":true' in script
+    assert '"file_max_bytes":2097152' in script
+    assert '"total_max_bytes":8388608' in script
+    assert '"file_max_count":32' in script
     assert '"replace":false' in script
     assert "cluster_registry_sha256" in script
     assert "cluster_route_revision" in script

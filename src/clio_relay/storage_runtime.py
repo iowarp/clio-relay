@@ -467,11 +467,27 @@ class StorageManagedQueue(ClioCoreQueue):
                             details={"state": resolution.state},
                         )
                     )
+            tree_snapshot = self.storage_runtime.policy.capture_admission_snapshot()
+            with self.storage_runtime.policy.admission_lock():
+                resolution = self.resolve_idempotent_submission(job)
+                canonical = job.model_copy(update={"job_id": resolution.canonical_job_id})
+                if resolution.state in {"existing", "retired"}:
+                    saved = super().submit_job(canonical)
+                    return self._verify_existing_reservation(saved)
+                if resolution.state not in {"new", "reserved"}:
+                    raise StorageAdmissionError(
+                        _denied_decision(
+                            StorageReason.INVALID_REQUEST,
+                            "queue returned an unsupported idempotency resolution state",
+                            details={"state": resolution.state},
+                        )
+                    )
                 self.storage_runtime.ensure_new_intake_allowed()
                 decision = self.storage_runtime.policy.reserve(
                     canonical.job_id,
                     core_bytes=estimate.core_bytes,
                     spool_bytes=estimate.spool_bytes,
+                    tree_snapshot=tree_snapshot,
                 )
                 if not decision.allowed:
                     raise StorageAdmissionError(decision)
@@ -537,13 +553,24 @@ class StorageManagedQueue(ClioCoreQueue):
                         attempt_id=attempt_id,
                         policy=policy,
                     )
-
+            tree_snapshot = self.storage_runtime.policy.capture_admission_snapshot()
+            with self.storage_runtime.policy.admission_lock():
+                current = self.get_job(job_id)
+                if current.state is not JobState.FAILED:
+                    if current.state not in TERMINAL_STATES:
+                        self._verify_existing_reservation(current)
+                    return super().begin_input_ingest(
+                        job_id,
+                        attempt_id=attempt_id,
+                        policy=policy,
+                    )
                 estimate = self.storage_runtime.estimate(current)
                 self.storage_runtime.ensure_new_intake_allowed()
                 decision = self.storage_runtime.policy.reserve(
                     current.job_id,
                     core_bytes=estimate.core_bytes,
                     spool_bytes=estimate.spool_bytes,
+                    tree_snapshot=tree_snapshot,
                 )
                 if not decision.allowed:
                     raise StorageAdmissionError(decision)

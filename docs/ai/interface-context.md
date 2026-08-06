@@ -52,6 +52,7 @@ Endpoint and job work:
 - `clio-relay queue retention-plan <job-id>`
 - `clio-relay queue retention-status <job-id>`
 - `clio-relay queue retention-collect <job-id>`
+- `clio-relay scheduler status-batch` (internal bounded teardown query)
 - `clio-relay storage status`
 - `clio-relay worker status`
 - `clio-relay job submit`
@@ -135,6 +136,12 @@ hash-pinned payload used by schema-driven JARVIS input staging. `POST
 `GET /jobs/{job_id}/transform` returns it or JSON `null`; both require normal API
 authentication and exact job ownership, while POST also requires the session
 submission binding.
+
+`session plan-start`, `start`, `start-status`, and `start-watch` carry one exact
+`clio-relay.owner-session-input-policy.v1` value derived from the validated
+desktop configuration. It is part of selector identity and is persisted in the
+cluster-local start journal and ready-session metadata. A different limit set
+is a different owned-session identity and requires explicit replacement.
 
 ## MCP Surfaces
 
@@ -244,6 +251,11 @@ Important environment variables:
 - `CLIO_RELAY_INPUT_FILE_MAX_BYTES`
 - `CLIO_RELAY_INPUT_TOTAL_MAX_BYTES`
 - `CLIO_RELAY_INPUT_FILE_MAX_COUNT`
+
+The three input-limit variables configure policy at the desktop planning
+boundary. They are not ambient cluster defaults: the selected values are
+serialized into the durable start contract and projected into the exact owned
+API generation.
 
 Local cluster registry data lives under `.clio-relay/clusters.json` by default. Secrets for unattended local runs can live in ignored `.clio-relay/secrets.json`.
 

@@ -156,14 +156,11 @@ class _McpFlowHarness:
             result["mcp_result"] = {
                 "tool": "jarvis_add_step",
                 "structured_result": {
-                    "result": {
-                        "pipeline_id": job.spec.arguments["pipeline_id"],
-                        "appended": package_name,
-                        "step_id": job.spec.arguments.get("step_id")
-                        or package_name.rsplit(".", 1)[-1],
-                        "configured": True,
-                        "config": job.spec.arguments.get("config", {}),
-                    }
+                    "pipeline_id": job.spec.arguments["pipeline_id"],
+                    "appended": package_name,
+                    "step_id": job.spec.arguments.get("step_id") or package_name.rsplit(".", 1)[-1],
+                    "configured": True,
+                    "config": job.spec.arguments.get("config", {}),
                 },
             }
         return result
@@ -880,6 +877,44 @@ def test_nonterminal_staged_add_step_reports_handle_without_accepting_lineage(
         == harness.submitted_payloads[-1]["idempotency_key"]
     )
     assert list((settings.core_dir / "jarvis_pipeline_input_lineage").glob("*.json"))
+
+
+def test_add_step_identity_accepts_historical_nested_result() -> None:
+    """Previously recorded nested result evidence remains readable."""
+    result: JSON = {
+        "mcp_result": {
+            "structured_result": {
+                "result": {
+                    "pipeline_id": "science-run",
+                    "step_id": "lammps",
+                }
+            }
+        }
+    }
+
+    assert (
+        mcp_server_module._jarvis_add_step_result_step_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            result
+        )
+        == "lammps"
+    )
+
+
+def test_add_step_identity_rejects_ambiguous_result_envelopes() -> None:
+    """A result cannot smuggle a second, conflicting step identity."""
+    result: JSON = {
+        "mcp_result": {
+            "structured_result": {
+                "step_id": "lammps",
+                "result": {"step_id": "other"},
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="ambiguous result envelopes"):
+        mcp_server_module._jarvis_add_step_result_step_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            result
+        )
 
 
 def _configured_flow(

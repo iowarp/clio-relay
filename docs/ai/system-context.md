@@ -61,6 +61,11 @@ Session teardown quiesces the exact owner-session generation before discovery. W
 running jobs before gateway or API cleanup. It stops the API to seal intake, rescans
 for pre-quiescence in-flight submissions, and acknowledges those before gateway
 cleanup. A timeout leaves intake quiesced and the remaining resources explicit.
+Default scheduler retention remains evidence-bearing without opening one SSH
+process per job: exact scheduler identities are de-duplicated, grouped by
+provider, and queried in bounded batches of at most 256. Every job still emits
+its own validated cleanup resource and status; batching changes transport cost,
+not ownership or preservation semantics.
 
 JARVIS-owned execution is authoritative only when it supplies the exact `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and `jarvis.execution.progress.v1` documents. The relay preserves those documents and projects them into `clio-relay.jarvis-runtime.v1` for job/task metadata, events, artifacts, and provenance. The older `jarvis.runtime.v1`, flexible structured payloads, and stdout scheduler patterns are compatibility evidence only and cannot authorize polling or cancellation or satisfy the 1.0 gate.
 
@@ -114,6 +119,18 @@ artifacts, ingests changed bytes, and admits one immutable per-run input
 manifest before the worker materializes those settings and calls JARVIS.
 Idempotent retries reuse that manifest without rescanning Host state. Other
 schemas and path-looking arguments are pass-through.
+
+Input file, aggregate-byte, and count limits are part of the immutable owned
+session start plan, status selector, retry selector, attempt journal, and ready
+session metadata. The cluster-local launcher projects that exact policy into
+the owned API child process. A running pre-policy session or a changed policy
+requires explicit replacement; reconnect and retry never reinterpret limits
+from whichever environment happens to observe the session later.
+
+The canonical FastMCP JARVIS add-step result exposes `step_id` directly in
+`structured_result`. Relay accepts the historical nested `result.step_id`
+envelope only to read existing evidence and rejects an ambiguous response that
+contains both forms.
 
 ## Transports
 

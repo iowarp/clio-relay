@@ -5108,10 +5108,20 @@ def _jarvis_add_step_result_step_id(result: JSON) -> str:
     raw_structured = cast(JSON, raw_mcp_result).get("structured_result")
     if not isinstance(raw_structured, dict):
         raise ValueError("jarvis_add_step terminal result omitted structured output")
-    raw_payload = cast(JSON, raw_structured).get("result")
-    if not isinstance(raw_payload, dict):
-        raise ValueError("jarvis_add_step structured output omitted its result object")
-    step_id = cast(JSON, raw_payload).get("step_id")
+    structured = cast(JSON, raw_structured)
+    raw_nested = structured.get("result")
+    has_flat_identity = "step_id" in structured
+    if has_flat_identity and raw_nested is not None:
+        raise ValueError("jarvis_add_step structured output has ambiguous result envelopes")
+    if has_flat_identity:
+        raw_payload = structured
+    elif isinstance(raw_nested, dict):
+        # Compatibility for relay evidence produced by the historical test adapter.
+        # FastMCP's declared JARVIS contract returns the object itself.
+        raw_payload = cast(JSON, raw_nested)
+    else:
+        raise ValueError("jarvis_add_step structured output omitted its step identity")
+    step_id = raw_payload.get("step_id")
     if not isinstance(step_id, str) or not step_id:
         raise ValueError("jarvis_add_step structured output omitted its step identity")
     return step_id

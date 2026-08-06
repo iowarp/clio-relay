@@ -578,6 +578,26 @@ def test_concurrent_reservations_never_overcommit_high_water(tmp_path: Path) -> 
     assert status.status.reserved_core_bytes == 100
 
 
+def test_reservation_scan_does_not_hold_ledger_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy(tmp_path)
+    observer = _policy(tmp_path)
+    real_scan_tree = storage_module.scan_tree
+
+    def checked_scan(*args: object, **kwargs: object) -> object:
+        with observer._ledger_lock():  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            pass
+        return real_scan_tree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(storage_module, "scan_tree", checked_scan)
+
+    decision = policy.reserve("scan-outside-ledger", core_bytes=1, spool_bytes=0)
+
+    assert decision.allowed is True
+
+
 def test_scan_identity_race_denies_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

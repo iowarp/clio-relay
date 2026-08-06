@@ -4324,9 +4324,16 @@ def test_cli_session_start_json_returns_self_contained_current_selector(
         "remote_api_port": 9001,
         "replace": False,
         "require_token": False,
+        "input_policy": {
+            "schema_version": "clio-relay.owner-session-input-policy.v1",
+            "file_max_bytes": 1_048_576,
+            "total_max_bytes": 4_194_304,
+            "file_max_count": 16,
+        },
         "expected_api_release_identity_sha256": release.sha256(),
     }
     assert starts[0]["start_operation_id"] == "start_cli_json"
+    assert starts[0]["input_policy"] == session_lifecycle.OwnedSessionInputPolicy()
 
 
 def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
@@ -4359,6 +4366,7 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
             start_retryable=True,
             start_replace=False,
             start_require_token=False,
+            start_input_policy=plan.input_policy,
             start_expected_api_release_identity_sha256=release.sha256(),
         )
         return session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -7391,6 +7399,112 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
     assert scheduler.residual is False
     assert report.residual_resources == []
     assert checks["cleanup.jobs-preserved-default"] == "passed"
+
+
+def test_scheduler_phase_batch_uses_one_remote_command(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
+    definition = ClusterDefinition(
+        name="configured-target",
+        ssh_host="configured-target",
+        scheduler_provider="slurm",
+    )
+    calls: list[list[str]] = []
+
+    def remote_statuses(
+        _definition: ClusterDefinition,
+        args: list[str],
+    ) -> str:
+        calls.append(args)
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.scheduler-status-batch.v1",
+                "scheduler": "slurm",
+                "statuses": [
+                    {
+                        "scheduler": "slurm",
+                        "scheduler_job_id": "101",
+                        "phase": "completed",
+                        "record_found": True,
+                        "active_record_found": False,
+                        "observed_at": "2026-08-05T12:00:00Z",
+                    },
+                    {
+                        "scheduler": "slurm",
+                        "scheduler_job_id": "102",
+                        "phase": "running",
+                        "record_found": True,
+                        "active_record_found": True,
+                        "observed_at": "2026-08-05T12:00:00Z",
+                    },
+                ],
+            }
+        )
+
+    monkeypatch.setattr(cli, "run_remote_clio", remote_statuses)
+
+    observed = cli._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition,
+        (("slurm", "101"), ("slurm", "102")),
+    )
+
+    assert len(calls) == 1
+    assert calls[0].count("--scheduler-job-id") == 2
+    assert observed == {
+        ("slurm", "101"): ("completed", None),
+        ("slurm", "102"): ("running", None),
+    }
+
+
+def test_scheduler_status_batch_command_returns_each_exact_identity(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path, name="configured-target", scheduler_provider="slurm")
+
+    def poll(scheduler_job_id: str) -> SchedulerStatus:
+        return SchedulerStatus(
+            scheduler="slurm",
+            scheduler_job_id=scheduler_job_id,
+            phase=(
+                SchedulerPhase.COMPLETED if scheduler_job_id == "101" else SchedulerPhase.RUNNING
+            ),
+            record_found=True,
+            active_record_found=scheduler_job_id != "101",
+        )
+
+    scheduler = SimpleNamespace(poll=poll)
+
+    def resolve_provider(_provider: str) -> Any:
+        return scheduler
+
+    monkeypatch.setattr(cli, "provider_for_scheduler", resolve_provider)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "scheduler",
+            "status-batch",
+            "--cluster",
+            "configured-target",
+            "--provider",
+            "slurm",
+            "--scheduler-job-id",
+            "101",
+            "--scheduler-job-id",
+            "102",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "clio-relay.scheduler-status-batch.v1"
+    assert [status["scheduler_job_id"] for status in payload["statuses"]] == [
+        "101",
+        "102",
+    ]
 
 
 @pytest.mark.parametrize(
