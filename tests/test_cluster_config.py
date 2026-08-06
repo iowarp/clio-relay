@@ -855,15 +855,31 @@ def test_cluster_relay_executable_is_an_exact_remote_path() -> None:
     definition = ClusterDefinition(
         name="site-cluster",
         ssh_host="site-login",
-        relay_executable="/srv/releases/relay-1.5.12/bin/clio-relay",
+        relay_executable="/srv/releases/relay-1.5.13/bin/clio-relay",
     )
 
-    assert definition.relay_executable == "/srv/releases/relay-1.5.12/bin/clio-relay"
-    with pytest.raises(ValueError, match="absolute remote path"):
+    assert definition.relay_executable == "/srv/releases/relay-1.5.13/bin/clio-relay"
+    with pytest.raises(ValueError, match="absolute"):
         ClusterDefinition(
             name="site-cluster",
             ssh_host="site-login",
             relay_executable="clio-relay",
+        )
+
+
+def test_cluster_relay_receipt_is_an_optional_exact_remote_path() -> None:
+    definition = ClusterDefinition(
+        name="site-cluster",
+        ssh_host="site-login",
+        relay_install_receipt="/srv/releases/relay-1.5.13/install-receipt.json",
+    )
+
+    assert definition.relay_install_receipt == ("/srv/releases/relay-1.5.13/install-receipt.json")
+    with pytest.raises(ValueError, match="absolute"):
+        ClusterDefinition(
+            name="site-cluster",
+            ssh_host="site-login",
+            relay_install_receipt="install-receipt.json",
         )
 
 

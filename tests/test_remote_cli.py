@@ -37,6 +37,7 @@ def test_remote_clio_uses_the_configured_digest_bound_executable(
         name="ares",
         ssh_host="ares-login",
         relay_executable="/srv/releases/relay-a1b2/bin/clio-relay",
+        relay_install_receipt="/srv/releases/relay-a1b2/install-receipt.json",
     )
     observed: list[str] = []
 
@@ -52,6 +53,9 @@ def test_remote_clio_uses_the_configured_digest_bound_executable(
     ]
     assert (
         'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="/srv/releases/relay-a1b2/bin/clio-relay";'
+    ) in observed[0]
+    assert (
+        'export CLIO_RELAY_INSTALL_RECEIPT="/srv/releases/relay-a1b2/install-receipt.json";'
     ) in observed[0]
 
 
