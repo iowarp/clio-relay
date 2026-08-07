@@ -53,6 +53,12 @@ TransportMode = Literal["brokered_tcp", "udp_rendezvous", "ssh_forward"]
 CHANNEL_BOOTSTRAP_SCHEMA: Final = "clio-relay.channel-bootstrap.v1"
 CHANNEL_EVENT_SCHEMA: Final = "clio-relay.control-channel-event.v1"
 
+# The bring-up document is framed, not positional: a login shell's profile may
+# print a banner first, and the cluster-local executors may pretty-print.
+# They begin with a letter so no shell parses them as an option operand.
+CHANNEL_BOOTSTRAP_BEGIN: Final = b"CLIO_RELAY_CHANNEL_BOOTSTRAP_BEGIN"
+CHANNEL_BOOTSTRAP_END: Final = b"CLIO_RELAY_CHANNEL_BOOTSTRAP_END"
+
 MAX_CHANNEL_BOOTSTRAP_BYTES: Final = 256 * 1024
 MAX_CHANNEL_EVENT_DETAIL_CHARS: Final = 2_000
 DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS: Final = 30.0
@@ -388,7 +394,7 @@ class SshForwardTransport:
                 process.kill()
 
     def _read_bootstrap(self, process: ChannelProcess) -> OwnedSessionChannelBootstrap:
-        """Read the single bring-up document the held process prints first."""
+        """Read the bring-up document the held process emits between its markers."""
         stdout = process.stdout
         if stdout is None:
             raise ChannelBootstrapError("channel bring-up process has no readable output")
@@ -397,22 +403,20 @@ class SshForwardTransport:
             if self.requires_user_authorization
             else self._ready_timeout_seconds
         )
-        line = _read_line_with_deadline(
+        payload = _read_delimited_document(
             stdout,
             timeout_seconds=deadline_seconds,
-            is_running=lambda: process.poll() is None,
+            maximum_bytes=MAX_CHANNEL_BOOTSTRAP_BYTES,
         )
-        if line is None:
+        if payload is None:
             detail = self._drain_stderr() or "no bring-up document was produced"
             raise ChannelBootstrapError(
                 f"owned session channel bring-up did not report its bootstrap: {detail}"
             )
-        if len(line) > MAX_CHANNEL_BOOTSTRAP_BYTES:
-            raise ChannelBootstrapError("owned session channel bootstrap exceeded its byte limit")
         try:
-            document = json.loads(line.decode("utf-8"))
+            document = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            detail = self._drain_stderr() or line[:512].decode("utf-8", errors="replace")
+            detail = self._drain_stderr() or payload[:512].decode("utf-8", errors="replace")
             raise ChannelBootstrapError(
                 f"owned session channel bootstrap was not UTF-8 JSON: {detail}"
             ) from exc
@@ -463,6 +467,8 @@ def owned_session_channel_bootstrap_script(
         session_generation_id=session_generation_id,
         nonce=nonce,
     ).model_dump_json()
+    begin = CHANNEL_BOOTSTRAP_BEGIN.decode("ascii")
+    end = CHANNEL_BOOTSTRAP_END.decode("ascii")
     return (
         "set -euo pipefail\n"
         "umask 077\n"
@@ -471,9 +477,15 @@ def owned_session_channel_bootstrap_script(
         f"--cluster {shlex.quote(cluster)} --session-id {shlex.quote(session_id)})\n"
         f"__clio_identity=$(printf '%s' {shlex.quote(challenge_request)} | "
         f"{relay_executable} session challenge-owned)\n"
+        # Frame the document so a login-shell banner, or an executor that
+        # pretty-prints its JSON, cannot be mistaken for the bootstrap.
+        f"printf '%s\\n' {shlex.quote(begin)}\n"
         'printf \'{"schema_version":"%s","status":%s,"identity":%s}\\n\' '
         f"{shlex.quote(CHANNEL_BOOTSTRAP_SCHEMA)} "
         '"$__clio_status" "$__clio_identity"\n'
+        f"printf '%s\\n' {shlex.quote(end)}\n"
+        # Hold the SSH session, and therefore the port forward, until the local
+        # relay closes this pipe.
         "exec cat >/dev/null\n"
     )
 
@@ -534,48 +546,61 @@ def _available_loopback_port() -> int:
     return port
 
 
-def _read_line_with_deadline(
+def _read_delimited_document(
     stream: IO[bytes],
     *,
     timeout_seconds: float,
-    is_running: Callable[[], bool],
+    maximum_bytes: int,
 ) -> bytes | None:
-    """Read one line within a bounded deadline without blocking the caller forever.
+    """Read the marker-delimited bring-up document within a bounded deadline.
 
-    A pipe cannot be polled portably, so the blocking read runs on a helper
-    thread while this function owns the deadline.  The thread is a daemon: if
-    the deadline expires the caller tears the process down and the read fails.
+    The document is framed by explicit markers rather than assumed to be the
+    first line: the cluster-local executors are free to pretty-print their JSON,
+    and ``bash -lc`` runs a login shell whose profile may write a banner to
+    stdout before anything of ours appears.  Everything outside the markers is
+    ignored.
+
+    A pipe cannot be polled portably, so the blocking reads run on a helper
+    thread while this function owns the deadline.  The thread is a daemon and
+    ends at EOF, which the caller guarantees by tearing the process down.
     """
-    results: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+    lines: queue.Queue[bytes | None] = queue.Queue()
 
-    def _read() -> None:
+    def _pump() -> None:
         try:
-            results.put(stream.readline())
+            for line in stream:
+                lines.put(line)
         except (OSError, ValueError):
-            results.put(None)
+            pass
+        finally:
+            lines.put(None)
 
-    reader = threading.Thread(target=_read, name="clio-relay-channel-bootstrap", daemon=True)
+    reader = threading.Thread(target=_pump, name="clio-relay-channel-bootstrap", daemon=True)
     reader.start()
     deadline = time.monotonic() + timeout_seconds
+    collecting = False
+    collected: list[bytes] = []
+    collected_bytes = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
         try:
-            line = results.get(timeout=min(0.25, remaining))
+            line = lines.get(timeout=min(0.25, remaining))
         except queue.Empty:
-            if not is_running():
-                # The process exited; give the reader one bounded chance to
-                # surface whatever it had already buffered.
-                try:
-                    return results.get(timeout=0.5)
-                except queue.Empty:
-                    return None
-
             continue
-        if line is None or not line.strip():
+        if line is None:
             return None
-        return line.strip()
+        marker = line.strip()
+        if not collecting:
+            collecting = marker == CHANNEL_BOOTSTRAP_BEGIN
+            continue
+        if marker == CHANNEL_BOOTSTRAP_END:
+            return b"".join(collected)
+        collected_bytes += len(line)
+        if collected_bytes > maximum_bytes:
+            raise ChannelBootstrapError("owned session channel bootstrap exceeded its byte limit")
+        collected.append(line)
 
 
 def _wait_for_channel_health(

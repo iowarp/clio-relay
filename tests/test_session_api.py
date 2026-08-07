@@ -10,6 +10,7 @@ import pytest
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
+from clio_relay.control_channel import CHANNEL_BOOTSTRAP_BEGIN, CHANNEL_BOOTSTRAP_END
 from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
@@ -123,7 +124,14 @@ class _ChannelProcess:
 
     def __init__(self, bootstrap: dict[str, object]) -> None:
         self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO(json.dumps(bootstrap).encode("utf-8") + b"\n")
+        self.stdout = io.BytesIO(
+            CHANNEL_BOOTSTRAP_BEGIN
+            + b"\n"
+            + json.dumps(bootstrap).encode("utf-8")
+            + b"\n"
+            + CHANNEL_BOOTSTRAP_END
+            + b"\n"
+        )
         self.stderr = io.BytesIO(b"")
         self.returncode: int | None = None
 

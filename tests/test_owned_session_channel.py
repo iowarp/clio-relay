@@ -27,6 +27,9 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.control_channel import (
+    CHANNEL_BOOTSTRAP_BEGIN,
+    CHANNEL_BOOTSTRAP_END,
+    ChannelBootstrapError,
     ChannelDropped,
     SshForwardTransport,
     TransportModeUnavailable,
@@ -108,10 +111,25 @@ class _Stream:
 class _ChannelProcess:
     """One fake held-channel process: exactly one of these is one SSH dial."""
 
-    def __init__(self, bootstrap: dict[str, object], argv: list[str]) -> None:
+    def __init__(
+        self,
+        bootstrap: dict[str, object],
+        argv: list[str],
+        *,
+        banner: bytes = b"",
+        indent: int | None = None,
+    ) -> None:
         self.argv = argv
         self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO(json.dumps(bootstrap).encode("utf-8") + b"\n")
+        self.stdout = io.BytesIO(
+            banner
+            + CHANNEL_BOOTSTRAP_BEGIN
+            + b"\n"
+            + json.dumps(bootstrap, indent=indent).encode("utf-8")
+            + b"\n"
+            + CHANNEL_BOOTSTRAP_END
+            + b"\n"
+        )
         self.stderr = io.BytesIO(b"")
         self.returncode: int | None = None
 
@@ -787,3 +805,62 @@ def test_registry_reconnect_is_the_single_explicit_reestablish_entry_point(
     with pytest.raises(ConfigurationError, match="no owned session connection is held"):
         harness.registry.reconnect("theta")
     assert harness.dials == 2
+
+
+def test_bring_up_survives_a_login_banner_and_pretty_printed_executor_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bootstrap is framed, not positional.
+
+    ``bash -lc`` runs a login shell whose profile commonly writes a banner to
+    stdout, and ``session recovery-status`` pretty-prints its JSON across many
+    lines. Neither may break bring-up.
+    """
+    harness = _Harness()
+    _install(monkeypatch, harness)
+
+    def noisy_factory(argv: list[str], **_kwargs: object) -> _ChannelProcess:
+        process = _ChannelProcess(
+            harness.bootstrap(),
+            argv,
+            banner=b"Welcome to ares\nLast login: Tue\n\n",
+            indent=2,
+        )
+        harness.processes.append(process)
+        return process
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", noisy_factory)
+
+    connection = _connect(tmp_path, harness)
+
+    assert connection.connected is True
+    assert harness.dials == 1
+    bootstrap = connection.bootstrap
+    assert bootstrap is not None
+    assert bootstrap.status["session_generation_id"] == "generation-1"
+
+
+def test_bring_up_without_the_framed_document_fails_with_a_typed_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bring-up whose executors failed must not be mistaken for a good one."""
+    harness = _Harness()
+    _install(monkeypatch, harness)
+
+    def failing_factory(argv: list[str], **_kwargs: object) -> _ChannelProcess:
+        process = _ChannelProcess(harness.bootstrap(), argv)
+        process.stdout = io.BytesIO(b"Welcome to ares\n")
+        process.stderr = io.BytesIO(b"clio-relay: owned session metadata is unavailable\n")
+        process.returncode = 1
+        harness.processes.append(process)
+        return process
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", failing_factory)
+
+    with pytest.raises(ChannelBootstrapError, match="did not report its bootstrap"):
+        _connect(tmp_path, harness)
+
+    assert harness.dials == 1
+    assert harness.streams == []
