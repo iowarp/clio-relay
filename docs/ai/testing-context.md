@@ -2,6 +2,14 @@
 
 Local tests are necessary but not sufficient for transport or cluster behavior.
 
+A harness may place fixtures on an evidence cluster at bring-up, but it must
+never move a run input out of band. Copying scientific inputs to the cluster
+before a run masks the staging seam and makes the results describe the harness
+rather than relay; that bypass has already invalidated a benchmark campaign and
+is tracked as [#177](https://github.com/iowarp/clio-relay/issues/177). Every
+harness that submits work asserts the invariants in `docs/connection-model.md`,
+not the ones its own scaffolding happens to satisfy.
+
 ## local gates
 
 Run:
@@ -62,7 +70,12 @@ evidence must also prove the relevant boundary before it is claimed:
 - a generic remote MCP call runs in endpoint containment with
   `outer_jarvis_pipeline=false` and creates no scheduler allocation;
 - a package-declared v3.6 local file is hash-pinned, ingested, rewritten, and
-  inherited by the exact later JARVIS run after an MCP reconnect; and
+  inherited by the exact later JARVIS run after an MCP reconnect, with a
+  non-empty `used_artifact_refs` whose digest matches the client's bytes and no
+  out-of-band copy anywhere in the proven path;
+- the connection opens no new ssh connections after bring-up: zero in the frp
+  modes and one held forward in the ssh fallback, counted two-sided across an
+  arbitrary number of operations, watches, and recoveries; and
 - a nondefault input policy survives session start, status/retry reconstruction,
   API launch, and reconnect, while a changed policy is rejected without explicit
   replacement;
