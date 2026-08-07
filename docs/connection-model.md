@@ -316,7 +316,7 @@ residual checklist.
 
 Both entries describe deployments older than this release, which still behave
 this way. They are kept because a reader meeting a 1.5.x deployment needs to
-recognise the shape.
+recognize the shape.
 
 - **Owned-session control plane dialed ssh per operation**
   ([#179](https://github.com/iowarp/clio-relay/issues/179)). On 1.5.x, owned
