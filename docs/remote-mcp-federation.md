@@ -375,13 +375,21 @@ has no input lineage, and it is not evidence of anything even when it reports
 success and the output looks correct. Treat an empty list as a failed run and
 fix the staging path; do not work around it by placing the file on the cluster.
 
-Two configurations produce an empty list without any error. A cluster-absolute
+One configuration produces an empty list without any error: a cluster-absolute
 path in the setting is forwarded verbatim, because a path-looking value carries
-no authority to read a local file. And the built-in JARVIS door does not engage
-staging at all today, so a declared binding reached through it is silently
-skipped — that is tracked as
-[#176](https://github.com/iowarp/clio-relay/issues/176), with the end-to-end
-proof tracked as [#177](https://github.com/iowarp/clio-relay/issues/177).
+no authority to read a local file. Pass a workspace-relative client path
+instead.
+
+The built-in JARVIS door used to produce an empty list for a declared binding
+too, because it never entered the staging plane
+([#176](https://github.com/iowarp/clio-relay/issues/176)). As of this release it
+shares the plane with the registered route, so the check above means the same
+thing on both doors. One deliberate, typed difference remains: the built-in door
+engages staging only when the JARVIS MCP runs on another machine, and a built-in
+run whose staged content changed is refused by name (`jarvis_run_input_drift`)
+rather than run against bytes the configuration never received. The end-to-end
+proof through both doors is still outstanding and tracked as
+[#177](https://github.com/iowarp/clio-relay/issues/177).
 
 ## Keep the compact JARVIS surface
 

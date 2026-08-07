@@ -307,34 +307,80 @@ no reader can rationally construct the wrong one.
 
 These are tracked defects. The sections above state the design; this section
 records where the shipped implementation does not yet meet it, so no reader
-mistakes current behavior for the contract.
+mistakes current behavior for the contract. The campaign that restores the
+implementation to this page is
+[#182](https://github.com/iowarp/clio-relay/issues/182), which carries the
+residual checklist.
 
-- **Owned-session control plane dials ssh per operation**
+### Closed by this release
+
+Both entries describe deployments older than this release, which still behave
+this way. They are kept because a reader meeting a 1.5.x deployment needs to
+recognise the shape.
+
+- **Owned-session control plane dialed ssh per operation**
   ([#179](https://github.com/iowarp/clio-relay/issues/179)). On 1.5.x, owned
-  session status, identity challenge, and watch open fresh ssh connections per
-  client context, and a per-context `-L` forward is created and torn down around
+  session status, identity challenge, and watch opened fresh ssh connections per
+  client context, and a per-context `-L` forward was created and torn down around
   each call. A two-sided measurement of one `jarvis_describe` recorded nine
-  fresh ssh connections. The fix is to ride the established link; multiplexing
-  and forward pooling are explicitly out of scope as fixes.
+  fresh ssh connections. The owned-session control plane now rides one channel
+  held per remote connection — see
+  [the one-link control plane](one-link-control-plane.md) for the implemented
+  shape and the two-sided measurement the deployment gate re-runs. Multiplexing
+  and forward pooling were never in scope as fixes and still are not. #179 stays
+  open for the residuals listed below.
+- **The built-in JARVIS door skipped input staging**
+  ([#176](https://github.com/iowarp/clio-relay/issues/176)). Virtual `jarvis_*`
+  tools reached through the built-in door forwarded a declared file-typed setting
+  verbatim and returned an empty `used_artifact_refs`, so the binding's promise
+  was silently skipped. Both doors now stage through one plane
+  (`src/clio_relay/jarvis_input_plane.py`), so an empty `used_artifact_refs` on
+  either route means what this page says it means everywhere else: staging did
+  not engage, and the run is not evidence.
+
+### Still deviating
+
+- **`relay_bind_jarvis_runtime` admission dials ssh per call.**
+  `owner_session_admission.py` opens four fresh ssh connections per invocation.
+  It sits outside the owned-session control plane restored above and needs a
+  server-side admission endpoint.
+- **The `jarvis_service_runtime` scheduler bridge dials ssh per operation** at
+  roughly twenty sites. Same shape, separate subsystem, restored separately.
 - **Cluster-targeted CLI dispatch dials ssh per invocation.** With
   `CLIO_RELAY_CLI_MODE=auto`, a cluster-targeted CLI command whose cluster has a
   non-local `ssh_host` is executed by opening an ssh connection for that
-  invocation. This is the same shape as #179 and the same rule applies to it.
-  `CLIO_RELAY_CLI_MODE=local` keeps the command in-process.
-- **The built-in JARVIS door skips input staging**
-  ([#176](https://github.com/iowarp/clio-relay/issues/176)). Virtual `jarvis_*`
-  tools reached through the built-in door forward a declared file-typed setting
-  verbatim and return an empty `used_artifact_refs`, so the binding's promise is
-  silently skipped. Until it lands, an empty `used_artifact_refs` on that route
-  is expected, and it still means the run is not evidence.
+  invocation. This is the same shape as the entries above and the same rule
+  applies to it. `CLIO_RELAY_CLI_MODE=local` keeps the command in-process.
+- **No production surface re-establishes a dropped channel.**
+  `RemoteConnection.reconnect()`, `RemoteConnectionRegistry.reconnect()`,
+  `event_report()`, and `close_all()` exist and are covered by tests, but no
+  door calls them, so a dropped channel surfaces as a typed failure rather than
+  a recovery a user can authorize.
+- **Only mode (c) is implemented.** `brokered_tcp` and `udp_rendezvous` are
+  declared and refuse with `TransportModeUnavailable` rather than degrading into
+  per-operation ssh. Until they are built, the primary modes are design, not
+  shipped behavior.
+- **Live service streams still ride a compute-node-side `frpc`** that dials the
+  relay host directly, instead of reaching the cluster relay over
+  cluster-internal connectivity and riding the connection's link. It also
+  requires outbound internet reachability from compute nodes, which most sites do
+  not grant.
+- **The connection-lifetime identity nonce is weaker than a per-operation
+  proof.** Streams are re-proven against the same out-of-band bring-up identity
+  document; a client-verifiable per-operation challenge is still owed.
+- **`--wait-seconds` is a wire-compatibility break** against cluster relays older
+  than this release. It fails loudly, but without naming the version mismatch as
+  the cause.
 - **End-to-end client-local staging to a remote cluster is not yet proven**
-  ([#177](https://github.com/iowarp/clio-relay/issues/177)). The capability
-  exists on the registered JARVIS route; the release-gating proof is outstanding
-  because harness-side `scp` had been masking the seam. Acceptance requires no
-  out-of-band copying anywhere in the proven path.
+  ([#177](https://github.com/iowarp/clio-relay/issues/177)). The capability now
+  exists on both JARVIS routes; the release-gating proof is outstanding because
+  harness-side `scp` had been masking the seam. Acceptance requires no
+  out-of-band copying anywhere in the proven path, through both doors.
 
 ## Related pages
 
+- [the one-link control plane](one-link-control-plane.md) — the implemented
+  transport, its configuration, and the two-sided ssh measurement.
 - [architecture](architecture.md) — roles, durable records, execution boundary.
 - [connect a desktop, homelab relay, and cluster](connect-desktop-homelab-cluster.md)
   — the first-connection walkthrough.

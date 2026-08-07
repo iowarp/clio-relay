@@ -177,8 +177,14 @@ concurrently, behind one stable client-facing MCP endpoint.
 
 Transport failure must not corrupt queue state. Direct transport and NAT punching are optimizations, not reliability requirements.
 
-`docs/connection-model.md` is normative for this section and records the
-deviations currently tracked in #179, #176, and #177.
+`docs/connection-model.md` is normative for this section. The owned-session
+control plane (#179) and the built-in JARVIS door's input staging (#176) meet it
+as of this release; `docs/one-link-control-plane.md` describes the implemented
+transport. The deviations that remain — per-operation ssh in
+`owner_session_admission.py` and the `jarvis_service_runtime` bridge, cluster-
+targeted CLI dispatch, the missing reconnect surface, the two unbuilt transport
+modes, compute-node-side live-stream `frpc`, and the outstanding #177 staging
+proof — are listed on that page and tracked on #182.
 
 ## Sessions
 

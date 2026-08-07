@@ -69,14 +69,27 @@ however successful it looks.
 ### Deviations you will see in the shipped code
 
 State the design, not the deviation, in anything you write. These are tracked
-defects, not the contract: per-operation ssh dialing in the owned-session control
-plane ([#179](https://github.com/iowarp/clio-relay/issues/179)); cluster-targeted
-CLI dispatch opening an ssh connection per invocation under
-`CLIO_RELAY_CLI_MODE=auto`; the built-in JARVIS door skipping input staging
-([#176](https://github.com/iowarp/clio-relay/issues/176)); the outstanding
-end-to-end staging proof ([#177](https://github.com/iowarp/clio-relay/issues/177)).
-`ControlMaster` multiplexing and forward pooling are explicitly not fixes for
-any of them.
+defects, not the contract.
+
+Two are closed by this release and survive only in older deployments:
+per-operation ssh dialing in the owned-session control plane
+([#179](https://github.com/iowarp/clio-relay/issues/179)), which now rides one
+channel held per remote connection, and the built-in JARVIS door skipping input
+staging ([#176](https://github.com/iowarp/clio-relay/issues/176)), which now
+stages through the same plane as the registered route.
+
+Still deviating: `relay_bind_jarvis_runtime` admission dialing four fresh ssh
+per call; the `jarvis_service_runtime` scheduler bridge dialing ssh per
+operation; cluster-targeted CLI dispatch opening an ssh connection per
+invocation under `CLIO_RELAY_CLI_MODE=auto`; no production surface calling
+`reconnect()` on a dropped channel; only the ssh-forward transport mode being
+implemented; compute-node-side `frpc` carrying live service streams; and the
+outstanding end-to-end staging proof
+([#177](https://github.com/iowarp/clio-relay/issues/177)). `ControlMaster`
+multiplexing and forward pooling are explicitly not fixes for any of them. The
+full residual checklist is on
+[#182](https://github.com/iowarp/clio-relay/issues/182); `docs/connection-model.md`
+carries the same list in normative form.
 
 ## CLI Surfaces
 

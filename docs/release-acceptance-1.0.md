@@ -27,12 +27,16 @@ input** out of band: the LAMMPS input deck and the secure-runtime dataset
 descriptor are copied to the cluster and then referenced by cluster-absolute
 path. That is the bypass tracked by
 [#177](https://github.com/iowarp/clio-relay/issues/177), whose acceptance
-requires no out-of-band copying anywhere in the proven path, and it depends on
-[#176](https://github.com/iowarp/clio-relay/issues/176) for the built-in JARVIS
-door to engage staging. Both steps are marked in place. They are recorded here
-as the current state of the harness, not as a supported pattern; a run input
-belongs in the relay's input staging, which leaves a non-empty
-`used_artifact_refs` on the job.
+requires no out-of-band copying anywhere in the proven path. The capability
+those steps were waiting on has landed:
+[#176](https://github.com/iowarp/clio-relay/issues/176) makes the built-in
+JARVIS door stage declared inputs through the same plane as the registered
+route, so both steps can now be rewritten to pass a workspace-relative client
+path. Rewriting them is tracked on
+[#182](https://github.com/iowarp/clio-relay/issues/182) and has not been done
+yet; both steps are marked in place. They are recorded here as the current state
+of the harness, not as a supported pattern; a run input belongs in the relay's
+input staging, which leaves a non-empty `used_artifact_refs` on the job.
 
 ## Required report matrix
 
@@ -928,11 +932,13 @@ Invoke-RelayReport -Id "ares-jarvis-gray-scott" -ReportOption "--report" -Comman
   "--wait-timeout-seconds", "900", "--poll-seconds", "2"
 )
 
-# NON-CONFORMING, tracked by #177 and #176. The LAMMPS deck is a run input and
-# must reach the cluster through relay input staging: a path relative to
-# CLIO_RELAY_INPUT_WORKSPACE_ROOT in config.script, leaving a non-empty
-# used_artifact_refs on the job. The out-of-band copy and cluster-absolute path
-# below are the bypass those issues remove. Do not copy this pattern.
+# NON-CONFORMING, acceptance tracked by #177, rewrite tracked by #182. The
+# LAMMPS deck is a run input and must reach the cluster through relay input
+# staging: a path relative to CLIO_RELAY_INPUT_WORKSPACE_ROOT in config.script,
+# leaving a non-empty used_artifact_refs on the job. #176 landed the built-in
+# door's half of that capability; this step has not been rewritten onto it yet.
+# The out-of-band copy and cluster-absolute path below are the bypass. Do not
+# copy this pattern.
 $RemoteLammpsInput = "$AresRemoteRoot/lammps/in.lj"
 & $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/lammps'"
 Copy-RemoteTextFile `
@@ -1639,9 +1645,11 @@ if ($SecureDatasetRecords.Count -ne 1 -or $null -eq $SecureDatasetRecords[0].des
 }
 $SecureDescriptorLocal = Write-JsonFile `
   "ares-secure-runtime-dataset-descriptor.json" $SecureDatasetRecords[0].descriptor
-# NON-CONFORMING, tracked by #177 and #176. The descriptor is a run input for
-# the submitted pipeline; it belongs in relay input staging rather than an
-# out-of-band copy referenced by cluster-absolute path. Do not copy this pattern.
+# NON-CONFORMING, acceptance tracked by #177, rewrite tracked by #182. The
+# descriptor is a run input for the submitted pipeline; it belongs in relay input
+# staging rather than an out-of-band copy referenced by cluster-absolute path.
+# #176 landed the capability this step was waiting on; the step itself has not
+# been rewritten onto it yet. Do not copy this pattern.
 $SecureDescriptorRemote = "$AresRemoteRoot/secure-runtime/dataset-descriptor.json"
 & $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/secure-runtime'"
 if ($LASTEXITCODE -ne 0) { throw "secure-runtime fixture directory creation failed" }

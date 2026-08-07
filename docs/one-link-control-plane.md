@@ -184,3 +184,26 @@ Deployment and lifecycle, not the runtime control plane:
   the ordinary remote-command budget) so a silent SSH command stays bounded, so
   the cost is one connection per 120 seconds watched rather than one per 0.5s
   interval. The CLI's default 120-second watch is exactly one connection.
+
+## What still dials and should not
+
+These are outside the owned-session control plane restored here. They are
+deviations from `connection-model.md`, not sanctioned exceptions, and the
+campaign issue [#182](https://github.com/iowarp/clio-relay/issues/182) carries
+them:
+
+- `relay_bind_jarvis_runtime` admission (`owner_session_admission.py`) opens four
+  fresh SSH connections per call; it needs a server-side admission endpoint.
+- the `jarvis_service_runtime` scheduler bridge dials SSH per operation at
+  roughly twenty sites.
+- cluster-targeted CLI dispatch under `CLIO_RELAY_CLI_MODE=auto` opens one SSH
+  connection per invocation.
+- no production surface calls `RemoteConnectionRegistry.reconnect()`,
+  `event_report()`, or `close_all()`, so a dropped channel has no door-side
+  recovery path today.
+- `brokered_tcp` and `udp_rendezvous` are declared but unbuilt, so the primary
+  transport modes are design rather than shipped behavior.
+- gateway live streams still run a compute-node-side `frpc` that dials the relay
+  host directly instead of riding this channel via the cluster relay.
+- `--wait-seconds` is a wire-compatibility break against cluster relays older
+  than this release: it fails loudly, but without naming the version mismatch.
