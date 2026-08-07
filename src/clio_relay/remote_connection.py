@@ -649,9 +649,7 @@ class RemoteConnectionRegistry:
         with self._lock:
             connection = self._connections.get(cluster)
         if connection is None:
-            raise ConfigurationError(
-                f"no owned session connection is held for cluster {cluster}"
-            )
+            raise ConfigurationError(f"no owned session connection is held for cluster {cluster}")
         connection.reconnect()
         return connection
 
@@ -708,9 +706,7 @@ class RemoteConnectionRegistry:
             cast(int, cast(dict[str, object], value)["transport_connections_opened"])
             for value in clusters.values()
         )
-        retired_total = sum(
-            cast(int, item["transport_connections_opened"]) for item in retired
-        )
+        retired_total = sum(cast(int, item["transport_connections_opened"]) for item in retired)
         return {
             "schema_version": CHANNEL_EVENT_REPORT_SCHEMA,
             "clusters": clusters,

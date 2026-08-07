@@ -569,6 +569,7 @@ def test_bring_up_refuses_a_channel_that_maps_a_different_owned_api_port(
 ) -> None:
     harness = _Harness()
     _install(monkeypatch, harness)
+
     def mismatched_port_factory(argv: list[str], **_kwargs: object) -> _ChannelProcess:
         process = _ChannelProcess(harness.bootstrap(remote_api_port=9999), argv)
         harness.processes.append(process)
