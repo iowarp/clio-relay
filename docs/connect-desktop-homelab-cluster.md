@@ -11,6 +11,12 @@ This guide starts from three machines that are not already connected through
 The homelab relay does not store job state. It only joins outbound `frp`
 connections from the desktop and the cluster.
 
+This walkthrough builds one connection: the desktop-local relay and the
+cluster-side relay joined by exactly one persistent link, which then carries
+every later operation. `docs/connection-model.md` is the normative statement of
+that model — the transport modes, the ssh budget, reconnect, and how run inputs
+reach the cluster. Read it before adapting these steps into automation.
+
 Install the released relay as a persistent tool on each operator host that runs
 `clio-relay`. Replace `<released-version>` with the exact version being deployed:
 
@@ -98,12 +104,25 @@ clio-relay agent render-mcp-config `
   --output .\clio-relay-agent.config.toml
 ```
 
-Copy the MCP config and prompt to the cluster:
+Place the MCP config and prompt on the cluster. This is **bootstrap-time file
+placement**: it happens once, at bring-up, alongside the deploy step that the
+mode's ssh budget already covers, because `agent run` takes cluster-side paths
+for both and relay has no channel for placing them today. Any file placement
+mechanism the site already trusts is acceptable here; the point is that it
+happens once, before the connection carries work:
 
 ```powershell
 scp .\clio-relay-agent.config.toml my-cluster-login:/home/<user>/relay/clio-relay-agent.config.toml
 scp .\prompt.md my-cluster-login:/home/<user>/relay/prompt.md
 ```
+
+This step is not a pattern to generalize. It does not repeat per run, per job,
+or per operation, and it never carries run inputs. A file that a job reads —
+a simulation input deck, a script a package executes, a dataset descriptor —
+reaches the cluster through relay's input staging, described under
+"Move a run input to the cluster" below. Copying such a file out of band leaves
+the job with an empty `used_artifact_refs` and no lineage, and the run stops
+being reproducible even when it succeeds.
 
 The prompt should tell the agent to use the relay tools rather than bypassing
 the relay. For example:
@@ -111,7 +130,9 @@ the relay. For example:
 ```text
 Use the clio-relay MCP tools. Submit the requested runtime or JARVIS pipeline
 through clio-relay. Return the child job id or gateway session id. Do not run
-the workload directly outside clio-relay.
+the workload directly outside clio-relay. Do not use ssh, scp, or rsync to move
+files or run commands on the cluster; relay staging is the only path for run
+inputs.
 ```
 
 ## Submit a remote agent run
@@ -144,6 +165,47 @@ clio-relay job list-artifacts <agent-job-id> --cluster my-cluster
 
 If the agent submits child work, it should return the child `job_id` or gateway
 session id. Monitor the child separately.
+
+## Move a run input to the cluster
+
+Files that a job reads are staged by the relay over the connection's one link.
+Nothing is copied to the cluster by hand after bootstrap.
+
+Point the desktop MCP process at the workspace it may read, on the desktop:
+
+```powershell
+$env:CLIO_RELAY_INPUT_WORKSPACE_ROOT = "$PWD\my-workspace"
+```
+
+Then configure the step with the path **relative to that workspace**, not a
+cluster path:
+
+```text
+jarvis_add_step(cluster="my-cluster", pipeline_id=..., step_id=...,
+                config={"script": "inputs/run.in"}, wait_for_terminal=true)
+```
+
+Staging is authorized by the package's own schema: the setting must declare
+`jarvis.configuration-input-binding.v1` with `kind="local_file"`, discovered
+through `jarvis_describe(target="package", ...)` on the same connection. Relay
+snapshots the bytes from the desktop workspace, hashes them, ingests them
+through the owned session, materializes a content-addressed copy on the cluster,
+rewrites the setting to that staged reference, and records lineage.
+
+Verify it engaged before trusting the run:
+
+```powershell
+clio-relay job used-artifacts <job-id> --cluster my-cluster
+```
+
+A non-empty result whose digest matches the desktop file is the proof. An empty
+result on a package that declared a file-typed setting means the bytes never
+travelled through relay: the run has no lineage and is not reproducible. Fix the
+staging path rather than copying the file to the cluster.
+
+Settings that declare no binding are passed through unchanged. A path-looking
+value is never enough on its own to make relay read a local file, so a
+cluster-absolute path in that slot is forwarded verbatim and stages nothing.
 
 ## Connect to a live service
 

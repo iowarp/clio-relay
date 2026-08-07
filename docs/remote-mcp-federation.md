@@ -5,6 +5,12 @@ register stdio MCP servers that exist in a cluster environment, discover their
 real schemas through durable relay jobs, and expose selected remote tools as
 normal local tools with a `cluster` argument.
 
+This focalization is the point of the layer, not a convenience. Servers on any
+number of clusters collapse into one MCP surface: the agent calls one endpoint
+and the local relay fans out behind it over each connection's single held link.
+Adding a cluster adds a value to the `cluster` enum, never a second MCP
+registration, endpoint, tunnel, or shell.
+
 The desktop agent does not need one MCP registration per cluster. A virtual
 call follows the normal relay path:
 
@@ -256,9 +262,15 @@ which immutable evidence backs the `relay_wait` projection.
 
 ## stage declared local package inputs
 
-Registered JARVIS contract v3.6 can move a small caller-local file without
-adding an upload tool to the agent surface. Configure the desktop MCP process
-with a workspace it is allowed to read:
+This is the only way a run input reaches the cluster. Registered JARVIS contract
+v3.6 moves a small caller-local file without adding an upload tool to the agent
+surface: the bytes travel through the owned session over the connection's one
+link, exactly like every other relay operation. Nothing is copied around the
+transport — `scp` and `rsync` of a run input are always wrong, and the value
+supplied for a binding-declared setting is a path on the **caller's** machine,
+never a cluster-absolute path.
+
+Configure the desktop MCP process with a workspace it is allowed to read:
 
 ```powershell
 $env:CLIO_RELAY_INPUT_WORKSPACE_ROOT = "$PWD\science-workspace"
@@ -325,6 +337,34 @@ path-looking name is never sufficient authority to read a local file. Legacy or
 other remote MCP contracts also remain pass-through and cannot opt into staging.
 Large collections should use a separately managed data-staging service or
 shared storage rather than raising these control-plane limits without review.
+That is a data-management decision made by the site with its own transfer
+service; it is not permission for a client, harness, or agent to `scp` run
+inputs to the cluster beside the relay.
+
+### verify that staging engaged
+
+A job whose package declared a file-typed setting must return a non-empty
+`used_artifact_refs`, each entry pinning an artifact id and its SHA-256:
+
+```powershell
+clio-relay job used-artifacts <job-id> --cluster my-cluster
+```
+
+Non-empty, with a digest matching the caller's file, is the proof of engagement:
+the bytes travelled through relay, the configuration was rewritten to the staged
+reference, and the run is reproducible from its lineage. Empty means staging did
+not happen. Whatever the job read on the cluster arrived some other way, the run
+has no input lineage, and it is not evidence of anything even when it reports
+success and the output looks correct. Treat an empty list as a failed run and
+fix the staging path; do not work around it by placing the file on the cluster.
+
+Two configurations produce an empty list without any error. A cluster-absolute
+path in the setting is forwarded verbatim, because a path-looking value carries
+no authority to read a local file. And the built-in JARVIS door does not engage
+staging at all today, so a declared binding reached through it is silently
+skipped — that is tracked as
+[#176](https://github.com/iowarp/clio-relay/issues/176), with the end-to-end
+proof tracked as [#177](https://github.com/iowarp/clio-relay/issues/177).
 
 ## Keep the compact JARVIS surface
 

@@ -6,6 +6,12 @@ For a complete first-connection walkthrough from a local desktop through a
 homelab relay to a cluster worker and remote agent, see
 `docs/connect-desktop-homelab-cluster.md`.
 
+`docs/connection-model.md` is normative for everything transport-related on this
+page: one held link per connection, the ssh budget, the 2FA operating
+assumption, reconnect, and relay-owned input staging. The operator paths below
+are ways to build and drive that one connection, not independent ways to reach
+the cluster.
+
 ## Add a Cluster
 
 ```powershell
@@ -590,10 +596,12 @@ that membership through verified generation closure.
 The user MCP profile exposes the read-only `relay_queue_list`,
 `relay_queue_diagnose`, and `relay_queue_stale` tools. The admin profile also
 exposes `relay_queue_cleanup_stale`, `relay_cancel_job`, and worker status.
-When `cluster` names a configured SSH target, these tools operate on that
-cluster's queue and return a `route_revision`; exact follow-up operations can
-echo that revision so a changed cluster route is rejected instead of silently
-acting on a different queue.
+When `cluster` names a configured remote cluster, these tools operate on that
+cluster's queue over its established connection and return a `route_revision`;
+exact follow-up operations can echo that revision so a changed cluster route is
+rejected instead of silently acting on a different queue. The `cluster` argument
+selects a connection the local relay already holds. It is not an instruction to
+open one.
 
 For release evidence, configure at least three live worker slots and the exact
 per-kind cap `jarvis=2`, then run during a quiet window with an otherwise empty
@@ -657,6 +665,13 @@ whether fresh worker registrations agree, and active leases by kind.
 clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
+
+The `--prompt` and `--mcp-config` values are cluster-side paths for operator
+material placed once at bootstrap, before the connection carries work. They are
+not a transfer channel and must not be used as a precedent for getting other
+files onto the cluster. A file that a job reads is staged by relay from the
+desktop workspace through the connection's one link; see `stage declared local
+package inputs` in `docs/remote-mcp-federation.md`.
 
 Agents should submit child cluster work asynchronously and return the child `job_id`. A single cluster worker cannot execute a child job while it is blocked inside a parent agent job waiting for that child to finish.
 
@@ -1126,7 +1141,11 @@ runtime until `stop-runtime` has proven connector cleanup.
 
 ## Use FRP Transport
 
-Use frp when the desktop and cluster cannot directly SSH to each other but can both reach a relay host.
+frp is the primary transport. Use it whenever the desktop and cluster can both
+reach a relay host, including when SSH between them also happens to work. Both
+sides dial outbound and the relay host brokers a handshake that joins them into
+the connection's one link; neither side accepts inbound, and the relay host
+stores nothing. After bring-up this mode opens no ssh connections at all.
 
 ```powershell
 $env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
@@ -1141,7 +1160,18 @@ For Cloudflare-backed homelab deployments, configure the cluster transport as `w
 
 ## Use SSH Forwarding
 
-Use SSH forwarding when the desktop already has SSH or VPN access to the cluster.
+SSH forwarding is the fallback. Use it when no relay host is reachable from both
+sides, as on DOE-class infrastructure. One local port forward is established at
+bring-up, with the user present for its interactive authorization, and is held
+for the lifetime of the connection; every later message rides the mapped port.
+
+The connection's ssh budget in this mode is two: deploying the cluster relay
+(skipped when it is already deployed) and that one forward. Nothing re-dials ssh
+afterwards for status, watch, polling, recovery, cancellation, or staging. A
+protected cluster asks for interactive 2FA on each connection and the user is
+present only at bring-up, so an unattended dial is a defect even when it
+succeeds on a key-based test host. `ControlMaster` multiplexing and forward
+pooling are not remedies; they keep the wrong shape at lower cost.
 
 ```powershell
 clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
@@ -1196,8 +1226,11 @@ for an attached API. Automation should persist the returned secret-free status
 selector.
 
 There is deliberately no aggregate start wait deadline in the relay contract.
-Each SSH/status observation is bounded so a client remains responsive, but a
+Each status observation is bounded so a client remains responsive, but a
 deadline produces `starting` or `ambiguous`, never a fabricated terminal failure.
+A status observation is a request over the connection's established link; it
+never opens transport of its own, and a bounded deadline is never a reason to
+dial again.
 The same operation id and immutable route/port/auth/release policy must be reused
 until it becomes terminal. A changed route or policy fails closed before mutation.
 
