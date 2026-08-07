@@ -56,6 +56,10 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_server_artifact_binding_verified,
 )
 from clio_relay.jarvis_provider import JarvisCdProvider
+from clio_relay.jarvis_run_environment import (
+    jarvis_run_environment_values,
+    registered_site_spack_command,
+)
 from clio_relay.models import (
     CLIO_PROVENANCE_METADATA_KEY,
     REGISTERED_JARVIS_USER_CONTRACT,
@@ -1014,6 +1018,9 @@ class EndpointWorker:
         if endpoint_mcp_call:
             assert isinstance(job.spec, McpCallSpec)
             execution_environment_values = _minimal_mcp_runner_environment(job.spec.env_from)
+            execution_environment_values.update(
+                self._jarvis_run_environment_values(job, task_id=task.task_id)
+            )
             if progress_sidecar_enabled:
                 execution_environment_values.update(
                     {
@@ -3172,6 +3179,37 @@ class EndpointWorker:
                 "result_sha256": result_sha256,
             },
         )
+
+    def _jarvis_run_environment_values(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+    ) -> dict[str, str]:
+        """Compose the site runtime identity this cluster registered for JARVIS.
+
+        A ``jarvis_run`` resolves its ``spack_specs`` inside the JARVIS MCP child
+        this worker spawns, so the child needs the same Spack executable the
+        cluster registered and the Spack route already receives. A cluster that
+        declares none keeps the previous environment exactly.
+        """
+        route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
+        if not route_valid:
+            return {}
+        spack_command = registered_site_spack_command(job.cluster)
+        values = jarvis_run_environment_values(spack_command)
+        if values:
+            self.queue.append_event(
+                job.job_id,
+                "jarvis.run_environment_composed",
+                "Registered cluster Spack executable composed into the JARVIS run environment",
+                payload={
+                    "task_id": task_id,
+                    "cluster": job.cluster,
+                    "spack_command": spack_command,
+                },
+            )
+        return values
 
     def _refuse_jarvis_execution_recovery(
         self,

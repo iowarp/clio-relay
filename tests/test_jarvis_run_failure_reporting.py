@@ -1,4 +1,4 @@
-"""A refused JARVIS run reaches a terminal state carrying its typed reason.
+"""A refused JARVIS run terminalizes, and a registered Spack path reaches it.
 
 The MCP result documents below reproduce the shapes captured on the isolated
 ``p5run2`` deployment for durable job ``job_63d173b2bf8a47d2b811860ac26af569``:
@@ -19,14 +19,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
+from clio_relay import jarvis_run_environment as jarvis_run_environment_module
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
+from clio_relay.errors import ConfigurationError
 from clio_relay.jarvis_dispatch_failure import jarvis_dispatch_refusal
 from clio_relay.jarvis_provider import JarvisCdProvider
+from clio_relay.jarvis_run_environment import (
+    RELAY_JARVIS_SPACK_COMMAND_ENV,
+    jarvis_run_environment_values,
+    registered_site_spack_command,
+)
 from clio_relay.models import (
     Cursor,
     EndpointRole,
@@ -47,6 +56,7 @@ SPECIMEN_ERROR_MESSAGE = (
     "Run failed: Spack executable was not found in PATH, SPACK_ROOT/bin, "
     "~/.local/spack, or /opt/spack"
 )
+SITE_SPACK_COMMAND = "/home/operator/.local/share/clio-relay/site-profiles/ares-spack-v1/bin/spack"
 
 
 def _specimen_error_result_document(
@@ -547,3 +557,169 @@ def test_successful_protocol_result_is_not_a_refusal() -> None:
     }
 
     assert jarvis_dispatch_refusal(document) is None
+
+
+def _registry_with(tmp_path: Path, *, spack_executable: str | None) -> Path:
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(
+        clusters={
+            CLUSTER: ClusterDefinition(
+                name=CLUSTER,
+                ssh_host="localhost",
+                spack_executable=spack_executable,
+            )
+        }
+    ).save(registry_path)
+    return registry_path
+
+
+def test_registered_spack_executable_reaches_the_run_environment(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A declared cluster Spack executable is composed for the JARVIS child."""
+    registry_path = _registry_with(tmp_path, spack_executable=SITE_SPACK_COMMAND)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+
+    resolved = registered_site_spack_command(CLUSTER)
+
+    assert resolved == SITE_SPACK_COMMAND
+    assert jarvis_run_environment_values(resolved) == {
+        RELAY_JARVIS_SPACK_COMMAND_ENV: SITE_SPACK_COMMAND
+    }
+
+
+def test_home_anchored_spack_executable_expands_on_the_executing_host(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A ``$HOME``-anchored registration resolves against the worker's account."""
+    registry_path = _registry_with(
+        tmp_path,
+        spack_executable="$HOME/.local/share/clio-relay/site-profiles/ares-spack-v1/bin/spack",
+    )
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+
+    def _fake_expanduser(_value: str) -> str:
+        return "/home/operator"
+
+    monkeypatch.setattr(jarvis_run_environment_module.os.path, "expanduser", _fake_expanduser)
+
+    assert registered_site_spack_command(CLUSTER) == SITE_SPACK_COMMAND
+
+
+def test_cluster_without_a_declaration_composes_nothing(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An undeclared Spack executable never invents a default."""
+    registry_path = _registry_with(tmp_path, spack_executable=None)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+
+    assert registered_site_spack_command(CLUSTER) is None
+    assert jarvis_run_environment_values(None) == {}
+    assert registered_site_spack_command("another-cluster") is None
+
+
+def test_unreadable_registry_refuses_instead_of_downgrading(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A configured registry that cannot be read is a refusal, not a quiet skip."""
+    registry_path = tmp_path / "clusters.json"
+    registry_path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+
+    with pytest.raises(ConfigurationError, match="cluster registry could not be read"):
+        registered_site_spack_command(CLUSTER)
+
+
+def test_worker_publishes_the_registered_spack_command_to_the_mcp_runner(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The dispatched runner environment carries the cluster's Spack identity."""
+    registry_path = _registry_with(tmp_path, spack_executable=SITE_SPACK_COMMAND)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    server_artifact = {
+        **verified_jarvis_server_artifact(),
+        "install_spec": "/releases/clio-kit.whl",
+    }
+    digest = remote_mcp_server_artifact_digest(server_artifact)
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = _submit_registered_run(
+        queue,
+        command=command,
+        digest=digest,
+        idempotency_key="copper-elastic-v1-run-004",
+    )
+    spec = cast(McpCallSpec, job.spec)
+    provider = _DispatchProvider(
+        document=_successful_result_document(
+            command=command,
+            digest=digest,
+            server_artifact=server_artifact,
+            arguments=spec.arguments,
+            expected_registered_contract=spec.expected_registered_contract,
+            execution_id=cast(str, spec.arguments["execution_id"]),
+        ),
+        returncode=0,
+    )
+
+    result = _worker(settings, queue, provider).run_once()
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    assert provider.environments
+    assert provider.environments[0][RELAY_JARVIS_SPACK_COMMAND_ENV] == SITE_SPACK_COMMAND
+    events, _cursor = queue.drain_events(Cursor(job_id=job.job_id), limit=200)
+    composed = [event for event in events if event.event_type == "jarvis.run_environment_composed"]
+    assert len(composed) == 1
+    assert composed[0].payload["spack_command"] == SITE_SPACK_COMMAND
+
+
+def test_worker_without_a_declaration_leaves_the_run_environment_unchanged(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """No declaration keeps the previously composed runner environment exactly."""
+    registry_path = _registry_with(tmp_path, spack_executable=None)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    server_artifact = {
+        **verified_jarvis_server_artifact(),
+        "install_spec": "/releases/clio-kit.whl",
+    }
+    digest = remote_mcp_server_artifact_digest(server_artifact)
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = _submit_registered_run(
+        queue,
+        command=command,
+        digest=digest,
+        idempotency_key="copper-elastic-v1-run-005",
+    )
+    spec = cast(McpCallSpec, job.spec)
+    provider = _DispatchProvider(
+        document=_successful_result_document(
+            command=command,
+            digest=digest,
+            server_artifact=server_artifact,
+            arguments=spec.arguments,
+            expected_registered_contract=spec.expected_registered_contract,
+            execution_id=cast(str, spec.arguments["execution_id"]),
+        ),
+        returncode=0,
+    )
+
+    result = _worker(settings, queue, provider).run_once()
+
+    assert result is not None
+    assert provider.environments
+    assert RELAY_JARVIS_SPACK_COMMAND_ENV not in provider.environments[0]
+    events, _cursor = queue.drain_events(Cursor(job_id=job.job_id), limit=200)
+    assert not [event for event in events if event.event_type == "jarvis.run_environment_composed"]

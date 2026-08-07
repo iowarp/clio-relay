@@ -45,6 +45,30 @@ def remote_value_expands_home(value: str) -> bool:
     return _leading_home_suffix(value) is not None
 
 
+def expand_remote_value_on_host(value: str, *, field: str, home: str) -> str:
+    """Expand a leading remote ``$HOME`` token against the host that runs the value.
+
+    Args:
+        value: The operator-configured remote value.
+        field: Configuration field name used in refusal messages.
+        home: Absolute home directory of the account executing on that host.
+
+    Returns:
+        The value with only an exact leading ``$HOME`` token replaced.
+
+    Raises:
+        ConfigurationError: If the value carries control characters, or requests
+            HOME expansion while the executing account has no home directory.
+    """
+    _validate_remote_value(value, field=field)
+    home_suffix = _leading_home_suffix(value)
+    if home_suffix is None:
+        return value
+    if not home:
+        raise ConfigurationError(f"remote {field} requires a home directory to expand $HOME")
+    return f"{home.rstrip('/')}{home_suffix}"
+
+
 def validate_remote_path(value: str, *, field: str) -> None:
     """Require an absolute POSIX path or one anchored by an exact leading HOME token."""
     _validate_remote_value(value, field=field)
