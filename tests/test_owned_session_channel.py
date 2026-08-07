@@ -12,13 +12,18 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shlex
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 
+from clio_relay import remote_connection
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -32,6 +37,7 @@ from clio_relay.control_channel import (
     ChannelBootstrapError,
     ChannelDropped,
     SshForwardTransport,
+    StreamChannelsUnavailable,
     TransportModeUnavailable,
     build_transport,
     owned_session_channel_bootstrap_script,
@@ -132,18 +138,28 @@ class _ChannelProcess:
         )
         self.stderr = io.BytesIO(b"")
         self.returncode: int | None = None
+        self.ignores_stdin_close = False
+        self.terminated = False
+        self.killed = False
 
     def poll(self) -> int | None:
         return self.returncode
 
     def terminate(self) -> None:
-        self.returncode = -15
+        self.terminated = True
+        if not self.ignores_stdin_close:
+            self.returncode = -15
 
     def kill(self) -> None:
+        self.killed = True
         self.returncode = -9
 
     def wait(self, timeout: float | None = None) -> int:
         del timeout
+        if self.ignores_stdin_close:
+            # A real ssh that does not notice the closed pipe: close() must
+            # escalate to terminate() and, failing that, kill().
+            raise subprocess.TimeoutExpired(cmd="ssh", timeout=5)
         if self.returncode is None:
             self.returncode = 0
         return self.returncode
@@ -487,12 +503,13 @@ def test_bring_up_command_reports_status_and_identity_then_holds_the_forward() -
 
 
 def test_ssh_forward_argv_maps_the_owned_api_port_and_allows_one_authorization() -> None:
+    script = "set -euo pipefail\nfoo 'bar baz'\nexec cat >/dev/null\n"
     transport = SshForwardTransport(
         definition=_definition(),
         session_id="desktop-session-1",
         session_generation_id="generation-1",
         remote_api_port=8765,
-        bootstrap_script="true",
+        bootstrap_script=script,
     )
 
     argv = transport.argv(local_port=18_795)
@@ -500,8 +517,16 @@ def test_ssh_forward_argv_maps_the_owned_api_port_and_allows_one_authorization()
     assert argv[:2] == ["ssh", "-T"]
     assert "-L" in argv
     assert argv[argv.index("-L") + 1] == "127.0.0.1:18795:127.0.0.1:8765"
-    assert argv[-3:-1] == ["bash", "-lc"]
-    assert "ares-login" in argv
+    assert argv[-2] == "ares-login"
+
+    # ssh joins its trailing operands with spaces into ONE remote command
+    # string, so the script must arrive already quoted. Reconstruct what the
+    # remote login shell is actually handed and prove it re-parses to exactly
+    # `bash -lc <script>` -- an unquoted script would lose `set -euo pipefail`
+    # and be interpreted by whatever login shell the account happens to have.
+    remote_command = argv[-1]
+    assert shlex.split(remote_command) == ["bash", "-lc", script]
+    assert "\n" not in remote_command.split(" ", 2)[0]
     # The user is present for exactly this one connection, so it must be able
     # to prompt: BatchMode would make interactive two-factor approval fail.
     assert "BatchMode=yes" not in argv
@@ -689,10 +714,6 @@ def test_identity_mismatch_over_the_channel_refuses_before_any_credential(
 
     forged = dict(harness.identity)
     forged["hmac_sha256"] = "f" * 64
-    monkeypatch.setattr(
-        "clio_relay.remote_connection._IDENTITY_FIELDS",
-        ("schema_version", "cluster", "session_id", "session_generation_id", "nonce"),
-    )
     original = _Stream.getresponse
 
     def forged_response(self: _Stream) -> _Response:
@@ -864,3 +885,157 @@ def test_bring_up_without_the_framed_document_fails_with_a_typed_reason(
 
     assert harness.dials == 1
     assert harness.streams == []
+
+
+def test_close_escalates_to_terminate_and_kill_when_the_process_ignores_the_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing stdin is the polite teardown; it must not be the only one."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    process = harness.processes[0]
+    process.ignores_stdin_close = True
+
+    connection.close()
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.poll() is not None
+
+
+def test_a_stream_proven_against_a_replaced_channel_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream must never outlive the link it was proven against."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    # Empty the pool so the next acquire has to prove a new stream.
+    harness.streams[0].close()
+    connection._idle_streams.clear()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    original_open = remote_connection._open_identity_bound_stream  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    replaced_once = False
+
+    def replace_channel_midway(**kwargs: Any) -> Any:
+        nonlocal replaced_once
+        if not replaced_once:
+            # The channel is replaced while this stream is being proven. Only
+            # do it on the first prove, or the reconnect recurses into itself.
+            replaced_once = True
+            harness.processes[0].drop()
+            connection.reconnect()
+        return original_open(**kwargs)
+
+    monkeypatch.setattr(
+        remote_connection,
+        "_open_identity_bound_stream",
+        replace_channel_midway,
+    )
+
+    with pytest.raises(ChannelDropped, match="replaced while"):
+        connection.request_json(method="GET", path="/jobs/job_1/status")
+
+
+def test_bring_up_diagnostics_do_not_block_on_a_live_process_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure path must not hang, and a chatty channel must not wedge.
+
+    Uses a real child process, because the hazards are properties of OS pipes:
+    a fixed-size read on a live process's stderr blocks until EOF, and an
+    undrained stderr pipe fills and stops the writer -- which for a real ``ssh``
+    means the port forward stops being serviced, silently.
+    """
+    harness = _Harness()
+    _install(monkeypatch, harness)
+    # Writes far more than any pipe buffer to stderr, emits no bootstrap, and
+    # never exits on its own.
+    child_source = (
+        "import sys, time\n"
+        "for index in range(20000):\n"
+        "    sys.stderr.write('channel %d: open failed: connect failed\n' % index)\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(600)\n"
+    )
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def real_child_factory(_argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        del kwargs
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_source],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        spawned.append(process)
+        harness.processes.append(cast(Any, process))
+        return process
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", real_child_factory)
+
+    transport = SshForwardTransport(
+        definition=_definition(),
+        session_id="desktop-session-1",
+        session_generation_id="generation-1",
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        bootstrap_script="true",
+        process_factory=real_child_factory,
+        ready_timeout_seconds=2.0,
+        authorization_timeout_seconds=2.0,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(ChannelBootstrapError, match="did not report its bootstrap"):
+            transport.establish(nonce=NONCE)
+    finally:
+        transport.close()
+        for process in spawned:
+            if process.poll() is None:  # pragma: no cover - defensive cleanup
+                process.kill()
+                process.wait(timeout=10)
+    elapsed = time.monotonic() - started
+
+    # Without the stderr pump the child wedges on a full pipe; without a
+    # non-blocking drain the failure path never returns at all.
+    assert elapsed < 30
+    assert spawned[0].poll() is not None
+
+
+def test_the_link_is_shaped_for_stream_channels_and_refuses_to_dial_for_them() -> None:
+    """Live service streams must ride the one link, never a second one.
+
+    The compute node on a real HPC cluster has no route to the internet, so the
+    only viable path is compute node to cluster relay to this link. Nothing
+    implements it yet; what must hold now is that the link's shape admits it and
+    that asking refuses rather than opening new transport.
+    """
+    transport = SshForwardTransport(
+        definition=_definition(),
+        session_id="desktop-session-1",
+        session_generation_id="generation-1",
+        remote_api_port=8765,
+        bootstrap_script="true",
+    )
+
+    with pytest.raises(StreamChannelsUnavailable, match="one held link"):
+        transport.open_stream_channel(name="paraview", remote_port=11111)
+
+
+def test_established_link_reports_its_control_endpoint_and_stream_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+
+    link = connection.link
+    assert link is not None
+    assert link.control_endpoint.host == "127.0.0.1"
+    assert link.control_endpoint.base_url.startswith("http://127.0.0.1:")
+    assert link.bootstrap.status["session_id"] == "desktop-session-1"
+    # No mode carries multiplexed stream channels yet; the flag says so rather
+    # than the capability being absent from the interface.
+    assert link.stream_channels is False

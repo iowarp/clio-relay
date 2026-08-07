@@ -7,21 +7,26 @@ challenge, job submission, ingest, artifact content, watch -- rides it as plain
 HTTP against the mapped port.  Nothing in this module may reopen the underlying
 transport for an individual operation.
 
-Three transport modes are declared by the design:
+The mode is a deployment-time configuration choice, made per connection, and
+this layer never selects or switches one.  There is no probing, no "try TCP and
+degrade to SSH": an operator configures the pathway a connection uses, a link
+failure is reported as a typed failure, and a reconnect re-establishes the same
+configured mode.
 
 ``brokered_tcp``
     TCP through an internet-accessible relay point.  Both relays dial out and a
     server-brokered handshake joins the two outbound connections.
 ``udp_rendezvous``
-    The same rendezvous with a UDP hole-punching handshake, falling back to the
-    server-carried TCP path when traversal fails.
+    The same rendezvous with a UDP hole-punching handshake.  When traversal
+    fails its own handshake carries the link through the server instead; that
+    is internal to this mode, not a switch to another one.
 ``ssh_forward``
-    The fallback for infrastructure that permits nothing else: one SSH process
-    holding one port forward for the lifetime of the connection.
+    For infrastructure that permits nothing else: one SSH process holding one
+    port forward for the lifetime of the connection.
 
-Only ``ssh_forward`` is implemented here.  The other two modes are declared and
-refused with a typed error so that a missing mode is visible rather than
-silently degraded into per-operation SSH.
+Only ``ssh_forward`` is implemented here.  Configuring either other mode raises
+a typed error, so a missing implementation is visible rather than silently
+served by SSH.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -43,12 +49,11 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import REMOTE_TRANSPORT_MODE_ENV, TransportMode
 from clio_relay.errors import RelayError
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
 from clio_relay.session_lifecycle import OwnedSessionIdentityChallengeRequest
-
-TransportMode = Literal["brokered_tcp", "udp_rendezvous", "ssh_forward"]
 
 CHANNEL_BOOTSTRAP_SCHEMA: Final = "clio-relay.channel-bootstrap.v1"
 CHANNEL_EVENT_SCHEMA: Final = "clio-relay.control-channel-event.v1"
@@ -135,6 +140,34 @@ class OwnedSessionChannelBootstrap(BaseModel):
     identity: dict[str, object] = Field(default_factory=dict[str, object])
 
 
+class StreamChannelsUnavailable(RelayError):
+    """This transport cannot yet carry multiplexed stream channels."""
+
+
+@dataclass(frozen=True)
+class ChannelLink:
+    """One established relay-to-relay link.
+
+    The link, not the owned-session API, is the unit the design holds open.
+    Owned-session request/response rides ``control_endpoint`` today, but the
+    same link is also what live application service streams must ride: a
+    compute node reaches the cluster relay over cluster-internal connectivity,
+    the cluster relay carries that traffic across this link, and the local relay
+    serves it -- identically in every mode, because a compute node on a real
+    HPC cluster has no route to the internet and cannot dial a relay host
+    itself.
+
+    ``stream_channels`` is therefore part of the link's shape from the start.
+    No mode implements it yet; :meth:`RelayTransport.open_stream_channel`
+    refuses with a typed error until one does, so adding it later extends this
+    interface instead of breaking it.
+    """
+
+    control_endpoint: ChannelEndpoint
+    bootstrap: OwnedSessionChannelBootstrap
+    stream_channels: bool = False
+
+
 class ChannelEvent(BaseModel):
     """One typed, visible transport lifecycle transition.
 
@@ -219,6 +252,56 @@ def spawn_channel_process(*args: Any, **kwargs: Any) -> ChannelProcess:
     return cast(ChannelProcess, subprocess.Popen(*args, **kwargs))
 
 
+class BoundedStderrBuffer:
+    """A drained, bounded record of what a held channel process wrote to stderr.
+
+    The channel process lives for the whole connection, so its stderr pipe must
+    be read continuously or it fills and the process blocks writing to it --
+    which in ``ssh_forward`` mode stops the port forward being serviced, with no
+    error and no event.  ``ssh -L`` writes one line per refused forwarded
+    connection, so this is reached in ordinary operation, and the pipe buffer is
+    only about 4 KiB on Windows.
+    """
+
+    def __init__(self, *, maximum_bytes: int = MAX_CHANNEL_EVENT_DETAIL_CHARS) -> None:
+        if maximum_bytes <= 0:
+            raise ValueError("stderr buffer maximum_bytes must be positive")
+        self._maximum_bytes = maximum_bytes
+        self._lock = threading.Lock()
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+
+    def append(self, payload: bytes) -> None:
+        """Record one chunk, discarding the oldest to stay inside the bound."""
+        with self._lock:
+            self._chunks.append(payload)
+            self._size += len(payload)
+            while self._size > self._maximum_bytes and len(self._chunks) > 1:
+                self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str | None:
+        """Return the retained diagnostics, or None when nothing was written."""
+        with self._lock:
+            joined = b"".join(self._chunks)
+        detail = joined.decode("utf-8", errors="replace").strip()
+        return detail[-self._maximum_bytes :] or None
+
+
+def pump_stderr(stream: IO[bytes], buffer: BoundedStderrBuffer) -> threading.Thread:
+    """Continuously drain one process's stderr into a bounded buffer."""
+
+    def _pump() -> None:
+        try:
+            for line in stream:
+                buffer.append(line)
+        except (OSError, ValueError):
+            pass
+
+    thread = threading.Thread(target=_pump, name="clio-relay-channel-stderr", daemon=True)
+    thread.start()
+    return thread
+
+
 class RelayTransport(Protocol):
     """One establishable relay-to-relay link.
 
@@ -237,8 +320,18 @@ class RelayTransport(Protocol):
         """Return whether establishing may block on an interactive approval."""
         ...
 
-    def establish(self, *, nonce: str) -> tuple[ChannelEndpoint, OwnedSessionChannelBootstrap]:
-        """Bring the link up once and return its endpoint and bootstrap facts."""
+    def establish(self, *, nonce: str) -> ChannelLink:
+        """Bring the link up once and return it."""
+        ...
+
+    def open_stream_channel(self, *, name: str, remote_port: int) -> ChannelEndpoint:
+        """Map one additional stream channel onto the SAME held link.
+
+        This is how live application service traffic will ride the one link in
+        a later slice. It must never open new transport: a mode that cannot
+        multiplex additional channels onto its established link refuses with
+        :class:`StreamChannelsUnavailable` rather than dialing.
+        """
         ...
 
     def is_alive(self) -> bool:
@@ -295,6 +388,7 @@ class SshForwardTransport:
         self._authorization_timeout_seconds = authorization_timeout_seconds
         self._allow_interactive_authorization = allow_interactive_authorization
         self._process: ChannelProcess | None = None
+        self._stderr_buffer: BoundedStderrBuffer | None = None
         self._established = False
         self._failure_detail: str | None = None
 
@@ -323,6 +417,13 @@ class SshForwardTransport:
             # the authorization prompt.  The default keeps the user's single
             # bring-up approval possible.
             options = ["-o", "BatchMode=yes", *options]
+        # ssh joins its trailing operands with single spaces into ONE command
+        # string for the remote login shell; local argv boundaries are not
+        # preserved. The remote command must therefore arrive pre-quoted, the
+        # way remote_cli.py and session_lifecycle.py already do it. Passing the
+        # script as a separate argv element would strip `set -euo pipefail` of
+        # its effect and hand the body to whatever login shell the account has.
+        remote_command = f"bash -lc {shlex.quote(self._bootstrap_script)}"
         return [
             "ssh",
             "-T",
@@ -330,13 +431,11 @@ class SshForwardTransport:
             "-L",
             f"127.0.0.1:{local_port}:127.0.0.1:{self._remote_api_port}",
             self._definition.ssh_host,
-            "bash",
-            "-lc",
-            self._bootstrap_script,
+            remote_command,
         ]
 
-    def establish(self, *, nonce: str) -> tuple[ChannelEndpoint, OwnedSessionChannelBootstrap]:
-        """Dial once, hold the forward, and return the bring-up bootstrap."""
+    def establish(self, *, nonce: str) -> ChannelLink:
+        """Dial once, hold the forward, and return the established link."""
         if self._established:
             raise RelayError("ssh forward transport was already established")
         if len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce):
@@ -350,6 +449,9 @@ class SshForwardTransport:
         )
         self._process = process
         self._established = True
+        if process.stderr is not None:
+            self._stderr_buffer = BoundedStderrBuffer()
+            pump_stderr(process.stderr, self._stderr_buffer)
         try:
             bootstrap = self._read_bootstrap(process)
             endpoint = ChannelEndpoint(host="127.0.0.1", port=local_port)
@@ -362,7 +464,20 @@ class SshForwardTransport:
             self._failure_detail = self._drain_stderr()
             self.close()
             raise
-        return endpoint, bootstrap
+        return ChannelLink(control_endpoint=endpoint, bootstrap=bootstrap)
+
+    def open_stream_channel(self, *, name: str, remote_port: int) -> ChannelEndpoint:
+        """Refuse until this mode can multiplex channels onto the held forward.
+
+        Adding a forward to an established SSH connection needs a control
+        socket on that same connection. That is multiplexing the one held link,
+        not per-operation dialing -- but it is not built here, and this must
+        never fall back to a second SSH connection.
+        """
+        raise StreamChannelsUnavailable(
+            f"ssh_forward cannot yet carry the {name!r} stream channel to remote port "
+            f"{remote_port}; live service streams must ride the one held link, not a new one"
+        )
 
     def is_alive(self) -> bool:
         """Return whether the held SSH process is still running."""
@@ -392,6 +507,12 @@ class SshForwardTransport:
                 process.wait(timeout=5)
             except (subprocess.TimeoutExpired, OSError):
                 process.kill()
+                with suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=5)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                with suppress(OSError):
+                    stream.close()
 
     def _read_bootstrap(self, process: ChannelProcess) -> OwnedSessionChannelBootstrap:
         """Read the bring-up document the held process emits between its markers."""
@@ -428,17 +549,17 @@ class SshForwardTransport:
             ) from exc
 
     def _drain_stderr(self) -> str | None:
-        """Return bounded stderr from the channel process without blocking forever."""
-        process = self._process
-        if process is None or process.stderr is None:
+        """Return the most recent bounded diagnostics the channel process wrote.
+
+        This reads the ring buffer the stderr pump fills, never the pipe.  A
+        blocking read here would hang every bring-up failure path: the held
+        process is still alive, so its stderr pipe has no EOF and a fixed-size
+        read would wait for bytes that never come.
+        """
+        recorded = self._stderr_buffer
+        if recorded is None:
             return None
-        try:
-            payload = process.stderr.read(MAX_CHANNEL_EVENT_DETAIL_CHARS)
-        except (OSError, ValueError):
-            return None
-        if not payload:
-            return None
-        return payload.decode("utf-8", errors="replace").strip() or None
+        return recorded.text()
 
 
 def owned_session_channel_bootstrap_script(
@@ -503,12 +624,13 @@ def build_transport(
     ready_timeout_seconds: float = DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS,
     allow_interactive_authorization: bool = True,
 ) -> RelayTransport:
-    """Build the transport for one declared mode.
+    """Build the transport for the mode this connection is configured to use.
 
     ``brokered_tcp`` and ``udp_rendezvous`` are part of the design and slot in
-    here as sibling implementations.  Until they exist this refuses with a typed
-    error rather than falling back, so an unimplemented mode can never quietly
-    become per-operation SSH.
+    here as sibling implementations.  Until they exist, asking for one is a
+    typed refusal: this function never substitutes a different mode, so a
+    connection configured for a server-brokered pathway can never quietly be
+    served by SSH instead.
     """
     if mode == "ssh_forward":
         return SshForwardTransport(
@@ -531,7 +653,8 @@ def build_transport(
     if mode in ("brokered_tcp", "udp_rendezvous"):
         raise TransportModeUnavailable(
             f"relay transport mode {mode!r} is declared by the design but not implemented in "
-            "this build; configure the ssh_forward fallback explicitly instead of falling back"
+            f"this build; set {REMOTE_TRANSPORT_MODE_ENV} to a mode this build implements "
+            "rather than expecting another mode to serve the connection"
         )
     raise ValueError(f"unknown relay transport mode: {mode!r}")
 

@@ -24,17 +24,17 @@ from contextlib import suppress
 from typing import Final, Literal, cast
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import RelaySettings
+from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
     ChannelDropped,
     ChannelEndpoint,
     ChannelEvent,
     ChannelEventSink,
+    ChannelLink,
     ChannelNotEstablished,
     ChannelProcessFactory,
     OwnedSessionChannelBootstrap,
     RelayTransport,
-    TransportMode,
     build_transport,
     channel_event,
 )
@@ -103,11 +103,11 @@ class RemoteConnection:
         definition: ClusterDefinition,
         settings: RelaySettings,
         remote_api_port: int | None = None,
-        transport_mode: TransportMode = "ssh_forward",
+        transport_mode: TransportMode | None = None,
         process_factory: ChannelProcessFactory | None = None,
         timeout_seconds: float = 30.0,
         event_sink: ChannelEventSink | None = None,
-        allow_interactive_authorization: bool = True,
+        allow_interactive_authorization: bool | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -124,18 +124,32 @@ class RemoteConnection:
             settings=settings,
             remote_api_port=remote_api_port,
         )
-        self._transport_mode: TransportMode = transport_mode
+        # The mode is configuration, never a runtime choice: it is fixed for the
+        # connection's whole life and every reconnect re-establishes this same
+        # mode. Nothing here probes a mode or substitutes another one.
+        self._transport_mode: TransportMode = transport_mode or settings.remote_transport_mode
         self._process_factory = process_factory
         self._timeout_seconds = timeout_seconds
         self._event_sink = event_sink
-        self._allow_interactive_authorization = allow_interactive_authorization
+        # A headless deployment must be able to refuse the prompt rather than
+        # burn its whole bring-up deadline waiting for a tty that is not there.
+        self._allow_interactive_authorization = (
+            settings.remote_transport_interactive
+            if allow_interactive_authorization is None
+            else allow_interactive_authorization
+        )
         self._lock = threading.RLock()
         self._transport: RelayTransport | None = None
         self._endpoint: ChannelEndpoint | None = None
         self._bootstrap: OwnedSessionChannelBootstrap | None = None
+        self._link: ChannelLink | None = None
         self._nonce: str | None = None
         self._idle_streams: list[http.client.HTTPConnection] = []
         self._open_streams = 0
+        # Counts proofs, not live streams: the event means "another stream was
+        # proven after bring-up", which is true both when one replaces a dead
+        # stream and when concurrency needs an extra one.
+        self._streams_proven = 0
         self._transport_generation = 0
         self._attempt = 0
         self._events: list[ChannelEvent] = []
@@ -180,6 +194,15 @@ class RemoteConnection:
     def bootstrap(self) -> OwnedSessionChannelBootstrap | None:
         """Return the out-of-band bring-up document proven for this channel."""
         return self._bootstrap
+
+    @property
+    def link(self) -> ChannelLink | None:
+        """Return the established link, or None when no channel is held.
+
+        The link is what every kind of traffic rides, not just owned-session
+        request/response; a later slice adds multiplexed stream channels to it.
+        """
+        return self._link
 
     def connect(self) -> None:
         """Establish the channel once.
@@ -351,7 +374,9 @@ class RemoteConnection:
             allow_interactive_authorization=self._allow_interactive_authorization,
         )
         try:
-            endpoint, bootstrap = transport.establish(nonce=nonce)
+            link = transport.establish(nonce=nonce)
+            endpoint = link.control_endpoint
+            bootstrap = link.bootstrap
             self._verify_bootstrap(bootstrap)
             stream = _open_identity_bound_stream(
                 endpoint=endpoint,
@@ -375,9 +400,11 @@ class RemoteConnection:
         self._transport = transport
         self._endpoint = endpoint
         self._bootstrap = bootstrap
+        self._link = link
         self._nonce = nonce
         self._idle_streams = [stream]
         self._open_streams = 1
+        self._streams_proven = 1
         self._record(
             channel_event(
                 cluster=self.cluster,
@@ -448,8 +475,7 @@ class RemoteConnection:
                 candidate = self._idle_streams.pop()
                 if candidate.sock is not None:
                     return candidate
-                with suppress(OSError):
-                    candidate.close()
+                self._close_stream_locked(candidate)
             endpoint = self._endpoint
             bootstrap = self._bootstrap
             nonce = self._nonce
@@ -475,7 +501,8 @@ class RemoteConnection:
                     "a stream was being proven"
                 )
             self._open_streams += 1
-            if self._open_streams > 1:
+            self._streams_proven += 1
+            if self._streams_proven > 1:
                 self._record(
                     channel_event(
                         cluster=self.cluster,
@@ -517,6 +544,7 @@ class RemoteConnection:
             with suppress(OSError):
                 stream.close()
         self._open_streams = 0
+        self._streams_proven = 0
         self._transport_generation += 1
         transport = self._transport
         self._transport = None
@@ -546,6 +574,7 @@ class RemoteConnectionRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._connections: dict[str, RemoteConnection] = {}
+        self._retired: list[dict[str, object]] = []
 
     def connection(
         self,
@@ -553,37 +582,57 @@ class RemoteConnectionRegistry:
         definition: ClusterDefinition,
         settings: RelaySettings,
         remote_api_port: int | None = None,
-        transport_mode: TransportMode = "ssh_forward",
+        transport_mode: TransportMode | None = None,
         process_factory: ChannelProcessFactory | None = None,
         timeout_seconds: float = 30.0,
         event_sink: ChannelEventSink | None = None,
-        allow_interactive_authorization: bool = True,
+        allow_interactive_authorization: bool | None = None,
     ) -> RemoteConnection:
-        """Return the held connection for one cluster, establishing it once."""
+        """Return the held connection for one cluster, establishing it once.
+
+        Bring-up can block for as long as a user takes to authorize it, so the
+        registry lock is never held across it: one cluster connecting must not
+        stall every other cluster's operations, nor the acceptance report.
+        """
         with self._lock:
             existing = self._connections.get(definition.name)
             if existing is not None and existing.matches(
                 settings=settings,
                 remote_api_port=remote_api_port,
             ):
-                existing.connect()
-                return existing
-            if existing is not None:
-                existing.close()
-                del self._connections[definition.name]
-            created = RemoteConnection(
-                definition=definition,
-                settings=settings,
-                remote_api_port=remote_api_port,
-                transport_mode=transport_mode,
-                process_factory=process_factory,
-                timeout_seconds=timeout_seconds,
-                event_sink=event_sink,
-                allow_interactive_authorization=allow_interactive_authorization,
-            )
-            created.connect()
+                held = existing
+            else:
+                held = None
+                if existing is not None:
+                    # The pinned identity changed, so this is a different
+                    # connection, not a retry. Retire the old one but keep its
+                    # transport count, or the acceptance measurement loses it.
+                    self._connections.pop(definition.name, None)
+                    self._retired.append(_retired_report(existing))
+        if held is not None:
+            held.connect()
+            return held
+        if existing is not None:
+            existing.close()
+        created = RemoteConnection(
+            definition=definition,
+            settings=settings,
+            remote_api_port=remote_api_port,
+            transport_mode=transport_mode,
+            process_factory=process_factory,
+            timeout_seconds=timeout_seconds,
+            event_sink=event_sink,
+            allow_interactive_authorization=allow_interactive_authorization,
+        )
+        created.connect()
+        with self._lock:
+            raced = self._connections.get(definition.name)
+            if raced is not None:
+                self._retired.append(_retired_report(created))
+                created.close()
+                return raced
             self._connections[definition.name] = created
-            return created
+        return created
 
     def get(self, cluster: str) -> RemoteConnection | None:
         """Return the existing connection for one cluster without creating it."""
@@ -610,6 +659,8 @@ class RemoteConnectionRegistry:
         """Close and forget one cluster's connection."""
         with self._lock:
             connection = self._connections.pop(cluster, None)
+            if connection is not None:
+                self._retired.append(_retired_report(connection))
         if connection is not None:
             connection.close()
 
@@ -618,6 +669,7 @@ class RemoteConnectionRegistry:
         with self._lock:
             connections = list(self._connections.values())
             self._connections.clear()
+            self._retired.extend(_retired_report(item) for item in connections)
         for connection in connections:
             connection.close()
 
@@ -637,6 +689,7 @@ class RemoteConnectionRegistry:
         """
         with self._lock:
             connections = dict(self._connections)
+            retired = list(self._retired)
         clusters: dict[str, object] = {}
         for cluster, connection in connections.items():
             events = connection.events
@@ -651,14 +704,33 @@ class RemoteConnectionRegistry:
                 ),
                 "events": [event.model_dump(mode="json") for event in events],
             }
+        live = sum(
+            cast(int, cast(dict[str, object], value)["transport_connections_opened"])
+            for value in clusters.values()
+        )
+        retired_total = sum(
+            cast(int, item["transport_connections_opened"]) for item in retired
+        )
         return {
             "schema_version": CHANNEL_EVENT_REPORT_SCHEMA,
             "clusters": clusters,
-            "transport_connections_opened": sum(
-                cast(int, cast(dict[str, object], value)["transport_connections_opened"])
-                for value in clusters.values()
-            ),
+            "retired": retired,
+            "transport_connections_opened": live + retired_total,
         }
+
+
+def _retired_report(connection: RemoteConnection) -> dict[str, object]:
+    """Keep a retired connection's transport count for the acceptance report."""
+    events = connection.events
+    return {
+        "cluster": connection.cluster,
+        "session_id": connection.session_id,
+        "session_generation_id": connection.session_generation_id,
+        "transport_mode": connection.transport_mode,
+        "transport_connections_opened": sum(
+            1 for event in events if event.event in {"established", "reestablished"}
+        ),
+    }
 
 
 _REGISTRY = RemoteConnectionRegistry()

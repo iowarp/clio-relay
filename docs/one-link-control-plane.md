@@ -22,6 +22,35 @@ declared and slot in as sibling implementations of `RelayTransport`
 `TransportModeUnavailable` — an unbuilt mode must never quietly degrade into
 per-operation SSH.
 
+**The mode is configuration, not a runtime decision.** SSH is not a fallback in
+the "try TCP, fail, degrade" sense: an operator configures which pathway a
+connection uses, per connection, at deployment time. Nothing probes a mode and
+nothing switches between them. A link failure re-establishes the *same*
+configured mode or reports a typed failure. Set it with
+`CLIO_RELAY_REMOTE_TRANSPORT_MODE` (`brokered_tcp` | `udp_rendezvous` |
+`ssh_forward`, default `ssh_forward`); an unrecognised value is refused at
+configuration load, not at first use. `CLIO_RELAY_REMOTE_TRANSPORT_INTERACTIVE=0`
+declares a headless deployment, which adds `BatchMode=yes` so bring-up fails
+fast instead of waiting for a prompt no one can answer.
+
+## What rides the link
+
+The link, not the owned-session API, is the unit the design holds open.
+Owned-session request/response rides its control endpoint today. Live
+application service streams must ride the *same* link: a compute node reaches
+the cluster relay over cluster-internal connectivity, the cluster relay carries
+that traffic across the link, and the local relay serves it — identically in
+every mode, because a compute node on a real HPC cluster has no route to the
+internet and cannot dial a relay host itself. (The current gateway
+implementation, where a compute-node-side `frpc` dials the relay host directly,
+is a deviation from this and is recorded on #179.)
+
+No mode carries multiplexed stream channels yet. What holds today is the shape:
+`ChannelLink` names its `control_endpoint` and a `stream_channels` capability
+flag, and `RelayTransport.open_stream_channel` exists and refuses with
+`StreamChannelsUnavailable` rather than opening a second connection. Adding
+streams later extends this interface instead of breaking it.
+
 ## How bring-up spends exactly one connection
 
 In `ssh_forward` mode a single SSH process does both jobs:
