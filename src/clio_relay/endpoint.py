@@ -43,6 +43,12 @@ from clio_relay.filesystem_paths import (
 )
 from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import installation_info
+from clio_relay.jarvis_dispatch_failure import (
+    JARVIS_DISPATCH_REFUSAL_RESOLUTION,
+    JarvisDispatchRefusal,
+    McpRuntimeIngestOutcome,
+    jarvis_dispatch_refusal,
+)
 from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
 from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
@@ -1167,7 +1173,7 @@ class EndpointWorker:
                 package_progress_provider=package_log_progress_adapter,
                 source_authority=PackageProgressSourceAuthority.PACKAGE_LOG,
             )
-        mcp_runtime_ingested = self._ingest_mcp_runtime_metadata(
+        mcp_runtime_outcome = self._ingest_mcp_runtime_metadata(
             job,
             task_id=task.task_id,
             spool=spool,
@@ -1176,15 +1182,24 @@ class EndpointWorker:
             scheduler_job_ids=scheduler_job_ids,
         )
         dispatch_recovered = False
-        if jarvis_execution_recovery is not None and not mcp_runtime_ingested:
-            dispatch_recovered = self._recover_jarvis_execution(
-                job,
-                task_id=task.task_id,
-                spool=spool,
-                state=runtime_metadata_state,
-                digests=runtime_metadata_digests,
-                scheduler_job_ids=scheduler_job_ids,
-            )
+        dispatch_refusal = mcp_runtime_outcome.refusal
+        if jarvis_execution_recovery is not None and not mcp_runtime_outcome.ingested:
+            if dispatch_refusal is not None:
+                self._refuse_jarvis_execution_recovery(
+                    job,
+                    task_id=task.task_id,
+                    spool=spool,
+                    refusal=dispatch_refusal,
+                )
+            else:
+                dispatch_recovered = self._recover_jarvis_execution(
+                    job,
+                    task_id=task.task_id,
+                    spool=spool,
+                    state=runtime_metadata_state,
+                    digests=runtime_metadata_digests,
+                    scheduler_job_ids=scheduler_job_ids,
+                )
         scheduler_identity_reconciled = False
         if not endpoint_mcp_call or jarvis_execution_recovery is not None:
             scheduler_identity_reconciled = self._resolve_execution_ownership(
@@ -1229,7 +1244,14 @@ class EndpointWorker:
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
         self._append_optional_result_artifacts(job, spool)
-        effective_returncode = 0 if dispatch_recovered else result.returncode
+        if dispatch_recovered:
+            effective_returncode = 0
+        elif dispatch_refusal is not None and result.returncode == 0:
+            # A recorded refusal is the run's answer. It stays the terminal
+            # outcome even if the transport that carried it exited cleanly.
+            effective_returncode = 1
+        else:
+            effective_returncode = result.returncode
         terminal_state = (
             JobState.CANCELED
             if self._job_cancellation_requested(job.job_id)
@@ -1288,19 +1310,30 @@ class EndpointWorker:
                 ),
             )
             return
+        failure_metadata: dict[str, object] = {"returncode": effective_returncode}
+        if dispatch_refusal is not None:
+            failure_metadata["jarvis_dispatch_refusal"] = dispatch_refusal.as_payload()
         self.queue.update_task_state(
             task.task_id,
             JobState.FAILED,
             message=f"Task failed: {task.name}",
-            metadata={"returncode": effective_returncode},
+            metadata=failure_metadata,
         )
         self.queue.update_job_state(
             job.job_id,
             JobState.FAILED,
             message=(
-                "Endpoint MCP operation failed" if endpoint_mcp_call else "JARVIS-CD run failed"
+                "JARVIS run failed"
+                if dispatch_refusal is not None
+                else "Endpoint MCP operation failed"
+                if endpoint_mcp_call
+                else "JARVIS-CD run failed"
             ),
-            error=f"exit code {effective_returncode}",
+            error=(
+                bounded_error_detail(dispatch_refusal.as_error_detail())
+                if dispatch_refusal is not None
+                else f"exit code {effective_returncode}"
+            ),
         )
 
     def _append_provenance_artifact(
@@ -2448,15 +2481,20 @@ class EndpointWorker:
         state: list[JarvisRuntimeMetadata | None],
         digests: set[str],
         scheduler_job_ids: list[str],
-    ) -> bool:
-        """Ingest structured runtime metadata returned by a remote MCP call."""
+    ) -> McpRuntimeIngestOutcome:
+        """Ingest structured runtime metadata returned by a remote MCP call.
+
+        Returns:
+            Whether native runtime metadata was adopted, together with the typed
+            refusal when the pinned route answered with an explicit tool error.
+        """
         route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
         if not route_valid:
-            return False
+            return McpRuntimeIngestOutcome(ingested=False)
         result_path = spool.path / "mcp-result.json"
         storage_result_path = internal_filesystem_path(result_path)
         if not storage_result_path.exists():
-            return False
+            return McpRuntimeIngestOutcome(ingested=False)
         try:
             result_document = json.loads(storage_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -2465,9 +2503,14 @@ class EndpointWorker:
                 "runtime.metadata_read_failed",
                 f"MCP runtime result could not be read: {exc}",
             )
-            return False
+            return McpRuntimeIngestOutcome(ingested=False)
         trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
         if not trusted:
+            identity_matched, _identity_reason = _jarvis_mcp_result_identity_matches(
+                job,
+                result_document,
+            )
+            refusal = jarvis_dispatch_refusal(result_document) if identity_matched else None
             self.queue.append_event(
                 job.job_id,
                 "runtime.metadata_refused",
@@ -2476,9 +2519,10 @@ class EndpointWorker:
                     "source": RuntimeMetadataSource.JARVIS_MCP.value,
                     "ownership_verified": False,
                     "reason": reason,
+                    "dispatch_refused": refusal is not None,
                 },
             )
-            return False
+            return McpRuntimeIngestOutcome(ingested=False, refusal=refusal)
         try:
             metadata = runtime_metadata_from_mcp_result_document(result_document)
         except ValueError as exc:
@@ -2496,7 +2540,7 @@ class EndpointWorker:
                 f"native JARVIS execution documents were invalid: {exc}"
             ) from exc
         if metadata is None:
-            return False
+            return McpRuntimeIngestOutcome(ingested=False)
         if not _runtime_metadata_is_native(metadata):
             self.queue.append_event(
                 job.job_id,
@@ -2508,7 +2552,7 @@ class EndpointWorker:
                     "reason": "native handle, record, and progress documents are required",
                 },
             )
-            return False
+            return McpRuntimeIngestOutcome(ingested=False)
         expected_pipeline_id = (
             job.spec.arguments.get("pipeline_id") if isinstance(job.spec, McpCallSpec) else None
         )
@@ -2565,7 +2609,7 @@ class EndpointWorker:
             resolution="dispatch_result",
             result_path=result_path,
         )
-        return True
+        return McpRuntimeIngestOutcome(ingested=True)
 
     def _recover_jarvis_execution(
         self,
@@ -3126,6 +3170,61 @@ class EndpointWorker:
                 "scheduler_job_id": metadata.scheduler_job_id,
                 "resolution": resolution,
                 "result_sha256": result_sha256,
+            },
+        )
+
+    def _refuse_jarvis_execution_recovery(
+        self,
+        job: RelayJob,
+        *,
+        task_id: str,
+        spool: JobSpool,
+        refusal: JarvisDispatchRefusal,
+    ) -> None:
+        """Settle ownership from one explicit JARVIS tool error on the dispatch.
+
+        The JARVIS user contract issues a durable execution handle only when a
+        run starts, so an ``isError`` answer proves no execution exists to query
+        or adopt. Recording it resolves the recovery intent instead of leaving
+        the durable job nonterminal behind an ownership question that cannot be
+        answered.
+        """
+        task = self.queue.get_task(task_id)
+        intent = _durable_jarvis_execution_recovery(job, task)
+        if intent is None:
+            return
+        if intent["state"] != "pending" or intent["dispatch_state"] != "started":
+            raise RelayError("JARVIS dispatch refusal did not match a released dispatch")
+        storage_result_path = internal_filesystem_path(spool.path / "mcp-result.json")
+        if not storage_result_path.is_file():
+            raise RelayError("JARVIS dispatch refusal has no durable result artifact")
+        result_sha256 = hashlib.sha256(storage_result_path.read_bytes()).hexdigest()
+        self.queue.update_task_metadata(
+            task_id,
+            {
+                "jarvis_execution_recovery": {
+                    **intent,
+                    "state": "resolved",
+                    "last_error": None,
+                    "next_retry_at": None,
+                    "result_sha256": result_sha256,
+                    "resolved_at": utc_now().isoformat(),
+                    "resolution": JARVIS_DISPATCH_REFUSAL_RESOLUTION,
+                    "scheduler_provider": None,
+                    "scheduler_job_id": None,
+                    "query_process": None,
+                },
+                "jarvis_dispatch_refusal": refusal.as_payload(),
+            },
+        )
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.dispatch_refused",
+            f"JARVIS refused the run: {refusal.as_error_detail()}",
+            payload={
+                "task_id": task_id,
+                "result_sha256": result_sha256,
+                **refusal.as_payload(),
             },
         )
 
@@ -4307,6 +4406,7 @@ class EndpointWorker:
             try:
                 recovered_dispatch = False
                 dispatch_not_released = False
+                dispatch_refused = False
                 recovered_runtime: JarvisRuntimeMetadata | None = None
                 recovery_spool: JobSpool | None = None
                 process_id = self._terminate_recorded_execution(
@@ -4359,6 +4459,11 @@ class EndpointWorker:
                     recovered_runtime = recovered_state[0]
                     task = self.queue.get_task(task.task_id)
                     recovery_intent = _durable_jarvis_execution_recovery(job, task)
+                elif (
+                    recovery_intent is not None
+                    and recovery_intent.get("resolution") == JARVIS_DISPATCH_REFUSAL_RESOLUTION
+                ):
+                    dispatch_refused = True
                 elif recovery_intent is not None:
                     recovery_spool = JobSpool(
                         self.settings.spool_dir,
@@ -4374,7 +4479,7 @@ class EndpointWorker:
                     recovered_dispatch = True
                 if recovery_intent is None:
                     self._reconcile_recorded_scheduler_submission(job, task)
-                elif dispatch_not_released:
+                elif dispatch_not_released or dispatch_refused:
                     pass
                 elif recovery_intent["state"] != "resolved" or not recovered_dispatch:
                     raise SchedulerSubmissionUnresolvedError(
@@ -4389,6 +4494,7 @@ class EndpointWorker:
                     and self._scheduler_cancel_was_requested(job.job_id)
                     and recovery_intent is not None
                     and not dispatch_not_released
+                    and not dispatch_refused
                 ):
                     owned_ids = self._durable_scheduler_job_ids(
                         job,
@@ -4446,6 +4552,18 @@ class EndpointWorker:
                             job.job_id,
                             JobState.SUCCEEDED,
                             message="JARVIS MCP response recovered from durable execution",
+                        )
+                elif dispatch_refused and not cancellation_requested:
+                    current_job = self.queue.get_job(job.job_id)
+                    if current_job.state not in {
+                        JobState.FAILED,
+                        JobState.CANCELED,
+                    }:
+                        self.queue.update_job_state(
+                            job.job_id,
+                            JobState.FAILED,
+                            message="JARVIS run failed",
+                            error=_durable_jarvis_dispatch_refusal_detail(task),
                         )
                 elif dispatch_not_released and not cancellation_requested:
                     current_job = self.queue.get_job(job.job_id)
@@ -5917,7 +6035,13 @@ def _durable_jarvis_execution_recovery(
                 or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
             )
         )
-        or resolution not in {None, "dispatch_result", "execution_query"}
+        or resolution
+        not in {
+            None,
+            "dispatch_result",
+            "execution_query",
+            JARVIS_DISPATCH_REFUSAL_RESOLUTION,
+        }
         or (
             scheduler_provider is not None
             and (not isinstance(scheduler_provider, str) or not scheduler_provider)
@@ -5995,6 +6119,20 @@ def _jarvis_execution_recovery_is_pending(job: RelayJob, task: RelayTask) -> boo
     return intent is not None and intent["state"] == "pending"
 
 
+def _durable_jarvis_dispatch_refusal_detail(task: RelayTask) -> str:
+    """Return the typed reason recorded when JARVIS refused one durable run."""
+    payload = task.metadata.get("jarvis_dispatch_refusal")
+    if isinstance(payload, dict):
+        typed = cast(dict[str, object], payload)
+        code = typed.get("code")
+        message = typed.get("message")
+        if isinstance(code, str) and code and isinstance(message, str) and message:
+            bounded = bounded_error_detail(f"{code}: {message}")
+            if bounded is not None:
+                return bounded
+    return "JARVIS refused the run without a recorded typed reason"
+
+
 def _durable_runtime_recovery_state(
     task: RelayTask,
 ) -> tuple[JarvisRuntimeMetadata | None, set[str]]:
@@ -6013,13 +6151,18 @@ def _durable_runtime_recovery_state(
     return runtime, {digest}
 
 
-def _trusted_jarvis_mcp_result(
+def _jarvis_mcp_result_identity_matches(
     job: RelayJob,
     document: object,
     *,
     expected_tool: str = "jarvis_run",
 ) -> tuple[bool, str]:
-    """Verify runtime identity came from the configured owned JARVIS MCP call."""
+    """Verify one MCP result document came from this durable job's pinned route.
+
+    Identity is independent of the call's outcome: a dispatch that answered with
+    a tool error still proves which route produced it, which is what lets the
+    worker record that answer as this job's typed failure.
+    """
     route_valid, route_reason = _trusted_jarvis_mcp_route(
         job,
         expected_tool=expected_tool,
@@ -6063,6 +6206,24 @@ def _trusted_jarvis_mcp_result(
         artifact_failure = "MCP result server artifact identity is not the exact relay release pin"
     if not artifact_verified:
         return False, artifact_failure
+    return True, "configured JARVIS MCP command and durable route matched"
+
+
+def _trusted_jarvis_mcp_result(
+    job: RelayJob,
+    document: object,
+    *,
+    expected_tool: str = "jarvis_run",
+) -> tuple[bool, str]:
+    """Verify runtime identity came from the configured owned JARVIS MCP call."""
+    identity_matched, identity_reason = _jarvis_mcp_result_identity_matches(
+        job,
+        document,
+        expected_tool=expected_tool,
+    )
+    if not identity_matched:
+        return False, identity_reason
+    typed = cast(dict[str, object], document)
     if (
         typed.get("returncode") != 0
         or typed.get("timed_out") is True
