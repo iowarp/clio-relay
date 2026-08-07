@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
         def to_dict(self) -> dict[str, Any]:
             """Return the serialized binding a package menu entry publishes."""
+            ...
 
 else:
     from jarvis_cd.core.pkg import Application

@@ -498,6 +498,30 @@ def reconcile_jarvis_run_inputs(
     return tuple(sorted(resolutions, key=lambda item: item.binding.identity()))
 
 
+def jarvis_run_input_drift(
+    current: JarvisPipelineInputBindings,
+    *,
+    settings: RelaySettings,
+) -> tuple[str, ...]:
+    """Return tracked step settings whose workspace content changed after staging.
+
+    A JARVIS route that cannot carry a resolved run manifest to the cluster must
+    detect drift before it ingests anything, so a changed local file becomes a
+    typed refusal rather than a run that claims bytes the configuration never
+    received.
+    """
+    snapshots = _snapshot_inputs_by_binding(current=current, settings=settings)
+    existing_by_identity = {item.identity(): item for item in current.bindings}
+    return tuple(
+        sorted(
+            f"{snapshot.step_id}.{snapshot.canonical_setting}"
+            for snapshot in snapshots
+            if existing_by_identity[(snapshot.step_id, snapshot.canonical_setting)].sha256
+            != snapshot.sha256
+        )
+    )
+
+
 def _snapshot_inputs(
     *,
     step_id: str,

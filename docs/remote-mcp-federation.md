@@ -274,14 +274,24 @@ must be at least the per-file bound. Relative paths are resolved under the
 workspace. Absolute paths are accepted only when the verified file remains
 inside it.
 
+Both JARVIS doors stage through the same plane. A registered route reaches it
+through its `clio-kit-jarvis-user-v3.6` registration; the built-in `jarvis_*`
+tools reach it through the relay's own pinned clio-kit release, whose contract
+digest and JARVIS-CD lock take the place of a registration revision in the
+staged route identity. The built-in door engages staging only when the JARVIS
+MCP runs on another machine: when it runs on this host the configured path is
+already the path the package reads, so nothing is transferred.
+
 Staging is schema-driven, not filename-driven. It is enabled only when all of
 these statements are true:
 
-- the registration declares exactly `contract: clio-kit-jarvis-user-v3.6` and
-  its immutable server artifact and discovered schemas match that contract;
-- the same MCP connection first completes
+- the door is the built-in JARVIS route, or a registration declares exactly
+  `contract: clio-kit-jarvis-user-v3.6` and its immutable server artifact and
+  discovered schemas match that contract;
+- the same route first completes
   `jarvis_describe(target="package", package_name=...,
-  wait_for_terminal=true)` on the same route;
+  wait_for_terminal=true)`, in this MCP connection or in an earlier one that
+  recorded the durable contract;
 - the selected package setting contains exactly
   `jarvis.configuration-input-binding.v1` with `kind="local_file"` and
   `structure="regular_file"`;
@@ -317,12 +327,19 @@ idempotency key reuses the already admitted manifest without rescanning the
 mutable workspace. A missing, unsafe, oversized, or concurrently changing file
 fails before run submission.
 
+The cluster-side materialization of a per-run manifest is accepted only for the
+registered contract. The built-in route therefore compares every tracked path
+against its staged digest before it ingests anything and refuses the run with a
+typed error naming each changed `step.setting`; call `jarvis_edit_step` on that
+setting to stage the new content, then run again.
+
 A changed route, registration, artifact, pipeline, session generation,
 checksum, or provenance fails closed rather than reusing stale bytes.
 
-Settings without the exact declaration are passed through unchanged; a
-path-looking name is never sufficient authority to read a local file. Legacy or
-other remote MCP contracts also remain pass-through and cannot opt into staging.
+Settings without the exact declaration are passed through unchanged, so a
+package that means a cluster-side absolute path keeps working; a path-looking
+name is never sufficient authority to read a local file. Legacy or other remote
+MCP contracts also remain pass-through and cannot opt into staging.
 Large collections should use a separately managed data-staging service or
 shared storage rather than raising these control-plane limits without review.
 
