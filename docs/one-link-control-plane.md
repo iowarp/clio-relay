@@ -70,10 +70,16 @@ Reconnect is explicit. If the held channel drops, the next operation raises
 `reestablishing` → `authorization_required` → `establishing` → `reestablished`.
 In `ssh_forward` mode that call is what the user authorizes.
 
-A broken *TCP stream* is not a broken *channel*. Re-opening the stream through
-the forward that is already held costs no new transport and is recorded as
-`stream_reproven`; the re-opened stream is re-proven against the same
-out-of-band bring-up identity document before any credential is sent.
+`RemoteConnectionRegistry.reconnect(cluster)` is the single entry point for it,
+so an operator action can reach it and a retry cannot.
+
+A broken *TCP stream* is not a broken *channel*. HTTP streams are pooled over
+the one held channel — a long poll on one operation must not block every other
+operation on the same cluster — and opening another stream is another TCP
+connection *through the forward that is already held*, so it costs no new
+transport. Each stream is proven against the same out-of-band bring-up identity
+document before any credential is sent, and extra streams are recorded as
+`stream_reproven`.
 
 ## One local relay, many remote relays
 

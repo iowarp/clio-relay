@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -32,7 +33,7 @@ from clio_relay.control_channel import (
     build_transport,
     owned_session_channel_bootstrap_script,
 )
-from clio_relay.errors import RelayError
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.remote_connection import (
@@ -723,4 +724,66 @@ def test_event_report_counts_the_transport_connections_the_gate_measures(
 
     reconnected = harness.registry.event_report()
     assert reconnected["transport_connections_opened"] == 2
+    assert harness.dials == 2
+
+
+def test_concurrent_operations_share_the_channel_without_serializing_or_redialing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long poll on one operation must not block the rest of the cluster.
+
+    Extra streams run through the forward that is already held, so concurrency
+    costs more TCP connections but never another SSH connection.
+    """
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    blocked = threading.Event()
+    released = threading.Event()
+    original_getresponse = _Stream.getresponse
+
+    def slow_wait(self: _Stream) -> _Response:
+        path = cast(str, self.harness.requests[-1]["path"])
+        if path.endswith("/wait"):
+            blocked.set()
+            assert released.wait(timeout=10)
+        return original_getresponse(self)
+
+    monkeypatch.setattr(_Stream, "getresponse", slow_wait)
+
+    waiter = threading.Thread(
+        target=lambda: connection.request_json(method="POST", path="/jobs/job_1/wait", body={}),
+        daemon=True,
+    )
+    waiter.start()
+    assert blocked.wait(timeout=10)
+
+    # The long poll is still in flight; other operations must proceed anyway.
+    for index in range(4):
+        connection.request_json(method="GET", path=f"/jobs/job_{index}/status")
+
+    released.set()
+    waiter.join(timeout=10)
+    assert waiter.is_alive() is False
+
+    assert harness.dials == 1
+    assert len(harness.streams) == 2
+
+
+def test_registry_reconnect_is_the_single_explicit_reestablish_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.processes[0].drop()
+
+    reconnected = harness.registry.reconnect("ares")
+
+    assert reconnected is connection
+    assert harness.dials == 2
+    assert connection.connected is True
+
+    with pytest.raises(ConfigurationError, match="no owned session connection is held"):
+        harness.registry.reconnect("theta")
     assert harness.dials == 2

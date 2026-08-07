@@ -46,6 +46,9 @@ from clio_relay.job_identity import (
 
 MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 MAX_RECORDED_CHANNEL_EVENTS: Final = 256
+# Idle streams held over the one channel; more concurrent operations simply open
+# more streams through the same forward, which costs no new transport.
+MAX_POOLED_CHANNEL_STREAMS: Final = 8
 DEFAULT_OWNED_SESSION_API_PORT: Final = 8765
 CHANNEL_EVENT_REPORT_SCHEMA: Final = "clio-relay.control-channel-report.v1"
 
@@ -131,7 +134,9 @@ class RemoteConnection:
         self._endpoint: ChannelEndpoint | None = None
         self._bootstrap: OwnedSessionChannelBootstrap | None = None
         self._nonce: str | None = None
-        self._stream: http.client.HTTPConnection | None = None
+        self._idle_streams: list[http.client.HTTPConnection] = []
+        self._open_streams = 0
+        self._transport_generation = 0
         self._attempt = 0
         self._events: list[ChannelEvent] = []
 
@@ -227,9 +232,9 @@ class RemoteConnection:
             not math.isfinite(response_timeout_seconds) or response_timeout_seconds <= 0
         ):
             raise ValueError("response_timeout_seconds must be positive and finite")
-        with self._lock:
-            stream = self._live_stream()
-            return _request_json_on_stream(
+        stream = self._acquire_stream()
+        try:
+            document = _request_json_on_stream(
                 stream=stream,
                 method=normalized_method,
                 path=path,
@@ -240,6 +245,11 @@ class RemoteConnection:
                 generation_id=self._generation_id,
                 response_timeout_seconds=response_timeout_seconds,
             )
+        except BaseException:
+            self._discard_stream(stream)
+            raise
+        self._release_stream(stream)
+        return document
 
     def session_status(self) -> dict[str, object]:
         """Read the remote relay session's status over the held channel.
@@ -366,7 +376,8 @@ class RemoteConnection:
         self._endpoint = endpoint
         self._bootstrap = bootstrap
         self._nonce = nonce
-        self._stream = stream
+        self._idle_streams = [stream]
+        self._open_streams = 1
         self._record(
             channel_event(
                 cluster=self.cluster,
@@ -402,76 +413,115 @@ class RemoteConnection:
                 "configure CLIO_RELAY_OWNER_SESSION_API_PORT for this connection"
             )
 
-    def _live_stream(self) -> http.client.HTTPConnection:
-        """Return the proven stream, re-proving it over the same held channel.
+    def _acquire_stream(self) -> http.client.HTTPConnection:
+        """Take one proven HTTP stream over the held channel.
 
-        A broken TCP stream is not a broken channel.  Re-opening it costs no new
-        transport: it is another connection through the forward that is already
-        held.  The re-opened stream is re-proven against the same out-of-band
-        bring-up identity document before any credential is sent, so the
-        connection never talks to an unproven listener.
+        Streams are pooled, not shared: a long poll on one operation must not
+        block every other operation on the same cluster.  Opening another stream
+        is another TCP connection *through the forward that is already held*, so
+        it costs no new transport -- the dial count is unchanged.  Every stream
+        is proven against the same out-of-band bring-up identity document before
+        any credential is sent, so none of them talks to an unproven listener.
         """
-        transport = self._transport
-        if transport is None:
-            raise ChannelNotEstablished(
-                f"owned session connection for {self.cluster} has no channel; call connect()"
-            )
-        if not transport.is_alive():
-            self._record(
-                channel_event(
-                    cluster=self.cluster,
-                    mode=self._transport_mode,
-                    event="dropped",
-                    attempt=self._attempt,
-                    reason="transport_exited",
-                    detail=transport.failure_detail(),
+        with self._lock:
+            transport = self._transport
+            if transport is None:
+                raise ChannelNotEstablished(
+                    f"owned session connection for {self.cluster} has no channel; call connect()"
                 )
-            )
-            raise ChannelDropped(
-                f"owned session channel for {self.cluster} dropped; "
-                "call reconnect() to re-establish it"
-            )
-        stream = self._stream
-        if stream is not None and stream.sock is not None:
-            return stream
-        endpoint = self._endpoint
-        bootstrap = self._bootstrap
-        nonce = self._nonce
-        if endpoint is None or bootstrap is None or nonce is None:
-            raise ChannelNotEstablished(
-                f"owned session connection for {self.cluster} lost its proven bring-up identity"
-            )
-        reproven = _open_identity_bound_stream(
+            if not transport.is_alive():
+                self._record(
+                    channel_event(
+                        cluster=self.cluster,
+                        mode=self._transport_mode,
+                        event="dropped",
+                        attempt=self._attempt,
+                        reason="transport_exited",
+                        detail=transport.failure_detail(),
+                    )
+                )
+                raise ChannelDropped(
+                    f"owned session channel for {self.cluster} dropped; "
+                    "call reconnect() to re-establish it"
+                )
+            while self._idle_streams:
+                candidate = self._idle_streams.pop()
+                if candidate.sock is not None:
+                    return candidate
+                with suppress(OSError):
+                    candidate.close()
+            endpoint = self._endpoint
+            bootstrap = self._bootstrap
+            nonce = self._nonce
+            generation = self._transport_generation
+            if endpoint is None or bootstrap is None or nonce is None:
+                raise ChannelNotEstablished(
+                    f"owned session connection for {self.cluster} lost its proven bring-up identity"
+                )
+        proven = _open_identity_bound_stream(
             endpoint=endpoint,
             nonce=nonce,
             expected_identity=bootstrap.identity,
             timeout_seconds=self._timeout_seconds,
         )
-        self._stream = reproven
-        self._record(
-            channel_event(
-                cluster=self.cluster,
-                mode=self._transport_mode,
-                event="stream_reproven",
-                attempt=self._attempt,
-                reason="http_stream_closed",
-            )
-        )
-        return reproven
+        with self._lock:
+            if generation != self._transport_generation:
+                # The channel was replaced while this stream was being proven;
+                # it belongs to a link that no longer exists.
+                with suppress(OSError):
+                    proven.close()
+                raise ChannelDropped(
+                    f"owned session channel for {self.cluster} was replaced while "
+                    "a stream was being proven"
+                )
+            self._open_streams += 1
+            if self._open_streams > 1:
+                self._record(
+                    channel_event(
+                        cluster=self.cluster,
+                        mode=self._transport_mode,
+                        event="stream_reproven",
+                        attempt=self._attempt,
+                        reason="http_stream_opened",
+                    )
+                )
+        return proven
+
+    def _release_stream(self, stream: http.client.HTTPConnection) -> None:
+        """Return one still-usable stream to the pool."""
+        with self._lock:
+            if stream.sock is None or self._transport is None:
+                self._close_stream_locked(stream)
+                return
+            if len(self._idle_streams) >= MAX_POOLED_CHANNEL_STREAMS:
+                self._close_stream_locked(stream)
+                return
+            self._idle_streams.append(stream)
+
+    def _discard_stream(self, stream: http.client.HTTPConnection) -> None:
+        """Drop one stream that failed; the channel itself is unaffected."""
+        with self._lock:
+            self._close_stream_locked(stream)
+
+    def _close_stream_locked(self, stream: http.client.HTTPConnection) -> None:
+        with suppress(OSError):
+            stream.close()
+        self._open_streams = max(0, self._open_streams - 1)
 
     def _release_locked(self, *, reason: str) -> None:
-        """Drop the held stream and transport without recording an event."""
+        """Drop every stream and the transport without recording an event."""
         del reason
-        stream = self._stream
-        self._stream = None
-        if stream is not None:
+        streams = self._idle_streams
+        self._idle_streams = []
+        for stream in streams:
             with suppress(OSError):
                 stream.close()
+        self._open_streams = 0
+        self._transport_generation += 1
         transport = self._transport
         self._transport = None
         self._endpoint = None
         self._bootstrap = None
-        self._nonce = None
         if transport is not None:
             transport.close()
 
@@ -539,6 +589,22 @@ class RemoteConnectionRegistry:
         """Return the existing connection for one cluster without creating it."""
         with self._lock:
             return self._connections.get(cluster)
+
+    def reconnect(self, cluster: str) -> RemoteConnection:
+        """Re-establish one cluster's dropped channel on explicit instruction.
+
+        This is the only way a replacement transport is ever opened.  In
+        ``ssh_forward`` mode calling it is what the present user authorizes, so
+        it must be reached from an operator action and never from a retry.
+        """
+        with self._lock:
+            connection = self._connections.get(cluster)
+        if connection is None:
+            raise ConfigurationError(
+                f"no owned session connection is held for cluster {cluster}"
+            )
+        connection.reconnect()
+        return connection
 
     def disconnect(self, cluster: str) -> None:
         """Close and forget one cluster's connection."""
