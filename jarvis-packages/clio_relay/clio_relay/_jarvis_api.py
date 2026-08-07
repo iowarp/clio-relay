@@ -16,7 +16,16 @@ if TYPE_CHECKING:
 
         config: dict[str, Any]
 
+    class ConfigurationInputBinding:
+        """Static shape of the JARVIS-CD configuration input binding used here."""
+
+        def __init__(self, *, kind: str, structure: str) -> None: ...
+
+        def to_dict(self) -> dict[str, Any]:
+            """Return the serialized binding a package menu entry publishes."""
+
 else:
     from jarvis_cd.core.pkg import Application
+    from jarvis_cd.deployment import ConfigurationInputBinding
 
-__all__ = ["Application"]
+__all__ = ["Application", "ConfigurationInputBinding"]
