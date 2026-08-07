@@ -5015,3 +5015,37 @@ def test_owned_session_start_status_wait_returns_on_the_first_terminal_observati
 
     assert status.start_state == "ready"
     assert calls == ["starting", "starting", "ready"]
+
+
+def test_default_cli_start_watch_costs_exactly_one_remote_command(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The CLI's default 120s watch must fit inside one bounded remote wait."""
+    definition, _release, plan = _durable_start_plan()
+    scripts: list[str] = []
+    pending = _durable_start_status(plan, state="starting")
+    moments = iter((0.0, 0.0, 120.0))
+
+    def fake_ssh(
+        _definition: ClusterDefinition,
+        script: str,
+        *,
+        timeout_seconds: float = 0.0,
+    ) -> str:
+        del timeout_seconds
+        scripts.append(script)
+        return pending.model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=120.0,
+        monotonic=lambda: next(moments),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.watch_deadline_exceeded is True
+    assert len(scripts) == 1
+    assert "--wait-seconds 120" in scripts[0]

@@ -148,7 +148,10 @@ Deployment and lifecycle, not the runtime control plane:
   must work when the owned API is not running and therefore cannot ride a
   channel that depends on it;
 - `session start-watch`, which observes a start transition that by definition
-  precedes the owned API. It is no longer a redial loop: the desktop sends its
-  remaining deadline as `--wait-seconds` and the cluster-local command blocks
-  against durable state, so one watch is one connection regardless of how long
-  the start takes.
+  precedes the owned API and therefore cannot ride a channel that depends on it.
+  It is no longer a redial loop: the desktop sends its remaining deadline as
+  `--wait-seconds` and the cluster-local command blocks against durable state.
+  The remote wait is capped at `MAX_REMOTE_SESSION_START_WAIT_SECONDS` (120s,
+  the ordinary remote-command budget) so a silent SSH command stays bounded, so
+  the cost is one connection per 120 seconds watched rather than one per 0.5s
+  interval. The CLI's default 120-second watch is exactly one connection.

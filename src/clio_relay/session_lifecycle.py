@@ -68,8 +68,11 @@ SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 _REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS = 15.0
-# One start watch is one bounded server-side wait, never a client redial loop.
-MAX_REMOTE_SESSION_START_WAIT_SECONDS = 60.0
+# One start watch is a bounded server-side wait, never a client redial loop.
+# The cap matches the ordinary remote-command budget above, so the CLI's default
+# 120-second watch costs exactly one connection; a longer watch costs one more
+# per cap rather than one per polling interval.
+MAX_REMOTE_SESSION_START_WAIT_SECONDS = _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS
 _REMOTE_SESSION_START_WAIT_TRANSPORT_MARGIN_SECONDS = 15.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
