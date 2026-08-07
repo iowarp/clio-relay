@@ -437,6 +437,86 @@ def test_refusal_outranks_a_clean_transport_exit(
     assert result.last_error == f"{SPECIMEN_ERROR_CODE}: {SPECIMEN_ERROR_MESSAGE}"
 
 
+def test_restart_cleanup_settles_a_run_left_stuck_by_an_earlier_build(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A job already stuck behind a failed recovery query settles on the next pass.
+
+    This reproduces the live specimen's durable state: the errored dispatch is in
+    the spool, the recovery intent is still pending, and the job never left
+    ``running``. Restart cleanup must read the recorded answer instead of
+    querying JARVIS again for an execution that was never created.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    command = ["clio-kit", "mcp-server", "jarvis"]
+    server_artifact = {
+        **verified_jarvis_server_artifact(),
+        "install_spec": "/releases/clio-kit.whl",
+    }
+    digest = remote_mcp_server_artifact_digest(server_artifact)
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    job = _submit_registered_run(
+        queue,
+        command=command,
+        digest=digest,
+        idempotency_key="copper-elastic-v1-run-007",
+    )
+    spec = cast(McpCallSpec, job.spec)
+    provider = _DispatchProvider(
+        document=_specimen_error_result_document(
+            command=command,
+            digest=digest,
+            server_artifact=server_artifact,
+            arguments=spec.arguments,
+            expected_registered_contract=spec.expected_registered_contract,
+            execution_id=cast(str, spec.arguments["execution_id"]),
+        ),
+        returncode=1,
+    )
+    worker = _worker(settings, queue, provider)
+
+    def _blind_to_refusals(_document: object) -> None:
+        return None
+
+    def _failed_recovery_query(*_args: object, **_kwargs: object) -> bool:
+        raise endpoint_module.SchedulerSubmissionUnresolvedError(
+            "artifact-pinned JARVIS execution recovery result was not trusted"
+        )
+
+    monkeypatch.setattr(endpoint_module, "jarvis_dispatch_refusal", _blind_to_refusals)
+    monkeypatch.setattr(
+        endpoint_module.EndpointWorker,
+        "_recover_jarvis_execution",
+        _failed_recovery_query,
+    )
+
+    stuck = worker.run_once()
+
+    assert stuck is not None
+    assert stuck.state is JobState.RUNNING
+    stuck_task = queue.list_tasks(job.job_id)[0]
+    stuck_intent = cast(dict[str, object], stuck_task.metadata["jarvis_execution_recovery"])
+    assert stuck_intent["state"] == "pending"
+
+    monkeypatch.undo()
+    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+
+    assert worker.run_once() is None
+
+    settled = queue.get_job(job.job_id)
+    assert settled.state is JobState.FAILED
+    assert settled.last_error == f"{SPECIMEN_ERROR_CODE}: {SPECIMEN_ERROR_MESSAGE}"
+    settled_task = queue.get_task(stuck_task.task_id)
+    assert settled_task.state is JobState.FAILED
+    settled_intent = cast(dict[str, object], settled_task.metadata["jarvis_execution_recovery"])
+    assert settled_intent["state"] == "resolved"
+    assert settled_intent["resolution"] == "dispatch_refusal"
+    events, _cursor = queue.drain_events(Cursor(job_id=job.job_id), limit=300)
+    assert "jarvis.dispatch_refused" in {event.event_type for event in events}
+
+
 def test_successful_jarvis_run_still_terminalizes_as_succeeded(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

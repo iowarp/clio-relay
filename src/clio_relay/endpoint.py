@@ -2513,11 +2513,7 @@ class EndpointWorker:
             return McpRuntimeIngestOutcome(ingested=False)
         trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
         if not trusted:
-            identity_matched, _identity_reason = _jarvis_mcp_result_identity_matches(
-                job,
-                result_document,
-            )
-            refusal = jarvis_dispatch_refusal(result_document) if identity_matched else None
+            refusal = _attributed_jarvis_dispatch_refusal(job, result_document)
             self.queue.append_event(
                 job.job_id,
                 "runtime.metadata_refused",
@@ -3210,6 +3206,32 @@ class EndpointWorker:
                 },
             )
         return values
+
+    def _recorded_jarvis_dispatch_refusal(
+        self,
+        job: RelayJob,
+        *,
+        spool: JobSpool,
+    ) -> JarvisDispatchRefusal | None:
+        """Return the typed refusal an earlier dispatch already persisted.
+
+        A worker that restarts, or one reconciling an attempt another worker
+        abandoned, reads the same durable answer the original dispatch recorded
+        rather than querying JARVIS for an execution the refusal proves absent.
+        """
+        storage_result_path = internal_filesystem_path(spool.path / "mcp-result.json")
+        if not storage_result_path.is_file():
+            return None
+        try:
+            document = json.loads(storage_result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.queue.append_event(
+                job.job_id,
+                "runtime.metadata_read_failed",
+                f"MCP runtime result could not be read: {exc}",
+            )
+            return None
+        return _attributed_jarvis_dispatch_refusal(job, document)
 
     def _refuse_jarvis_execution_recovery(
         self,
@@ -4485,15 +4507,28 @@ class EndpointWorker:
                         relay_job_id=job.job_id,
                         task_id=task.task_id,
                     )
+                    recorded_refusal = self._recorded_jarvis_dispatch_refusal(
+                        job,
+                        spool=recovery_spool,
+                    )
                     with self._jarvis_execution_recovery_claim(job, task=task):
-                        recovered_dispatch = self._recover_jarvis_execution(
-                            job,
-                            task_id=task.task_id,
-                            spool=recovery_spool,
-                            state=recovered_state,
-                            digests=previous_digests,
-                            scheduler_job_ids=recovered_scheduler_job_ids,
-                        )
+                        if recorded_refusal is not None:
+                            self._refuse_jarvis_execution_recovery(
+                                job,
+                                task_id=task.task_id,
+                                spool=recovery_spool,
+                                refusal=recorded_refusal,
+                            )
+                            dispatch_refused = True
+                        else:
+                            recovered_dispatch = self._recover_jarvis_execution(
+                                job,
+                                task_id=task.task_id,
+                                spool=recovery_spool,
+                                state=recovered_state,
+                                digests=previous_digests,
+                                scheduler_job_ids=recovered_scheduler_job_ids,
+                            )
                     recovered_runtime = recovered_state[0]
                     task = self.queue.get_task(task.task_id)
                     recovery_intent = _durable_jarvis_execution_recovery(job, task)
@@ -6155,6 +6190,17 @@ def _jarvis_execution_recovery_is_pending(job: RelayJob, task: RelayTask) -> boo
     """Return whether scheduler identity is awaiting an exact JARVIS query."""
     intent = _durable_jarvis_execution_recovery(job, task)
     return intent is not None and intent["state"] == "pending"
+
+
+def _attributed_jarvis_dispatch_refusal(
+    job: RelayJob,
+    document: object,
+) -> JarvisDispatchRefusal | None:
+    """Return the typed refusal only when the result came from this job's route."""
+    identity_matched, _identity_reason = _jarvis_mcp_result_identity_matches(job, document)
+    if not identity_matched:
+        return None
+    return jarvis_dispatch_refusal(document)
 
 
 def _durable_jarvis_dispatch_refusal_detail(task: RelayTask) -> str:
