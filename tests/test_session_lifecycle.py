@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -4911,3 +4911,141 @@ def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
     assert "exec 9>" not in script
     assert "metadata.json" not in script
     assert "last_cleanup" not in script
+
+
+def test_start_watch_is_one_bounded_server_side_wait_not_a_redial_loop(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A start watch must cost one remote command, whatever the start costs."""
+    definition, _release, plan = _durable_start_plan()
+    scripts: list[str] = []
+    timeouts: list[float] = []
+    ready = _durable_start_status(plan, state="ready")
+
+    def fake_ssh(
+        _definition: ClusterDefinition,
+        script: str,
+        *,
+        timeout_seconds: float = 0.0,
+    ) -> str:
+        scripts.append(script)
+        timeouts.append(timeout_seconds)
+        return ready.model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=45.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.state == "ready"
+    assert len(scripts) == 1
+    assert "--wait-seconds 45" in scripts[0]
+    # The transport deadline must outlast the remote wait it is carrying.
+    assert timeouts[0] > 45.0
+
+
+def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch) -> None:
+    definition, _release, plan = _durable_start_plan()
+    scripts: list[str] = []
+    pending = _durable_start_status(plan, state="starting")
+    moments = iter((0.0, 0.0, 600.0))
+
+    def fake_ssh(
+        _definition: ClusterDefinition,
+        script: str,
+        *,
+        timeout_seconds: float = 0.0,
+    ) -> str:
+        del timeout_seconds
+        scripts.append(script)
+        return pending.model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=600.0,
+        monotonic=lambda: next(moments),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.watch_deadline_exceeded is True
+    assert len(scripts) == 1
+    assert (
+        f"--wait-seconds {session_lifecycle.MAX_REMOTE_SESSION_START_WAIT_SECONDS:g}" in scripts[0]
+    )
+
+
+def test_owned_session_start_status_wait_returns_on_the_first_terminal_observation() -> None:
+    observations = iter(("starting", "starting", "ready"))
+    calls: list[str] = []
+
+    def fake_inspect(**kwargs: object) -> OwnedSessionRecoveryStatus:
+        state = next(observations)
+        calls.append(state)
+        return OwnedSessionRecoveryStatus(
+            cluster=str(kwargs["cluster"]),
+            session_id=str(kwargs["session_id"]),
+            session_generation_id="generation-start",
+            start_operation_id=str(kwargs["start_operation_id"]),
+            cluster_route_revision=str(kwargs["cluster_route_revision"]),
+            start_state=cast(Any, state),
+            running=state == "ready",
+            ownership_verified=state == "ready",
+            recovery_verified=state == "ready",
+            start_attempt_verified=True,
+        )
+
+    status = session_lifecycle.wait_owned_session_start_status(
+        cluster="ares",
+        session_id="session-start",
+        start_operation_id="start_test",
+        cluster_route_revision="revision-1",
+        core_dir=Path("core"),
+        wait_seconds=30.0,
+        inspect=fake_inspect,
+        monotonic=iter([0.0, 1.0, 2.0, 3.0, 4.0]).__next__,
+        sleep=lambda _seconds: None,
+    )
+
+    assert status.start_state == "ready"
+    assert calls == ["starting", "starting", "ready"]
+
+
+def test_default_cli_start_watch_costs_exactly_one_remote_command(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The CLI's default 120s watch must fit inside one bounded remote wait."""
+    definition, _release, plan = _durable_start_plan()
+    scripts: list[str] = []
+    pending = _durable_start_status(plan, state="starting")
+    moments = iter((0.0, 0.0, 120.0))
+
+    def fake_ssh(
+        _definition: ClusterDefinition,
+        script: str,
+        *,
+        timeout_seconds: float = 0.0,
+    ) -> str:
+        del timeout_seconds
+        scripts.append(script)
+        return pending.model_dump_json()
+
+    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+
+    result = session_lifecycle.watch_remote_session_start(
+        definition=definition,
+        plan=plan,
+        timeout_seconds=120.0,
+        monotonic=lambda: next(moments),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.watch_deadline_exceeded is True
+    assert len(scripts) == 1
+    assert "--wait-seconds 120" in scripts[0]

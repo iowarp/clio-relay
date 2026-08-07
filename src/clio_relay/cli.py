@@ -279,7 +279,6 @@ from clio_relay.session_lifecycle import (
     execute_owned_session_teardown,
     finalize_remote_session_cleanup_report,
     inspect_owned_session_recovery_status,
-    inspect_owned_session_start_status,
     open_owned_session_transaction,
     plan_remote_session_start,
     publish_owned_session_api_startup_receipt,
@@ -291,6 +290,7 @@ from clio_relay.session_lifecycle import (
     start_remote_session_durable,
     status_remote_session,
     teardown_remote_session,
+    wait_owned_session_start_status,
     watch_remote_session_start,
 )
 from clio_relay.storage_runtime import (
@@ -5449,16 +5449,26 @@ def session_start_status_owned(
         str,
         typer.Option(help="Exact cluster route revision selected by the start plan."),
     ],
+    wait_seconds: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Block here against durable start state until the observation is terminal "
+                "or this bound elapses. Zero returns one nonblocking observation."
+            )
+        ),
+    ] = 0.0,
 ) -> None:
-    """Return one nonblocking cluster-local start observation."""
+    """Return one cluster-local start observation, optionally waiting for terminal."""
 
     def action() -> None:
-        status = inspect_owned_session_start_status(
+        status = wait_owned_session_start_status(
             cluster=cluster,
             session_id=session_id,
             start_operation_id=start_operation_id,
             cluster_route_revision=cluster_route_revision,
             core_dir=RelaySettings.from_env().core_dir,
+            wait_seconds=wait_seconds,
         )
         typer.echo(status.model_dump_json(indent=2))
 

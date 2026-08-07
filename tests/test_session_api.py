@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
-from collections.abc import Generator
-from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
+from clio_relay.control_channel import CHANNEL_BOOTSTRAP_BEGIN, CHANNEL_BOOTSTRAP_END
 from clio_relay.errors import ObservationTimeoutError, RelayError
+from clio_relay.job_identity import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+)
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     REGISTERED_JARVIS_USER_CONTRACT,
@@ -23,9 +27,8 @@ from clio_relay.models import (
     RelayJob,
     prepare_owned_jarvis_run_submission,
 )
+from clio_relay.remote_connection import RemoteConnectionRegistry
 from clio_relay.session_api import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
     OwnedSessionApiClient,
     session_identity_document,
     submit_owned_session_job,
@@ -116,12 +119,62 @@ class _Connection:
         self.sock = None
 
 
-class _ReadinessClient:
-    def __enter__(self) -> _ReadinessClient:
-        return self
+class _ChannelProcess:
+    """One fake held-channel process standing in for the bring-up SSH dial."""
 
-    def __exit__(self, *_args: object) -> None:
-        return None
+    def __init__(self, bootstrap: dict[str, object]) -> None:
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(
+            CHANNEL_BOOTSTRAP_BEGIN
+            + b"\n"
+            + json.dumps(bootstrap).encode("utf-8")
+            + b"\n"
+            + CHANNEL_BOOTSTRAP_END
+            + b"\n"
+        )
+        self.stderr = io.BytesIO(b"")
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def drop(self) -> None:
+        """Simulate the held channel dying without a local close."""
+        self.returncode = 255
+
+
+def _bootstrap_document(
+    *,
+    identity: dict[str, str],
+    session_generation_id: str = "generation-1",
+    remote_api_port: int = 8765,
+) -> dict[str, object]:
+    """Return the exact out-of-band document one bring-up dial reports."""
+    return {
+        "schema_version": "clio-relay.channel-bootstrap.v1",
+        "status": {
+            "owner": "clio-relay",
+            "cluster": "ares",
+            "session_id": "desktop-session-1",
+            "session_generation_id": session_generation_id,
+            "remote_api_port": remote_api_port,
+            "running": True,
+            "ownership_verified": True,
+        },
+        "identity": dict(identity),
+    }
 
 
 def _settings(tmp_path: Path) -> RelaySettings:
@@ -205,22 +258,16 @@ def _install_transport(
     *,
     responses: list[_Response],
     fail_authenticated_request: bool = False,
-) -> tuple[list[dict[str, object]], list[_Connection]]:
+    bootstrap: dict[str, object] | None = None,
+) -> _Transport:
+    """Install one fake held channel and expose its dial and request record.
+
+    Every element of the real transport is replaced at the seam the production
+    code actually uses: the channel process factory (one call == one SSH dial),
+    the loopback health probe, and the proven HTTP stream.  Nothing here can
+    reach a real ``ssh`` process, so a dial count is exact.
+    """
     nonce = "1" * 64
-
-    def status(*, definition: ClusterDefinition, session_id: str) -> dict[str, object]:
-        assert definition.name == "ares"
-        assert session_id == "desktop-session-1"
-        return {
-            "owner": "clio-relay",
-            "cluster": "ares",
-            "session_id": "desktop-session-1",
-            "session_generation_id": "generation-1",
-            "remote_api_port": 8766,
-            "running": True,
-            "ownership_verified": True,
-        }
-
     expected_identity = session_identity_document(
         owner_token="owner-token",
         cluster="ares",
@@ -228,15 +275,14 @@ def _install_transport(
         generation_id="generation-1",
         nonce=nonce,
     )
-
-    def challenge(**_kwargs: object) -> dict[str, object]:
-        return dict(expected_identity)
+    document = bootstrap or _bootstrap_document(identity=expected_identity)
 
     captured: list[dict[str, object]] = []
     connections: list[_Connection] = []
+    processes: list[_ChannelProcess] = []
 
-    def connection_factory(*_args: object, **_kwargs: object) -> _Connection:
-        timeout_value = _kwargs.get("timeout", 30.0)
+    def connection_factory(*_args: object, **kwargs: object) -> _Connection:
+        timeout_value = kwargs.get("timeout", 30.0)
         if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
             raise AssertionError("HTTP connection timeout must be numeric")
         connection = _Connection(
@@ -248,23 +294,48 @@ def _install_transport(
         connections.append(connection)
         return connection
 
-    @contextmanager
-    def forward(**_kwargs: Any) -> Generator[int, None, None]:
-        yield 18_766
+    def process_factory(*_args: object, **_kwargs: object) -> _ChannelProcess:
+        process = _ChannelProcess(document)
+        processes.append(process)
+        return process
 
     def token_hex(_size: int) -> str:
         return nonce
 
-    def readiness_client(**_kwargs: object) -> _ReadinessClient:
-        return _ReadinessClient()
+    registry = RemoteConnectionRegistry()
 
-    monkeypatch.setattr("clio_relay.session_api.status_remote_session", status)
-    monkeypatch.setattr("clio_relay.session_api.challenge_remote_session_identity", challenge)
-    monkeypatch.setattr("clio_relay.session_api.secrets.token_hex", token_hex)
-    monkeypatch.setattr("clio_relay.session_api.httpx.Client", readiness_client)
-    monkeypatch.setattr("clio_relay.session_api.http.client.HTTPConnection", connection_factory)
-    monkeypatch.setattr("clio_relay.session_api._ssh_forward", forward)
-    return captured, connections
+    def skip_health(*_args: object, **_kwargs: object) -> None:
+        """The forward is faked, so its loopback readiness probe is a no-op."""
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
+    monkeypatch.setattr("clio_relay.control_channel._wait_for_channel_health", skip_health)
+    monkeypatch.setattr("clio_relay.remote_connection.secrets.token_hex", token_hex)
+    monkeypatch.setattr(
+        "clio_relay.remote_connection.http.client.HTTPConnection",
+        connection_factory,
+    )
+    monkeypatch.setattr("clio_relay.session_api.connection_registry", lambda: registry)
+    return _Transport(
+        captured=captured,
+        connections=connections,
+        processes=processes,
+        registry=registry,
+    )
+
+
+@dataclass
+class _Transport:
+    """The observable record of one installed fake channel."""
+
+    captured: list[dict[str, object]]
+    connections: list[_Connection]
+    processes: list[_ChannelProcess]
+    registry: RemoteConnectionRegistry
+
+    @property
+    def dials(self) -> int:
+        """Return how many new channel processes (SSH dials) were spawned."""
+        return len(self.processes)
 
 
 def _submit_jarvis_run_receipt(
@@ -317,7 +388,7 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
         generation_id="generation-1",
         nonce="1" * 64,
     )
-    captured, connections = _install_transport(
+    transport = _install_transport(
         monkeypatch,
         responses=[
             _Response(identity),
@@ -343,19 +414,19 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
     assert job.owner_session_id == "desktop-session-1"
     assert job.owner_session_generation_id == "generation-1"
     assert job.metadata["owner_session_generation_id"] == "generation-1"
-    assert len(connections) == 1
-    proof_headers = captured[0]["headers"]
+    assert len(transport.connections) == 1
+    proof_headers = transport.captured[0]["headers"]
     assert isinstance(proof_headers, dict)
     assert "Authorization" not in proof_headers
     assert OWNER_SESSION_ID_HEADER not in proof_headers
     assert SESSION_GENERATION_ID_HEADER not in proof_headers
-    assert captured[0]["path"] == f"/session-identity?nonce={'1' * 64}"
-    auth_headers = captured[1]["headers"]
+    assert transport.captured[0]["path"] == f"/session-identity?nonce={'1' * 64}"
+    auth_headers = transport.captured[1]["headers"]
     assert isinstance(auth_headers, dict)
     assert auth_headers["Authorization"] == "Bearer session-api-token"
     assert auth_headers[OWNER_SESSION_ID_HEADER] == "desktop-session-1"
     assert auth_headers[SESSION_GENERATION_ID_HEADER] == "generation-1"
-    assert captured[1]["auto_open"] == 0
+    assert transport.captured[1]["auto_open"] == 0
 
 
 def test_owned_session_submission_rejects_dropped_artifact_dependencies(
@@ -544,7 +615,7 @@ def test_owned_session_client_reuses_one_proven_connection_for_composite_request
         generation_id="generation-1",
         nonce="1" * 64,
     )
-    captured, connections = _install_transport(
+    transport = _install_transport(
         monkeypatch,
         responses=[_Response(identity), _Response({"state": "running"}), _Response({"ok": True})],
     )
@@ -558,8 +629,8 @@ def test_owned_session_client_reuses_one_proven_connection_for_composite_request
             method="GET", path="/jobs/job_1/logs/stdout", query={"offset": 0, "limit": 64}
         ) == {"ok": True}
 
-    assert len(connections) == 1
-    assert [request["method"] for request in captured] == ["GET", "GET", "GET"]
+    assert len(transport.connections) == 1
+    assert [request["method"] for request in transport.captured] == ["GET", "GET", "GET"]
 
 
 def test_owned_session_client_scopes_long_response_timeout_to_one_request(
@@ -573,7 +644,7 @@ def test_owned_session_client_scopes_long_response_timeout_to_one_request(
         generation_id="generation-1",
         nonce="1" * 64,
     )
-    _captured, connections = _install_transport(
+    transport = _install_transport(
         monkeypatch,
         responses=[_Response(identity), _Response({"state": "succeeded"}), _Response({})],
     )
@@ -587,12 +658,12 @@ def test_owned_session_client_scopes_long_response_timeout_to_one_request(
             path="/jobs/job_1/wait",
             response_timeout_seconds=610,
         ) == {"state": "succeeded"}
-        assert connections[0].timeout == 30
-        assert connections[0].socket.timeout == 30
+        assert transport.connections[0].timeout == 30
+        assert transport.connections[0].socket.timeout == 30
         assert client.request_json(method="GET", path="/jobs/job_1/status") == {}
 
-    assert len(connections) == 1
-    assert connections[0].socket.timeout_changes == [610, 30]
+    assert len(transport.connections) == 1
+    assert transport.connections[0].socket.timeout_changes == [610, 30]
 
 
 def test_owned_session_client_types_only_a_bounded_response_deadline_as_observation_timeout(
@@ -606,7 +677,7 @@ def test_owned_session_client_types_only_a_bounded_response_deadline_as_observat
         generation_id="generation-1",
         nonce="1" * 64,
     )
-    _captured, connections = _install_transport(
+    transport = _install_transport(
         monkeypatch,
         responses=[_Response(identity), _TimeoutResponse({})],
     )
@@ -624,7 +695,7 @@ def test_owned_session_client_types_only_a_bounded_response_deadline_as_observat
             response_timeout_seconds=0.25,
         )
 
-    assert connections[0].socket.timeout_changes == [0.25, 30]
+    assert transport.connections[0].socket.timeout_changes == [0.25, 30]
 
 
 def test_owned_session_client_never_reconnects_after_identity_proof(
@@ -638,7 +709,7 @@ def test_owned_session_client_never_reconnects_after_identity_proof(
         generation_id="generation-1",
         nonce="1" * 64,
     )
-    captured, connections = _install_transport(
+    transport = _install_transport(
         monkeypatch,
         responses=[_Response(identity)],
         fail_authenticated_request=True,
@@ -653,31 +724,27 @@ def test_owned_session_client_never_reconnects_after_identity_proof(
     ):
         client.request_json(method="GET", path="/jobs/job_1/status")
 
-    assert len(connections) == 1
-    assert captured[1]["auto_open"] == 0
+    assert len(transport.connections) == 1
+    assert transport.captured[1]["auto_open"] == 0
 
 
-def test_owned_session_client_rejects_replaced_generation_before_transport(
+def test_owned_session_client_rejects_replaced_generation_before_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def status(*, definition: ClusterDefinition, session_id: str) -> dict[str, object]:
-        del definition, session_id
-        return {
-            "owner": "clio-relay",
-            "cluster": "ares",
-            "session_id": "desktop-session-1",
-            "session_generation_id": "generation-2",
-            "remote_api_port": 8766,
-            "running": True,
-            "ownership_verified": True,
-        }
-
-    def fail_client(**_kwargs: object) -> _ReadinessClient:
-        raise AssertionError("stale generation opened an HTTP transport")
-
-    monkeypatch.setattr("clio_relay.session_api.status_remote_session", status)
-    monkeypatch.setattr("clio_relay.session_api.httpx.Client", fail_client)
+    """A channel that reaches a replaced generation never carries a credential."""
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-2",
+        nonce="1" * 64,
+    )
+    transport = _install_transport(
+        monkeypatch,
+        responses=[_Response(identity)],
+        bootstrap=_bootstrap_document(identity=identity, session_generation_id="generation-2"),
+    )
 
     with pytest.raises(RelayError, match="ownership-verified generation"):
         submit_owned_session_job(
@@ -692,3 +759,8 @@ def test_owned_session_client_rejects_replaced_generation_before_transport(
                 "idempotency_key": "stale-generation",
             },
         )
+
+    assert transport.dials == 1
+    assert transport.connections == []
+    assert transport.captured == []
+    assert transport.processes[0].poll() is not None

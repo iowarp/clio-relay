@@ -21,6 +21,7 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.http_api import InputArtifactBodyLimitMiddleware, create_app
+from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
     EndpointRegistration,
@@ -36,7 +37,6 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.queue_management import diagnose_job
-from clio_relay.session_api import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import storage_managed_queue
 
