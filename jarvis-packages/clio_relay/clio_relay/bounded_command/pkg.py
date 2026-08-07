@@ -1,4 +1,13 @@
-"""JARVIS-CD package for bounded relay commands."""
+"""Run a bounded command on the cluster, optionally from a staged local script.
+
+The command is an explicit argument vector executed with no shell interposed,
+under a wall-clock limit, with optional structured progress extraction from
+stdout. Its script setting declares a local-file input binding: the relay
+stages one file from the caller's own machine, ingesting it as an immutable
+input artifact and appending the staged cluster path to the command as its
+final argument, so a shell script or any other interpreted file written on the
+caller's machine can be executed here without being copied by hand.
+"""
 
 from __future__ import annotations
 
