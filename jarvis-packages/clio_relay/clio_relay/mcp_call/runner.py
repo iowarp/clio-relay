@@ -175,6 +175,14 @@ _CLIO_KIT_REQUEST_ENV_OVERRIDES = {
     # remains available outside the served MCP session.
     "CLIO_KIT_UV_CACHE_PRUNE": "0",
 }
+# The relay composes one site runtime identity for a JARVIS run from the Spack
+# executable its cluster registered, and publishes it to this runner under a
+# relay-owned name. The JARVIS MCP server reads JARVIS_MCP_SPACK_COMMAND before
+# it searches PATH, SPACK_ROOT/bin, ~/.local/spack or /opt/spack, so mapping the
+# composed value onto that variable makes `spack load` resolve the registered
+# executable rather than whichever one a search happens to reach.
+_RELAY_JARVIS_SPACK_COMMAND_ENV = "CLIO_RELAY_JARVIS_SPACK_COMMAND"
+_JARVIS_MCP_SPACK_COMMAND_CHILD_ENV = "JARVIS_MCP_SPACK_COMMAND"
 _JARVIS_CD_LOCK_BINDING_SCHEMA = "clio-relay.jarvis-cd-lock-binding.v1"
 # These values intentionally mirror clio_relay.bootstrap. A focused release test
 # prevents either copy from moving independently. The JARVIS package also runs as
@@ -4795,12 +4803,11 @@ def _run_mcp_session(
     jarvis_input_manifest: dict[str, Any] | None = None,
     wait_for_locked_launcher: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    overrides = _child_environment_overrides(wait_for_locked_launcher=wait_for_locked_launcher)
     process = _open_process(
         command,
         env_from=env_from or {},
-        environment_overrides=(
-            _CLIO_KIT_REQUEST_ENV_OVERRIDES if wait_for_locked_launcher else None
-        ),
+        environment_overrides=overrides or None,
     )
     previous_handlers = _install_parent_termination_handlers(process)
     stdout_queue: Queue[_StreamEvent] = Queue()
@@ -5258,6 +5265,30 @@ def _drain_available(queue: Queue[_StreamEvent], lines: list[str]) -> None:
             lines.append(f"\n[{line.message}]\n")
         elif line is not None:
             lines.append(line)
+
+
+def _child_environment_overrides(*, wait_for_locked_launcher: bool) -> dict[str, str]:
+    """Return every relay-owned value applied on top of the referenced child env."""
+    overrides: dict[str, str] = {}
+    if wait_for_locked_launcher:
+        overrides.update(_CLIO_KIT_REQUEST_ENV_OVERRIDES)
+    overrides.update(_relay_composed_run_environment())
+    return overrides
+
+
+def _relay_composed_run_environment() -> dict[str, str]:
+    """Map the relay-composed site Spack identity onto the JARVIS child variable.
+
+    Returns:
+        The child overrides, empty when the relay composed no site identity for
+        this call. The relay publishes the variable only for a JARVIS run whose
+        cluster registered a Spack executable, so an unregistered cluster keeps
+        the previous child environment exactly.
+    """
+    composed = os.environ.get(_RELAY_JARVIS_SPACK_COMMAND_ENV)
+    if not composed:
+        return {}
+    return {_JARVIS_MCP_SPACK_COMMAND_CHILD_ENV: composed}
 
 
 def _open_process(

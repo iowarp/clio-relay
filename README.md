@@ -31,13 +31,15 @@ Lease admission uses a crash-replayed aggregate for constant-read capacity
 checks, while an explicit full audit retains exact canonical and operational
 index verification for repair and production diagnostics.
 
-Transport is replaceable because it only carries HTTP bytes between endpoints:
+A connection is the desktop relay and the cluster relay joined by exactly one persistent link. Every operation for that connection rides it — submission, status, events, logs, artifact content, input staging, watch, cancellation, teardown — and the link is established once at bring-up and held. Transport is replaceable because it only carries HTTP bytes between endpoints:
 
-- Relay mode uses frp through a public relay host. It supports WebSocket/TLS for Cloudflare-style HTTPS infrastructure and raw TCP for environments that provide a direct public port.
+- Relay mode is the primary path. Both relays dial outbound to a public relay host, which brokers a handshake joining them; neither side accepts inbound. It supports WebSocket/TLS for Cloudflare-style HTTPS infrastructure and raw TCP for environments that provide a direct public port.
 - NAT bypass uses frp XTCP to try a direct peer path between desktop and cluster. It is an optimization for lower-latency or higher-volume traffic, with fallback to relay mode and the durable queue.
-- SSH forwarding uses local port forwarding through an existing SSH or VPN path. It is useful for closed environments that do not want a public relay.
+- SSH forwarding is the fallback for closed environments that permit no other path. One local port forward is established at bring-up and held for the life of the connection.
 
-Remote agent tasks, remote MCP calls, JARVIS pipelines, and gateway sessions all use the same queue and observation model. The transport can change without changing where state lives.
+SSH is a bootstrap mechanism or that one held forward. A connection opens at most one ssh connection in the frp modes — deploying the cluster relay, skipped when it is already there — and at most two in the SSH fallback. After bring-up it opens none, for any number of operations, because a protected cluster asks for interactive 2FA and the user is present only for the first connection. One desktop relay manages many cluster connections at once, behind one MCP endpoint.
+
+Remote agent tasks, remote MCP calls, JARVIS pipelines, and gateway sessions all use the same queue and observation model. The transport can change without changing where state lives. See [connection model](docs/connection-model.md) for the normative statement, including how run inputs reach the cluster.
 
 ## Install
 
@@ -92,6 +94,11 @@ Expose relay tools to an agent:
 clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
 clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
 ```
+
+`--prompt` and `--mcp-config` name cluster-side paths for operator material
+placed once at bootstrap. They are not a transfer channel: run inputs reach the
+cluster through relay's schema-declared input staging, which snapshots a file
+from the desktop workspace and records its lineage on the job.
 
 The MCP server is native FastMCP and can project long-running relay operations
 through standard SEP-2663 task handles without introducing a second scheduler.
@@ -205,6 +212,8 @@ single-node `BatchHost` rather than guessing an allocation node.
 
 ## Choose Transport
 
+Choose the mode that builds the connection's one link. The primary path is frp through a public relay point; SSH forwarding is the fallback for infrastructure that permits nothing else. Both carry the same traffic afterwards.
+
 For a public relay through Cloudflare or another HTTPS edge, use frp with `transport.protocol = "wss"`:
 
 ```powershell
@@ -216,7 +225,7 @@ clio-relay relay-host render-frpc-visitor-config --cluster my-cluster --bind-por
 clio-relay relay-host test-http-transport --cluster my-cluster --local-bind-port 18765
 ```
 
-For closed environments where SSH or VPN already exists, use SSH local forwarding:
+For closed environments where no relay point is reachable, use SSH local forwarding. The forward is established once and held; nothing re-dials ssh for status, polling, recovery, or staging afterwards:
 
 ```powershell
 clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
@@ -241,6 +250,7 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
 
 ## Documentation
 
+- [connection model](docs/connection-model.md) — normative
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
 - [release](docs/release.md)

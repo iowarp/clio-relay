@@ -7,7 +7,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,6 +30,26 @@ DEFAULT_INPUT_FILE_MAX_COUNT = 16
 MAX_INPUT_FILE_MAX_BYTES = 64 * 1024 * 1024
 MAX_INPUT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
 ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV = "CLIO_RELAY_ALLOW_UNAUTHENTICATED_OWNED_SESSION"
+REMOTE_TRANSPORT_MODE_ENV = "CLIO_RELAY_REMOTE_TRANSPORT_MODE"
+REMOTE_TRANSPORT_INTERACTIVE_ENV = "CLIO_RELAY_REMOTE_TRANSPORT_INTERACTIVE"
+
+TransportMode = Literal["brokered_tcp", "udp_rendezvous", "ssh_forward"]
+"""How one remote connection reaches its remote relay.
+
+The mode is a deployment-time configuration choice, made per connection, not a
+runtime decision.  Nothing may probe one mode and switch to another: a link
+failure re-establishes the *same* configured mode or reports a typed failure.
+An operator picks ``brokered_tcp`` (TCP joined by an internet-accessible
+server), ``udp_rendezvous`` (the same rendezvous with NAT traversal), or
+``ssh_forward`` for infrastructure that permits nothing else.
+"""
+
+TRANSPORT_MODES: tuple[TransportMode, ...] = (
+    "brokered_tcp",
+    "udp_rendezvous",
+    "ssh_forward",
+)
+DEFAULT_REMOTE_TRANSPORT_MODE: TransportMode = "ssh_forward"
 
 
 class RelaySettings(BaseModel):
@@ -113,6 +133,9 @@ class RelaySettings(BaseModel):
     owner_session_id: str | None = None
     owner_session_generation_id: DurableRecordId | None = None
     owner_session_cluster: str | None = None
+    owner_session_api_port: int | None = Field(default=None, gt=0, le=65_535)
+    remote_transport_mode: TransportMode = DEFAULT_REMOTE_TRANSPORT_MODE
+    remote_transport_interactive: bool = True
     remote_cluster: str | None = None
     session_owner_token: str | None = None
     allow_unauthenticated_owned_session: bool = False
@@ -290,6 +313,14 @@ class RelaySettings(BaseModel):
             owner_session_id=os.getenv("CLIO_RELAY_OWNER_SESSION_ID"),
             owner_session_generation_id=os.getenv("CLIO_RELAY_SESSION_GENERATION_ID"),
             owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
+            owner_session_api_port=_optional_positive_int_env(
+                "CLIO_RELAY_OWNER_SESSION_API_PORT",
+            ),
+            remote_transport_mode=_transport_mode_env(),
+            remote_transport_interactive=_boolean_env(
+                REMOTE_TRANSPORT_INTERACTIVE_ENV,
+                True,
+            ),
             remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
             session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
             allow_unauthenticated_owned_session=_boolean_env(
@@ -402,6 +433,32 @@ def _positive_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _transport_mode_env() -> TransportMode:
+    """Read the configured transport mode; never infer or probe one."""
+    raw = os.getenv(REMOTE_TRANSPORT_MODE_ENV)
+    if raw is None or raw == "":
+        return DEFAULT_REMOTE_TRANSPORT_MODE
+    normalized = raw.strip().lower()
+    if normalized not in TRANSPORT_MODES:
+        supported = ", ".join(TRANSPORT_MODES)
+        raise ValueError(f"{REMOTE_TRANSPORT_MODE_ENV} must be one of: {supported}")
+    return normalized
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    """Read one optional positive integer without inventing a default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
     try:
         value = int(raw)
     except ValueError as exc:

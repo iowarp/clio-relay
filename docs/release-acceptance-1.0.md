@@ -13,6 +13,31 @@ by the 1.0 release policy. They are not product allowlists. Any operator can
 register other cluster names, and a later policy can select other evidence
 instances without a core-code change.
 
+## This runbook is harness scaffolding, not the relay interface
+
+The `ssh` and `scp` invocations below belong to the gate harness. They place
+build scripts, provider fixtures, and site material on an evidence cluster
+before any connection carries work. They are not how a client, an agent, or an
+application uses relay, and they must never be copied into product code, agent
+instructions, or a benchmark harness. `docs/connection-model.md` is normative
+for what relay actually does.
+
+Two steps below currently go further than fixture placement and stage a **run
+input** out of band: the LAMMPS input deck and the secure-runtime dataset
+descriptor are copied to the cluster and then referenced by cluster-absolute
+path. That is the bypass tracked by
+[#177](https://github.com/iowarp/clio-relay/issues/177), whose acceptance
+requires no out-of-band copying anywhere in the proven path. The capability
+those steps were waiting on has landed:
+[#176](https://github.com/iowarp/clio-relay/issues/176) makes the built-in
+JARVIS door stage declared inputs through the same plane as the registered
+route, so both steps can now be rewritten to pass a workspace-relative client
+path. Rewriting them is tracked on
+[#182](https://github.com/iowarp/clio-relay/issues/182) and has not been done
+yet; both steps are marked in place. They are recorded here as the current state
+of the harness, not as a supported pattern; a run input belongs in the relay's
+input staging, which leaves a non-empty `used_artifact_refs` on the job.
+
 ## Required report matrix
 
 Each stage produces exactly these 19 policy reports. The tracked
@@ -907,6 +932,13 @@ Invoke-RelayReport -Id "ares-jarvis-gray-scott" -ReportOption "--report" -Comman
   "--wait-timeout-seconds", "900", "--poll-seconds", "2"
 )
 
+# NON-CONFORMING, acceptance tracked by #177, rewrite tracked by #182. The
+# LAMMPS deck is a run input and must reach the cluster through relay input
+# staging: a path relative to CLIO_RELAY_INPUT_WORKSPACE_ROOT in config.script,
+# leaving a non-empty used_artifact_refs on the job. #176 landed the built-in
+# door's half of that capability; this step has not been rewritten onto it yet.
+# The out-of-band copy and cluster-absolute path below are the bypass. Do not
+# copy this pattern.
 $RemoteLammpsInput = "$AresRemoteRoot/lammps/in.lj"
 & $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/lammps'"
 Copy-RemoteTextFile `
@@ -1592,6 +1624,12 @@ the descriptor from the same operator-owned catalog record that the released
 Scientific Catalog MCP already validated. This lightweight preparation may run
 on the login node; ParaView itself runs only in the submitted SLURM allocation.
 
+The `ssh ... cat` below is harness convenience for reading operator-owned site
+metadata while assembling a fixture. It is not a relay capability: the local
+relay cannot read cluster storage, and a client asking for cluster-side content
+does so over the connection's link. Never write product code, or instruct an
+agent, to read a cluster file by shelling out.
+
 ```powershell
 $SecureDatasetId = "deep-water-impact-2018-yb31-first5"
 $CatalogText = (& $OpenSsh $AresSshHost "cat '$AresScientificCatalogFile'" | Out-String)
@@ -1607,6 +1645,11 @@ if ($SecureDatasetRecords.Count -ne 1 -or $null -eq $SecureDatasetRecords[0].des
 }
 $SecureDescriptorLocal = Write-JsonFile `
   "ares-secure-runtime-dataset-descriptor.json" $SecureDatasetRecords[0].descriptor
+# NON-CONFORMING, acceptance tracked by #177, rewrite tracked by #182. The
+# descriptor is a run input for the submitted pipeline; it belongs in relay input
+# staging rather than an out-of-band copy referenced by cluster-absolute path.
+# #176 landed the capability this step was waiting on; the step itself has not
+# been rewritten onto it yet. Do not copy this pattern.
 $SecureDescriptorRemote = "$AresRemoteRoot/secure-runtime/dataset-descriptor.json"
 & $OpenSsh $AresSshHost "install -d -m 700 '$AresRemoteRoot/secure-runtime'"
 if ($LASTEXITCODE -ne 0) { throw "secure-runtime fixture directory creation failed" }

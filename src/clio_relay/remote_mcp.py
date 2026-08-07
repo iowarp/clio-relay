@@ -1498,13 +1498,6 @@ class VirtualRemoteMcpTool:
                 "The terminal reconciliation is automatic; if its bound expires, relay "
                 "returns an error containing the still-observable durable job handle."
             )
-        elif exact_v36_routes and self.remote_tool.name == "jarvis_add_step":
-            description += (
-                " When configuration contains a package-declared local-file input, relay "
-                "performs bounded terminal reconciliation before recording durable input "
-                "lineage; calls without staged local inputs retain ordinary asynchronous "
-                "semantics."
-            )
         elif exact_v36_routes and self.remote_tool.name == "jarvis_run":
             description += (
                 " On each genuinely new run identity, relay securely reconciles every tracked "

@@ -25,7 +25,6 @@ import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
-import clio_relay.session_api as session_api_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
@@ -62,6 +61,7 @@ from clio_relay.models import (
     SchedulerStatus,
     ServiceRuntimeSpec,
 )
+from clio_relay.remote_connection import validate_channel_request
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.service_runtime import (
     ServiceRuntimePendingResult,
@@ -364,7 +364,7 @@ def test_owned_session_authority_uses_identity_bound_api_when_browser_attach_is_
     )
 
     assert (
-        session_api_module._validate_request(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        validate_channel_request(
             method="POST",
             path=runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
         )

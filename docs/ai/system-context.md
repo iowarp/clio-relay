@@ -6,7 +6,10 @@
 
 - `clio-core` is the authoritative queue and state boundary.
 - The file-backed queue in this repository is a development backend for the same record contract.
-- frp and SSH forwarding are byte transports only.
+- frp and SSH forwarding are byte transports only. A connection has exactly one
+  such link, established at bring-up and held; every control-plane and
+  data-plane operation rides it. See `docs/connection-model.md`, which is
+  normative for transport, ssh budget, reconnect, and input staging.
 - JARVIS-CD owns cluster execution, scheduler integration, package behavior, output collection, and provenance.
 - Application-specific behavior belongs in JARVIS packages or package-aware adapters, not in generic relay core code.
 
@@ -61,11 +64,13 @@ Session teardown quiesces the exact owner-session generation before discovery. W
 running jobs before gateway or API cleanup. It stops the API to seal intake, rescans
 for pre-quiescence in-flight submissions, and acknowledges those before gateway
 cleanup. A timeout leaves intake quiesced and the remaining resources explicit.
-Default scheduler retention remains evidence-bearing without opening one SSH
-process per job: exact scheduler identities are de-duplicated, grouped by
-provider, and queried in bounded batches of at most 256. Every job still emits
-its own validated cleanup resource and status; batching changes transport cost,
-not ownership or preservation semantics.
+Default scheduler retention remains evidence-bearing without a per-job remote
+round trip: exact scheduler identities are de-duplicated, grouped by provider,
+and queried in bounded batches of at most 256 over the connection's established
+link. Every job still emits its own validated cleanup resource and status;
+batching changes transport cost, not ownership or preservation semantics. Per-job
+dialing is not the baseline this improves on — no relay operation opens
+transport of its own.
 
 JARVIS-owned execution is authoritative only when it supplies the exact `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and `jarvis.execution.progress.v1` documents. The relay preserves those documents and projects them into `clio-relay.jarvis-runtime.v1` for job/task metadata, events, artifacts, and provenance. The older `jarvis.runtime.v1`, flexible structured payloads, and stdout scheduler patterns are compatibility evidence only and cannot authorize polling or cancellation or satisfy the 1.0 gate.
 
@@ -120,6 +125,15 @@ manifest before the worker materializes those settings and calls JARVIS.
 Idempotent retries reuse that manifest without rescanning Host state. Other
 schemas and path-looking arguments are pass-through.
 
+This is the only way a run input reaches the cluster. The declared value is a
+workspace-relative path on the client machine and the bytes ride the
+connection's one link; relay never copies a run input with `scp` or `rsync`, and
+a cluster-absolute path in a binding-declared setting disables staging rather
+than performing it. Non-empty `used_artifact_refs` with a digest matching the
+client's bytes is the proof that staging engaged. An empty list on a declared
+file-typed setting means the input arrived out of band: that run is not
+reproducible and cannot serve as evidence, whatever its terminal state says.
+
 Input file, aggregate-byte, and count limits are part of the immutable owned
 session start plan, status selector, retry selector, attempt journal, and ready
 session metadata. The cluster-local launcher projects that exact policy into
@@ -134,14 +148,43 @@ contains both forms.
 
 ## Transports
 
-Supported paths:
+One connection is one local relay and one remote relay joined by exactly one
+persistent link. The mode below decides how that link is built; it never gives
+an individual operation its own transport. Modes, in order of preference:
 
-- frp STCP over WebSocket/TLS for Cloudflare-backed or HTTPS-edge relay hosts.
-- frp STCP over TCP for public or institutional relay hosts.
-- SSH local port forwarding for closed environments that already have SSH or VPN access.
-- frp XTCP probing as an optional optimization with fallback.
+- frp STCP over WebSocket/TLS for Cloudflare-backed or HTTPS-edge relay hosts,
+  and over TCP for public or institutional relay hosts. Both relays dial
+  outbound and the relay point brokers the handshake that joins them; neither
+  side accepts inbound. This is the primary path.
+- frp XTCP probing as the UDP NAT-bypass variant, yielding a direct peer link
+  and falling back to the relay-point path.
+- SSH local port forwarding as the fallback for infrastructure that permits no
+  other path. One forward is established at bring-up and held for the lifetime
+  of the connection.
+
+The ssh budget is per connection lifetime: at most one connection in the frp
+modes (deploying the cluster relay, skipped when already deployed) and at most
+two in the ssh fallback (deploy plus the held forward). After bring-up, zero.
+The operating assumption is that a protected cluster requires interactive 2FA
+and the user is present only for the first connection, so no path may dial ssh
+unattended for status, polling, recovery, reconnect, or staging. SSH
+multiplexing and forward pooling are not fixes for exceeding the budget.
+
+Reconnect is first class: durable state lives in the core and the link is only
+transport, so the link is re-establishable without loss and a reconnect is never
+a new deployment. One local relay manages connections to many remote relays
+concurrently, behind one stable client-facing MCP endpoint.
 
 Transport failure must not corrupt queue state. Direct transport and NAT punching are optimizations, not reliability requirements.
+
+`docs/connection-model.md` is normative for this section. The owned-session
+control plane (#179) and the built-in JARVIS door's input staging (#176) meet it
+as of this release; `docs/one-link-control-plane.md` describes the implemented
+transport. The deviations that remain — per-operation ssh in
+`owner_session_admission.py` and the `jarvis_service_runtime` bridge, cluster-
+targeted CLI dispatch, the missing reconnect surface, the two unbuilt transport
+modes, compute-node-side live-stream `frpc`, and the outstanding #177 staging
+proof — are listed on that page and tracked on #182.
 
 ## Sessions
 

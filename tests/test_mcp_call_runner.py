@@ -1634,6 +1634,44 @@ def test_mcp_call_runner_refuses_unverified_builtin_jarvis_launcher_before_launc
     assert "launcher digest did not verify" in result["protocol_error"]
 
 
+def test_relay_composed_spack_identity_reaches_the_jarvis_child(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The composed cluster Spack path is applied as the child's JARVIS variable."""
+    runner = _load_runner()
+    monkeypatch.setenv("CLIO_RELAY_JARVIS_SPACK_COMMAND", "/site/spack/bin/spack")
+    overrides = cast(Any, runner)._child_environment_overrides(wait_for_locked_launcher=False)
+    captured: dict[str, dict[str, str]] = {}
+
+    class _RecordedPopen:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            captured["env"] = cast(dict[str, str], kwargs["env"])
+
+    monkeypatch.setattr(cast(Any, runner).subprocess, "Popen", _RecordedPopen)
+    cast(Any, runner)._open_process(
+        ["server"],
+        env_from={},
+        environment_overrides=overrides,
+    )
+
+    assert overrides == {"JARVIS_MCP_SPACK_COMMAND": "/site/spack/bin/spack"}
+    assert captured["env"]["JARVIS_MCP_SPACK_COMMAND"] == "/site/spack/bin/spack"
+    assert "CLIO_RELAY_JARVIS_SPACK_COMMAND" not in captured["env"]
+
+
+def test_child_overrides_are_empty_without_a_composed_spack_identity(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An unregistered cluster leaves the child environment exactly as before."""
+    runner = _load_runner()
+    monkeypatch.delenv("CLIO_RELAY_JARVIS_SPACK_COMMAND", raising=False)
+
+    assert cast(Any, runner)._child_environment_overrides(wait_for_locked_launcher=False) == {}
+    assert cast(Any, runner)._child_environment_overrides(wait_for_locked_launcher=True) == {
+        "CLIO_KIT_UV_CACHE_PRUNE": "0"
+    }
+
+
 def test_registered_jarvis_server_uses_artifact_binding_without_relay_dependency_pin(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

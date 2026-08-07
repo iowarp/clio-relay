@@ -68,6 +68,12 @@ SESSION_RELAY_CANCELED_CHECK_ID = "cleanup.relay-jobs-canceled"
 SESSION_SCHEDULER_CANCELED_CHECK_ID = "cleanup.explicit-job-cancel"
 _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS = 120.0
 _REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS = 15.0
+# One start watch is a bounded server-side wait, never a client redial loop.
+# The cap matches the ordinary remote-command budget above, so the CLI's default
+# 120-second watch costs exactly one connection; a longer watch costs one more
+# per cap rather than one per polling interval.
+MAX_REMOTE_SESSION_START_WAIT_SECONDS = _REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS
+_REMOTE_SESSION_START_WAIT_TRANSPORT_MARGIN_SECONDS = 15.0
 _REMOTE_API_READINESS_TIMEOUT_SECONDS = 60.0
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
 MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES = 32 * 1024 * 1024
@@ -3092,6 +3098,60 @@ def inspect_owned_session_start_status(
         )
 
 
+def owned_session_start_status_is_terminal(status: OwnedSessionRecoveryStatus) -> bool:
+    """Return whether one start observation needs no further waiting."""
+    if status.start_state in {"failed", "failed_cleaned", "not_current"}:
+        return True
+    return (
+        status.start_state == "ready"
+        and status.recovery_verified
+        and status.ownership_verified
+        and status.session_generation_id is not None
+    )
+
+
+def wait_owned_session_start_status(
+    *,
+    cluster: str,
+    session_id: str,
+    start_operation_id: str,
+    cluster_route_revision: str,
+    core_dir: Path,
+    wait_seconds: float = 0.0,
+    poll_seconds: float = 0.25,
+    inspect: Callable[..., OwnedSessionRecoveryStatus] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> OwnedSessionRecoveryStatus:
+    """Observe one exact start, blocking cluster-side until it is terminal.
+
+    This is the cluster-local half of a start watch.  The desktop issues one
+    command carrying its remaining deadline instead of redialing per interval,
+    so a watch costs one transport connection regardless of how long the start
+    takes.  The wait is bounded and always returns the latest exact observation.
+    """
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        raise ValueError("start status wait_seconds must be finite and nonnegative")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("start status poll_seconds must be finite and positive")
+    observe = inspect or inspect_owned_session_start_status
+    deadline = monotonic() + wait_seconds
+    while True:
+        status = observe(
+            cluster=cluster,
+            session_id=session_id,
+            start_operation_id=start_operation_id,
+            cluster_route_revision=cluster_route_revision,
+            core_dir=core_dir,
+        )
+        if owned_session_start_status_is_terminal(status):
+            return status
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return status
+        sleep(min(poll_seconds, remaining))
+
+
 def _inspect_owned_session_cleanup_receipt(
     *,
     cluster: str,
@@ -5845,6 +5905,7 @@ def execute_owned_session_start(
                 "CLIO_RELAY_SESSION_ROUTE_REVISION": request.cluster_route_revision,
                 "CLIO_RELAY_OWNER_SESSION_ID": request.session_id,
                 "CLIO_RELAY_OWNER_SESSION_CLUSTER": request.cluster,
+                "CLIO_RELAY_OWNER_SESSION_API_PORT": str(request.remote_api_port),
                 "CLIO_RELAY_REMOTE_CLUSTER": request.cluster,
                 **request.input_policy.environment(),
             }
@@ -7330,15 +7391,30 @@ def status_remote_session_start(
     *,
     definition: ClusterDefinition,
     selector: OwnedSessionStartStatusSelector,
+    wait_seconds: float = 0.0,
 ) -> OwnedSessionRecoveryStatus:
-    """Return a nonblocking remote observation for one exact start operation."""
+    """Return one remote observation for one exact start operation.
+
+    With ``wait_seconds`` the cluster-local command blocks against its durable
+    state until the start is terminal, so a watch does not redial per interval.
+    """
     if definition.name != selector.cluster:
         raise RelayError("owned-session start status selector changed cluster")
+    bounded_wait = max(0.0, min(wait_seconds, MAX_REMOTE_SESSION_START_WAIT_SECONDS))
+    transport_timeout = (
+        _REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS
+        if bounded_wait <= 0
+        else bounded_wait + _REMOTE_SESSION_START_WAIT_TRANSPORT_MARGIN_SECONDS
+    )
     try:
         output = _ssh_script(
             definition,
-            _owned_start_status_script(definition=definition, selector=selector),
-            timeout_seconds=_REMOTE_SESSION_START_RECOVERY_TIMEOUT_SECONDS,
+            _owned_start_status_script(
+                definition=definition,
+                selector=selector,
+                wait_seconds=bounded_wait,
+            ),
+            timeout_seconds=transport_timeout,
         )
     except _RemoteSessionCommandDeadline as exc:
         return OwnedSessionRecoveryStatus(
@@ -7500,12 +7576,14 @@ def query_remote_session_start(
     definition: ClusterDefinition,
     plan: OwnedSessionStartPlan,
     transport_deadline_exceeded: bool = False,
+    wait_seconds: float = 0.0,
 ) -> OwnedSessionStartResult:
     """Query one exact start once; callers choose any aggregate polling policy."""
     try:
         status = status_remote_session_start(
             definition=definition,
             selector=plan.status_selector,
+            wait_seconds=wait_seconds,
         )
     except RelayError as exc:
         status = OwnedSessionRecoveryStatus(
@@ -7534,7 +7612,11 @@ def watch_remote_session_start(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> OwnedSessionStartResult:
-    """Poll one exact start until ready, terminal failure, or bounded detach.
+    """Watch one exact start until ready, terminal failure, or bounded detach.
+
+    The watch is a bounded server-side wait against the remote relay's durable
+    start state, not a client redial loop: each observation blocks remotely for
+    what remains of the deadline and returns as soon as the start is terminal.
 
     A watch timeout does not erase or reinterpret the durable operation.  The
     returned nonterminal result remains a handle carrying the exact status and
@@ -7544,8 +7626,17 @@ def watch_remote_session_start(
         raise ValueError("start watch timeout_seconds must be finite and positive")
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("start watch poll_seconds must be finite and positive")
-    query_once = query or (lambda: query_remote_session_start(definition=definition, plan=plan))
     deadline = monotonic() + timeout_seconds
+
+    def _durable_wait() -> OwnedSessionStartResult:
+        remaining_wait = max(deadline - monotonic(), 0.0)
+        return query_remote_session_start(
+            definition=definition,
+            plan=plan,
+            wait_seconds=min(remaining_wait, MAX_REMOTE_SESSION_START_WAIT_SECONDS),
+        )
+
+    query_once = query or _durable_wait
     while True:
         result = query_once()
         if result.terminal:
@@ -7975,9 +8066,16 @@ def _owned_start_status_script(
     *,
     definition: ClusterDefinition,
     selector: OwnedSessionStartStatusSelector,
+    wait_seconds: float = 0.0,
 ) -> str:
-    """Render the nonblocking exact-operation start-status command."""
+    """Render the exact-operation start-status command.
+
+    ``wait_seconds`` makes the cluster-local command block against its own
+    durable state until the start reaches a terminal observation, so one watch
+    costs one command instead of one command per polling interval.
+    """
     relay_executable = _owned_session_relay_executable(definition)
+    wait_argument = "" if wait_seconds <= 0 else f" --wait-seconds {wait_seconds:g}"
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
@@ -7986,7 +8084,7 @@ def _owned_start_status_script(
         f"--session-id {shlex.quote(selector.session_id)} "
         f"--start-operation-id {shlex.quote(selector.start_operation_id)} "
         "--cluster-route-revision "
-        f"{shlex.quote(selector.cluster_route_revision)}\n"
+        f"{shlex.quote(selector.cluster_route_revision)}{wait_argument}\n"
     )
 
 

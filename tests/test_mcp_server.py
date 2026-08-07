@@ -492,9 +492,12 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     add_step_tool = next(
         tool for tool in response["result"]["tools"] if tool["name"] == "jarvis_add_step"
     )
-    assert "package_search is discovery only" in add_step_tool["description"]
-    assert "target='package'" in add_step_tool["description"]
-    assert "package-owned settings contract rather than guessing" in add_step_tool["description"]
+    # The tool description carries relay transport semantics only. Behavioral
+    # steering prose was reverted: the failure it suppressed was a package
+    # returning a null deployment, which is a data defect, not a prompt gap.
+    assert "package_search is discovery only" not in add_step_tool["description"]
+    assert "rather than guessing" not in add_step_tool["description"]
+    assert "durable relay job" in add_step_tool["description"]
 
 
 @pytest.mark.parametrize("profile", ["user", "admin"])

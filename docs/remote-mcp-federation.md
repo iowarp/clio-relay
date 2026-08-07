@@ -5,6 +5,12 @@ register stdio MCP servers that exist in a cluster environment, discover their
 real schemas through durable relay jobs, and expose selected remote tools as
 normal local tools with a `cluster` argument.
 
+This focalization is the point of the layer, not a convenience. Servers on any
+number of clusters collapse into one MCP surface: the agent calls one endpoint
+and the local relay fans out behind it over each connection's single held link.
+Adding a cluster adds a value to the `cluster` enum, never a second MCP
+registration, endpoint, tunnel, or shell.
+
 The desktop agent does not need one MCP registration per cluster. A virtual
 call follows the normal relay path:
 
@@ -256,9 +262,15 @@ which immutable evidence backs the `relay_wait` projection.
 
 ## stage declared local package inputs
 
-Registered JARVIS contract v3.6 can move a small caller-local file without
-adding an upload tool to the agent surface. Configure the desktop MCP process
-with a workspace it is allowed to read:
+This is the only way a run input reaches the cluster. Registered JARVIS contract
+v3.6 moves a small caller-local file without adding an upload tool to the agent
+surface: the bytes travel through the owned session over the connection's one
+link, exactly like every other relay operation. Nothing is copied around the
+transport — `scp` and `rsync` of a run input are always wrong, and the value
+supplied for a binding-declared setting is a path on the **caller's** machine,
+never a cluster-absolute path.
+
+Configure the desktop MCP process with a workspace it is allowed to read:
 
 ```powershell
 $env:CLIO_RELAY_INPUT_WORKSPACE_ROOT = "$PWD\science-workspace"
@@ -274,14 +286,24 @@ must be at least the per-file bound. Relative paths are resolved under the
 workspace. Absolute paths are accepted only when the verified file remains
 inside it.
 
+Both JARVIS doors stage through the same plane. A registered route reaches it
+through its `clio-kit-jarvis-user-v3.6` registration; the built-in `jarvis_*`
+tools reach it through the relay's own pinned clio-kit release, whose contract
+digest and JARVIS-CD lock take the place of a registration revision in the
+staged route identity. The built-in door engages staging only when the JARVIS
+MCP runs on another machine: when it runs on this host the configured path is
+already the path the package reads, so nothing is transferred.
+
 Staging is schema-driven, not filename-driven. It is enabled only when all of
 these statements are true:
 
-- the registration declares exactly `contract: clio-kit-jarvis-user-v3.6` and
-  its immutable server artifact and discovered schemas match that contract;
-- the same MCP connection first completes
+- the door is the built-in JARVIS route, or a registration declares exactly
+  `contract: clio-kit-jarvis-user-v3.6` and its immutable server artifact and
+  discovered schemas match that contract;
+- the same route first completes
   `jarvis_describe(target="package", package_name=...,
-  wait_for_terminal=true)` on the same route;
+  wait_for_terminal=true)`, in this MCP connection or in an earlier one that
+  recorded the durable contract;
 - the selected package setting contains exactly
   `jarvis.configuration-input-binding.v1` with `kind="local_file"` and
   `structure="regular_file"`;
@@ -317,14 +339,57 @@ idempotency key reuses the already admitted manifest without rescanning the
 mutable workspace. A missing, unsafe, oversized, or concurrently changing file
 fails before run submission.
 
+The cluster-side materialization of a per-run manifest is accepted only for the
+registered contract. The built-in route therefore compares every tracked path
+against its staged digest before it ingests anything and refuses the run with a
+typed error naming each changed `step.setting`; call `jarvis_edit_step` on that
+setting to stage the new content, then run again.
+
 A changed route, registration, artifact, pipeline, session generation,
 checksum, or provenance fails closed rather than reusing stale bytes.
 
-Settings without the exact declaration are passed through unchanged; a
-path-looking name is never sufficient authority to read a local file. Legacy or
-other remote MCP contracts also remain pass-through and cannot opt into staging.
+Settings without the exact declaration are passed through unchanged, so a
+package that means a cluster-side absolute path keeps working; a path-looking
+name is never sufficient authority to read a local file. Legacy or other remote
+MCP contracts also remain pass-through and cannot opt into staging.
 Large collections should use a separately managed data-staging service or
 shared storage rather than raising these control-plane limits without review.
+That is a data-management decision made by the site with its own transfer
+service; it is not permission for a client, harness, or agent to `scp` run
+inputs to the cluster beside the relay.
+
+### verify that staging engaged
+
+A job whose package declared a file-typed setting must return a non-empty
+`used_artifact_refs`, each entry pinning an artifact id and its SHA-256:
+
+```powershell
+clio-relay job used-artifacts <job-id> --cluster my-cluster
+```
+
+Non-empty, with a digest matching the caller's file, is the proof of engagement:
+the bytes travelled through relay, the configuration was rewritten to the staged
+reference, and the run is reproducible from its lineage. Empty means staging did
+not happen. Whatever the job read on the cluster arrived some other way, the run
+has no input lineage, and it is not evidence of anything even when it reports
+success and the output looks correct. Treat an empty list as a failed run and
+fix the staging path; do not work around it by placing the file on the cluster.
+
+One configuration produces an empty list without any error: a cluster-absolute
+path in the setting is forwarded verbatim, because a path-looking value carries
+no authority to read a local file. Pass a workspace-relative client path
+instead.
+
+The built-in JARVIS door used to produce an empty list for a declared binding
+too, because it never entered the staging plane
+([#176](https://github.com/iowarp/clio-relay/issues/176)). As of this release it
+shares the plane with the registered route, so the check above means the same
+thing on both doors. One deliberate, typed difference remains: the built-in door
+engages staging only when the JARVIS MCP runs on another machine, and a built-in
+run whose staged content changed is refused by name (`jarvis_run_input_drift`)
+rather than run against bytes the configuration never received. The end-to-end
+proof through both doors is still outstanding and tracked as
+[#177](https://github.com/iowarp/clio-relay/issues/177).
 
 ## Keep the compact JARVIS surface
 

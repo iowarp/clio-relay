@@ -1,4 +1,13 @@
-"""JARVIS-CD package for bounded relay commands."""
+"""Run a bounded command on the cluster, optionally from a staged local script.
+
+The command is an explicit argument vector executed with no shell interposed,
+under a wall-clock limit, with optional structured progress extraction from
+stdout. Its script setting declares a local-file input binding: the relay
+stages one file from the caller's own machine, ingesting it as an immutable
+input artifact and appending the staged cluster path to the command as its
+final argument, so a shell script or any other interpreted file written on the
+caller's machine can be executed here without being copied by hand.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO, cast
 
-from clio_relay._jarvis_api import Application
+from clio_relay._jarvis_api import Application, ConfigurationInputBinding
 from clio_relay.bounded_command.progress import adapter_from_config, append_progress_record
 from clio_relay.process_containment import nested_popen_kwargs, terminate_nested_process
 
@@ -66,22 +75,89 @@ class BoundedCommand(Application):
         """Initialize package state."""
 
     def _configure_menu(self) -> list[dict[str, Any]]:
-        """Return JARVIS configurator options."""
-        return []
+        """Return the JARVIS configurator options this package accepts.
+
+        JARVIS validates every configuration key against this menu before a
+        package is added to a pipeline, so an undeclared setting is rejected
+        even though the package would consume it.  Each option that may be
+        omitted declares a concrete default: JARVIS treats a menu entry whose
+        default is ``None`` as a required parameter.
+        """
+        return [
+            {
+                "name": "command",
+                "msg": (
+                    "Argument vector to execute, starting with the program. No shell is "
+                    "interposed, so shell syntax needs an explicit interpreter entry."
+                ),
+                "type": list,
+            },
+            {
+                "name": "workdir",
+                "msg": (
+                    "Working directory for the command. An empty string runs it in the "
+                    "directory JARVIS selected for the package."
+                ),
+                "type": str,
+                "default": "",
+            },
+            {
+                "name": "env",
+                "msg": (
+                    "Environment variables added to the inherited environment. Relay-owned "
+                    "capability variables are always removed before the command starts."
+                ),
+                "type": dict,
+                "default": {},
+            },
+            {
+                "name": "timeout_seconds",
+                "msg": (
+                    "Wall-clock limit in seconds after which the command tree is terminated. "
+                    "Zero means no limit."
+                ),
+                "type": int,
+                "default": 0,
+            },
+            {
+                "name": "progress",
+                "msg": (
+                    "Structured progress extraction from stdout: {'adapter': 'regex', "
+                    "'pattern': ...} publishes progress records, {'adapter': 'none'} "
+                    "publishes none."
+                ),
+                "type": dict,
+                "default": {"adapter": "none"},
+            },
+            {
+                "name": "script",
+                "msg": (
+                    "Caller-local script staged onto the cluster and appended to 'command' "
+                    "as its final argument. The relay snapshots this file, ingests it as an "
+                    "immutable input artifact, and rewrites this setting to the staged "
+                    "cluster path before JARVIS records the step."
+                ),
+                "type": str,
+                "default": "",
+                "input_binding": ConfigurationInputBinding(
+                    kind="local_file",
+                    structure="regular_file",
+                ).to_dict(),
+            },
+        ]
 
     def _configure(self, **kwargs: Any) -> None:
-        """Store configuration provided by the pipeline YAML."""
+        """Store configuration provided by the pipeline YAML or the configurator."""
+        if "command" in kwargs:
+            _command_arguments(kwargs["command"])
         self.config.update(kwargs)
 
     def start(self) -> None:
         """Run the configured command."""
-        command = self.config.get("command")
-        if not isinstance(command, list):
-            raise ValueError("command must be a string array")
-        raw_command = cast(list[object], command)
-        if not all(isinstance(item, str) for item in raw_command):
-            raise ValueError("command must be a string array")
-        command_args = [cast(str, item) for item in raw_command]
+        command_args = _command_arguments(self.config.get("command"))
+        staged_script = _optional_script(self.config.get("script"))
+        if staged_script is not None:
+            command_args = [*command_args, staged_script]
         env = os.environ.copy()
         supplied_env = self.config.get("env", {})
         if isinstance(supplied_env, dict):
@@ -89,9 +165,8 @@ class BoundedCommand(Application):
             env.update({str(key): str(value) for key, value in typed_env.items()})
         env = _scrub_relay_environment(env)
         workdir_value = self.config.get("workdir")
-        workdir = Path(workdir_value) if isinstance(workdir_value, str) else None
-        timeout_value = self.config.get("timeout_seconds")
-        timeout = int(timeout_value) if timeout_value is not None else None
+        workdir = Path(workdir_value) if isinstance(workdir_value, str) and workdir_value else None
+        timeout = _optional_timeout(self.config.get("timeout_seconds"))
         result = _run_streaming(
             command_args,
             cwd=workdir,
@@ -107,6 +182,40 @@ class BoundedCommand(Application):
 
     def clean(self) -> None:
         """Clean hook for bounded commands."""
+
+
+def _command_arguments(value: object) -> list[str]:
+    """Return the configured command as an argument vector."""
+    if not isinstance(value, list):
+        raise ValueError("command must be a string array")
+    raw_command = cast(list[object], value)
+    if not raw_command:
+        raise ValueError("command must be a non-empty string array")
+    if not all(isinstance(item, str) for item in raw_command):
+        raise ValueError("command must be a string array")
+    return [cast(str, item) for item in raw_command]
+
+
+def _optional_script(value: object) -> str | None:
+    """Return the staged script path appended to the command, or None when unset."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("script must be a path string")
+    return value
+
+
+def _optional_timeout(value: object) -> int | None:
+    """Return the configured wall-clock limit, or None when no limit applies."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("timeout_seconds must be an integer number of seconds")
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise ValueError("timeout_seconds must be an integer number of seconds") from exc
+    return seconds if seconds > 0 else None
 
 
 def _run_streaming(

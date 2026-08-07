@@ -599,12 +599,6 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
                 "include_service_runtimes=true; bind one with relay_bind_jarvis_runtime before "
                 "opening a viewer. Never use execution_id as gateway_session_id."
             )
-        elif remote_tool == "jarvis_add_step":
-            tool_guidance = (
-                " package_search is discovery only. Before add_step, call jarvis_describe with "
-                "target='package' and package_name set to the selected canonical name, then use "
-                "that package-owned settings contract rather than guessing settings."
-            )
         elif remote_tool == "jarvis_run":
             tool_guidance = (
                 " wait_for_terminal is a clio-relay transport control: it waits only for the "

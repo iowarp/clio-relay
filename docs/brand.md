@@ -14,7 +14,7 @@ Context:
 - clio-relay is part of the federation layer for clio-agent, but it is usable by any CLI, HTTP, or MCP client.
 - It submits remote scientific and engineering work, follows progress, and returns logs, artifacts, and provenance.
 - It keeps job state in durable records while network transports only carry bytes.
-- It supports cluster work, JARVIS-CD pipelines, SSH forwarding, and frp relay paths.
+- It supports cluster work and JARVIS-CD pipelines over one held relay path per connection, primarily frp, with SSH forwarding as the fallback.
 
 Visual direction:
 - Clear, technical, calm, and trustworthy.

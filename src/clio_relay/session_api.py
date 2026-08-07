@@ -1,32 +1,24 @@
-"""Authenticated client transport for one exact owned relay session API."""
+"""Authenticated client for one exact owned relay session API.
+
+Every operation here rides the connection-scoped channel the local relay
+established once, at bring-up, for this cluster.  This module owns owned-session
+*semantics* -- submission receipts, transforms, identity documents -- and never
+owns transport: see :mod:`clio_relay.control_channel` for the held link and
+:mod:`clio_relay.remote_connection` for the connection that holds it.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import http.client
-import json
-import math
-import secrets
-import socket
-import subprocess
-import time
-import urllib.parse
-from collections.abc import Generator
-from contextlib import ExitStack, contextmanager
 from typing import Final, cast
 
-import httpx
 from pydantic import ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
+from clio_relay.errors import RelayError
 from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
-from clio_relay.job_identity import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
-)
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     REGISTERED_JARVIS_USER_CONTRACT,
@@ -44,14 +36,27 @@ from clio_relay.models import (
     deterministic_jarvis_execution_id,
     is_owned_jarvis_run_spec,
 )
-from clio_relay.remote_mcp import resolve_pinned_mcp_admission
-from clio_relay.session_lifecycle import (
-    challenge_remote_session_identity,
-    status_remote_session,
+from clio_relay.remote_connection import (
+    MAX_SESSION_API_RESPONSE_BYTES,
+    RemoteConnection,
+    RemoteConnectionRegistry,
+    connection_registry,
+    validate_channel_request,
 )
+from clio_relay.remote_mcp import resolve_pinned_mcp_admission
 
 SESSION_IDENTITY_SCHEMA: Final = "clio-relay.session-identity.v1"
-MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
+__all__ = [
+    "MAX_SESSION_API_RESPONSE_BYTES",
+    "OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS",
+    "SESSION_IDENTITY_SCHEMA",
+    "OwnedSessionApiClient",
+    "get_owned_session_transform",
+    "record_owned_session_transform",
+    "request_owned_session_json",
+    "session_identity_document",
+    "submit_owned_session_job",
+]
 # Leave part of clio-agent's ordinary 30-second transport budget available for
 # propagating the completed MCP result after this inner long-poll returns.
 OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS: Final = 10.0
@@ -68,7 +73,15 @@ _JOB_SUBMISSION_PATHS = frozenset(
 
 
 class OwnedSessionApiClient:
-    """Identity-proven client for one exact owned session generation."""
+    """Identity-proven client for one exact owned session generation.
+
+    This is a handle onto the channel the local relay already holds for the
+    cluster, not a transport of its own.  Entering it costs no new connection:
+    the channel was established once, at connection bring-up, and every
+    owned-session operation -- status, identity, submission, ingest, artifact
+    content, watch -- rides that one link.  Leaving the context releases the
+    handle and leaves the channel held for the next operation.
+    """
 
     def __init__(
         self,
@@ -76,74 +89,37 @@ class OwnedSessionApiClient:
         definition: ClusterDefinition,
         settings: RelaySettings,
         timeout_seconds: float = 30.0,
+        registry: RemoteConnectionRegistry | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._definition = definition
         self._settings = settings
         self._timeout_seconds = timeout_seconds
-        self._stack: ExitStack | None = None
-        self._connection: http.client.HTTPConnection | None = None
-        self._session_id: str | None = None
-        self._generation_id: str | None = None
-        self._api_token: str | None = None
+        self._registry = registry
+        self._connection: RemoteConnection | None = None
 
     def __enter__(self) -> OwnedSessionApiClient:
-        """Prove the SSH-authenticated server and bind one persistent TCP stream."""
-        session_id, generation_id, api_token = _owned_session_credentials(
+        """Bind to the held channel for this cluster, establishing it once."""
+        registry = self._registry or connection_registry()
+        self._connection = registry.connection(
             definition=self._definition,
             settings=self._settings,
+            timeout_seconds=self._timeout_seconds,
         )
-        remote_api_port = _verified_remote_api_port(
-            definition=self._definition,
-            session_id=session_id,
-            generation_id=generation_id,
-        )
-        nonce = secrets.token_hex(32)
-        expected_identity = challenge_remote_session_identity(
-            definition=self._definition,
-            session_id=session_id,
-            session_generation_id=generation_id,
-            nonce=nonce,
-        )
-        stack = ExitStack()
-        try:
-            readiness_client = stack.enter_context(httpx.Client(trust_env=False))
-            local_port = stack.enter_context(
-                _ssh_forward(
-                    definition=self._definition,
-                    remote_api_port=remote_api_port,
-                    client=readiness_client,
-                    timeout_seconds=self._timeout_seconds,
-                )
-            )
-            connection = _open_identity_bound_connection(
-                local_port=local_port,
-                nonce=nonce,
-                expected_identity=expected_identity,
-                timeout_seconds=self._timeout_seconds,
-            )
-            stack.callback(connection.close)
-        except BaseException:
-            stack.close()
-            raise
-        self._stack = stack
-        self._connection = connection
-        self._session_id = session_id
-        self._generation_id = generation_id
-        self._api_token = api_token
         return self
 
     def __exit__(self, *_args: object) -> None:
-        """Close the proven stream and its SSH forward without reconnecting."""
-        stack = self._stack
-        self._stack = None
+        """Release the handle; the connection keeps its channel held."""
         self._connection = None
-        self._session_id = None
-        self._generation_id = None
-        self._api_token = None
-        if stack is not None:
-            stack.close()
+
+    @property
+    def connection(self) -> RemoteConnection:
+        """Return the held connection backing this handle."""
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("owned session API client is not open")
+        return connection
 
     def request_json(
         self,
@@ -154,33 +130,17 @@ class OwnedSessionApiClient:
         body: dict[str, object] | None = None,
         response_timeout_seconds: float | None = None,
     ) -> object:
-        """Issue one authenticated JSON request on the already proven TCP stream.
+        """Issue one authenticated JSON request over the held channel.
 
         ``response_timeout_seconds`` changes only the response deadline for this
-        request. It does not relax the bounded SSH-forward or identity-proof
-        deadlines, and the connection's ordinary timeout is restored before a
-        later request reuses the same proven stream.
+        request. It never relaxes the channel's bring-up deadlines, and the
+        stream's ordinary timeout is restored before a later request reuses it.
         """
-        normalized_method = _validate_request(method=method, path=path)
-        if response_timeout_seconds is not None and (
-            not math.isfinite(response_timeout_seconds) or response_timeout_seconds <= 0
-        ):
-            raise ValueError("response_timeout_seconds must be positive and finite")
-        connection = self._connection
-        session_id = self._session_id
-        generation_id = self._generation_id
-        api_token = self._api_token
-        if connection is None or session_id is None or generation_id is None or api_token is None:
-            raise RuntimeError("owned session API client is not open")
-        return _request_json_on_connection(
-            connection=connection,
-            method=normalized_method,
+        return self.connection.request_json(
+            method=method,
             path=path,
             query=query,
             body=body,
-            api_token=api_token,
-            session_id=session_id,
-            generation_id=generation_id,
             response_timeout_seconds=response_timeout_seconds,
         )
 
@@ -299,8 +259,8 @@ def request_owned_session_json(
     body: dict[str, object] | None = None,
     timeout_seconds: float = 30.0,
 ) -> object:
-    """Call one exact-generation session API after proving its server identity."""
-    _validate_request(method=method, path=path)
+    """Call one exact-generation session API over the connection's held channel."""
+    validate_channel_request(method=method, path=path)
     with OwnedSessionApiClient(
         definition=definition,
         settings=settings,
@@ -575,303 +535,3 @@ def _expected_jarvis_mcp_arguments(
     if supplied_execution_id is not None and supplied_execution_id != expected_execution_id:
         raise RelayError("owned session JARVIS run used a different execution identity")
     return {**expected_arguments, "execution_id": expected_execution_id}
-
-
-def _owned_session_credentials(
-    *,
-    definition: ClusterDefinition,
-    settings: RelaySettings,
-) -> tuple[str, str, str]:
-    session_id = settings.owner_session_id
-    generation_id = settings.owner_session_generation_id
-    api_token = settings.api_token
-    if session_id is None or generation_id is None:
-        raise ConfigurationError(
-            "owned remote request requires CLIO_RELAY_OWNER_SESSION_ID and "
-            "CLIO_RELAY_SESSION_GENERATION_ID"
-        )
-    if settings.resolved_owner_session_cluster() != definition.name:
-        raise ConfigurationError(
-            "owned remote request requires CLIO_RELAY_OWNER_SESSION_CLUSTER to match the "
-            "selected route"
-        )
-    if not api_token:
-        raise ConfigurationError(
-            "owned remote request requires CLIO_RELAY_API_TOKEN for authentication"
-        )
-    return session_id, generation_id, api_token
-
-
-def _verified_remote_api_port(
-    *,
-    definition: ClusterDefinition,
-    session_id: str,
-    generation_id: str,
-) -> int:
-    remote_status = status_remote_session(definition=definition, session_id=session_id)
-    remote_api_port = remote_status.get("remote_api_port")
-    if (
-        remote_status.get("owner") != "clio-relay"
-        or remote_status.get("cluster") != definition.name
-        or remote_status.get("session_id") != session_id
-        or remote_status.get("session_generation_id") != generation_id
-        or remote_status.get("running") is not True
-        or remote_status.get("ownership_verified") is not True
-        or isinstance(remote_api_port, bool)
-        or not isinstance(remote_api_port, int)
-        or not 1 <= remote_api_port <= 65_535
-    ):
-        raise RelayError(
-            "remote relay session is not the active, ownership-verified generation requested "
-            f"for {definition.name}/{session_id}"
-        )
-    return remote_api_port
-
-
-def _validate_request(*, method: str, path: str) -> str:
-    normalized_method = method.upper()
-    if normalized_method not in {"GET", "POST"}:
-        raise ValueError("owned session API method must be GET or POST")
-    if (
-        not path.startswith("/")
-        or path.startswith("//")
-        or any(character in path for character in ("\r", "\n", "?"))
-    ):
-        raise ValueError("owned session API path must be an absolute path without a query")
-    return normalized_method
-
-
-def _open_identity_bound_connection(
-    *,
-    local_port: int,
-    nonce: str,
-    expected_identity: dict[str, object],
-    timeout_seconds: float,
-) -> http.client.HTTPConnection:
-    """Prove one non-reconnecting TCP stream before any credential is sent."""
-    connection = http.client.HTTPConnection("127.0.0.1", local_port, timeout=timeout_seconds)
-    try:
-        connection.connect()
-        connection.auto_open = 0
-        connection.request(
-            "GET",
-            "/session-identity?" + urllib.parse.urlencode({"nonce": nonce}),
-            headers={"Accept": "application/json", "Connection": "keep-alive"},
-        )
-        proof_response = connection.getresponse()
-        proof_document = _read_json_response(proof_response, label="session identity challenge")
-        if proof_response.status != 200 or not isinstance(proof_document, dict):
-            raise RelayError("owned session API did not return a valid server identity challenge")
-        _verify_session_identity(
-            cast(dict[str, object], proof_document),
-            expected=expected_identity,
-        )
-        if proof_response.will_close or connection.sock is None:
-            raise RelayError(
-                "owned session API closed the identity-proven connection before authentication"
-            )
-        return connection
-    except (OSError, http.client.HTTPException) as exc:
-        connection.close()
-        raise RelayError("owned session API identity challenge failed") from exc
-    except BaseException:
-        connection.close()
-        raise
-
-
-def _request_json_on_connection(
-    *,
-    connection: http.client.HTTPConnection,
-    method: str,
-    path: str,
-    query: dict[str, object] | None,
-    body: dict[str, object] | None,
-    api_token: str,
-    session_id: str,
-    generation_id: str,
-    response_timeout_seconds: float | None,
-) -> object:
-    """Issue one request without permitting HTTPConnection to reconnect."""
-    encoded_query = "" if query is None else "?" + urllib.parse.urlencode(query)
-    encoded_body = None if body is None else json.dumps(body).encode("utf-8")
-    proven_socket = connection.sock
-    prior_connection_timeout = connection.timeout
-    prior_socket_timeout: float | None = None
-    response_timeout_applied = False
-    try:
-        if response_timeout_seconds is not None:
-            if proven_socket is None:
-                raise RelayError("owned session API identity-proven connection is not open")
-            prior_socket_timeout = proven_socket.gettimeout()
-            connection.timeout = response_timeout_seconds
-            proven_socket.settimeout(response_timeout_seconds)
-            response_timeout_applied = True
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_token}",
-            OWNER_SESSION_ID_HEADER: session_id,
-            SESSION_GENERATION_ID_HEADER: generation_id,
-        }
-        if encoded_body is not None:
-            headers["Content-Type"] = "application/json"
-        connection.request(
-            method,
-            path + encoded_query,
-            body=encoded_body,
-            headers=headers,
-        )
-        response = connection.getresponse()
-        document = _read_json_response(response, label=f"{method} {path}")
-        if not 200 <= response.status < 300:
-            detail = json.dumps(document, ensure_ascii=False)[:2_000]
-            raise RelayError(
-                f"owned session API request failed: {method} {path}: "
-                f"HTTP {response.status}: {detail}"
-            )
-        return document
-    except (OSError, http.client.HTTPException) as exc:
-        if response_timeout_applied and isinstance(exc, TimeoutError):
-            raise ObservationTimeoutError(
-                f"owned session API response observation timed out for {method} {path}"
-            ) from exc
-        raise RelayError(
-            f"owned session API identity-bound request failed for {method} {path}: {exc}"
-        ) from exc
-    finally:
-        if response_timeout_seconds is not None:
-            connection.timeout = prior_connection_timeout
-            if (
-                response_timeout_applied
-                and connection.sock is proven_socket
-                and proven_socket is not None
-            ):
-                try:
-                    proven_socket.settimeout(prior_socket_timeout)
-                except OSError:
-                    # The response may have closed the proven socket. Never let
-                    # HTTPConnection reconnect it under the authenticated client.
-                    connection.close()
-
-
-def _read_json_response(response: http.client.HTTPResponse, *, label: str) -> object:
-    payload = response.read(MAX_SESSION_API_RESPONSE_BYTES + 1)
-    if len(payload) > MAX_SESSION_API_RESPONSE_BYTES:
-        raise RelayError(f"owned session API {label} response exceeded its byte limit")
-    try:
-        return json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RelayError(f"owned session API {label} response was not UTF-8 JSON") from exc
-
-
-def _verify_session_identity(
-    observed: dict[str, object],
-    *,
-    expected: dict[str, object],
-) -> None:
-    fields = (
-        "schema_version",
-        "cluster",
-        "session_id",
-        "session_generation_id",
-        "nonce",
-    )
-    if any(observed.get(field) != expected.get(field) for field in fields):
-        raise RelayError("owned session API server identity did not match the SSH-proven session")
-    observed_signature = observed.get("hmac_sha256")
-    expected_signature = expected.get("hmac_sha256")
-    if (
-        not isinstance(observed_signature, str)
-        or not isinstance(expected_signature, str)
-        or len(observed_signature) != 64
-        or len(expected_signature) != 64
-        or not hmac.compare_digest(observed_signature, expected_signature)
-    ):
-        raise RelayError("owned session API server identity HMAC did not verify")
-
-
-@contextmanager
-def _ssh_forward(
-    *,
-    definition: ClusterDefinition,
-    remote_api_port: int,
-    client: httpx.Client,
-    timeout_seconds: float,
-) -> Generator[int, None, None]:
-    """Open a bounded loopback-only SSH forward and always stop it after the request."""
-    local_port = _available_loopback_port()
-    process = subprocess.Popen(
-        [
-            "ssh",
-            "-N",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            f"127.0.0.1:{local_port}:127.0.0.1:{remote_api_port}",
-            definition.ssh_host,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    base_url = f"http://127.0.0.1:{local_port}"
-    try:
-        _wait_for_forward(
-            process,
-            client=client,
-            base_url=base_url,
-            timeout_seconds=timeout_seconds,
-        )
-        yield local_port
-    finally:
-        _terminate_forward(process)
-
-
-def _available_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    if not isinstance(port, int) or port <= 0:
-        raise RelayError("could not select a loopback port for the owned session API")
-    return port
-
-
-def _wait_for_forward(
-    process: subprocess.Popen[bytes],
-    *,
-    client: httpx.Client,
-    base_url: str,
-    timeout_seconds: float,
-) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    last_error = "SSH forward did not become ready"
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RelayError(_forward_error(process, "owned session SSH forward exited"))
-        try:
-            response = client.get(base_url + "/healthz", timeout=min(0.5, timeout_seconds))
-            if response.status_code == 200 and response.json().get("ok") is True:
-                return
-            last_error = f"unexpected health response: HTTP {response.status_code}"
-        except (httpx.HTTPError, TypeError, ValueError) as exc:
-            last_error = str(exc)
-        time.sleep(0.05)
-    raise RelayError(f"owned session SSH forward did not become ready: {last_error}")
-
-
-def _terminate_forward(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-
-
-def _forward_error(process: subprocess.Popen[bytes], fallback: str) -> str:
-    stderr = process.stderr.read() if process.stderr is not None else b""
-    detail = stderr.decode("utf-8", errors="replace").strip()
-    return detail or fallback

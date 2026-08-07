@@ -726,7 +726,9 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
         *,
         definition: ClusterDefinition,
         selector: OwnedSessionStartStatusSelector,
+        wait_seconds: float = 0.0,
     ) -> OwnedSessionRecoveryStatus:
+        del wait_seconds
         assert definition == ClusterDefinition(name="test-cluster", ssh_host="test-host")
         status_selectors.append(selector)
         return OwnedSessionRecoveryStatus(
