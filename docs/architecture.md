@@ -157,6 +157,16 @@ restart and is keyed by the complete route, server artifact, pipeline, and
 owner-session identity. Unannotated path-like strings and other contracts are
 never interpreted as upload requests.
 
+Run inputs move only this way. The declared value is a path on the client
+machine, relative to the configured workspace root; the bytes travel through the
+owned session over the connection's one link. Relay never copies a run input
+with `scp` or `rsync`, and a cluster-absolute path supplied for a
+binding-declared setting is not staging — it disables it, leaving the job with
+an empty `used_artifact_refs`. A non-empty `used_artifact_refs` whose digest
+matches the client's bytes is the proof that staging engaged; an empty one on a
+declared file-typed setting means the input arrived out of band and the run is
+not reproducible.
+
 ## provenance records
 
 An `ArtifactUse` content pin may carry additive, bounded
@@ -175,14 +185,38 @@ the agent-facing MCP surface, and are garbage-collected with their job.
 
 ## Transport
 
-Transport is replaceable:
+A connection is one local relay process and one remote relay process joined by
+exactly one persistent link. All control-plane and data-plane traffic for that
+connection rides that single channel: owned-session status and identity, job
+submission, events, logs, artifact content, input-artifact ingest, watch,
+cancellation, gateway operations, and teardown. The link is established once at
+bring-up and held for the lifetime of the connection; an operation uses the
+transport that already exists and never establishes its own.
 
-- frp over WebSocket/TLS for Cloudflare or other HTTPS edges.
-- frp over TCP for public hosts or institutional relay hosts.
-- SSH local port forwarding for closed environments that already have SSH or VPN access.
-- frp XTCP probing as an optional direct path optimization.
+The mode decides how the one link is built:
+
+- frp through an internet-accessible relay point is the primary path. Both
+  relays dial outbound — WebSocket/TLS for Cloudflare or other HTTPS edges, TCP
+  for a public or institutional host — and the relay point brokers a handshake
+  that joins them. Neither side accepts inbound.
+- frp XTCP is the UDP NAT-bypass variant. The relays end with a direct peer
+  link and fall back to the relay-point path when hole punching fails.
+- SSH local port forwarding is the fallback for infrastructure that permits no
+  other path. One forward is established at bring-up and held; every message
+  rides the mapped port.
+
+SSH is a bootstrap mechanism or that single held forward. The connection's ssh
+budget is at most one connection in the frp modes (deploying the cluster relay,
+skipped when it is already deployed) and at most two in the ssh fallback (deploy
+plus the held forward). After bring-up, the count of new ssh connections is
+zero, for any number of operations. One local relay manages many such
+connections concurrently, behind one client-facing MCP endpoint.
 
 Every transport carries local HTTP between endpoints. No job submission, cursor, artifact, cancellation, progress, or provenance record depends on a particular tunnel.
+
+`docs/connection-model.md` is the normative statement of this model, including
+the 2FA operating constraint, reconnect semantics, the input-staging contract,
+and the tracked deviations. Read it before implementing against relay.
 
 ## Detach and Teardown
 
