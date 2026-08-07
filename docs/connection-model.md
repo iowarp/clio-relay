@@ -76,9 +76,20 @@ handshake. When hole punching fails, the connection falls back to (a)'s
 relay-point-carried TCP. This is a latency and throughput optimization; it is
 never a reliability requirement, and a failed bypass is not a failed connection.
 
-### (c) SSH port forward — fallback
+### (c) SSH port forward — the configured pathway for secure environments
 
-For infrastructure that permits no other path, such as DOE-class clusters:
+"Fallback" here is a statement about which mode is the default, not about
+runtime behavior. The transport mode is a per-connection **configuration
+choice**: TCP through a relay point is what a user configures by default, and
+the ssh pathway is what a user configures for secure environments that permit
+no other path, such as DOE-class clusters. The relay never switches modes on
+its own — a connection whose configured link fails reports a typed link
+failure and re-establishes the **same** configured mode; it does not try
+another transport. (The one sanctioned in-mode degradation is (b)'s
+hole-punch handshake falling back to (a)'s relay-point-carried TCP, which
+stays within the same configured rendezvous.)
+
+For a connection configured on this pathway:
 
 1. One ssh connection deploys the cluster relay. Skipped when it is already
    deployed.
