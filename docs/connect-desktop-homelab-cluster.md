@@ -212,15 +212,24 @@ cluster-absolute path in that slot is forwarded verbatim and stages nothing.
 For scheduler-backed services, use a managed runtime. The runtime starts the
 application on a compute node and connects it to the desktop through `frp`.
 
-The data path is:
+The data path is the same as every other kind of traffic — the compute node
+talks to the cluster relay over cluster-internal connectivity, and the cluster
+relay carries the stream over the connection's one link:
 
 ```text
 application service on cluster compute node
-  -> cluster-side frpc outbound to relay host
-  -> frps relay host
-  -> desktop-side frpc visitor
+  -> cluster relay on the master node (cluster-internal connectivity)
+  -> the connection's link (relay point TCP, or the held ssh forward)
+  -> local relay
   -> http://127.0.0.1:<desktop-port>/<stream-path>
 ```
+
+A compute node never opens transport of its own: it needs no outbound internet
+reachability, and the stream's semantics are identical in every transport mode.
+(The current implementation deviates — it launches a compute-node-side `frpc`
+that dials the relay host directly, which both bypasses the cluster relay and
+demands outbound internet access from compute nodes; tracked on the
+connection-model restoration, issue #179.)
 
 The stream is pushed over the live transport. The relay core stores session,
 job, scheduler, lifecycle, and artifact metadata. It does not store bulk image

@@ -1087,7 +1087,7 @@ writes a revocation marker before
 stopping the owned proxy; same-id retries return an idempotent revoked result, while
 a different attachment id is refused.
 
-Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. The application stream still flows through the relay/bypass transport to the desktop-local bind port, not through an SSH port forward.
+Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. By design the application stream rides the connection's one link like all other traffic — compute node to the cluster relay over cluster-internal connectivity, then the cluster relay to the local relay over whatever link the connection is configured with (relay-point TCP, or the held ssh forward; the stream's semantics are identical in every mode). The current `transport_mode` implementation deviates: it opens a compute-node-side frp transport that bypasses the cluster relay and has no ssh-pathway equivalent — tracked on the connection-model restoration, issue #179.
 
 The default service contract is push-based. A desktop client subscribes once to `stream_url`, and the remote application pushes data, images, frames, or domain records as they are emitted. The relay does not assume any application-specific endpoint shape. Pull-style endpoints are represented only as named `compatibility_paths`, such as `snapshot`, `render_once`, or `state_dump`.
 
