@@ -22,6 +22,7 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.input_staging import REGISTERED_JARVIS_CONTRACT_ID
+from clio_relay.jarvis_input_plane import jarvis_add_step_result_step_id
 from clio_relay.mcp_server import McpSessionState, handle_request
 from clio_relay.models import (
     ArtifactRef,
@@ -892,12 +893,7 @@ def test_add_step_identity_accepts_historical_nested_result() -> None:
         }
     }
 
-    assert (
-        mcp_server_module._jarvis_add_step_result_step_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            result
-        )
-        == "lammps"
-    )
+    assert jarvis_add_step_result_step_id(result) == "lammps"
 
 
 def test_add_step_identity_rejects_ambiguous_result_envelopes() -> None:
@@ -912,9 +908,7 @@ def test_add_step_identity_rejects_ambiguous_result_envelopes() -> None:
     }
 
     with pytest.raises(ValueError, match="ambiguous result envelopes"):
-        mcp_server_module._jarvis_add_step_result_step_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            result
-        )
+        jarvis_add_step_result_step_id(result)
 
 
 def _configured_flow(
