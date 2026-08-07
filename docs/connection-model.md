@@ -341,9 +341,10 @@ recognize the shape.
 ### Still deviating
 
 - **`relay_bind_jarvis_runtime` admission dials ssh per call.**
-  `owner_session_admission.py` opens four fresh ssh connections per invocation.
-  It sits outside the owned-session control plane restored above and needs a
-  server-side admission endpoint.
+  `owner_session_admission.py` reads its status through
+  `remote_cli.run_remote_clio`, which opens one ssh connection per call; the bind
+  flow was measured at four. It sits outside the owned-session control plane
+  restored above and needs a server-side admission endpoint.
 - **The `jarvis_service_runtime` scheduler bridge dials ssh per operation** at
   roughly twenty sites. Same shape, separate subsystem, restored separately.
 - **Cluster-targeted CLI dispatch dials ssh per invocation.** With
