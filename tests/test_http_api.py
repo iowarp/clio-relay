@@ -24,6 +24,10 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.http_api import create_app
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
+from clio_relay.job_identity import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+)
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
@@ -55,11 +59,7 @@ from clio_relay.remote_mcp import (
     remote_mcp_registration_revision,
     remote_mcp_server_artifact_digest,
 )
-from clio_relay.session_api import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
-    session_identity_document,
-)
+from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageManagedQueue
 

@@ -113,6 +113,7 @@ class RelaySettings(BaseModel):
     owner_session_id: str | None = None
     owner_session_generation_id: DurableRecordId | None = None
     owner_session_cluster: str | None = None
+    owner_session_api_port: int | None = Field(default=None, gt=0, le=65_535)
     remote_cluster: str | None = None
     session_owner_token: str | None = None
     allow_unauthenticated_owned_session: bool = False
@@ -290,6 +291,9 @@ class RelaySettings(BaseModel):
             owner_session_id=os.getenv("CLIO_RELAY_OWNER_SESSION_ID"),
             owner_session_generation_id=os.getenv("CLIO_RELAY_SESSION_GENERATION_ID"),
             owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
+            owner_session_api_port=_optional_positive_int_env(
+                "CLIO_RELAY_OWNER_SESSION_API_PORT",
+            ),
             remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
             session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
             allow_unauthenticated_owned_session=_boolean_env(
@@ -402,6 +406,20 @@ def _positive_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    """Read one optional positive integer without inventing a default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
     try:
         value = int(raw)
     except ValueError as exc:

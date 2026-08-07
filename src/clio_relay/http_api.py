@@ -148,6 +148,7 @@ from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_qu
 from clio_relay.validation_report import redact_sensitive_values
 
 ModelRecord = TypeVar("ModelRecord", bound=BaseModel)
+OWNED_SESSION_STATUS_SCHEMA = "clio-relay.owned-session-status.v1"
 INPUT_ARTIFACT_REQUEST_JSON_OVERHEAD_BYTES = 16 * 1024
 MAX_INPUT_ARTIFACT_BASE64_CHARS = 4 * ((MAX_INPUT_FILE_MAX_BYTES + 2) // 3)
 
@@ -1252,6 +1253,35 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             generation_id=resolved.owner_session_generation_id,
             nonce=nonce,
         )
+
+    @app.get("/session-status", dependencies=[auth_dependency])
+    def session_status() -> dict[str, object]:
+        """Report this live owned session over the connection's held channel.
+
+        This is the HTTP replacement for the per-operation ``ssh ... bash -s``
+        status probe.  It is the running API process describing itself, so its
+        ``evidence`` is named exactly that: it proves liveness and exact
+        identity, not the cluster-local filesystem and process ownership audit.
+        That stronger audit stays where it can actually be produced -- the
+        cluster-local recovery-status executor, carried out of band once by the
+        transport that establishes the channel.
+        """
+        if (
+            resolved.owner_session_id is None
+            or resolved.owner_session_generation_id is None
+            or owner_session_cluster is None
+        ):
+            raise HTTPException(status_code=404, detail="owned session status is unavailable")
+        return {
+            "schema_version": OWNED_SESSION_STATUS_SCHEMA,
+            "owner": "clio-relay",
+            "cluster": owner_session_cluster,
+            "session_id": resolved.owner_session_id,
+            "session_generation_id": resolved.owner_session_generation_id,
+            "remote_api_port": resolved.owner_session_api_port,
+            "running": True,
+            "evidence": "live_api_self_report",
+        }
 
     @app.get("/storage/status", dependencies=[auth_dependency])
     def storage_status() -> dict[str, object]:

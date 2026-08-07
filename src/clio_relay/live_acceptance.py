@@ -47,6 +47,10 @@ from clio_relay.jarvis_service_runtime import (
     JarvisServiceRuntimeBinding,
     JarvisServiceRuntimeHandoff,
 )
+from clio_relay.job_identity import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+)
 from clio_relay.mcp_stdio_validation import (
     PackagedMcpStdioSession,
     decode_strict_json,
@@ -72,10 +76,6 @@ from clio_relay.runtime_metadata import (
     native_execution_documents,
 )
 from clio_relay.service_runtime import ServiceRuntimeStopResult, ServiceRuntimeSupervisor
-from clio_relay.session_api import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
-)
 from clio_relay.storage_runtime import StorageManagedQueue, storage_managed_queue
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
