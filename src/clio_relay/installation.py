@@ -302,6 +302,11 @@ class InstallReceipt(BaseModel):
     deployment_fingerprint: str | None = None
     deployment_manifest: dict[str, object] | None = None
     generation: str | None = None
+    # Provenance note for a mixed install (e.g. relay identity minted from a
+    # local build, components inherited from a bootstrap generation): the
+    # source receipt path components/component_artifacts were copied
+    # verbatim from. None when this receipt's own process derived them.
+    components_source_receipt: str | None = None
 
     @model_validator(mode="after")
     def validate_deployment_identity(self) -> InstallReceipt:
@@ -1196,7 +1201,12 @@ def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource
     return receipt, source
 
 
-def write_self_install_receipt(path: Path, *, force: bool = False) -> InstallReceipt:
+def write_self_install_receipt(
+    path: Path,
+    *,
+    force: bool = False,
+    components_from: Path | None = None,
+) -> InstallReceipt:
     """Mint a durable receipt describing the RUNNING installation's own identity.
 
     A dev-tool install has no receipt describing itself: ``installation_info()``
@@ -1211,12 +1221,41 @@ def write_self_install_receipt(path: Path, *, force: bool = False) -> InstallRec
     install, or the exact pinned commit sha for an exact-sha VCS install
     (``_vcs_commit_identity_verified``, clio-relay#206). Never re-derived a
     second, potentially divergent way.
+
+    ``components_from`` names another receipt -- the generation receipt
+    that genuinely installed components such as clio-kit/jarvis-cd -- whose
+    ``components``/``component_artifacts`` blocks are copied verbatim into
+    the minted receipt. This is for a legitimate mixed dev-channel install:
+    relay identity is this process's own (self), while its components are
+    still served by a bootstrap generation's locked runtime. The source
+    path is recorded on ``components_source_receipt`` so the mix is
+    traceable, never silent. Refuses when the source receipt carries no
+    component artifacts to inherit.
     """
     if path.exists() and not force:
         raise ConfigurationError(
             f"install receipt already exists: {path} (use --force to overwrite)"
         )
     receipt, _source = _persistent_uv_tool_install_receipt()
+    if components_from is not None:
+        try:
+            source_receipt = load_install_receipt(components_from)
+        except ConfigurationError as exc:
+            raise ConfigurationError(
+                f"components source receipt could not be loaded: {components_from}: {exc}"
+            ) from exc
+        if not source_receipt.component_artifacts:
+            raise ConfigurationError(
+                "components source receipt has no component artifacts to inherit: "
+                f"{components_from}"
+            )
+        receipt = receipt.model_copy(
+            update={
+                "components": dict(source_receipt.components),
+                "component_artifacts": dict(source_receipt.component_artifacts),
+                "components_source_receipt": str(components_from),
+            }
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(receipt.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")

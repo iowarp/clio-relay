@@ -2201,6 +2201,17 @@ def installation_write_receipt(
         bool,
         typer.Option(help="Overwrite an existing receipt already at the destination path."),
     ] = False,
+    components_from: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Copy components/component_artifacts verbatim from this generation "
+                "receipt, for a mixed install where relay is self-described but "
+                "components (clio-kit, jarvis-cd, ...) still come from a bootstrap "
+                "generation's locked runtime."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Mint a durable install receipt describing this process's own running identity.
 
@@ -2209,13 +2220,23 @@ def installation_write_receipt(
     resolved exactly as the persistent-uv-tool identity check already
     trusts it: a wheel's sha256 for a WHEEL/PYPI install, or the exact
     pinned commit sha for an exact-sha VCS install (clio-relay#206).
+
+    ``--components-from`` supports a legitimate mixed dev-channel install:
+    relay identity is minted for this process (self), while
+    components/component_artifacts are inherited verbatim from another
+    receipt -- the generation that genuinely installed them -- with the
+    source path recorded on the minted receipt for provenance.
     """
     if not self_flag:
         raise typer.BadParameter("--self is required; only self-description is supported")
     _run_or_exit(
         lambda: typer.echo(
             json.dumps(
-                write_self_install_receipt(output, force=force).model_dump(mode="json"),
+                write_self_install_receipt(
+                    output,
+                    force=force,
+                    components_from=components_from,
+                ).model_dump(mode="json"),
                 indent=2,
                 default=str,
             )

@@ -1286,6 +1286,164 @@ def test_write_self_install_receipt_mints_exact_vcs_sha_and_refuses_to_clobber(
     assert load_install_receipt(output).artifact_sha256 == other_sha
 
 
+def test_write_self_install_receipt_inherits_components_from_source_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed dev-channel install: relay identity is self, components are inherited.
+
+    ``jarvis_mcp_command()`` requires ``component_artifacts.clio-kit`` on
+    the receipt and fails typed without it -- blocking the door's JARVIS
+    catalog refresh whenever relay is minted from a local build/VCS pin but
+    clio-kit/jarvis-cd still come from a bootstrap generation's locked
+    runtime. ``--components-from`` copies that generation receipt's
+    components/component_artifacts verbatim into the minted receipt.
+    """
+    # --- the source ("generation") receipt that genuinely installed clio-kit ---
+    relay_wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    relay_wheel.write_bytes(b"relay-wheel")
+    clio_kit_wheel = tmp_path / "clio_kit-2.3.1-py3-none-any.whl"
+    clio_kit_wheel.write_bytes(b"clio-kit-wheel")
+    tool = tmp_path / "clio-kit.exe"
+    tool.write_bytes(b"persistent-tool")
+    uv = tmp_path / "uv.exe"
+    uv.write_bytes(b"uv")
+    persistent_tool = PersistentUvToolIdentity(
+        uv_executable=str(uv.resolve()),
+        uv_version="0.11.28",
+        uv_executable_sha256=hashlib.sha256(b"uv").hexdigest(),
+        tool_directory=str(tmp_path / "tools"),
+        tool_bin_directory=str(tmp_path),
+        environment_prefix=str(tmp_path / "tools" / "clio-kit"),
+        provider_interpreter=sys.executable,
+        provider_interpreter_sha256="a" * 64,
+        tool_executable=str(tool.resolve()),
+        tool_executable_resolved=str(tool.resolve()),
+        tool_executable_sha256=hashlib.sha256(b"persistent-tool").hexdigest(),
+        distribution_console_script_path=str(tool.resolve()),
+        distribution_console_script_sha256=hashlib.sha256(b"persistent-tool").hexdigest(),
+        uv_receipt_path=str(tmp_path / "tools" / "clio-kit" / "uv-receipt.toml"),
+        uv_receipt_sha256="d" * 64,
+        distribution="clio-kit",
+        distribution_version="2.3.1",
+        distribution_metadata_path=str(tmp_path / "clio-kit.dist-info"),
+        entry_point="clio-kit",
+        source_artifact_path=str(clio_kit_wheel.resolve()),
+        source_artifact_sha256=hashlib.sha256(b"clio-kit-wheel").hexdigest(),
+        record_path=str(tmp_path / "clio-kit.dist-info" / "RECORD"),
+        record_sha256="b" * 64,
+        runtime_closure_sha256="c" * 64,
+        runtime_file_count=10,
+        runtime_bytes=1_024,
+        pyvenv_uv_version="0.11.28",
+    )
+    command = [str(tool), "mcp-server", "jarvis"]
+    source_receipt_path = tmp_path / "generation-install-receipt.json"
+    write_install_receipt(
+        install_spec=str(relay_wheel),
+        artifact_path=relay_wheel,
+        path=source_receipt_path,
+        components={"clio-kit": "2.3.1"},
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                distribution_version="2.3.1",
+                install_spec="clio-kit==2.3.1",
+                requested_source="pypi",
+                artifact_filename=clio_kit_wheel.name,
+                artifact_sha256=hashlib.sha256(b"clio-kit-wheel").hexdigest(),
+                runtime_artifact_path=str(clio_kit_wheel),
+                runtime_command=command,
+                runtime_interpreters={"provider": sys.executable},
+                runtime_executables={"clio-kit": str(tool), "uv": str(uv)},
+                persistent_tool=persistent_tool,
+                locked_server_runtime=_verified_locked_jarvis_runtime(),
+            )
+        },
+    )
+
+    def persistent_identity(**_kwargs: object) -> PersistentUvToolIdentity:
+        return persistent_tool
+
+    monkeypatch.setattr(
+        "clio_relay.installation.probe_persistent_uv_tool_identity",
+        persistent_identity,
+    )
+
+    # --- mint a receipt describing THIS process's own (self) identity: a
+    #     VCS exact-sha pin, inheriting components from the generation receipt ---
+    commit_sha = "7" * 40
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    self_source = _vcs_full_sha_install_source(
+        tmp_path=tmp_path, commit_sha=commit_sha, uv_receipt=uv_receipt
+    )
+
+    def detect_self_source(**_kwargs: object) -> InstallSource:
+        return self_source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_self_source)
+
+    minted_path = tmp_path / "generations" / "mixed" / "install-receipt.json"
+    minted = write_self_install_receipt(minted_path, components_from=source_receipt_path)
+
+    # (a) self identity is correct AND the clio-kit component is present verbatim.
+    assert minted.artifact_sha256 == commit_sha
+    assert minted.requested_source == "vcs"
+    assert minted.components == {"clio-kit": "2.3.1"}
+    assert minted.component_artifacts["clio-kit"] == ComponentArtifactIdentity(
+        distribution="clio-kit",
+        distribution_version="2.3.1",
+        install_spec="clio-kit==2.3.1",
+        requested_source="pypi",
+        artifact_filename=clio_kit_wheel.name,
+        artifact_sha256=hashlib.sha256(b"clio-kit-wheel").hexdigest(),
+        runtime_artifact_path=str(clio_kit_wheel),
+        runtime_command=command,
+        runtime_interpreters={"provider": sys.executable},
+        runtime_executables={"clio-kit": str(tool), "uv": str(uv)},
+        persistent_tool=persistent_tool,
+        locked_server_runtime=_verified_locked_jarvis_runtime(),
+    )
+    assert minted.components_source_receipt == str(source_receipt_path)
+
+    # (c) the load-bearing proof: jarvis_mcp_command() derives successfully
+    #     against the MINTED (mixed) receipt, mirroring how
+    #     test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool
+    #     consumes an ordinary (non-mixed) receipt.
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(minted_path))
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+    assert jarvis_mcp_command() == command
+
+
+def test_write_self_install_receipt_refuses_components_from_without_component_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) a source receipt with nothing to inherit is a typed refusal, not a silent no-op."""
+    commit_sha = "8" * 40
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    source = _vcs_full_sha_install_source(
+        tmp_path=tmp_path, commit_sha=commit_sha, uv_receipt=uv_receipt
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    empty_source_receipt_path = tmp_path / "empty-receipt.json"
+    write_install_receipt(install_spec="checkout", path=empty_source_receipt_path)
+
+    minted_path = tmp_path / "generations" / "mixed" / "install-receipt.json"
+    with pytest.raises(ConfigurationError, match="no component artifacts to inherit"):
+        write_self_install_receipt(minted_path, components_from=empty_source_receipt_path)
+    assert not minted_path.exists()
+
+
 def test_remote_native_jarvis_component_requires_runtime_capability_provenance(
     tmp_path: Path,
 ) -> None:

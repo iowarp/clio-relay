@@ -42,7 +42,11 @@ from clio_relay.errors import (
     QueueConflictError,
     RelayError,
 )
-from clio_relay.installation import verify_remote_worker_info, write_self_install_receipt
+from clio_relay.installation import (
+    InstallReceipt,
+    verify_remote_worker_info,
+    write_self_install_receipt,
+)
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
@@ -805,6 +809,46 @@ def test_endpoint_worker_info_forwards_pinned_install_receipt_path(
         observed["pinned_install_receipt_path"]
         == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
     )
+
+
+def test_installation_write_receipt_forwards_components_from(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The CLI surface forwards --components-from to write_self_install_receipt."""
+    observed: dict[str, object] = {}
+    output_path = tmp_path / "generations" / "mixed" / "install-receipt.json"
+    source_path = tmp_path / "generation-install-receipt.json"
+
+    def write_receipt(path: Path, **kwargs: object) -> InstallReceipt:
+        observed["path"] = path
+        observed.update(kwargs)
+        return InstallReceipt(
+            installed_at=datetime.now(UTC),
+            install_spec="checkout",
+            requested_source="vcs",
+            distribution_version="0.0.0",
+            software=SoftwareIdentity(version="0.0.0"),
+        )
+
+    monkeypatch.setattr(cli, "write_self_install_receipt", write_receipt)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "installation-write-receipt",
+            "--self",
+            "--output",
+            str(output_path),
+            "--components-from",
+            str(source_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert observed["path"] == output_path
+    assert observed["components_from"] == source_path
+    assert observed["force"] is False
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
