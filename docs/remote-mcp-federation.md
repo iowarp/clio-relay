@@ -434,7 +434,7 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.6.6 artifact carries the pinned six-tool JARVIS v3.6
+The released clio-kit 2.7.2 artifact carries the pinned six-tool JARVIS v3.6
 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
@@ -468,14 +468,18 @@ The release gate requires that exact 2.6.6 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
-The exact release wheel is
-`clio_kit-2.6.6-py3-none-any.whl` with SHA-256
-`fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91`.
-Its canonical contract is `clio-kit-jarvis-user-v3.6`, with contract SHA-256
-`055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d`
-and canonical tools-wire SHA-256
-`c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023`.
-The bundled contract artifact SHA-256 is
+The exact release wheel bootstrap installs by default is
+`clio_kit-2.7.2-py3-none-any.whl` with SHA-256
+`8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5`.
+Its canonical contract is `clio-kit-jarvis-user-v3.6`. The relay's own
+vendored certification snapshot of that contract (used to cross-check the
+bundled `_contracts/jarvis-user-v3.6.json` copy against a known-good
+clio-kit release, independent of which wheel bootstrap installs) remains
+pinned to the clio-kit 2.6.6 build: contract SHA-256
+`055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d`,
+canonical tools-wire SHA-256
+`c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023`, and
+bundled contract artifact SHA-256
 `6e839f3ac975f247053ef4b6a048c53686882c2ab6a1b103f91dfc744ed29ed5`.
 The nested runtime lock is bound to the public
 [`jarvis_cd-1.8.0-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.8.0/jarvis_cd-1.8.0-py3-none-any.whl)
