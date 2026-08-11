@@ -77,6 +77,7 @@ from clio_relay.deployment import (
     restart_endpoint_user_service_over_ssh,
     write_endpoint_user_service,
 )
+from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.endpoint import EndpointWorker
 from clio_relay.endpoint_service_status import endpoint_service_readiness_over_ssh
@@ -1770,6 +1771,15 @@ def endpoint_worker_info(
             ),
         ),
     ] = None,
+    dev_mode: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "clio-relay#211: cluster-registered dev_mode, threaded in by the "
+                "caller. Combined with CLIO_RELAY_DEV_MODE on this host either way."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Report fresh process-bound identity for the active cluster worker."""
     _run_or_exit(
@@ -1780,6 +1790,7 @@ def endpoint_worker_info(
                     freshness_seconds=freshness_seconds,
                     readiness_only=readiness_only,
                     pinned_install_receipt_path=pinned_install_receipt_path,
+                    dev_mode=dev_mode_enabled(cluster_dev_mode=dev_mode),
                 ),
                 indent=2,
             )
@@ -1981,6 +1992,16 @@ def cluster_add(
         str | None,
         typer.Option(help="Expected SHA-256 of the remote /etc/machine-id site marker."),
     ] = None,
+    dev_mode: Annotated[
+        bool,
+        typer.Option(
+            "--dev-mode/--no-dev-mode",
+            help=(
+                "clio-relay#211: downgrade this cluster's install/identity/receipt/sha "
+                "verification chain to warnings instead of raising. Never for production."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Add or update a local cluster definition."""
     if (target_hostname is None) != (ssh_host_key_sha256 is None):
@@ -2002,6 +2023,7 @@ def cluster_add(
             agent_bin=_none_if_blank(agent_bin),
             agent_adapter=agent_adapter,
             scheduler_provider=scheduler_provider,
+            dev_mode=dev_mode,
             worker_capacity=WorkerCapacityPolicy(
                 concurrency=worker_concurrency,
                 control_query_concurrency=worker_control_query_concurrency,
@@ -2212,6 +2234,16 @@ def installation_write_receipt(
             ),
         ),
     ] = None,
+    dev_mode: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "clio-relay#211: mint a best-effort receipt even when identity "
+                "derivation would otherwise fail, recording each finding as a "
+                "warning instead. Never for production."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Mint a durable install receipt describing this process's own running identity.
 
@@ -2229,19 +2261,24 @@ def installation_write_receipt(
     """
     if not self_flag:
         raise typer.BadParameter("--self is required; only self-description is supported")
-    _run_or_exit(
-        lambda: typer.echo(
-            json.dumps(
-                write_self_install_receipt(
-                    output,
-                    force=force,
-                    components_from=components_from,
-                ).model_dump(mode="json"),
-                indent=2,
-                default=str,
-            )
+    resolved_dev_mode = dev_mode_enabled(cluster_dev_mode=dev_mode)
+    findings = VerificationFindings()
+
+    def action() -> None:
+        receipt = write_self_install_receipt(
+            output,
+            force=force,
+            components_from=components_from,
+            dev_mode=resolved_dev_mode,
+            findings=findings,
         )
-    )
+        payload: dict[str, object] = receipt.model_dump(mode="json")
+        dev_mode_payload = findings.payload()
+        if dev_mode_payload is not None:
+            payload.update(dev_mode_payload)
+        typer.echo(json.dumps(payload, indent=2, default=str))
+
+    _run_or_exit(action)
 
 
 @remote_mcp_app.command("register")
@@ -4082,7 +4119,13 @@ def session_plan_start(
     settings = RelaySettings.from_env()
 
     def action() -> None:
-        release_identity = _verify_session_start_worker_release_identity(definition)
+        dev_mode_findings = VerificationFindings()
+        release_identity = _verify_session_start_worker_release_identity(
+            definition,
+            dev_mode=dev_mode_enabled(cluster_dev_mode=definition.dev_mode),
+            findings=dev_mode_findings,
+        )
+        _echo_dev_mode_findings(dev_mode_findings)
         typer.echo(
             plan_remote_session_start(
                 cluster=cluster,
@@ -4148,7 +4191,13 @@ def session_start(
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
         )
         with _session_transition_lock(cluster=cluster, session_id=session_id):
-            api_release_identity = _verify_session_start_worker_release_identity(definition)
+            dev_mode_findings = VerificationFindings()
+            api_release_identity = _verify_session_start_worker_release_identity(
+                definition,
+                dev_mode=dev_mode_enabled(cluster_dev_mode=definition.dev_mode),
+                findings=dev_mode_findings,
+            )
+            _echo_dev_mode_findings(dev_mode_findings)
             if (
                 expected_api_release_identity_sha256 is not None
                 and api_release_identity.sha256() != expected_api_release_identity_sha256
@@ -5212,8 +5261,24 @@ def _persist_verified_cleanup_report_before_closure(
 
 def _verify_session_start_worker_release_identity(
     definition: ClusterDefinition,
+    *,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
 ) -> SessionApiReleaseIdentity:
-    """Require one exact live worker/install identity before session mutation."""
+    """Require one exact live worker/install identity before session mutation.
+
+    ``dev_mode`` (clio-relay#211) downgrades the REMOTE worker's identity
+    comparison to a recorded warning instead of raising -- this is the
+    "identity_matches_current" wall observed live on a cluster pinned to a
+    dev sha. The local desktop identity resolution is unaffected by this
+    parameter (it already honors ``CLIO_RELAY_DEV_MODE`` on its own via
+    ``installation_info``'s default): session start still requires *a*
+    session-API process-attestation identity to bind to, so when the
+    downgraded remote receipt has no artifact sha at all, one is derived
+    deterministically from what IS known and clearly marked advisory rather
+    than silently treated as a real release digest.
+    """
+    findings = findings if findings is not None else VerificationFindings()
     local_identity = _session_api_release_identity_from_installation(
         installation_info(),
         label="local clio-relay",
@@ -5225,15 +5290,39 @@ def _verify_session_start_worker_release_identity(
         expected_software=local_identity.software,
         expected_artifact_sha256=local_identity.artifact_sha256,
         expected_source=None,
+        dev_mode=dev_mode,
+        findings=findings,
     )
     artifact_sha256 = remote_receipt.artifact_sha256
     if artifact_sha256 is None:
-        raise ConfigurationError("remote worker receipt omitted its artifact SHA-256")
+        if not dev_mode:
+            raise ConfigurationError("remote worker receipt omitted its artifact SHA-256")
+        message = "remote worker receipt omitted its artifact SHA-256"
+        findings.record(message)
+        artifact_sha256 = hashlib.sha256(
+            f"dev-mode-advisory:{remote_receipt.distribution_version}:"
+            f"{remote_receipt.install_spec}".encode()
+        ).hexdigest()
     return SessionApiReleaseIdentity(
         distribution_version=remote_receipt.distribution_version,
         artifact_sha256=artifact_sha256,
         software=remote_receipt.software,
     )
+
+
+def _echo_dev_mode_findings(findings: VerificationFindings) -> None:
+    """Print the DEV MODE banner + downgraded findings to stderr, when present.
+
+    clio-relay#211 requires every status/info surface a downgraded check
+    can reach to carry an unmissable marker; commands that return a typed,
+    ``extra="forbid"`` payload (a session start plan, an install receipt)
+    cannot have arbitrary keys merged in, so this prints the same banner
+    payload as a companion line instead of silently dropping it.
+    """
+    dev_mode_payload = findings.payload()
+    if dev_mode_payload is None:
+        return
+    typer.echo(json.dumps(dev_mode_payload, indent=2), err=True)
 
 
 def _session_api_release_identity_from_installation(
@@ -18003,6 +18092,8 @@ def _remote_worker_info(
     args = ["endpoint", "worker-info", "--cluster", definition.name]
     if definition.relay_install_receipt is not None:
         args = [*args, "--pinned-install-receipt-path", definition.relay_install_receipt]
+    if definition.dev_mode:
+        args = [*args, "--dev-mode"]
     info = _json_output(
         _run_remote_clio_before_deadline(
             definition,

@@ -773,6 +773,7 @@ def test_endpoint_worker_info_exposes_bounded_readiness_mode(
         "freshness_seconds": 90.0,
         "readiness_only": True,
         "pinned_install_receipt_path": None,
+        "dev_mode": False,
     }
 
 
@@ -809,6 +810,62 @@ def test_endpoint_worker_info_forwards_pinned_install_receipt_path(
         observed["pinned_install_receipt_path"]
         == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
     )
+
+
+def test_endpoint_worker_info_dev_mode_flag_resolves_env_and_cluster_pin(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#211: --dev-mode (cluster pin) combines with CLIO_RELAY_DEV_MODE either way."""
+    observed: list[bool] = []
+
+    def worker_info(**kwargs: object) -> dict[str, object]:
+        observed.append(cast(bool, kwargs["dev_mode"]))
+        return {
+            "schema_version": "clio-relay.worker-runtime-info.v1",
+            "cluster": kwargs["cluster"],
+            "running": True,
+        }
+
+    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
+    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
+
+    off = CliRunner().invoke(app, ["endpoint", "worker-info", "--cluster", "ares"])
+    assert off.exit_code == 0, off.output
+
+    on_via_flag = CliRunner().invoke(
+        app, ["endpoint", "worker-info", "--cluster", "ares", "--dev-mode"]
+    )
+    assert on_via_flag.exit_code == 0, on_via_flag.output
+
+    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
+    on_via_env = CliRunner().invoke(app, ["endpoint", "worker-info", "--cluster", "ares"])
+    assert on_via_env.exit_code == 0, on_via_env.output
+
+    assert observed == [False, True, True]
+
+
+def test_cluster_add_dev_mode_flag_persists_on_the_registry_entry(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#211: cluster add --dev-mode is the CLI path to pin a cluster's dev mode."""
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+
+    result = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login", "--dev-mode"],
+    )
+    assert result.exit_code == 0, result.output
+    definition = ClusterRegistry.load(registry_path).require("ares-p5run2")
+    assert definition.dev_mode is True
+
+    result = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares", "--ssh-host", "ares-login"],
+    )
+    assert result.exit_code == 0, result.output
+    assert ClusterRegistry.load(registry_path).require("ares").dev_mode is False
 
 
 def test_installation_write_receipt_forwards_components_from(
@@ -1978,6 +2035,7 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
 
     def accept_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return _session_api_release_identity()
 
@@ -4152,6 +4210,7 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
 
     def accept_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return _session_api_release_identity()
 
@@ -4306,6 +4365,7 @@ def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_pr
 
     def verify_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return _session_api_release_identity()
 
@@ -4362,6 +4422,7 @@ def test_cli_session_start_returns_self_contained_current_selector(
 
     def verify_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return release
 
@@ -4435,6 +4496,7 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
 
     def verify_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return release
 
@@ -4525,6 +4587,7 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
 
     def verify_worker_compatibility(
         _definition: ClusterDefinition,
+        **_kwargs: object,
     ) -> SessionApiReleaseIdentity:
         return release
 

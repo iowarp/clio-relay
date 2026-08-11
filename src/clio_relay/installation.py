@@ -21,6 +21,7 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
+from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled, enforce
 from clio_relay.errors import ConfigurationError
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -1087,6 +1088,9 @@ def _path_within(path: Path, root: Path) -> bool:
 
 def _current_install_receipt(
     path: Path | None = None,
+    *,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
 ) -> tuple[InstallReceipt, Literal["bootstrap", "uv-tool"], InstallSource | None]:
     """Load the durable receipt that owns the current relay installation."""
     receipt_path = path or default_install_receipt_path()
@@ -1095,7 +1099,9 @@ def _current_install_receipt(
     if receipt_path.exists() or path is not None or os.environ.get(INSTALL_RECEIPT_PATH_ENV):
         receipt = load_install_receipt(receipt_path)
     else:
-        receipt, install_source = _persistent_uv_tool_install_receipt()
+        receipt, install_source = _persistent_uv_tool_install_receipt(
+            dev_mode=dev_mode, findings=findings
+        )
         receipt_origin = "uv-tool"
     return receipt, receipt_origin, install_source
 
@@ -1123,13 +1129,29 @@ def verified_session_api_install_receipt(path: Path | None = None) -> InstallRec
     return receipt
 
 
-def installation_info(path: Path | None = None) -> dict[str, object]:
-    """Return current package identity together with its durable install receipt."""
-    receipt, receipt_origin, install_source = _current_install_receipt(path)
+def installation_info(
+    path: Path | None = None,
+    *,
+    dev_mode: bool | None = None,
+) -> dict[str, object]:
+    """Return current package identity together with its durable install receipt.
+
+    ``dev_mode`` defaults to :func:`clio_relay.dev_mode.dev_mode_enabled` (the
+    ``CLIO_RELAY_DEV_MODE`` environment switch) when omitted, so every
+    existing caller of this function honors the environment switch for
+    free; a caller holding cluster context (e.g. ``worker_runtime_info``)
+    passes the resolved value explicitly to also honor a cluster's
+    ``dev_mode`` registry flag (clio-relay#211).
+    """
+    resolved_dev_mode = dev_mode_enabled() if dev_mode is None else dev_mode
+    findings = VerificationFindings()
+    receipt, receipt_origin, install_source = _current_install_receipt(
+        path, dev_mode=resolved_dev_mode, findings=findings
+    )
     current_software = detect_software_identity()
     current_version = metadata.version("clio-relay")
     component_runtime = _component_runtime_identity(receipt)
-    return {
+    info: dict[str, object] = {
         "schema_version": "clio-relay.installation-info.v1",
         "distribution_version": current_version,
         "software": current_software.model_dump(mode="json"),
@@ -1143,9 +1165,17 @@ def installation_info(path: Path | None = None) -> dict[str, object]:
         ),
         "component_runtime": component_runtime,
     }
+    dev_mode_payload = findings.payload()
+    if dev_mode_payload is not None:
+        info.update(dev_mode_payload)
+    return info
 
 
-def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource]:
+def _persistent_uv_tool_install_receipt(
+    *,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
+) -> tuple[InstallReceipt, InstallSource]:
     """Derive a compatible receipt from uv's exact persistent-tool identity.
 
     A VCS-kind install counts only when pinned to an exact 40-hex git commit
@@ -1155,34 +1185,66 @@ def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource
     identity-anchor role a wheel's sha256 digest plays. A branch or tag
     reference leaves ``artifact_identity_verified`` False and is rejected
     below exactly like an unverified wheel.
+
+    In dev mode (clio-relay#211) a failed check is recorded on ``findings``
+    instead of raising, and derivation still produces a best-effort receipt
+    -- honestly less-verified (``artifact_sha256`` may be ``None``, the
+    install timestamp may fall back to now) rather than blocking a
+    non-generation dev install from getting a receipt at all.
     """
+    findings = findings if findings is not None else VerificationFindings()
     source = detect_install_source(
         launcher="uv-tool",
         infer_artifact_sha256=True,
     )
-    if source.kind not in {
-        InstallSourceKind.WHEEL,
-        InstallSourceKind.PYPI,
-        InstallSourceKind.VCS,
-    }:
-        raise ConfigurationError("running clio-relay is not installed as a persistent uv tool")
-    if not source.launcher_verified:
-        raise ConfigurationError("persistent uv tool launcher identity could not be verified")
-    if not source.artifact_identity_verified or source.artifact_sha256 is None:
-        raise ConfigurationError("persistent uv tool wheel identity could not be verified")
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=source.kind
+        in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI, InstallSourceKind.VCS},
+        message="running clio-relay is not installed as a persistent uv tool",
+    )
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=source.launcher_verified,
+        message="persistent uv tool launcher identity could not be verified",
+    )
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=source.artifact_identity_verified and source.artifact_sha256 is not None,
+        message="persistent uv tool wheel identity could not be verified",
+    )
     raw_uv_receipt = source.launcher_receipt.get("uv_tool_receipt")
-    if not isinstance(raw_uv_receipt, dict):
-        raise ConfigurationError("persistent uv tool receipt could not be verified")
-    uv_receipt = cast(dict[str, object], raw_uv_receipt)
-    if uv_receipt.get("verified") is not True:
-        raise ConfigurationError("persistent uv tool receipt could not be verified")
+    uv_receipt: dict[str, object] = (
+        cast(dict[str, object], raw_uv_receipt) if isinstance(raw_uv_receipt, dict) else {}
+    )
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=isinstance(raw_uv_receipt, dict) and uv_receipt.get("verified") is True,
+        message="persistent uv tool receipt could not be verified",
+    )
     receipt_path_value = uv_receipt.get("path")
-    if not isinstance(receipt_path_value, str):
-        raise ConfigurationError("persistent uv tool receipt path is missing")
-    try:
-        installed_at = datetime.fromtimestamp(Path(receipt_path_value).stat().st_mtime, tz=UTC)
-    except OSError as exc:
-        raise ConfigurationError("persistent uv tool receipt path is unavailable") from exc
+    installed_at = datetime.now(UTC)
+    if isinstance(receipt_path_value, str):
+        try:
+            installed_at = datetime.fromtimestamp(Path(receipt_path_value).stat().st_mtime, tz=UTC)
+        except OSError as exc:
+            enforce(
+                findings,
+                dev_mode=dev_mode,
+                condition=False,
+                message=f"persistent uv tool receipt path is unavailable: {exc}",
+            )
+    else:
+        enforce(
+            findings,
+            dev_mode=dev_mode,
+            condition=False,
+            message="persistent uv tool receipt path is missing",
+        )
     reference = source.reference
     artifact_filename: str | None = None
     if reference is not None and source.kind is not InstallSourceKind.VCS:
@@ -1206,6 +1268,8 @@ def write_self_install_receipt(
     *,
     force: bool = False,
     components_from: Path | None = None,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
 ) -> InstallReceipt:
     """Mint a durable receipt describing the RUNNING installation's own identity.
 
@@ -1231,12 +1295,18 @@ def write_self_install_receipt(
     path is recorded on ``components_source_receipt`` so the mix is
     traceable, never silent. Refuses when the source receipt carries no
     component artifacts to inherit.
+
+    ``dev_mode`` (clio-relay#211) downgrades identity derivation to a
+    best-effort receipt with recorded warnings instead of raising -- for a
+    non-generation dev install (a checkout, an unverified launcher, ...)
+    that still needs *a* receipt to iterate against. ``force`` still
+    governs overwriting the destination path unconditionally.
     """
     if path.exists() and not force:
         raise ConfigurationError(
             f"install receipt already exists: {path} (use --force to overwrite)"
         )
-    receipt, _source = _persistent_uv_tool_install_receipt()
+    receipt, _source = _persistent_uv_tool_install_receipt(dev_mode=dev_mode, findings=findings)
     if components_from is not None:
         try:
             source_receipt = load_install_receipt(components_from)
@@ -1274,6 +1344,7 @@ def worker_runtime_info(
     current_installation: dict[str, object] | None = None,
     readiness_only: bool = False,
     pinned_install_receipt_path: str | None = None,
+    dev_mode: bool = False,
 ) -> dict[str, object]:
     """Prove the active worker process loaded the same exact installation receipt.
 
@@ -1285,6 +1356,12 @@ def worker_runtime_info(
     only against this invocation's own ambient ``current`` installation: a
     multi-tenant host can keep its shared ``current`` pointed at a different
     generation for other tenants while one cluster is pinned to its own.
+
+    ``dev_mode`` (clio-relay#211, resolved by the caller from
+    ``CLIO_RELAY_DEV_MODE``/the cluster's ``dev_mode`` flag) is threaded
+    into the ``current`` self-check so a non-generation dev install here
+    still produces a readable status instead of raising; it never affects
+    freshness/liveness or the fresh-endpoint scan below, which stay hard.
     """
     from clio_relay.config import RelaySettings
     from clio_relay.core_queue import MAX_ENDPOINT_FRESH_SECONDS, ClioCoreQueue
@@ -1296,7 +1373,11 @@ def worker_runtime_info(
         raise ConfigurationError(
             "worker freshness_seconds exceeds the bounded fresh endpoint window"
         )
-    current = installation_info() if current_installation is None else current_installation
+    current = (
+        installation_info(dev_mode=dev_mode)
+        if current_installation is None
+        else current_installation
+    )
     if current.get("schema_version") != "clio-relay.installation-info.v1":
         raise ConfigurationError("current installation snapshot is invalid")
     pinned_installation: dict[str, object] | None = None
@@ -1372,12 +1453,30 @@ def verify_remote_installation_info(
     expected_software: SoftwareIdentity,
     expected_artifact_sha256: str | None,
     expected_source: str | None,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
 ) -> InstallReceipt:
-    """Require a remote receipt to match the exact local acceptance artifact."""
-    if info.get("distribution_version") != expected_version:
-        raise ConfigurationError("remote clio-relay distribution version does not match")
-    if info.get("receipt_matches_install") is not True:
-        raise ConfigurationError("remote installation receipt does not match the running package")
+    """Require a remote receipt to match the exact local acceptance artifact.
+
+    In dev mode (clio-relay#211) every semantic identity comparison below
+    is downgraded to a recorded warning instead of raising, and the parsed
+    receipt is still returned. Payload shape (the receipt must parse as a
+    valid ``InstallReceipt``) stays hard either way -- a malformed payload
+    is corruption, not a would-have-failed release check.
+    """
+    findings = findings if findings is not None else VerificationFindings()
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=info.get("distribution_version") == expected_version,
+        message="remote clio-relay distribution version does not match",
+    )
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=info.get("receipt_matches_install") is True,
+        message="remote installation receipt does not match the running package",
+    )
     raw_software = info.get("software")
     raw_receipt = info.get("receipt")
     try:
@@ -1385,16 +1484,35 @@ def verify_remote_installation_info(
         receipt = InstallReceipt.model_validate(raw_receipt)
     except ValidationError as exc:
         raise ConfigurationError(f"remote installation identity is invalid: {exc}") from exc
-    if software != expected_software:
-        raise ConfigurationError("remote worker commit/tag identity does not match")
+    enforce(
+        findings,
+        dev_mode=dev_mode,
+        condition=software == expected_software,
+        message="remote worker commit/tag identity does not match",
+    )
     if expected_artifact_sha256 is None:
-        raise ConfigurationError("acceptance did not identify the tested artifact SHA-256")
-    if receipt.artifact_sha256 != expected_artifact_sha256:
-        raise ConfigurationError("remote worker wheel SHA-256 does not match")
-    if expected_source is not None and receipt.requested_source != expected_source:
-        raise ConfigurationError(
-            "remote worker install source does not match: "
-            f"{receipt.requested_source} != {expected_source}"
+        enforce(
+            findings,
+            dev_mode=dev_mode,
+            condition=False,
+            message="acceptance did not identify the tested artifact SHA-256",
+        )
+    else:
+        enforce(
+            findings,
+            dev_mode=dev_mode,
+            condition=receipt.artifact_sha256 == expected_artifact_sha256,
+            message="remote worker wheel SHA-256 does not match",
+        )
+    if expected_source is not None:
+        enforce(
+            findings,
+            dev_mode=dev_mode,
+            condition=receipt.requested_source == expected_source,
+            message=(
+                "remote worker install source does not match: "
+                f"{receipt.requested_source} != {expected_source}"
+            ),
         )
     return receipt
 
@@ -1419,6 +1537,8 @@ def verify_remote_worker_info(
     expected_artifact_sha256: str | None,
     expected_source: str | None,
     require_target_identity: bool = True,
+    dev_mode: bool = False,
+    findings: VerificationFindings | None = None,
 ) -> InstallReceipt:
     """Require fresh live-worker proof in addition to a static install receipt.
 
@@ -1430,7 +1550,17 @@ def verify_remote_worker_info(
     shared host's ``current`` symlink is not required to agree with a pin
     made for one cluster. A cluster with no pin keeps requiring
     ``identity_matches_current`` exactly as before.
+
+    In dev mode (clio-relay#211) every identity/receipt/sha comparison below
+    is downgraded to a recorded warning instead of raising, and the best
+    receipt available is still returned. Liveness (``fresh``,
+    ``process_running``) and every structural/shape check (schema, cluster
+    and role match, scheduler-provider attestation, physical target
+    identity) stay hard regardless -- dev mode relaxes release-integrity
+    ceremony for a trusted git sha, not proof the worker process is real,
+    live, and the one this call actually asked about.
     """
+    findings = findings if findings is not None else VerificationFindings()
     if info.get("schema_version") != "clio-relay.worker-runtime-info.v1":
         raise ConfigurationError("remote worker runtime identity schema does not match")
     if info.get("cluster") != expected_cluster:
@@ -1439,14 +1569,17 @@ def verify_remote_worker_info(
     if raw_pinned_installation is not None and not isinstance(raw_pinned_installation, dict):
         raise ConfigurationError("remote worker pinned installation identity is invalid")
     cluster_pins_runtime = raw_pinned_installation is not None
-    required_flags = (
-        ("fresh", "process_running")
-        if cluster_pins_runtime
-        else ("fresh", "process_running", "identity_matches_current", "running")
-    )
-    for flag in required_flags:
+    for flag in ("fresh", "process_running"):
         if info.get(flag) is not True:
             raise ConfigurationError(f"remote worker runtime did not prove {flag}")
+    if not cluster_pins_runtime:
+        for flag in ("identity_matches_current", "running"):
+            enforce(
+                findings,
+                dev_mode=dev_mode,
+                condition=info.get(flag) is True,
+                message=f"remote worker runtime did not prove {flag}",
+            )
     current = info.get("installation")
     endpoint_installation = info.get("endpoint_installation")
     endpoint = info.get("endpoint")
@@ -1477,20 +1610,25 @@ def verify_remote_worker_info(
         expected_software=expected_software,
         expected_artifact_sha256=expected_artifact_sha256,
         expected_source=expected_source,
+        dev_mode=dev_mode,
+        findings=findings,
     )
     if cluster_pins_runtime:
         if info.get("identity_matches_pinned") is not True:
             try:
                 pinned_receipt = InstallReceipt.model_validate(raw_pinned_installation)
+                message = (
+                    "remote worker runtime does not match its cluster's pinned installation: "
+                    f"worker={_installation_identity_label(endpoint_receipt)} "
+                    f"pinned={_installation_identity_label(pinned_receipt)}"
+                )
             except ValidationError as exc:
-                raise ConfigurationError(
-                    f"remote worker pinned installation identity is invalid: {exc}"
-                ) from exc
-            raise ConfigurationError(
-                "remote worker runtime does not match its cluster's pinned installation: "
-                f"worker={_installation_identity_label(endpoint_receipt)} "
-                f"pinned={_installation_identity_label(pinned_receipt)}"
-            )
+                if not dev_mode:
+                    raise ConfigurationError(
+                        f"remote worker pinned installation identity is invalid: {exc}"
+                    ) from exc
+                message = f"remote worker pinned installation identity is invalid: {exc}"
+            enforce(findings, dev_mode=dev_mode, condition=False, message=message)
         current_receipt = endpoint_receipt
     else:
         current_receipt = verify_remote_installation_info(
@@ -1499,9 +1637,15 @@ def verify_remote_worker_info(
             expected_software=expected_software,
             expected_artifact_sha256=expected_artifact_sha256,
             expected_source=expected_source,
+            dev_mode=dev_mode,
+            findings=findings,
         )
-        if endpoint_receipt != current_receipt:
-            raise ConfigurationError("running worker receipt differs from current installation")
+        enforce(
+            findings,
+            dev_mode=dev_mode,
+            condition=endpoint_receipt == current_receipt,
+            message="running worker receipt differs from current installation",
+        )
     if require_target_identity:
         target_identity = info.get("target_identity")
         if not isinstance(target_identity, dict):

@@ -19,6 +19,7 @@ from typing import cast
 import pytest
 
 import clio_relay.installation as installation_module
+from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import (
     CLIO_KIT_JARVIS_CONTRACT_ID,
@@ -1201,6 +1202,89 @@ def test_installation_info_rejects_vcs_uv_tool_install_pinned_to_a_branch(
         installation_info()
 
 
+def test_installation_info_downgrades_to_warning_in_dev_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#211: the exact same failing install still derives a receipt in dev mode.
+
+    Reuses the precise fixture from
+    test_installation_info_rejects_vcs_uv_tool_install_pinned_to_a_branch
+    (a branch-pinned, therefore unverified, VCS install) -- production
+    behavior there is unchanged (still raises); with CLIO_RELAY_DEV_MODE=1
+    the identical install now returns a best-effort receipt with the exact
+    would-have-failed message carried as a warning behind the DEV MODE
+    banner, and without the env var it raises exactly as before.
+    """
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    source_url = "https://github.com/iowarp/clio-relay"
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=None,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {"vcs": "git", "requested_revision": "main", "commit_id": "d" * 40},
+        },
+        artifact_identity_verified=False,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {"path": str(uv_receipt), "verified": True},
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    # still raises without dev mode -- production behavior is byte-for-byte unchanged.
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    with pytest.raises(ConfigurationError, match="wheel identity could not be verified"):
+        installation_info()
+
+    # dev mode via CLIO_RELAY_DEV_MODE: downgraded to a warning, receipt still returned.
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+    info = installation_info()
+    assert info["dev_mode_banner"] == DEV_MODE_BANNER
+    dev_mode_warnings = cast(list[str], info["dev_mode_warnings"])
+    assert "persistent uv tool wheel identity could not be verified" in dev_mode_warnings
+    receipt = cast(dict[str, object], info["receipt"])
+    assert receipt["requested_source"] == "vcs"
+    assert receipt["artifact_sha256"] is None
+
+    # no findings, no banner, no keys at all -- the clean case never mentions dev mode.
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    verified_source = source.model_copy(
+        update={"artifact_identity_verified": True, "artifact_sha256": "a" * 40}
+    )
+
+    def detect_verified_source(**_kwargs: object) -> InstallSource:
+        return verified_source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_verified_source)
+    clean_info = installation_info()
+    assert "dev_mode_banner" not in clean_info
+    assert "dev_mode_warnings" not in clean_info
+
+
 def _vcs_full_sha_install_source(
     *, tmp_path: Path, commit_sha: str, uv_receipt: Path
 ) -> InstallSource:
@@ -1819,6 +1903,116 @@ def test_verify_remote_worker_info_uses_cluster_pin_over_global_current(tmp_path
         )
 
 
+def test_verify_remote_worker_info_dev_mode_downgrades_pin_mismatch_to_warning(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#211: the identity_matches_pinned wall becomes advisory in dev mode.
+
+    Reuses test_verify_remote_worker_info_uses_cluster_pin_over_global_current's
+    exact "(b)" pin-mismatch scenario -- production behavior there
+    (dev_mode=False, the default) is proven unchanged; with dev_mode=True the
+    SAME payload now passes, carrying the exact would-have-failed message as
+    a warning, naming both identities exactly as the production error would.
+    """
+    pinned_wheel = tmp_path / "clio_relay-pinned-1.0.0-py3-none-any.whl"
+    pinned_wheel.write_bytes(b"cluster-pinned-generation-g")
+    pinned_receipt_path = tmp_path / "pinned-receipt.json"
+    pinned_receipt = write_install_receipt(
+        install_spec=str(pinned_wheel),
+        artifact_path=pinned_wheel,
+        path=pinned_receipt_path,
+        generation="a" * 64,
+    )
+
+    other_wheel = tmp_path / "clio_relay-other-1.0.0-py3-none-any.whl"
+    other_wheel.write_bytes(b"shared-tenant-global-current")
+    other_receipt_path = tmp_path / "other-receipt.json"
+    other_receipt = write_install_receipt(
+        install_spec=str(other_wheel),
+        artifact_path=other_wheel,
+        path=other_receipt_path,
+        generation="b" * 64,
+    )
+    worker_matches_other = installation_info(other_receipt_path)
+
+    runtime: dict[str, object] = {
+        "schema_version": "clio-relay.worker-runtime-info.v1",
+        "cluster": "ares-p5run2",
+        "fresh": True,
+        "process_running": True,
+        "scheduler_provider": "slurm",
+        "endpoint": {
+            "role": "worker",
+            "cluster": "ares-p5run2",
+            "pid": 123,
+            "metadata": {"scheduler_provider": "slurm"},
+        },
+        "installation": worker_matches_other,
+        "target_identity": {
+            "verified": True,
+            "hostname": "ares-login",
+            "ssh_host_key_sha256": ["SHA256:test"],
+            "scheduler_cluster_name": "ares",
+        },
+        "pinned_installation": pinned_receipt.model_dump(mode="json"),
+        "endpoint_installation": worker_matches_other,
+        "identity_matches_current": True,
+        "identity_matches_pinned": False,
+        "running": True,
+    }
+    call_kwargs: dict[str, object] = {
+        "expected_cluster": "ares-p5run2",
+        "expected_version": other_receipt.distribution_version,
+        "expected_software": SoftwareIdentity.model_validate(worker_matches_other["software"]),
+        "expected_artifact_sha256": other_receipt.artifact_sha256,
+        "expected_source": "wheel",
+        "require_target_identity": False,
+    }
+
+    # unchanged production behavior: still raises without dev mode.
+    with pytest.raises(ConfigurationError, match="pinned installation"):
+        verify_remote_worker_info(runtime, **call_kwargs)  # pyright: ignore[reportArgumentType]
+
+    # dev mode: the same mismatch downgrades to a warning; verification passes.
+    findings = VerificationFindings()
+    verified = verify_remote_worker_info(
+        runtime,
+        dev_mode=True,
+        findings=findings,
+        **call_kwargs,  # pyright: ignore[reportArgumentType]
+    )
+    assert verified == other_receipt
+    assert len(findings.warnings) == 1
+    assert "pinned installation" in findings.warnings[0]
+    assert other_receipt.distribution_version in findings.warnings[0]
+    assert "worker=" in findings.warnings[0] and "pinned=" in findings.warnings[0]
+
+    # hard checks stay hard even in dev mode: liveness (fresh/process_running)...
+    with pytest.raises(ConfigurationError, match="fresh"):
+        verify_remote_worker_info(
+            {**runtime, "fresh": False},
+            dev_mode=True,
+            **call_kwargs,  # pyright: ignore[reportArgumentType]
+        )
+    # ...and physical target identity.
+    unverified_target = {
+        **cast(dict[str, object], runtime["target_identity"]),
+        "verified": False,
+    }
+    unverified_target_runtime = {**runtime, "target_identity": unverified_target}
+    with pytest.raises(ConfigurationError, match="physical target identity"):
+        verify_remote_worker_info(
+            unverified_target_runtime,
+            dev_mode=True,
+            require_target_identity=True,
+            expected_cluster="ares-p5run2",
+            expected_version=other_receipt.distribution_version,
+            expected_software=SoftwareIdentity.model_validate(worker_matches_other["software"]),
+            expected_artifact_sha256=other_receipt.artifact_sha256,
+            expected_source="wheel",
+        )
+
+
 def test_worker_runtime_info_resolves_cluster_pinned_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1874,8 +2068,11 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
     def worker_process_matches(_pid: int) -> bool:
         return True
 
+    def current_installation(**_kwargs: object) -> dict[str, object]:
+        return current_identity
+
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
-    monkeypatch.setattr(installation_module, "installation_info", lambda: current_identity)
+    monkeypatch.setattr(installation_module, "installation_info", current_installation)
     monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
 
     result = worker_runtime_info(
@@ -1938,7 +2135,7 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     )
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
 
-    def current_installation() -> dict[str, object]:
+    def current_installation(**_kwargs: object) -> dict[str, object]:
         return identity
 
     monkeypatch.setattr(installation_module, "installation_info", current_installation)
@@ -2144,6 +2341,40 @@ def test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool(
     assert runtime["clio-kit"]["command_matches_receipt"] is True
     assert runtime["clio-kit"]["launcher"] == "uv tool"
     assert runtime["clio-kit"]["persistent_tool_verified"] is True
+
+
+def test_jarvis_mcp_command_dev_mode_downgrades_missing_component_to_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#211/#210: a receipt with no clio-kit component becomes advisory.
+
+    ``jarvis_mcp_command()`` requires ``component_artifacts.clio-kit`` and
+    raises typed ("install receipt has no clio-kit component artifact")
+    without it -- one of the four concrete walls named in clio-relay#211.
+    Production behavior is unchanged; CLIO_RELAY_DEV_MODE=1 falls back to
+    DEFAULT_JARVIS_MCP_COMMAND (the same fallback already used when no
+    receipt exists at all) and records the exact production reason.
+    """
+    receipt_path = tmp_path / "install-receipt.json"
+    write_install_receipt(install_spec="checkout", path=receipt_path)
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(receipt_path))
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    with pytest.raises(ValueError, match="no clio-kit component artifact"):
+        jarvis_mcp_command()
+
+    findings = VerificationFindings()
+    fallback = ["clio-kit", "mcp-server", "jarvis"]
+    assert jarvis_mcp_command(dev_mode=True, findings=findings) == fallback
+    assert len(findings.warnings) == 1
+    assert "no clio-kit component artifact" in findings.warnings[0]
+
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+    env_findings = VerificationFindings()
+    assert jarvis_mcp_command(findings=env_findings) == ["clio-kit", "mcp-server", "jarvis"]
+    assert len(env_findings.warnings) == 1
 
 
 def test_component_runtime_identity_does_not_probe_unverified_clio_kit_launcher(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
+from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
 from clio_relay.remote_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     CLIO_KIT_JARVIS_USER_WIRE_SHA256,
@@ -211,8 +212,24 @@ def require_handle_first_jarvis_run_schema(
 _VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES = _load_bundled_jarvis_user_contract()
 
 
-def jarvis_mcp_command() -> list[str]:
-    """Return the command used on the cluster to launch the JARVIS MCP server."""
+def jarvis_mcp_command(
+    *,
+    dev_mode: bool | None = None,
+    findings: VerificationFindings | None = None,
+) -> list[str]:
+    """Return the command used on the cluster to launch the JARVIS MCP server.
+
+    ``dev_mode`` defaults to :func:`clio_relay.dev_mode.dev_mode_enabled` (the
+    ``CLIO_RELAY_DEV_MODE`` environment switch) when omitted, so every
+    existing caller honors the environment switch for free (clio-relay#211).
+    When the receipt-bound clio-kit contract/digest identity does not
+    verify, dev mode records the exact production error on ``findings`` and
+    falls back to :data:`DEFAULT_JARVIS_MCP_COMMAND` -- the same fallback
+    already used when no receipt exists at all -- instead of raising and
+    blocking the worker's JARVIS MCP server from starting at all.
+    """
+    resolved_dev_mode = dev_mode_enabled() if dev_mode is None else dev_mode
+    findings = findings if findings is not None else VerificationFindings()
     configured = os.environ.get(JARVIS_MCP_COMMAND_ENV)
     if configured is not None and configured.strip():
         return _decode_command(configured)
@@ -225,7 +242,10 @@ def jarvis_mcp_command() -> list[str]:
     identity = jarvis_mcp_runtime_identity(receipt)
     if identity.get("artifact_identity_verified") is not True:
         reason = identity.get("error") or "receipt-bound clio-kit runtime identity did not verify"
-        raise ValueError(str(reason))
+        if not resolved_dev_mode:
+            raise ValueError(str(reason))
+        findings.record(str(reason))
+        return list(DEFAULT_JARVIS_MCP_COMMAND)
     command = identity.get("command")
     if not isinstance(command, list):
         raise ValueError("install receipt has no valid clio-kit runtime command")
