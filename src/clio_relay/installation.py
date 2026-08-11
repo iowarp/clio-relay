@@ -1196,6 +1196,38 @@ def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource
     return receipt, source
 
 
+def write_self_install_receipt(path: Path, *, force: bool = False) -> InstallReceipt:
+    """Mint a durable receipt describing the RUNNING installation's own identity.
+
+    A dev-tool install has no receipt describing itself: ``installation_info()``
+    prefers any existing on-disk receipt at the default bootstrap-style path,
+    so a stale receipt left over from an earlier bootstrap deployment shadows
+    the actual running identity. A cluster's pinned runtime
+    (``cluster pin-runtime --install-receipt``, clio-relay#205) needs an
+    explicit, accurate receipt file to point at -- this mints one.
+
+    Identity is resolved exactly the way the persistent-uv-tool identity
+    check already trusts it: a wheel's sha256 digest for a WHEEL/PYPI
+    install, or the exact pinned commit sha for an exact-sha VCS install
+    (``_vcs_commit_identity_verified``, clio-relay#206). Never re-derived a
+    second, potentially divergent way.
+    """
+    if path.exists() and not force:
+        raise ConfigurationError(
+            f"install receipt already exists: {path} (use --force to overwrite)"
+        )
+    receipt, _source = _persistent_uv_tool_install_receipt()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(receipt.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    return receipt
+
+
 def worker_runtime_info(
     *,
     cluster: str,

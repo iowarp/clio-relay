@@ -38,6 +38,7 @@ from clio_relay.installation import (
     verify_remote_worker_info,
     worker_runtime_info,
     write_install_receipt,
+    write_self_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
@@ -1198,6 +1199,91 @@ def test_installation_info_rejects_vcs_uv_tool_install_pinned_to_a_branch(
 
     with pytest.raises(ConfigurationError, match="wheel identity could not be verified"):
         installation_info()
+
+
+def _vcs_full_sha_install_source(
+    *, tmp_path: Path, commit_sha: str, uv_receipt: Path
+) -> InstallSource:
+    """Build a synthetic exact-sha-pinned VCS InstallSource for identity-minting tests."""
+    version = metadata.version("clio-relay")
+    source_url = "https://github.com/iowarp/clio-relay"
+    return InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=commit_sha,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": commit_sha,
+                "commit_id": commit_sha,
+            },
+        },
+        artifact_identity_verified=True,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {"path": str(uv_receipt), "verified": True},
+        },
+    )
+
+
+def test_write_self_install_receipt_mints_exact_vcs_sha_and_refuses_to_clobber(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dev-tool VCS install has no on-disk receipt of its own; this mints one.
+
+    The minted receipt carries the exact pinned commit sha as its identity
+    anchor (clio-relay#206's ``_vcs_commit_identity_verified``), and the
+    command refuses to silently clobber an existing receipt without
+    ``--force`` -- a cluster's runtime pin (clio-relay#205) depends on this
+    file being trustworthy, not overwritten by accident.
+    """
+    commit_sha = "e" * 40
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    source = _vcs_full_sha_install_source(
+        tmp_path=tmp_path, commit_sha=commit_sha, uv_receipt=uv_receipt
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    output = tmp_path / "generations" / "g1" / "install-receipt.json"
+    receipt = write_self_install_receipt(output)
+
+    assert receipt.artifact_sha256 == commit_sha
+    assert receipt.requested_source == "vcs"
+    reloaded = load_install_receipt(output)
+    assert reloaded == receipt
+
+    with pytest.raises(ConfigurationError, match="already exists"):
+        write_self_install_receipt(output)
+
+    # a stale receipt from an earlier generation must not be clobbered silently
+    assert load_install_receipt(output) == receipt
+
+    other_sha = "f" * 40
+    other_source = _vcs_full_sha_install_source(
+        tmp_path=tmp_path, commit_sha=other_sha, uv_receipt=uv_receipt
+    )
+
+    def detect_other_source(**_kwargs: object) -> InstallSource:
+        return other_source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_other_source)
+    forced = write_self_install_receipt(output, force=True)
+    assert forced.artifact_sha256 == other_sha
+    assert load_install_receipt(output).artifact_sha256 == other_sha
 
 
 def test_remote_native_jarvis_component_requires_runtime_capability_provenance(

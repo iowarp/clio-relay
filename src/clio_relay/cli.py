@@ -99,6 +99,7 @@ from clio_relay.installation import (
     verified_session_api_install_receipt,
     verify_remote_worker_info,
     worker_runtime_info,
+    write_self_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
@@ -2120,6 +2121,104 @@ def cluster_pin_target(
                 ),
             },
             indent=2,
+        )
+    )
+
+
+@cluster_app.command("pin-runtime")
+def cluster_pin_runtime(
+    cluster: Annotated[str, typer.Option(help="Existing configured cluster name.")],
+    relay_executable: Annotated[
+        str | None,
+        typer.Option(help="Remote clio-relay executable path pinned to one generation."),
+    ] = None,
+    install_receipt: Annotated[
+        str | None,
+        typer.Option(help="Remote pinned install-receipt.json path for this cluster's generation."),
+    ] = None,
+    clear: Annotated[
+        bool,
+        typer.Option(help="Remove only the existing pinned runtime identity."),
+    ] = False,
+) -> None:
+    """Pin or clear one cluster's runtime identity without replacing its config.
+
+    Updates only ``relay_executable``/``relay_install_receipt`` on the
+    existing entry -- every other field (``remote_mcp_servers``,
+    ``target_identity``, worker capacity, transport config, ...) is
+    preserved exactly. Unlike ``cluster add``, this never replaces the
+    entry wholesale, so it is the sanctioned way to declare the per-cluster
+    pin that session-start verification honors (clio-relay#205).
+    """
+    identity_arguments_present = relay_executable is not None or install_receipt is not None
+    if clear and identity_arguments_present:
+        raise typer.BadParameter("--clear cannot be combined with pinned runtime values")
+    if not clear and not identity_arguments_present:
+        raise typer.BadParameter(
+            "--relay-executable or --install-receipt is required unless --clear is used"
+        )
+    default_relay_executable = cast(str, ClusterDefinition.model_fields["relay_executable"].default)
+
+    def update_pinned_runtime(registry: ClusterRegistry) -> None:
+        definition = registry.require(cluster)
+        if clear:
+            definition.relay_executable = default_relay_executable
+            definition.relay_install_receipt = None
+        else:
+            if relay_executable is not None:
+                definition.relay_executable = relay_executable
+            if install_receipt is not None:
+                definition.relay_install_receipt = install_receipt
+
+    try:
+        registry = ClusterRegistry.mutate(default_registry_path(), update_pinned_runtime)
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    definition = registry.require(cluster)
+    typer.echo(
+        json.dumps(
+            {
+                "cluster": cluster,
+                "relay_executable": definition.relay_executable,
+                "relay_install_receipt": definition.relay_install_receipt,
+            },
+            indent=2,
+        )
+    )
+
+
+@app.command("installation-write-receipt")
+def installation_write_receipt(
+    output: Annotated[Path, typer.Option(help="Destination install-receipt.json path.")],
+    self_flag: Annotated[
+        bool,
+        typer.Option(
+            "--self",
+            help="Describe this process's own running installation (currently the only mode).",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(help="Overwrite an existing receipt already at the destination path."),
+    ] = False,
+) -> None:
+    """Mint a durable install receipt describing this process's own running identity.
+
+    A cluster's pinned runtime (``cluster pin-runtime --install-receipt``,
+    clio-relay#205) points at a receipt written this way. Identity is
+    resolved exactly as the persistent-uv-tool identity check already
+    trusts it: a wheel's sha256 for a WHEEL/PYPI install, or the exact
+    pinned commit sha for an exact-sha VCS install (clio-relay#206).
+    """
+    if not self_flag:
+        raise typer.BadParameter("--self is required; only self-description is supported")
+    _run_or_exit(
+        lambda: typer.echo(
+            json.dumps(
+                write_self_install_receipt(output, force=force).model_dump(mode="json"),
+                indent=2,
+                default=str,
+            )
         )
     )
 
