@@ -1847,18 +1847,30 @@ def vanished(error: OSError) -> bool:
     return error.errno in {errno.ENOENT, errno.ESRCH}
 
 
+def read_capped(path: Path) -> bytes:
+    """Read one proc pseudo-file's bytes, enforcing the bounded read-size invariant.
+
+    Unlike read_bounded, a non-vanished OSError is raised to the caller
+    un-translated.  Every caller except the writer-proof environ evidence
+    treats any such error as immediately fatal (see read_bounded below); the
+    writer proof instead treats an unreadable environ as best-effort evidence
+    that a non-target candidate can still be dismissed without it.
+    """
+    with path.open("rb") as stream:
+        value = stream.read(MAX_PROC_FILE_BYTES + 1)
+    if len(value) > MAX_PROC_FILE_BYTES:
+        fail(f"{path} exceeds the bounded inspection size")
+    return value
+
+
 def read_bounded(path: Path) -> bytes | None:
     """Read one proc pseudo-file without accepting an unbounded value."""
     try:
-        with path.open("rb") as stream:
-            value = stream.read(MAX_PROC_FILE_BYTES + 1)
+        return read_capped(path)
     except OSError as error:
         if vanished(error):
             return None
         fail(f"cannot inspect {path}: {error}")
-    if len(value) > MAX_PROC_FILE_BYTES:
-        fail(f"{path} exceeds the bounded inspection size")
-    return value
 
 
 def decode_nul_values(value: bytes) -> list[str]:
@@ -2226,9 +2238,25 @@ def prove_no_writer(cluster: str, expected_core: str, proc_root: Path) -> None:
                 writer_kind = "mcp-server"
                 options = command[1:]
             process_cluster = option_value(options, "--cluster")
-            raw_environment = read_bounded(process / "environ")
-            if raw_environment is None:
-                continue
+            environ_path = process / "environ"
+            try:
+                raw_environment = read_capped(environ_path)
+            except OSError as error:
+                if vanished(error):
+                    continue
+                if process_cluster is not None and process_cluster != cluster:
+                    # environ is best-effort evidence for writer-proof, not a
+                    # mandatory one.  A candidate whose cmdline names a
+                    # cluster other than the one being bootstrapped is
+                    # provably not our concern even when its environment
+                    # cannot be inspected -- e.g. a same-uid peer hardened by
+                    # our own process_containment.enforce_linux_secret_memory_gate
+                    # non-dumpable gate, whose environ is root-only.  A
+                    # candidate that matches our cluster, or leaves it
+                    # ambiguous (no --cluster in its cmdline), still cannot
+                    # be dismissed without proof: keep failing closed.
+                    continue
+                fail(f"cannot inspect {environ_path}: {error}")
             candidates = process_core_candidates(
                 process,
                 environment(raw_environment),

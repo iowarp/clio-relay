@@ -997,10 +997,19 @@ def test_embedded_writer_proof_allows_other_cluster_worker_on_different_core(
 
 
 @pytest.mark.release_platform("posix")
-def test_embedded_writer_proof_fails_closed_when_environment_is_unreadable(
+def test_embedded_writer_proof_skips_unreadable_environment_for_a_different_cluster(
     tmp_path: Path,
 ) -> None:
-    """Bootstrap never substitutes service metadata for an unreadable process contract."""
+    """A hardened same-uid peer bootstrapping a DIFFERENT cluster cannot block bootstrap.
+
+    Regression for clio-relay#189: clio-relay's own
+    process_containment.enforce_linux_secret_memory_gate() makes a worker
+    process non-dumpable, so its /proc/<pid>/environ becomes root-only even
+    for the owning same-uid account.  environ is best-effort writer-proof
+    evidence, not mandatory: once the candidate's own cmdline proves it is
+    bootstrapping a different cluster, an unreadable environ can no longer
+    abort bootstrap for every cluster name on the host.
+    """
     proc_root = tmp_path / "proc"
     process_id = 1735
     _fake_proc_process(
@@ -1011,8 +1020,76 @@ def test_embedded_writer_proof_fails_closed_when_environment_is_unreadable(
             "endpoint",
             "start",
             "--role=worker",
-            "--cluster=protected",
+            "--cluster=ares-demo",
         ],
+        environment={"HOME": str(tmp_path)},
+    )
+    process = proc_root / str(process_id)
+    process.joinpath("environ").chmod(0)
+
+    result = _run_writer_proof(
+        proc_root,
+        cluster="ares-p5run2",
+        core_dir=tmp_path / "expected-core",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "relay_worker_writer_proof=clear"
+
+
+@pytest.mark.release_platform("posix")
+def test_embedded_writer_proof_fails_closed_when_target_cluster_environment_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """An unreadable environ for a candidate that MATCHES our cluster still hard-fails.
+
+    Environ only becomes dismissable once cmdline proves the candidate targets
+    a different cluster; a same-cluster candidate can never be dismissed
+    without reading it, preserving today's exclusivity guarantee.
+    """
+    proc_root = tmp_path / "proc"
+    process_id = 1736
+    _fake_proc_process(
+        proc_root,
+        pid=process_id,
+        argv=[
+            "/home/operator/.local/bin/clio-relay",
+            "endpoint",
+            "start",
+            "--role=worker",
+            "--cluster=custom",
+        ],
+        environment={"HOME": str(tmp_path)},
+    )
+    process = proc_root / str(process_id)
+    process.joinpath("environ").chmod(0)
+
+    result = _run_writer_proof(
+        proc_root,
+        cluster="custom",
+        core_dir=tmp_path / "expected-core",
+    )
+
+    assert result.returncode != 0
+    assert f"cannot inspect {process / 'environ'}" in result.stderr
+
+
+@pytest.mark.release_platform("posix")
+def test_embedded_writer_proof_fails_closed_when_ambiguous_environment_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A candidate whose cmdline exposes no --cluster stays a hard failure when unreadable.
+
+    api/mcp-server invocations carry no --cluster argument, so their target
+    core cannot be ruled out from cmdline alone; an unreadable environ on one
+    of them must remain fail-closed exactly like today.
+    """
+    proc_root = tmp_path / "proc"
+    process_id = 1737
+    _fake_proc_process(
+        proc_root,
+        pid=process_id,
+        argv=["/home/operator/.local/bin/clio-relay", "api", "start", "--host", "127.0.0.1"],
         environment={"HOME": str(tmp_path)},
     )
     process = proc_root / str(process_id)
