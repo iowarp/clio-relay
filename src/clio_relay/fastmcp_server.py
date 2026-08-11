@@ -382,6 +382,16 @@ class RelayMcpRuntime:
             arguments=arguments,
             catalog_revision=tool.catalog_revision,
             initial_result=structured,
+            # The synchronous call that produced ``structured`` already ran the
+            # job to completion and verified its evidence (relay#215 / D22):
+            # for a terminal-at-birth task, promote that already-verified
+            # receipt into wire shape now rather than leaving it unset and
+            # forcing the first ``tasks/get`` to re-derive the identical
+            # answer over two more round trips (``task_status``'s own
+            # ``status``/``wait`` re-fetch below).
+            completed_result=(
+                _call_tool_result_document(structured) if state in TERMINAL_STATES else None
+            ),
         )
         record = RelayMcpTaskRecord(
             task_id=job_id,
@@ -929,7 +939,25 @@ class RelayTasksExtension(ServerExtension):
         params: GetTaskParams,
     ) -> GetTaskResult:
         self._check_request(ctx, params.task_id)
-        return await self._runtime.task_status(await self._record(params.task_id))
+        record = await self._record(params.task_id)
+        try:
+            return await self._runtime.task_status(record)
+        except MCPError:
+            raise
+        except Exception as exc:
+            # relay#215: this projection can re-derive a task's status over
+            # network round trips (``task_status``'s ``status``/``wait``
+            # re-fetch); an unwrapped failure there escaped as a bare, typeless
+            # "Internal server error" (no try/except -> the SDK's generic
+            # handler catch-all). Surface a typed, queryable reason instead.
+            raise MCPError(
+                code=mcp_types.INTERNAL_ERROR,
+                message=f"relay could not reconcile task {params.task_id!r}'s status: {exc}",
+                data={
+                    "reason": "mcp_task_status_reconciliation_failed",
+                    "task_id": params.task_id,
+                },
+            ) from exc
 
     async def _handle_update(
         self,

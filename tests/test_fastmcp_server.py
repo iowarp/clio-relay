@@ -1091,6 +1091,163 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
         )
 
 
+def test_create_task_promotes_an_already_terminal_receipt_to_completed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D22: the synchronous call that produced ``structured`` already ran a
+    ``wait_for_terminal`` dispatch to completion and verified its evidence
+    -- for a terminal-at-birth task, ``create_task`` must promote that
+    already-verified receipt into ``completed_result`` immediately, in the
+    exact wire shape a later ``tasks/get`` would otherwise spend two extra
+    round trips re-deriving (``task_status``'s own status/wait re-fetch,
+    the mechanism behind relay#215's intermittent failure). A non-terminal
+    receipt must NOT get a ``completed_result`` -- there is nothing yet to
+    promote."""
+
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
+    tool = RelayTool(
+        definition,
+        runtime=runtime,
+        catalog_revision=None,
+        task_capable=True,
+    )
+    terminal_structured: JSON = {
+        "job_id": "job-terminal-at-birth",
+        "state": JobState.SUCCEEDED.value,
+        "kind": JobKind.MCP_CALL.value,
+        "terminal": True,
+        "mcp_result": {
+            "tool": "jarvis_run",
+            "returncode": 0,
+            "protocol_result": {"isError": False, "content": []},
+        },
+    }
+
+    async def scenario() -> None:
+        saved = await runtime.create_task(
+            tool=tool,
+            arguments={"pipeline_id": "p"},
+            result=ToolResult(
+                content=[mcp_types.TextContent(type="text", text="done")],
+                structured_content=terminal_structured,
+            ),
+        )
+        assert saved is not None
+        expected = fastmcp_server_module._call_tool_result_document(  # pyright: ignore[reportPrivateUsage]
+            terminal_structured
+        )
+        assert saved.projection.completed_result == expected
+        assert saved.projection.completed_result is not None
+        assert saved.projection.completed_result["isError"] is False
+
+        # Zero extra round trips: task_status must serve completed_result
+        # straight off the projection, never touching the re-derivation
+        # path this batch is eliminating.
+        def must_not_be_called(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("status_mcp_job/wait_mcp_job must not be called")
+
+        monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", must_not_be_called)
+        monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", must_not_be_called)
+        observed = await runtime.task_status(saved)
+        assert observed.status == "completed"
+        assert observed.result == expected
+
+        # Sibling: a non-terminal receipt gets no completed_result at all.
+        queued_task = await runtime.create_task(
+            tool=tool,
+            arguments={"pipeline_id": "q"},
+            result=ToolResult(
+                content=[mcp_types.TextContent(type="text", text="queued")],
+                structured_content={
+                    "job_id": "job-not-yet-terminal",
+                    "state": JobState.QUEUED.value,
+                    "terminal": False,
+                },
+            ),
+        )
+        assert queued_task is not None
+        assert queued_task.projection.completed_result is None
+
+    asyncio.run(scenario())
+
+
+def test_task_get_wraps_a_status_reconciliation_failure_as_a_typed_error(
+    tmp_path: Path,
+) -> None:
+    """D7 (relay#215): ``task_status``'s re-derivation path had no
+    try/except in ``_handle_get``, so any exception raised inside it -- a
+    real, observed intermittent relay#215 failure -- escaped as a bare,
+    typeless "Internal server error" via the SDK's generic handler
+    catch-all (``mcp/server/runner.py``, only ``MCPError``/``ValidationError``
+    are mapped; everything else returns ``None`` and gets replaced by that
+    literal string). Reproduced here without reaching relay's SSH-tunneled
+    remote path at all: a task record whose backing job was never durably
+    written drives ``task_status``'s local re-derivation branch straight
+    into ``queue.get_job``'s natural ``NotFoundError``, which must now
+    surface as a typed, queryable ``MCPError`` instead of an opaque crash."""
+
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
+    tool = RelayTool(
+        definition,
+        runtime=runtime,
+        catalog_revision=None,
+        task_capable=True,
+    )
+    server: FastMCP[dict[str, Any]] = FastMCP(
+        "relay-task-reconciliation-test",
+        tools=[tool],
+        lifespan=runtime.lifespan,
+        tasks=False,
+        strict_input_validation=True,
+    )
+    server.add_extension(RelayTasksExtension(runtime))
+
+    async def scenario() -> None:
+        saved = await runtime.create_task(
+            tool=tool,
+            arguments={"value": "orphan"},
+            result=ToolResult(
+                content=[mcp_types.TextContent(type="text", text="queued")],
+                structured_content={
+                    "job_id": "job-never-durably-written",
+                    "state": JobState.QUEUED.value,
+                    "terminal": False,
+                },
+            ),
+        )
+        assert saved is not None
+
+        async with Client(server, mode="auto") as client:
+            with pytest.raises(MCPError) as failure:
+                await client.session.send_request(
+                    GetTaskRequest(params=GetTaskRequestParams(task_id=saved.task_id)),
+                    ClientGetTaskResult,
+                )
+        assert failure.value.code == mcp_types.INTERNAL_ERROR
+        assert failure.value.data == {
+            "reason": "mcp_task_status_reconciliation_failed",
+            "task_id": saved.task_id,
+        }
+        assert saved.task_id in failure.value.message
+
+    asyncio.run(scenario())
+
+
 def test_mcp_task_family_is_additive_and_collected_with_its_job(tmp_path: Path) -> None:
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)

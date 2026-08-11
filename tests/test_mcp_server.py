@@ -3129,6 +3129,263 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
     ]
 
 
+def _owned_jarvis_success_scenario(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    idempotency_key: str,
+) -> tuple[RelaySettings, RelayJob]:
+    """Shared setup for the D16/D14/D15 owned-collection regression tests below."""
+
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    _bind_virtual_jarvis_catalog(monkeypatch, cluster="ares")
+
+    def artifact_binding(_cluster: str) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(
+        "clio_relay.mcp_server.jarvis_mcp_artifact_binding",
+        artifact_binding,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="ares",
+    )
+    queued = RelayJob(
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="clio-kit",
+            server_args=["mcp-server", "jarvis"],
+            expected_server_artifact_digest="a" * 64,
+            tool="jarvis_run",
+            arguments={"pipeline_id": "simulation"},
+        ),
+        idempotency_key=idempotency_key,
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+    return settings, queued
+
+
+def _call_jarvis_run(
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> dict[str, Any]:
+    session = McpSessionState()
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "jarvis_run",
+                "arguments": {
+                    "cluster": "ares",
+                    "pipeline_id": "simulation",
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": 600,
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+    assert response is not None
+    return response
+
+
+def test_owned_artifact_pagination_rejects_a_page_that_understates_its_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D16, with a deviation recorded: the audit's static read compared only
+    each paginator's own post-loop ``if len(records) != total: raise``
+    line and found ``_complete_owned_collection`` alone lacking one. On the
+    real code, all three siblings -- including ``_complete_owned_collection``,
+    unchanged by this batch -- already call the SAME shared
+    ``_validate_complete_collection_page`` helper inside their loop, whose
+    ``next_cursor is None and collected_count + page_count != total`` check
+    is mathematically identical to the post-loop check and fires first (its
+    own message: "... ended before its declared total"). So a truncated
+    owned-session page was never actually silently accepted -- this test
+    proves that directly, against the unmodified pre-batch code, and it
+    already passes there. The post-loop check was still added to
+    ``_complete_owned_collection`` for structural symmetry with its two
+    siblings (matching the audit's literal instruction, zero behavior
+    change, dead code exactly like the equivalent line already is in both
+    siblings) -- not because it closes a live gap. The live D14/D15 gap in
+    the D16->D14->D15 chain is closed by the sibling test below, which DOES
+    fail red against the pre-batch code."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path, monkeypatch, idempotency_key="owned-artifact-page-truncated"
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+
+    class TruncatingOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> TruncatingOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # Claims to be the last page (next_cursor=None) but total
+                # says 2 records exist while this page returned 0 -- a page
+                # that understated its own total, the D16 scenario.
+                return {
+                    "artifacts": [],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 2,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        TruncatingOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "ended before its declared total" in response["error"]["message"]
+
+
+def test_owned_jarvis_success_with_no_mcp_result_artifact_fails_loud_not_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILING-FIRST (D14/D15): a SUCCEEDED MCP_CALL job whose artifact listing
+    is complete (unlike the D16 case above) but carries no ``kind=mcp_result``
+    record must not produce a bounded receipt with ``isError`` left ``False``
+    and no ``mcp_result`` key at all -- a missing payload indistinguishable
+    from a real success (relay#215's underlying symptom class, and D17's
+    structural gap made visible). ``_verified_owned_mcp_result``'s
+    ``require_result=True`` path (set because this job is a succeeded
+    MCP_CALL) must raise a typed, loud reason instead of the bare ``None``
+    it used to return."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path, monkeypatch, idempotency_key="owned-jarvis-missing-mcp-result"
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+
+    class NoResultArtifactOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> NoResultArtifactOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # A COMPLETE page (total matches the collected count -- D16's
+                # check is satisfied) that simply has no mcp_result-kind
+                # artifact among what the job actually produced.
+                return {
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact_stdout_only",
+                            "job_id": queued.job_id,
+                            "kind": "stdout",
+                            "size_bytes": 0,
+                            "sha256": "0" * 64,
+                            "created_at": "2026-07-16T12:38:30Z",
+                        }
+                    ],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        NoResultArtifactOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "no mcp_result artifact was found" in response["error"]["message"]
+    assert queued.job_id in response["error"]["message"]
+
+
 def test_direct_remote_waited_mcp_submission_returns_artifact_bound_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3596,6 +3853,35 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     assert submitted.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
     terminal = submitted.model_copy(update={"state": JobState.SUCCEEDED})
     requests: list[tuple[str, str]] = []
+    # A real SUCCEEDED MCP_CALL job always has a durable mcp_result artifact
+    # (D14/D15/D17: the worker writes it unconditionally before marking the
+    # job succeeded) -- reflect that in this fixture so the relay_wait
+    # followup's now-loud require_result guard sees the artifact a real
+    # dispatch would produce, instead of the empty page this fixture
+    # previously stood in for it with.
+    result_payload = json.dumps(
+        {
+            "operation": "tools/call",
+            "tool": "inspect",
+            "returncode": 0,
+            "timed_out": False,
+            "protocol_error": None,
+            "structured_result": {"dataset": "asteroid2018"},
+            "protocol_result": {"isError": False},
+            "protocol_version": "2024-11-05",
+            "server_info": {"name": "science"},
+            "result_validation": None,
+        },
+        sort_keys=True,
+    ).encode()
+    result_artifact = {
+        "artifact_id": "artifact_science_inspect_result",
+        "job_id": submitted.job_id,
+        "kind": "mcp_result",
+        "size_bytes": len(result_payload),
+        "sha256": hashlib.sha256(result_payload).hexdigest(),
+        "created_at": "2026-07-16T12:38:30Z",
+    }
 
     class FakeOwnedSessionApiClient:
         def __init__(self, **_kwargs: object) -> None:
@@ -3643,11 +3929,17 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                 }
             if path == f"/jobs/{submitted.job_id}/artifacts":
                 return {
-                    "artifacts": [],
+                    "artifacts": [result_artifact],
                     "cursor": 1,
                     "limit": 500,
                     "next_cursor": None,
-                    "total": 0,
+                    "total": 1,
+                }
+            if path == f"/artifacts/{result_artifact['artifact_id']}/content":
+                return {
+                    "artifact": result_artifact,
+                    "encoding": "base64",
+                    "data": base64.b64encode(result_payload).decode("ascii"),
                 }
             raise AssertionError(f"unexpected owned session request: {method} {path}")
 
@@ -3685,6 +3977,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         ("POST", f"/jobs/{submitted.job_id}/wait"),
         ("GET", f"/jobs/{submitted.job_id}/status"),
         ("GET", f"/jobs/{submitted.job_id}/artifacts"),
+        ("GET", f"/artifacts/{result_artifact['artifact_id']}/content"),
     ]
 
     ClusterRegistry(
@@ -3707,7 +4000,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     )
     assert stale is not None
     assert "cluster route changed" in stale["error"]["message"]
-    assert len(requests) == 6
+    assert len(requests) == 7
 
 
 def test_registered_remote_mcp_ssh_forwarding_carries_evidence_not_lane(

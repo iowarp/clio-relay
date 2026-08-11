@@ -3184,6 +3184,8 @@ def _complete_owned_collection(
         )
         records.extend(page)
         if next_cursor is None:
+            if len(records) != total:
+                raise ValueError(f"{label} changed during bounded discovery")
             return records
         cursor = next_cursor
 
@@ -3286,11 +3288,43 @@ def _verified_mcp_result(
     return _decode_verified_mcp_result(envelope, artifact=artifact, job_id=job_id)
 
 
+def _owned_mcp_result_is_required(job: RelayJob) -> bool:
+    """Whether a succeeded job's worker is expected to have written an mcp_result.
+
+    True only for an ordinary (``WORKLOAD``) MCP_CALL job that reached
+    ``SUCCEEDED``: its worker unconditionally writes the ``mcp_result``
+    artifact before marking success (D17), so a missing one there is always
+    a defect (D14/D15), never a legitimate state. ``CONTROL_QUERY``-class
+    calls are a privileged scheduling assertion answered outside the
+    ordinary spooled worker/artifact pipeline and are exempt.
+    """
+    return (
+        isinstance(job.spec, McpCallSpec)
+        and job.spec.admission_class is not McpAdmissionClass.CONTROL_QUERY
+        and job.state is JobState.SUCCEEDED
+    )
+
+
 def _verified_owned_mcp_result(
     client: OwnedSessionApiClient,
     job_id: str,
     artifacts: list[JSON],
+    *,
+    require_result: bool = False,
 ) -> _VerifiedMcpResult | None:
+    """Find and verify one job's durable MCP result artifact, if present.
+
+    ``require_result`` is set by callers that already know this job kind
+    always produces an ``mcp_result`` artifact on success (an MCP_CALL job
+    that reached ``SUCCEEDED``): for them, a missing artifact is never a
+    legitimate "nothing to attach" case (D14/D15/D17) -- it means a
+    succeeded job would otherwise report a bounded receipt with no result
+    and ``isError`` left false, indistinguishable from real success. Raise
+    loud and typed instead of returning a bare ``None`` a caller could
+    silently accept. Ordinary callers observing a job of unknown/mixed kind
+    (e.g. ``relay_wait`` on any job) leave this ``False`` and keep the
+    existing silent-None contract for job kinds that never have one.
+    """
     artifact = next(
         (
             item
@@ -3300,6 +3334,11 @@ def _verified_owned_mcp_result(
         None,
     )
     if artifact is None:
+        if require_result:
+            raise ValueError(
+                f"job {job_id} succeeded but no mcp_result artifact was found among "
+                f"{len(artifacts)} indexed artifact(s)"
+            )
         return None
     artifact_id = artifact.get("artifact_id")
     if not isinstance(artifact_id, str) or not artifact_id:
@@ -3888,7 +3927,12 @@ def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings)
                     record_key="artifacts",
                     label=f"owned remote artifacts for {job_id}",
                 )
-                parsed_result = _verified_owned_mcp_result(client, job_id, artifact_records)
+                parsed_result = _verified_owned_mcp_result(
+                    client,
+                    job_id,
+                    artifact_records,
+                    require_result=_owned_mcp_result_is_required(source_job),
+                )
         else:
             try:
                 with remote_command_timeout(
@@ -4838,7 +4882,12 @@ def _owned_session_submission_result(
                         record_key="artifacts",
                         label=f"owned remote artifacts for {job.job_id}",
                     )
-                    parsed_result = _verified_owned_mcp_result(client, job.job_id, artifacts)
+                    parsed_result = _verified_owned_mcp_result(
+                        client,
+                        job.job_id,
+                        artifacts,
+                        require_result=_owned_mcp_result_is_required(job),
+                    )
                 if include_terminal_logs:
                     logs = _owned_job_logs(
                         client,

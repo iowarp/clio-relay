@@ -13,7 +13,13 @@ projection of an existing durable relay job:
 - relay routing, leasing, workers, JARVIS execution, artifacts, events,
   recovery, and cancellation are unchanged;
 - task projections retain the exact tool, arguments, catalog revision, initial
-  receipt, input rounds, and final result needed for reconnect; and
+  receipt, and input rounds needed for reconnect. The SEP-2663 create response
+  never carries a result or error -- only a status claim -- regardless of
+  whether the underlying job already finished before the claim was minted; a
+  client always resolves the final result through `tasks/get`. The projection
+  records that result as `completed_result` once known: immediately, if the
+  job was already terminal when the task was created, or on the first
+  `tasks/get` that observes it turn terminal otherwise; and
 - a new MCP client can reconstruct a `ToolTask` from its retained task handle
   while the same relay state remains available.
 
