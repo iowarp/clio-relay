@@ -1,7 +1,7 @@
 {
   "schema_version": "clio-relay.release-acceptance-matrix.v1",
-  "release_version": "1.6.3",
-  "matrix_sha256": "963ca64fcd3cec80d0d56c2eb748be91a6ad6a2b9e5c1fbc886ec23aba458a9c",
+  "release_version": "1.6.4",
+  "matrix_sha256": "806437d985658832bf1479e851bf05369192c20d781299bcd44da0f4e20f2b0d",
   "report_count_per_stage": 19,
   "target_labels_are_policy_evidence_instances": true,
   "stages": [
@@ -22,7 +22,10 @@
       "id": "ares-bootstrap",
       "cluster": "ares",
       "scenario": "cluster-bootstrap",
-      "command": ["cluster", "bootstrap"],
+      "command": [
+        "cluster",
+        "bootstrap"
+      ],
       "report_option": "--report"
     },
     {
@@ -30,7 +33,9 @@
       "id": "ares-cluster-bootstrap-live-test",
       "cluster": "ares",
       "scenario": "cluster-bootstrap",
-      "command": ["live-test"],
+      "command": [
+        "live-test"
+      ],
       "report_option": "--report"
     },
     {
@@ -38,7 +43,10 @@
       "id": "ares-queue-management",
       "cluster": "ares",
       "scenario": "queue-management",
-      "command": ["queue", "validate"],
+      "command": [
+        "queue",
+        "validate"
+      ],
       "report_option": "--report"
     },
     {
@@ -46,7 +54,9 @@
       "id": "ares-jarvis-gray-scott",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["jarvis-mcp-validate"],
+      "command": [
+        "jarvis-mcp-validate"
+      ],
       "report_option": "--report",
       "package": "builtin.gray_scott"
     },
@@ -55,7 +65,9 @@
       "id": "ares-jarvis-lammps",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["jarvis-mcp-validate"],
+      "command": [
+        "jarvis-mcp-validate"
+      ],
       "report_option": "--report",
       "package": "builtin.lammps"
     },
@@ -64,7 +76,10 @@
       "id": "ares-scientific-catalog-describe",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["remote-mcp", "validate"],
+      "command": [
+        "remote-mcp",
+        "validate"
+      ],
       "report_option": "--validation-report",
       "remote_tool": "scientific_dataset_describe",
       "arguments": {
@@ -77,7 +92,10 @@
       "id": "ares-spack-find",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["remote-mcp", "validate"],
+      "command": [
+        "remote-mcp",
+        "validate"
+      ],
       "report_option": "--validation-report",
       "remote_tool": "spack_find",
       "package": "lammps",
@@ -88,7 +106,10 @@
       "id": "ares-spack-locate",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["remote-mcp", "validate"],
+      "command": [
+        "remote-mcp",
+        "validate"
+      ],
       "report_option": "--validation-report",
       "remote_tool": "spack_locate",
       "package": "lammps",
@@ -99,7 +120,10 @@
       "id": "ares-spack-install",
       "cluster": "ares",
       "scenario": "remote-mcp",
-      "command": ["remote-mcp", "validate"],
+      "command": [
+        "remote-mcp",
+        "validate"
+      ],
       "report_option": "--validation-report",
       "remote_tool": "spack_install",
       "package": "libsigsegv@2.14",
@@ -110,7 +134,10 @@
       "id": "ares-slurm-lifecycle",
       "cluster": "ares",
       "scenario": "scheduler-lifecycle",
-      "command": ["scheduler", "validate-lifecycle"],
+      "command": [
+        "scheduler",
+        "validate-lifecycle"
+      ],
       "report_option": "--report"
     },
     {
@@ -118,7 +145,10 @@
       "id": "ares-cleanup-detach",
       "cluster": "ares",
       "scenario": "cleanup",
-      "command": ["session", "detach"],
+      "command": [
+        "session",
+        "detach"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "ares-default-cleanup-session"
     },
@@ -127,7 +157,10 @@
       "id": "ares-cleanup-teardown",
       "cluster": "ares",
       "scenario": "cleanup",
-      "command": ["session", "teardown"],
+      "command": [
+        "session",
+        "teardown"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "ares-default-cleanup-session"
     },
@@ -136,7 +169,10 @@
       "id": "ares-explicit-cancel-teardown",
       "cluster": "ares",
       "scenario": "cleanup",
-      "command": ["session", "teardown"],
+      "command": [
+        "session",
+        "teardown"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "ares-explicit-cancel-session"
     },
@@ -145,7 +181,10 @@
       "id": "homelab-cleanup-detach",
       "cluster": "homelab",
       "scenario": "cleanup",
-      "command": ["session", "detach"],
+      "command": [
+        "session",
+        "detach"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "homelab-default-cleanup-session"
     },
@@ -154,7 +193,10 @@
       "id": "homelab-cleanup-teardown",
       "cluster": "homelab",
       "scenario": "cleanup",
-      "command": ["session", "teardown"],
+      "command": [
+        "session",
+        "teardown"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "homelab-default-cleanup-session"
     },
@@ -163,7 +205,9 @@
       "id": "homelab-transport",
       "cluster": "homelab",
       "scenario": "transport",
-      "command": ["live-test"],
+      "command": [
+        "live-test"
+      ],
       "report_option": "--report"
     },
     {
@@ -171,7 +215,10 @@
       "id": "ares-gateway-start",
       "cluster": "ares",
       "scenario": "gateway-runtime",
-      "command": ["gateway", "start-runtime"],
+      "command": [
+        "gateway",
+        "start-runtime"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "ares-dedicated-gateway"
     },
@@ -180,7 +227,10 @@
       "id": "ares-gateway-stop",
       "cluster": "ares",
       "scenario": "gateway-runtime",
-      "command": ["gateway", "stop-runtime"],
+      "command": [
+        "gateway",
+        "stop-runtime"
+      ],
       "report_option": "--validation-report",
       "evidence_group": "ares-dedicated-gateway"
     },
@@ -189,7 +239,9 @@
       "id": "ares-secure-runtime",
       "cluster": "ares",
       "scenario": "secure-runtime",
-      "command": ["live-test"],
+      "command": [
+        "live-test"
+      ],
       "report_option": "--report",
       "evidence_group": "ares-secure-jarvis-runtime"
     }
