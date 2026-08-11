@@ -1077,6 +1077,129 @@ def test_installation_info_uses_verified_uv_tool_receipt_without_bootstrap_recei
     assert info["component_runtime"] == {}
 
 
+def test_installation_info_accepts_exact_sha_pinned_vcs_uv_tool_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#206: a full-sha VCS pin is an official uv-tool identity anchor too.
+
+    ``uv tool install git+https://github.com/iowarp/clio-relay@<40-hex-sha>``
+    pins an exact commit -- the desktop persistent-uv-tool identity check
+    must accept it and record that sha as the identity anchor exactly as it
+    would a wheel's sha256 digest.
+    """
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    commit_sha = "c" * 40
+    source_url = "https://github.com/iowarp/clio-relay"
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=commit_sha,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": commit_sha,
+                "commit_id": commit_sha,
+            },
+        },
+        artifact_identity_verified=True,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {
+                "path": str(uv_receipt),
+                "verified": True,
+            },
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    info = installation_info()
+    receipt = cast(dict[str, object], info["receipt"])
+
+    assert info["receipt_origin"] == "uv-tool"
+    assert receipt["requested_source"] == "vcs"
+    assert receipt["artifact_sha256"] == commit_sha
+    assert receipt["artifact_filename"] is None
+    assert receipt["install_spec"] == source_url
+
+
+def test_installation_info_rejects_vcs_uv_tool_install_pinned_to_a_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#206: a branch/tag-pinned VCS install stays rejected, not silently accepted."""
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    source_url = "https://github.com/iowarp/clio-relay"
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=None,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": "main",
+                "commit_id": "d" * 40,
+            },
+        },
+        artifact_identity_verified=False,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {
+                "path": str(uv_receipt),
+                "verified": True,
+            },
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    with pytest.raises(ConfigurationError, match="wheel identity could not be verified"):
+        installation_info()
+
+
 def test_remote_native_jarvis_component_requires_runtime_capability_provenance(
     tmp_path: Path,
 ) -> None:
@@ -1334,6 +1457,208 @@ def test_remote_worker_identity_is_bound_to_fresh_running_endpoint(tmp_path: Pat
             expected_artifact_sha256=receipt.artifact_sha256,
             expected_source="wheel",
         )
+
+
+def test_verify_remote_worker_info_uses_cluster_pin_over_global_current(tmp_path: Path) -> None:
+    """clio-relay#205: a cluster's pinned runtime is authoritative over global current.
+
+    On a multi-tenant host, one cluster can be pinned (via a #204 drop-in
+    override) to its own generation while the shared ``current`` symlink
+    stays on a different generation to protect other tenants. Session start
+    must pass when the worker matches the CLUSTER's pin even though it
+    diverges from ``current`` -- and must fail when the worker diverges from
+    the pin even if it happens to match ``current`` (the check is stronger
+    for pinned clusters, not weaker).
+    """
+    pinned_wheel = tmp_path / "clio_relay-pinned-1.0.0-py3-none-any.whl"
+    pinned_wheel.write_bytes(b"cluster-pinned-generation-g")
+    pinned_receipt_path = tmp_path / "pinned-receipt.json"
+    pinned_receipt = write_install_receipt(
+        install_spec=str(pinned_wheel),
+        artifact_path=pinned_wheel,
+        path=pinned_receipt_path,
+        generation="a" * 64,
+    )
+    worker_matches_pin = installation_info(pinned_receipt_path)
+
+    other_wheel = tmp_path / "clio_relay-other-1.0.0-py3-none-any.whl"
+    other_wheel.write_bytes(b"shared-tenant-global-current")
+    other_receipt_path = tmp_path / "other-receipt.json"
+    other_receipt = write_install_receipt(
+        install_spec=str(other_wheel),
+        artifact_path=other_wheel,
+        path=other_receipt_path,
+        generation="b" * 64,
+    )
+    worker_matches_other = installation_info(other_receipt_path)
+
+    base_runtime: dict[str, object] = {
+        "schema_version": "clio-relay.worker-runtime-info.v1",
+        "cluster": "ares-p5run2",
+        "fresh": True,
+        "process_running": True,
+        "scheduler_provider": "slurm",
+        "endpoint": {
+            "role": "worker",
+            "cluster": "ares-p5run2",
+            "pid": 123,
+            "metadata": {"scheduler_provider": "slurm"},
+        },
+        # This ssh session's own ambient "current" is the shared tenant's
+        # generation -- deliberately NOT the cluster's pin.
+        "installation": worker_matches_other,
+        "target_identity": {
+            "verified": True,
+            "hostname": "ares-login",
+            "ssh_host_key_sha256": ["SHA256:test"],
+            "scheduler_cluster_name": "ares",
+        },
+        "pinned_installation": pinned_receipt.model_dump(mode="json"),
+    }
+
+    # (a) worker reports the pin (G); current is OTHER -> verification PASSES.
+    passing_runtime = {
+        **base_runtime,
+        "endpoint_installation": worker_matches_pin,
+        "identity_matches_current": False,
+        "identity_matches_pinned": True,
+        "running": False,
+    }
+    verified = verify_remote_worker_info(
+        passing_runtime,
+        expected_cluster="ares-p5run2",
+        expected_version=pinned_receipt.distribution_version,
+        expected_software=SoftwareIdentity.model_validate(worker_matches_pin["software"]),
+        expected_artifact_sha256=pinned_receipt.artifact_sha256,
+        expected_source="wheel",
+        require_target_identity=False,
+    )
+    assert verified == pinned_receipt
+
+    # (b) worker reports something OTHER than the pin -- even a worker that
+    # matches global `current` (the old, weaker check would have passed this)
+    # must fail with a typed error naming both identities.
+    failing_runtime = {
+        **base_runtime,
+        "endpoint_installation": worker_matches_other,
+        "identity_matches_current": True,
+        "identity_matches_pinned": False,
+        "running": True,
+    }
+    with pytest.raises(ConfigurationError, match="pinned installation") as excinfo:
+        verify_remote_worker_info(
+            failing_runtime,
+            expected_cluster="ares-p5run2",
+            expected_version=other_receipt.distribution_version,
+            expected_software=SoftwareIdentity.model_validate(worker_matches_other["software"]),
+            expected_artifact_sha256=other_receipt.artifact_sha256,
+            expected_source="wheel",
+            require_target_identity=False,
+        )
+    message = str(excinfo.value)
+    assert other_receipt.distribution_version in message
+    assert "worker=" in message and "pinned=" in message
+
+    # A cluster whose worker never proves `fresh`/`process_running` still
+    # fails even when pinned -- the pin narrows the identity check, it does
+    # not remove the liveness proof.
+    not_fresh_runtime = {**passing_runtime, "fresh": False}
+    with pytest.raises(ConfigurationError, match="fresh"):
+        verify_remote_worker_info(
+            not_fresh_runtime,
+            expected_cluster="ares-p5run2",
+            expected_version=pinned_receipt.distribution_version,
+            expected_software=SoftwareIdentity.model_validate(worker_matches_pin["software"]),
+            expected_artifact_sha256=pinned_receipt.artifact_sha256,
+            expected_source="wheel",
+            require_target_identity=False,
+        )
+
+
+def test_worker_runtime_info_resolves_cluster_pinned_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#205: worker_runtime_info resolves the cluster's own pinned receipt.
+
+    The pin is resolved independent of whatever this fresh ssh invocation's
+    ambient ``current`` installation happens to be (env-dependent, and on a
+    shared host may reflect a different tenant's protected generation).
+    """
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.models import EndpointRegistration, EndpointRole
+
+    root = tmp_path / "core"
+
+    pinned_wheel = tmp_path / "clio_relay-pinned.whl"
+    pinned_wheel.write_bytes(b"pinned-generation-wheel")
+    pinned_receipt_path = tmp_path / "pinned-receipt.json"
+    pinned_receipt = write_install_receipt(
+        install_spec=str(pinned_wheel),
+        artifact_path=pinned_wheel,
+        path=pinned_receipt_path,
+        generation="c" * 64,
+    )
+    worker_identity = installation_info(pinned_receipt_path)
+
+    current_wheel = tmp_path / "clio_relay-current.whl"
+    current_wheel.write_bytes(b"shared-tenant-current-wheel")
+    current_receipt_path = tmp_path / "current-receipt.json"
+    write_install_receipt(
+        install_spec=str(current_wheel),
+        artifact_path=current_wheel,
+        path=current_receipt_path,
+        generation="d" * 64,
+    )
+    current_identity = installation_info(current_receipt_path)
+
+    queue = ClioCoreQueue(root)
+    queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="endpoint_pinned_worker",
+            role=EndpointRole.WORKER,
+            cluster="ares-p5run2",
+            hostname="worker",
+            pid=os.getpid(),
+            metadata={
+                "installation_info": worker_identity,
+                "scheduler_provider": "slurm",
+            },
+        )
+    )
+
+    def worker_process_matches(_pid: int) -> bool:
+        return True
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
+    monkeypatch.setattr(installation_module, "installation_info", lambda: current_identity)
+    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+
+    result = worker_runtime_info(
+        cluster="ares-p5run2",
+        freshness_seconds=120,
+        pinned_install_receipt_path=str(pinned_receipt_path),
+    )
+
+    assert result["identity_matches_current"] is False
+    assert result["identity_matches_pinned"] is True
+    assert result["pinned_installation"] == pinned_receipt.model_dump(mode="json")
+
+    # A cluster with no pin keeps returning None for both new fields.
+    unpinned_result = worker_runtime_info(cluster="ares-p5run2", freshness_seconds=120)
+    assert unpinned_result["pinned_installation"] is None
+    assert unpinned_result["identity_matches_pinned"] is None
+
+    # readiness-only stays a bounded flag surface -- the pinned fields never
+    # leak into it, matching every other detailed-only field.
+    readiness = worker_runtime_info(
+        cluster="ares-p5run2",
+        freshness_seconds=120,
+        readiness_only=True,
+        pinned_install_receipt_path=str(pinned_receipt_path),
+    )
+    assert "pinned_installation" not in readiness
+    assert "identity_matches_pinned" not in readiness
 
 
 def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(

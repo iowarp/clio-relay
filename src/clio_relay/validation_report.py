@@ -71,6 +71,10 @@ _OFFICIAL_RELEASE_WHEEL_PATH = re.compile(
     r"/iowarp/clio-relay/releases/download/v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)/"
     r"clio_relay-(?P=version)-py3-none-any\.whl"
 )
+_OFFICIAL_PYPI_WHEEL_PATH = re.compile(
+    r"/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{16,64}/"
+    r"clio_relay-[0-9A-Za-z][0-9A-Za-z.+-]*-py3-none-any\.whl"
+)
 SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS = (
     "remote-mcp.spack-preinstall-absent",
     "remote-mcp.spack-fresh-install",
@@ -1383,7 +1387,7 @@ def _detect_persistent_uv_tool_receipt(
         distribution=distribution,
     )
     verified = (
-        detected_kind in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI}
+        detected_kind in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI, InstallSourceKind.VCS}
         and uv_path_verified
         and uv_stable
         and tool_directory is not None
@@ -3705,6 +3709,39 @@ def _distribution_direct_url(distribution: metadata.Distribution) -> dict[str, A
     return value
 
 
+_FULL_GIT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _vcs_commit_identity_verified(direct_url: dict[str, Any] | None) -> str | None:
+    """Return the pinned full git commit sha, or None unless it is exact-pinned.
+
+    A VCS install only counts as identity-verified when it is pinned to an
+    exact 40-hex commit sha (``git+https://.../clio-relay@<sha>``) -- a
+    branch or tag reference is a moving target, not a fixed identity, and is
+    rejected even though it still resolves to a ``commit_id``. The returned
+    sha plays the same identity-anchor role ``artifact_sha256`` plays for a
+    wheel: recorded on the receipt and compared for exact equality.
+    """
+    if direct_url is None:
+        return None
+    vcs_info = direct_url.get("vcs_info")
+    if not isinstance(vcs_info, dict):
+        return None
+    typed_vcs_info = cast(dict[str, Any], vcs_info)
+    if typed_vcs_info.get("vcs") != "git":
+        return None
+    requested_revision = typed_vcs_info.get("requested_revision")
+    commit_id = typed_vcs_info.get("commit_id")
+    if (
+        not isinstance(requested_revision, str)
+        or _FULL_GIT_COMMIT_SHA.fullmatch(requested_revision) is None
+    ):
+        return None
+    if not isinstance(commit_id, str) or commit_id.lower() != requested_revision.lower():
+        return None
+    return requested_revision.lower()
+
+
 def _verify_running_artifact_identity(
     distribution: metadata.Distribution,
     *,
@@ -3735,8 +3772,13 @@ def _infer_running_artifact_identity(
     direct_url: dict[str, Any] | None,
     launcher: str,
 ) -> tuple[str | None, bool]:
-    """Inspect one exact direct wheel for human-facing installation information."""
-    if launcher != "uv-tool" or detected_kind is not InstallSourceKind.WHEEL:
+    """Inspect one exact direct wheel, or exact-sha VCS pin, for installation identity."""
+    if launcher != "uv-tool":
+        return None, False
+    if detected_kind is InstallSourceKind.VCS:
+        commit_sha = _vcs_commit_identity_verified(direct_url)
+        return commit_sha, commit_sha is not None
+    if detected_kind is not InstallSourceKind.WHEEL:
         return None, False
     wheel_bytes = _direct_wheel_bytes(direct_url)
     if wheel_bytes is None:
@@ -3842,22 +3884,34 @@ class _ReleaseWheelRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _is_official_release_wheel_url(value: str) -> bool:
-    """Allow only one credential-free canonical clio-relay GitHub release URL."""
+    """Allow only credential-free canonical clio-relay GitHub or PyPI wheel URLs.
+
+    GitHub release assets and the trusted-publishing PyPI upload both carry
+    the identical released bytes (the same artifact is attached to a GitHub
+    Release and published to PyPI from that release); either canonical
+    channel is an official source of the wheel. This function recognizes the
+    *channel* only -- the sha256 digest binding performed by
+    ``_wheel_url_matches_install`` remains the actual integrity anchor.
+    """
     try:
         parsed = urllib.parse.urlsplit(value)
         port = parsed.port
     except ValueError:
         return False
-    return (
-        parsed.scheme.casefold() == "https"
-        and parsed.hostname == "github.com"
-        and port in {None, 443}
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and _OFFICIAL_RELEASE_WHEEL_PATH.fullmatch(parsed.path) is not None
-    )
+    if (
+        parsed.scheme.casefold() != "https"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if parsed.hostname == "github.com":
+        return _OFFICIAL_RELEASE_WHEEL_PATH.fullmatch(parsed.path) is not None
+    if parsed.hostname == "files.pythonhosted.org":
+        return _OFFICIAL_PYPI_WHEEL_PATH.fullmatch(parsed.path) is not None
+    return False
 
 
 def _is_github_release_asset_url(value: str) -> bool:

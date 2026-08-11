@@ -1758,6 +1758,17 @@ def endpoint_worker_info(
         bool,
         typer.Option(help="Return bounded readiness flags without detailed installation records."),
     ] = False,
+    pinned_install_receipt_path: Annotated[
+        str | None,
+        typer.Option(
+            "--pinned-install-receipt-path",
+            help=(
+                "Cluster-registered relay_install_receipt path (this host's "
+                "own pinned runtime) to verify the worker against, instead of "
+                "this invocation's ambient current installation."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Report fresh process-bound identity for the active cluster worker."""
     _run_or_exit(
@@ -1767,6 +1778,7 @@ def endpoint_worker_info(
                     cluster=cluster,
                     freshness_seconds=freshness_seconds,
                     readiness_only=readiness_only,
+                    pinned_install_receipt_path=pinned_install_receipt_path,
                 ),
                 indent=2,
             )
@@ -17858,14 +17870,23 @@ def _remote_worker_info(
     *,
     timeout_seconds: float | None = None,
 ) -> dict[str, object]:
-    """Read fresh process-bound worker identity over one optional total deadline."""
+    """Read fresh process-bound worker identity over one optional total deadline.
+
+    When the cluster registry pins a runtime (``relay_install_receipt``), that
+    pin is threaded to the remote check so the worker is verified against its
+    own cluster's declared identity rather than only this SSH session's
+    ambient current installation (clio-relay#205).
+    """
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     deadline = None if timeout_seconds is None else monotonic() + timeout_seconds
+    args = ["endpoint", "worker-info", "--cluster", definition.name]
+    if definition.relay_install_receipt is not None:
+        args = [*args, "--pinned-install-receipt-path", definition.relay_install_receipt]
     info = _json_output(
         _run_remote_clio_before_deadline(
             definition,
-            ["endpoint", "worker-info", "--cluster", definition.name],
+            args,
             deadline=deadline,
         ),
         "remote clio-relay worker runtime info",

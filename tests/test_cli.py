@@ -762,7 +762,43 @@ def test_endpoint_worker_info_exposes_bounded_readiness_mode(
         "cluster": "ares",
         "freshness_seconds": 90.0,
         "readiness_only": True,
+        "pinned_install_receipt_path": None,
     }
+
+
+def test_endpoint_worker_info_forwards_pinned_install_receipt_path(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#205: the CLI surface forwards the cluster's pinned receipt path."""
+    observed: dict[str, object] = {}
+
+    def worker_info(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "clio-relay.worker-runtime-info.v1",
+            "cluster": kwargs["cluster"],
+            "running": True,
+        }
+
+    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "worker-info",
+            "--cluster",
+            "ares-p5run2",
+            "--pinned-install-receipt-path",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        observed["pinned_install_receipt_path"]
+        == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
+    )
 
 
 def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -8791,6 +8827,74 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
     target_scheduler_provider[0] = "external"
     with pytest.raises(ConfigurationError, match="physical target scheduler provider"):
         cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_remote_worker_info_threads_cluster_pinned_receipt_path(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#205: a cluster-pinned receipt is threaded to the remote check.
+
+    ``worker_runtime_info`` runs server-side over the SSH session and has no
+    access to the desktop's local cluster registry, so the desktop -- which
+    does hold ``ClusterDefinition.relay_install_receipt`` -- must pass it
+    along explicitly rather than the check silently falling back to whatever
+    this SSH invocation's ambient current installation happens to be.
+    """
+    target_identity = ClusterTargetIdentity(
+        hostnames=["ares-login-1.example.edu"],
+        ssh_host_key_sha256=["SHA256:operator-pinned-fingerprint"],
+        scheduler_cluster_name="ares",
+        site_marker_sha256="a" * 64,
+    )
+    pinned_definition = ClusterDefinition(
+        name="ares-p5run2",
+        ssh_host="ares",
+        scheduler_provider="slurm",
+        relay_install_receipt="$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        target_identity=target_identity,
+    )
+    unpinned_definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares",
+        scheduler_provider="slurm",
+        target_identity=target_identity,
+    )
+    observed_arguments: list[list[str]] = []
+
+    def fake_run_remote_clio(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        observed_arguments.append(arguments)
+        if arguments[1] == "worker-info":
+            return json.dumps({"scheduler_provider": "slurm"})
+        return json.dumps(
+            {
+                "schema_version": "clio-relay.cluster-target-info.v1",
+                "hostname": "ares-login-1",
+                "fqdn": "ares-login-1.example.edu",
+                "site_marker_sha256": "a" * 64,
+                "scheduler_provider": "slurm",
+                "scheduler_cluster_name": "ares",
+            }
+        )
+
+    def fake_host_key_fingerprints(_host: str) -> list[str]:
+        return ["SHA256:operator-pinned-fingerprint"]
+
+    monkeypatch.setattr(cli, "run_remote_clio", fake_run_remote_clio)
+    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+
+    cli._remote_worker_info(pinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli._remote_worker_info(unpinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    worker_info_calls = [call for call in observed_arguments if call[1] == "worker-info"]
+    assert worker_info_calls[0] == [
+        "endpoint",
+        "worker-info",
+        "--cluster",
+        "ares-p5run2",
+        "--pinned-install-receipt-path",
+        "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+    ]
+    assert worker_info_calls[1] == ["endpoint", "worker-info", "--cluster", "ares"]
 
 
 def test_remote_worker_info_uses_one_total_observation_deadline(
