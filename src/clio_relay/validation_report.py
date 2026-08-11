@@ -71,6 +71,10 @@ _OFFICIAL_RELEASE_WHEEL_PATH = re.compile(
     r"/iowarp/clio-relay/releases/download/v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)/"
     r"clio_relay-(?P=version)-py3-none-any\.whl"
 )
+_OFFICIAL_PYPI_WHEEL_PATH = re.compile(
+    r"/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{16,64}/"
+    r"clio_relay-[0-9A-Za-z][0-9A-Za-z.+-]*-py3-none-any\.whl"
+)
 SPACK_FRESH_INSTALL_TRANSITION_CHECK_IDS = (
     "remote-mcp.spack-preinstall-absent",
     "remote-mcp.spack-fresh-install",
@@ -3842,22 +3846,34 @@ class _ReleaseWheelRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _is_official_release_wheel_url(value: str) -> bool:
-    """Allow only one credential-free canonical clio-relay GitHub release URL."""
+    """Allow only credential-free canonical clio-relay GitHub or PyPI wheel URLs.
+
+    GitHub release assets and the trusted-publishing PyPI upload both carry
+    the identical released bytes (the same artifact is attached to a GitHub
+    Release and published to PyPI from that release); either canonical
+    channel is an official source of the wheel. This function recognizes the
+    *channel* only -- the sha256 digest binding performed by
+    ``_wheel_url_matches_install`` remains the actual integrity anchor.
+    """
     try:
         parsed = urllib.parse.urlsplit(value)
         port = parsed.port
     except ValueError:
         return False
-    return (
-        parsed.scheme.casefold() == "https"
-        and parsed.hostname == "github.com"
-        and port in {None, 443}
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and _OFFICIAL_RELEASE_WHEEL_PATH.fullmatch(parsed.path) is not None
-    )
+    if (
+        parsed.scheme.casefold() != "https"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if parsed.hostname == "github.com":
+        return _OFFICIAL_RELEASE_WHEEL_PATH.fullmatch(parsed.path) is not None
+    if parsed.hostname == "files.pythonhosted.org":
+        return _OFFICIAL_PYPI_WHEEL_PATH.fullmatch(parsed.path) is not None
+    return False
 
 
 def _is_github_release_asset_url(value: str) -> bool:

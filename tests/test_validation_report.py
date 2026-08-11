@@ -528,6 +528,68 @@ def test_remote_wheel_fetch_rejects_noncanonical_sources(url: str) -> None:
     )
 
 
+def test_official_release_wheel_url_recognizes_github_unchanged() -> None:
+    """clio-relay#206: the pre-existing GitHub release-asset channel is untouched."""
+    url = (
+        "https://github.com/iowarp/clio-relay/releases/download/v1.6.6/"
+        "clio_relay-1.6.6-py3-none-any.whl"
+    )
+    assert validation_report_module._is_official_release_wheel_url(url) is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_official_release_wheel_url_recognizes_pypi_channel() -> None:
+    """clio-relay#206: PyPI (files.pythonhosted.org) is an official wheel channel too.
+
+    Observed live: a desktop ``uv tool install clio-relay==1.6.6`` resolved
+    from PyPI produced a wheel with the identical sha256 digest as the GitHub
+    release asset, but ``_is_official_release_wheel_url`` hardcoded
+    ``github.com`` and rejected it outright.
+    """
+    url = (
+        "https://files.pythonhosted.org/packages/4a/1e/"
+        "cadc4d66aa11223344556677889900aabbccddeeff00112233445566778899/"
+        "clio_relay-1.6.6-py3-none-any.whl"
+    )
+    assert validation_report_module._is_official_release_wheel_url(url) is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # wrong project name on an otherwise well-formed PyPI wheel path
+        "https://files.pythonhosted.org/packages/4a/1e/"
+        "cadc4d66aa11223344556677889900aabbccddeeff00112233445566778899/"
+        "other-project-1.6.6-py3-none-any.whl",
+        # credentials embedded in the host
+        "https://user@files.pythonhosted.org/packages/4a/1e/"
+        "cadc4d66aa11223344556677889900aabbccddeeff00112233445566778899/"
+        "clio_relay-1.6.6-py3-none-any.whl",
+        # query string smuggled onto an otherwise canonical URL
+        "https://files.pythonhosted.org/packages/4a/1e/"
+        "cadc4d66aa11223344556677889900aabbccddeeff00112233445566778899/"
+        "clio_relay-1.6.6-py3-none-any.whl?redirect=https://127.0.0.1",
+        # an arbitrary other host is never an official channel
+        "https://pypi.example.org/packages/4a/1e/"
+        "cadc4d66aa11223344556677889900aabbccddeeff00112233445566778899/"
+        "clio_relay-1.6.6-py3-none-any.whl",
+        # not the packages/ hash-addressed path shape at all
+        "https://files.pythonhosted.org/clio_relay-1.6.6-py3-none-any.whl",
+        # legacy simple-index style path is not the hash-addressed download path
+        "https://files.pythonhosted.org/packages/source/c/clio-relay/"
+        "clio_relay-1.6.6-py3-none-any.whl",
+    ],
+)
+def test_official_release_wheel_url_rejects_noncanonical_pypi_sources(url: str) -> None:
+    """clio-relay#206: recognition is narrow -- host and filename pattern both bind."""
+    assert validation_report_module._is_official_release_wheel_url(url) is False  # pyright: ignore[reportPrivateUsage]
+    assert (
+        validation_report_module._direct_wheel_bytes(  # pyright: ignore[reportPrivateUsage]
+            {"url": url, "archive_info": {}}
+        )
+        is None
+    )
+
+
 def test_release_wheel_fetch_rejects_private_dns_and_unsafe_redirects(
     monkeypatch: MonkeyPatch,
 ) -> None:
