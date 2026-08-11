@@ -423,6 +423,112 @@ def test_broken_http_stream_is_reproven_over_the_same_channel_without_a_new_dial
     assert all("Authorization" not in cast(dict[str, str], r["headers"]) for r in identity_requests)
 
 
+def test_stale_pooled_stream_is_identity_bound_reconnected_and_the_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#213: a stream that dies between requests gets one retry.
+
+    Unlike ``test_broken_http_stream_is_reproven_over_the_same_channel_without_a_new_dial``
+    (which simulates a stream Python already knows is dead before it is used),
+    this simulates the real defect: the stream looks live when it leaves the
+    pool and only fails on the actual I/O, the way an OS-level idle close
+    (WinError 10053/10054) really surfaces.
+    """
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    original_getresponse = _Stream.getresponse
+    failures_remaining = 1
+
+    def flaky_getresponse(self: _Stream) -> _Response:
+        nonlocal failures_remaining
+        path = cast(str, self.harness.requests[-1]["path"])
+        if path == "/jobs/job_1/status" and failures_remaining > 0:
+            failures_remaining -= 1
+            raise ConnectionResetError(
+                "[WinError 10054] An existing connection was forcibly closed by the remote host"
+            )
+        return original_getresponse(self)
+
+    monkeypatch.setattr(_Stream, "getresponse", flaky_getresponse)
+
+    result = connection.request_json(method="GET", path="/jobs/job_1/status")
+
+    assert result == {"ok": True}
+    # A stream retry, never a channel reconnect: no new SSH dial.
+    assert harness.dials == 1
+    # The dead stream was discarded and exactly one replacement was proven.
+    assert len(harness.streams) == 2
+    assert [event.event for event in connection.events][-1] == "stream_reproven"
+    assert connection.events[-1].reason == "stale_pooled_stream"
+    identity_requests = [
+        request
+        for request in harness.requests
+        if cast(str, request["path"]).startswith("/session-identity")
+    ]
+    # One identity proof for the original bring-up stream, one for the
+    # replacement -- the reconnect RE-PROVES identity on the new stream, it
+    # never skips or weakens the proof to retry faster.
+    assert len(identity_requests) == 2
+    assert all("Authorization" not in cast(dict[str, str], r["headers"]) for r in identity_requests)
+
+
+def test_stale_pooled_stream_persistent_failure_surfaces_after_exactly_one_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second consecutive failure, on the freshly proven stream, surfaces unchanged."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    original_getresponse = _Stream.getresponse
+
+    def always_dead(self: _Stream) -> _Response:
+        path = cast(str, self.harness.requests[-1]["path"])
+        if path == "/jobs/job_1/status":
+            raise ConnectionResetError(
+                "[WinError 10054] An existing connection was forcibly closed by the remote host"
+            )
+        return original_getresponse(self)
+
+    monkeypatch.setattr(_Stream, "getresponse", always_dead)
+
+    with pytest.raises(RelayError, match="identity-bound request failed"):
+        connection.request_json(method="GET", path="/jobs/job_1/status")
+
+    # Still never escalates to a channel-level reconnect (no new SSH dial), and
+    # exactly one stream-level reconnect was attempted -- not an unbounded retry.
+    assert harness.dials == 1
+    assert len(harness.streams) == 2
+    events = [event.event for event in connection.events]
+    assert events.count("stream_reproven") == 1
+    assert connection.events[-1].reason == "stale_pooled_stream"
+
+
+def test_a_non_stale_failure_never_triggers_a_stream_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry is deliberately narrow: an HTTP-status failure is not a stale stream."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    original_getresponse = _Stream.getresponse
+
+    def not_found(self: _Stream) -> _Response:
+        path = cast(str, self.harness.requests[-1]["path"])
+        if path == "/jobs/job_1/status":
+            return _Response({"error": "not found"}, status=404)
+        return original_getresponse(self)
+
+    monkeypatch.setattr(_Stream, "getresponse", not_found)
+
+    with pytest.raises(RelayError, match="HTTP 404"):
+        connection.request_json(method="GET", path="/jobs/job_1/status")
+
+    assert harness.dials == 1
+    assert len(harness.streams) == 1
+    assert [event.event for event in connection.events][-1] == "established"
+
+
 def test_one_local_relay_holds_one_channel_per_remote_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

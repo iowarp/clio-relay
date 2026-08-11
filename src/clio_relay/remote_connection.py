@@ -5,10 +5,19 @@ connected to.  A connection establishes its transport once, at bring-up, and
 holds it for the connection's lifetime.  Every owned-session operation is plain
 HTTP over the mapped port of that held channel.
 
-Nothing here may re-establish transport implicitly.  A dropped channel raises
+Nothing here may re-establish *transport* implicitly.  A dropped channel raises
 :class:`~clio_relay.control_channel.ChannelDropped`; replacing it is an explicit
 :meth:`RemoteConnection.reconnect` call that emits typed, visible events -- in
 ``ssh_forward`` mode that call is what a present user authorizes.
+
+One level below the transport, a pooled HTTP *stream* over an already-held
+channel is a cheaper, narrower thing: :meth:`RemoteConnection.request_json`
+identity-bound reconnects a stream that died between requests (an OS-level
+idle close it cannot see coming) exactly once, re-proving it against the same
+bring-up identity, before surfacing anything (clio-relay#213). That is never a
+silent redial -- it costs no new transport and is itself a typed, visible
+``stream_reproven`` event -- and it never substitutes for the explicit
+channel-level reconnect above.
 """
 
 from __future__ import annotations
@@ -51,6 +60,19 @@ MAX_RECORDED_CHANNEL_EVENTS: Final = 256
 MAX_POOLED_CHANNEL_STREAMS: Final = 8
 DEFAULT_OWNED_SESSION_API_PORT: Final = 8765
 CHANNEL_EVENT_REPORT_SCHEMA: Final = "clio-relay.control-channel-report.v1"
+
+# clio-relay#213: the closed set of exceptions `_request_json_on_stream` wraps and
+# chains that mean the *stream* died at the OS level (idle-closed, reset, a bad
+# status line) rather than the request being genuinely rejected. Deliberately
+# narrow: an HTTP-status failure or a slow-but-live server (ObservationTimeoutError)
+# must never retry under a second identity-bound stream.
+_STALE_STREAM_ERROR_TYPES: Final = (ConnectionError, http.client.BadStatusLine)
+
+
+def _is_stale_stream_error(exc: BaseException) -> bool:
+    """Return True only for the narrow, OS-observed dead-pooled-stream signature."""
+    return isinstance(exc.__cause__, _STALE_STREAM_ERROR_TYPES)
+
 
 _IDENTITY_FIELDS: Final = (
     "schema_version",
@@ -249,30 +271,51 @@ class RemoteConnection:
         body: dict[str, object] | None = None,
         response_timeout_seconds: float | None = None,
     ) -> object:
-        """Issue one authenticated JSON request over the held channel."""
+        """Issue one authenticated JSON request over the held channel.
+
+        clio-relay#213: a pooled stream that looked live when it left the pool
+        but died at the OS level while idle (WinError 10053/10054, a reset, a
+        bad status line -- the kind of loss nothing sees coming until the next
+        real I/O) is retried exactly once. The dead stream is discarded, a
+        replacement is proven fresh against this connection's already-held
+        bring-up identity (`_acquire_stream` re-runs the same per-stream
+        identity challenge it always does), and the request is reissued. A
+        second consecutive failure on that freshly proven stream surfaces
+        unchanged. This is a narrow, typed, visible *stream* retry over the
+        channel that is already held -- never a silent redial: the channel
+        itself only ever replaces via the explicit, user-authorized
+        `reconnect()`.
+        """
         normalized_method = validate_channel_request(method=method, path=path)
         if response_timeout_seconds is not None and (
             not math.isfinite(response_timeout_seconds) or response_timeout_seconds <= 0
         ):
             raise ValueError("response_timeout_seconds must be positive and finite")
-        stream = self._acquire_stream()
-        try:
-            document = _request_json_on_stream(
-                stream=stream,
-                method=normalized_method,
-                path=path,
-                query=query,
-                body=body,
-                api_token=self._api_token,
-                session_id=self._session_id,
-                generation_id=self._generation_id,
-                response_timeout_seconds=response_timeout_seconds,
+        retried = False
+        while True:
+            stream = self._acquire_stream(
+                reason="stale_pooled_stream" if retried else "http_stream_opened"
             )
-        except BaseException:
-            self._discard_stream(stream)
-            raise
-        self._release_stream(stream)
-        return document
+            try:
+                document = _request_json_on_stream(
+                    stream=stream,
+                    method=normalized_method,
+                    path=path,
+                    query=query,
+                    body=body,
+                    api_token=self._api_token,
+                    session_id=self._session_id,
+                    generation_id=self._generation_id,
+                    response_timeout_seconds=response_timeout_seconds,
+                )
+            except BaseException as exc:
+                self._discard_stream(stream)
+                if retried or not _is_stale_stream_error(exc):
+                    raise
+                retried = True
+                continue
+            self._release_stream(stream)
+            return document
 
     def session_status(self) -> dict[str, object]:
         """Read the remote relay session's status over the held channel.
@@ -440,7 +483,11 @@ class RemoteConnection:
                 "configure CLIO_RELAY_OWNER_SESSION_API_PORT for this connection"
             )
 
-    def _acquire_stream(self) -> http.client.HTTPConnection:
+    def _acquire_stream(
+        self,
+        *,
+        reason: str = "http_stream_opened",
+    ) -> http.client.HTTPConnection:
         """Take one proven HTTP stream over the held channel.
 
         Streams are pooled, not shared: a long poll on one operation must not
@@ -449,6 +496,10 @@ class RemoteConnection:
         it costs no new transport -- the dial count is unchanged.  Every stream
         is proven against the same out-of-band bring-up identity document before
         any credential is sent, so none of them talks to an unproven listener.
+
+        ``reason`` labels *why* a freshly proven stream's ``stream_reproven``
+        event fired: ordinary concurrency (the default) versus `request_json`
+        retrying a stream that died between requests (clio-relay#213).
         """
         with self._lock:
             transport = self._transport
@@ -509,7 +560,7 @@ class RemoteConnection:
                         mode=self._transport_mode,
                         event="stream_reproven",
                         attempt=self._attempt,
-                        reason="http_stream_opened",
+                        reason=reason,
                     )
                 )
         return proven
