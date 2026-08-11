@@ -33,6 +33,18 @@ from clio_relay.errors import ConfigurationError
 from clio_relay.remote_mcp import default_remote_mcp_cache_path
 
 
+def test_cluster_definition_dev_mode_defaults_off_and_is_strict_bool() -> None:
+    """clio-relay#211: a cluster's dev_mode pin defaults off and rejects non-bool input."""
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    assert definition.dev_mode is False
+
+    dev_definition = ClusterDefinition(name="ares", ssh_host="ares-login", dev_mode=True)
+    assert dev_definition.dev_mode is True
+
+    with pytest.raises(Exception, match="bool"):
+        ClusterDefinition(name="ares", ssh_host="ares-login", dev_mode="1")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("profile", ["", " ares", "ares ", ".", "..", "a/res", "a\\res"])
 def test_cluster_definition_rejects_unsafe_jarvis_graph_profile(profile: str) -> None:
     """A profile is one explicit JARVIS catalog key, never a relay-owned path."""

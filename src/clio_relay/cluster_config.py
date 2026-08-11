@@ -433,6 +433,13 @@ class ClusterDefinition(BaseModel):
     spool_dir: str = "$HOME/.local/share/clio-relay/spool"
     relay_executable: str = "$HOME/.local/bin/clio-relay"
     relay_install_receipt: str | None = None
+    # clio-relay#211: downgrades this cluster's install/identity/receipt/sha
+    # verification chain to typed warnings instead of raising. CLIO_RELAY_DEV_MODE=1
+    # (environment) is equivalent; either is sufficient. See dev_mode.py --
+    # checks protecting live state (writer proof, worker-lifetime lock, storage
+    # admission, teardown scoping) and physical target identity never consult
+    # this flag and stay hard regardless.
+    dev_mode: bool = Field(default=False, strict=True)
     jarvis_bin: str | None = None
     jarvis_resource_graph_profile: str | None = None
     allow_jarvis_resource_graph_build: bool = Field(default=False, strict=True)
