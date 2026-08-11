@@ -1077,6 +1077,129 @@ def test_installation_info_uses_verified_uv_tool_receipt_without_bootstrap_recei
     assert info["component_runtime"] == {}
 
 
+def test_installation_info_accepts_exact_sha_pinned_vcs_uv_tool_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#206: a full-sha VCS pin is an official uv-tool identity anchor too.
+
+    ``uv tool install git+https://github.com/iowarp/clio-relay@<40-hex-sha>``
+    pins an exact commit -- the desktop persistent-uv-tool identity check
+    must accept it and record that sha as the identity anchor exactly as it
+    would a wheel's sha256 digest.
+    """
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    commit_sha = "c" * 40
+    source_url = "https://github.com/iowarp/clio-relay"
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=commit_sha,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": commit_sha,
+                "commit_id": commit_sha,
+            },
+        },
+        artifact_identity_verified=True,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {
+                "path": str(uv_receipt),
+                "verified": True,
+            },
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    info = installation_info()
+    receipt = cast(dict[str, object], info["receipt"])
+
+    assert info["receipt_origin"] == "uv-tool"
+    assert receipt["requested_source"] == "vcs"
+    assert receipt["artifact_sha256"] == commit_sha
+    assert receipt["artifact_filename"] is None
+    assert receipt["install_spec"] == source_url
+
+
+def test_installation_info_rejects_vcs_uv_tool_install_pinned_to_a_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#206: a branch/tag-pinned VCS install stays rejected, not silently accepted."""
+    missing_bootstrap = tmp_path / "missing-install-receipt.json"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    version = metadata.version("clio-relay")
+    source_url = "https://github.com/iowarp/clio-relay"
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=None,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": "main",
+                "commit_id": "d" * 40,
+            },
+        },
+        artifact_identity_verified=False,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {
+                "path": str(uv_receipt),
+                "verified": True,
+            },
+        },
+    )
+
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    monkeypatch.setattr(
+        installation_module,
+        "default_install_receipt_path",
+        lambda: missing_bootstrap,
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    with pytest.raises(ConfigurationError, match="wheel identity could not be verified"):
+        installation_info()
+
+
 def test_remote_native_jarvis_component_requires_runtime_capability_provenance(
     tmp_path: Path,
 ) -> None:

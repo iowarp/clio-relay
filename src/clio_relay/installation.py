@@ -1141,12 +1141,25 @@ def installation_info(path: Path | None = None) -> dict[str, object]:
 
 
 def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource]:
-    """Derive a compatible receipt from uv's exact persistent-tool identity."""
+    """Derive a compatible receipt from uv's exact persistent-tool identity.
+
+    A VCS-kind install counts only when pinned to an exact 40-hex git commit
+    sha (``git+https://.../clio-relay@<sha>``); ``detect_install_source``
+    resolves that sha into ``artifact_sha256`` (see
+    ``_vcs_commit_identity_verified``), where it plays the same
+    identity-anchor role a wheel's sha256 digest plays. A branch or tag
+    reference leaves ``artifact_identity_verified`` False and is rejected
+    below exactly like an unverified wheel.
+    """
     source = detect_install_source(
         launcher="uv-tool",
         infer_artifact_sha256=True,
     )
-    if source.kind not in {InstallSourceKind.WHEEL, InstallSourceKind.PYPI}:
+    if source.kind not in {
+        InstallSourceKind.WHEEL,
+        InstallSourceKind.PYPI,
+        InstallSourceKind.VCS,
+    }:
         raise ConfigurationError("running clio-relay is not installed as a persistent uv tool")
     if not source.launcher_verified:
         raise ConfigurationError("persistent uv tool launcher identity could not be verified")
@@ -1167,7 +1180,7 @@ def _persistent_uv_tool_install_receipt() -> tuple[InstallReceipt, InstallSource
         raise ConfigurationError("persistent uv tool receipt path is unavailable") from exc
     reference = source.reference
     artifact_filename: str | None = None
-    if reference is not None:
+    if reference is not None and source.kind is not InstallSourceKind.VCS:
         parsed = urlsplit(reference)
         if parsed.path:
             artifact_filename = Path(unquote(parsed.path)).name or None

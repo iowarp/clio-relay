@@ -590,6 +590,105 @@ def test_official_release_wheel_url_rejects_noncanonical_pypi_sources(url: str) 
     )
 
 
+_FULL_COMMIT_SHA = "a" * 40
+
+
+def test_vcs_commit_identity_accepts_exact_full_sha_pin() -> None:
+    """clio-relay#206: a VCS install pinned to a full 40-hex commit sha is exact."""
+    direct_url = {
+        "url": "https://github.com/iowarp/clio-relay",
+        "vcs_info": {
+            "vcs": "git",
+            "requested_revision": _FULL_COMMIT_SHA,
+            "commit_id": _FULL_COMMIT_SHA.upper(),
+        },
+    }
+    assert (
+        validation_report_module._vcs_commit_identity_verified(  # pyright: ignore[reportPrivateUsage]
+            direct_url
+        )
+        == _FULL_COMMIT_SHA
+    )
+
+
+@pytest.mark.parametrize(
+    "vcs_info",
+    [
+        # a branch reference is a moving target, not a fixed identity
+        {"vcs": "git", "requested_revision": "main", "commit_id": _FULL_COMMIT_SHA},
+        # a tag reference is also a moving target relative to a commit sha
+        {"vcs": "git", "requested_revision": "v1.6.6", "commit_id": _FULL_COMMIT_SHA},
+        # a short sha is not the full 40-hex identity anchor
+        {"vcs": "git", "requested_revision": _FULL_COMMIT_SHA[:12], "commit_id": _FULL_COMMIT_SHA},
+        # no requested_revision at all (unpinned VCS reference)
+        {"vcs": "git", "commit_id": _FULL_COMMIT_SHA},
+        # a non-git VCS is out of scope for this recognition
+        {"vcs": "hg", "requested_revision": _FULL_COMMIT_SHA, "commit_id": _FULL_COMMIT_SHA},
+        # requested_revision and the resolved commit_id disagree
+        {"vcs": "git", "requested_revision": _FULL_COMMIT_SHA, "commit_id": "b" * 40},
+    ],
+)
+def test_vcs_commit_identity_rejects_moving_or_inexact_references(
+    vcs_info: dict[str, object],
+) -> None:
+    """clio-relay#206: branch/tag refs and short shas never count as pinned."""
+    direct_url = {"url": "https://github.com/iowarp/clio-relay", "vcs_info": vcs_info}
+    assert (
+        validation_report_module._vcs_commit_identity_verified(  # pyright: ignore[reportPrivateUsage]
+            direct_url
+        )
+        is None
+    )
+    assert (
+        validation_report_module._vcs_commit_identity_verified(None)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_infer_running_artifact_identity_records_exact_vcs_sha() -> None:
+    """clio-relay#206: an exact-sha VCS pin is captured the same way a wheel digest is."""
+    distribution = metadata.distribution("clio-relay")
+    pinned_direct_url = {
+        "url": "https://github.com/iowarp/clio-relay",
+        "vcs_info": {
+            "vcs": "git",
+            "requested_revision": _FULL_COMMIT_SHA,
+            "commit_id": _FULL_COMMIT_SHA,
+        },
+    }
+    digest, verified = validation_report_module._infer_running_artifact_identity(  # pyright: ignore[reportPrivateUsage]
+        distribution,
+        detected_kind=InstallSourceKind.VCS,
+        direct_url=pinned_direct_url,
+        launcher="uv-tool",
+    )
+    assert digest == _FULL_COMMIT_SHA
+    assert verified is True
+
+    branch_direct_url = {
+        "url": "https://github.com/iowarp/clio-relay",
+        "vcs_info": {"vcs": "git", "requested_revision": "main", "commit_id": _FULL_COMMIT_SHA},
+    }
+    digest, verified = validation_report_module._infer_running_artifact_identity(  # pyright: ignore[reportPrivateUsage]
+        distribution,
+        detected_kind=InstallSourceKind.VCS,
+        direct_url=branch_direct_url,
+        launcher="uv-tool",
+    )
+    assert digest is None
+    assert verified is False
+
+    # a non uv-tool launcher never counts, matching the wheel path's own gate
+    digest, verified = validation_report_module._infer_running_artifact_identity(  # pyright: ignore[reportPrivateUsage]
+        distribution,
+        detected_kind=InstallSourceKind.VCS,
+        direct_url=pinned_direct_url,
+        launcher="uvx",
+    )
+    assert digest is None
+    assert verified is False
+
+
 def test_release_wheel_fetch_rejects_private_dns_and_unsafe_redirects(
     monkeypatch: MonkeyPatch,
 ) -> None:
