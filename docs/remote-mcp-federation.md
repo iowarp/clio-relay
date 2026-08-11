@@ -474,13 +474,15 @@ The exact release wheel bootstrap installs by default is
 Its canonical contract is `clio-kit-jarvis-user-v3.6`. The relay's own
 vendored certification snapshot of that contract (used to cross-check the
 bundled `_contracts/jarvis-user-v3.6.json` copy against a known-good
-clio-kit release, independent of which wheel bootstrap installs) remains
-pinned to the clio-kit 2.6.6 build: contract SHA-256
-`055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d`,
+clio-kit release, independent of which wheel bootstrap installs) is
+re-certified against the same clio-kit 2.7.2 build: contract SHA-256
+`a326af259e50b57b19b7aa1d209720d5a71e57d7c2e64979596c4fc21850bdda`,
 canonical tools-wire SHA-256
-`c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023`, and
+`0f912b4dfa7135448834f915984ca413f77b73ef53b0f758594006cd7551cd35`, and
 bundled contract artifact SHA-256
-`6e839f3ac975f247053ef4b6a048c53686882c2ab6a1b103f91dfc744ed29ed5`.
+`08c86eda618ec83109fa3c86fe28eccfd44c1ed0e647b93bcb0a82e470fd0d5e`.
+(clio-kit 2.7.2 added a `title` key to every user-profile tool, which shifts
+all three digests from the pre-2.7.2 values; clio-relay#199.)
 The nested runtime lock is bound to the public
 [`jarvis_cd-1.8.0-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.8.0/jarvis_cd-1.8.0-py3-none-any.whl)
 release artifact with SHA-256
@@ -500,15 +502,16 @@ operator-defined and do not select behavior. Existing
 `clio-kit-spack-user-v2` registrations remain supported and are verified
 against their distinct preserved contract digest.
 The current v2.1 contract SHA-256 is
-`f1a62d96179012975f763402446571146e04e519f98df30583f9800f233216fc`,
+`4a065d2c67c0dd34e2cc18bca9dc53ed87ce35aa4ac524ef3e5c954a875c19db`,
 its canonical tools-wire SHA-256 is
-`e06bfa71153e19ea44f03ed55f03873bc643f42b4b25b96788c02892df719da8`,
+`c7f1d1a4ce35b58664b46d2994863257a1e5a30e5c4ab7501b0a96a4becc08b7`,
 and its bundled artifact SHA-256 is
-`24f6e2b340ef5e2649241c10d7c2260b8d8cbbaa4e10f1a389c9249c2e7e6171`.
+`b8da9a3cad05ad734ac3a20adb635f11fa45a8870afe08a9f4e261fdc713b57d`
+(re-certified against clio-kit 2.7.2; clio-relay#199).
 
 ## Register the scientific catalog MCP
 
-clio-kit 2.6.6 also ships the two-tool
+clio-kit also ships the two-tool
 `clio-kit-scientific-catalog-user-v1.1` contract. It separates dataset discovery
 from visualization control: `scientific_dataset_search` finds operator catalog
 records and `scientific_dataset_describe` returns the complete catalog record
@@ -534,11 +537,12 @@ clio-relay remote-mcp refresh --cluster my-cluster --name scientific-catalog
 ```
 
 The relay checks the current contract SHA-256
-`80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c`,
+`fd9fd4ba76617f1fd13560420cd650f78adc55d0957bd950d10d09c72ebe1889`,
 canonical tools-wire SHA-256
-`1c8df94a298f92b92126c953a7b8124d90b2fa12919de93738a40e563c3eaa28`,
+`6a8fc61e31515880c722db3447d2f01584e4b297cb02b70b5618bff081840380`,
 and exact contract artifact SHA-256
-`29cbbfe64eaa7bcf29531b3d28762b8ff47e89d291b0a5b66119da96c790135e`.
+`8548aa8f0d1993ec644bb2fea778a4759b27d34bea3ed93ff92254b6fbf3052e`
+(re-certified against clio-kit 2.7.2; clio-relay#199).
 Historical `clio-kit-scientific-catalog-user-v1` registrations remain accepted
 against their separately preserved contract, wire, and artifact digests; they
 do not claim the explicit top-level descriptor handoff added in v1.1. At

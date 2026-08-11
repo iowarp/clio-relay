@@ -143,7 +143,7 @@ EXPECTED_CONTRACTS = {
     "clio-kit-slurm-user-v3": {
         "server_name": "slurm",
         "artifact": "slurm-user-v3.json",
-        "contract_sha256": "8557f6dbbf5d88ca0a617e06581056d61a363e21ec7fac01f8e31f65e66736a8",
+        "contract_sha256": "f61b27b0c7d4648d86c27b29504688a13ba45767bd75bfc372c830308f7c05c0",
         "tool_names": {
             "slurm_cancel",
             "slurm_cluster",

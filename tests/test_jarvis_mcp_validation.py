@@ -22,6 +22,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_mcp_server_args,
     jarvis_user_contract,
     jarvis_user_contract_digest,
+    jarvis_user_contract_titles,
     render_virtual_jarvis_agent_context,
     virtual_jarvis_tool_definitions,
 )
@@ -1513,7 +1514,7 @@ def _acceptance_inputs() -> dict[str, Any]:
             "returncode": 0,
             "protocol_result": {
                 "tools": [
-                    _remote_tool(name, definition)
+                    _remote_tool(name, definition, title=jarvis_user_contract_titles()[name])
                     for name, definition in jarvis_user_contract().items()
                 ]
             },
@@ -2075,9 +2076,12 @@ def _jarvis_server_artifact() -> dict[str, object]:
 def _remote_tool(
     name: str,
     definition: dict[str, Any],
+    *,
+    title: str | None = None,
 ) -> dict[str, object]:
     return {
         "name": name,
+        "title": title,
         "description": definition["description"],
         "inputSchema": definition["inputSchema"],
         "outputSchema": definition["outputSchema"],

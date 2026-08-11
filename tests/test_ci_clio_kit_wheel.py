@@ -35,21 +35,21 @@ JARVIS_MCP_WHEEL_URL = (
 # The exact upstream wheel CI stages before the local release gate, which
 # includes the cross-repository contract-certification suite
 # (test_clio_kit_mcp_contracts.py). That suite vendors byte-exact copies of
-# clio-kit's spack-user and scientific-catalog-user contracts under
-# src/clio_relay/_contracts/ and re-verifies them against a live wheel;
+# clio-kit's jarvis-user, spack-user, and scientific-catalog-user contracts
+# under src/clio_relay/_contracts/ and re-verifies them against a live wheel.
 # clio-kit 2.7.2 shifted the wire/contract bytes for every locked MCP
-# surface (jarvis, spack, scientific-catalog, slurm), not only the jarvis
-# package-search ranking fix that motivated #190. Re-certifying the vendored
-# spack/scientific-catalog fixtures (and the shared live ares-cluster
-# acceptance policy in docs/release-gate-1.0.yaml, which separately pins a
-# worker's installed clio-kit distribution_version) against 2.7.2 is
-# deliberately out of scope for this bootstrap-pin hotfix.
-CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.6.6-py3-none-any.whl"
+# surface (jarvis, spack, scientific-catalog, slurm) by adding a "title" key
+# to every user-profile tool. #190/#191 moved only the bootstrap install pin
+# above to 2.7.2 and deliberately left this certification pin on 2.6.6 as
+# tracked follow-up; clio-relay#199 completed that follow-up by
+# re-certifying every locked surface against 2.7.2, so this pin now matches
+# the bootstrap install pin again.
+CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.7.2-py3-none-any.whl"
 CONTRACT_CERTIFICATION_WHEEL_SHA256 = (
-    "fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91"
+    "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
 )
 CONTRACT_CERTIFICATION_WHEEL_URL = (
-    "https://github.com/iowarp/clio-kit/releases/download/v2.6.6/"
+    "https://github.com/iowarp/clio-kit/releases/download/v2.7.2/"
     f"{CONTRACT_CERTIFICATION_WHEEL_FILENAME}"
 )
 
@@ -62,16 +62,19 @@ def test_bootstrap_jarvis_mcp_install_pin_is_self_consistent() -> None:
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == JARVIS_MCP_WHEEL_URL
 
 
-def test_contract_certification_pin_is_independent_of_the_bootstrap_install_pin() -> None:
-    """spack/scientific-catalog stay certified against their existing wheel.
+def test_contract_certification_pins_match_the_certified_release() -> None:
+    """spack/scientific-catalog are certified against the same released wheel.
 
-    clio-kit 2.7.2 shifted every locked MCP contract's wire/contract bytes,
-    not only jarvis's; re-certifying relay's vendored spack and
-    scientific-catalog fixtures against it is separate follow-up work, so
-    their wheel-version labels intentionally do not move with #190.
+    clio-kit 2.7.2 shifted every locked MCP contract's wire/contract bytes
+    (jarvis, spack, scientific-catalog, slurm) by adding a "title" key to
+    every user-profile tool. #190/#191 moved only the bootstrap install pin
+    to 2.7.2 and deliberately left this certification pin on 2.6.6 as
+    tracked follow-up (clio-relay#199); that follow-up re-certified every
+    locked surface against 2.7.2, so the certification pin below now equals
+    the bootstrap install pin above instead of trailing it.
     """
-    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.6.6"
-    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.6.6"
+    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.7.2"
+    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.7.2"
 
 
 def _ci_workflow() -> dict[str, Any]:
@@ -144,8 +147,8 @@ def test_ci_wheel_download_is_bounded_https_only_and_fail_closed() -> None:
         assert "pip install" not in script
         assert "uvx" not in script
         assert "|| true" not in script
-        assert "clio-kit-v2.6.6" in script
-        assert "clio-kit-v2.5.11" not in script
+        assert "clio-kit-v2.7.2" in script
+        assert "clio-kit-v2.6.6" not in script
 
     assert 'if [ "$RUNNER_OS" = Windows ]' in scripts["validate"]
     assert "cygpath --windows --absolute" in scripts["validate"]

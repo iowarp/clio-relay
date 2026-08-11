@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from clio_relay.remote_mcp import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    CLIO_KIT_JARVIS_USER_WIRE_SHA256,
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     RemoteMcpSchemaCache,
     RemoteMcpSchemaCacheEntry,
@@ -48,12 +50,11 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 
 JSON = dict[str, Any]
 
-CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
-)
-CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023"
-)
+# CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 / CLIO_KIT_JARVIS_USER_WIRE_SHA256 are
+# imported from clio_relay.remote_mcp above, not redefined here: the two
+# modules carried independent duplicate literals for the same clio-kit
+# contract digest until clio-relay#199 consolidated them to remote_mcp's
+# CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID as the sole source of truth.
 _JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.6.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
@@ -74,7 +75,7 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> JSON:
     return result
 
 
-def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
+def _load_bundled_jarvis_user_contract() -> tuple[dict[str, JSON], dict[str, str | None]]:
     """Load and verify the canonical clio-kit user contract shipped by the relay."""
     try:
         payload = _JARVIS_USER_CONTRACT_PATH.read_bytes()
@@ -103,6 +104,7 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
     if not isinstance(raw_tools, list):
         raise RuntimeError("bundled clio-kit JARVIS user contract omitted its tools")
     tools: dict[str, JSON] = {}
+    titles: dict[str, str | None] = {}
     wire_tools: list[JSON] = []
     for raw_tool in cast(list[object], raw_tools):
         if not isinstance(raw_tool, dict):
@@ -117,15 +119,18 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
             "outputSchema": tool.get("outputSchema"),
             "annotations": tool.get("annotations"),
         }
+        title = tool.get("title")
         if (
             not isinstance(definition["description"], str)
             or not isinstance(definition["inputSchema"], dict)
             or not isinstance(definition["outputSchema"], dict)
             or not isinstance(definition["annotations"], dict)
+            or (title is not None and not isinstance(title, str))
         ):
             raise RuntimeError("bundled clio-kit JARVIS tool schema was incomplete")
         wire_tools.append(deepcopy(tool))
         tools[name] = cast(JSON, definition)
+        titles[name] = title
     if set(tools) != _EXPECTED_JARVIS_USER_TOOLS:
         raise RuntimeError("bundled clio-kit JARVIS user tool set did not match")
     require_handle_first_jarvis_run_schema(
@@ -133,21 +138,28 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
         error_type=RuntimeError,
         label="bundled clio-kit JARVIS user contract",
     )
-    if _jarvis_contract_digest(tools) != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
+    if _jarvis_contract_digest(tools, titles) != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
         raise RuntimeError("bundled clio-kit JARVIS user contract digest did not match")
     if (
         artifact.get("wire_sha256") != CLIO_KIT_JARVIS_USER_WIRE_SHA256
         or _jarvis_wire_digest(wire_tools) != CLIO_KIT_JARVIS_USER_WIRE_SHA256
     ):
         raise RuntimeError("bundled clio-kit JARVIS wire contract digest did not match")
-    return tools
+    return tools, titles
 
 
-def _jarvis_contract_digest(tools: dict[str, JSON]) -> str:
+def _jarvis_contract_digest(tools: dict[str, JSON], titles: dict[str, str | None]) -> str:
+    """Recompute clio-kit's canonical agent-facing contract digest.
+
+    ``titles`` must carry the exact per-tool ``title`` clio-kit shipped
+    (``None`` when a tool declares none); the digest is only correct when it
+    reflects the real value, never a hardcoded placeholder (clio-kit 2.7.2
+    added ``title`` to every user-profile tool, which shifts this digest).
+    """
     projection = [
         {
             "name": name,
-            "title": None,
+            "title": titles[name],
             "description": definition["description"],
             "input_schema": definition["inputSchema"],
             "output_schema": definition["outputSchema"],
@@ -196,7 +208,7 @@ def require_handle_first_jarvis_run_schema(
         )
 
 
-_VIRTUAL_JARVIS_TOOLS = _load_bundled_jarvis_user_contract()
+_VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES = _load_bundled_jarvis_user_contract()
 
 
 def jarvis_mcp_command() -> list[str]:
@@ -630,9 +642,21 @@ def jarvis_user_contract() -> dict[str, JSON]:
     return deepcopy(_VIRTUAL_JARVIS_TOOLS)
 
 
+def jarvis_user_contract_titles() -> dict[str, str | None]:
+    """Return a defensive copy of clio-kit's per-tool ``title`` for the pinned contract.
+
+    Kept separate from :func:`jarvis_user_contract` because that function's
+    return value is also the relay's own contract-identity projection (which
+    intentionally excludes ``title``); callers that need the exact clio-kit
+    wire title per tool (for example to reconstruct a faithful mock of a
+    live clio-kit ``tools/list`` response) use this instead.
+    """
+    return dict(_VIRTUAL_JARVIS_TOOL_TITLES)
+
+
 def jarvis_user_contract_digest() -> str:
     """Return the bundled clio-kit JARVIS user-contract digest."""
-    return _jarvis_contract_digest(_VIRTUAL_JARVIS_TOOLS)
+    return _jarvis_contract_digest(_VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES)
 
 
 def jarvis_mcp_artifact_binding(
