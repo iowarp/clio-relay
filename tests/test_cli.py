@@ -11,6 +11,7 @@ import sys
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from importlib import metadata
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from click import unstyle
 from filelock import FileLock
 from typer.testing import CliRunner
 
+import clio_relay.installation as installation_module
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import __version__, cli
 from clio_relay.cli import app
@@ -40,6 +42,7 @@ from clio_relay.errors import (
     QueueConflictError,
     RelayError,
 )
+from clio_relay.installation import verify_remote_worker_info, write_self_install_receipt
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
@@ -86,7 +89,10 @@ from clio_relay.session_lifecycle import (
 )
 from clio_relay.validation_report import (
     EvidenceReference,
+    InstallSource,
+    InstallSourceKind,
     LiveValidationReport,
+    SoftwareIdentity,
     ValidationCheck,
     ValidationRecorder,
     ValidationResource,
@@ -8543,6 +8549,344 @@ def test_cli_cluster_pin_target_clear_is_exclusive_and_preserves_cluster_config(
     updated = ClusterRegistry.load(registry_path).require("frontier")
     assert updated.target_identity is None
     assert updated.model_copy(update={"target_identity": definition.target_identity}) == definition
+
+
+def test_cli_cluster_pin_runtime_preserves_every_unrelated_cluster_setting(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#205 follow-up: pin-runtime is a partial update, not a wholesale replace."""
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition.model_validate(
+        {
+            "name": "ares-p5run2",
+            "ssh_host": "ares-login",
+            "bootstrap_profile": "site-profile",
+            "core_dir": "/srv/clio/core",
+            "spool_dir": "/scratch/clio/spool",
+            "jarvis_bin": "/opt/jarvis/bin/jarvis",
+            "spack_executable": "/opt/site/spack/bin/spack",
+            "frpc_bin": "/opt/frp/frpc",
+            "agent_bin": "/opt/agent/bin/agent",
+            "agent_adapter": "exec",
+            "agent_npm_package": "@example/agent",
+            "agent_npm_bin": "example-agent",
+            "agent_args": ["--profile", "science"],
+            "scheduler_provider": "slurm",
+            "remote_mcp_servers": {
+                "spack": {
+                    "command": "uvx",
+                    "args": [
+                        "--from",
+                        "/opt/clio/clio_kit-2.3.1-py3-none-any.whl",
+                        "clio-kit",
+                        "mcp-server",
+                        "spack",
+                    ],
+                    "namespace": "software",
+                    "allow_tools": ["spack_find", "spack_install"],
+                    "profiles": ["user"],
+                }
+            },
+            "frp_transport": {
+                "protocol": "tcp",
+                "server_addr": "relay.example.edu",
+                "server_port": 7000,
+                "token_env": "SITE_FRP_TOKEN",
+                "stcp_secret_env": "SITE_STCP_SECRET",
+                "direct": {
+                    "enabled": True,
+                    "mode": "xtcp",
+                    "fallback_order": ["xtcp", "frp_stcp", "queue"],
+                    "probe_timeout_seconds": 14,
+                },
+            },
+            "target_identity": {
+                "hostnames": ["ares-login.example.edu"],
+                "ssh_host_key_sha256": ["SHA256:pinned-key"],
+                "scheduler_cluster_name": "ares",
+                "site_marker_sha256": "a" * 64,
+            },
+        }
+    )
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+    expected_unrelated = definition.model_dump(mode="json")
+    expected_unrelated.pop("relay_executable")
+    expected_unrelated.pop("relay_install_receipt")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--relay-executable",
+            "$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    updated = ClusterRegistry.load(registry_path).require("ares-p5run2")
+    actual_unrelated = updated.model_dump(mode="json")
+    actual_unrelated.pop("relay_executable")
+    actual_unrelated.pop("relay_install_receipt")
+    assert actual_unrelated == expected_unrelated
+    assert updated.relay_executable == "$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay"
+    assert (
+        updated.relay_install_receipt
+        == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
+    )
+
+
+def test_cli_cluster_pin_runtime_clear_is_exclusive_and_preserves_cluster_config(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(
+        name="frontier",
+        ssh_host="frontier-login",
+        agent_args=["--keep-this"],
+        relay_executable="$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay",
+        relay_install_receipt="$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+    )
+    ClusterRegistry(clusters={"frontier": definition}).save(registry_path)
+
+    rejected = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "frontier",
+            "--clear",
+            "--install-receipt",
+            "$HOME/unexpected/install-receipt.json",
+        ],
+    )
+    assert rejected.exit_code == 2
+    assert ClusterRegistry.load(registry_path).require("frontier") == definition
+
+    cleared = CliRunner().invoke(
+        app,
+        ["cluster", "pin-runtime", "--cluster", "frontier", "--clear"],
+    )
+    assert cleared.exit_code == 0, cleared.output
+    updated = ClusterRegistry.load(registry_path).require("frontier")
+    assert updated.relay_install_receipt is None
+    assert updated.relay_executable == ClusterDefinition.model_fields["relay_executable"].default
+    assert (
+        updated.model_copy(
+            update={
+                "relay_executable": definition.relay_executable,
+                "relay_install_receipt": definition.relay_install_receipt,
+            }
+        )
+        == definition
+    )
+
+
+def test_cli_cluster_pin_runtime_rejects_an_unconfigured_cluster(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#205 follow-up: a typed error, not a silently-created entry."""
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    ClusterRegistry(clusters={}).save(registry_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "nonexistent",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/install-receipt.json",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert result.exception is not None
+    assert isinstance(result.exception, ConfigurationError)
+    assert "nonexistent" in str(result.exception)
+    assert ClusterRegistry.load(registry_path).clusters == {}
+
+
+def test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#205/#206 end-to-end: dev-tool VCS install -> write-receipt -> pin-runtime.
+
+    Closes the loop the live deployment finding surfaced: a dev-tool VCS
+    install (exact-sha pinned) has no receipt describing its own identity,
+    so ``installation-write-receipt --self`` mints one; ``cluster
+    pin-runtime --install-receipt`` points the cluster's pin at it; and a
+    worker self-reporting that exact same sha then passes
+    ``verify_remote_worker_info`` even though this ssh session's own ambient
+    ``current`` is a different (stale) generation.
+    """
+    monkeypatch.chdir(tmp_path)
+    commit_sha = "9" * 40
+    version = metadata.version("clio-relay")
+    source_url = "https://github.com/iowarp/clio-relay"
+    uv_receipt = tmp_path / "tools" / "clio-relay" / "uv-receipt.toml"
+    uv_receipt.parent.mkdir(parents=True)
+    uv_receipt.write_text("[tool]\n", encoding="utf-8")
+    source = InstallSource(
+        kind=InstallSourceKind.VCS,
+        detected_kind=InstallSourceKind.VCS,
+        reference=source_url,
+        launcher="uv-tool",
+        package_path=str(tmp_path / "site-packages" / "clio_relay"),
+        distribution_version=version,
+        artifact_sha256=commit_sha,
+        direct_url={
+            "url": source_url,
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": commit_sha,
+                "commit_id": commit_sha,
+            },
+        },
+        artifact_identity_verified=True,
+        released_artifact=False,
+        launcher_verified=True,
+        launcher_receipt={
+            "verified": True,
+            "uv_tool_receipt": {"path": str(uv_receipt), "verified": True},
+        },
+    )
+
+    def detect_source(**_kwargs: object) -> InstallSource:
+        return source
+
+    monkeypatch.setattr(installation_module, "detect_install_source", detect_source)
+
+    # 1. mint a receipt describing this dev-tool VCS install's own identity.
+    receipt_path = tmp_path / "generations" / "g1" / "install-receipt.json"
+    minted = write_self_install_receipt(receipt_path)
+    assert minted.artifact_sha256 == commit_sha
+
+    # 2. pin the cluster's runtime at that receipt (partial update, no wholesale replace).
+    # relay_install_receipt names a path on the CLUSTER host, not this test's local
+    # tmp_path -- `receipt_path` above is only where this test minted the bytes.
+    remote_receipt_path = "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(
+        name="ares-p5run2",
+        ssh_host="ares-login",
+        scheduler_provider="slurm",
+        remote_mcp_servers={
+            "spack": RemoteMcpServerConfig(command="uvx", args=["spack"]),
+        },
+    )
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+    pinned = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--install-receipt",
+            remote_receipt_path,
+        ],
+    )
+    assert pinned.exit_code == 0, pinned.output
+    updated = ClusterRegistry.load(registry_path).require("ares-p5run2")
+    assert updated.relay_install_receipt == remote_receipt_path
+    assert updated.remote_mcp_servers == definition.remote_mcp_servers
+
+    # 3. a worker self-reporting the exact same pinned sha passes verification,
+    #    even though this ssh session's own ambient `current` is a stale, different
+    #    generation -- the pin is authoritative, not `current`.
+    worker_matches_pin = {
+        "schema_version": "clio-relay.installation-info.v1",
+        "distribution_version": minted.distribution_version,
+        "software": minted.software.model_dump(mode="json"),
+        "receipt": minted.model_dump(mode="json"),
+        "receipt_origin": "uv-tool",
+        "install_source": None,
+        "receipt_matches_install": True,
+        "component_runtime": {},
+    }
+    stale_current = {
+        "schema_version": "clio-relay.installation-info.v1",
+        "distribution_version": "1.5.10",
+        "software": minted.software.model_dump(mode="json"),
+        "receipt": {**minted.model_dump(mode="json"), "artifact_sha256": "0" * 40},
+        "receipt_origin": "bootstrap",
+        "install_source": None,
+        "receipt_matches_install": True,
+        "component_runtime": {},
+    }
+    runtime: dict[str, object] = {
+        "schema_version": "clio-relay.worker-runtime-info.v1",
+        "cluster": "ares-p5run2",
+        "fresh": True,
+        "process_running": True,
+        "identity_matches_current": False,
+        "running": False,
+        "scheduler_provider": "slurm",
+        "endpoint": {
+            "role": "worker",
+            "cluster": "ares-p5run2",
+            "pid": 123,
+            "metadata": {"scheduler_provider": "slurm"},
+        },
+        "installation": stale_current,
+        "endpoint_installation": worker_matches_pin,
+        "target_identity": {
+            "verified": True,
+            "hostname": "ares-login",
+            "ssh_host_key_sha256": ["SHA256:test"],
+            "scheduler_cluster_name": "ares",
+        },
+        "pinned_installation": minted.model_dump(mode="json"),
+        "identity_matches_pinned": True,
+    }
+
+    verified = verify_remote_worker_info(
+        runtime,
+        expected_cluster="ares-p5run2",
+        expected_version=minted.distribution_version,
+        expected_software=SoftwareIdentity.model_validate(minted.software.model_dump(mode="json")),
+        expected_artifact_sha256=minted.artifact_sha256,
+        expected_source="vcs",
+        require_target_identity=False,
+    )
+    assert verified == minted
+
+    # a worker reporting anything other than the pin fails even though it now
+    # matches this session's `current` -- the pin remains authoritative.
+    drifted_runtime = {
+        **runtime,
+        "endpoint_installation": stale_current,
+        "installation": stale_current,
+        "identity_matches_current": True,
+        "running": True,
+        "identity_matches_pinned": False,
+    }
+    with pytest.raises(ConfigurationError, match="pinned installation"):
+        verify_remote_worker_info(
+            drifted_runtime,
+            expected_cluster="ares-p5run2",
+            expected_version="1.5.10",
+            expected_software=SoftwareIdentity.model_validate(
+                minted.software.model_dump(mode="json")
+            ),
+            expected_artifact_sha256="0" * 40,
+            expected_source="vcs",
+            require_target_identity=False,
+        )
 
 
 def test_ssh_host_key_fingerprints_prefers_all_configured_known_hosts_files(
