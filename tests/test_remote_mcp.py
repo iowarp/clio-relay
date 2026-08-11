@@ -38,6 +38,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
     jarvis_user_contract,
+    jarvis_user_contract_titles,
     virtual_jarvis_job_output_schema,
 )
 from clio_relay.mcp_server import McpSessionState, handle_request, serve_stdio
@@ -641,7 +642,7 @@ def test_current_scientific_catalog_contract_requires_explicit_handoff(
 def test_scientific_catalog_contract_projects_identity_to_live_report() -> None:
     """A live describe call proves and projects the v1.1 descriptor handoff."""
     contract_id = "clio-kit-scientific-catalog-user-v1.1"
-    contract_sha256 = "80a9b583c26a084ff07d638ddf0c2c7d4325dbc8d4299931d0c4f3627cb8674c"
+    contract_sha256 = "fd9fd4ba76617f1fd13560420cd650f78adc55d0957bd950d10d09c72ebe1889"
     dataset_id = "deep-water-impact-2018-yb31-first5"
     registration = RemoteMcpServerConfig(
         command="uvx",
@@ -6587,6 +6588,7 @@ def _jarvis_cache_entry(
 ) -> tuple[RemoteMcpSchemaCacheEntry, dict[str, object]]:
     """Return one fresh built-in JARVIS discovery entry and its bound artifact."""
     contract = jarvis_user_contract()
+    titles = jarvis_user_contract_titles()
     now = datetime.now(UTC)
     server_artifact = verified_jarvis_server_artifact()
     executable = cast(dict[str, object], server_artifact["executable"])
@@ -6601,6 +6603,7 @@ def _jarvis_cache_entry(
         tools=[
             RemoteMcpToolSchema(
                 name=name,
+                title=titles[name],
                 description=str(definition["description"]),
                 input_schema=definition["inputSchema"],
                 output_schema=definition["outputSchema"],

@@ -28,6 +28,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     JARVIS_MCP_CACHE_SERVER_NAME,
     jarvis_user_contract,
+    jarvis_user_contract_titles,
     virtual_jarvis_tool_definitions,
 )
 from clio_relay.mcp_stdio_validation import run_packaged_mcp_stdio_session
@@ -172,6 +173,7 @@ def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
     )
     server_artifact = verified_jarvis_server_artifact()
     contract = jarvis_user_contract()
+    titles = jarvis_user_contract_titles()
     now = datetime.now(UTC)
     RemoteMcpSchemaCache.update_entry(
         cache_path,
@@ -185,6 +187,7 @@ def test_packaged_stdio_session_initializes_lists_and_calls_virtual_jarvis(
             tools=[
                 RemoteMcpToolSchema(
                     name=name,
+                    title=titles[name],
                     description=str(definition["description"]),
                     input_schema=definition["inputSchema"],
                     output_schema=definition["outputSchema"],

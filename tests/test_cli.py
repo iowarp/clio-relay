@@ -46,6 +46,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     jarvis_cd_lock_binding_expectation,
     jarvis_user_contract,
+    jarvis_user_contract_titles,
 )
 from clio_relay.live_acceptance import LiveAcceptanceOptions
 from clio_relay.models import (
@@ -9716,6 +9717,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     """Keep the discovery hash bound to stored bytes, not a JSON reserialization."""
     monkeypatch.chdir(tmp_path)
     contract = jarvis_user_contract()
+    titles = jarvis_user_contract_titles()
     server_artifact: dict[str, object] = {
         "verified": True,
         "server_process_artifact_verified": True,
@@ -9744,6 +9746,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
             "tools": [
                 {
                     "name": name,
+                    "title": titles[name],
                     "description": definition["description"],
                     "inputSchema": definition["inputSchema"],
                     "outputSchema": definition["outputSchema"],

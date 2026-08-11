@@ -1,7 +1,7 @@
 {
   "canonicalization": "json-sort-keys-compact-utf8-v1",
   "contract_id": "clio-kit-jarvis-user-v3.6",
-  "contract_sha256": "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d",
+  "contract_sha256": "a326af259e50b57b19b7aa1d209720d5a71e57d7c2e64979596c4fc21850bdda",
   "profile": "user",
   "projection": "mcp-agent-tool-schema-v1",
   "schema_version": "clio-kit.mcp-user-contract.v1",
@@ -80,7 +80,8 @@
       "outputSchema": {
         "additionalProperties": true,
         "type": "object"
-      }
+      },
+      "title": "Add Step"
     },
     {
       "_meta": {
@@ -327,7 +328,8 @@
       "outputSchema": {
         "additionalProperties": true,
         "type": "object"
-      }
+      },
+      "title": "Create Jarvis Run"
     },
     {
       "_meta": {
@@ -1560,7 +1562,8 @@
         ],
         "type": "object",
         "x-fastmcp-wrap-result": true
-      }
+      },
+      "title": "Describe"
     },
     {
       "_meta": {
@@ -1618,7 +1621,8 @@
       "outputSchema": {
         "additionalProperties": true,
         "type": "object"
-      }
+      },
+      "title": "Edit Step"
     },
     {
       "_meta": {
@@ -3096,7 +3100,8 @@
           "service_runtimes"
         ],
         "type": "object"
-      }
+      },
+      "title": "Get Execution"
     },
     {
       "_meta": {
@@ -3838,8 +3843,9 @@
           "runtime_metadata"
         ],
         "type": "object"
-      }
+      },
+      "title": "Start Execution"
     }
   ],
-  "wire_sha256": "c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023"
+  "wire_sha256": "0f912b4dfa7135448834f915984ca413f77b73ef53b0f758594006cd7551cd35"
 }

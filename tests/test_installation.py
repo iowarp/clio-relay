@@ -45,6 +45,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
     jarvis_user_contract,
+    jarvis_user_contract_titles,
 )
 from clio_relay.validation_report import (
     InstallSource,
@@ -1707,10 +1708,11 @@ def test_jarvis_mcp_override_cannot_masquerade_as_receipt_bound_runtime(
 
 
 def _clio_kit_jarvis_contract_document() -> dict[str, object]:
+    titles = jarvis_user_contract_titles()
     tools = [
         {
             "name": name,
-            "title": None,
+            "title": titles[name],
             "description": definition["description"],
             "inputSchema": definition["inputSchema"],
             "outputSchema": definition["outputSchema"],
