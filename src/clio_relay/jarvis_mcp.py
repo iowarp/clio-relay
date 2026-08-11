@@ -49,10 +49,10 @@ JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 JSON = dict[str, Any]
 
 CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
-    "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
+    "c845f7f72f0692aa3e0f28a5310a343ce116aae1e5542d3bc8a2a9de17b3296b"
 )
 CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
-    "c69db36bda5d1cc97043d7b7cee88cabcf044d506865046537e0fb17ab0b2023"
+    "1353209b546f438430c55a86c066a4aedc84cc306f399d110c966d4c688f0bc7"
 )
 _JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.6.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
@@ -112,13 +112,15 @@ def _load_bundled_jarvis_user_contract() -> dict[str, JSON]:
         if not isinstance(name, str) or not name or name in tools:
             raise RuntimeError("bundled clio-kit JARVIS user contract repeated a tool")
         definition = {
+            "title": tool.get("title"),
             "description": tool.get("description"),
             "inputSchema": tool.get("inputSchema"),
             "outputSchema": tool.get("outputSchema"),
             "annotations": tool.get("annotations"),
         }
         if (
-            not isinstance(definition["description"], str)
+            (definition["title"] is not None and not isinstance(definition["title"], str))
+            or not isinstance(definition["description"], str)
             or not isinstance(definition["inputSchema"], dict)
             or not isinstance(definition["outputSchema"], dict)
             or not isinstance(definition["annotations"], dict)
@@ -147,7 +149,7 @@ def _jarvis_contract_digest(tools: dict[str, JSON]) -> str:
     projection = [
         {
             "name": name,
-            "title": None,
+            "title": definition["title"],
             "description": definition["description"],
             "input_schema": definition["inputSchema"],
             "output_schema": definition["outputSchema"],
@@ -620,6 +622,7 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
         tools.append(
             {
                 "name": virtual_jarvis_tool_name(remote_tool),
+                **({"title": definition["title"]} if definition["title"] is not None else {}),
                 "description": (
                     f"{definition['description']} Routed through the verified cluster-local "
                     "clio-kit JARVIS MCP and returned as a durable relay job. Preserve the "

@@ -331,6 +331,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
     jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.6"])
     artifact_projection = {
         name: {
+            "title": tool.get("title"),
             "description": tool.get("description"),
             "inputSchema": tool["inputSchema"],
             "outputSchema": tool.get("outputSchema"),

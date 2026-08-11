@@ -68,6 +68,18 @@ def test_virtual_jarvis_control_queries_follow_the_pinned_annotations() -> None:
     assert is_virtual_jarvis_control_query("not-a-contract-tool") is False
 
 
+def test_virtual_jarvis_tools_preserve_pinned_mcp_titles() -> None:
+    """Relay retains standardized titles from the verified remote contract."""
+    tools = {tool["name"]: tool for tool in virtual_jarvis_tool_definitions()}
+
+    assert tools["jarvis_add_step"]["title"] == "add(step)"
+    assert tools["jarvis_create_pipeline"]["title"] == "create(jarvis run)"
+    assert tools["jarvis_describe"]["title"] == "describe(jarvis)"
+    assert tools["jarvis_edit_step"]["title"] == "edit(step)"
+    assert tools["jarvis_get_execution"]["title"] == "get(execution)"
+    assert tools["jarvis_run"]["title"] == "start(execution)"
+
+
 def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     report = build_jarvis_mcp_validation_report(**_acceptance_inputs())
 
