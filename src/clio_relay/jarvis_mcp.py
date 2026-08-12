@@ -822,10 +822,13 @@ def jarvis_mcp_artifact_binding_from_entry(
         raise ValueError("JARVIS MCP discovery does not contain the exact user tool set")
     server_artifact = entry.provenance.server_artifact
     if not jarvis_mcp_server_artifact_verified(server_artifact):
-        raise ValueError(
-            "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
-            "unverified; run jarvis-mcp-refresh"
-        )
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise ValueError(
+                "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
+                "unverified; run jarvis-mcp-refresh"
+            )
     return remote_mcp_server_artifact_digest(server_artifact)
 
 
