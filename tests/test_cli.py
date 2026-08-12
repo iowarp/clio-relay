@@ -9056,6 +9056,110 @@ def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
     assert "route revision changed" not in unchanged.output
 
 
+def test_cli_cluster_add_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216 rework: `cluster add` is one of the three sanctioned edit commands
+    the fix names (add / pin-target / pin-runtime) but only pin-runtime's
+    warning path was pinned by a test above -- this fills that gap for
+    `add`. Re-adding an EXISTING cluster with a changed routing-relevant
+    field (ssh_host) must warn loudly that cached MCP discovery evidence is
+    now stale, exactly like pin-runtime.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    created = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-1"],
+    )
+    assert created.exit_code == 0, created.output
+    # First registration of a NEW cluster has no prior route revision to
+    # compare against (before=None) -- never a warning.
+    assert "route revision changed" not in created.output
+
+    changed = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-adding with the identical routing-relevant fields changes nothing:
+    # no repeated warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+
+def test_cli_cluster_pin_target_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216 rework: `cluster pin-target` is one of the three sanctioned edit
+    commands the fix names (add / pin-target / pin-runtime) but only
+    pin-runtime's warning path was pinned by a test above -- this fills
+    that gap for `pin-target`. target_identity is included in
+    cluster_route_revision()'s digest (it excludes only
+    remote_mcp_servers/worker_capacity), so pinning a physical target
+    identity strands cached MCP discovery evidence exactly like pin-runtime
+    and must warn the same way.
+    """
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+
+    changed = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "ares-p5run2",
+            "--target-hostname",
+            "ares-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:operator-pinned-fingerprint",
+        ],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-pinning the identical target identity changes nothing: no repeated
+    # warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "ares-p5run2",
+            "--target-hostname",
+            "ares-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:operator-pinned-fingerprint",
+        ],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+    # --clear also changes target_identity (back to None) and must warn too.
+    cleared = CliRunner().invoke(
+        app,
+        ["cluster", "pin-target", "--cluster", "ares-p5run2", "--clear"],
+    )
+    assert cleared.exit_code == 0, cleared.output
+    assert "route revision changed" in cleared.output
+
+
 def test_cli_cluster_pin_runtime_clear_is_exclusive_and_preserves_cluster_config(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
