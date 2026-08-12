@@ -1649,6 +1649,102 @@ def test_create_task_does_not_promote_a_cancelled_at_birth_job(
     asyncio.run(scenario())
 
 
+def test_create_task_degrades_to_lazy_resolution_when_eager_transport_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """N1: the eager ``completed_result`` promotion C1 introduced performs a
+    network round trip (``wait_mcp_job``) INSIDE ``create_task``, reached
+    from ``intercept_tool_call`` with no surrounding try/except. Before this
+    fix, a transport failure there killed the whole ``tools/call`` AND left
+    no durable task record at all -- relay#215's own defect class,
+    relocated out of ``_handle_get`` (already guarded by D7) and into
+    ``create_task`` (not).
+
+    The fix wraps ONLY the eager resolution: on failure it logs a typed
+    reason and leaves ``completed_result`` as ``None`` -- exactly what a
+    non-terminal job's projection looks like -- so the lazy ``tasks/get``
+    path resolves it on first poll to the identical document C1 proved the
+    eager path would have produced. Degradation is safe, not silent, and
+    never a lost dispatch."""
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    tool = _make_tool(runtime)
+
+    def failing_wait_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+        raise RuntimeError("ssh channel closed during the post-dispatch re-derivation")
+
+    monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", failing_wait_mcp_job)
+
+    async def scenario() -> None:
+        with caplog.at_level("ERROR", logger="clio_relay.fastmcp_server"):
+            saved = await runtime.create_task(
+                tool=tool,
+                arguments={"pipeline_id": "phase-d-stage-check-1786484613"},
+                result=ToolResult(
+                    content=[mcp_types.TextContent(type="text", text="done")],
+                    structured_content=_LIVE_CREATE_PIPELINE_RECEIPT,
+                ),
+            )
+
+        # tools/call succeeds: create_task returns a record instead of the
+        # transport failure escaping out through intercept_tool_call.
+        assert saved is not None
+        assert saved.state is JobState.SUCCEEDED
+        # The eager resolution failed -- typed and logged, not silent -- and
+        # promoted no completed_result rather than a lost dispatch.
+        assert saved.projection.completed_result is None
+        # The durable task record was still written: N1's regression was a
+        # failure escaping BEFORE ``put_mcp_task`` was ever reached.
+        assert queue.get_mcp_task(saved.task_id).task_id == saved.task_id
+
+        # A typed, queryable reason reached the log (no-silent-fallback),
+        # with the real underlying transport failure attached as a
+        # traceback rather than swallowed.
+        deferred_records = [
+            record
+            for record in caplog.records
+            if record.name == "clio_relay.fastmcp_server" and record.exc_info is not None
+        ]
+        assert deferred_records, "expected the eager-resolution failure to log a traceback"
+        assert "mcp_task_eager_result_deferred" in deferred_records[-1].message
+        exc_info = deferred_records[-1].exc_info
+        assert exc_info is not None
+        logged_exc_type = exc_info[0]
+        assert logged_exc_type is not None and issubclass(logged_exc_type, RuntimeError)
+
+        # The lazy path is fully intact: once transport recovers, the FIRST
+        # ``tasks/get`` resolves the SAME job to the identical document C1
+        # proved the eager path would have produced for this exact fixture.
+        def recovered_wait_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+            assert arguments["job_id"] == _LIVE_CREATE_PIPELINE_JOB_ID
+            return json.loads(json.dumps(_LIVE_CREATE_PIPELINE_WAIT_DOCUMENT))
+
+        def fake_status_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+            assert arguments["job_id"] == _LIVE_CREATE_PIPELINE_JOB_ID
+            return {
+                "job": _live_relay_job(
+                    _LIVE_CREATE_PIPELINE_JOB_ID,
+                    state=JobState.SUCCEEDED,
+                    tool="jarvis_create_pipeline",
+                )
+            }
+
+        monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", recovered_wait_mcp_job)
+        monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", fake_status_mcp_job)
+        lazy = await runtime.task_status(saved)
+        assert lazy.status == "completed"
+        assert lazy.result is not None
+        assert "job_id" not in lazy.result["structuredContent"]
+        assert lazy.result["structuredContent"]["job"]["state"] == "succeeded"
+        assert "relay_queue" in lazy.result["structuredContent"]
+
+    asyncio.run(scenario())
+
+
 def test_task_get_wraps_a_status_reconciliation_failure_as_a_typed_error(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

@@ -409,7 +409,27 @@ class RelayMcpRuntime:
                 state=state,
                 projection=projection,
             )
-            completed_result = await self._terminal_completed_result(provisional)
+            # N1: this re-derivation performs a network round trip
+            # (``wait_mcp_job`` over the owned session, possibly SSH-tunnelled)
+            # *inside* ``tools/call``, which has no surrounding try/except
+            # (``intercept_tool_call``). Left unguarded, a transport failure
+            # here would kill the whole dispatch AND leave no durable task
+            # record at all -- relay#215's defect class, relocated from
+            # ``_handle_get`` (which already has its own guard) into
+            # ``create_task`` (which did not). Degrade to the lazy path
+            # instead: it is fully intact, and per C1 it produces the
+            # byte-identical document through this exact same builder on
+            # first ``tasks/get`` -- so deferring is a safe, silent-wrong-
+            # answer-free degradation, never a lost dispatch.
+            try:
+                completed_result = await self._terminal_completed_result(provisional)
+            except Exception:
+                logger.exception(
+                    "mcp_task_eager_result_deferred: eager completed_result "
+                    "resolution failed for task %r; deferring to tasks/get",
+                    job_id,
+                )
+                completed_result = None
             projection = RelayMcpTaskProjection.model_validate(
                 {
                     **projection.model_dump(mode="python"),
