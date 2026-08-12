@@ -837,10 +837,16 @@ def test_endpoint_start_rejects_concurrency_one_against_a_registered_cluster(
     ``_reserve_a_workload_slot`` model validator independently requires
     ``control_query_concurrency < concurrency`` -- with the registry's
     default control_query_concurrency of 1 inherited unpinned here,
-    concurrency=1 collides with it regardless. LIVE FACT: no live worker
-    uses --concurrency 1 today (the p5run2 deployment runs --concurrency 4
-    --control-query-concurrency 1), so this refusal matches how the flag is
-    actually operated, not merely how it once defaulted.
+    concurrency=1 collides with it regardless.
+
+    LIVE FACT (resolved, verification round 2): the actual p5run2 worker
+    running on ares (PID 3261405) was started with
+    ``endpoint start --role worker --cluster ares-p5run2 --concurrency 4
+    --control-query-concurrency 1 --kind-concurrency jarvis=2
+    --kind-concurrency mcp_call=3 --scheduler-provider slurm`` -- no live
+    worker uses --concurrency 1, so this refusal matches how the flag is
+    actually operated in the accepted deployment, not merely how it once
+    defaulted.
     """
     definition = ClusterDefinition(
         name="configured-cluster",
