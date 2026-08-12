@@ -1081,6 +1081,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
 
     def owns_job(job: RelayJob) -> bool:
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if dev_mode_enabled():
+            return True
         return resolved.owner_session_id is None or (
             job.metadata.get("owner") == "clio-relay"
             and job.metadata.get("owner_session_id") == resolved.owner_session_id
