@@ -1033,6 +1033,16 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
         )
         errored_status = await runtime.task_status(errored)
         assert errored_status.status == "failed"
+        assert errored_status.error == {
+            "code": mcp_types.INTERNAL_ERROR,
+            "message": "relay protocol projection failed",
+        }
+        errored_replay = await runtime.create_task(
+            tool=tool,
+            arguments={"value": "same"},
+            result=result,
+        )
+        assert errored_replay == errored
 
     asyncio.run(scenario())
 
@@ -1161,8 +1171,10 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
     real_put_mcp_task = queue.put_mcp_task
+    conflicting_task_ids: list[str] = []
 
     def forced_conflict(task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        conflicting_task_ids.append(task.task_id)
         raise QueueConflictError(
             f"MCP task identity was reused with different semantics: {task.task_id}"
         )
@@ -1176,11 +1188,96 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
                 await call_tool_task(client, "relay_submit_agent", arguments)
             assert failure.value.code == mcp_types.INVALID_PARAMS
             assert "different semantics" in str(failure.value)
+            # clio-relay#218 rework: the sibling MCPError raise ~80 lines
+            # above (mcp_task_status_reconciliation_failed) carries
+            # data={"reason": ..., "task_id": ...} so the caller can query
+            # the failure -- this raise must match that pattern too.
+            assert conflicting_task_ids
+            assert failure.value.data == {
+                "reason": "mcp_task_identity_conflict",
+                "task_id": conflicting_task_ids[-1],
+            }
 
     try:
         asyncio.run(scenario())
     finally:
         queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
+
+
+def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#218 rework: _park_agent_input's CAS-exhaustion conflict is
+    a transient concurrency conflict, never a client parameter problem -- it
+    must not be mistyped as MCPError(INVALID_PARAMS) the way put_mcp_task's
+    genuine task-identity-reuse conflict correctly is (test above). Forcing
+    every update_mcp_task_projection call to conflict exhausts
+    _park_agent_input's 8 retry attempts and raises
+    TaskInputParkConflictError, which intercept_tool_call deliberately
+    leaves unwrapped.
+    """
+
+    def create_test_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+
+    def accept_test_path(path: Path, *, directory: bool) -> None:
+        if directory:
+            create_test_directory(path)
+
+    for module_name in (
+        "clio_relay.cluster_config",
+        "clio_relay.core_queue",
+        "clio_relay.worker_lifetime_lock",
+    ):
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_directory",
+            create_test_directory,
+        )
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_path",
+            accept_test_path,
+        )
+
+    def _open_atomic(path: Path) -> BinaryIO:
+        return path.open("xb")
+
+    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+
+    def _no_cluster(_cluster: str) -> None:
+        return None
+
+    monkeypatch.setattr("clio_relay.mcp_server._optional_cluster_definition", _no_cluster)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+
+    def always_conflict(*args: Any, **kwargs: Any) -> RelayMcpTaskRecord:
+        raise QueueConflictError("forced permanent parking CAS conflict")
+
+    monkeypatch.setattr(queue, "update_mcp_task_projection", always_conflict)
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            arguments = {
+                **_submit_arguments(tmp_path, "park-cas-exhaustion"),
+                "request_followup_message": True,
+            }
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(client, "relay_submit_agent", arguments)
+            # FastMCP's generic handler surfaces this exactly as it did for
+            # ANY unhandled QueueConflictError before #218 -- a bare,
+            # typeless INTERNAL_ERROR. What #218 rework must guarantee is
+            # narrower: this is never MCPError(INVALID_PARAMS), the code
+            # that tells a client "your parameters are wrong" when the real
+            # cause is transient server-side CAS contention.
+            assert failure.value.code == mcp_types.INTERNAL_ERROR
+            assert failure.value.code != mcp_types.INVALID_PARAMS
+
+    asyncio.run(scenario())
 
 
 # --------------------------------------------------------------------------- #

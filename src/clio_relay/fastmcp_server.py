@@ -47,7 +47,7 @@ from pydantic import PrivateAttr
 from clio_relay import __version__
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.errors import NotFoundError, QueueConflictError, TaskInputParkConflictError
 from clio_relay.jarvis_mcp import is_virtual_jarvis_tool
 from clio_relay.mcp_server import (
     McpSessionState,
@@ -442,6 +442,15 @@ class RelayMcpRuntime:
             state=state,
             projection=projection,
         )
+        # put_mcp_task's QueueConflictError (a genuine task-identity reuse
+        # conflict) is intentionally left unwrapped here -- this is the
+        # RUNTIME/domain layer, and a direct caller (e.g. a test invoking
+        # create_task() without going through the MCP wire) must see the
+        # plain domain exception. intercept_tool_call, the protocol-facing
+        # interceptor, is what translates it into a typed MCPError for the
+        # wire (clio-relay#218 rework: TYPE, not call site, is what lets it
+        # discriminate this leg from _park_agent_input's own
+        # TaskInputParkConflictError below).
         saved = await asyncio.to_thread(self.queue.put_mcp_task, record)
         if not _agent_input_enabled(tool.name, arguments):
             return saved
@@ -511,7 +520,12 @@ class RelayMcpRuntime:
                     self.queue.get_mcp_task,
                     candidate.task_id,
                 )
-        raise QueueConflictError(
+        # clio-relay#218 rework: a distinct subtype (never the base
+        # QueueConflictError put_mcp_task raises for a genuine identity
+        # conflict) is what lets intercept_tool_call refuse to mistype this
+        # transient CAS-exhaustion conflict as INVALID_PARAMS -- it is not a
+        # client parameter problem, unlike put_mcp_task's conflict.
+        raise TaskInputParkConflictError(
             f"MCP task input could not park after concurrent updates: {record.task_id}"
         )
 
@@ -1089,15 +1103,33 @@ class RelayTasksExtension(ServerExtension):
                 result=outcome,
                 context=context,
             )
+        except TaskInputParkConflictError:
+            # relay#218 rework: _park_agent_input's own CAS-exhaustion
+            # conflict is an unrelated transient concurrency conflict, not a
+            # client parameter problem -- it must never be mistyped as
+            # INVALID_PARAMS. A distinct exception TYPE (checked first, so
+            # it never reaches the broader except below) is what makes this
+            # a non-heuristic discrimination rather than a message/keyword
+            # match. Left unwrapped: it escapes through FastMCP's generic
+            # handler exactly as it did before #218, a bare internal error.
+            raise
         except QueueConflictError as exc:
-            # relay#218: a genuine task-identity reuse conflict (as opposed to
-            # the transport-control-only false positive normalized away in
-            # put_mcp_task) must still be refused, but as a typed, queryable
-            # MCPError -- not escape through FastMCP's generic handler as a
-            # bare, typeless -32603 internal error (the live symptom).
+            # relay#218: a genuine task-identity reuse conflict (put_mcp_task,
+            # as opposed to the transport-control-only false positive
+            # normalized away by _canonical_mcp_task_arguments, and as
+            # opposed to the CAS-exhaustion conflict above) must still be
+            # refused, but as a typed, queryable MCPError -- not escape
+            # through FastMCP's generic handler as a bare, typeless -32603
+            # internal error (the live symptom).
+            conflicting_task_id = (
+                outcome.structured_content.get("job_id")
+                if isinstance(outcome.structured_content, dict)
+                else None
+            )
             raise MCPError(
                 code=mcp_types.INVALID_PARAMS,
                 message=str(exc),
+                data={"reason": "mcp_task_identity_conflict", "task_id": conflicting_task_id},
             ) from exc
         if task is None:
             return outcome
