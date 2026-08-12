@@ -3184,8 +3184,15 @@ def _complete_owned_collection(
         )
         records.extend(page)
         if next_cursor is None:
-            if len(records) != total:
-                raise ValueError(f"{label} changed during bounded discovery")
+            # D16: no post-loop completeness check needed here (unlike this
+            # function's two siblings above) -- ``_validate_complete_
+            # collection_page`` above already enforces the identical
+            # ``next_cursor is None and collected_count + page_count != total``
+            # invariant on every iteration, before ``records.extend(page)``
+            # runs, so a page that understates its own total never reaches
+            # this line. Do not re-add a post-loop check here; it would be
+            # provably dead code (verified: this function's own regression
+            # test still fails on the in-loop message, never a post-loop one).
             return records
         cursor = next_cursor
 
@@ -3291,18 +3298,27 @@ def _verified_mcp_result(
 def _owned_mcp_result_is_required(job: RelayJob) -> bool:
     """Whether a succeeded job's worker is expected to have written an mcp_result.
 
-    True only for an ordinary (``WORKLOAD``) MCP_CALL job that reached
-    ``SUCCEEDED``: its worker unconditionally writes the ``mcp_result``
-    artifact before marking success (D17), so a missing one there is always
-    a defect (D14/D15), never a legitimate state. ``CONTROL_QUERY``-class
-    calls are a privileged scheduling assertion answered outside the
-    ordinary spooled worker/artifact pipeline and are exempt.
+    True for any MCP_CALL job that reached ``SUCCEEDED``, ``WORKLOAD`` and
+    ``CONTROL_QUERY`` admission classes alike: the worker unconditionally
+    writes the ``mcp_result`` artifact before marking success (D17), so a
+    missing one there is always a defect (D14/D15), never a legitimate
+    state.
+
+    C2 (review): this used to exempt ``CONTROL_QUERY`` on the theory that it
+    is "answered outside the ordinary spooled worker/artifact pipeline" --
+    false against live evidence. ``CONTROL_QUERY`` is only a worker-lane and
+    admission-cap distinction (``endpoint.py``'s ``_serve_worker_slots``
+    builds an identical ``EndpointWorker`` per lane; ``core_queue.py`` uses
+    it solely to pick the concurrency ceiling); the SAME spooled
+    worker/artifact pipeline runs both classes. A live production
+    ``jarvis_describe``/``jarvis_get_execution`` job -- always admitted as
+    CONTROL_QUERY, since the owned session path requires the pinned
+    read-only ``expected_server_artifact_digest`` that triggers that
+    admission class -- carries its own ``mcp_result`` artifact just like any
+    WORKLOAD job. The old exclusion silently exempted exactly the two
+    curated read operations this guard exists to protect.
     """
-    return (
-        isinstance(job.spec, McpCallSpec)
-        and job.spec.admission_class is not McpAdmissionClass.CONTROL_QUERY
-        and job.state is JobState.SUCCEEDED
-    )
+    return isinstance(job.spec, McpCallSpec) and job.state is JobState.SUCCEEDED
 
 
 def _verified_owned_mcp_result(

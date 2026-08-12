@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 import mcp_types
 import pytest
@@ -41,6 +41,7 @@ from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from clio_relay.models import (
     JobKind,
     JobState,
+    McpCallSpec,
     RelayJob,
     RelayMcpInputRound,
     RelayMcpTaskProjection,
@@ -1091,66 +1092,363 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
         )
 
 
-def test_create_task_promotes_an_already_terminal_receipt_to_completed_result(
+# --------------------------------------------------------------------------- #
+# C1 fixtures: sanitized, structurally-verbatim captures from a live p5run2
+# relay deployment's durable MCP task records
+# (D:\relay-p5local\core\mcp_tasks\job_995b61bf....json and
+# job_3544b072....json). Usernames and spool host paths are redacted;
+# hashes, job/artifact ids, and every field name are kept verbatim. C1's
+# whole point is that the eager and lazy documents must match a REAL
+# captured wire shape, not merely each other, so these are the acceptance
+# fixtures for the equivalence proof below -- never a hand-built shape that
+# happens to satisfy the code under test.
+# --------------------------------------------------------------------------- #
+
+_LIVE_CREATE_PIPELINE_JOB_ID = "job_995b61bfee794b90b4221c4b33ac26eb"
+
+# The create-time receipt ``create_task`` receives as ``structured`` (live
+# ``initial_result``, verbatim): flat, ``job_id``/``state`` at the top level.
+_LIVE_CREATE_PIPELINE_RECEIPT: JSON = {
+    "cluster": "ares-p5run2",
+    "job_id": _LIVE_CREATE_PIPELINE_JOB_ID,
+    "state": "succeeded",
+    "kind": "mcp_call",
+    "terminal": True,
+    "remote": True,
+    "route_revision": "e701bebd118f9bbdec5f76f13c742ecd412f29aec39c66b93757fe65ae14a141",
+    "observation": {
+        "outcome": "terminal",
+        "timeout_seconds": 600.0,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    },
+    "last_error": None,
+    "mcp_result_artifact": {
+        "artifact_id": "artifact_ee911b95320f4237898a3041c93ad419",
+        "job_id": _LIVE_CREATE_PIPELINE_JOB_ID,
+        "kind": "mcp_result",
+        "size_bytes": 15178,
+        "sha256": "cbb62884dc180c3dd7aec91934397cfafaea03a0139eb9dd97ef01618fd28a3d",
+        "created_at": "2026-08-11T21:45:19.166672Z",
+    },
+    "mcp_result": {
+        "operation": "tools/call",
+        "tool": "jarvis_create_pipeline",
+        "returncode": 0,
+        "timed_out": False,
+        "protocol_error": None,
+        "structured_result": {
+            "pipeline_id": "phase-d-stage-check-1786484613",
+            "status": "created",
+        },
+        "protocol_version": "2024-11-05",
+        "server_info": {"name": "jarvis", "version": "4.0.0b1"},
+        "result_validation": None,
+    },
+    "catalog_revision": "c0d254025e861b1dc41e661f7fedc98cf1a8765e7efea7db2566fc93f5b1117a",
+}
+
+# The document ``task_status``'s lazy re-derivation independently produces
+# for the SAME job once settled: the ``job``/``relay_queue``/``scheduler``/
+# ``transform``/``artifacts`` envelope shape is a genuine live capture
+# (job_3544b072....json's own ``completed_result.structuredContent`` shape,
+# spool paths redacted); ``job``/``mcp_result`` are this job's own succeeded
+# evidence so both fixtures describe the identical dispatch.
+_LIVE_CREATE_PIPELINE_WAIT_DOCUMENT: JSON = {
+    "job": {
+        "job_id": _LIVE_CREATE_PIPELINE_JOB_ID,
+        "cluster": "ares-p5run2",
+        "kind": "mcp_call",
+        "state": "succeeded",
+        "last_error": None,
+    },
+    "transform": None,
+    "relay_queue": {"state": "succeeded", "jobs_ahead": None, "position": None},
+    "scheduler": [],
+    "terminal": True,
+    "cluster": "ares-p5run2",
+    "route_revision": "e701bebd118f9bbdec5f76f13c742ecd412f29aec39c66b93757fe65ae14a141",
+    "observation": {
+        "outcome": "terminal",
+        "timeout_seconds": 0.01,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    },
+    "last_error": None,
+    "mcp_result_artifact": {
+        "artifact_id": "artifact_ee911b95320f4237898a3041c93ad419",
+        "job_id": _LIVE_CREATE_PIPELINE_JOB_ID,
+        "kind": "mcp_result",
+        "size_bytes": 15178,
+        "sha256": "cbb62884dc180c3dd7aec91934397cfafaea03a0139eb9dd97ef01618fd28a3d",
+        "created_at": "2026-08-11T21:45:19.166672Z",
+    },
+    "mcp_result": {
+        "operation": "tools/call",
+        "tool": "jarvis_create_pipeline",
+        "returncode": 0,
+        "timed_out": False,
+        "protocol_error": None,
+        "structured_result": {
+            "pipeline_id": "phase-d-stage-check-1786484613",
+            "status": "created",
+        },
+        "protocol_version": "2024-11-05",
+        "server_info": {"name": "jarvis", "version": "4.0.0b1"},
+        "result_validation": None,
+    },
+    "artifacts": [
+        {
+            "artifact_id": "artifact_ee911b95320f4237898a3041c93ad419",
+            "job_id": _LIVE_CREATE_PIPELINE_JOB_ID,
+            "sequence": 1,
+            "uri": "file:///redacted/relay-spool/job_995b61bf/mcp-result.json",
+            "kind": "mcp_result",
+            "size_bytes": 15178,
+            "sha256": "cbb62884dc180c3dd7aec91934397cfafaea03a0139eb9dd97ef01618fd28a3d",
+            "created_at": "2026-08-11T21:45:19.166672Z",
+        },
+    ],
+}
+
+_LIVE_FAILED_DESCRIBE_JOB_ID = "job_3544b0721ffe45099371957593130a9d"
+_LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE = (
+    "1 validation error for call[jarvis_describe_tool]\n"
+    "target\n  Missing required argument [type=missing_argument, "
+    "input_value={'query': 'script'}, input_type=dict]"
+)
+
+# Live create-time receipt for a job that reached JARVIS but the remote call
+# itself failed (job_3544b072....json's own ``initial_result``, verbatim).
+_LIVE_FAILED_DESCRIBE_RECEIPT: JSON = {
+    "cluster": "ares-p5run2",
+    "job_id": _LIVE_FAILED_DESCRIBE_JOB_ID,
+    "state": "failed",
+    "kind": "mcp_call",
+    "terminal": True,
+    "remote": True,
+    "route_revision": "d16c7e8ddf3c66a3f2d986695b97606ea2d2cf704348728ff7cc40d26563421b",
+    "observation": {
+        "outcome": "terminal",
+        "timeout_seconds": 600.0,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    },
+    "last_error": "exit code 1",
+    "mcp_result_artifact": {
+        "artifact_id": "artifact_e35348ca11bd4c3389bd2329e5e09b54",
+        "job_id": _LIVE_FAILED_DESCRIBE_JOB_ID,
+        "kind": "mcp_result",
+        "size_bytes": 15244,
+        "sha256": "d8bc0bfbe7563066d2f0702fe2683384aa50f80f15077ddb0a39834a435c7a78",
+        "created_at": "2026-08-11T19:13:30.339982Z",
+    },
+    "mcp_result": {
+        "operation": "tools/call",
+        "tool": "jarvis_describe",
+        "returncode": 1,
+        "timed_out": False,
+        "protocol_error": "tools/call returned isError=true",
+        "structured_result": None,
+        "protocol_result": {
+            "content": [{"text": _LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE, "type": "text"}],
+            "isError": True,
+        },
+        "protocol_version": "2024-11-05",
+        "server_info": {"name": "jarvis", "version": "4.0.0b1"},
+        "result_validation": None,
+    },
+    "catalog_revision": "21c338ab4da4ab00adee9e8b1afc6523586b9b184737b5dc3b94fe703c6ee37f",
+}
+
+# Live lazy-resolved document for the SAME failed job
+# (job_3544b072....json's own ``completed_result.structuredContent``,
+# verbatim except a trimmed ``artifacts`` list and redacted spool paths).
+_LIVE_FAILED_DESCRIBE_WAIT_DOCUMENT: JSON = {
+    "job": {
+        "job_id": _LIVE_FAILED_DESCRIBE_JOB_ID,
+        "cluster": "ares-p5run2",
+        "kind": "mcp_call",
+        "state": "failed",
+        "last_error": "exit code 1",
+    },
+    "transform": None,
+    "relay_queue": {"state": "failed", "jobs_ahead": None, "position": None},
+    "scheduler": [],
+    "terminal": True,
+    "cluster": "ares-p5run2",
+    "route_revision": "d16c7e8ddf3c66a3f2d986695b97606ea2d2cf704348728ff7cc40d26563421b",
+    "observation": {
+        "outcome": "terminal",
+        "timeout_seconds": 0.01,
+        "scheduler_action": "none",
+        "relay_action": "none",
+    },
+    "last_error": "exit code 1",
+    "mcp_result_artifact": {
+        "artifact_id": "artifact_e35348ca11bd4c3389bd2329e5e09b54",
+        "job_id": _LIVE_FAILED_DESCRIBE_JOB_ID,
+        "kind": "mcp_result",
+        "size_bytes": 15244,
+        "sha256": "d8bc0bfbe7563066d2f0702fe2683384aa50f80f15077ddb0a39834a435c7a78",
+        "created_at": "2026-08-11T19:13:30.339982Z",
+    },
+    "mcp_result": {
+        "operation": "tools/call",
+        "tool": "jarvis_describe",
+        "returncode": 1,
+        "timed_out": False,
+        "protocol_error": "tools/call returned isError=true",
+        "structured_result": None,
+        "protocol_result": {
+            "content": [{"text": _LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE, "type": "text"}],
+            "isError": True,
+        },
+        "protocol_version": "2024-11-05",
+        "server_info": {"name": "jarvis", "version": "4.0.0b1"},
+        "result_validation": None,
+    },
+    "artifacts": [
+        {
+            "artifact_id": "artifact_e35348ca11bd4c3389bd2329e5e09b54",
+            "job_id": _LIVE_FAILED_DESCRIBE_JOB_ID,
+            "sequence": 1,
+            "uri": "file:///redacted/relay-spool/job_3544b072/mcp-result.json",
+            "kind": "mcp_result",
+            "size_bytes": 15244,
+            "sha256": "d8bc0bfbe7563066d2f0702fe2683384aa50f80f15077ddb0a39834a435c7a78",
+            "created_at": "2026-08-11T19:13:30.339982Z",
+        },
+    ],
+}
+
+
+def _live_relay_job(job_id: str, *, state: JobState, tool: str) -> JSON:
+    """A minimal, fully valid ``RelayJob`` document for the given live job id."""
+
+    return RelayJob(
+        job_id=job_id,
+        cluster="ares-p5run2",
+        kind=JobKind.MCP_CALL,
+        state=state,
+        spec=McpCallSpec(
+            server="clio-kit",
+            server_args=["mcp-server", "jarvis"],
+            expected_server_artifact_digest="a" * 64,
+            tool=tool,
+            arguments={},
+        ),
+        idempotency_key=f"test-{job_id}",
+    ).model_dump(mode="json")
+
+
+def _make_tool(runtime: RelayMcpRuntime) -> RelayTool:
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
+    return RelayTool(definition, runtime=runtime, catalog_revision=None, task_capable=True)
+
+
+def test_create_task_eager_promotion_matches_the_lazy_first_poll_document(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D22: the synchronous call that produced ``structured`` already ran a
-    ``wait_for_terminal`` dispatch to completion and verified its evidence
-    -- for a terminal-at-birth task, ``create_task`` must promote that
-    already-verified receipt into ``completed_result`` immediately, in the
-    exact wire shape a later ``tasks/get`` would otherwise spend two extra
-    round trips re-deriving (``task_status``'s own status/wait re-fetch,
-    the mechanism behind relay#215's intermittent failure). A non-terminal
-    receipt must NOT get a ``completed_result`` -- there is nothing yet to
-    promote."""
+    """C1: the eager ``completed_result`` D22 promotes at create time must be
+    byte-equivalent to what the lazy ``tasks/get`` path serves for the SAME
+    job -- the WAIT DOCUMENT (with ``job``/``relay_queue`` siblings), not the
+    flat create-time receipt. Before this fix, ``create_task`` wrapped
+    ``structured`` (the receipt) directly; the receipt and the wait document
+    are structurally different (flat ``job_id``/``state`` at the top level
+    vs. a nested ``job``), and the client's envelope detector -- keyed on
+    exactly that shape difference -- silently handed the receipt back to the
+    agent as if it were the tool's own result (every successful dispatch,
+    100% of the time).
 
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-    )
+    Proven with a REAL live-captured fixture pair (see the module constants
+    above): the create-time receipt goes in as ``structured`` for the eager
+    path; the SAME live wait-document shape comes back out of a mocked
+    ``wait_mcp_job`` for a SEPARATE, freshly created record driven through
+    the real lazy ``task_status`` path. They must be byte-for-byte equal --
+    not by construction (the eager path does not just echo its input; the
+    lazy path independently reaches the identical builder), but because
+    both now run through the SAME shared function
+    (``RelayMcpRuntime._terminal_completed_result``)."""
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
-    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
-    tool = RelayTool(
-        definition,
-        runtime=runtime,
-        catalog_revision=None,
-        task_capable=True,
-    )
-    terminal_structured: JSON = {
-        "job_id": "job-terminal-at-birth",
-        "state": JobState.SUCCEEDED.value,
-        "kind": JobKind.MCP_CALL.value,
-        "terminal": True,
-        "mcp_result": {
-            "tool": "jarvis_run",
-            "returncode": 0,
-            "protocol_result": {"isError": False, "content": []},
-        },
-    }
+    tool = _make_tool(runtime)
+
+    wait_calls: list[JSON] = []
+
+    def fake_wait_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+        wait_calls.append(dict(arguments))
+        assert arguments["job_id"] == _LIVE_CREATE_PIPELINE_JOB_ID
+        assert arguments["cluster"] == "ares-p5run2"
+        return json.loads(json.dumps(_LIVE_CREATE_PIPELINE_WAIT_DOCUMENT))
+
+    def fake_status_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+        assert arguments["job_id"] == _LIVE_CREATE_PIPELINE_JOB_ID
+        return {
+            "job": _live_relay_job(
+                _LIVE_CREATE_PIPELINE_JOB_ID,
+                state=JobState.SUCCEEDED,
+                tool="jarvis_create_pipeline",
+            )
+        }
+
+    monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", fake_wait_mcp_job)
+    monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", fake_status_mcp_job)
 
     async def scenario() -> None:
+        # Eager: create_task's own promotion.
         saved = await runtime.create_task(
             tool=tool,
-            arguments={"pipeline_id": "p"},
+            arguments={"pipeline_id": "phase-d-stage-check-1786484613"},
             result=ToolResult(
                 content=[mcp_types.TextContent(type="text", text="done")],
-                structured_content=terminal_structured,
+                structured_content=_LIVE_CREATE_PIPELINE_RECEIPT,
             ),
         )
         assert saved is not None
-        expected = fastmcp_server_module._call_tool_result_document(  # pyright: ignore[reportPrivateUsage]
-            terminal_structured
-        )
-        assert saved.projection.completed_result == expected
-        assert saved.projection.completed_result is not None
-        assert saved.projection.completed_result["isError"] is False
+        assert len(wait_calls) == 1
+        eager = saved.projection.completed_result
+        assert eager is not None
+        assert eager["isError"] is False
+        # The flat create-time receipt's own top-level shape must NOT leak
+        # through -- this is the exact C1 regression.
+        assert "job_id" not in eager["structuredContent"]
+        assert eager["structuredContent"]["job"]["state"] == "succeeded"
+        assert "relay_queue" in eager["structuredContent"]
 
-        # Zero extra round trips: task_status must serve completed_result
-        # straight off the projection, never touching the re-derivation
-        # path this batch is eliminating.
+        # Lazy: a SEPARATE, freshly created non-terminal record for the SAME
+        # job, driven through the real task_status() first-poll path.
+        wait_calls.clear()
+        lazy_projection = RelayMcpTaskProjection(
+            tool_name=tool.name,
+            profile="user",
+            arguments={"pipeline_id": "phase-d-stage-check-1786484613"},
+            catalog_revision=None,
+            initial_result=_LIVE_CREATE_PIPELINE_RECEIPT,
+        )
+        lazy_record = RelayMcpTaskRecord(
+            task_id=_LIVE_CREATE_PIPELINE_JOB_ID,
+            job_id=_LIVE_CREATE_PIPELINE_JOB_ID,
+            state=JobState.RUNNING,
+            projection=lazy_projection,
+        )
+        await asyncio.to_thread(queue.put_mcp_task, lazy_record)
+        lazy = await runtime.task_status(lazy_record)
+        assert len(wait_calls) == 1
+        assert lazy.status == "completed"
+
+        # The A/B proof: identical underlying job, two different resolution
+        # paths (eager at create time, lazy at first poll) -- byte-for-byte
+        # equal.
+        assert eager == lazy.result
+
+        # Zero extra round trips on the NEXT poll of the EAGER task: once
+        # promoted, task_status must serve completed_result straight off
+        # the projection, never touching wait_mcp_job/status_mcp_job again.
         def must_not_be_called(*_args: object, **_kwargs: object) -> object:
             raise AssertionError("status_mcp_job/wait_mcp_job must not be called")
 
@@ -1158,7 +1456,7 @@ def test_create_task_promotes_an_already_terminal_receipt_to_completed_result(
         monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", must_not_be_called)
         observed = await runtime.task_status(saved)
         assert observed.status == "completed"
-        assert observed.result == expected
+        assert observed.result == eager
 
         # Sibling: a non-terminal receipt gets no completed_result at all.
         queued_task = await runtime.create_task(
@@ -1179,8 +1477,181 @@ def test_create_task_promotes_an_already_terminal_receipt_to_completed_result(
     asyncio.run(scenario())
 
 
+def test_create_task_eager_promotion_preserves_a_failed_dispatchs_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C1's failure half: a FAILED job's eager promotion must preserve the
+    SAME failure evidence (``protocol_error``/``returncode``/
+    ``protocol_result.isError``) the lazy path would carry, so the client's
+    ``raise_remote_call_failure`` still finds it and raises the typed
+    ``jarvis_remote_call_failed`` -- never a masked success. Fixture is the
+    live failed-describe job's own captured receipt and wait document
+    (job_3544b072....json), which genuinely reached ``completed_result`` in
+    production."""
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    tool = _make_tool(runtime)
+
+    def fake_wait_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+        assert arguments["job_id"] == _LIVE_FAILED_DESCRIBE_JOB_ID
+        return json.loads(json.dumps(_LIVE_FAILED_DESCRIBE_WAIT_DOCUMENT))
+
+    monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", fake_wait_mcp_job)
+
+    async def scenario() -> None:
+        saved = await runtime.create_task(
+            tool=tool,
+            arguments={"target": "package", "package_name": "clio_relay.bounded_command"},
+            result=ToolResult(
+                content=[mcp_types.TextContent(type="text", text="failed")],
+                structured_content=_LIVE_FAILED_DESCRIBE_RECEIPT,
+            ),
+        )
+        assert saved is not None
+        eager = saved.projection.completed_result
+        assert eager is not None
+        # The promotion itself must classify this as a failure...
+        assert eager["isError"] is True
+        # ...and the evidence clio-agent's raise_remote_call_failure keys on
+        # must survive intact: protocol_error, non-zero returncode, and the
+        # remote tool's own rejection message under mcp_result.
+        mcp_result = eager["structuredContent"]["mcp_result"]
+        assert mcp_result["protocol_error"] == "tools/call returned isError=true"
+        assert mcp_result["returncode"] == 1
+        assert mcp_result["protocol_result"]["isError"] is True
+        assert _LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE in (
+            mcp_result["protocol_result"]["content"][0]["text"]
+        )
+        # C1's shape claim, not just the outcome: the failed eager document
+        # must ALSO be the nested job/relay_queue wait shape, never the flat
+        # create-time receipt (whose top-level carries job_id directly).
+        assert "job_id" not in eager["structuredContent"]
+        assert eager["structuredContent"]["job"]["state"] == "failed"
+
+        # A/B: the SAME live wait document, resolved through the real lazy
+        # task_status() path for a separate freshly created record, must be
+        # byte-for-byte identical to the eager one above.
+        lazy_projection = RelayMcpTaskProjection(
+            tool_name=tool.name,
+            profile="user",
+            arguments={"target": "package", "package_name": "clio_relay.bounded_command"},
+            catalog_revision=None,
+            initial_result=_LIVE_FAILED_DESCRIBE_RECEIPT,
+        )
+        lazy_record = RelayMcpTaskRecord(
+            task_id=_LIVE_FAILED_DESCRIBE_JOB_ID,
+            job_id=_LIVE_FAILED_DESCRIBE_JOB_ID,
+            state=JobState.RUNNING,
+            projection=lazy_projection,
+        )
+        await asyncio.to_thread(queue.put_mcp_task, lazy_record)
+
+        def fake_status_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+            assert arguments["job_id"] == _LIVE_FAILED_DESCRIBE_JOB_ID
+            return {
+                "job": _live_relay_job(
+                    _LIVE_FAILED_DESCRIBE_JOB_ID,
+                    state=JobState.FAILED,
+                    tool="jarvis_describe",
+                )
+            }
+
+        monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", fake_status_mcp_job)
+        lazy = await runtime.task_status(lazy_record)
+        assert lazy.status == "completed"
+        assert eager == lazy.result
+
+        # task_status must report the SAME "completed, isError=True" shape
+        # -- SEP-2663 "completed" means the TASK finished; the tool-level
+        # failure rides inside the result's own isError, exactly as the
+        # lazy path already reports it -- straight off the promoted
+        # projection, with zero extra round trips. (RELAY_STATE_MAP maps
+        # "tool_failure" -> status "completed"; only a relay-level
+        # ``protocol_error`` maps to status "failed".)
+        def must_not_be_called(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("status_mcp_job/wait_mcp_job must not be called")
+
+        monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", must_not_be_called)
+        monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", must_not_be_called)
+        observed = await runtime.task_status(saved)
+        assert observed.status == "completed"
+        assert observed.result == eager
+        assert observed.result is not None
+        assert observed.result["isError"] is True
+
+    asyncio.run(scenario())
+
+
+def test_create_task_does_not_promote_a_cancelled_at_birth_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C3: a job CANCELED before its claim was minted must never be reported
+    as ``completed`` -- ``create_task`` must not promote a
+    ``completed_result`` for it at all, so ``task_status`` keeps reaching
+    its honest ``cancelled`` branch instead of the shadowed
+    ``completed_result is not None`` branch."""
+
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    tool = _make_tool(runtime)
+
+    def must_not_be_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a cancelled-at-birth job must never re-derive a result")
+
+    monkeypatch.setattr(fastmcp_server_module, "wait_mcp_job", must_not_be_called)
+
+    def fake_status_mcp_job(arguments: JSON, **_kwargs: object) -> JSON:
+        return {
+            "job": _live_relay_job(
+                cast(str, arguments["job_id"]),
+                state=JobState.CANCELED,
+                tool="jarvis_describe",
+            )
+        }
+
+    monkeypatch.setattr(fastmcp_server_module, "status_mcp_job", fake_status_mcp_job)
+
+    cancelled_receipt: JSON = {
+        "cluster": "ares-p5run2",
+        "job_id": "job-cancelled-at-birth",
+        "state": JobState.CANCELED.value,
+        "kind": JobKind.MCP_CALL.value,
+        "terminal": True,
+        "remote": True,
+        "route_revision": "e701bebd118f9bbdec5f76f13c742ecd412f29aec39c66b93757fe65ae14a141",
+        "last_error": "cancelled before claim",
+    }
+
+    async def scenario() -> None:
+        saved = await runtime.create_task(
+            tool=tool,
+            arguments={"target": "package"},
+            result=ToolResult(
+                content=[mcp_types.TextContent(type="text", text="cancelled")],
+                structured_content=cancelled_receipt,
+            ),
+        )
+        assert saved is not None
+        assert saved.state is JobState.CANCELED
+        # C3: no completed_result was promoted -- wait_mcp_job asserted it
+        # was never called, above.
+        assert saved.projection.completed_result is None
+
+        observed = await runtime.task_status(saved)
+        assert observed.status == "cancelled"
+        assert observed.result is None
+
+    asyncio.run(scenario())
+
+
 def test_task_get_wraps_a_status_reconciliation_failure_as_a_typed_error(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """D7 (relay#215): ``task_status``'s re-derivation path had no
     try/except in ``_handle_get``, so any exception raised inside it -- a
@@ -1232,18 +1703,37 @@ def test_task_get_wraps_a_status_reconciliation_failure_as_a_typed_error(
         )
         assert saved is not None
 
-        async with Client(server, mode="auto") as client:
-            with pytest.raises(MCPError) as failure:
-                await client.session.send_request(
-                    GetTaskRequest(params=GetTaskRequestParams(task_id=saved.task_id)),
-                    ClientGetTaskResult,
-                )
+        with caplog.at_level("ERROR", logger="clio_relay.fastmcp_server"):
+            async with Client(server, mode="auto") as client:
+                with pytest.raises(MCPError) as failure:
+                    await client.session.send_request(
+                        GetTaskRequest(params=GetTaskRequestParams(task_id=saved.task_id)),
+                        ClientGetTaskResult,
+                    )
         assert failure.value.code == mcp_types.INTERNAL_ERROR
         assert failure.value.data == {
             "reason": "mcp_task_status_reconciliation_failed",
             "task_id": saved.task_id,
         }
-        assert saved.task_id in failure.value.message
+        # D7 polish: the wire message is generic -- the typed reason and
+        # task_id in ``data`` are the queryable signal, never handler
+        # internals (``str(exc)``) or even the task_id folded into prose.
+        assert failure.value.message == "relay could not reconcile this task's status."
+        assert saved.task_id not in failure.value.message
+        # D7 polish: raising ``MCPError`` short-circuits the SDK's own
+        # ``logger.exception(...)`` (it only fires for handler exceptions
+        # left unmapped), so the traceback must be logged here or it is
+        # lost server-side entirely -- prove it actually is.
+        reconciliation_records = [
+            record
+            for record in caplog.records
+            if record.name == "clio_relay.fastmcp_server" and record.exc_info is not None
+        ]
+        assert reconciliation_records, "expected the reconciliation failure to log a traceback"
+        exc_info = reconciliation_records[-1].exc_info
+        assert exc_info is not None
+        logged_exc_type = exc_info[0]
+        assert logged_exc_type is not None and issubclass(logged_exc_type, NotFoundError)
 
     asyncio.run(scenario())
 

@@ -3134,6 +3134,7 @@ def _owned_jarvis_success_scenario(
     monkeypatch: pytest.MonkeyPatch,
     *,
     idempotency_key: str,
+    admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD,
 ) -> tuple[RelaySettings, RelayJob]:
     """Shared setup for the D16/D14/D15 owned-collection regression tests below."""
 
@@ -3167,6 +3168,7 @@ def _owned_jarvis_success_scenario(
             expected_server_artifact_digest="a" * 64,
             tool="jarvis_run",
             arguments={"pipeline_id": "simulation"},
+            admission_class=admission_class,
         ),
         idempotency_key=idempotency_key,
         metadata={
@@ -3211,24 +3213,27 @@ def test_owned_artifact_pagination_rejects_a_page_that_understates_its_total(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D16, with a deviation recorded: the audit's static read compared only
-    each paginator's own post-loop ``if len(records) != total: raise``
-    line and found ``_complete_owned_collection`` alone lacking one. On the
-    real code, all three siblings -- including ``_complete_owned_collection``,
-    unchanged by this batch -- already call the SAME shared
-    ``_validate_complete_collection_page`` helper inside their loop, whose
-    ``next_cursor is None and collected_count + page_count != total`` check
-    is mathematically identical to the post-loop check and fires first (its
-    own message: "... ended before its declared total"). So a truncated
-    owned-session page was never actually silently accepted -- this test
-    proves that directly, against the unmodified pre-batch code, and it
-    already passes there. The post-loop check was still added to
-    ``_complete_owned_collection`` for structural symmetry with its two
-    siblings (matching the audit's literal instruction, zero behavior
-    change, dead code exactly like the equivalent line already is in both
-    siblings) -- not because it closes a live gap. The live D14/D15 gap in
-    the D16->D14->D15 chain is closed by the sibling test below, which DOES
-    fail red against the pre-batch code."""
+    """D16 -- FALSE POSITIVE, verified by both the review and the
+    implementer: the audit's static read compared only each paginator's own
+    post-loop ``if len(records) != total: raise`` line and found
+    ``_complete_owned_collection`` alone lacking one. On the real code, all
+    three siblings -- ``_complete_owned_collection`` included -- already
+    call the SAME shared ``_validate_complete_collection_page`` helper
+    inside their loop, whose ``next_cursor is None and collected_count +
+    page_count != total`` check is mathematically identical to the
+    post-loop check and fires first (its own message: "... ended before its
+    declared total"). So a truncated owned-session page was never actually
+    silently accepted -- this test proves that directly, against the real
+    code, and it passes.
+
+    An earlier revision of this batch added a redundant post-loop
+    ``if len(records) != total: raise`` line to ``_complete_owned_collection``
+    for structural symmetry with its two siblings; a fix round removed it
+    again (it was provably dead -- unreachable behind the in-loop check
+    above -- and its message could never be emitted, only mislead a future
+    reader grepping for it) and replaced it with a comment pointing back
+    here. The live D14/D15 gap in the D16->D14->D15 chain is closed by the
+    sibling test below, which DOES fail red against the pre-batch code."""
 
     settings, queued = _owned_jarvis_success_scenario(
         tmp_path, monkeypatch, idempotency_key="owned-artifact-page-truncated"
@@ -3349,6 +3354,105 @@ def test_owned_jarvis_success_with_no_mcp_result_artifact_fails_loud_not_silent(
                 # A COMPLETE page (total matches the collected count -- D16's
                 # check is satisfied) that simply has no mcp_result-kind
                 # artifact among what the job actually produced.
+                return {
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact_stdout_only",
+                            "job_id": queued.job_id,
+                            "kind": "stdout",
+                            "size_bytes": 0,
+                            "sha256": "0" * 64,
+                            "created_at": "2026-07-16T12:38:30Z",
+                        }
+                    ],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        NoResultArtifactOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "no mcp_result artifact was found" in response["error"]["message"]
+    assert queued.job_id in response["error"]["message"]
+
+
+def test_owned_control_query_success_with_no_mcp_result_artifact_fails_loud_not_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2 (review): ``_owned_mcp_result_is_required`` used to exempt
+    ``CONTROL_QUERY``-class jobs from this exact guard on the theory that
+    they are answered outside the ordinary spooled worker/artifact
+    pipeline -- false against live evidence (a live CONTROL_QUERY
+    ``jarvis_describe`` job carries its own ``mcp_result`` artifact just
+    like any WORKLOAD job), and it silently exempted exactly the two
+    curated read operations (``jarvis_describe``/``jarvis_get_execution``)
+    that make up 8 of 11 live-captured task records. This is the sibling of
+    ``test_owned_jarvis_success_with_no_mcp_result_artifact_fails_loud_not_silent``
+    above with ``admission_class=CONTROL_QUERY``: before the exclusion was
+    removed, this exact scenario would have returned a bounded receipt with
+    ``isError`` left ``False`` and no ``mcp_result`` key -- a silent wrong
+    answer. It must now raise the identical typed, loud reason."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path,
+        monkeypatch,
+        idempotency_key="owned-control-query-missing-mcp-result",
+        admission_class=McpAdmissionClass.CONTROL_QUERY,
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+    assert isinstance(terminal.spec, McpCallSpec)
+    assert terminal.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+
+    class NoResultArtifactOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> NoResultArtifactOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # A COMPLETE page (D16's check is satisfied) with no
+                # mcp_result-kind artifact -- same shape as the WORKLOAD
+                # sibling above, just on a CONTROL_QUERY job.
                 return {
                     "artifacts": [
                         {

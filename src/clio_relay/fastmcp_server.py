@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -73,6 +74,8 @@ from clio_relay.storage_runtime import StorageManagedQueue, storage_managed_queu
 if TYPE_CHECKING:
     from fastmcp.server.context import Context
     from fastmcp.server.extensions import ToolCallContinuation, ToolCallOutcome
+
+logger = logging.getLogger(__name__)
 
 JSON = dict[str, Any]
 SESSION_STATE_KEY = "clio-relay/mcp-session-state"
@@ -382,17 +385,37 @@ class RelayMcpRuntime:
             arguments=arguments,
             catalog_revision=tool.catalog_revision,
             initial_result=structured,
-            # The synchronous call that produced ``structured`` already ran the
-            # job to completion and verified its evidence (relay#215 / D22):
-            # for a terminal-at-birth task, promote that already-verified
-            # receipt into wire shape now rather than leaving it unset and
-            # forcing the first ``tasks/get`` to re-derive the identical
-            # answer over two more round trips (``task_status``'s own
-            # ``status``/``wait`` re-fetch below).
-            completed_result=(
-                _call_tool_result_document(structured) if state in TERMINAL_STATES else None
-            ),
         )
+        if state in TERMINAL_STATES and state is not JobState.CANCELED:
+            # The synchronous call that produced ``structured`` already ran the
+            # job to completion (relay#215 / D22). Resolve the durable
+            # ``completed_result`` now, through the IDENTICAL ``wait_mcp_job``
+            # -based document builder ``task_status``'s lazy re-derivation uses
+            # (``_terminal_completed_result``) -- never by wrapping the
+            # create-time receipt directly. The two are structurally different
+            # documents (the receipt is flat: ``job_id``/``state`` at the top
+            # level; the wait document nests the job under ``job`` alongside
+            # ``relay_queue``/``scheduler``/``transform``), and a client that
+            # only recognizes the wait shape silently received relay's own
+            # bookkeeping instead of the tool's result (C1). Sharing the exact
+            # builder makes the two paths structurally incapable of
+            # diverging, at the cost of paying the re-derivation now instead
+            # of on first poll -- correctness over the round-trip saving.
+            # CANCELED is excluded: it must keep reporting the honest
+            # ``cancelled`` status (C3), never a completed-looking result.
+            provisional = RelayMcpTaskRecord(
+                task_id=job_id,
+                job_id=job_id,
+                state=state,
+                projection=projection,
+            )
+            completed_result = await self._terminal_completed_result(provisional)
+            projection = RelayMcpTaskProjection.model_validate(
+                {
+                    **projection.model_dump(mode="python"),
+                    "completed_result": completed_result,
+                }
+            )
         record = RelayMcpTaskRecord(
             task_id=job_id,
             job_id=job_id,
@@ -405,6 +428,28 @@ class RelayMcpRuntime:
         if context is None:
             raise ValueError("post-admission agent input requires an MCP task context")
         return await self._park_agent_input(saved, context)
+
+    async def _terminal_completed_result(self, record: RelayMcpTaskRecord) -> JSON:
+        """Serialize one terminal job's result through the SAME builder
+        ``task_status``'s lazy re-derivation uses (``wait_mcp_job`` then
+        ``_call_tool_result_document``). Sharing this one function is what
+        makes an eager (create-time) and lazy (first-``tasks/get``)
+        resolution of the identical job byte-for-byte identical -- see C1.
+        """
+        route_arguments = self._route_arguments(record)
+        waited = await asyncio.to_thread(
+            lambda: wait_mcp_job(
+                {
+                    **route_arguments,
+                    "timeout_seconds": 0.01,
+                    "poll_seconds": 0.01,
+                    "include_logs": False,
+                },
+                queue=self.queue,
+                settings=self.settings,
+            )
+        )
+        return _call_tool_result_document(waited)
 
     async def _park_agent_input(
         self,
@@ -527,19 +572,7 @@ class RelayMcpRuntime:
                 **{key: value for key, value in common.items() if key != "last_updated_at"},
             )
 
-        waited = await asyncio.to_thread(
-            lambda: wait_mcp_job(
-                {
-                    **route_arguments,
-                    "timeout_seconds": 0.01,
-                    "poll_seconds": 0.01,
-                    "include_logs": False,
-                },
-                queue=self.queue,
-                settings=self.settings,
-            )
-        )
-        final = _call_tool_result_document(waited)
+        final = await self._terminal_completed_result(record)
         completed_projection = RelayMcpTaskProjection.model_validate(
             {
                 **projection.model_dump(mode="python"),
@@ -950,9 +983,21 @@ class RelayTasksExtension(ServerExtension):
             # re-fetch); an unwrapped failure there escaped as a bare, typeless
             # "Internal server error" (no try/except -> the SDK's generic
             # handler catch-all). Surface a typed, queryable reason instead.
+            # Raising ``MCPError`` here short-circuits the SDK's own
+            # ``logger.exception(...)`` (``mcp/server/runner.py``'s
+            # ``modern_error_data`` only logs when the handler exception is
+            # left for its generic catch-all), so the traceback would
+            # otherwise be lost entirely -- log it ourselves. And keep
+            # handler internals off the wire (the SDK's own stated posture
+            # for INTERNAL_ERROR: a generic message, never ``str(exc)``);
+            # the typed reason plus task_id in ``data`` is the queryable
+            # signal instead.
+            logger.exception(
+                "relay could not reconcile task %r's status", params.task_id
+            )
             raise MCPError(
                 code=mcp_types.INTERNAL_ERROR,
-                message=f"relay could not reconcile task {params.task_id!r}'s status: {exc}",
+                message="relay could not reconcile this task's status.",
                 data={
                     "reason": "mcp_task_status_reconciliation_failed",
                     "task_id": params.task_id,
