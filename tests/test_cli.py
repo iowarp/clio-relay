@@ -737,6 +737,160 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
     assert provider.name == "slurm"
 
 
+def test_endpoint_start_defaults_control_query_concurrency_from_cluster_registry(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: an unpinned worker must never silently start with zero control-query
+    capacity. Historically ``endpoint start`` had its own disconnected CLI
+    default of 0, independent of the cluster's registered WorkerCapacityPolicy
+    (whose own default is 1) -- a fresh deployment that never pins
+    --control-query-concurrency got a worker that accepts describe-class jobs
+    and never runs them, with no typed reason.
+    """
+    captured: dict[str, object] = {}
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    class FakeWorker:
+        def register(self) -> None:
+            captured["registered"] = True
+
+        def run_once(self) -> None:
+            captured["ran_once"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    def load_cluster(cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
+
+    result = CliRunner().invoke(
+        app,
+        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["control_query_concurrency"] == 1
+    assert captured["concurrency"] == 3
+
+
+def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registered_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: WorkerCapacityPolicy.control_query_concurrency requires >= 1, so an
+    operator cannot even pin 0 against a cluster resolved from the registry --
+    reusing that validation (the same one render-user-service relies on)
+    rejects it outright instead of silently starting a worker that will
+    never pick up a describe-class job.
+    """
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+    monkeypatch.setattr(cli, "_require_cluster", lambda cluster: definition)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "configured-cluster",
+            "--control-query-concurrency",
+            "0",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "control_query_concurrency" in result.output
+
+
+def test_endpoint_start_warns_loudly_when_control_query_concurrency_is_explicitly_zero(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: a worker started with an explicit --scheduler-provider bypasses
+    cluster-registry resolution (test_endpoint_worker_with_explicit_provider_
+    does_not_require_remote_registry) and so is not bound by
+    WorkerCapacityPolicy's >= 1 floor; 0 remains reachable there. It must
+    still surface a loud, typed warning rather than silently starting a
+    worker that will never pick up a describe-class job.
+    """
+
+    class FakeWorker:
+        def register(self) -> None:
+            pass
+
+        def run_once(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        return FakeWorker()
+
+    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
+        raise AssertionError(f"unexpected registry lookup for {cluster}")
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
+
+    zero = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "homelab",
+            "--scheduler-provider",
+            "external",
+            "--control-query-concurrency",
+            "0",
+            "--once",
+        ],
+    )
+    nonzero = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "homelab",
+            "--scheduler-provider",
+            "external",
+            "--control-query-concurrency",
+            "1",
+            "--concurrency",
+            "2",
+            "--once",
+        ],
+    )
+
+    assert zero.exit_code == 0, zero.output
+    assert "control_query_concurrency=0" in zero.output
+    assert "queue forever" in zero.output
+    assert nonzero.exit_code == 0, nonzero.output
+    assert "control_query_concurrency=0" not in nonzero.output
+
+
 def test_endpoint_worker_info_exposes_bounded_readiness_mode(
     monkeypatch: MonkeyPatch,
 ) -> None:

@@ -1598,13 +1598,27 @@ def endpoint_start(
     ] = None,
     once: Annotated[bool, typer.Option(help="Run one worker iteration and exit.")] = False,
     concurrency: Annotated[
-        int,
-        typer.Option(help="Number of in-process worker slots for worker endpoints."),
-    ] = 1,
+        int | None,
+        typer.Option(
+            help=(
+                "Number of in-process worker slots for worker endpoints. Defaults to the "
+                "cluster's registered worker_capacity for worker endpoints (clio-relay#219); "
+                "1 without a configured cluster."
+            )
+        ),
+    ] = None,
     control_query_concurrency: Annotated[
-        int,
-        typer.Option(help="Slots carved out of total capacity for control-class MCP queries."),
-    ] = 0,
+        int | None,
+        typer.Option(
+            help=(
+                "Slots carved out of total capacity for control-class MCP queries. Defaults "
+                "to the cluster's registered worker_capacity for worker endpoints "
+                "(clio-relay#219) rather than an unpinned 0: 0 silently starves every "
+                "control-class job (jarvis_describe and kin) with no typed reason -- it just "
+                "never gets picked up."
+            )
+        ),
+    ] = None,
     kind_concurrency: Annotated[
         list[str] | None,
         typer.Option(
@@ -1618,13 +1632,6 @@ def endpoint_start(
     ] = None,
 ) -> None:
     """Start a desktop or worker endpoint."""
-    if concurrency < 1:
-        raise typer.BadParameter("--concurrency must be at least 1")
-    if control_query_concurrency < 0:
-        raise typer.BadParameter("--control-query-concurrency must not be negative")
-    if control_query_concurrency >= concurrency:
-        raise typer.BadParameter("--control-query-concurrency must be less than --concurrency")
-    kind_limits = _kind_concurrency_options(kind_concurrency)
     settings = RelaySettings.from_env()
     definition: ClusterDefinition | None = None
     if role == EndpointRole.WORKER:
@@ -1632,6 +1639,53 @@ def endpoint_start(
             raise typer.BadParameter("--cluster is required for worker endpoints")
         if scheduler_provider is None:
             definition = _require_cluster(cluster)
+    if definition is not None:
+        # clio-relay#219: resolve unpinned concurrency/control_query_concurrency from
+        # the cluster's own registered WorkerCapacityPolicy (the same resolution
+        # `endpoint render-user-service` already applies) instead of this command's
+        # own disconnected CLI defaults -- a fresh worker deployment that never pins
+        # these flags otherwise gets control_query_concurrency=0 and silently
+        # starves every control-class job.
+        capacity = _resolved_worker_capacity_policy(
+            definition,
+            concurrency=concurrency,
+            control_query_concurrency=control_query_concurrency,
+            kind_concurrency=kind_concurrency,
+            clear_kind_concurrency=False,
+        )
+        resolved_concurrency = capacity.concurrency
+        resolved_control_query_concurrency = capacity.control_query_concurrency
+        resolved_kind_concurrency: dict[JobKind, int] = capacity.kind_concurrency
+    else:
+        # No cluster is configured (desktop role): preserve the historical
+        # single-slot, no-reserved-control-capacity default exactly.
+        # WorkerCapacityPolicy requires concurrency>=2, which does not fit this
+        # role's single-slot default, so its own bounds are enforced directly.
+        resolved_concurrency = 1 if concurrency is None else concurrency
+        resolved_control_query_concurrency = (
+            0 if control_query_concurrency is None else control_query_concurrency
+        )
+        if resolved_concurrency < 1:
+            raise typer.BadParameter("--concurrency must be at least 1")
+        if resolved_control_query_concurrency < 0:
+            raise typer.BadParameter("--control-query-concurrency must not be negative")
+        if resolved_control_query_concurrency >= resolved_concurrency:
+            raise typer.BadParameter("--control-query-concurrency must be less than --concurrency")
+        resolved_kind_concurrency = _kind_concurrency_options(kind_concurrency)
+    if role == EndpointRole.WORKER and resolved_control_query_concurrency == 0:
+        # clio-relay#219: a worker with zero control-query capacity accepts
+        # describe-class submissions and never runs them -- indistinguishable
+        # from slow until an operator discovers the knob. Warn loudly at
+        # startup instead of leaving that silent.
+        typer.echo(
+            f"warning: worker {cluster or 'local'!r} is starting with "
+            "control_query_concurrency=0; every describe-class control-query job "
+            "submitted to it will queue forever with no typed reason. Pass "
+            "--control-query-concurrency N (N >= 1) here, or bake it into the persisted "
+            "systemd unit with 'clio-relay endpoint render-user-service --cluster "
+            f"{cluster or '<cluster>'} --control-query-concurrency N'.",
+            err=True,
+        )
     selected_scheduler = scheduler_provider
     if selected_scheduler is None and definition is not None:
         selected_scheduler = definition.scheduler_provider
@@ -1639,9 +1693,9 @@ def endpoint_start(
         role=role,
         settings=settings,
         cluster=cluster or "local",
-        concurrency=concurrency,
-        control_query_concurrency=control_query_concurrency,
-        kind_concurrency=kind_limits,
+        concurrency=resolved_concurrency,
+        control_query_concurrency=resolved_control_query_concurrency,
+        kind_concurrency=resolved_kind_concurrency,
         scheduler_provider=(
             provider_for_scheduler(selected_scheduler) if role == EndpointRole.WORKER else None
         ),
