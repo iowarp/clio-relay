@@ -215,6 +215,7 @@ _VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES = _load_bundled_jarvis_user_c
 def jarvis_mcp_command(
     *,
     receipt_path: Path | None = None,
+    cluster: str | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
 ) -> list[str]:
@@ -228,6 +229,18 @@ def jarvis_mcp_command(
     running more than one relay deployment must never let one deployment's
     JARVIS MCP launcher resolve through another's shared box-global state
     (clio-relay#228); omit it only where no cluster-scoped pin is available.
+
+    A ``receipt_path`` explicitly passed by the caller is an EXPLICIT pin: if
+    it does not exist or cannot be loaded, resolution raises a typed
+    ``ValueError`` naming ``cluster`` when given (matching
+    :func:`clio_relay.installation.worker_runtime_info`'s "cluster {cluster}
+    pinned install receipt could not be loaded" refusal) rather than
+    silently falling back to :data:`DEFAULT_JARVIS_MCP_COMMAND` -- that
+    fallback is reserved for the OMITTED (ambient, no cluster-scoped pin
+    available) case only, exactly as before clio-relay#228 (clio-relay#228
+    rework). Silently running the box-global default launcher in place of an
+    unloadable explicit pin is the exact wrong-tenant hazard this fix exists
+    to kill.
 
     ``dev_mode`` defaults to :func:`clio_relay.dev_mode.dev_mode_enabled` (the
     ``CLIO_RELAY_DEV_MODE`` environment switch) when omitted, so every
@@ -243,12 +256,23 @@ def jarvis_mcp_command(
     configured = os.environ.get(JARVIS_MCP_COMMAND_ENV)
     if configured is not None and configured.strip():
         return _decode_command(configured)
+    from clio_relay.errors import ConfigurationError
     from clio_relay.installation import default_install_receipt_path, load_install_receipt
 
-    receipt_path = receipt_path if receipt_path is not None else default_install_receipt_path()
-    if not receipt_path.exists():
-        return list(DEFAULT_JARVIS_MCP_COMMAND)
-    receipt = load_install_receipt(receipt_path)
+    explicit_receipt_path = receipt_path is not None
+    resolved_receipt_path = (
+        receipt_path if receipt_path is not None else default_install_receipt_path()
+    )
+    if explicit_receipt_path:
+        try:
+            receipt = load_install_receipt(resolved_receipt_path)
+        except ConfigurationError as exc:
+            prefix = f"cluster {cluster} " if cluster else ""
+            raise ValueError(f"{prefix}pinned install receipt could not be loaded: {exc}") from exc
+    else:
+        if not resolved_receipt_path.exists():
+            return list(DEFAULT_JARVIS_MCP_COMMAND)
+        receipt = load_install_receipt(resolved_receipt_path)
     identity = jarvis_mcp_runtime_identity(receipt)
     if identity.get("artifact_identity_verified") is not True:
         reason = identity.get("error") or "receipt-bound clio-kit runtime identity did not verify"
@@ -572,19 +596,21 @@ def _sha256(path: Path) -> str:
 def jarvis_mcp_server(
     *,
     receipt_path: Path | None = None,
+    cluster: str | None = None,
     dev_mode: bool | None = None,
 ) -> str:
     """Return the executable component of the JARVIS MCP command."""
-    return jarvis_mcp_command(receipt_path=receipt_path, dev_mode=dev_mode)[0]
+    return jarvis_mcp_command(receipt_path=receipt_path, cluster=cluster, dev_mode=dev_mode)[0]
 
 
 def jarvis_mcp_server_args(
     *,
     receipt_path: Path | None = None,
+    cluster: str | None = None,
     dev_mode: bool | None = None,
 ) -> list[str]:
     """Return the argument component of the JARVIS MCP command."""
-    return jarvis_mcp_command(receipt_path=receipt_path, dev_mode=dev_mode)[1:]
+    return jarvis_mcp_command(receipt_path=receipt_path, cluster=cluster, dev_mode=dev_mode)[1:]
 
 
 def is_virtual_jarvis_control_query(remote_tool: str) -> bool:

@@ -43,6 +43,7 @@ from clio_relay.installation import (
 )
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    DEFAULT_JARVIS_MCP_COMMAND,
     JARVIS_MCP_COMMAND_ENV,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
@@ -2454,6 +2455,68 @@ def test_jarvis_mcp_command_receipt_path_overrides_ambient_current_installation(
 
     assert jarvis_mcp_command() == ambient_command
     assert jarvis_mcp_command(receipt_path=pinned_path) == pinned_command
+
+
+def test_jarvis_mcp_command_explicit_receipt_path_missing_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: a missing EXPLICIT (cluster-pinned) receipt_path
+    must refuse typed, never silently fall back to DEFAULT_JARVIS_MCP_COMMAND.
+
+    Before this rework, ``jarvis_mcp_command()`` treated an explicit
+    ``receipt_path`` override exactly like the OMITTED/ambient case: any
+    nonexistent path -- including a real cluster pin that simply hasn't been
+    written yet, or one mistyped in the registry -- silently ran the
+    box-global default launcher instead of refusing. On a multi-tenant host
+    that is the exact wrong-tenant hazard clio-relay#228 exists to kill: an
+    operator who believes they pinned a specific deployment's launcher would
+    instead silently get whatever unrelated deployment's launcher the shared
+    box default happens to resolve. The OMITTED case (no cluster-scoped pin
+    at all) keeps the historical silent fallback unchanged.
+    """
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    missing_receipt = tmp_path / "deployment-p5run2" / "install-receipt.json"
+    assert not missing_receipt.exists()
+
+    with pytest.raises(
+        ValueError,
+        match=r"cluster test-cluster pinned install receipt could not be loaded",
+    ):
+        jarvis_mcp_command(receipt_path=missing_receipt, cluster="test-cluster")
+
+    # Without a cluster name the refusal still fires, just without the
+    # worker_runtime_info-style "cluster {cluster}" prefix.
+    with pytest.raises(ValueError, match=r"^pinned install receipt could not be loaded"):
+        jarvis_mcp_command(receipt_path=missing_receipt)
+
+    # Sabotage check: the OMITTED (ambient) case -- no receipt anywhere on
+    # this box -- must be entirely unaffected and keep its historical
+    # silent fallback.
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(missing_receipt))
+    assert jarvis_mcp_command() == list(DEFAULT_JARVIS_MCP_COMMAND)
+
+
+def test_jarvis_mcp_command_explicit_receipt_path_unloadable_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: an EXPLICIT receipt that EXISTS but cannot be
+    parsed must also refuse typed rather than fall back silently -- the
+    missing-file case above only covers ``Path.exists()``; a corrupt/
+    truncated receipt on disk must be caught too.
+    """
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+    corrupt_receipt = tmp_path / "deployment-p5run2" / "install-receipt.json"
+    corrupt_receipt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_receipt.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"cluster test-cluster pinned install receipt could not be loaded",
+    ):
+        jarvis_mcp_command(receipt_path=corrupt_receipt, cluster="test-cluster")
 
 
 def test_jarvis_mcp_command_dev_mode_downgrades_missing_component_to_warning(

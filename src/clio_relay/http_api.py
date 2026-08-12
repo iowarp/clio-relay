@@ -141,6 +141,7 @@ from clio_relay.remote_mcp import (
     resolve_pinned_mcp_admission,
     resolve_registered_remote_mcp_admission,
 )
+from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
@@ -1666,30 +1667,60 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         # endpoint resolve through another deployment's shared box-global
         # state. No owned session means no cluster-scoped pin is available;
         # fall back to the ambient identity exactly as before.
+        #
+        # relay_install_receipt may be recorded ``$HOME/``-anchored (the same
+        # convention jarvis_run_environment.registered_site_spack_command
+        # expands for spack_executable). ``Path.expanduser()`` only expands a
+        # leading ``~`` and leaves a literal ``$HOME/`` prefix untouched, so a
+        # ``$HOME/``-anchored pin previously resolved to a nonexistent path
+        # and, because jarvis_mcp_command() silently falls back to the box
+        # default launcher when its receipt_path override is absent on disk,
+        # every such pin silently ran the wrong (default, unpinned) launcher
+        # instead of refusing -- the exact wrong-tenant hazard #228 exists to
+        # kill (clio-relay#228 rework). Expand it against this process's own
+        # home before resolving.
         pinned_receipt_path = (
-            Path(owner_session_cluster_definition.relay_install_receipt).expanduser()
+            Path(
+                expand_remote_value_on_host(
+                    owner_session_cluster_definition.relay_install_receipt,
+                    field="relay_install_receipt",
+                    home=os.path.expanduser("~"),
+                )
+            ).expanduser()
             if owner_session_cluster_definition is not None
             and owner_session_cluster_definition.relay_install_receipt is not None
             else None
         )
+        # dev_mode is OR-composed with the host's CLIO_RELAY_DEV_MODE switch
+        # (clio-relay#211: "either is sufficient"). jarvis_mcp_command()
+        # only overrides the host env when it receives a non-None dev_mode,
+        # so an explicit cluster-level ``dev_mode: false`` must still pass
+        # None here rather than False -- otherwise a cluster that never
+        # opted in to dev mode would silently mask CLIO_RELAY_DEV_MODE=1 set
+        # on the host running this session API process.
         pinned_dev_mode = (
-            owner_session_cluster_definition.dev_mode
+            True
             if owner_session_cluster_definition is not None
+            and owner_session_cluster_definition.dev_mode
             else None
         )
         try:
             server = jarvis_mcp_server(
                 receipt_path=pinned_receipt_path,
+                cluster=request.cluster,
                 dev_mode=pinned_dev_mode,
             )
             server_args = jarvis_mcp_server_args(
                 receipt_path=pinned_receipt_path,
+                cluster=request.cluster,
                 dev_mode=pinned_dev_mode,
             )
             env_from = jarvis_mcp_env_from()
         except ValueError as exc:
-            # clio-relay#228: a launcher-identity verification failure must
-            # surface typed, never escape as a bare unhandled 500.
+            # clio-relay#228: a launcher-identity verification failure --
+            # including a missing/unloadable EXPLICIT cluster pin -- must
+            # surface typed, never escape as a bare unhandled 500 nor
+            # silently fall back to the default launcher.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return submit_owned(
             RelayJob(
