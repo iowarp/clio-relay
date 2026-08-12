@@ -2103,6 +2103,133 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
     assert "identity_matches_pinned" not in readiness
 
 
+def test_worker_runtime_info_expands_home_anchored_pinned_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2 (ledger item 2, worker_runtime_info):
+    ``pinned_install_receipt_path`` may ALSO be recorded ``$HOME/``-anchored
+    -- the same convention ``jarvis_mcp.jarvis_mcp_command`` already expands
+    for its own per-cluster receipt pin. ``Path.expanduser()`` alone only
+    expands a leading ``~`` and silently leaves a literal ``$HOME/`` prefix
+    unresolved, breaking the #205 ``identity_matches_pinned`` chain: the
+    reviewer confirmed this is real and doubly dangerous -- a bare
+    ``Path(...).expanduser()`` load failure is loud but MISLEADING (reads as
+    "receipt missing/corrupt", not "path never expanded"), and on a
+    shell-quoted remote command line the raw ``$HOME`` token would not even
+    undergo remote shell expansion, so the failure mode is not confined to
+    this local read path either.
+    """
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.models import EndpointRegistration, EndpointRole
+
+    root = tmp_path / "core"
+    fake_home = tmp_path / "home" / "operator"
+
+    pinned_wheel = fake_home / "deployment-p5run2" / "clio_relay-pinned.whl"
+    pinned_wheel.parent.mkdir(parents=True, exist_ok=True)
+    pinned_wheel.write_bytes(b"pinned-generation-wheel")
+    pinned_receipt_path = fake_home / "deployment-p5run2" / "install-receipt.json"
+    pinned_receipt = write_install_receipt(
+        install_spec=str(pinned_wheel),
+        artifact_path=pinned_wheel,
+        path=pinned_receipt_path,
+        generation="c" * 64,
+    )
+    worker_identity = installation_info(pinned_receipt_path)
+
+    current_wheel = tmp_path / "clio_relay-current.whl"
+    current_wheel.write_bytes(b"shared-tenant-current-wheel")
+    current_receipt_path = tmp_path / "current-receipt.json"
+    write_install_receipt(
+        install_spec=str(current_wheel),
+        artifact_path=current_wheel,
+        path=current_receipt_path,
+        generation="d" * 64,
+    )
+    current_identity = installation_info(current_receipt_path)
+
+    queue = ClioCoreQueue(root)
+    queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="endpoint_pinned_worker",
+            role=EndpointRole.WORKER,
+            cluster="ares-p5run2",
+            hostname="worker",
+            pid=os.getpid(),
+            metadata={
+                "installation_info": worker_identity,
+                "scheduler_provider": "slurm",
+            },
+        )
+    )
+
+    def worker_process_matches(_pid: int) -> bool:
+        return True
+
+    def current_installation(**_kwargs: object) -> dict[str, object]:
+        return current_identity
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
+    monkeypatch.setattr(installation_module, "installation_info", current_installation)
+    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+
+    result = worker_runtime_info(
+        cluster="ares-p5run2",
+        freshness_seconds=120,
+        pinned_install_receipt_path="$HOME/deployment-p5run2/install-receipt.json",
+    )
+
+    assert result["identity_matches_pinned"] is True
+    assert result["pinned_installation"] == pinned_receipt.model_dump(mode="json")
+
+
+def test_worker_runtime_info_unloadable_home_anchored_pin_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: before the fix, a ``$HOME/``-anchored
+    pin that a real remote worker would resolve correctly instead resolved
+    to a literal, nonexistent ``$HOME/...`` path here and failed with a
+    misleading "could not be loaded" refusal even though the receipt was
+    perfectly readable at its true (expanded) location. This sabotage-style
+    check proves the CURRENT (fixed) code raises only for a GENUINELY
+    missing receipt, not for a merely-unexpanded one.
+
+    Pinned-receipt resolution happens before any fresh-endpoint scan, so no
+    registered worker endpoint is needed here -- only a schema-valid
+    ``current_installation`` stand-in (this test process is not itself a
+    persistent uv tool install, so the real ``installation_info()`` would
+    raise for an unrelated reason before ever reaching the code under test).
+    """
+    fake_home = tmp_path / "home" / "operator"
+    fake_home.mkdir(parents=True, exist_ok=True)
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"cluster ares-p5run2 pinned install receipt could not be loaded",
+    ):
+        worker_runtime_info(
+            cluster="ares-p5run2",
+            freshness_seconds=120,
+            current_installation={"schema_version": "clio-relay.installation-info.v1"},
+            pinned_install_receipt_path="$HOME/deployment-p5run2/install-receipt.json",
+        )
+
+
 def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
