@@ -457,8 +457,13 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
         command="clio-kit",
         contract="clio-kit-spack-user-v2",
     )
+    v2_3_spack_registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        contract="clio-kit-spack-user-v2.3",
+    )
     assert current_spack_registration.contract == "clio-kit-spack-user-v2.1"
     assert legacy_spack_registration.contract == "clio-kit-spack-user-v2"
+    assert v2_3_spack_registration.contract == "clio-kit-spack-user-v2.3"
 
     with pytest.raises(ValidationError, match="exact names or '\\*' only"):
         RemoteMcpServerConfig(command="science-mcp", allow_tools=["inspect*"])
@@ -5405,6 +5410,218 @@ def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
     assert "declared contract" in catalog.issues[0].reason
 
 
+def _spack_v2_3_registration(**overrides: object) -> RemoteMcpServerConfig:
+    defaults: dict[str, object] = {
+        "command": "uvx",
+        "args": [
+            "--from",
+            "/opt/clio/clio_kit-2.8.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        "profiles": ["user"],
+    }
+    defaults.update(overrides)
+    return RemoteMcpServerConfig(**cast(Any, defaults))
+
+
+def test_spack_v2_3_declared_registration_requires_the_exact_five_tool_set(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2.3-declared registration must expose exactly the audited 5-tool surface."""
+    v2_3_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES)
+    ]
+    registration = _spack_v2_3_registration(
+        allow_tools=sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES),
+        contract="clio-kit-spack-user-v2.3",
+    )
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=v2_3_tools)
+    exact_digest = remote_mcp.remote_mcp_schema_digest(list(entry.tools))
+    monkeypatch.setitem(
+        remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
+        "clio-kit-spack-user-v2.3",
+        exact_digest,
+    )
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is True
+    assert check.evidence["remote_tool_names"] == sorted(
+        remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES
+    )
+    assert check.evidence["live_contract_drifted"] is False
+    assert check.evidence["contract_drift_notice"] is None
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.issues == ()
+    assert {
+        "remote_software_spack_find",
+        "remote_software_spack_locate",
+        "remote_software_spack_install",
+        "remote_software_spack_search",
+        "remote_software_spack_info",
+    } <= set(catalog.tools)
+
+
+def test_spack_v2_3_declared_registration_fails_closed_on_only_the_legacy_three_tools() -> None:
+    """A v2.3 declaration is exact -- it does not tolerate a downgraded 3-tool live server."""
+    registration = _spack_v2_3_registration(
+        allow_tools=sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES),
+        contract="clio-kit-spack-user-v2.3",
+    )
+    legacy_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=legacy_tools)
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is False
+    assert check.evidence["remote_tool_names"] == sorted(
+        remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES
+    )
+
+
+def test_spack_v2_1_declared_registration_accepts_forward_compatible_v2_3_live_server(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """THE SABOTAGE: today's exact-name-equality behavior drops the entire spack
+    registration once the live server (kit 2.8.0, contract v2.3) answers 5 tools
+    against a v2.1-declared registration. This must now be accepted as a
+    forward-compatible subset: the declared 3 tools keep serving, unaudited
+    extras stay hidden, and a typed drift notice names the live contract --
+    the registration must never be silently dropped.
+    """
+    legacy_names = sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/clio/clio_kit-2.8.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        allow_tools=legacy_names,
+        profiles=["user"],
+        contract="clio-kit-spack-user-v2.1",
+    )
+    v2_3_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES)
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=v2_3_tools)
+    live_digest = remote_mcp.remote_mcp_schema_digest(list(entry.tools))
+    monkeypatch.setitem(
+        remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
+        "clio-kit-spack-user-v2.3",
+        live_digest,
+    )
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+    assert check.passed is True, check.evidence
+    assert check.evidence["live_contract_drifted"] is True
+    assert check.evidence["live_matched_contract_id"] == "clio-kit-spack-user-v2.3"
+    assert check.evidence["live_tool_names_beyond_declared"] == ["spack_info", "spack_search"]
+    notice = check.evidence["contract_drift_notice"]
+    assert isinstance(notice, str)
+    assert "clio-kit-spack-user-v2.1" in notice
+    assert "clio-kit-spack-user-v2.3" in notice
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    # The registration must NEVER be silently dropped: the declared subset
+    # keeps serving, and the catalog carries exactly one typed, non-fatal
+    # notice -- not a fatal "declared contract ... failed" issue.
+    assert {
+        "remote_software_spack_find",
+        "remote_software_spack_locate",
+        "remote_software_spack_install",
+    } <= set(catalog.tools)
+    assert "remote_software_spack_search" not in catalog.tools
+    assert "remote_software_spack_info" not in catalog.tools
+    assert len(catalog.issues) == 1
+    # A fatal drop reads "declared contract '...' failed: ...";  the notice
+    # must NOT use that fatal wording even though it also names the contract.
+    assert "failed:" not in catalog.issues[0].reason
+    assert "clio-kit-spack-user-v2.3" in catalog.issues[0].reason
+
+
+def test_spack_v2_1_declared_registration_still_fails_closed_on_unaudited_drift() -> None:
+    """A live superset must match a KNOWN audited contract digest -- not any superset.
+
+    An extra tool that isn't part of any audited contract (v2, v2.1, or v2.3)
+    must still fail closed, proving the forward-compatible path is not a blind
+    "newer is fine" acceptance.
+    """
+    legacy_names = sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/clio/clio_kit-2.3.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        allow_tools=legacy_names,
+        profiles=["user"],
+        contract="clio-kit-spack-user-v2.1",
+    )
+    unaudited_tools = [
+        *(_spack_tool(name) for name in legacy_names),
+        _spack_tool("spack_load"),
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=unaudited_tools)
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is False
+    assert check.evidence["live_contract_drifted"] is True
+    assert check.evidence["live_matched_contract_id"] is None
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.tools == {}
+    assert len(catalog.issues) == 1
+    assert "declared contract" in catalog.issues[0].reason
+
+
+def test_unknown_declared_spack_contract_still_raises() -> None:
+    """A contract id this relay build has never audited must still fail loudly."""
+    fake_registration = SimpleNamespace(
+        contract="clio-kit-spack-user-v2.9",
+        profiles=["user"],
+        allow_tools=["spack_find"],
+    )
+    with pytest.raises(ValueError, match="unsupported remote MCP semantic contract"):
+        remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+            None, cast(Any, fake_registration)
+        )
+
+
 @pytest.mark.parametrize(
     ("remote_schema", "arguments_json", "expected_remote_arguments"),
     [
@@ -6405,13 +6622,23 @@ def _scientific_catalog_tool(
     }
 
 
+_SPACK_TOOL_REQUIRED_PROPERTY = {
+    "spack_find": None,
+    "spack_locate": "spec",
+    "spack_install": "spec",
+    "spack_search": "query",
+    "spack_info": "package",
+}
+
+
 def _spack_tool(name: str) -> dict[str, object]:
     """Return one representative schema from the audited Spack MCP surface."""
     read_only = name != "spack_install"
-    required = ["spec"] if name in {"spack_locate", "spack_install"} else []
+    required_property = _SPACK_TOOL_REQUIRED_PROPERTY.get(name)
+    required = [required_property] if required_property is not None else []
     properties: dict[str, object] = {}
-    if "spec" in required:
-        properties["spec"] = {"type": "string"}
+    if required_property is not None:
+        properties[required_property] = {"type": "string"}
     tool: dict[str, object] = {
         "name": name,
         "description": f"Audited {name} operation.",

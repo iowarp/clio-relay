@@ -150,10 +150,18 @@ CLIO_KIT_JARVIS_USER_TOOL_NAMES = frozenset(
 CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.7.2"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
+# v2.3 adds spack_search/spack_info to the audited surface (clio-kit 2.8.0) and
+# revises spack_install's outputSchema; a v2.1/v2-declared registration whose
+# live server now answers v2.3 is handled as a forward-compatible subset (see
+# _spack_user_contract_check), not a hard failure -- a v2.1/v2-only relay build
+# used to drop the ENTIRE spack registration once the kit shipped ahead of the
+# relay's known contract set.
+CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3 = "clio-kit-spack-user-v2.3"
 CLIO_KIT_SPACK_USER_CONTRACT_IDS = frozenset(
     {
         CLIO_KIT_SPACK_USER_CONTRACT_ID,
         CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID,
+        CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3,
     }
 )
 # Digest the MCP wire ``tools/list`` result. FastMCP's in-process FunctionTool
@@ -166,6 +174,9 @@ CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "3c5412148c770f4844e98eb893c4db0d0afdbf13afe967df67bd5f7d25e1f7db"
     ),
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: (
+        "ce5d1827c365b549308130e110cffac66a21e0202d688ac38636cd8ad98b6b85"
+    ),
 }
 CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_CONTRACT_ID: (
@@ -173,6 +184,9 @@ CLIO_KIT_SPACK_USER_WIRE_SHA256_BY_ID = {
     ),
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "e575c901226a34a1f4286228b3f71966fe55b68d82bae5c6fd6582af0e43fd2d"
+    ),
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: (
+        "6bc1de3515226777f4a4823d921787a87766d6657451cf0f053f56c9740fe3ae"
     ),
 }
 CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID = {
@@ -182,14 +196,34 @@ CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID = {
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: (
         "6a254d2d6734b71d8069b6806a81a4e237cc682e3bf6dde4b76b61de7464701b"
     ),
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: (
+        "f6c8305d9ac5c983ceb8f05c40d89308851670972a67105bf253d5056d3418b6"
+    ),
 }
 CLIO_KIT_SPACK_USER_CONTRACT_ARTIFACT_BY_ID = {
     CLIO_KIT_SPACK_USER_CONTRACT_ID: "spack-user-v2.1.json",
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: "spack-user-v2.json",
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: "spack-user-v2.3.json",
+}
+CLIO_KIT_SPACK_USER_WHEEL_VERSION_BY_ID = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: "2.7.2",
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: "2.7.2",
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: "2.8.0",
 }
 CLIO_KIT_SPACK_USER_CONTRACT_SHA256 = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID[
     CLIO_KIT_SPACK_USER_CONTRACT_ID
 ]
+# The audited tool surface per declared contract. v2.1/v2 share the original
+# 3-tool surface; v2.3 adds spack_search/spack_info.
+CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES = frozenset({"spack_find", "spack_locate", "spack_install"})
+CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES = frozenset(
+    {"spack_find", "spack_locate", "spack_install", "spack_search", "spack_info"}
+)
+CLIO_KIT_SPACK_USER_TOOL_NAMES_BY_ID: dict[str, frozenset[str]] = {
+    CLIO_KIT_SPACK_USER_CONTRACT_ID: CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES,
+    CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES,
+    CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES,
+}
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.7.2"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
@@ -785,7 +819,9 @@ class RemoteMcpStructuredResultExpectation(BaseModel):
     schema_version: Literal["clio-relay.remote-mcp-result-expectation.v1"] = (
         "clio-relay.remote-mcp-result-expectation.v1"
     )
-    contract: Literal["clio-kit-spack-user-v2.1", "clio-kit-spack-user-v2"]
+    contract: Literal[
+        "clio-kit-spack-user-v2.1", "clio-kit-spack-user-v2", "clio-kit-spack-user-v2.3"
+    ]
     tool: Literal["spack_find", "spack_locate", "spack_install"]
     package_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9_.+-]+$")
     dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
@@ -806,6 +842,19 @@ class RemoteMcpStructuredResultExpectation(BaseModel):
     @model_validator(mode="after")
     def validate_operation_fields(self) -> RemoteMcpStructuredResultExpectation:
         """Require only the operation-specific expectations used by the contract."""
+        if self.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3 and self.tool == "spack_install":
+            # v2.3 revised spack_install's outputSchema (a single "package" object
+            # plus "prefix"/"load_spec"/"log_path"/"log_tail" replacing the v2.1
+            # "packages" array); _validate_spack_install_result still assumes the
+            # v2.1 shape. Fail closed with a typed reason rather than silently
+            # evaluating the wrong schema -- porting install-result verification
+            # to v2.3 is tracked separately, out of this contract-recognition fix.
+            raise ValueError(
+                "structured-result expectations for spack_install under "
+                "clio-kit-spack-user-v2.3 are not yet supported (v2.3 revised the "
+                "install outputSchema); use spack_find or spack_locate under v2.3, "
+                "or declare the v2.1/v2 contract for install verification"
+            )
         if self.tool == "spack_find":
             if (
                 self.requested_spec is not None
@@ -2171,6 +2220,21 @@ def build_virtual_remote_mcp_catalog(
                         )
                     )
                     continue
+                drift_notice = contract_check.evidence.get("contract_drift_notice")
+                if isinstance(drift_notice, str) and drift_notice:
+                    # Non-fatal: the declared contract still passed (its exact
+                    # tool subset is served unchanged), but the live server has
+                    # moved to a newer audited contract. Record the typed
+                    # notice and keep going -- this registration must NOT be
+                    # silently dropped, and must not be silently "upgraded"
+                    # either (allow_tools still gates on the declared subset).
+                    record_issue(
+                        RemoteMcpCatalogIssue(
+                            cluster=cluster_name,
+                            server_name=server_name,
+                            reason=drift_notice,
+                        )
+                    )
             discovered_names = {tool.name for tool in entry.tools}
             for allowed_tool in registration.allow_tools:
                 if allowed_tool != "*" and allowed_tool not in discovered_names:
@@ -4256,43 +4320,60 @@ def _is_canonical_relative_posix_path(value: object) -> bool:
     return ".." not in path.parts and str(path) == value
 
 
+CLIO_KIT_SPACK_USER_ANNOTATION_EXPECTATIONS: dict[str, dict[str, bool]] = {
+    "spack_find": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "spack_locate": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "spack_install": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    "spack_search": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "spack_info": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+}
+# The one required input property that identifies each tool's request, or
+# ``None`` for spack_find (which takes only an optional query).
+CLIO_KIT_SPACK_USER_REQUIRED_INPUT_PROPERTY: dict[str, str | None] = {
+    "spack_find": None,
+    "spack_locate": "spec",
+    "spack_install": "spec",
+    "spack_search": "query",
+    "spack_info": "package",
+}
+
+
 def _spack_user_contract_check(
     entry: RemoteMcpSchemaCacheEntry | None,
     registration: RemoteMcpServerConfig | None,
 ) -> RemoteMcpAcceptanceCheck:
-    """Require the exact stateless Spack surface approved for desktop agents."""
-    expected_names = {"spack_find", "spack_locate", "spack_install"}
+    """Require the audited stateless Spack surface approved for desktop agents.
+
+    A registration declaring an older contract (v2.1/v2, 3 tools) is accepted
+    when the live server has moved on to a newer *audited* contract (v2.3, 5
+    tools) that still serves every declared tool unchanged: only the declared
+    subset is exposed (``allow_tools`` stays pinned to the declared set), and
+    the acceptance evidence carries a typed ``contract_drift_notice`` naming
+    the live contract so operators can re-register to unlock the rest. This is
+    a forward-compatible subset check, not a rubber stamp: the live server's
+    *full* tool digest must still match one of the SHA-256-pinned contracts
+    this relay build knows about, or the registration fails closed exactly as
+    it always has.
+    """
+    declared_contract = registration.contract if registration is not None else None
+    expected_names: set[str] = set(
+        CLIO_KIT_SPACK_USER_TOOL_NAMES_BY_ID.get(
+            declared_contract or "", CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES
+        )
+    )
     tools = {tool.name: tool for tool in entry.tools} if entry is not None else {}
     actual_names = set(tools)
     allowlisted_names: set[str] = (
         set(registration.allow_tools) if registration is not None else set()
     )
     observed_contract_digest = remote_mcp_schema_digest(list(tools.values()))
-    declared_contract = registration.contract if registration is not None else None
     expected_contract_digest = CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID.get(
         declared_contract or ""
     )
 
-    annotation_expectations: dict[str, dict[str, bool]] = {
-        "spack_find": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "openWorldHint": False,
-        },
-        "spack_locate": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "openWorldHint": False,
-        },
-        "spack_install": {
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "openWorldHint": True,
-        },
-    }
     annotation_matches: dict[str, bool] = {}
     schema_matches: dict[str, bool] = {}
-    for name, expected_annotations in annotation_expectations.items():
+    for name, expected_annotations in CLIO_KIT_SPACK_USER_ANNOTATION_EXPECTATIONS.items():
         tool = tools.get(name)
         annotations = tool.annotations if tool is not None else None
         annotation_matches[name] = annotations is not None and all(
@@ -4303,12 +4384,16 @@ def _spack_user_contract_check(
         required = cast(list[object], raw_required) if isinstance(raw_required, list) else []
         raw_properties = schema.get("properties", {})
         properties = cast(JSON, raw_properties) if isinstance(raw_properties, dict) else {}
+        required_property = CLIO_KIT_SPACK_USER_REQUIRED_INPUT_PROPERTY[name]
         schema_matches[name] = (
             schema.get("type") == "object"
             and schema.get("additionalProperties") is False
             and (
-                name == "spack_find"
-                or ("spec" in required and isinstance(properties.get("spec"), dict))
+                required_property is None
+                or (
+                    required_property in required
+                    and isinstance(properties.get(required_property), dict)
+                )
             )
         )
 
@@ -4332,25 +4417,67 @@ def _spack_user_contract_check(
         and "load_spec" in output_required
     )
 
+    declared_tools_present = expected_names <= actual_names
+    exact_match = actual_names == expected_names
+    drifted = declared_tools_present and not exact_match
+    live_matched_contract_id: str | None = None
+    if not declared_tools_present:
+        digest_ok = False
+    elif exact_match:
+        digest_ok = observed_contract_digest == expected_contract_digest
+        live_matched_contract_id = declared_contract if digest_ok else None
+    else:
+        # Forward-compatible path: the declared tools are all present, plus
+        # undeclared extras. Only accept it when the FULL live surface digest
+        # matches some other contract this relay build has audited by
+        # SHA-256 -- never a blind "newer is fine" acceptance.
+        live_matched_contract_id = next(
+            (
+                candidate_id
+                for candidate_id, digest in CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID.items()
+                if digest == observed_contract_digest
+            ),
+            None,
+        )
+        digest_ok = live_matched_contract_id is not None
+
     passed = (
-        actual_names == expected_names
+        declared_tools_present
         and allowlisted_names == expected_names
         and registration is not None
         and registration.contract in CLIO_KIT_SPACK_USER_CONTRACT_IDS
         and "user" in registration.profiles
-        and all(annotation_matches.values())
-        and all(schema_matches.values())
+        and all(annotation_matches[name] for name in expected_names)
+        and all(schema_matches[name] for name in expected_names)
         and locate_load_spec_matches
-        and observed_contract_digest == expected_contract_digest
+        and digest_ok
     )
+
+    contract_drift_notice: str | None = None
+    message: str
+    if not passed:
+        message = "Spack user tools, allowlist, schemas, or safety annotations drifted"
+    elif drifted:
+        contract_drift_notice = (
+            f"declared contract {declared_contract!r} audits {sorted(expected_names)}; "
+            f"live server now answers {sorted(actual_names)}"
+            + (
+                f", matching audited contract {live_matched_contract_id!r}"
+                if live_matched_contract_id is not None
+                else ""
+            )
+            + f" -- only the declared {sorted(expected_names)} subset is served; "
+            "re-register this remote MCP server with "
+            f"--contract {live_matched_contract_id!r} to expose the rest"
+        )
+        message = contract_drift_notice
+    else:
+        message = "Spack exposes exactly the declared audited contract's tool set and schemas"
+
     return RemoteMcpAcceptanceCheck(
         name="remote-mcp.spack-user-contract",
         passed=passed,
-        message=(
-            "Spack exposes only find, locate, and install with the audited user schemas"
-            if passed
-            else "Spack user tools, allowlist, schemas, or safety annotations drifted"
-        ),
+        message=message,
         evidence={
             "expected_tool_names": sorted(expected_names),
             "remote_tool_names": sorted(actual_names),
@@ -4371,8 +4498,14 @@ def _spack_user_contract_check(
             "expected_contract_artifact_sha256": (
                 CLIO_KIT_SPACK_USER_ARTIFACT_SHA256_BY_ID.get(declared_contract or "")
             ),
-            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION,
+            "expected_clio_kit_version": CLIO_KIT_SPACK_USER_WHEEL_VERSION_BY_ID.get(
+                declared_contract or "", CLIO_KIT_SPACK_USER_WHEEL_VERSION
+            ),
             "observed_contract_sha256": observed_contract_digest,
+            "live_contract_drifted": drifted,
+            "live_matched_contract_id": live_matched_contract_id,
+            "live_tool_names_beyond_declared": sorted(actual_names - expected_names),
+            "contract_drift_notice": contract_drift_notice,
         },
     )
 

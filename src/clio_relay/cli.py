@@ -2317,9 +2317,10 @@ def remote_mcp_register(
         str | None,
         typer.Option(
             help=(
-                "Optional audited semantic contract. Supported: clio-kit-spack-user-v2.1 "
-                "(current), clio-kit-spack-user-v2 (compatibility), "
-                "clio-kit-scientific-catalog-user-v1.1 (current), "
+                "Optional audited semantic contract. Supported: clio-kit-spack-user-v2.3 "
+                "(current, 5 tools), clio-kit-spack-user-v2.1 (compatibility, 3 tools; "
+                "accepted against a live v2.3 server as a subset), clio-kit-spack-user-v2 "
+                "(compatibility), clio-kit-scientific-catalog-user-v1.1 (current), "
                 "clio-kit-scientific-catalog-user-v1 (compatibility)."
             )
         ),
