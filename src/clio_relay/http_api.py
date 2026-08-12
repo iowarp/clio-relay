@@ -48,9 +48,13 @@ from clio_relay.core_queue import (
     INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
     ClioCoreQueue,
 )
+from clio_relay.dev_mode import VerificationFindings
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.jarvis_mcp import (
+    JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON,
+    JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY,
+    JARVIS_MCP_PINNED_LAUNCHER_UNVERIFIED_REASON,
     is_virtual_jarvis_control_query,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding,
@@ -141,6 +145,7 @@ from clio_relay.remote_mcp import (
     resolve_pinned_mcp_admission,
     resolve_registered_remote_mcp_admission,
 )
+from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
@@ -1658,14 +1663,116 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                         "JARVIS MCP artifact identity changed; refresh discovery before submission"
                     ),
                 )
+        # clio-relay#228: resolve the launcher from the CLUSTER's own pinned
+        # runtime (the owned session's frozen relay_install_receipt/dev_mode,
+        # the same per-cluster pins #205 introduced) rather than this
+        # process's ambient current installation -- a multi-tenant host
+        # running more than one relay deployment must never let this pinned
+        # endpoint resolve through another deployment's shared box-global
+        # state. No owned session means no cluster-scoped pin is available;
+        # fall back to the ambient identity exactly as before.
+        #
+        # dev_mode is OR-composed with the host's CLIO_RELAY_DEV_MODE switch
+        # (clio-relay#211: "either is sufficient"). jarvis_mcp_command()
+        # only overrides the host env when it receives a non-None dev_mode,
+        # so an explicit cluster-level ``dev_mode: false`` must still pass
+        # None here rather than False -- otherwise a cluster that never
+        # opted in to dev mode would silently mask CLIO_RELAY_DEV_MODE=1 set
+        # on the host running this session API process.
+        pinned_dev_mode = (
+            True
+            if owner_session_cluster_definition is not None
+            and owner_session_cluster_definition.dev_mode
+            else None
+        )
+        launcher_findings = VerificationFindings()
+        try:
+            # relay_install_receipt may be recorded ``$HOME/``-anchored (the
+            # same convention jarvis_run_environment.registered_site_spack_command
+            # expands for spack_executable). ``Path.expanduser()`` only
+            # expands a leading ``~`` and leaves a literal ``$HOME/`` prefix
+            # untouched, so a ``$HOME/``-anchored pin previously resolved to
+            # a nonexistent path and, because jarvis_mcp_command() silently
+            # fell back to the box default launcher when its receipt_path
+            # override was absent on disk, every such pin silently ran the
+            # wrong (default, unpinned) launcher instead of refusing -- the
+            # exact wrong-tenant hazard #228 exists to kill (clio-relay#228
+            # rework). Expand it against this process's own home before
+            # resolving. This call raises ConfigurationError on a malformed
+            # value; it lives inside this try (not before it) so that
+            # failure surfaces as the same typed 409 below rather than an
+            # unhandled 500 (clio-relay#228 rework round 2).
+            pinned_receipt_path = (
+                Path(
+                    expand_remote_value_on_host(
+                        owner_session_cluster_definition.relay_install_receipt,
+                        field="relay_install_receipt",
+                        home=os.path.expanduser("~"),
+                    )
+                ).expanduser()
+                if owner_session_cluster_definition is not None
+                and owner_session_cluster_definition.relay_install_receipt is not None
+                else None
+            )
+            server = jarvis_mcp_server(
+                receipt_path=pinned_receipt_path,
+                cluster=request.cluster,
+                dev_mode=pinned_dev_mode,
+                # clio-relay#228 rework round 2: this route's own findings
+                # instance, not an internally-constructed-and-discarded one
+                # -- otherwise a dev-mode verification downgrade is recorded
+                # nowhere this caller can read it. Threaded through only the
+                # server call (not server_args below): both calls resolve
+                # the identical receipt/identity, so recording once is
+                # sufficient and avoids double-recording the same warning.
+                findings=launcher_findings,
+            )
+            server_args = jarvis_mcp_server_args(
+                receipt_path=pinned_receipt_path,
+                cluster=request.cluster,
+                dev_mode=pinned_dev_mode,
+            )
+            env_from = jarvis_mcp_env_from()
+        except (ValueError, ConfigurationError) as exc:
+            # clio-relay#228: a launcher-identity verification failure --
+            # including a missing/unloadable EXPLICIT cluster pin -- must
+            # surface typed, never escape as a bare unhandled 500 nor
+            # silently fall back to the default launcher.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # clio-relay#228 rework round 2 (design ruling): dev mode relaxes
+        # VERIFICATION of a receipt, it must never SILENTLY substitute a
+        # different binary with no queryable trace. When resolution above
+        # downgraded a failed identity check to a warning (pinned route: the
+        # pinned receipt's own unverified launcher was used; ambient route:
+        # DEFAULT_JARVIS_MCP_COMMAND was used, its historical behavior),
+        # attach that typed reason to the durable job record -- the same
+        # "never a silent downgrade" contract VerificationFindings/
+        # DEV_MODE_BANNER already establishes for every other dev-mode-gated
+        # check in this codebase.
+        downgrade_payload = launcher_findings.payload()
+        job_metadata: dict[str, object] = (
+            {
+                JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY: {
+                    "reason": (
+                        JARVIS_MCP_PINNED_LAUNCHER_UNVERIFIED_REASON
+                        if pinned_receipt_path is not None
+                        else JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON
+                    ),
+                    "cluster": request.cluster,
+                    **downgrade_payload,
+                }
+            }
+            if downgrade_payload is not None
+            else {}
+        )
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
                 kind=JobKind.MCP_CALL,
                 spec=McpCallSpec(
-                    server=jarvis_mcp_server(),
-                    server_args=jarvis_mcp_server_args(),
-                    env_from=jarvis_mcp_env_from(),
+                    server=server,
+                    server_args=server_args,
+                    env_from=env_from,
                     expected_server_artifact_digest=expected_digest,
                     expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
                     admission_class=admission_class,
@@ -1676,6 +1783,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 ),
                 idempotency_key=request.idempotency_key,
                 used_artifact_refs=request.used_artifact_refs,
+                metadata=job_metadata,
             ),
             owner_session_identity=owner_session_identity,
             mcp_admission_authority=admission_authority,

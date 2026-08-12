@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled, enforce
 from clio_relay.errors import ConfigurationError
+from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.validation_report import (
     EvidenceReference,
     InstallSource,
@@ -1357,6 +1358,18 @@ def worker_runtime_info(
     multi-tenant host can keep its shared ``current`` pointed at a different
     generation for other tenants while one cluster is pinned to its own.
 
+    ``pinned_install_receipt_path`` may be recorded ``$HOME/``-anchored (the
+    same convention ``jarvis_run_environment.registered_site_spack_command``
+    expands for ``spack_executable``, and ``jarvis_mcp.jarvis_mcp_command``
+    expands for its own per-cluster receipt pin, clio-relay#228). It is
+    expanded via :func:`clio_relay.remote_values.expand_remote_value_on_host`
+    against this process's own home before loading -- ``Path.expanduser()``
+    alone only expands a leading ``~`` and silently leaves a literal
+    ``$HOME/`` prefix unresolved, which previously either misreported this
+    #205 identity-verification chain as broken (a nonexistent-path load
+    failure, loud but misleading) or, worse on a shell-quoted remote command
+    line, prevented remote shell expansion entirely.
+
     ``dev_mode`` (clio-relay#211, resolved by the caller from
     ``CLIO_RELAY_DEV_MODE``/the cluster's ``dev_mode`` flag) is threaded
     into the ``current`` self-check so a non-generation dev install here
@@ -1382,8 +1395,14 @@ def worker_runtime_info(
         raise ConfigurationError("current installation snapshot is invalid")
     pinned_installation: dict[str, object] | None = None
     if pinned_install_receipt_path is not None:
-        pinned_receipt_path = Path(pinned_install_receipt_path).expanduser()
         try:
+            pinned_receipt_path = Path(
+                expand_remote_value_on_host(
+                    pinned_install_receipt_path,
+                    field="relay_install_receipt",
+                    home=os.path.expanduser("~"),
+                )
+            ).expanduser()
             pinned_receipt = load_install_receipt(pinned_receipt_path)
         except ConfigurationError as exc:
             raise ConfigurationError(

@@ -33,6 +33,7 @@ from clio_relay.cluster_config import (
     ClusterTargetIdentity,
     FrpTransportConfig,
     RemoteMcpServerConfig,
+    WorkerCapacityPolicy,
     cluster_route_revision,
 )
 from clio_relay.core_queue import ClioCoreQueue
@@ -735,6 +736,273 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
     assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "slurm"
+
+
+def test_endpoint_start_defaults_control_query_concurrency_from_cluster_registry(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: an unpinned worker must never silently start with zero control-query
+    capacity. Historically ``endpoint start`` had its own disconnected CLI
+    default of 0, independent of the cluster's registered WorkerCapacityPolicy
+    (whose own default is 1) -- a fresh deployment that never pins
+    --control-query-concurrency got a worker that accepts describe-class jobs
+    and never runs them, with no typed reason.
+    """
+    captured: dict[str, object] = {}
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    class FakeWorker:
+        def register(self) -> None:
+            captured["registered"] = True
+
+        def run_once(self) -> None:
+            captured["ran_once"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    def load_cluster(cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
+
+    result = CliRunner().invoke(
+        app,
+        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["control_query_concurrency"] == 1
+    assert captured["concurrency"] == 3
+
+
+def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registered_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: WorkerCapacityPolicy.control_query_concurrency requires >= 1, so an
+    operator cannot even pin 0 against a cluster resolved from the registry --
+    reusing that validation (the same one render-user-service relies on)
+    rejects it outright instead of silently starting a worker that will
+    never pick up a describe-class job.
+    """
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "configured-cluster",
+            "--control-query-concurrency",
+            "0",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "control_query_concurrency" in result.output
+
+
+def test_endpoint_start_rejects_concurrency_one_against_a_registered_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219 rework: this is a DELIBERATE side effect of reusing
+    WorkerCapacityPolicy's own validation, pinned here rather than left as an
+    unstated regression risk. --concurrency 1 -- the CLI's own PRE-#219
+    default -- is now a typed refusal against a registered cluster, exactly
+    like --control-query-concurrency 0 above, over-determined by TWO of
+    WorkerCapacityPolicy's own invariants at once: its ``concurrency``
+    field requires >= 2, and even were that alone relaxed, its
+    ``_reserve_a_workload_slot`` model validator independently requires
+    ``control_query_concurrency < concurrency`` -- with the registry's
+    default control_query_concurrency of 1 inherited unpinned here,
+    concurrency=1 collides with it regardless.
+
+    LIVE FACT (resolved, verification round 2): the actual p5run2 worker
+    running on ares (PID 3261405) was started with
+    ``endpoint start --role worker --cluster ares-p5run2 --concurrency 4
+    --control-query-concurrency 1 --kind-concurrency jarvis=2
+    --kind-concurrency mcp_call=3 --scheduler-provider slurm`` -- no live
+    worker uses --concurrency 1, so this refusal matches how the flag is
+    actually operated in the accepted deployment, not merely how it once
+    defaulted.
+    """
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "configured-cluster",
+            "--concurrency",
+            "1",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "concurrency" in result.output
+
+
+def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219 rework: an unpinned --kind-concurrency now INHERITS the cluster's
+    registered WorkerCapacityPolicy.kind_concurrency limits, not "no limits"
+    -- a real behavior change #219's own commit message never stated. Before
+    #219, omitting the flag always meant no per-kind limits regardless of any
+    cluster registration (``_kind_concurrency_options(None)`` == ``{}``,
+    applied unconditionally); now `_resolved_worker_capacity_policy` inherits
+    ``current.kind_concurrency`` from the registry whenever the CLI flag is
+    None and --clear-kind-concurrency was not passed. Pinned here so a future
+    change to that inheritance is a deliberate decision, not a silent drift.
+    """
+    captured: dict[str, object] = {}
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+        worker_capacity=WorkerCapacityPolicy(
+            concurrency=5,
+            control_query_concurrency=1,
+            kind_concurrency={JobKind.MCP_CALL: 2},
+        ),
+    )
+
+    class FakeWorker:
+        def register(self) -> None:
+            pass
+
+        def run_once(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
+
+    result = CliRunner().invoke(
+        app,
+        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kind_concurrency"] == {JobKind.MCP_CALL: 2}
+
+
+def test_endpoint_start_warns_loudly_when_control_query_concurrency_is_explicitly_zero(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219: a worker started with an explicit --scheduler-provider bypasses
+    cluster-registry resolution (test_endpoint_worker_with_explicit_provider_
+    does_not_require_remote_registry) and so is not bound by
+    WorkerCapacityPolicy's >= 1 floor; 0 remains reachable there. It must
+    still surface a loud, typed warning rather than silently starting a
+    worker that will never pick up a describe-class job.
+    """
+
+    class FakeWorker:
+        def register(self) -> None:
+            pass
+
+        def run_once(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        return FakeWorker()
+
+    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
+        raise AssertionError(f"unexpected registry lookup for {cluster}")
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
+
+    zero = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "homelab",
+            "--scheduler-provider",
+            "external",
+            "--control-query-concurrency",
+            "0",
+            "--once",
+        ],
+    )
+    nonzero = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "homelab",
+            "--scheduler-provider",
+            "external",
+            "--control-query-concurrency",
+            "1",
+            "--concurrency",
+            "2",
+            "--once",
+        ],
+    )
+
+    assert zero.exit_code == 0, zero.output
+    assert "control_query_concurrency=0" in zero.output
+    assert "queue forever" in zero.output
+    assert nonzero.exit_code == 0, nonzero.output
+    assert "control_query_concurrency=0" not in nonzero.output
 
 
 def test_endpoint_worker_info_exposes_bounded_readiness_mode(
@@ -8747,6 +9015,155 @@ def test_cli_cluster_pin_runtime_preserves_every_unrelated_cluster_setting(
         updated.relay_install_receipt
         == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
     )
+
+
+def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216: an edit that changes cluster_route_revision must warn loudly at edit
+    time -- cached MCP discovery evidence for the cluster silently strands
+    otherwise, and every call through it fails typed only later, per call.
+    """
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+
+    changed = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-pinning the identical value changes nothing: no repeated warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+
+def test_cli_cluster_add_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216 rework: `cluster add` is one of the three sanctioned edit commands
+    the fix names (add / pin-target / pin-runtime) but only pin-runtime's
+    warning path was pinned by a test above -- this fills that gap for
+    `add`. Re-adding an EXISTING cluster with a changed routing-relevant
+    field (ssh_host) must warn loudly that cached MCP discovery evidence is
+    now stale, exactly like pin-runtime.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    created = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-1"],
+    )
+    assert created.exit_code == 0, created.output
+    # First registration of a NEW cluster has no prior route revision to
+    # compare against (before=None) -- never a warning.
+    assert "route revision changed" not in created.output
+
+    changed = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-adding with the identical routing-relevant fields changes nothing:
+    # no repeated warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+
+def test_cli_cluster_pin_target_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216 rework: `cluster pin-target` is one of the three sanctioned edit
+    commands the fix names (add / pin-target / pin-runtime) but only
+    pin-runtime's warning path was pinned by a test above -- this fills
+    that gap for `pin-target`. target_identity is included in
+    cluster_route_revision()'s digest (it excludes only
+    remote_mcp_servers/worker_capacity), so pinning a physical target
+    identity strands cached MCP discovery evidence exactly like pin-runtime
+    and must warn the same way.
+    """
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+
+    changed = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "ares-p5run2",
+            "--target-hostname",
+            "ares-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:operator-pinned-fingerprint",
+        ],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-pinning the identical target identity changes nothing: no repeated
+    # warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-target",
+            "--cluster",
+            "ares-p5run2",
+            "--target-hostname",
+            "ares-login-1.example.edu",
+            "--ssh-host-key-sha256",
+            "SHA256:operator-pinned-fingerprint",
+        ],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+    # --clear also changes target_identity (back to None) and must warn too.
+    cleared = CliRunner().invoke(
+        app,
+        ["cluster", "pin-target", "--cluster", "ares-p5run2", "--clear"],
+    )
+    assert cleared.exit_code == 0, cleared.output
+    assert "route revision changed" in cleared.output
 
 
 def test_cli_cluster_pin_runtime_clear_is_exclusive_and_preserves_cluster_config(

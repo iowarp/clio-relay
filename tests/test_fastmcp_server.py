@@ -1092,6 +1092,194 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
         )
 
 
+def test_task_projection_conflict_check_ignores_relay_control_only_arguments(
+    tmp_path: Path,
+) -> None:
+    """#218: control-only transport keys must not trip the conflict check.
+
+    ``wait_for_terminal``/``wait_timeout_seconds``/``poll_seconds`` are consumed
+    by clio-relay's own transport layer and never forwarded to the remote MCP
+    server (``VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS``); they cannot change the
+    executed work. A later dispatch of the identical work that varies only in
+    those keys must replay the existing task instead of raising
+    ``QueueConflictError`` -- the door-side bug that produced an unhandled
+    -32603 when a probe omitted ``wait_for_terminal``/``wait_timeout_seconds``
+    relative to an earlier cached dispatch.
+    """
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
+    tool = RelayTool(
+        definition,
+        runtime=runtime,
+        catalog_revision=None,
+        task_capable=True,
+    )
+    result = ToolResult(
+        content=[mcp_types.TextContent(type="text", text="accepted")],
+        structured_content={
+            "job_id": "job-control-only-replay",
+            "state": JobState.QUEUED.value,
+            "terminal": False,
+        },
+    )
+
+    async def scenario() -> None:
+        first = await runtime.create_task(
+            tool=tool,
+            arguments={
+                "value": "same",
+                "wait_for_terminal": False,
+                "wait_timeout_seconds": 600,
+                "poll_seconds": 2,
+            },
+            result=result,
+        )
+        assert first is not None
+        # Same substantive work, but wait_for_terminal/wait_timeout_seconds are
+        # omitted and poll_seconds differs -- exactly the shape that collided
+        # with a cached record in the live repro (clio-relay#218).
+        replay = await runtime.create_task(
+            tool=tool,
+            arguments={"value": "same", "poll_seconds": 5},
+            result=result,
+        )
+        assert replay == first
+
+    asyncio.run(scenario())
+
+
+def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) -> None:
+    """#218: a genuine task-identity conflict must surface as a typed MCPError.
+
+    ``intercept_tool_call`` calls ``create_task`` with no surrounding
+    try/except, so an unhandled ``QueueConflictError`` from ``put_mcp_task``
+    previously escaped through FastMCP's generic handler as a bare, typeless
+    -32603 internal error (the exact live symptom). A real conflict (as
+    opposed to the control-only-argument false positive covered above) must
+    still be refused, but as a typed, queryable MCPError.
+    """
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+    real_put_mcp_task = queue.put_mcp_task
+    conflicting_task_ids: list[str] = []
+
+    def forced_conflict(task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        conflicting_task_ids.append(task.task_id)
+        raise QueueConflictError(
+            f"MCP task identity was reused with different semantics: {task.task_id}"
+        )
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            arguments = _submit_arguments(tmp_path, "typed-conflict")
+            await call_tool_task(client, "relay_submit_agent", arguments)
+            queue.put_mcp_task = forced_conflict  # type: ignore[method-assign]
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(client, "relay_submit_agent", arguments)
+            assert failure.value.code == mcp_types.INVALID_PARAMS
+            assert "different semantics" in str(failure.value)
+            # clio-relay#218 rework: the sibling MCPError raise ~80 lines
+            # above (mcp_task_status_reconciliation_failed) carries
+            # data={"reason": ..., "task_id": ...} so the caller can query
+            # the failure -- this raise must match that pattern too.
+            assert conflicting_task_ids
+            assert failure.value.data == {
+                "reason": "mcp_task_identity_conflict",
+                "task_id": conflicting_task_ids[-1],
+            }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
+
+
+def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#218 rework: _park_agent_input's CAS-exhaustion conflict is
+    a transient concurrency conflict, never a client parameter problem -- it
+    must not be mistyped as MCPError(INVALID_PARAMS) the way put_mcp_task's
+    genuine task-identity-reuse conflict correctly is (test above). Forcing
+    every update_mcp_task_projection call to conflict exhausts
+    _park_agent_input's 8 retry attempts and raises
+    TaskInputParkConflictError, which intercept_tool_call deliberately
+    leaves unwrapped.
+    """
+
+    def create_test_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+
+    def accept_test_path(path: Path, *, directory: bool) -> None:
+        if directory:
+            create_test_directory(path)
+
+    for module_name in (
+        "clio_relay.cluster_config",
+        "clio_relay.core_queue",
+        "clio_relay.worker_lifetime_lock",
+    ):
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_directory",
+            create_test_directory,
+        )
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_path",
+            accept_test_path,
+        )
+
+    def _open_atomic(path: Path) -> BinaryIO:
+        return path.open("xb")
+
+    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+
+    def _no_cluster(_cluster: str) -> None:
+        return None
+
+    monkeypatch.setattr("clio_relay.mcp_server._optional_cluster_definition", _no_cluster)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+
+    def always_conflict(*args: Any, **kwargs: Any) -> RelayMcpTaskRecord:
+        raise QueueConflictError("forced permanent parking CAS conflict")
+
+    monkeypatch.setattr(queue, "update_mcp_task_projection", always_conflict)
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            arguments = {
+                **_submit_arguments(tmp_path, "park-cas-exhaustion"),
+                "request_followup_message": True,
+            }
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(client, "relay_submit_agent", arguments)
+            # FastMCP's generic handler surfaces this exactly as it did for
+            # ANY unhandled QueueConflictError before #218 -- a bare,
+            # typeless INTERNAL_ERROR. What #218 rework must guarantee is
+            # narrower: this is never MCPError(INVALID_PARAMS), the code
+            # that tells a client "your parameters are wrong" when the real
+            # cause is transient server-side CAS contention.
+            assert failure.value.code == mcp_types.INTERNAL_ERROR
+            assert failure.value.code != mcp_types.INVALID_PARAMS
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------------- #
 # C1 fixtures: sanitized, structurally-verbatim captures from a live p5run2
 # relay deployment's durable MCP task records
@@ -1522,8 +1710,9 @@ def test_create_task_eager_promotion_preserves_a_failed_dispatchs_evidence(
         assert mcp_result["protocol_error"] == "tools/call returned isError=true"
         assert mcp_result["returncode"] == 1
         assert mcp_result["protocol_result"]["isError"] is True
-        assert _LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE in (
-            mcp_result["protocol_result"]["content"][0]["text"]
+        assert (
+            _LIVE_FAILED_DESCRIBE_REMOTE_MESSAGE
+            in (mcp_result["protocol_result"]["content"][0]["text"])
         )
         # C1's shape claim, not just the outcome: the failed eager document
         # must ALSO be the nested job/relay_queue wait shape, never the flat

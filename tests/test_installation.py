@@ -43,6 +43,7 @@ from clio_relay.installation import (
 )
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+    DEFAULT_JARVIS_MCP_COMMAND,
     JARVIS_MCP_COMMAND_ENV,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
@@ -2102,6 +2103,133 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
     assert "identity_matches_pinned" not in readiness
 
 
+def test_worker_runtime_info_expands_home_anchored_pinned_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2 (ledger item 2, worker_runtime_info):
+    ``pinned_install_receipt_path`` may ALSO be recorded ``$HOME/``-anchored
+    -- the same convention ``jarvis_mcp.jarvis_mcp_command`` already expands
+    for its own per-cluster receipt pin. ``Path.expanduser()`` alone only
+    expands a leading ``~`` and silently leaves a literal ``$HOME/`` prefix
+    unresolved, breaking the #205 ``identity_matches_pinned`` chain: the
+    reviewer confirmed this is real and doubly dangerous -- a bare
+    ``Path(...).expanduser()`` load failure is loud but MISLEADING (reads as
+    "receipt missing/corrupt", not "path never expanded"), and on a
+    shell-quoted remote command line the raw ``$HOME`` token would not even
+    undergo remote shell expansion, so the failure mode is not confined to
+    this local read path either.
+    """
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.models import EndpointRegistration, EndpointRole
+
+    root = tmp_path / "core"
+    fake_home = tmp_path / "home" / "operator"
+
+    pinned_wheel = fake_home / "deployment-p5run2" / "clio_relay-pinned.whl"
+    pinned_wheel.parent.mkdir(parents=True, exist_ok=True)
+    pinned_wheel.write_bytes(b"pinned-generation-wheel")
+    pinned_receipt_path = fake_home / "deployment-p5run2" / "install-receipt.json"
+    pinned_receipt = write_install_receipt(
+        install_spec=str(pinned_wheel),
+        artifact_path=pinned_wheel,
+        path=pinned_receipt_path,
+        generation="c" * 64,
+    )
+    worker_identity = installation_info(pinned_receipt_path)
+
+    current_wheel = tmp_path / "clio_relay-current.whl"
+    current_wheel.write_bytes(b"shared-tenant-current-wheel")
+    current_receipt_path = tmp_path / "current-receipt.json"
+    write_install_receipt(
+        install_spec=str(current_wheel),
+        artifact_path=current_wheel,
+        path=current_receipt_path,
+        generation="d" * 64,
+    )
+    current_identity = installation_info(current_receipt_path)
+
+    queue = ClioCoreQueue(root)
+    queue.register_endpoint(
+        EndpointRegistration(
+            endpoint_id="endpoint_pinned_worker",
+            role=EndpointRole.WORKER,
+            cluster="ares-p5run2",
+            hostname="worker",
+            pid=os.getpid(),
+            metadata={
+                "installation_info": worker_identity,
+                "scheduler_provider": "slurm",
+            },
+        )
+    )
+
+    def worker_process_matches(_pid: int) -> bool:
+        return True
+
+    def current_installation(**_kwargs: object) -> dict[str, object]:
+        return current_identity
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
+    monkeypatch.setattr(installation_module, "installation_info", current_installation)
+    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+
+    result = worker_runtime_info(
+        cluster="ares-p5run2",
+        freshness_seconds=120,
+        pinned_install_receipt_path="$HOME/deployment-p5run2/install-receipt.json",
+    )
+
+    assert result["identity_matches_pinned"] is True
+    assert result["pinned_installation"] == pinned_receipt.model_dump(mode="json")
+
+
+def test_worker_runtime_info_unloadable_home_anchored_pin_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: before the fix, a ``$HOME/``-anchored
+    pin that a real remote worker would resolve correctly instead resolved
+    to a literal, nonexistent ``$HOME/...`` path here and failed with a
+    misleading "could not be loaded" refusal even though the receipt was
+    perfectly readable at its true (expanded) location. This sabotage-style
+    check proves the CURRENT (fixed) code raises only for a GENUINELY
+    missing receipt, not for a merely-unexpanded one.
+
+    Pinned-receipt resolution happens before any fresh-endpoint scan, so no
+    registered worker endpoint is needed here -- only a schema-valid
+    ``current_installation`` stand-in (this test process is not itself a
+    persistent uv tool install, so the real ``installation_info()`` would
+    raise for an unrelated reason before ever reaching the code under test).
+    """
+    fake_home = tmp_path / "home" / "operator"
+    fake_home.mkdir(parents=True, exist_ok=True)
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"cluster ares-p5run2 pinned install receipt could not be loaded",
+    ):
+        worker_runtime_info(
+            cluster="ares-p5run2",
+            freshness_seconds=120,
+            current_installation={"schema_version": "clio-relay.installation-info.v1"},
+            pinned_install_receipt_path="$HOME/deployment-p5run2/install-receipt.json",
+        )
+
+
 def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2341,6 +2469,181 @@ def test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool(
     assert runtime["clio-kit"]["command_matches_receipt"] is True
     assert runtime["clio-kit"]["launcher"] == "uv tool"
     assert runtime["clio-kit"]["persistent_tool_verified"] is True
+
+
+def _write_verified_jarvis_receipt(
+    root: Path,
+    *,
+    tool_name: str,
+    version: str,
+) -> tuple[Path, list[str], PersistentUvToolIdentity]:
+    """Build one fully-verified receipt-bound clio-kit JARVIS command at ``root``."""
+    root.mkdir(parents=True, exist_ok=True)
+    relay_wheel = root / "clio_relay-1.0.0-py3-none-any.whl"
+    relay_wheel.write_bytes(b"relay-wheel")
+    clio_kit_wheel = root / f"clio_kit-{version}-py3-none-any.whl"
+    clio_kit_wheel.write_bytes(tool_name.encode("utf-8"))
+    tool = root / f"{tool_name}.exe"
+    tool.write_bytes(tool_name.encode("utf-8"))
+    uv = root / "uv.exe"
+    uv.write_bytes(b"uv")
+    persistent_tool = PersistentUvToolIdentity(
+        uv_executable=str(uv.resolve()),
+        uv_version="0.11.28",
+        uv_executable_sha256=hashlib.sha256(b"uv").hexdigest(),
+        tool_directory=str(root / "tools"),
+        tool_bin_directory=str(root),
+        environment_prefix=str(root / "tools" / "clio-kit"),
+        provider_interpreter=sys.executable,
+        provider_interpreter_sha256="a" * 64,
+        tool_executable=str(tool.resolve()),
+        tool_executable_resolved=str(tool.resolve()),
+        tool_executable_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        distribution_console_script_path=str(tool.resolve()),
+        distribution_console_script_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        uv_receipt_path=str(root / "tools" / "clio-kit" / "uv-receipt.toml"),
+        uv_receipt_sha256="d" * 64,
+        distribution="clio-kit",
+        distribution_version=version,
+        distribution_metadata_path=str(root / "clio-kit.dist-info"),
+        entry_point="clio-kit",
+        source_artifact_path=str(clio_kit_wheel.resolve()),
+        source_artifact_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        record_path=str(root / "clio-kit.dist-info" / "RECORD"),
+        record_sha256="b" * 64,
+        runtime_closure_sha256="c" * 64,
+        runtime_file_count=10,
+        runtime_bytes=1_024,
+        pyvenv_uv_version="0.11.28",
+    )
+    command = [str(tool), "mcp-server", "jarvis"]
+    receipt_path = root / "install-receipt.json"
+    write_install_receipt(
+        install_spec=str(relay_wheel),
+        artifact_path=relay_wheel,
+        path=receipt_path,
+        components={"clio-kit": version},
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                distribution_version=version,
+                install_spec=f"clio-kit=={version}",
+                requested_source="pypi",
+                artifact_filename=clio_kit_wheel.name,
+                artifact_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+                runtime_artifact_path=str(clio_kit_wheel),
+                runtime_command=command,
+                runtime_interpreters={"provider": sys.executable},
+                runtime_executables={"clio-kit": str(tool), "uv": str(uv)},
+                persistent_tool=persistent_tool,
+                locked_server_runtime=_verified_locked_jarvis_runtime(),
+            )
+        },
+    )
+    return receipt_path, command, persistent_tool
+
+
+def test_jarvis_mcp_command_receipt_path_overrides_ambient_current_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#228: an explicit receipt_path must win over the ambient/global receipt.
+
+    The pinned ``/jobs/jarvis-mcp-call`` route resolved its launcher via this
+    PROCESS's ambient current installation (``CLIO_RELAY_INSTALL_RECEIPT`` /
+    the box-global ``current`` symlink fallback) rather than the CLUSTER's
+    own registered ``relay_install_receipt`` -- on a multi-tenant host, a
+    version-skewed shared tenant's receipt bricks every call with a bare
+    500. ``receipt_path`` must be honored over the ambient identity so the
+    caller can pin resolution to its own deployment.
+    """
+    ambient_path, ambient_command, ambient_tool = _write_verified_jarvis_receipt(
+        tmp_path / "ambient-shared-tenant",
+        tool_name="ambient-clio-kit",
+        version="1.5.10",
+    )
+    pinned_path, pinned_command, pinned_tool = _write_verified_jarvis_receipt(
+        tmp_path / "deployment-p5run2",
+        tool_name="pinned-clio-kit",
+        version="2.7.2",
+    )
+    assert ambient_command != pinned_command
+
+    def persistent_identity(*, tool_executable: str, **_kwargs: object) -> PersistentUvToolIdentity:
+        return ambient_tool if tool_executable == ambient_tool.tool_executable else pinned_tool
+
+    monkeypatch.setattr(
+        "clio_relay.installation.probe_persistent_uv_tool_identity",
+        persistent_identity,
+    )
+    # The ambient/global installation (what an unpinned lookup would resolve).
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(ambient_path))
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+
+    assert jarvis_mcp_command() == ambient_command
+    assert jarvis_mcp_command(receipt_path=pinned_path) == pinned_command
+
+
+def test_jarvis_mcp_command_explicit_receipt_path_missing_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: a missing EXPLICIT (cluster-pinned) receipt_path
+    must refuse typed, never silently fall back to DEFAULT_JARVIS_MCP_COMMAND.
+
+    Before this rework, ``jarvis_mcp_command()`` treated an explicit
+    ``receipt_path`` override exactly like the OMITTED/ambient case: any
+    nonexistent path -- including a real cluster pin that simply hasn't been
+    written yet, or one mistyped in the registry -- silently ran the
+    box-global default launcher instead of refusing. On a multi-tenant host
+    that is the exact wrong-tenant hazard clio-relay#228 exists to kill: an
+    operator who believes they pinned a specific deployment's launcher would
+    instead silently get whatever unrelated deployment's launcher the shared
+    box default happens to resolve. The OMITTED case (no cluster-scoped pin
+    at all) keeps the historical silent fallback unchanged.
+    """
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+    monkeypatch.delenv(INSTALL_RECEIPT_PATH_ENV, raising=False)
+    missing_receipt = tmp_path / "deployment-p5run2" / "install-receipt.json"
+    assert not missing_receipt.exists()
+
+    with pytest.raises(
+        ValueError,
+        match=r"cluster test-cluster pinned install receipt could not be loaded",
+    ):
+        jarvis_mcp_command(receipt_path=missing_receipt, cluster="test-cluster")
+
+    # Without a cluster name the refusal still fires, just without the
+    # worker_runtime_info-style "cluster {cluster}" prefix.
+    with pytest.raises(ValueError, match=r"^pinned install receipt could not be loaded"):
+        jarvis_mcp_command(receipt_path=missing_receipt)
+
+    # Sabotage check: the OMITTED (ambient) case -- no receipt anywhere on
+    # this box -- must be entirely unaffected and keep its historical
+    # silent fallback.
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(missing_receipt))
+    assert jarvis_mcp_command() == list(DEFAULT_JARVIS_MCP_COMMAND)
+
+
+def test_jarvis_mcp_command_explicit_receipt_path_unloadable_refuses_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: an EXPLICIT receipt that EXISTS but cannot be
+    parsed must also refuse typed rather than fall back silently -- the
+    missing-file case above only covers ``Path.exists()``; a corrupt/
+    truncated receipt on disk must be caught too.
+    """
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+    corrupt_receipt = tmp_path / "deployment-p5run2" / "install-receipt.json"
+    corrupt_receipt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_receipt.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"cluster test-cluster pinned install receipt could not be loaded",
+    ):
+        jarvis_mcp_command(receipt_path=corrupt_receipt, cluster="test-cluster")
 
 
 def test_jarvis_mcp_command_dev_mode_downgrades_missing_component_to_warning(

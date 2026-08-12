@@ -95,6 +95,7 @@ from clio_relay.pagination import (
     validate_record_cursor,
     validate_response_page_limit,
 )
+from clio_relay.remote_mcp import VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
 from clio_relay.worker_concurrency import KindConcurrencyInput, normalize_kind_concurrency
 from clio_relay.worker_lifetime_lock import (
     LockedCoreIdentity,
@@ -7492,7 +7493,8 @@ class ClioCoreQueue:
                     or existing.job_id != task.job_id
                     or persisted.tool_name != requested.tool_name
                     or persisted.profile != requested.profile
-                    or persisted.arguments != requested.arguments
+                    or _canonical_mcp_task_arguments(persisted.arguments)
+                    != _canonical_mcp_task_arguments(requested.arguments)
                     or persisted.catalog_revision != requested.catalog_revision
                     or {field: persisted.initial_result.get(field) for field in route_fields}
                     != {field: requested.initial_result.get(field) for field in route_fields}
@@ -15878,6 +15880,27 @@ def _unlink_durable_path(path: Path, *, missing_ok: bool = False) -> None:
             ):
                 raise
             time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
+
+
+def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Strip clio-relay's own transport-control keys before a task identity compare.
+
+    ``VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS`` (``idempotency_key``,
+    ``wait_for_terminal``, ``wait_timeout_seconds``, ``poll_seconds``,
+    ``include_logs``, ``log_limit``) are consumed by clio-relay's own MCP
+    transport and never forwarded to the remote server -- they cannot change
+    the executed work. ``put_mcp_task``'s replay-vs-conflict check must
+    compare the same canonical identity the job queue's own idempotency
+    digest already uses (``_job_idempotency_digest`` never sees these keys,
+    since they are stripped before a ``RelayJob.spec.arguments`` is built), or
+    two dispatches of identical work that differ only in a transport control
+    incorrectly raise ``QueueConflictError`` (clio-relay#218).
+    """
+    return {
+        key: value
+        for key, value in arguments.items()
+        if key not in VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
+    }
 
 
 def _job_idempotency_digest(job: RelayJob) -> str:
