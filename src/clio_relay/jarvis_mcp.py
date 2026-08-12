@@ -38,7 +38,7 @@ CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
     "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.7"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -77,7 +77,7 @@ JSON = dict[str, Any]
 # modules carried independent duplicate literals for the same clio-kit
 # contract digest until clio-relay#199 consolidated them to remote_mcp's
 # CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID as the sole source of truth.
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.6.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.7.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",

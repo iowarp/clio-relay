@@ -261,8 +261,8 @@ class ClusterTargetIdentity(BaseModel):
 
 RemoteMcpProfile = Literal["user", "admin", "operator"]
 RemoteMcpContract = Literal[
+    "clio-kit-jarvis-user-v3.7",
     "clio-kit-jarvis-user-v3.6",
-    "clio-kit-jarvis-user-v3.5",
     "clio-kit-spack-user-v2.3",
     "clio-kit-spack-user-v2.1",
     "clio-kit-spack-user-v2",
