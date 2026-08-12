@@ -63,6 +63,7 @@ from clio_relay.cluster_config import (
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
     acquire_private_configuration_windows_parent_guard,
+    cluster_route_revision,
     default_registry_path,
     ensure_private_configuration_windows_handle,
     open_private_atomic_file,
@@ -1851,6 +1852,36 @@ def cluster_list() -> None:
         )
 
 
+def _route_revision_before_edit(cluster: str) -> str | None:
+    """Return the cluster's current route revision, or None when unconfigured."""
+    try:
+        return cluster_route_revision(
+            ClusterRegistry.load(default_registry_path()).require(cluster)
+        )
+    except ConfigurationError:
+        return None
+
+
+def _warn_if_route_revision_changed(cluster: str, *, before: str | None, after: str) -> None:
+    """Warn loudly when an edit strands cached MCP discovery evidence (clio-relay#216).
+
+    ``cluster_route_revision()`` covers every routing-relevant field except
+    ``remote_mcp_servers``/``worker_capacity``. Every call routed through
+    cached MCP discovery evidence (minted by ``remote-mcp refresh``) fails
+    typed only once dispatched -- and only per call, well after this edit --
+    unless the operator is warned here, at edit time, that a refresh is due.
+    """
+    if before is not None and before != after:
+        typer.echo(
+            f"warning: cluster {cluster!r} route revision changed "
+            f"({before[:12]} -> {after[:12]}); cached MCP discovery evidence for this "
+            f"cluster is now stale. Run 'clio-relay remote-mcp refresh --cluster {cluster}' "
+            "before the next MCP call through it, or every call will fail typed (409) only "
+            "after its full dispatch budget.",
+            err=True,
+        )
+
+
 @cluster_app.command("add")
 def cluster_add(
     name: Annotated[str, typer.Option(help="Cluster name used by relay jobs.")],
@@ -2059,9 +2090,15 @@ def cluster_add(
         )
     except ValidationError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    before_revision = _route_revision_before_edit(name)
     ClusterRegistry.mutate(
         default_registry_path(),
         lambda registry: registry.clusters.__setitem__(name, definition),
+    )
+    _warn_if_route_revision_changed(
+        name,
+        before=before_revision,
+        after=cluster_route_revision(definition),
     )
     typer.echo(f"{name} ssh={ssh_host} profile={bootstrap_profile}")
 
@@ -2129,8 +2166,14 @@ def cluster_pin_target(
     def update_target_identity(registry: ClusterRegistry) -> None:
         registry.require(cluster).target_identity = target_identity
 
+    before_revision = _route_revision_before_edit(cluster)
     registry = ClusterRegistry.mutate(default_registry_path(), update_target_identity)
     definition = registry.require(cluster)
+    _warn_if_route_revision_changed(
+        cluster,
+        before=before_revision,
+        after=cluster_route_revision(definition),
+    )
     typer.echo(
         json.dumps(
             {
@@ -2192,11 +2235,17 @@ def cluster_pin_runtime(
             if install_receipt is not None:
                 definition.relay_install_receipt = install_receipt
 
+    before_revision = _route_revision_before_edit(cluster)
     try:
         registry = ClusterRegistry.mutate(default_registry_path(), update_pinned_runtime)
     except ValidationError as exc:
         raise typer.BadParameter(str(exc)) from exc
     definition = registry.require(cluster)
+    _warn_if_route_revision_changed(
+        cluster,
+        before=before_revision,
+        after=cluster_route_revision(definition),
+    )
     typer.echo(
         json.dumps(
             {

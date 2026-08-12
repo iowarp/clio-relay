@@ -8749,6 +8749,51 @@ def test_cli_cluster_pin_runtime_preserves_every_unrelated_cluster_setting(
     )
 
 
+def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#216: an edit that changes cluster_route_revision must warn loudly at edit
+    time -- cached MCP discovery evidence for the cluster silently strands
+    otherwise, and every call through it fails typed only later, per call.
+    """
+    monkeypatch.chdir(tmp_path)
+    registry_path = tmp_path / ".clio-relay" / "clusters.json"
+    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
+    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
+
+    changed = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "route revision changed" in changed.output
+    assert "stale" in changed.output
+    assert "remote-mcp refresh" in changed.output
+
+    # Re-pinning the identical value changes nothing: no repeated warning noise.
+    unchanged = CliRunner().invoke(
+        app,
+        [
+            "cluster",
+            "pin-runtime",
+            "--cluster",
+            "ares-p5run2",
+            "--install-receipt",
+            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
+        ],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert "route revision changed" not in unchanged.output
+
+
 def test_cli_cluster_pin_runtime_clear_is_exclusive_and_preserves_cluster_config(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
