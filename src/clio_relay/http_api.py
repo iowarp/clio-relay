@@ -1658,14 +1658,47 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                         "JARVIS MCP artifact identity changed; refresh discovery before submission"
                     ),
                 )
+        # clio-relay#228: resolve the launcher from the CLUSTER's own pinned
+        # runtime (the owned session's frozen relay_install_receipt/dev_mode,
+        # the same per-cluster pins #205 introduced) rather than this
+        # process's ambient current installation -- a multi-tenant host
+        # running more than one relay deployment must never let this pinned
+        # endpoint resolve through another deployment's shared box-global
+        # state. No owned session means no cluster-scoped pin is available;
+        # fall back to the ambient identity exactly as before.
+        pinned_receipt_path = (
+            Path(owner_session_cluster_definition.relay_install_receipt).expanduser()
+            if owner_session_cluster_definition is not None
+            and owner_session_cluster_definition.relay_install_receipt is not None
+            else None
+        )
+        pinned_dev_mode = (
+            owner_session_cluster_definition.dev_mode
+            if owner_session_cluster_definition is not None
+            else None
+        )
+        try:
+            server = jarvis_mcp_server(
+                receipt_path=pinned_receipt_path,
+                dev_mode=pinned_dev_mode,
+            )
+            server_args = jarvis_mcp_server_args(
+                receipt_path=pinned_receipt_path,
+                dev_mode=pinned_dev_mode,
+            )
+            env_from = jarvis_mcp_env_from()
+        except ValueError as exc:
+            # clio-relay#228: a launcher-identity verification failure must
+            # surface typed, never escape as a bare unhandled 500.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
                 kind=JobKind.MCP_CALL,
                 spec=McpCallSpec(
-                    server=jarvis_mcp_server(),
-                    server_args=jarvis_mcp_server_args(),
-                    env_from=jarvis_mcp_env_from(),
+                    server=server,
+                    server_args=server_args,
+                    env_from=env_from,
                     expected_server_artifact_digest=expected_digest,
                     expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
                     admission_class=admission_class,

@@ -214,10 +214,20 @@ _VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES = _load_bundled_jarvis_user_c
 
 def jarvis_mcp_command(
     *,
+    receipt_path: Path | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
 ) -> list[str]:
     """Return the command used on the cluster to launch the JARVIS MCP server.
+
+    ``receipt_path`` pins resolution to one exact install receipt -- normally
+    the CLUSTER's own registered ``relay_install_receipt`` (clio-relay#205's
+    per-cluster pin) -- instead of this PROCESS's ambient current installation
+    (:func:`clio_relay.installation.default_install_receipt_path`, which
+    resolves through the box-global ``current`` symlink). A multi-tenant host
+    running more than one relay deployment must never let one deployment's
+    JARVIS MCP launcher resolve through another's shared box-global state
+    (clio-relay#228); omit it only where no cluster-scoped pin is available.
 
     ``dev_mode`` defaults to :func:`clio_relay.dev_mode.dev_mode_enabled` (the
     ``CLIO_RELAY_DEV_MODE`` environment switch) when omitted, so every
@@ -235,7 +245,7 @@ def jarvis_mcp_command(
         return _decode_command(configured)
     from clio_relay.installation import default_install_receipt_path, load_install_receipt
 
-    receipt_path = default_install_receipt_path()
+    receipt_path = receipt_path if receipt_path is not None else default_install_receipt_path()
     if not receipt_path.exists():
         return list(DEFAULT_JARVIS_MCP_COMMAND)
     receipt = load_install_receipt(receipt_path)
@@ -559,14 +569,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def jarvis_mcp_server() -> str:
+def jarvis_mcp_server(
+    *,
+    receipt_path: Path | None = None,
+    dev_mode: bool | None = None,
+) -> str:
     """Return the executable component of the JARVIS MCP command."""
-    return jarvis_mcp_command()[0]
+    return jarvis_mcp_command(receipt_path=receipt_path, dev_mode=dev_mode)[0]
 
 
-def jarvis_mcp_server_args() -> list[str]:
+def jarvis_mcp_server_args(
+    *,
+    receipt_path: Path | None = None,
+    dev_mode: bool | None = None,
+) -> list[str]:
     """Return the argument component of the JARVIS MCP command."""
-    return jarvis_mcp_command()[1:]
+    return jarvis_mcp_command(receipt_path=receipt_path, dev_mode=dev_mode)[1:]
 
 
 def is_virtual_jarvis_control_query(remote_tool: str) -> bool:

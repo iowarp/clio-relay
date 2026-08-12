@@ -2343,6 +2343,119 @@ def test_jarvis_mcp_defaults_to_persistent_receipt_bound_clio_kit_tool(
     assert runtime["clio-kit"]["persistent_tool_verified"] is True
 
 
+def _write_verified_jarvis_receipt(
+    root: Path,
+    *,
+    tool_name: str,
+    version: str,
+) -> tuple[Path, list[str], PersistentUvToolIdentity]:
+    """Build one fully-verified receipt-bound clio-kit JARVIS command at ``root``."""
+    root.mkdir(parents=True, exist_ok=True)
+    relay_wheel = root / "clio_relay-1.0.0-py3-none-any.whl"
+    relay_wheel.write_bytes(b"relay-wheel")
+    clio_kit_wheel = root / f"clio_kit-{version}-py3-none-any.whl"
+    clio_kit_wheel.write_bytes(tool_name.encode("utf-8"))
+    tool = root / f"{tool_name}.exe"
+    tool.write_bytes(tool_name.encode("utf-8"))
+    uv = root / "uv.exe"
+    uv.write_bytes(b"uv")
+    persistent_tool = PersistentUvToolIdentity(
+        uv_executable=str(uv.resolve()),
+        uv_version="0.11.28",
+        uv_executable_sha256=hashlib.sha256(b"uv").hexdigest(),
+        tool_directory=str(root / "tools"),
+        tool_bin_directory=str(root),
+        environment_prefix=str(root / "tools" / "clio-kit"),
+        provider_interpreter=sys.executable,
+        provider_interpreter_sha256="a" * 64,
+        tool_executable=str(tool.resolve()),
+        tool_executable_resolved=str(tool.resolve()),
+        tool_executable_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        distribution_console_script_path=str(tool.resolve()),
+        distribution_console_script_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        uv_receipt_path=str(root / "tools" / "clio-kit" / "uv-receipt.toml"),
+        uv_receipt_sha256="d" * 64,
+        distribution="clio-kit",
+        distribution_version=version,
+        distribution_metadata_path=str(root / "clio-kit.dist-info"),
+        entry_point="clio-kit",
+        source_artifact_path=str(clio_kit_wheel.resolve()),
+        source_artifact_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+        record_path=str(root / "clio-kit.dist-info" / "RECORD"),
+        record_sha256="b" * 64,
+        runtime_closure_sha256="c" * 64,
+        runtime_file_count=10,
+        runtime_bytes=1_024,
+        pyvenv_uv_version="0.11.28",
+    )
+    command = [str(tool), "mcp-server", "jarvis"]
+    receipt_path = root / "install-receipt.json"
+    write_install_receipt(
+        install_spec=str(relay_wheel),
+        artifact_path=relay_wheel,
+        path=receipt_path,
+        components={"clio-kit": version},
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                distribution_version=version,
+                install_spec=f"clio-kit=={version}",
+                requested_source="pypi",
+                artifact_filename=clio_kit_wheel.name,
+                artifact_sha256=hashlib.sha256(tool_name.encode("utf-8")).hexdigest(),
+                runtime_artifact_path=str(clio_kit_wheel),
+                runtime_command=command,
+                runtime_interpreters={"provider": sys.executable},
+                runtime_executables={"clio-kit": str(tool), "uv": str(uv)},
+                persistent_tool=persistent_tool,
+                locked_server_runtime=_verified_locked_jarvis_runtime(),
+            )
+        },
+    )
+    return receipt_path, command, persistent_tool
+
+
+def test_jarvis_mcp_command_receipt_path_overrides_ambient_current_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#228: an explicit receipt_path must win over the ambient/global receipt.
+
+    The pinned ``/jobs/jarvis-mcp-call`` route resolved its launcher via this
+    PROCESS's ambient current installation (``CLIO_RELAY_INSTALL_RECEIPT`` /
+    the box-global ``current`` symlink fallback) rather than the CLUSTER's
+    own registered ``relay_install_receipt`` -- on a multi-tenant host, a
+    version-skewed shared tenant's receipt bricks every call with a bare
+    500. ``receipt_path`` must be honored over the ambient identity so the
+    caller can pin resolution to its own deployment.
+    """
+    ambient_path, ambient_command, ambient_tool = _write_verified_jarvis_receipt(
+        tmp_path / "ambient-shared-tenant",
+        tool_name="ambient-clio-kit",
+        version="1.5.10",
+    )
+    pinned_path, pinned_command, pinned_tool = _write_verified_jarvis_receipt(
+        tmp_path / "deployment-p5run2",
+        tool_name="pinned-clio-kit",
+        version="2.7.2",
+    )
+    assert ambient_command != pinned_command
+
+    def persistent_identity(*, tool_executable: str, **_kwargs: object) -> PersistentUvToolIdentity:
+        return ambient_tool if tool_executable == ambient_tool.tool_executable else pinned_tool
+
+    monkeypatch.setattr(
+        "clio_relay.installation.probe_persistent_uv_tool_identity",
+        persistent_identity,
+    )
+    # The ambient/global installation (what an unpinned lookup would resolve).
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(ambient_path))
+    monkeypatch.delenv(JARVIS_MCP_COMMAND_ENV, raising=False)
+
+    assert jarvis_mcp_command() == ambient_command
+    assert jarvis_mcp_command(receipt_path=pinned_path) == pinned_command
+
+
 def test_jarvis_mcp_command_dev_mode_downgrades_missing_component_to_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
