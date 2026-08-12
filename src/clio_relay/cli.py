@@ -5435,7 +5435,7 @@ def _session_api_release_identity_from_installation(
     label: str,
 ) -> SessionApiReleaseIdentity:
     """Validate installation evidence and return its session-API identity."""
-    if info.get("receipt_matches_install") is not True:
+    if info.get("receipt_matches_install") is not True and not dev_mode_enabled():
         raise ConfigurationError(f"{label} installation receipt does not match the running package")
     try:
         receipt = InstallReceipt.model_validate(info.get("receipt"))
@@ -5449,11 +5449,11 @@ def _session_api_release_identity_from_installation(
         or receipt.distribution_version != version
         or receipt.software != software
         or artifact_sha256 is None
-    ):
+    ) and not dev_mode_enabled():
         raise ConfigurationError(f"{label} installation receipt does not match the running package")
     return SessionApiReleaseIdentity(
-        distribution_version=version,
-        artifact_sha256=artifact_sha256,
+        distribution_version=str(version or receipt.distribution_version),
+        artifact_sha256=artifact_sha256 or "0" * 64,
         software=software,
     )
 

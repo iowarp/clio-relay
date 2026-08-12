@@ -5329,7 +5329,12 @@ def execute_owned_session_start(
         request.expected_api_release_identity is not None
         and release_identity != request.expected_api_release_identity
     ):
-        raise RelayError("session API installation changed after compatibility verification")
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise RelayError(
+                "session API installation changed after compatibility verification"
+            )
     api_token = _owned_session_api_token(require_token=request.require_token)
     settings_core_dir = RelaySettings.from_env().core_dir if core_dir is None else core_dir
     queue = ClioCoreQueue(settings_core_dir)

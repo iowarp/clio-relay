@@ -3495,9 +3495,12 @@ def resolve_receipt_bound_jarvis_python(
         installation.get("schema_version") != "clio-relay.installation-info.v1"
         or installation.get("receipt_matches_install") is not True
     ):
-        raise ConfigurationError(
-            "relay-managed JARVIS installation receipt does not match this worker"
-        )
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise ConfigurationError(
+                "relay-managed JARVIS installation receipt does not match this worker"
+            )
     raw_receipt = installation.get("receipt")
     raw_runtime = installation.get("component_runtime")
     if not isinstance(raw_receipt, dict) or not isinstance(raw_runtime, dict):

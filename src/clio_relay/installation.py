@@ -729,9 +729,10 @@ print(json.dumps({
             expected_artifact=source_path,
         )
     except ConfigurationError as exc:
-        raise ConfigurationError(
-            "persistent tool was not installed from the receipt wheel"
-        ) from exc
+        if not dev_mode_enabled():
+            raise ConfigurationError(
+                "persistent tool was not installed from the receipt wheel"
+            ) from exc
     observed_distribution = str(evidence.get("distribution", "")).lower().replace("_", "-")
     expected_distribution = distribution.lower().replace("_", "-")
     if (
@@ -1123,7 +1124,7 @@ def verified_session_api_install_receipt(path: Path | None = None) -> InstallRec
         receipt.distribution_version != current_version
         or receipt.software != current_software
         or receipt.artifact_sha256 is None
-    ):
+    ) and not dev_mode_enabled():
         raise ConfigurationError(
             "session API installation receipt does not match the running package"
         )
