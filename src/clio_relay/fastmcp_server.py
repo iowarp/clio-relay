@@ -1012,9 +1012,7 @@ class RelayTasksExtension(ServerExtension):
             # for INTERNAL_ERROR: a generic message, never ``str(exc)``);
             # the typed reason plus task_id in ``data`` is the queryable
             # signal instead.
-            logger.exception(
-                "relay could not reconcile task %r's status", params.task_id
-            )
+            logger.exception("relay could not reconcile task %r's status", params.task_id)
             raise MCPError(
                 code=mcp_types.INTERNAL_ERROR,
                 message="relay could not reconcile this task's status.",
@@ -1084,12 +1082,23 @@ class RelayTasksExtension(ServerExtension):
             return outcome
         if not isinstance(outcome, ToolResult) or not isinstance(tool, RelayTool):
             return outcome
-        task = await self._runtime.create_task(
-            tool=tool,
-            arguments=dict(params.arguments or {}),
-            result=outcome,
-            context=context,
-        )
+        try:
+            task = await self._runtime.create_task(
+                tool=tool,
+                arguments=dict(params.arguments or {}),
+                result=outcome,
+                context=context,
+            )
+        except QueueConflictError as exc:
+            # relay#218: a genuine task-identity reuse conflict (as opposed to
+            # the transport-control-only false positive normalized away in
+            # put_mcp_task) must still be refused, but as a typed, queryable
+            # MCPError -- not escape through FastMCP's generic handler as a
+            # bare, typeless -32603 internal error (the live symptom).
+            raise MCPError(
+                code=mcp_types.INVALID_PARAMS,
+                message=str(exc),
+            ) from exc
         if task is None:
             return outcome
         return CreateTaskResult(
