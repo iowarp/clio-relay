@@ -807,6 +807,46 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.errors == []
 
 
+def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_change(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#217: cluster_route_revision()'s canonicalization can change between relay
+    releases. A session minted under a prior version records the OLD algorithm's
+    digest in metadata.json; the currently-installed package recomputes a
+    DIFFERENT digest from the byte-identical, tamper-clean frozen snapshot. That
+    divergence is a version-skew artifact, not evidence of tampering, and must
+    never refuse recovery/teardown of an otherwise byte-proven session.
+    """
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata_path = session_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    recorded_route_revision = metadata["cluster_route_revision"]
+    # Simulate an algorithm change: the installed package now recomputes a
+    # different digest for the exact same (tamper-clean) frozen snapshot bytes.
+    assert isinstance(recorded_route_revision, str)
+    skewed_route_revision = "f" * 64
+    assert skewed_route_revision != recorded_route_revision
+    monkeypatch.setattr(
+        session_lifecycle,
+        "cluster_route_revision",
+        lambda definition: skewed_route_revision,
+    )
+
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.metadata_verified is True
+    assert status.cluster_registry_verified is True
+    assert not any("cluster registry" in error for error in status.errors)
+    assert status.recovery_verified is True
+
+
 def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

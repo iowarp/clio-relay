@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import importlib
 import json
+import logging
 import math
 import os
 import re
@@ -56,6 +57,8 @@ if TYPE_CHECKING:
         LiveValidationReport,
         ValidationResource,
     )
+
+logger = logging.getLogger(__name__)
 
 SESSION_DETACH_CHECK_ID = "cleanup.detach"
 SESSION_TEARDOWN_CHECK_ID = "cleanup.relay-session"
@@ -2776,12 +2779,34 @@ def inspect_owned_session_recovery_status(
                         for key, value in cast(dict[object, object], raw_registry).items()
                     }
                 registry = ClusterRegistry.model_validate(registry_document)
+                # clio-relay#217: the frozen snapshot's sha256 already proves these
+                # exact cluster-definition bytes are untampered (tamper-clean); do
+                # NOT also require a fresh cluster_route_revision() recomputation to
+                # match the value recorded at mint time. cluster_route_revision()'s
+                # canonicalization can change between relay releases, and
+                # recomputing it here with a different algorithm generation than
+                # the one that minted this session strands every session across an
+                # upgrade with a false "digest or identity mismatched" refusal --
+                # a version-skew artifact, never evidence of tampering. Trust the
+                # tamper-clean recorded route revision instead.
                 cluster_registry_verified = bool(
                     hashlib.sha256(registry_bytes).hexdigest() == registry_sha256
                     and set(registry.clusters) == {cluster}
                     and registry.clusters[cluster].name == cluster
-                    and cluster_route_revision(registry.clusters[cluster]) == route_revision
                 )
+                if cluster_registry_verified:
+                    recomputed_route_revision = cluster_route_revision(registry.clusters[cluster])
+                    if recomputed_route_revision != route_revision:
+                        logger.warning(
+                            "cluster_route_revision_algorithm_skew: session %r cluster %r "
+                            "recorded route revision %r but the installed package "
+                            "recomputes %r from the identical tamper-clean snapshot; "
+                            "trusting the recorded value (clio-relay#217)",
+                            session_id,
+                            cluster,
+                            route_revision,
+                            recomputed_route_revision,
+                        )
             except (RelayError, ValueError) as exc:
                 errors.append(str(exc))
             if not cluster_registry_verified and not any(
