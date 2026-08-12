@@ -117,8 +117,8 @@ def test_control_query_classification_requires_explicit_safe_annotations(
 @pytest.mark.parametrize(
     ("contract_id", "artifact_name"),
     [
+        ("clio-kit-jarvis-user-v3.7", "jarvis-user-v3.7.json"),
         ("clio-kit-jarvis-user-v3.6", "jarvis-user-v3.6.json"),
-        ("clio-kit-jarvis-user-v3.5", "jarvis-user-v3.5.json"),
     ],
 )
 def test_registered_jarvis_contract_accepts_current_and_frozen_legacy(
@@ -1388,7 +1388,7 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
     contract_artifact = cast(
         dict[str, object],
         json.loads(
-            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.6.json").read_text(
+            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.json").read_text(
                 encoding="utf-8"
             )
         ),
@@ -1407,7 +1407,7 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
         namespace="jarvis-demo",
         allow_tools=tool_names,
         profiles=["user"],
-        contract="clio-kit-jarvis-user-v3.6",
+        contract="clio-kit-jarvis-user-v3.7",
     )
     registry = ClusterRegistry(
         clusters={

@@ -142,6 +142,7 @@ def test_jarvis_mcp_validation_accepts_structured_durable_run() -> None:
     ]
     assert query["artifact_filter_fields"] == [
         "artifact_id",
+        "content_max_bytes",
         "cursor",
         "package_id",
         "page_size",
@@ -2079,11 +2080,34 @@ def _remote_tool(
     *,
     title: str | None = None,
 ) -> dict[str, object]:
-    return {
+    tool: dict[str, object] = {
         "name": name,
         "title": title,
         "description": definition["description"],
         "inputSchema": definition["inputSchema"],
         "outputSchema": definition["outputSchema"],
         "annotations": definition["annotations"],
+    }
+    meta = _bundled_wire_meta().get(name)
+    if meta is not None:
+        tool["_meta"] = meta
+    return tool
+
+
+def _bundled_wire_meta() -> dict[str, object]:
+    """Per-tool ``_meta`` exactly as the bundled wire contract ships it.
+
+    clio-kit-jarvis-user-v3.7 added a top-level ``_meta`` to every wire tool;
+    the wire digest covers it, so a reconstruction that drops it is unfaithful.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from clio_relay import jarvis_mcp as _jarvis_mcp
+
+    artifact = _json.loads(_Path(_jarvis_mcp._JARVIS_USER_CONTRACT_PATH).read_text("utf-8"))
+    return {
+        tool["name"]: tool["_meta"]
+        for tool in artifact.get("tools", [])
+        if isinstance(tool, dict) and "_meta" in tool
     }

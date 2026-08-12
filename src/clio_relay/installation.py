@@ -50,7 +50,7 @@ JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 CLIO_KIT_JARVIS_EXECUTION_SCHEMA = "clio-kit.jarvis-execution.v2"
-CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
+CLIO_KIT_JARVIS_CONTRACT_ID = "clio-kit-jarvis-user-v3.7"
 CLIO_KIT_MCP_CONTRACT_SCHEMA = "clio-kit.mcp-user-contract.v1"
 CLIO_KIT_NATIVE_OPERATIONS = (
     "jarvis_get_execution",
@@ -2163,8 +2163,16 @@ def _require_native_execution_query_contract(tool: dict[str, object]) -> None:
         "artifact_id",
         "page_size",
         "cursor",
+        "content_max_bytes",
     }:
         raise ConfigurationError("clio-kit native JARVIS artifact filter surface did not match")
+    raw_content_max_bytes = artifact_properties.get("content_max_bytes")
+    if not isinstance(raw_content_max_bytes, dict) or cast(
+        dict[str, object], raw_content_max_bytes
+    ).get("default") is not None:
+        raise ConfigurationError(
+            "clio-kit native JARVIS artifact content_max_bytes selector did not match"
+        )
     if artifact_properties.get("page_size") != {
         "default": 50,
         "description": "Maximum artifacts to return in this page.",
