@@ -33,6 +33,7 @@ from clio_relay.cluster_config import (
     ClusterTargetIdentity,
     FrpTransportConfig,
     RemoteMcpServerConfig,
+    WorkerCapacityPolicy,
     cluster_route_revision,
 )
 from clio_relay.core_queue import ClioCoreQueue
@@ -798,7 +799,11 @@ def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registe
         ssh_host="configured-cluster",
         scheduler_provider="slurm",
     )
-    monkeypatch.setattr(cli, "_require_cluster", lambda cluster: definition)
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
 
     result = CliRunner().invoke(
         app,
@@ -817,6 +822,109 @@ def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registe
 
     assert result.exit_code != 0
     assert "control_query_concurrency" in result.output
+
+
+def test_endpoint_start_rejects_concurrency_one_against_a_registered_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219 rework: this is a DELIBERATE side effect of reusing
+    WorkerCapacityPolicy's own validation, pinned here rather than left as an
+    unstated regression risk. --concurrency 1 -- the CLI's own PRE-#219
+    default -- is now a typed refusal against a registered cluster, exactly
+    like --control-query-concurrency 0 above, over-determined by TWO of
+    WorkerCapacityPolicy's own invariants at once: its ``concurrency``
+    field requires >= 2, and even were that alone relaxed, its
+    ``_reserve_a_workload_slot`` model validator independently requires
+    ``control_query_concurrency < concurrency`` -- with the registry's
+    default control_query_concurrency of 1 inherited unpinned here,
+    concurrency=1 collides with it regardless. LIVE FACT: no live worker
+    uses --concurrency 1 today (the p5run2 deployment runs --concurrency 4
+    --control-query-concurrency 1), so this refusal matches how the flag is
+    actually operated, not merely how it once defaulted.
+    """
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+    )
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "endpoint",
+            "start",
+            "--role",
+            "worker",
+            "--cluster",
+            "configured-cluster",
+            "--concurrency",
+            "1",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "concurrency" in result.output
+
+
+def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#219 rework: an unpinned --kind-concurrency now INHERITS the cluster's
+    registered WorkerCapacityPolicy.kind_concurrency limits, not "no limits"
+    -- a real behavior change #219's own commit message never stated. Before
+    #219, omitting the flag always meant no per-kind limits regardless of any
+    cluster registration (``_kind_concurrency_options(None)`` == ``{}``,
+    applied unconditionally); now `_resolved_worker_capacity_policy` inherits
+    ``current.kind_concurrency`` from the registry whenever the CLI flag is
+    None and --clear-kind-concurrency was not passed. Pinned here so a future
+    change to that inheritance is a deliberate decision, not a silent drift.
+    """
+    captured: dict[str, object] = {}
+    definition = ClusterDefinition(
+        name="configured-cluster",
+        ssh_host="configured-cluster",
+        scheduler_provider="slurm",
+        worker_capacity=WorkerCapacityPolicy(
+            concurrency=5,
+            control_query_concurrency=1,
+            kind_concurrency={JobKind.MCP_CALL: 2},
+        ),
+    )
+
+    class FakeWorker:
+        def register(self) -> None:
+            pass
+
+        def run_once(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def make_worker(**kwargs: object) -> FakeWorker:
+        captured.update(kwargs)
+        return FakeWorker()
+
+    monkeypatch.setattr(cli, "EndpointWorker", make_worker)
+
+    def _load_definition(_cluster: str) -> ClusterDefinition:
+        return definition
+
+    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
+
+    result = CliRunner().invoke(
+        app,
+        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kind_concurrency"] == {JobKind.MCP_CALL: 2}
 
 
 def test_endpoint_start_warns_loudly_when_control_query_concurrency_is_explicitly_zero(
