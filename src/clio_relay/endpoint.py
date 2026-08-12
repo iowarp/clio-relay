@@ -7139,6 +7139,8 @@ def _minimal_mcp_runner_environment(env_from: dict[str, str]) -> dict[str, str]:
     environment = {
         name: os.environ[name] for name in MCP_RUNNER_BASE_ENV_NAMES if name in os.environ
     }
+    if os.environ.get("CLIO_RELAY_DEV_MODE"):
+        environment["CLIO_RELAY_DEV_MODE"] = os.environ["CLIO_RELAY_DEV_MODE"]
     for source_name in env_from.values():
         if source_name not in os.environ:
             raise ConfigurationError(f"MCP env_from source is not set: {source_name}")
