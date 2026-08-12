@@ -1454,6 +1454,7 @@ def test_owned_remote_async_relay_wait_exposes_verified_service_binding(
         _client: object,
         selected_job_id: str,
         artifacts: list[dict[str, Any]],
+        require_result: bool = False,
     ) -> mcp_server_module._VerifiedMcpResult:  # pyright: ignore[reportPrivateUsage]
         assert selected_job_id == job.job_id
         assert artifacts == [artifact_record]
