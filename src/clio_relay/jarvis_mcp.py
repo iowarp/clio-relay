@@ -239,6 +239,7 @@ def jarvis_mcp_command(
     cluster: str | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
 ) -> list[str]:
     """Return the command used on the cluster to launch the JARVIS MCP server.
 
@@ -324,6 +325,16 @@ def jarvis_mcp_command(
                 isinstance(item, str) for item in cast(list[object], unverified_command)
             ):
                 return cast(list[str], unverified_command)
+            if registered_command:
+                # Dev channel: the receipt carries no kit component (e.g. a
+                # relay-only --self re-mint) but the cluster REGISTRATION
+                # names the exact kit launcher — the same source the queue
+                # lane trusts. Still never the box-global default.
+                findings.record(
+                    "pinned receipt has no clio-kit runtime command; using the "
+                    "cluster-registered jarvis command"
+                )
+                return list(registered_command)
             raise ValueError("pinned install receipt has no valid clio-kit runtime command")
         return list(DEFAULT_JARVIS_MCP_COMMAND)
     command = identity.get("command")
@@ -645,6 +656,7 @@ def jarvis_mcp_server(
     cluster: str | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
 ) -> str:
     """Return the executable component of the JARVIS MCP command."""
     return jarvis_mcp_command(
@@ -652,6 +664,7 @@ def jarvis_mcp_server(
         cluster=cluster,
         dev_mode=dev_mode,
         findings=findings,
+        registered_command=registered_command,
     )[0]
 
 
@@ -661,6 +674,7 @@ def jarvis_mcp_server_args(
     cluster: str | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
 ) -> list[str]:
     """Return the argument component of the JARVIS MCP command."""
     return jarvis_mcp_command(
@@ -668,6 +682,7 @@ def jarvis_mcp_server_args(
         cluster=cluster,
         dev_mode=dev_mode,
         findings=findings,
+        registered_command=registered_command,
     )[1:]
 
 

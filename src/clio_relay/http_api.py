@@ -1718,10 +1718,22 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 and owner_session_cluster_definition.relay_install_receipt is not None
                 else None
             )
+            registered_jarvis = (
+                owner_session_cluster_definition.remote_mcp_servers.get("jarvis")
+                if owner_session_cluster_definition is not None
+                and owner_session_cluster_definition.remote_mcp_servers
+                else None
+            )
+            registered_jarvis_command = (
+                [registered_jarvis.command, *registered_jarvis.args]
+                if registered_jarvis is not None
+                else None
+            )
             server = jarvis_mcp_server(
                 receipt_path=pinned_receipt_path,
                 cluster=request.cluster,
                 dev_mode=pinned_dev_mode,
+                registered_command=registered_jarvis_command,
                 # clio-relay#228 rework round 2: this route's own findings
                 # instance, not an internally-constructed-and-discarded one
                 # -- otherwise a dev-mode verification downgrade is recorded
@@ -1735,6 +1747,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 receipt_path=pinned_receipt_path,
                 cluster=request.cluster,
                 dev_mode=pinned_dev_mode,
+                registered_command=registered_jarvis_command,
             )
             env_from = jarvis_mcp_env_from()
         except (ValueError, ConfigurationError) as exc:
