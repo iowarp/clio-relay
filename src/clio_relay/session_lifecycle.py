@@ -1842,12 +1842,36 @@ def _inspect_owned_session_start_attempt_status(
         try:
             raw_registry = cast(object, json.loads(registry_payload))
             registry = ClusterRegistry.model_validate(raw_registry)
+            # clio-relay#217 rework: the SAME snapshot-trust relaxation
+            # inspect_owned_session_recovery_status applies below -- this
+            # pre-metadata start-attempt path reads the identical frozen
+            # per-generation cluster-registry snapshot and strands the same
+            # way across a relay upgrade if it also requires a FRESH
+            # cluster_route_revision() recomputation to match the value
+            # recorded in start-attempt.json. The sha256 check already
+            # proves these exact bytes are tamper-clean; recomputing the
+            # route revision with a different algorithm generation than the
+            # one that wrote this attempt adds no additional tamper
+            # detection, only false positives that block session start
+            # --replace with no recovery path.
             cluster_registry_verified = bool(
                 hashlib.sha256(registry_payload).hexdigest() == registry_sha256
                 and set(registry.clusters) == {cluster}
                 and registry.clusters[cluster].name == cluster
-                and cluster_route_revision(registry.clusters[cluster]) == route_revision
             )
+            if cluster_registry_verified:
+                recomputed_route_revision = cluster_route_revision(registry.clusters[cluster])
+                if recomputed_route_revision != route_revision:
+                    logger.warning(
+                        "cluster_route_revision_algorithm_skew: session %r cluster %r "
+                        "start attempt recorded route revision %r but the installed "
+                        "package recomputes %r from the identical tamper-clean "
+                        "snapshot; trusting the recorded value (clio-relay#217)",
+                        session_id,
+                        cluster,
+                        route_revision,
+                        recomputed_route_revision,
+                    )
         except (TypeError, ValueError):
             cluster_registry_verified = False
         if not cluster_registry_verified:

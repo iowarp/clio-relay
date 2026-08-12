@@ -810,6 +810,7 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
 def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_change(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """#217: cluster_route_revision()'s canonicalization can change between relay
     releases. A session minted under a prior version records the OLD algorithm's
@@ -827,12 +828,13 @@ def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_
     assert isinstance(recorded_route_revision, str)
     skewed_route_revision = "f" * 64
     assert skewed_route_revision != recorded_route_revision
-    monkeypatch.setattr(
-        session_lifecycle,
-        "cluster_route_revision",
-        lambda definition: skewed_route_revision,
-    )
 
+    def _skewed_route_revision(_definition: ClusterDefinition) -> str:
+        return skewed_route_revision
+
+    monkeypatch.setattr(session_lifecycle, "cluster_route_revision", _skewed_route_revision)
+
+    caplog.set_level("WARNING", logger="clio_relay.session_lifecycle")
     status = inspect_owned_session_recovery_status(
         cluster="ares",
         session_id="session-1",
@@ -845,6 +847,136 @@ def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_
     assert status.cluster_registry_verified is True
     assert not any("cluster registry" in error for error in status.errors)
     assert status.recovery_verified is True
+    # clio-relay#217 rework: a sabotage pass found deleting the warning
+    # block entirely leaves this test green (nothing above pins its
+    # existence) -- assert the typed skew warning was actually emitted,
+    # naming the session, cluster, and both diverging digests.
+    assert "cluster_route_revision_algorithm_skew" in caplog.text
+    assert "session-1" in caplog.text
+    assert "ares" in caplog.text
+    assert recorded_route_revision in caplog.text
+    assert skewed_route_revision in caplog.text
+
+
+def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algorithm_change(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """clio-relay#217 rework: the SAME snapshot-trust relaxation the test above
+    proves for the post-metadata recovery path must ALSO hold for the
+    pre-metadata start-attempt path (``_inspect_owned_session_start_attempt_status``,
+    reached when ``metadata.json`` does not exist yet -- an in-flight or
+    interrupted ``session start``). This path reads the identical frozen
+    per-generation ``cluster-registry-{generation}.json`` snapshot and, before
+    this rework, ALSO required a fresh ``cluster_route_revision()`` recompute
+    to match the value recorded in ``start-attempt.json``, stranding
+    ``session start --replace`` the exact same way across a relay upgrade
+    with no recovery path other than hand-editing the session directory.
+    """
+    generation = "generation-pending-start"
+    # `home` is unused here: unlike the public `inspect_owned_session_recovery_status`
+    # dispatcher, `_inspect_owned_session_start_attempt_status` (called directly
+    # below) has no `home` parameter -- it only ever sees a caller-supplied
+    # `transaction`.
+    _custom_home, session_dir, proc_root, queue = _owned_session_recovery_fixture(
+        tmp_path,
+        session_id="session-start",
+        generation_id=generation,
+    )
+    recovered_metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
+    registry_path = session_dir / f"cluster-registry-{generation}.json"
+    registry_bytes = registry_path.read_bytes()
+    recorded_route_revision = recovered_metadata["cluster_route_revision"]
+    assert isinstance(recorded_route_revision, str)
+    request = _owned_session_start_request().model_copy(
+        update={
+            "remote_api_port": 8765,
+            "cluster_registry": json.loads(registry_bytes),
+            "cluster_registry_sha256": recovered_metadata["cluster_registry_sha256"],
+            "cluster_route_revision": recorded_route_revision,
+        }
+    )
+    release = _api_release_identity()
+    (session_dir / "metadata.json").unlink()
+    transaction = _FakeSessionTransaction(session_dir, session_id=request.session_id)
+    attempt_identity: dict[str, object] = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "start_operation_id": request.start_operation_id,
+        "session_generation_id": generation,
+        "owner_token": recovered_metadata["owner_token"],
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(
+            cast(str, recovered_metadata["owner_token"]).encode()
+        ).hexdigest(),
+        "api_release_identity_sha256": release.sha256(),
+        "expected_api_release_identity_sha256": None,
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "replace": request.replace,
+        "require_token": request.require_token,
+        "input_policy": request.input_policy.model_dump(mode="json"),
+        "start_phase": "pending",
+        "systemd_unit": recovered_metadata["systemd_unit"],
+        "systemd_description": recovered_metadata["systemd_description"],
+        # _validated_start_attempt requires these unset for "pending"/
+        # "admitted" -- only "scope_bound"/"contained" carry a recorded
+        # scope/containment identity.
+        "systemd_cgroup_path": None,
+        "systemd_invocation_id": None,
+        "containment_broker_pid": None,
+        "containment_broker_start_identity": None,
+    }
+    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity=attempt_identity,
+    )
+
+    containment = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(containment, "adopt_linux_systemd_scope_identity", _no_adopted_scope)
+
+    # Simulate an algorithm change: the installed package now recomputes a
+    # different digest for the exact same (tamper-clean) frozen snapshot bytes.
+    skewed_route_revision = "f" * 64
+    assert skewed_route_revision != recorded_route_revision
+
+    def _skewed_route_revision(_definition: ClusterDefinition) -> str:
+        return skewed_route_revision
+
+    monkeypatch.setattr(session_lifecycle, "cluster_route_revision", _skewed_route_revision)
+
+    # This exercises `_inspect_owned_session_start_attempt_status` directly
+    # (not the public `inspect_owned_session_recovery_status` dispatcher):
+    # `_FakeSessionTransaction.read_json` asserts rather than raising
+    # `RelayError` on a missing required `metadata.json` (unlike the real
+    # transaction), so it cannot drive the dispatcher's `except RelayError`
+    # fallback into the pre-metadata path -- the same direct-call pattern
+    # `test_contained_start_crash_is_promoted_only_after_full_identity_recheck`
+    # already uses for a sibling private function.
+    caplog.set_level("WARNING", logger="clio_relay.session_lifecycle")
+    status = session_lifecycle._inspect_owned_session_start_attempt_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster=request.cluster,
+        session_id=request.session_id,
+        core_dir=queue.root,
+        proc_root=proc_root,
+        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        metadata_error="owned session metadata is unavailable",
+    )
+
+    assert status is not None
+    assert status.metadata_verified is False
+    assert status.cluster_registry_verified is True
+    assert not any("registry identity is invalid" in error for error in status.errors)
+    # clio-relay#217 rework sabotage check: the warning block must actually
+    # run, not merely leave the boolean unaffected.
+    assert "cluster_route_revision_algorithm_skew" in caplog.text
+    assert "session-start" in caplog.text
+    assert "ares" in caplog.text
+    assert recorded_route_revision in caplog.text
+    assert skewed_route_revision in caplog.text
 
 
 def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
