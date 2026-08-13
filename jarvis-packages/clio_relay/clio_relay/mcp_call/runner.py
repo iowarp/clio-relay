@@ -1086,7 +1086,7 @@ def _validated_jarvis_artifact_query(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise _McpProtocolFailure("MCP JARVIS artifacts query must be an object or null")
     typed = dict(cast(dict[str, Any], value))
-    allowed = {"package_id", "role", "state", "artifact_id", "page_size", "cursor"}
+    allowed = {"package_id", "role", "state", "artifact_id", "page_size", "cursor", "content_max_bytes"}
     if not set(typed).issubset(allowed):
         raise _McpProtocolFailure("MCP JARVIS artifact query contained unknown filters")
     for field_name, maximum in (("package_id", 256), ("artifact_id", 90)):
