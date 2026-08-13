@@ -237,10 +237,31 @@ class RemoteConnection:
             if self.connected:
                 return
             if self._transport is not None:
-                raise ChannelDropped(
-                    f"owned session channel for {self.cluster} dropped; "
-                    "call reconnect() to re-establish it"
+                from clio_relay.dev_mode import dev_mode_enabled
+
+                if not dev_mode_enabled():
+                    raise ChannelDropped(
+                        f"owned session channel for {self.cluster} dropped; "
+                        "call reconnect() to re-establish it"
+                    )
+                # Dev channel: auto-replace the dropped channel (recorded, one
+                # attempt) instead of requiring the explicit reconnect().
+                previous = self._transport
+                detail = None if previous is None else previous.failure_detail()
+                self._release_locked(reason="dev_mode_auto_reconnect")
+                self._record(
+                    channel_event(
+                        cluster=self.cluster,
+                        mode=self._transport_mode,
+                        event="reestablishing",
+                        attempt=self._attempt,
+                        reason="channel_dropped_dev_mode_auto",
+                        detail=detail,
+                        user_authorization_required=self._allow_interactive_authorization,
+                    )
                 )
+                self._establish(event="reestablished")
+                return
             self._establish(event="established")
 
     def reconnect(self) -> None:
