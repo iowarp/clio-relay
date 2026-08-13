@@ -4475,7 +4475,11 @@ def _current_session_api_release_identity() -> SessionApiReleaseIdentity:
     receipt = verified_session_api_install_receipt()
     artifact_sha256 = receipt.artifact_sha256
     if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
-        raise RelayError("session API installation identity is incomplete")
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise RelayError("session API installation identity is incomplete")
+        artifact_sha256 = "0" * 64
     return SessionApiReleaseIdentity(
         distribution_version=receipt.distribution_version,
         artifact_sha256=artifact_sha256,
