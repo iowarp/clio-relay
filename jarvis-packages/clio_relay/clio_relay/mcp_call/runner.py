@@ -108,7 +108,7 @@ _JARVIS_ARTIFACT_REQUIRED_FIELDS = frozenset(
     }
 )
 _JARVIS_ARTIFACT_OPTIONAL_FIELDS = frozenset(
-    {"location", "media_type", "format", "size_bytes", "checksum", "message"}
+    {"location", "media_type", "format", "size_bytes", "checksum", "message", "content", "content_error"}
 )
 _JARVIS_ARTIFACT_ID = re.compile(r"^art_[A-Za-z0-9_-]{22,86}$")
 _JARVIS_ARTIFACT_CHECKSUM = re.compile(r"^[a-z0-9][a-z0-9_-]*:[A-Fa-f0-9]{16,256}$")
