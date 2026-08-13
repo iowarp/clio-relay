@@ -503,7 +503,7 @@ class JarvisPackageInputRoute(BaseModel):
     )
     cluster: str = Field(min_length=1, max_length=256)
     server_name: str = Field(min_length=1, max_length=256)
-    contract: Literal["clio-kit-jarvis-user-v3.6"] = "clio-kit-jarvis-user-v3.6"
+    contract: Literal["clio-kit-jarvis-user-v3.7"] = "clio-kit-jarvis-user-v3.7"
     cluster_route_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     registration_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_server_artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -615,7 +615,7 @@ class JarvisPipelineInputRoute(BaseModel):
     )
     cluster: str = Field(min_length=1, max_length=256)
     server_name: str = Field(min_length=1, max_length=256)
-    contract: Literal["clio-kit-jarvis-user-v3.6"] = "clio-kit-jarvis-user-v3.6"
+    contract: Literal["clio-kit-jarvis-user-v3.7"] = "clio-kit-jarvis-user-v3.7"
     cluster_route_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     registration_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_server_artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
