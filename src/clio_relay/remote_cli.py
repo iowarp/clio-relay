@@ -374,6 +374,10 @@ def remote_env(definition: ClusterDefinition) -> str:
             )
             + ";"
         )
+    if definition.dev_mode:
+        # Dev channel: every remote leg (including broker-spawned children
+        # that bypass launcher wrappers) must see the verification downgrade.
+        exports.append("export CLIO_RELAY_DEV_MODE=1;")
     if definition.agent_args:
         exports.append(
             f"export CLIO_RELAY_AGENT_ARGS={shlex.quote(shlex.join(definition.agent_args))};"
