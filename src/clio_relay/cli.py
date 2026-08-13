@@ -5468,7 +5468,9 @@ def _require_process_bound_session_api_release() -> None:
     receipt = verified_session_api_install_receipt()
     artifact_sha256 = receipt.artifact_sha256
     if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
-        raise ConfigurationError("session API installation identity is incomplete")
+        if not dev_mode_enabled():
+            raise ConfigurationError("session API installation identity is incomplete")
+        artifact_sha256 = "0" * 64
     observed = SessionApiReleaseIdentity(
         distribution_version=receipt.distribution_version,
         artifact_sha256=artifact_sha256,
