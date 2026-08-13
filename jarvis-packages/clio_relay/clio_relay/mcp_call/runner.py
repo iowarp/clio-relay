@@ -108,7 +108,18 @@ _JARVIS_ARTIFACT_REQUIRED_FIELDS = frozenset(
     }
 )
 _JARVIS_ARTIFACT_OPTIONAL_FIELDS = frozenset(
-    {"location", "media_type", "format", "size_bytes", "checksum", "message", "content", "content_error"}
+    {
+        "location",
+        "media_type",
+        "format",
+        "size_bytes",
+        "checksum",
+        "message",
+        "content",
+        "content_error",
+        "content_truncated",
+        "content_bytes_read",
+    }
 )
 _JARVIS_ARTIFACT_ID = re.compile(r"^art_[A-Za-z0-9_-]{22,86}$")
 _JARVIS_ARTIFACT_CHECKSUM = re.compile(r"^[a-z0-9][a-z0-9_-]*:[A-Fa-f0-9]{16,256}$")
@@ -121,7 +132,7 @@ _JARVIS_ARTIFACT_UNSAFE_URI_SCHEMES = frozenset({"data", "file", "javascript"})
 _JARVIS_ARTIFACT_MAX_PAGE_SIZE = 100
 _JARVIS_ARTIFACT_DEFAULT_PAGE_SIZE = 50
 _JARVIS_ARTIFACT_MAX_CURSOR_LENGTH = 1024
-_JARVIS_ARTIFACT_MAX_EVENT_BYTES = 64 * 1024
+_JARVIS_ARTIFACT_MAX_EVENT_BYTES = 256 * 1024
 _JARVIS_ARTIFACT_MAX_METADATA_BYTES = 64 * 1024
 _WINDOWS_RESERVED_COMPONENTS = frozenset(
     {
