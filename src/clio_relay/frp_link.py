@@ -26,19 +26,18 @@ This module owns two concerns:
 
 ``BoundedStderrBuffer`` / ``pump_stderr`` / ``wait_for_channel_health`` / ``HeldFrpVisitor``
     The held-process lifecycle primitives. ``BoundedStderrBuffer``,
-    ``pump_stderr``, and ``wait_for_channel_health`` are promoted from
-    ``control_channel.py`` (:729-750 for the health helper) -- they were
-    already mode-agnostic there, so ``control_channel.py`` now imports them
-    from here instead of keeping a second copy, and its own behavior is
-    unchanged. ``HeldFrpVisitor`` is one spawned local ``frpc -c <toml>``
-    process holding an stcp/xtcp visitor tunnel, built with
-    ``SshForwardTransport``'s exact lifecycle discipline (``control_channel.py``
-    :350-562): a bounded, continuously drained stderr buffer so the process
-    never blocks writing diagnostics; ``poll()``-based liveness, never a
-    blocking wait; ``close()`` escalating terminate -> kill with timeouts; a
-    0600 rendered config file in its own temporary directory, removed on
-    ``close()``; and a bounded stderr excerpt as the only failure detail
-    exposed -- never a raw dump.
+    ``pump_stderr``, and ``wait_for_channel_health`` were promoted from
+    ``control_channel.py`` -- they were already mode-agnostic there, so
+    ``control_channel.py`` now imports them from here instead of keeping a
+    second copy, and its own behavior is unchanged. ``HeldFrpVisitor`` is one
+    spawned local ``frpc -c <toml>`` process holding an stcp/xtcp visitor
+    tunnel, built with ``control_channel.SshForwardTransport``'s exact
+    lifecycle discipline (the mode-(c) reference implementation): a bounded,
+    continuously drained stderr buffer so the process never blocks writing
+    diagnostics; ``poll()``-based liveness, never a blocking wait; ``close()``
+    escalating terminate -> kill with timeouts; a 0600 rendered config file in
+    its own temporary directory, removed on ``close()``; and a bounded stderr
+    excerpt as the only failure detail exposed -- never a raw dump.
 
 ``frp_transport.py`` (R5) builds the ``brokered_tcp``/``udp_rendezvous``
 ``RelayTransport`` implementations on top of ``HeldFrpVisitor`` rather than
