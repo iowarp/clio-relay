@@ -115,7 +115,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # `event_report()`/`_retired_report()`. No logic here is rewritten --
     # `_verify_bootstrap`'s own checks are untouched -- only this wiring is
     # new, so nothing in the file was a candidate for deletion first.
-    "src/clio_relay/remote_connection.py": 1006,
+    # R5 opus review fix set: +52 more (1006 -> 1058) -- `build_transport`
+    # moves inside `_establish`'s try (R2, a typed refusal must reach the
+    # ledger as `establish_failed`, not propagate with a dangling
+    # `establishing`), `authorization_required` gates on
+    # `transport.requires_user_authorization` instead of the connection-level
+    # setting (R7), `identity_anchor` prefers the held link's own snapshot
+    # over live config (R9), `close()` reads back a residual
+    # `config_cleanup_error` (R3), plus anchor-aware wording corrections
+    # (R12). Real behavioral fixes from a security-relevant review, not a
+    # deletable regression.
+    "src/clio_relay/remote_connection.py": 1058,
     "src/clio_relay/remote_mcp.py": 5308,
     "src/clio_relay/retention.py": 944,
     "src/clio_relay/runtime_metadata.py": 1749,

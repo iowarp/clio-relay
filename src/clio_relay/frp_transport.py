@@ -8,18 +8,34 @@ bring-up identity document out of band, refuse to redial internally. Both
 classes here hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor`
 (the R4 substrate) instead -- a local ``frpc`` process holding an stcp/xtcp
 visitor tunnel through the cluster's configured relay point -- and follow the
-same discipline: ``establish`` is callable once, ``open_stream_channel``
-refuses (multiplexing onto the held link is not built for any mode yet), and
-``close`` releases the held visitor.
+same discipline: ``establish`` is callable once (§8.5's R10 fix: a failed
+attempt permanently consumes the instance, exactly like ``SshForwardTransport``
+-- retrying means building a NEW transport), ``open_stream_channel`` refuses
+(multiplexing onto the held link is not built for any mode yet), and ``close``
+releases the held visitor.
 
 Modes (a)/(b) have no ssh-authenticated act to carry the bring-up identity
 document over the way mode (c)'s held SSH session does, so ``establish`` fetches
-the exact same two facts (``session-status``, ``session-identity``) as plain
-authenticated HTTP requests over the tunnel that is already held -- the same
-requests every later owned-session operation makes
-(``remote_connection.py``'s ``session_status``/``_open_identity_bound_stream``).
-That is why §8.3 requires a cluster to explicitly opt into the weaker
-``preshared_link_secret`` identity anchor before either mode may be used at all;
+the exact same two facts (``session-identity``, ``session-status``) as plain
+HTTP requests over the tunnel that is already held -- the same requests every
+later owned-session operation makes (``remote_connection.py``'s
+``_open_identity_bound_stream``/``session_status``). **Identity-first, always**
+(§8.3's R1 security fix): the unauthenticated identity challenge is fetched and
+verified against this connection's PINNED cluster/session/generation/nonce
+BEFORE the bearer-authenticated status request is ever issued. A rogue process
+squatting on the local loopback bind -- holding no secret of its own -- must
+already know this connection's exact pinned identity to pass that check;
+before this fix it received the real owner bearer token on request #0 for
+free. This is not a cryptographic proof (the transport has no owner token to
+check the response's HMAC against -- see ``OwnedSessionChannelBootstrap``'s
+docstring); only the later re-proof in
+``remote_connection.verify_session_identity`` closes that gap. The
+``preshared_link_secret`` anchor (§8.3) does not cover the LOCAL bind end (the
+loopback port) either -- see ``docs/connection-model.md``'s "Still deviating"
+entry.
+
+That anchor gap is why §8.3 requires a cluster to explicitly opt into
+``preshared_link_secret`` before either mode may be used at all;
 ``control_channel.build_transport`` enforces that refusal before this module is
 even imported (a lazy import there, to avoid a reverse circular import: this
 module needs ``ChannelLink``/``ChannelEndpoint``/``OwnedSessionChannelBootstrap``
@@ -30,18 +46,25 @@ refusal in this slice, not the automatic in-mode fallback to ``brokered_tcp``'s
 stcp visitor that ``docs/connection-model.md`` and §8.4 describe as the mode's
 eventual sanctioned behavior -- see that class's docstring and
 ``docs/connection-model.md``'s "Still deviating" entry for the tracked
-follow-up. This path must never render or spawn an stcp visitor:
-``transport_probe.py``'s probe-only ``allow_stcp_fallback`` has no equivalent
-here.
+follow-up. This path must never render OR spawn an stcp visitor -- proven at
+the render call itself, not only by inspecting rendered text
+(``tests/test_frp_transport_dials.py``'s sabotage twin spies on
+``frp_link.render_visitor_config``): ``transport_probe.py``'s probe-only
+``allow_stcp_fallback`` has no equivalent here.
+
+No real sockets are held open by anything in this module's own tests: no real
+``frpc``, no real cluster, only a temp dir for rendered TOML and (for the one
+health-timeout test that deliberately does not mock ``wait_for_channel_health``)
+a real, immediately-refused loopback connection attempt against a port nothing
+is listening on.
 """
 
 from __future__ import annotations
 
 import http.client
 import json
-import socket
 import urllib.parse
-from typing import ClassVar, Final
+from typing import ClassVar, Final, cast
 
 from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
 from clio_relay.config import TransportMode
@@ -54,16 +77,33 @@ from clio_relay.control_channel import (
     OwnedSessionChannelBootstrap,
     StreamChannelsUnavailable,
 )
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import RelayError
 from clio_relay.frp_link import (
     FrpLinkConfig,
     FrpProcessFactory,
     FrpVisitorType,
     HeldFrpVisitor,
+    assert_loopback_port_available,
+    select_loopback_port,
+    validate_channel_nonce,
 )
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
+from clio_relay.session_api import SESSION_IDENTITY_SCHEMA
 
 MAX_BRING_UP_FETCH_BYTES: Final = MAX_CHANNEL_BOOTSTRAP_BYTES
+
+# The identity challenge's fields checked against this connection's pinned
+# values before the authenticated status request is ever issued (§8.3/R1).
+# ``hmac_sha256`` is deliberately excluded: the transport has no owner token
+# to check it against, so it is not part of this pre-authentication gate --
+# only the later re-proof (`remote_connection.verify_session_identity`)
+# checks it.
+_PINNED_IDENTITY_FIELDS: Final = (
+    "cluster",
+    "session_id",
+    "session_generation_id",
+    "nonce",
+)
 
 
 class TransportPunchFailed(RelayError):
@@ -85,9 +125,10 @@ class _FrpChannelTransport:
     Both modes hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor` for
     the connection's lifetime. ``establish`` writes its rendered visitor config,
     spawns ``frpc`` once, waits for the mapped local port to answer, then
-    fetches the bring-up document over that SAME held link. Subclasses fix
-    ``_mode``/``_visitor_type`` and may override :meth:`_translate_tunnel_failure`
-    to turn a failed tunnel into a mode-specific typed error.
+    fetches the bring-up document -- identity first -- over that SAME held
+    link. Subclasses fix ``_mode``/``_visitor_type`` and may override
+    :meth:`_translate_tunnel_failure` to turn a failed tunnel into a
+    mode-specific typed error.
     """
 
     _mode: ClassVar[TransportMode]
@@ -151,12 +192,21 @@ class _FrpChannelTransport:
         return False
 
     def establish(self, *, nonce: str) -> ChannelLink:
-        """Hold one frp visitor tunnel and fetch the bring-up document over it."""
+        """Hold one frp visitor tunnel and fetch the bring-up document over it.
+
+        ``_established`` is set right after the dial succeeds (matching
+        ``SshForwardTransport``'s reference lifecycle, #231 R5 opus review
+        item R10), BEFORE the health-wait/bring-up-fetch phase that can still
+        fail: a failure from that point on permanently consumes this instance.
+        ``establish`` is callable once, full stop -- a failed attempt is
+        replaced by building a NEW transport, never retried in place
+        (``RelayTransport``'s own Protocol docstring).
+        """
         if self._established:
             raise RelayError(f"{self._mode} transport was already established")
-        _validate_channel_nonce(nonce)
-        local_bind_port = self._local_bind_port or _select_loopback_port()
-        _assert_bind_port_available(local_bind_port)
+        validate_channel_nonce(nonce)
+        local_bind_port = self._local_bind_port or select_loopback_port(subject="held frp visitor")
+        assert_loopback_port_available(local_bind_port, subject="frp visitor")
         config = FrpLinkConfig.from_cluster(
             self._definition,
             cluster=self._cluster,
@@ -170,12 +220,30 @@ class _FrpChannelTransport:
             keep_tunnel_open=self._visitor_type == "xtcp",
             process_factory=self._process_factory,
         )
+        visitor.establish()
         self._visitor = visitor
+        self._established = True
         try:
-            self._establish_visitor(visitor)
+            if not visitor.is_alive():
+                raise RelayError(
+                    _visitor_failure_message(
+                        mode=self._mode,
+                        visitor_type=self._visitor_type,
+                        cluster=self._cluster,
+                        visitor=visitor,
+                        situation="exited immediately",
+                    )
+                )
+            # Names the CONNECTION, not the process holding it (contrast
+            # HeldFrpVisitor.wait_healthy's own "frp {type} visitor" default) --
+            # #231 R4 opus review F4.
+            visitor.wait_healthy(
+                timeout_seconds=self._ready_timeout_seconds,
+                subject=f"frp {self._visitor_type} link",
+            )
         except BaseException as exc:
-            self._failure_detail = visitor.failure_detail()
             visitor.close()
+            self._failure_detail = _combined_failure_detail(visitor)
             self._visitor = None
             translated = self._translate_tunnel_failure(exc)
             if translated is exc:
@@ -186,34 +254,21 @@ class _FrpChannelTransport:
             bootstrap = _fetch_channel_bootstrap(
                 endpoint=endpoint,
                 api_token=self._api_token,
+                cluster=self._cluster,
                 session_id=self._session_id,
                 session_generation_id=self._session_generation_id,
                 nonce=nonce,
                 timeout_seconds=self._ready_timeout_seconds,
             )
         except BaseException:
-            self._failure_detail = visitor.failure_detail()
             visitor.close()
+            self._failure_detail = _combined_failure_detail(visitor)
             self._visitor = None
             raise
-        self._established = True
         return ChannelLink(
             control_endpoint=endpoint,
             bootstrap=bootstrap,
             identity_anchor=self._identity_anchor,
-        )
-
-    def _establish_visitor(self, visitor: HeldFrpVisitor) -> None:
-        """Spawn the held visitor and wait for its mapped local port to answer."""
-        visitor.establish()
-        if not visitor.is_alive():
-            raise RelayError(visitor.failure_detail() or f"{self._mode} visitor exited immediately")
-        # Names the CONNECTION, not the process holding it (contrast
-        # HeldFrpVisitor.wait_healthy's own "frp {type} visitor" default) --
-        # #231 R4 opus review F4.
-        visitor.wait_healthy(
-            timeout_seconds=self._ready_timeout_seconds,
-            subject=f"frp {self._visitor_type} link",
         )
 
     def _translate_tunnel_failure(self, exc: BaseException) -> BaseException:
@@ -249,6 +304,16 @@ class _FrpChannelTransport:
         self._visitor = None
         if visitor is not None:
             visitor.close()
+            cleanup_error = visitor.config_cleanup_error
+            if cleanup_error is not None:
+                # Never lost: the rendered config carries a plaintext
+                # token/secret, so a failed cleanup is a residual,
+                # security-relevant fact even on an otherwise ordinary close
+                # -- not routine stdout/stderr noise (#231 R5 opus review item
+                # R3). RemoteConnection.close() reads this back via
+                # failure_detail() to stamp a typed
+                # reason="config_cleanup_error" on the "closed" event.
+                self._failure_detail = cleanup_error
 
 
 class BrokeredTcpTransport(_FrpChannelTransport):
@@ -289,51 +354,120 @@ class UdpRendezvousTransport(_FrpChannelTransport):
         )
 
 
-def _validate_channel_nonce(nonce: str) -> None:
-    """Require the exact 256-bit lowercase hex nonce shape ``SshForwardTransport`` does."""
-    if len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce):
-        raise ValueError("channel bootstrap nonce must be a lowercase 256-bit hex value")
+def _combined_failure_detail(visitor: HeldFrpVisitor) -> str | None:
+    """Fold the visitor's stdout/stderr excerpt and any residual cleanup error.
+
+    ``HeldFrpVisitor.close()`` never suppresses a failed config-directory
+    cleanup (the config carries a plaintext token/secret); folding it in here
+    makes sure a residual secret is visible wherever this transport's
+    ``failure_detail()`` is read after a failed establish, not only inside
+    ``HeldFrpVisitor``'s own tracking (#231 R5 opus review item R3).
+    """
+    parts = [part for part in (visitor.failure_detail(), visitor.config_cleanup_error) if part]
+    return "; ".join(parts) if parts else None
 
 
-def _select_loopback_port() -> int:
-    """Select an unused loopback port for the local end of the held visitor."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    if not isinstance(port, int) or port <= 0:
-        raise RelayError("could not select a loopback port for the held frp visitor")
-    return port
+def _visitor_failure_message(
+    *,
+    mode: TransportMode,
+    visitor_type: FrpVisitorType,
+    cluster: str,
+    visitor: HeldFrpVisitor,
+    situation: str,
+) -> str:
+    """Return a mode/visitor-type/cluster-prefixed message, detail appended.
+
+    Mirrors ``transport_probe.py``'s ``_visitor_failure_message`` (#231 R4
+    opus review F2, R5 review item R4): the prefix naming WHICH link this is
+    is never replaced by the visitor's bounded stdout/stderr excerpt, only
+    extended by it.
+    """
+    label = f"{mode} {visitor_type} visitor for cluster {cluster!r} {situation}"
+    detail = _combined_failure_detail(visitor)
+    return f"{label}: {detail}" if detail else label
 
 
-def _assert_bind_port_available(port: int) -> None:
-    """Fail loudly, before spawning anything, when the local bind port is occupied."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            probe.bind(("127.0.0.1", port))
-    except OSError as exc:
-        raise ConfigurationError(f"local frp visitor port is already occupied: {port}") from exc
+def _verify_pinned_identity(
+    identity: dict[str, object],
+    *,
+    cluster: str,
+    session_id: str,
+    session_generation_id: str,
+    nonce: str,
+) -> None:
+    """Require the identity challenge to describe the exact pinned connection.
+
+    §8.3/R1's security fix: this request carries no credential, so it is
+    fetched and verified BEFORE the bearer-authenticated status request that
+    follows -- a rogue process squatting on the local loopback bind cannot use
+    this response alone to learn anything it did not already know, and the
+    authenticated request is never issued until this passes.
+
+    This is NOT a cryptographic proof: the transport has no owner token to
+    check the response's ``hmac_sha256`` against
+    (``OwnedSessionChannelBootstrap``'s own docstring says that token never
+    leaves the cluster), so a rogue that already knows this connection's
+    pinned cluster/session/generation/nonce could still pass this specific
+    check -- only the later re-proof
+    (``remote_connection.verify_session_identity``, against THIS document)
+    closes that gap. See ``docs/connection-model.md``'s "Still deviating"
+    entry: the preshared anchor does not cover the local bind end.
+    """
+    if identity.get("schema_version") != SESSION_IDENTITY_SCHEMA or any(
+        identity.get(field) != expected
+        for field, expected in zip(
+            _PINNED_IDENTITY_FIELDS,
+            (cluster, session_id, session_generation_id, nonce),
+            strict=True,
+        )
+    ):
+        raise ChannelBootstrapError(
+            "owned session channel bring-up identity challenge did not describe the pinned "
+            f"connection for {cluster}/{session_id}; refusing before authenticating"
+        )
 
 
 def _fetch_channel_bootstrap(
     *,
     endpoint: ChannelEndpoint,
     api_token: str,
+    cluster: str,
     session_id: str,
     session_generation_id: str,
     nonce: str,
     timeout_seconds: float,
 ) -> OwnedSessionChannelBootstrap:
-    """Fetch the bring-up document OVER the held link -- no ssh act exists here.
+    """Fetch the bring-up document OVER the held link, identity first.
 
     Mode (c) composes this document from an ssh-authenticated cluster-local
     executor. Modes (a)/(b) have no such act, so this fetches the same two
-    facts as plain HTTP over the tunnel that is already held: an authenticated
-    ``GET /session-status`` (the same request ``RemoteConnection.session_status``
-    makes once the channel is up) and an unauthenticated
+    facts as plain HTTP over the tunnel that is already held -- but in a
+    specific order (§8.3/R1): first the unauthenticated
     ``GET /session-identity?nonce=`` (the same identity challenge
-    ``_open_identity_bound_stream`` proves before any credential is sent).
+    ``_open_identity_bound_stream`` proves before any credential is sent),
+    verified against this connection's pinned identity, and ONLY THEN the
+    authenticated ``GET /session-status`` (the same request
+    ``RemoteConnection.session_status`` makes once the channel is up). A rogue
+    loopback responder that cannot pass the first check never sees the bearer
+    token the second one carries.
     """
+    identity = _get_bounded_json(
+        endpoint,
+        path="/session-identity?" + urllib.parse.urlencode({"nonce": nonce}),
+        timeout_seconds=timeout_seconds,
+        headers={"Accept": "application/json"},
+    )
+    if not isinstance(identity, dict):
+        raise ChannelBootstrapError(
+            "owned session channel bring-up did not report a JSON identity document"
+        )
+    _verify_pinned_identity(
+        cast("dict[str, object]", identity),
+        cluster=cluster,
+        session_id=session_id,
+        session_generation_id=session_generation_id,
+        nonce=nonce,
+    )
     status = _get_bounded_json(
         endpoint,
         path="/session-status",
@@ -345,15 +479,9 @@ def _fetch_channel_bootstrap(
             SESSION_GENERATION_ID_HEADER: session_generation_id,
         },
     )
-    identity = _get_bounded_json(
-        endpoint,
-        path="/session-identity?" + urllib.parse.urlencode({"nonce": nonce}),
-        timeout_seconds=timeout_seconds,
-        headers={"Accept": "application/json"},
-    )
-    if not isinstance(status, dict) or not isinstance(identity, dict):
+    if not isinstance(status, dict):
         raise ChannelBootstrapError(
-            "owned session channel bring-up did not report a JSON status/identity document"
+            "owned session channel bring-up did not report a JSON status document"
         )
     try:
         return OwnedSessionChannelBootstrap.model_validate({"status": status, "identity": identity})

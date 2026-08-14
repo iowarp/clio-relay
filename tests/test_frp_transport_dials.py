@@ -4,27 +4,46 @@ Cloned from ``tests/test_owned_session_channel.py``'s harness: a fake process
 factory records every dial, keyed on argv so an ``frpc`` spawn (one held frp
 visitor "pair") and an ``ssh`` spawn (one dial) are counted separately. The
 headline assertion throughout is ``ssh_dials == 0`` -- these modes must never
-fall back to, or accidentally reach, an ssh dial. No sockets, no real
-``frpc``, no cluster: only a temp dir for the rendered visitor TOML, which
-``HeldFrpVisitor`` itself still writes for real.
+fall back to, or accidentally reach, an ssh dial. No real ``frpc``, no real
+cluster: only a temp dir for the rendered visitor TOML, which ``HeldFrpVisitor``
+itself still writes for real, and (for exactly one health-timeout test that
+deliberately does not mock ``wait_for_channel_health``) a real, immediately
+-refused loopback connection attempt against a port nothing is listening on --
+no other test in this file opens a real socket.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from clio_relay import frp_link
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings, TransportMode
-from clio_relay.control_channel import ChannelDropped, TransportIdentityAnchorRequired
-from clio_relay.errors import ConfigurationError
+from clio_relay.control_channel import (
+    ChannelBootstrapError,
+    ChannelDropped,
+    StreamChannelsUnavailable,
+    TransportIdentityAnchorRequired,
+)
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_transport import BrokeredTcpTransport, TransportPunchFailed
-from clio_relay.remote_connection import DEFAULT_OWNED_SESSION_API_PORT, RemoteConnectionRegistry
-from clio_relay.session_api import OwnedSessionApiClient, session_identity_document
+from clio_relay.remote_connection import (
+    DEFAULT_OWNED_SESSION_API_PORT,
+    RemoteConnection,
+    RemoteConnectionRegistry,
+)
+from clio_relay.session_api import (
+    SESSION_IDENTITY_SCHEMA,
+    OwnedSessionApiClient,
+    session_identity_document,
+)
 
 NONCE = "1" * 64
 OWNER_TOKEN = "owner-token"
@@ -85,6 +104,19 @@ class _Stream:
     def getresponse(self) -> _Response:
         path = cast(str, self.harness.requests[-1]["path"])
         if path.startswith("/session-identity"):
+            if self.harness.rogue_identity:
+                # A rogue responder that does NOT know this connection's
+                # pinned identity -- it can only guess, and guesses wrong.
+                return _Response(
+                    {
+                        "schema_version": SESSION_IDENTITY_SCHEMA,
+                        "cluster": "not-the-pinned-cluster",
+                        "session_id": "not-the-pinned-session",
+                        "session_generation_id": "not-the-pinned-generation",
+                        "nonce": NONCE,
+                        "hmac_sha256": "0" * 64,
+                    }
+                )
             return _Response(self.harness.identity)
         if path == "/session-status":
             return _Response(self.harness.status)
@@ -138,9 +170,14 @@ class _Harness:
         self.cluster = cluster
         self.generation_id = generation_id
         self.processes: list[_ManagedProcess] = []
+        self.spawn_kwargs: list[dict[str, object]] = []
         self.visitor_configs: list[str] = []
         self.visitor_config_paths: list[Path] = []
         self.xtcp_should_fail = False
+        # One-shot injections consumed by the NEXT frpc spawn only.
+        self.next_frpc_stdout: bytes | None = None
+        self.next_frpc_exit: bytes | None = None
+        self.rogue_identity = False
         self.streams: list[_Stream] = []
         self.requests: list[dict[str, object]] = []
         self.responses: dict[str, object] = {}
@@ -181,18 +218,36 @@ class _Harness:
         )
 
 
-def _install(monkeypatch: pytest.MonkeyPatch, harness: _Harness) -> _Harness:
-    """Replace the real transport at the exact seams production code uses."""
+def _install(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: _Harness,
+    *,
+    skip_health_wait: bool = True,
+) -> _Harness:
+    """Replace the real transport at the exact seams production code uses.
 
-    def process_factory(argv: list[str], **_kwargs: object) -> _ManagedProcess:
+    ``skip_health_wait=False`` leaves ``frp_link.wait_for_channel_health``
+    real -- used by exactly one test that needs the genuine timeout/subject
+    text, never mocked away (#231 R5 opus review item R6b).
+    """
+
+    def process_factory(argv: list[str], **kwargs: object) -> _ManagedProcess:
         kind = "ssh" if argv and argv[0] == "ssh" else "frpc"
         process = _ManagedProcess(argv, kind=kind)
+        harness.spawn_kwargs.append(dict(kwargs))
         if kind == "frpc":
             config_path = Path(argv[-1])
             config_text = config_path.read_text(encoding="utf-8")
             harness.visitor_configs.append(config_text)
             harness.visitor_config_paths.append(config_path)
-            if harness.xtcp_should_fail and 'type = "xtcp"' in config_text:
+            if harness.next_frpc_stdout is not None:
+                process.stdout = io.BytesIO(harness.next_frpc_stdout)
+                harness.next_frpc_stdout = None
+            if harness.next_frpc_exit is not None:
+                process.returncode = 1
+                process.stderr = io.BytesIO(harness.next_frpc_exit)
+                harness.next_frpc_exit = None
+            elif harness.xtcp_should_fail and 'type = "xtcp"' in config_text:
                 process.returncode = 1
                 process.stderr = io.BytesIO(b"xtcp hole punching failed\n")
         harness.processes.append(process)
@@ -212,7 +267,8 @@ def _install(monkeypatch: pytest.MonkeyPatch, harness: _Harness) -> _Harness:
 
     monkeypatch.setattr("clio_relay.frp_link.spawn_frp_process", process_factory)
     monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
-    monkeypatch.setattr("clio_relay.frp_link.wait_for_channel_health", skip_health)
+    if skip_health_wait:
+        monkeypatch.setattr("clio_relay.frp_link.wait_for_channel_health", skip_health)
     monkeypatch.setattr("clio_relay.remote_connection.secrets.token_hex", fixed_nonce)
     monkeypatch.setattr("clio_relay.remote_connection.http.client.HTTPConnection", stream_factory)
     monkeypatch.setattr("clio_relay.frp_transport.http.client.HTTPConnection", stream_factory)
@@ -271,11 +327,14 @@ def _connect(
     *,
     mode: TransportMode = "brokered_tcp",
     definition: ClusterDefinition | None = None,
+    interactive: bool = False,
+    timeout_seconds: float | None = None,
 ) -> Any:
     """Establish the connection for the default cluster and return it."""
     return harness.registry.connection(
         definition=definition or _frp_definition(),
-        settings=_settings(tmp_path, mode=mode),
+        settings=_settings(tmp_path, mode=mode, interactive=interactive),
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else 30.0,
     )
 
 
@@ -298,6 +357,46 @@ def test_brokered_bring_up_performs_exactly_one_frp_pair_and_zero_ssh_dials(
     paths = [cast(str, request["path"]) for request in harness.requests]
     assert "/session-status" in paths
     assert any(path.startswith("/session-identity") for path in paths)
+    # Identity-first, always (§8.3/R1): even on the successful path, the
+    # unauthenticated identity challenge is fetched and verified strictly
+    # before the bearer-authenticated status request.
+    identity_index = next(i for i, path in enumerate(paths) if path.startswith("/session-identity"))
+    status_index = paths.index("/session-status")
+    assert identity_index < status_index
+
+
+def test_identity_first_bring_up_refuses_before_any_authenticated_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1 [security, HIGH]: a rogue loopback responder must learn nothing.
+
+    Demonstrated by the review: pre-fix, the AUTHENTICATED /session-status
+    (bearer token + owner headers) was request #0 over the still-unverified
+    tunnel -- a rogue process squatting on the local loopback bind, holding no
+    secret of its own, received the real owner bearer token and reached
+    connected==True. Post-fix, the unauthenticated /session-identity
+    challenge is fetched and verified against this connection's PINNED
+    identity FIRST; a rogue that answers with the wrong identity (it cannot
+    know the real one) never sees a single authenticated request, and no
+    Authorization header is ever sent to it.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.rogue_identity = True
+
+    with pytest.raises(ChannelBootstrapError, match="pinned"):
+        _connect(tmp_path, harness)
+
+    paths = [cast(str, request["path"]) for request in harness.requests]
+    assert not any(path == "/session-status" for path in paths)
+    assert any(path.startswith("/session-identity") for path in paths)
+    assert all(
+        "Authorization" not in cast(dict[str, str], request["headers"])
+        for request in harness.requests
+    )
+    # The typed refusal, not a spawned second attempt.
+    assert harness.frp_pairs == 1
 
 
 def test_ten_mixed_owned_session_operations_add_no_frp_pairs(
@@ -399,7 +498,63 @@ def test_close_releases_the_visitor_and_removes_its_rendered_config(
     assert connection.connected is False
     assert harness.processes[-1].terminated is True
     assert not config_path.exists()
-    assert [event.event for event in connection.events][-1] == "closed"
+    closed = connection.events[-1]
+    assert closed.event == "closed"
+    # Sabotage twin of test_close_surfaces_a_residual_config_cleanup_error_as_a_typed_event
+    # below: an ordinary close never fabricates a reason.
+    assert closed.reason is None
+    assert closed.detail is None
+
+
+def test_close_surfaces_a_residual_config_cleanup_error_as_a_typed_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R3: HeldFrpVisitor.config_cleanup_error must
+    reach the ledger, not stay buried inside the substrate.
+
+    SABOTAGE: monkeypatches TemporaryDirectory.cleanup to always raise
+    (mirrors tests/test_frp_link.py's own F3 sabotage), proving the residual,
+    secret-bearing config file is surfaced as a typed reason on the "closed"
+    event rather than silently dropped.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+
+    def raising_cleanup(self: tempfile.TemporaryDirectory[str]) -> None:
+        del self
+        raise OSError("simulated: the config file is still held open")
+
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", raising_cleanup)
+
+    connection.close()
+
+    closed = connection.events[-1]
+    assert closed.event == "closed"
+    assert closed.reason == "config_cleanup_error"
+    assert closed.detail is not None
+    assert "token/secret" in closed.detail
+
+
+def test_visitor_exit_message_prefixes_mode_visitor_type_and_cluster(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R4 (F2 shape): the prefix naming which link
+    this is must never be REPLACED by the visitor's bounded stdout/stderr
+    excerpt, only extended by it.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.next_frpc_exit = b"login to server failed: EOF\n"
+
+    with pytest.raises(RelayError) as exc_info:
+        _connect(tmp_path, harness)
+
+    message = str(exc_info.value)
+    assert message.startswith("brokered_tcp stcp visitor for cluster 'ares' exited immediately:")
+    assert "login to server failed" in message
 
 
 def test_udp_rendezvous_punch_failure_is_a_typed_refusal_never_falling_back_to_stcp(
@@ -410,6 +565,14 @@ def test_udp_rendezvous_punch_failure_is_a_typed_refusal_never_falling_back_to_s
     _set_frp_env(monkeypatch)
     harness = _install(monkeypatch, _Harness())
     harness.xtcp_should_fail = True
+    render_calls: list[str] = []
+    original_render = frp_link.render_visitor_config
+
+    def spy_render(config: Any, **kwargs: Any) -> str:
+        render_calls.append(cast(str, kwargs.get("visitor_type", "stcp")))
+        return original_render(config, **kwargs)
+
+    monkeypatch.setattr("clio_relay.frp_link.render_visitor_config", spy_render)
 
     with pytest.raises(TransportPunchFailed, match="hole punch failed"):
         _connect(tmp_path, harness, mode="udp_rendezvous")
@@ -417,9 +580,150 @@ def test_udp_rendezvous_punch_failure_is_a_typed_refusal_never_falling_back_to_s
     assert harness.frp_pairs == 1
     assert harness.ssh_dials == 0
     assert len(harness.processes) == 1
+    # Render-scoped, not just text-scoped (#231 R5 opus review item R6d):
+    # proves render_visitor_config itself was never invoked for stcp, not
+    # merely that the resulting rendered text happens not to contain the
+    # substring.
+    assert render_calls == ["xtcp"]
     assert harness.visitor_configs
     assert all('type = "xtcp"' in config for config in harness.visitor_configs)
     assert all('type = "stcp"' not in config for config in harness.visitor_configs)
+
+
+def test_udp_rendezvous_bring_up_performs_exactly_one_frp_pair_with_xtcp_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R6a: the successful udp_rendezvous half."""
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+
+    connection = _connect(tmp_path, harness, mode="udp_rendezvous")
+
+    assert harness.frp_pairs == 1
+    assert harness.ssh_dials == 0
+    assert connection.connected is True
+    assert connection.events[-1].mode == "udp_rendezvous"
+    assert connection.events[-1].identity_anchor == "preshared_link_secret"
+    rendered = harness.visitor_configs[-1]
+    assert 'type = "xtcp"' in rendered
+    assert "keepTunnelOpen = true" in rendered
+
+
+def test_udp_rendezvous_health_timeout_is_a_typed_punch_failure_naming_the_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R6b: the health-timeout half of TransportPunchFailed.
+
+    Deliberately does NOT mock ``wait_for_channel_health``: a real, bounded
+    wait against a loopback port nothing is listening on times out fast
+    (connection-refused is near-instant) and exercises the genuine subject
+    text ("frp xtcp link", #231 R4 opus review F4) end to end.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness(), skip_health_wait=False)
+
+    with pytest.raises(TransportPunchFailed, match="frp xtcp link"):
+        _connect(tmp_path, harness, mode="udp_rendezvous", timeout_seconds=0.3)
+
+    assert harness.frp_pairs == 1
+    assert harness.ssh_dials == 0
+
+
+def test_held_visitor_spawns_with_piped_stdout_and_the_pump_attaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R6c: lock the spawn kwargs.
+
+    A DEVNULL regression (frpc's chatty stdout by default, #231 R4 opus
+    review F1) must go red HERE -- a fast unit-test assertion -- not silently
+    wedge a real frpc child hours later in a live deployment.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.next_frpc_stdout = b"frpc: login to server success\n"
+    harness.next_frpc_exit = b"connection lost after login\n"
+
+    with pytest.raises(RelayError) as exc_info:
+        _connect(tmp_path, harness)
+
+    assert harness.spawn_kwargs
+    frpc_kwargs = harness.spawn_kwargs[-1]
+    assert frpc_kwargs.get("stdout") is subprocess.PIPE
+    assert frpc_kwargs.get("stderr") is subprocess.PIPE
+    # The pump attached and actually read it -- not devnull'd, not ignored.
+    assert "login to server success" in str(exc_info.value)
+
+
+def test_open_stream_channel_refuses_multiplexing() -> None:
+    """Multiplexing onto the held link is not built for any mode yet."""
+    transport = BrokeredTcpTransport(
+        definition=_frp_definition(),
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id="generation-1",
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        api_token="session-api-token",
+        identity_anchor="preshared_link_secret",
+        frpc_bin="frpc",
+    )
+
+    with pytest.raises(StreamChannelsUnavailable, match="not yet carry"):
+        transport.open_stream_channel(name="watch", remote_port=9000)
+
+
+def test_identity_anchor_prefers_the_held_links_snapshot_over_drifted_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R9: the audit trail describes the link, not
+    whatever the on-disk cluster definition says right now.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    assert connection.identity_anchor == "preshared_link_secret"
+
+    # Simulate the cluster definition drifting on disk after bring-up: the
+    # HELD link's own snapshot must still win.
+    connection._definition.frp_transport.identity_anchor = None  # pyright: ignore[reportPrivateUsage]
+
+    assert connection.identity_anchor == "preshared_link_secret"
+
+
+def test_established_permanently_consumes_a_failed_transport_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R10: matches SshForwardTransport's reference
+    lifecycle -- a failed establish never permits a retry in place. The
+    caller must build a NEW transport (exactly what
+    RemoteConnection.reconnect() does via build_transport()).
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.rogue_identity = True
+    transport = BrokeredTcpTransport(
+        definition=_frp_definition(),
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id="generation-1",
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        api_token="session-api-token",
+        identity_anchor="preshared_link_secret",
+        frpc_bin="frpc",
+    )
+
+    with pytest.raises(ChannelBootstrapError):
+        transport.establish(nonce=NONCE)
+
+    with pytest.raises(RelayError, match="already established"):
+        transport.establish(nonce=NONCE)
+
+    # The doomed retry attempt never reached the point of spawning a second pair.
+    assert harness.frp_pairs == 1
 
 
 def test_brokered_mode_requires_no_interactive_authorization(
@@ -428,14 +732,15 @@ def test_brokered_mode_requires_no_interactive_authorization(
 ) -> None:
     """Unlike mode (c) (`remote_connection.py:411-420`), no prompt is ever expected.
 
-    `BrokeredTcpTransport.requires_user_authorization` is unconditionally False:
-    both relays simply dial out to the already-deployed relay point, there is no
-    ssh act to authorize. The connection-level `authorization_required` event is
-    a separate, `RemoteConnection`-owned announcement gated on the deployment's
-    own interactive policy (`settings.remote_transport_interactive`) rather than
-    on the transport itself; a real brokered_tcp deployment turns that off
-    because it has no prompt to announce, which is exactly the config this
-    harness uses (see `_settings`'s `interactive=False` default).
+    `BrokeredTcpTransport.requires_user_authorization` is unconditionally
+    False: both relays simply dial out to the already-deployed relay point,
+    there is no ssh act to authorize. #231 R5 opus review item R7: the
+    connection-level `authorization_required` event is now gated on
+    `transport.requires_user_authorization` itself (not on
+    `settings.remote_transport_interactive`), so this is a STRUCTURAL
+    property of the mode, not a fixture/settings choice -- proven here with
+    the interactive policy left at its actual DEFAULT (`interactive=True`,
+    the same value a fresh deployment gets with nothing configured).
     """
     transport = BrokeredTcpTransport(
         definition=_frp_definition(),
@@ -451,7 +756,7 @@ def test_brokered_mode_requires_no_interactive_authorization(
 
     _set_frp_env(monkeypatch)
     harness = _install(monkeypatch, _Harness())
-    connection = _connect(tmp_path, harness)
+    connection = _connect(tmp_path, harness, interactive=True)
 
     assert "authorization_required" not in [event.event for event in connection.events]
 
@@ -463,13 +768,23 @@ def test_unconfigured_identity_anchor_refuses_before_spawning_anything(
     _set_frp_env(monkeypatch)
     harness = _install(monkeypatch, _Harness())
     unconfigured = ClusterDefinition(name="ares", ssh_host="ares-login")
+    connection = RemoteConnection(definition=unconfigured, settings=_settings(tmp_path))
 
     with pytest.raises(TransportIdentityAnchorRequired, match="preshared_link_secret"):
-        _connect(tmp_path, harness, definition=unconfigured)
+        connection.connect()
 
     assert harness.processes == []
     assert harness.ssh_dials == 0
     assert harness.frp_pairs == 0
+    # #231 R5 opus review item R2: the refusal must reach the ledger as a
+    # terminal establish_failed event, not propagate with a dangling
+    # establishing and no terminal event at all.
+    names = [event.event for event in connection.events]
+    assert names == ["establish_failed"]
+    terminal = connection.events[-1]
+    assert terminal.reason == "TransportIdentityAnchorRequired"
+    assert terminal.detail is not None
+    assert "preshared_link_secret" in terminal.detail
 
 
 def test_identity_anchor_appears_in_event_report(

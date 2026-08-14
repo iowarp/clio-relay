@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import socket
 import subprocess
 import time
 import urllib.error
@@ -23,6 +22,7 @@ from clio_relay.frp_link import (
     HeldFrpVisitor,
     require_frp_server_addr,
 )
+from clio_relay.frp_link import assert_loopback_port_available as _assert_local_bind_port_available
 from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
@@ -1083,19 +1083,28 @@ def _finish_frp_probe_cleanup(
     except BaseException as exc:
         remote_control_detail = f"remote SSH cleanup failed: {type(exc).__name__}: {exc}"
         cleanup_errors.append(remote_control_detail)
-    resources = [
-        _process_cleanup_resource(
-            kind="connector",
-            resource_id=f"frpc-visitor:{probe_id}",
-            role="desktop_frpc_visitor",
-            location="desktop",
-            ownership_verified=True,
-            outcome="stopped" if local_stopped else "failed",
-            verified_after_operation=local_stopped,
-            observed_state="stopped" if local_stopped else "running_or_unknown",
-            residual=not local_stopped,
-            detail=local_detail,
-        ),
+    resources: list[TransportCleanupResourceEvidence] = []
+    if visitor is not None:
+        # Omitted entirely when no visitor was ever constructed (#231 R5 opus
+        # review item R14): with no visitor object, nothing was verified
+        # stopped -- reporting "outcome=stopped, verified_after_operation=True"
+        # for a resource that never existed would be a fabricated claim, not a
+        # residual-secret gap like the config-file entry below.
+        resources.append(
+            _process_cleanup_resource(
+                kind="connector",
+                resource_id=f"frpc-visitor:{probe_id}",
+                role="desktop_frpc_visitor",
+                location="desktop",
+                ownership_verified=True,
+                outcome="stopped" if local_stopped else "failed",
+                verified_after_operation=local_stopped,
+                observed_state="stopped" if local_stopped else "running_or_unknown",
+                residual=not local_stopped,
+                detail=local_detail,
+            )
+        )
+    resources.append(
         _process_cleanup_resource(
             kind="connector",
             resource_id=f"ssh-probe-control:{probe_id}",
@@ -1107,8 +1116,8 @@ def _finish_frp_probe_cleanup(
             observed_state=("stopped" if remote_control_stopped else "running_or_unknown"),
             residual=not remote_control_stopped,
             detail=remote_control_detail,
-        ),
-    ]
+        )
+    )
     if config_cleanup_error is not None:
         # A residual, secret-bearing config file is a distinct resource from
         # the process above: the process can be confirmed stopped while its
@@ -1710,15 +1719,6 @@ def _last_json_line(output: str) -> dict[str, object]:
         if isinstance(value, dict):
             return cast(dict[str, object], value)
     raise RelayError("remote cleanup did not emit a bounded JSON object")
-
-
-def _assert_local_bind_port_available(port: int) -> None:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            probe.bind(("127.0.0.1", port))
-    except OSError as exc:
-        raise ConfigurationError(f"local visitor port is already occupied: {port}") from exc
 
 
 def _require_api_token(api_token: str | None) -> str:

@@ -57,6 +57,7 @@ never be reachable from this module.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import tempfile
 import threading
@@ -183,6 +184,67 @@ def _require_env_binding(environment: Mapping[str, str], env_name: str, *, purpo
         f"{purpose} is not set; the cluster declares it must come from the "
         f"{env_name} environment variable, never a literal default"
     )
+
+
+DEFAULT_LOOPBACK_PORT_SUBJECT: Final = "owned session channel"
+DEFAULT_BIND_PORT_SUBJECT: Final = "visitor"
+
+
+def select_loopback_port(*, subject: str = DEFAULT_LOOPBACK_PORT_SUBJECT) -> int:
+    """Select an unused loopback port for the local end of a held link.
+
+    Promoted (#231 R5 opus review item R6): ``control_channel.py``'s
+    ``SshForwardTransport`` and ``frp_transport.py``'s frp-based transports both
+    needed this identically -- one copy here rather than two byte-identical
+    functions. ``subject`` reproduces ``SshForwardTransport``'s
+    pre-promotion message text exactly by default, so its own call site needs
+    no change; ``frp_transport.py`` passes its own label.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    if not isinstance(port, int) or port <= 0:
+        raise RelayError(f"could not select a loopback port for the {subject}")
+    return port
+
+
+def assert_loopback_port_available(port: int, *, subject: str = DEFAULT_BIND_PORT_SUBJECT) -> None:
+    """Fail loudly, before spawning anything, when the local bind port is occupied.
+
+    Promoted (#231 R5 opus review item R6): ``transport_probe.py``'s
+    ``_assert_local_bind_port_available`` and ``frp_transport.py``'s identical
+    copy both needed this. Deliberately omits ``SO_REUSEADDR``: on Windows,
+    setting it can let a bind succeed even while another socket is actively
+    LISTENing on this port (not merely TIME_WAIT), which would make this check
+    a no-op against a real active listener -- silently defeating its own
+    purpose (review item R8). A residual TOCTOU remains regardless: nothing
+    prevents a third party from starting to listen on this exact port between
+    this check and the actual ``frpc``/``ssh`` spawn a few lines later. For the
+    frp modes, R1's identity-first bring-up ordering contains that residual's
+    consequence -- even if something raced onto this port, no credential ever
+    reaches it, because the unauthenticated identity challenge is verified
+    against this connection's pinned identity before anything authenticated is
+    sent.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise ConfigurationError(f"local {subject} port is already occupied: {port}") from exc
+
+
+def validate_channel_nonce(nonce: str) -> None:
+    """Require the exact 256-bit lowercase hex nonce shape every channel uses.
+
+    Promoted (#231 R5 opus review item R6): this exact check existed
+    separately in ``control_channel.SshForwardTransport.establish`` and
+    ``frp_transport.py``'s frp-based transports (the third copy, alongside
+    ``session_api.session_identity_document``'s check on a related but
+    distinct nonce concept -- not consolidated here, out of scope for this
+    promotion).
+    """
+    if len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce):
+        raise ValueError("channel bootstrap nonce must be a lowercase 256-bit hex value")
 
 
 def render_visitor_config(

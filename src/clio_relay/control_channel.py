@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import queue
 import shlex
-import socket
 import subprocess
 import threading
 import time
@@ -50,10 +49,12 @@ from typing import IO, Any, Final, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
 from clio_relay.config import TransportMode
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import BoundedStderrBuffer, pump_stderr
+from clio_relay.frp_link import select_loopback_port as _available_loopback_port
+from clio_relay.frp_link import validate_channel_nonce as _validate_channel_nonce
 from clio_relay.frp_link import wait_for_channel_health as _wait_for_channel_health
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
@@ -195,7 +196,7 @@ class ChannelLink:
     control_endpoint: ChannelEndpoint
     bootstrap: OwnedSessionChannelBootstrap
     stream_channels: bool = False
-    identity_anchor: str | None = None
+    identity_anchor: IdentityAnchor | None = None
 
 
 class ChannelEvent(BaseModel):
@@ -216,7 +217,7 @@ class ChannelEvent(BaseModel):
     reason: str | None = None
     detail: str | None = None
     user_authorization_required: bool = False
-    identity_anchor: str | None = None
+    identity_anchor: IdentityAnchor | None = None
 
 
 ChannelEventSink = Callable[[ChannelEvent], None]
@@ -231,7 +232,7 @@ def channel_event(
     reason: str | None = None,
     detail: str | None = None,
     user_authorization_required: bool = False,
-    identity_anchor: str | None = None,
+    identity_anchor: IdentityAnchor | None = None,
 ) -> ChannelEvent:
     """Build one bounded transport event with a machine-readable reason."""
     return ChannelEvent(
@@ -421,8 +422,7 @@ class SshForwardTransport:
         """Dial once, hold the forward, and return the established link."""
         if self._established:
             raise RelayError("ssh forward transport was already established")
-        if len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce):
-            raise ValueError("channel bootstrap nonce must be a lowercase 256-bit hex value")
+        _validate_channel_nonce(nonce)
         local_port = self._local_bind_port or _available_loopback_port()
         process = self._process_factory(
             self.argv(local_port=local_port),
@@ -680,16 +680,6 @@ def build_transport(
             ready_timeout_seconds=ready_timeout_seconds,
         )
     raise ValueError(f"unknown relay transport mode: {mode!r}")
-
-
-def _available_loopback_port() -> int:
-    """Select an unused loopback port for the local end of the forward."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    if not isinstance(port, int) or port <= 0:
-        raise RelayError("could not select a loopback port for the owned session channel")
-    return port
 
 
 def _read_delimited_document(
