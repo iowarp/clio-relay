@@ -101,7 +101,11 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     "src/clio_relay/storage_runtime.py": 1111,
-    "src/clio_relay/transport_probe.py": 1849,
+    # #231 R4: local-visitor spawn/health/cleanup delegates to the new
+    # frp_link.py substrate (HeldFrpVisitor) instead of duplicating it;
+    # run_frp_http_probe collapses into a thin proxy_type="stcp" wrapper
+    # around _run_frp_http_probe_with_proxy_type. -100 net (1849 -> 1749).
+    "src/clio_relay/transport_probe.py": 1749,
     "src/clio_relay/validation_report.py": 5458,
 }
 

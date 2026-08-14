@@ -38,19 +38,19 @@ import socket
 import subprocess
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import IO, Any, Final, Literal, Protocol, cast
 
-import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import REMOTE_TRANSPORT_MODE_ENV, TransportMode
 from clio_relay.errors import RelayError
+from clio_relay.frp_link import BoundedStderrBuffer, pump_stderr
+from clio_relay.frp_link import wait_for_channel_health as _wait_for_channel_health
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
 from clio_relay.session_lifecycle import OwnedSessionIdentityChallengeRequest
@@ -250,56 +250,6 @@ reach :mod:`subprocess` for the control plane except through a factory.
 def spawn_channel_process(*args: Any, **kwargs: Any) -> ChannelProcess:
     """Spawn one real channel process (the production dial)."""
     return cast(ChannelProcess, subprocess.Popen(*args, **kwargs))
-
-
-class BoundedStderrBuffer:
-    """A drained, bounded record of what a held channel process wrote to stderr.
-
-    The channel process lives for the whole connection, so its stderr pipe must
-    be read continuously or it fills and the process blocks writing to it --
-    which in ``ssh_forward`` mode stops the port forward being serviced, with no
-    error and no event.  ``ssh -L`` writes one line per refused forwarded
-    connection, so this is reached in ordinary operation, and the pipe buffer is
-    only about 4 KiB on Windows.
-    """
-
-    def __init__(self, *, maximum_bytes: int = MAX_CHANNEL_EVENT_DETAIL_CHARS) -> None:
-        if maximum_bytes <= 0:
-            raise ValueError("stderr buffer maximum_bytes must be positive")
-        self._maximum_bytes = maximum_bytes
-        self._lock = threading.Lock()
-        self._chunks: deque[bytes] = deque()
-        self._size = 0
-
-    def append(self, payload: bytes) -> None:
-        """Record one chunk, discarding the oldest to stay inside the bound."""
-        with self._lock:
-            self._chunks.append(payload)
-            self._size += len(payload)
-            while self._size > self._maximum_bytes and len(self._chunks) > 1:
-                self._size -= len(self._chunks.popleft())
-
-    def text(self) -> str | None:
-        """Return the retained diagnostics, or None when nothing was written."""
-        with self._lock:
-            joined = b"".join(self._chunks)
-        detail = joined.decode("utf-8", errors="replace").strip()
-        return detail[-self._maximum_bytes :] or None
-
-
-def pump_stderr(stream: IO[bytes], buffer: BoundedStderrBuffer) -> threading.Thread:
-    """Continuously drain one process's stderr into a bounded buffer."""
-
-    def _pump() -> None:
-        try:
-            for line in stream:
-                buffer.append(line)
-        except (OSError, ValueError):
-            pass
-
-    thread = threading.Thread(target=_pump, name="clio-relay-channel-stderr", daemon=True)
-    thread.start()
-    return thread
 
 
 class RelayTransport(Protocol):
@@ -724,27 +674,3 @@ def _read_delimited_document(
         if collected_bytes > maximum_bytes:
             raise ChannelBootstrapError("owned session channel bootstrap exceeded its byte limit")
         collected.append(line)
-
-
-def _wait_for_channel_health(
-    process: ChannelProcess,
-    *,
-    base_url: str,
-    timeout_seconds: float,
-) -> None:
-    """Wait for the mapped port to answer without opening any new transport."""
-    deadline = time.monotonic() + timeout_seconds
-    last_error = "channel forward did not become ready"
-    with httpx.Client(trust_env=False) as client:
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RelayError(f"owned session channel exited during bring-up: {last_error}")
-            try:
-                response = client.get(base_url + "/healthz", timeout=min(0.5, timeout_seconds))
-                if response.status_code == 200 and response.json().get("ok") is True:
-                    return
-                last_error = f"unexpected health response: HTTP {response.status_code}"
-            except (httpx.HTTPError, TypeError, ValueError) as exc:
-                last_error = str(exc)
-            time.sleep(0.05)
-    raise RelayError(f"owned session channel did not become ready: {last_error}")

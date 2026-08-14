@@ -7,25 +7,23 @@ import os
 import secrets
 import socket
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.relay_host import (
-    FrpcConfig,
-    FrpcVisitorConfig,
-    FrpTransportProtocol,
-    render_frpc_config,
-    render_frpc_visitor_config,
+from clio_relay.frp_link import (
+    FrpLinkConfig,
+    FrpVisitorType,
+    HeldFrpVisitor,
+    require_frp_server_addr,
 )
+from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
     CleanupResource,
@@ -103,9 +101,17 @@ class _RemoteCleanupPayload(BaseModel):
 
 
 class ManagedProcess(Protocol):
-    """Subset of subprocess.Popen used by the transport probe."""
+    """Subset of subprocess.Popen used by the transport probe.
+
+    ``stdin``/``stdout``/``stderr`` stay ``Any``: Protocol attributes are
+    checked invariantly, and the test double in
+    ``tests/test_transport_probe.py`` declares them with a narrower concrete
+    type that only ``Any`` accepts both ways without editing that file.
+    """
 
     stdin: Any | None
+    stdout: Any | None
+    stderr: Any | None
 
     def poll(self) -> int | None:
         """Return process status."""
@@ -224,115 +230,21 @@ def run_frp_http_probe(
     http_check: HttpCheck | None = None,
 ) -> list[str]:
     """Probe desktop-to-cluster HTTP reachability through frp STCP."""
-    if local_bind_port <= 0:
-        raise ConfigurationError("local_bind_port must be positive")
-    if remote_api_port <= 0:
-        raise ConfigurationError("remote_api_port must be positive")
-    if timeout_seconds <= 0:
-        raise ConfigurationError("timeout_seconds must be positive")
-    _assert_local_bind_port_available(local_bind_port)
-    factory = process_factory or _popen
-    transport = definition.frp_transport
-    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
-    _require_api_token(api_token)
-    protocol = FrpTransportProtocol(transport.protocol)
-    with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
-        temp_path = Path(temp_dir)
-        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
-        remote_frpc_config = render_frpc_config(
-            FrpcConfig(
-                server_addr=server_addr,
-                server_port=transport.server_port,
-                token=token,
-                transport_protocol=protocol,
-                proxy_name=proxy_name,
-                local_port=remote_api_port,
-                secret_key=secret_key,
-            )
-        )
-        visitor_config_path = temp_path / "frpc-visitor.toml"
-        visitor_config_path.write_text(
-            render_frpc_visitor_config(
-                FrpcVisitorConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=token,
-                    transport_protocol=protocol,
-                    visitor_name=f"{proxy_name}-visitor",
-                    server_name=proxy_name,
-                    bind_port=local_bind_port,
-                    secret_key=secret_key,
-                )
-            ),
-            encoding="utf-8",
-        )
-        remote = factory(
-            ["ssh", definition.ssh_host, "bash", "-s"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert remote.stdin is not None
-        remote.stdin.write(
-            _remote_probe_script(
-                cluster=cluster,
-                definition=definition,
-                probe_id=probe_id,
-                api_token=api_token,
-                api_port=remote_api_port,
-                frpc_config=remote_frpc_config,
-            ).encode("utf-8")
-        )
-        remote.stdin.close()
-        visitor = factory(
-            [frpc_bin, "-c", str(visitor_config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        lines: list[str] = []
-        primary_error: BaseException | None = None
-        try:
-            time.sleep(1)
-            if remote.poll() is not None:
-                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            try:
-                _wait_for_healthz(
-                    f"http://127.0.0.1:{local_bind_port}/healthz",
-                    timeout_seconds=timeout_seconds,
-                )
-            except RelayError as exc:
-                _terminate(visitor)
-                _terminate(remote)
-                details = [
-                    str(exc),
-                    _process_output_message(remote, "remote transport probe still running"),
-                    _process_output_message(visitor, "local frpc visitor still running"),
-                ]
-                raise RelayError("\n".join(details)) from exc
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            lines = [
-                f"transport.cluster={cluster}",
-                f"transport.server={server_addr}:{transport.server_port}",
-                f"transport.protocol={transport.protocol}",
-                f"transport.local_url=http://127.0.0.1:{local_bind_port}",
-                "transport.healthz=ok",
-            ]
-            if http_check is not None:
-                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
-        except BaseException as exc:
-            primary_error = exc
-        cleanup_lines = _finish_frp_probe_cleanup(
-            cluster=cluster,
-            definition=definition,
-            probe_id=probe_id,
-            visitor=visitor,
-            remote=remote,
-            primary_error=primary_error,
-        )
-        return [*lines, *cleanup_lines]
+    return _run_frp_http_probe_with_proxy_type(
+        cluster=cluster,
+        definition=definition,
+        frpc_bin=frpc_bin,
+        token=token,
+        secret_key=secret_key,
+        local_bind_port=local_bind_port,
+        remote_api_port=remote_api_port,
+        proxy_name=proxy_name,
+        api_token=api_token,
+        timeout_seconds=timeout_seconds,
+        process_factory=process_factory,
+        http_check=http_check,
+        proxy_type="stcp",
+    )
 
 
 def run_frp_direct_http_probe(
@@ -1009,110 +921,107 @@ def _run_frp_http_probe_with_proxy_type(
     _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
-    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
+    server_addr = require_frp_server_addr(transport.server_addr, cluster)
     _require_api_token(api_token)
     protocol = FrpTransportProtocol(transport.protocol)
-    with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
-        temp_path = Path(temp_dir)
-        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
-        remote_frpc_config = render_frpc_config(
-            FrpcConfig(
-                server_addr=server_addr,
-                server_port=transport.server_port,
-                token=token,
-                transport_protocol=protocol,
-                proxy_name=proxy_name,
-                proxy_type=proxy_type,
-                local_port=remote_api_port,
-                secret_key=secret_key,
-            )
+    probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
+    remote_frpc_config = render_frpc_config(
+        FrpcConfig(
+            server_addr=server_addr,
+            server_port=transport.server_port,
+            token=token,
+            transport_protocol=protocol,
+            proxy_name=proxy_name,
+            proxy_type=proxy_type,
+            local_port=remote_api_port,
+            secret_key=secret_key,
         )
-        visitor_config_path = temp_path / "frpc-visitor.toml"
-        visitor_config_path.write_text(
-            render_frpc_visitor_config(
-                FrpcVisitorConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=token,
-                    transport_protocol=protocol,
-                    visitor_name=f"{proxy_name}-visitor",
-                    visitor_type=proxy_type,
-                    server_name=proxy_name,
-                    bind_port=local_bind_port,
-                    secret_key=secret_key,
-                    keep_tunnel_open=proxy_type == "xtcp",
-                )
-            ),
-            encoding="utf-8",
-        )
-        remote = factory(
-            ["ssh", definition.ssh_host, "bash", "-s"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert remote.stdin is not None
-        remote.stdin.write(
-            _remote_probe_script(
-                cluster=cluster,
-                definition=definition,
-                probe_id=probe_id,
-                api_token=api_token,
-                api_port=remote_api_port,
-                frpc_config=remote_frpc_config,
-            ).encode("utf-8")
-        )
-        remote.stdin.close()
-        visitor = factory(
-            [frpc_bin, "-c", str(visitor_config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        lines: list[str] = []
-        primary_error: BaseException | None = None
-        try:
-            time.sleep(1)
-            if remote.poll() is not None:
-                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            try:
-                _wait_for_healthz(
-                    f"http://127.0.0.1:{local_bind_port}/healthz",
-                    timeout_seconds=timeout_seconds,
-                )
-            except RelayError as exc:
-                _terminate(visitor)
-                _terminate(remote)
-                details = [
-                    str(exc),
-                    _process_output_message(remote, "remote transport probe still running"),
-                    _process_output_message(visitor, "local frpc visitor still running"),
-                ]
-                raise RelayError("\n".join(details)) from exc
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            lines = [
-                f"transport.cluster={cluster}",
-                f"transport.server={server_addr}:{transport.server_port}",
-                f"transport.protocol={transport.protocol}",
-                f"transport.proxy_type={proxy_type}",
-                f"transport.local_url=http://127.0.0.1:{local_bind_port}",
-                "transport.healthz=ok",
-            ]
-            if http_check is not None:
-                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
-        except BaseException as exc:
-            primary_error = exc
-        cleanup_lines = _finish_frp_probe_cleanup(
+    )
+    remote = factory(
+        ["ssh", definition.ssh_host, "bash", "-s"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert remote.stdin is not None
+    remote.stdin.write(
+        _remote_probe_script(
             cluster=cluster,
             definition=definition,
             probe_id=probe_id,
-            visitor=visitor,
-            remote=remote,
-            primary_error=primary_error,
-        )
-        return [*lines, *cleanup_lines]
+            api_token=api_token,
+            api_port=remote_api_port,
+            frpc_config=remote_frpc_config,
+        ).encode("utf-8")
+    )
+    remote.stdin.close()
+
+    # The local-visitor half (write the 0600 config, spawn `frpc -c <toml>`,
+    # track/terminate it) delegates to the shared substrate (#231 R4) rather
+    # than reimplementing it here -- the remote-side script above is the only
+    # part of this probe that stays local to transport_probe.py.
+    visitor = HeldFrpVisitor(
+        frpc_bin=frpc_bin,
+        config=FrpLinkConfig(
+            server_addr=server_addr,
+            server_port=transport.server_port,
+            protocol=protocol,
+            token=token,
+            secret_key=secret_key,
+            proxy_name=proxy_name,
+        ),
+        local_bind_port=local_bind_port,
+        visitor_type=cast(FrpVisitorType, proxy_type),
+        keep_tunnel_open=proxy_type == "xtcp",
+        process_factory=process_factory,
+    )
+    visitor.establish()
+
+    lines: list[str] = []
+    primary_error: BaseException | None = None
+    try:
+        time.sleep(1)
+        if remote.poll() is not None:
+            raise RelayError(_process_output_message(remote, "remote transport probe failed"))
+        if not visitor.is_alive():
+            raise RelayError(visitor.failure_detail() or "local frpc visitor failed")
+        try:
+            _wait_for_healthz(
+                f"{visitor.base_url}/healthz",
+                timeout_seconds=timeout_seconds,
+            )
+        except RelayError as exc:
+            visitor.close()
+            _terminate(remote)
+            details = [
+                str(exc),
+                _process_output_message(remote, "remote transport probe still running"),
+                visitor.failure_detail() or "local frpc visitor still running",
+            ]
+            raise RelayError("\n".join(details)) from exc
+        if not visitor.is_alive():
+            raise RelayError(visitor.failure_detail() or "local frpc visitor failed")
+        lines = [
+            f"transport.cluster={cluster}",
+            f"transport.server={server_addr}:{transport.server_port}",
+            f"transport.protocol={transport.protocol}",
+            f"transport.proxy_type={proxy_type}",
+            f"transport.local_url={visitor.base_url}",
+            "transport.healthz=ok",
+        ]
+        if http_check is not None:
+            lines.extend(http_check(visitor.base_url))
+    except BaseException as exc:
+        primary_error = exc
+    cleanup_lines = _finish_frp_probe_cleanup(
+        cluster=cluster,
+        definition=definition,
+        probe_id=probe_id,
+        visitor=visitor,
+        remote=remote,
+        primary_error=primary_error,
+    )
+    return [*lines, *cleanup_lines]
 
 
 def _finish_frp_probe_cleanup(
@@ -1120,7 +1029,7 @@ def _finish_frp_probe_cleanup(
     cluster: str,
     definition: ClusterDefinition,
     probe_id: str,
-    visitor: ManagedProcess,
+    visitor: HeldFrpVisitor,
     remote: ManagedProcess,
     primary_error: BaseException | None,
 ) -> list[str]:
@@ -1130,8 +1039,8 @@ def _finish_frp_probe_cleanup(
     local_stopped = False
     local_detail: str | None = None
     try:
-        _terminate(visitor)
-        local_stopped = visitor.poll() is not None
+        visitor.close()
+        local_stopped = not visitor.is_alive()
         if not local_stopped:
             local_detail = "local frpc visitor remains running"
             cleanup_errors.append(local_detail)
@@ -1778,15 +1687,6 @@ def _assert_local_bind_port_available(port: int) -> None:
             probe.bind(("127.0.0.1", port))
     except OSError as exc:
         raise ConfigurationError(f"local visitor port is already occupied: {port}") from exc
-
-
-def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
-    if server_addr.strip():
-        return server_addr
-    raise ConfigurationError(
-        f"frp server address is not configured for cluster {cluster}; "
-        "set it with `clio-relay cluster add --frp-server-addr ...`"
-    )
 
 
 def _require_api_token(api_token: str | None) -> str:
