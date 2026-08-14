@@ -20,7 +20,7 @@ Kept current as slices land.
 | **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; `mcp_server.py`'s stdio `_error()` (§6.1's third surface) is not wired, tracked as [#235](https://github.com/iowarp/clio-relay/issues/235) (§6.5) | **DONE** — opus re-review (F1-F16) applied in the same slice | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), `28e0fb4` (docs landing R3), `7a526e9` (re-review fixes F1-F16), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3122 and `browser_gateway.py` 826→885 ratchet UP across both passes (net +59/+59), justified in `scripts/check_file_size.py`'s own baseline comments each time (§2 ground rule 5: remove/redesign first — evaluated and rejected, since the growth is real structure — the one global handler, the fourth adapter, the F5 defense-in-depth guard, the F7 typed oversize marker — not a fix that could net negative). `door_errors.py` is new, 667 lines (cap 800). |
 | **R4** | `frp_link.py` (656 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** — opus review fixes F1-F9 applied (`fff662d`); R5's own review then promoted three more shared dial-prep primitives here (§8.5, item R6) | `00aeaef` (frp_link.py + delegation + tests), `fff662d` (F1-F9: dual-stream stdout+stderr draining so a chatty `frpc` child never wedges, `config_cleanup_error` tracking, subject-parameterized health-wait text), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (R4, −100) →1795 (F1-F9, +46, justified); `control_channel.py` 751→676 (R4) →739 (R5 review item R6 shrinks it back down via delegation, still not baselined); `frp_link.py` is new, 471 (R4) →594 (F1-F9) →656 (R5 review item R6's promoted `select_loopback_port`/`assert_loopback_port_available`/`validate_channel_nonce`) lines (cap 800). |
 | **R5** | `frp_transport.py` (527 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** — opus review fix set (R1-R14) applied in the same slice, including a HIGH-severity security fix (R1) | `900f098` (frp_transport.py + wiring + tests), `053c928` (review fix set R1-R14: identity-first bring-up, R2/R7 `_establish` reorder, R6 primitive promotion, R9/R10/R13/R14 correctness fixes), `065431a`/plus the commit landing this revision (docs) | `feat/231-owner-modules` | `frp_transport.py` is new, 393 (initial) →527 (review fix set) lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 (initial) →1058 (review fix set, §8.5) ratchet UP, justified in `scripts/check_file_size.py`'s baseline comments each time. `control_channel.py` 676→749→739 (not baselined, no ratchet entry needed). |
-| **R6** | `bounded_payload.py` (269 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** | `babef74` (bounded_payload.py + wiring + tests), plus the commit landing this revision | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (+28, justified — the new T3 record-time bound doc §6.4/§6.5 named as never having existed) and `src/clio_relay/mcp_server.py` 5920→5930 (+10, justified — the T2 refusal-envelope guard in `_verified_local_mcp_result`), both recorded in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 269 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7 — `runner.py` must resolve it standalone on a JARVIS worker). `relay_ops.py` 530→556, `frp_check.py` 48→68, and `door_errors.py` 667→671 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
+| **R6** | `bounded_payload.py` (287 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** — opus review fix set (F1-F13) applied in the same slice, including a HIGH-severity `isError` correctness defect (F1) | `babef74` (bounded_payload.py + wiring + tests), `6972ebd` (docs landing R6), `eab1fc4` (review fix set F1-F13: shared `_delivery_refusal_failed` discriminator, the 413 `payload_too_large` door, five wrong-reason decode sites, `job read-artifact`'s exit code, the `_bounded_mcp_result` migration, `frp_check.py`'s discarded record + unbounded read, the degenerate-window refusal, wrong remediation advice, stale citations), plus the commit landing this revision (docs, §6.6) | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (T3 bound, unchanged by the review) and `src/clio_relay/mcp_server.py` 5920→5930→5943 (review fixes F1/F5/F7, +13 more), `src/clio_relay/cli.py` 19315→19333 (F5/F6, +18), `src/clio_relay/endpoint.py` 8710→8719 (F4, +9), `src/clio_relay/http_api.py` 3122→3151 (F2, +29), `src/clio_relay/jarvis_service_runtime.py` 1158→1169 (F5, +11), `src/clio_relay/live_acceptance.py` 5427→5447 (F5, +20), `src/clio_relay/remote_mcp.py` 5308→5319 (F5, +11) — all justified in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 287 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7). `relay_ops.py` 530→571, `frp_check.py` 48→104, and `door_errors.py` 667→676 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
 | **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
 
@@ -693,23 +693,31 @@ transport-level cut, not a `clio-relay.error.v1` document.
 ### 6.4 Byte budgets, three tiers
 
 **T1 — refusal text, 2,000 chars, hard-truncated, in-band marker.**
-Three independent precedents still separately agree on 2000 chars as the
-refusal-text budget: `MAX_REFUSAL_MESSAGE_CHARS = 2_000`
+Six independent literals now separately agree on 2000 as the refusal-text
+budget (recounted honestly by the R6 review pass, F13 — an earlier revision
+of this paragraph undercounted at three): `MAX_REFUSAL_MESSAGE_CHARS = 2_000`
 (`jarvis_dispatch_failure.py:29`), `MAX_CHANNEL_EVENT_DETAIL_CHARS: Final =
-2_000` (`control_channel.py:68`, used at `:212`), and an inline (unnamed)
+2_000` (`control_channel.py:75`, used at `:212`), an inline (unnamed)
 `[:2_000]` slice on a JSON-encoded error body in
-`remote_connection.py:920-924`. **R6 status:** unifying those three
-call-site literals into one shared char-count constant was floated as an
-aspiration when this section was first written, but it was never R6's own
-stated scope — the three *raw payload paths* named in §6.5, not these three
-already-agreeing refusal-text sites — and remains open, untracked by any
-issue yet. What R6 did land at T1: `bounded_payload.build_truncation_record`
-is now the single constructor every T1/T3 record is built through
-(`door_errors.py`'s R3-era `_bounded_text` calls it instead of building the
-record dict inline; its own `MAX_MESSAGE_CHARS = 2_000` char-count policy —
-what gets kept — is unchanged, only how the cut is *described* moved), plus
-a distinct byte-oriented T1 budget, `bounded_payload.T1_TEXT_MAX_BYTES =
-2_000`, backs `frp_check.py`'s new byte- (not line-count-) bounded frpc
+`remote_connection.py:992`, `frp_link.py:90`'s
+`DEFAULT_STDERR_BUFFER_MAX_BYTES: Final = 2_000` (R4/R5's promoted
+stderr-buffer cap — possibly a distinct semantic budget wearing the same
+number, not yet verified), `door_errors.py:147`'s own
+`MAX_MESSAGE_CHARS: Final = 2_000`, and R6's own
+`bounded_payload.T1_TEXT_MAX_BYTES: Final = 2_000`. **R6 status:** unifying
+these into one shared constant was floated as an aspiration when this
+section was first written, but it was never R6's own stated scope — the
+three *raw payload paths* named in §6.5, not these six already-agreeing
+refusal-text sites — and remains open, tracked as
+[iowarp/clio-relay#236](https://github.com/iowarp/clio-relay/issues/236)
+(filed from the R6 review, F13). What R6 did land at T1:
+`bounded_payload.build_truncation_record` is now the single constructor
+every T1/T3 record is built through (`door_errors.py`'s R3-era
+`_bounded_text` calls it instead of building the record dict inline; its
+own `MAX_MESSAGE_CHARS = 2_000` char-count policy — what gets kept — is
+unchanged, only how the cut is *described* moved), plus a distinct
+byte-oriented T1 budget, `bounded_payload.T1_TEXT_MAX_BYTES = 2_000`, backs
+`frp_check.py`'s new byte- (not line-count-) bounded frpc
 failure detail (§6.5).
 
 **T2 — agent-parsed payload, 65,536 bytes inline, never truncated; overflow
@@ -759,6 +767,30 @@ onto this schema — it was never one of R6's three named raw paths (§6.5), so
 it remains its own, separate, tail-only `STREAM_RESULT_TAIL_MAX_CHARACTERS`
 bound.
 
+**The bounded text's blast radius reaches the job's durable stdout.log too
+(F3, R6 review) — traced, not assumed.** `jarvis-packages/clio_relay/
+clio_relay/mcp_call/pkg.py`'s `McpCall.start()` runs the MCP call, then
+re-reads the JUST-WRITTEN `mcp-result.json` and re-prints
+`result.get("stdout")`/`result.get("stderr")` to its own process
+stdout/stderr (`pkg.py:26-43`) — which is what the JARVIS-CD pipeline step
+this package runs as, and in turn the endpoint worker spooling that
+process's output, captures into the job's durable `stdout.log`/`stderr.log`
+artifacts. Because `_write_mcp_result` bounds `stdout`/`stderr` BEFORE
+writing `mcp-result.json` (above), `pkg.py` re-prints the already-bounded
+text plus its in-band marker, not the original unbounded capture — the
+elided middle does not leak into `stdout.log` either; it survives nowhere
+(`evidence_ref: null` on every T3 record is honest, not merely unpopulated).
+**Named test gap:** proving this end-to-end (a live JARVIS-CD pipeline step
+whose durable `stdout.log` is asserted to carry the marker) requires the
+real `jarvis_cd` runtime package, which this tree's test environment does
+not install (`import jarvis_cd` fails; `pkg.py`'s `Application` base class
+is a `TYPE_CHECKING`-only stub otherwise, `_jarvis_api.py:14-30`) — the same
+constraint that makes `runner.py`'s own JARVIS-CD-wheel tests use real
+subprocess snapshotting rather than a unit-level fixture. `pkg.py` itself
+has no standalone, dependency-free function to unit-test the re-print in
+isolation. Tracked as an open gap rather than papered over with a shallow
+test that would not actually exercise the re-print path.
+
 The `clio-relay.truncation.v1` schema below is now shipped code, not a
 proposal: `{schema_version, truncated, retention: "head"|"tail"|"head_tail",
 original_bytes, retained_head_bytes, retained_tail_bytes, elided_bytes,
@@ -805,6 +837,128 @@ refusal message has no natural in-band position for it beyond the cut.
 | `release_pins.py`'s `PinSite` table + bump command + preflight | Specified (§7) | Not started | #198, tracked under #231 (R7) |
 | `frp_link.py` (R4 scope: `transport_probe.py` local-visitor + `frp_check.py`) | Specified (§4.3, §5, §8.2) | Not started | tracked under #231 (R4) |
 | `frp_link.py` extension + `frp_remote_scripts.py` (`service_runtime.py`'s copy) | Specified (§4.3, §5, §8.2, §10) | Not started | [#233](https://github.com/iowarp/clio-relay/issues/233), separate from R4 (B4 correction) |
+
+### 6.6 R6 opus review fix set (F1-F13)
+
+A review of the R6 landing above found thirteen findings, all fixed in the
+same slice (failing-first tests for every code fix; F3/F11-F13 are
+doc/tracking corrections).
+
+**F1 [HIGH] — `isError` missed every non-inline-limit T2 refusal.**
+`mcp_server.py`'s `_mcp_tool_result_failed` keyed its delivery-refusal
+branch on `code == MCP_RESULT_INLINE_LIMIT_CODE` only — an
+`artifact_content_too_large` refusal (relay_ops's new T2 path) returned
+`isError: false`, a SUCCESS `CallToolResult` whose body says
+`result_available: false`. Fixed via a shared `_delivery_refusal_failed`
+helper that discriminates on `is_delivery_refusal(document)` plus
+`delivery.status == "failed"`, not one named code.
+`test_mcp_tool_result_failed_recognizes_any_typed_delivery_refusal_not_one_named_code`
+and the `relay_wait`-shaped integration twin
+`test_oversized_artifact_read_refusal_sets_tool_error_not_a_silent_success`.
+
+**F2 [MED-HIGH] — `GET /artifacts/{id}/content` answered 200 over budget.**
+Fixed by routing the refusal through `door_errors`' existing
+`payload_too_large` door (413) instead of returning the refusal document
+as a 200 body — the refusal document itself rides along as the envelope's
+extension data (F4's contract-members-always-win discipline).
+`test_oversized_artifact_content_answers_413_payload_too_large_not_200`.
+
+**F3 — the bounded text's blast radius, traced not assumed.** Documented in
+§6.4 above: `pkg.py`'s `McpCall.start()` re-prints the already-bounded
+`mcp-result.json` `stdout`/`stderr` to its own process output, which the
+endpoint worker spools into the job's durable `stdout.log`/`stderr.log` —
+the elided middle survives nowhere. A live end-to-end test needs the real
+`jarvis_cd` runtime this environment doesn't install; named as an open test
+gap rather than papered over with a shallow one.
+
+**F4 — `recovered_document` inherited a stale truncation record.**
+`endpoint.py`'s lost-response recovery path blanks `stdout`/`stderr` to
+`""` but spreads `**query_document` first, which could carry a populated
+`stdout_truncation`/`stderr_truncation` from the source execution query — a
+record claiming a truncation happened on content that no longer exists.
+Fixed by nulling both fields explicitly alongside the blanked streams.
+`test_recovered_jarvis_run_result_nulls_stale_stream_truncation_records`.
+
+**F5 — five caller families reported the wrong reason for an over-budget
+artifact.** Every envelope-decoding call site checked `encoding != "base64"`
+without first checking whether the envelope was a T2 refusal, so each
+reported a generic, misleading "not base64 encoded"/"encoding is
+unsupported" instead of the refusal's own message/code. Fixed at
+`cli.py`'s shared `_decode_artifact_envelope` (covers four callers in one
+fix), `jarvis_service_runtime.py`'s `_load_source`, `remote_mcp.py`'s
+`_control_query_discovery_artifact_bytes`, `live_acceptance.py`'s
+`_decode_artifact_text` and `_verify_completed_job`'s two inline checks (a
+shared `_delivery_refusal_error` helper), and `mcp_server.py`'s
+`_mcp_tool_result_failed` top-level check (F1's fix already covers
+`_read_model_artifact_bytes`'s `relay_read_artifact` tool result).
+Failing-first tests in each touched suite; `live_acceptance.py`'s
+`_verify_completed_job` inline checks share the doc-note-only treatment
+where a live orchestration fixture would be disproportionate (matching
+F3's own standard).
+
+**F6 — `clio job read-artifact` exited 0 on a refusal.** Fixed by checking
+`is_delivery_refusal` after printing the document and raising
+`typer.Exit(code=1)`, so a script checking only the exit code (not
+grepping stdout) still observes the failure.
+`test_cli_read_artifact_over_budget_prints_the_refusal_and_exits_nonzero`.
+
+**F7 — `_bounded_mcp_result`'s inline failure dict, migrated.**
+`mcp_server.py`'s original T2 precedent built its failure document as an
+inline dict literal instead of calling into `bounded_payload`. Migrated
+onto `build_delivery_refusal`; the now-dead local `MCP_RESULT_DELIVERY_SCHEMA`
+constant is deleted (single owner, ground rule 1). The pre-existing
+`test_oversized_terminal_mcp_result_fails_closed_without_partial_payload`/
+`test_oversized_terminal_mcp_result_sets_tool_error_and_preserves_job_evidence`
+already exercise this path end-to-end; a new
+`test_delivery_failure_schema_version_is_pinned_to_the_mcp_server_precedent`
+pins the wire value itself.
+
+**F8 — `frp_check.py` discarded its truncation record; unbounded read.**
+`_bounded_failure_detail` built a `clio-relay.truncation.v1` record then
+threw it away; fixed by logging it (`ConfigurationError` has no typed data
+channel of its own, unlike `door_errors.classify()`'s exception dispatch).
+`subprocess.run`'s captured stdout also had no byte cap of its own before
+either return branch; fixed with a new generous, T3-shaped
+`_bounded_capture` (8 MiB head + 8 MiB tail) applied immediately after
+capture, on all three return paths (timeout/success/failure).
+`test_frpc_failure_detail_logs_the_discarded_truncation_record`,
+`test_bounded_capture_applies_the_generous_t3_read_cap`,
+`test_timeout_path_output_is_bounded_before_splitlines`,
+`test_clean_exit_output_is_bounded_before_splitlines`.
+
+**F9 — UTF-8 boundary + the degenerate zero-window case.**
+`bound_stream_capture(head_max=0, tail_max=0)` fell through to
+`retention="tail"` even though nothing is retained from either side — a
+silent mislabel. Now refused as a `ValueError` (a caller bug, not a shape
+to describe). The documented `errors="replace"`/U+FFFD behavior at a
+split multi-byte character is now pinned by a test rather than merely
+described. `test_sabotage_twin_the_degenerate_zero_zero_window_is_refused_not_mislabeled`,
+`test_a_character_straddling_the_cut_boundary_renders_as_u_fffd`.
+
+**F10 — wrong remediation advice for non-log artifacts.**
+`relay_ops.py`'s over-budget refusal always suggested "use the
+cursor-based log endpoint for job logs" — correct for a `stdout`/`stderr`
+artifact, actively wrong for e.g. an oversized `mcp_result` artifact,
+which that endpoint has no path to serve at all. Fixed by branching the
+remediation text on the artifact's `kind`.
+`test_oversized_non_log_artifact_refusal_does_not_recommend_the_log_endpoint`.
+
+**F11/F12/F13 — stale citations and an untracked residual, corrected.**
+`bounded_payload.py`'s own docstrings cited `mcp_server.py` line numbers
+and a `MCP_RESULT_DELIVERY_SCHEMA` constant F7's migration retired;
+rewritten to describe the current, post-migration shape.
+`door_errors.py` carried a dangling `#:` doc-comment (documenting nothing
+after `TRUNCATION_SCHEMA_VERSION` became an import) and a stale claim that
+"R6 is scoped to name one shared constant" for the T1 refusal-text
+literals — never actually true, and now corrected in both `door_errors.py`
+and §6.4 above. The recount itself was wrong too: three
+independently-agreeing 2,000 literals is actually six
+(`door_errors.MAX_MESSAGE_CHARS`, `jarvis_dispatch_failure.
+MAX_REFUSAL_MESSAGE_CHARS`, `control_channel.MAX_CHANNEL_EVENT_DETAIL_CHARS`,
+`remote_connection.py`'s inline `[:2_000]` slice, `frp_link.
+DEFAULT_STDERR_BUFFER_MAX_BYTES`, and `bounded_payload.T1_TEXT_MAX_BYTES`).
+Filed as [iowarp/clio-relay#236](https://github.com/iowarp/clio-relay/issues/236)
+so the residual has a gate instead of a dangling TODO.
 
 ## 7. Release-identity + contract pins (#198)
 
@@ -1408,7 +1562,9 @@ by ordering, not avoided by being independent:
   scheduling preference.
 - `mcp_server.py` is a target of **both** R3 (§6.2's translation-owner
   call surface) **and** R6 (§6.4's T2 precedent, `MAX_INLINE_MCP_RESULT_BYTES`
-  at `mcp_server.py:174`). `mcp_server.py` imports from `service_runtime.py`
+  at `mcp_server.py:175` — its former neighbor `MCP_RESULT_DELIVERY_SCHEMA`
+  was retired in the R6 review-fix migration, F7, shifting this by one
+  line). `mcp_server.py` imports from `service_runtime.py`
   (`mcp_server.py:153`) — that import is [#233](https://github.com/iowarp/clio-relay/issues/233)'s
   concern, not R4's (§8.2's B4 correction: R4 does not touch
   `service_runtime.py` at all), so `mcp_server.py`'s own R3/R6 edits are
@@ -1568,13 +1724,16 @@ document.
   merely stale text (§7). All three are symptoms of #198 (no single pin
   registry regenerates fixtures together with source) and are exactly what
   R7's `release_pins.py` is scoped to end.
-- **No record-time head+tail bound exists for `runner.py`'s `mcp-result.json`
-  today**, despite this document's own early working draft assuming one did
-  (§6.4). `_write_mcp_result` writes stdout/stderr through unchanged from
-  the upstream 32 MiB / 4 MiB read-time caps; the closest real precedent,
-  `jarvis_provider.py`'s `_BoundedTextTail`, is tail-only and shares one 1
-  MiB bound across both streams rather than the asymmetric split originally
-  hypothesized. Tracked in §6.5's ledger, scoped into R6.
+- **DONE (R6).** No record-time head+tail bound existed for `runner.py`'s
+  `mcp-result.json`, despite this document's own early working draft
+  assuming one did (§6.4) — `_write_mcp_result` wrote stdout/stderr through
+  unchanged from the upstream 32 MiB / 4 MiB read-time caps.
+  `bounded_payload.bound_stream_capture` now lands the asymmetric 1 MiB/
+  256 KiB stdout/stderr split originally hypothesized, applied after
+  protocol parsing and before the write (§6.4). `jarvis_provider.py`'s
+  tail-only `_BoundedTextTail` (one shared 1 MiB bound across both streams)
+  remains its own, separate, not-yet-migrated precedent — never one of R6's
+  three named raw paths.
 - **`allow_stcp_fallback` (`transport_probe.py:250-314` post-R4, defaults `True`) is
   exactly the automatic mode-switching `connection-model.md:85-86` rules
   out** (under the "(c) SSH port forward" section, not "Never do this" — an
