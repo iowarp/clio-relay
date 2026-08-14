@@ -1,6 +1,6 @@
 # clio-relay architecture — 2026-08 decomposition design
 
-**Status:** R1–R4 complete (2026-08-14); R5–R8+ open ·
+**Status:** R1–R6 complete (2026-08-14); R7–R8+ open ·
 **Origin:** owner correction 2026-08-13 — clio-relay drifted back to
 monolithic god files · **Tracking:**
 [iowarp/clio-relay#231](https://github.com/iowarp/clio-relay/issues/231)
@@ -20,7 +20,7 @@ Kept current as slices land.
 | **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; `mcp_server.py`'s stdio `_error()` (§6.1's third surface) is not wired, tracked as [#235](https://github.com/iowarp/clio-relay/issues/235) (§6.5) | **DONE** — opus re-review (F1-F16) applied in the same slice | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), `28e0fb4` (docs landing R3), `7a526e9` (re-review fixes F1-F16), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3122 and `browser_gateway.py` 826→885 ratchet UP across both passes (net +59/+59), justified in `scripts/check_file_size.py`'s own baseline comments each time (§2 ground rule 5: remove/redesign first — evaluated and rejected, since the growth is real structure — the one global handler, the fourth adapter, the F5 defense-in-depth guard, the F7 typed oversize marker — not a fix that could net negative). `door_errors.py` is new, 667 lines (cap 800). |
 | **R4** | `frp_link.py` (471 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** | `00aeaef` (frp_link.py + delegation + tests), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (−100, ratchet lowered); `control_channel.py` 751→676 (not baselined, no ratchet entry needed); `frp_link.py` is new, 471 lines (cap 800). |
 | **R5** | `frp_transport.py` (393 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** | `900f098` (frp_transport.py + wiring + tests), plus the commit landing this revision | `feat/231-owner-modules` | `frp_transport.py` is new, 393 lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 ratchet UP (§8.5, justified in `scripts/check_file_size.py`'s baseline comments). `control_channel.py` 676→749 (not baselined, no ratchet entry needed). |
-| **R6** | `bounded_payload.py` — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1` | PLANNED | — | — | — |
+| **R6** | `bounded_payload.py` (269 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** | `babef74` (bounded_payload.py + wiring + tests), plus the commit landing this revision | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (+28, justified — the new T3 record-time bound doc §6.4/§6.5 named as never having existed) and `src/clio_relay/mcp_server.py` 5920→5930 (+10, justified — the T2 refusal-envelope guard in `_verified_local_mcp_result`), both recorded in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 269 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7 — `runner.py` must resolve it standalone on a JARVIS worker). `relay_ops.py` 530→556, `frp_check.py` 48→68, and `door_errors.py` 667→671 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
 | **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
 
@@ -693,13 +693,24 @@ transport-level cut, not a `clio-relay.error.v1` document.
 ### 6.4 Byte budgets, three tiers
 
 **T1 — refusal text, 2,000 chars, hard-truncated, in-band marker.**
-Three independent precedents already agree on 2000 chars as the refusal-text
-budget: `MAX_REFUSAL_MESSAGE_CHARS = 2_000`
+Three independent precedents still separately agree on 2000 chars as the
+refusal-text budget: `MAX_REFUSAL_MESSAGE_CHARS = 2_000`
 (`jarvis_dispatch_failure.py:29`), `MAX_CHANNEL_EVENT_DETAIL_CHARS: Final =
 2_000` (`control_channel.py:68`, used at `:212`), and an inline (unnamed)
 `[:2_000]` slice on a JSON-encoded error body in
-`remote_connection.py:920-924`. R6 should name one shared constant instead of
-three independently-agreeing literals.
+`remote_connection.py:920-924`. **R6 status:** unifying those three
+call-site literals into one shared char-count constant was floated as an
+aspiration when this section was first written, but it was never R6's own
+stated scope — the three *raw payload paths* named in §6.5, not these three
+already-agreeing refusal-text sites — and remains open, untracked by any
+issue yet. What R6 did land at T1: `bounded_payload.build_truncation_record`
+is now the single constructor every T1/T3 record is built through
+(`door_errors.py`'s R3-era `_bounded_text` calls it instead of building the
+record dict inline; its own `MAX_MESSAGE_CHARS = 2_000` char-count policy —
+what gets kept — is unchanged, only how the cut is *described* moved), plus
+a distinct byte-oriented T1 budget, `bounded_payload.T1_TEXT_MAX_BYTES =
+2_000`, backs `frp_check.py`'s new byte- (not line-count-) bounded frpc
+failure detail (§6.5).
 
 **T2 — agent-parsed payload, 65,536 bytes inline, never truncated; overflow
 is a typed delivery-failure document.** `mcp_server.py` already implements
@@ -710,48 +721,72 @@ over it, a typed `dict` (not a dataclass or pydantic model today) carries
 `content_truncated`, `result_available`, and a nested `delivery` object
 (`schema_version`, `status`, `code`, `max_inline_bytes`,
 `private_evidence_preserved`, `remote_side_effects_may_have_occurred`,
-`message`). This is the T2 precedent R6 generalizes, and it is the one place
-in the current codebase where "never truncate — hand back a typed overflow
-document instead" is already real.
+`message`). This was the T2 precedent R6 generalized (unchanged itself —
+`_bounded_mcp_result` was never one of R6's three named raw paths) into
+`bounded_payload.build_delivery_refusal`/`is_delivery_refusal`, mirroring
+`mcp_server.py`'s schema tag *by value* rather than by import
+(`DELIVERY_FAILURE_SCHEMA_VERSION = "clio-relay.mcp-result-delivery.v1"` —
+importing the real constant would cycle, since `mcp_server.py` already
+imports `relay_ops.read_artifact_bytes`, now a T2 consumer of this shared
+constant). **R6 status:** wired at `relay_ops.py`'s `read_artifact_bytes`
+(over `MAX_ARTIFACT_CONTENT_BYTES`, 16 MiB, unchanged — the durable artifact
+reference is kept as evidence, `data` withheld, never a raise and never a
+partial body) and its `mcp_server.py` call site (`_verified_local_mcp_result`,
+which now recognizes the refusal shape via `is_delivery_refusal` and
+surfaces it as-is instead of falling into `_decode_verified_mcp_result` and
+misreporting it as a generic malformed-envelope `ValueError`).
 
 **T3 — durable operator evidence; read bounds stay generous, record bounds
-should be head+tail but currently are not implemented that way.** The read
-side is real and generous: `runner.py`'s 32 MiB stdout / 4 MiB stderr
-read-time caps (`:47-48`, applied at `:4838`) and `relay_ops.py`'s 16 MiB
-artifact-content read cap (`:44`, `:224`). **Correction against this
-document's own working hint:** there is no additional head+tail bounding
-applied when `runner.py`'s `_write_mcp_result` (`:2228-2319`) builds
-`mcp-result.json` — `stdout`/`stderr` are written through unchanged from the
-already-read-capped values (`:2298-2299`, sourced from `:2013-2014`); a
-targeted search for `head_bytes`/`tail_bytes`/`1_048_576`/`262_144`-style
-pairs in `runner.py` found none. The nearest real precedent for "bound the
-middle, keep both ends" is `_BoundedTextTail` in
-`src/clio_relay/jarvis_provider.py:36-74` — but it is **tail-only**, not
-head+tail, and applies one shared `STREAM_RESULT_TAIL_MAX_CHARACTERS = 1024 *
-1024` (1 MiB) bound identically to both `stdout_tail` and `stderr_tail`
-(`:314-315`), not the asymmetric stdout/stderr split this document
-originally hypothesized. R6's actual scope at T3 is therefore larger than
-"generalize an existing head+tail bound": it has to *build* head+tail
-record-time bounding for `runner.py`'s result document (extending the
-tail-only `_BoundedTextTail` shape, or a new bounded-window primitive) rather
-than lift one that already exists — recorded honestly in §6.5 below so R6 is
-scoped correctly from the start.
+are now head+tail (R6 landed).** The read side is real and generous, and
+**unchanged by R6** — narrowing it would break a chatty server's JSON-RPC
+parse, the risk this section's own earlier correction already flagged:
+`runner.py`'s 32 MiB stdout / 4 MiB stderr read-time caps (`:47-48`ish,
+`MCP_SESSION_MAX_STDOUT_BYTES`/`MCP_SESSION_MAX_STDERR_BYTES`) and
+`relay_ops.py`'s 16 MiB artifact-content read cap (`MAX_ARTIFACT_CONTENT_BYTES`).
+**R6 landed the record-time bound this section previously reported as
+missing:** `runner.py`'s `_write_mcp_result` now calls
+`bounded_payload.bound_stream_capture` on `stdout`/`stderr` *after* every
+protocol/pagination/initialize parse has already run against the full,
+unbounded capture (parsing must never see an already-truncated stream) and
+*before* the result document is written to disk — defaults 1 MiB head +
+1 MiB tail for stdout, 256 KiB head + 256 KiB tail for stderr (doc-named,
+`STDOUT_HEAD_MAX_BYTES`/`STDOUT_TAIL_MAX_BYTES`/`STDERR_HEAD_MAX_BYTES`/
+`STDERR_TAIL_MAX_BYTES`). The result document gains `stdout_truncation`/
+`stderr_truncation` fields — `null` when nothing was elided, a populated
+`clio-relay.truncation.v1` record otherwise. `jarvis_provider.py`'s
+tail-only `_BoundedTextTail` precedent is **unchanged and not migrated**
+onto this schema — it was never one of R6's three named raw paths (§6.5), so
+it remains its own, separate, tail-only `STREAM_RESULT_TAIL_MAX_CHARACTERS`
+bound.
 
-The `clio-relay.truncation.v1` schema below is this document's proposal for
-that still-to-be-built record-time bound, not a description of shipped code:
-`{schema_version, truncated, retention: "head"|"tail"|"head_tail",
+The `clio-relay.truncation.v1` schema below is now shipped code, not a
+proposal: `{schema_version, truncated, retention: "head"|"tail"|"head_tail",
 original_bytes, retained_head_bytes, retained_tail_bytes, elided_bytes,
-marker, evidence_ref}`. `retention` includes `"tail"` (not just
-`"head"`/`"head_tail"`) specifically to describe the *existing*
-`_BoundedTextTail` shape (§6.4) honestly once it adopts this schema, rather
-than forcing R6 to redesign a working tail-only precedent into a head+tail
-one it doesn't need. A single `retained_bytes` field is ambiguous once
-`retention` can be `"head_tail"` (two separate retained spans, not one), so
-the schema splits it into `retained_head_bytes`/`retained_tail_bytes` —
-either is `0` when `retention` doesn't include that side (e.g.
-`retained_head_bytes: 0` for `retention: "tail"`). The marker string
-`"[clio-relay: elided N bytes of stdout]"` is written full-line, in-band, at
-the elision point.
+marker, evidence_ref}`, built by `bounded_payload.build_truncation_record`
+(`src/clio_relay/bounded_payload.py`, vendored byte-identical into
+`jarvis-packages/clio_relay/clio_relay/bounded_payload.py` per the
+`process_containment.py` precedent, §7 — `runner.py` must resolve
+`clio_relay.bounded_payload` from its own standalone package tree when
+deployed to a JARVIS worker, not from `src/clio_relay`;
+`tests/test_bounded_payload.py::test_the_worker_vendored_copy_is_an_exact_mirror`
+enforces the mirror the same way `test_process_containment.py` already does).
+`door_errors.py`'s T1 `_bounded_text` and `runner.py`'s T3
+`_write_mcp_result` both build records through this one constructor;
+`jarvis_provider.py`'s `_BoundedTextTail` remains its own, not-yet-migrated
+tail-only shape (above). `retention` includes `"tail"` (not just
+`"head"`/`"head_tail"`) specifically to describe that still-separate
+precedent honestly if it ever adopts this schema, rather than forcing a
+head+tail redesign it doesn't need. A single `retained_bytes` field is
+ambiguous once `retention` can be `"head_tail"` (two separate retained
+spans, not one), so the schema splits it into
+`retained_head_bytes`/`retained_tail_bytes` — either is `0` when `retention`
+doesn't include that side (e.g. `retained_head_bytes: 0` for `retention:
+"tail"`). The marker string `"[clio-relay: elided N bytes of <stream>]"` is
+written full-line, in-band, at the elision point —
+`bound_stream_capture` embeds it directly in the retained T3 content;
+`door_errors._bounded_text`'s T1 record carries the same marker text but
+does not embed it in-band in the (already-cut) message itself, since a short
+refusal message has no natural in-band position for it beyond the cut.
 
 ### 6.5 Specified-but-not-implemented ledger
 
@@ -762,7 +797,9 @@ the elision point.
 | `REASONS` frozen set + membership test | Specified (§6.3) | **DONE (R3)** — 13 rows (the seed ten, the two verification-pass gaps, and `payload_too_large` added by the re-review), `tests/test_door_errors.py::test_every_reason_is_registered`; all relay-owned MCP codes moved out of the SDK's reserved `-32000..-32019` band (F1). Two rows (`jarvis_dispatch_refused`, `launcher_resolution_failed`) are declared, tested contract with no production call site emitting them yet (F11) | tracked under #231 (R3) |
 | `browser_gateway.py`'s `_error()` routed through `door_errors.classify()` | Specified (§6.1, §6.2) | **DONE (R3)** for the two exception-path call sites (`:509`/`:580` `except ValueError`); the oversize branch specifically gets the dedicated `payload_too_large` reason (F7+F14), the other three `_request_body` failures stay `configuration_error`. The other 11 `_error()` call sites are access-control decisions with hardcoded statuses, out of R3's stated scope | tracked under #231 (R3) |
 | T1 refusal-text truncation (`_bounded_text`, §6.4) | Specified (§6.3/§6.4) | **DONE (R3 re-review, F2)** — `_bounded_text` returns a populated `clio-relay.truncation.v1` record whenever it actually cuts a message; `as_http_problem`'s `truncation` field reflects it (never a hardcoded `null` on a truncated document) | tracked under #231 (R3) |
-| `clio-relay.truncation.v1` + head+tail T3 record-time bounding | Specified (§6.4) | Not started — no head+tail bound exists in `runner.py` today, only the tail-only, non-split `_BoundedTextTail` in `jarvis_provider.py`. Distinct from the T1 row above, which R3's re-review did implement | tracked under #231 (R6) |
+| `clio-relay.truncation.v1` + head+tail T3 record-time bounding | Specified (§6.4) | **DONE (R6)** — `bounded_payload.build_truncation_record`/`bound_stream_capture` land the head+tail record-time bound; wired into `runner.py`'s `_write_mcp_result` (stdout 1 MiB+1 MiB, stderr 256 KiB+256 KiB, applied after protocol parsing, before the write). `jarvis_provider.py`'s tail-only, non-split `_BoundedTextTail` is unchanged — not migrated onto this schema, out of R6's three-raw-path scope | tracked under #231 (R6) |
+| T2 typed refusal generalized to `relay_ops.py`'s `read_artifact_bytes` | Specified (§6.4) | **DONE (R6)** — `bounded_payload.build_delivery_refusal`/`is_delivery_refusal` (mirrors `mcp_server.py`'s `MCP_RESULT_DELIVERY_SCHEMA` shape by value, not import, to avoid a `relay_ops` → `bounded_payload` → `mcp_server` cycle). Over `MAX_ARTIFACT_CONTENT_BYTES` (16 MiB, unchanged), `read_artifact_bytes` returns the typed document instead of raising `RelayError`; `mcp_server.py`'s `_verified_local_mcp_result` recognizes and surfaces it | tracked under #231 (R6) |
+| T1 byte-bounded (not line-count) frpc failure detail | Specified (§6.4) | **DONE (R6)** — `frp_check.py`'s `ConfigurationError` detail was `"\n".join(stdout.splitlines()[-12:])`, a line-count heuristic with no byte guarantee; now `bounded_payload.bound_stream_capture(..., head_max=0, tail_max=T1_TEXT_MAX_BYTES)`, a byte-bounded tail retention | tracked under #231 (R6) |
 | `TaskInputParkConflictError` typed conversion (replace the bare re-raise) | Specified (§6.1) | **DONE (R3)** — `fastmcp_server.py`'s `intercept_tool_call` now raises `door_errors.as_mcp_error(door_errors.classify(exc))`, closing the live hole | tracked under #231 (R3) |
 | `http_api.py`'s 107 `HTTPException` sites routed through `door_errors.classify()` | Specified (§6.2, explicitly deferred) | Not started | later slice beyond R3, named not tonight (§10) |
 | `release_pins.py`'s `PinSite` table + bump command + preflight | Specified (§7) | Not started | #198, tracked under #231 (R7) |
