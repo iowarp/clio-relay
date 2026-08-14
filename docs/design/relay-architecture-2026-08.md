@@ -1,8 +1,9 @@
 # clio-relay architecture — 2026-08 decomposition design
 
-**Status:** R1–R2 complete (2026-08-14); R3–R8+ open · **Origin:** owner
-correction 2026-08-13 — clio-relay drifted back to monolithic god files ·
-**Tracking:** [iowarp/clio-relay#231](https://github.com/iowarp/clio-relay/issues/231)
+**Status:** R1 complete, R2 in review (2026-08-14); R3–R8+ open ·
+**Origin:** owner correction 2026-08-13 — clio-relay drifted back to
+monolithic god files · **Tracking:**
+[iowarp/clio-relay#231](https://github.com/iowarp/clio-relay/issues/231)
 (item 1: this doc). Mirrors the shape of clio-agent's
 `docs/design/system-cleanup-2026-07.md`.
 
@@ -15,12 +16,12 @@ Kept current as slices land.
 | Slice | Scope | State | Commits | Branch | Ratchet delta |
 |---|---|---|---|---|---|
 | **R1** | Port the file-size + class-in-function ratchet CI from clio-agent, wired into `local.file-size-ratchet`/`local.no-class-in-function` release-gate checks; delete dead `app_profiles/`, `package_adapters/`, stale `TASK.md` | **DONE** | `2713692` (ratchet CI), `429d3cb` (deletions) | `feat/231-owner-modules` | Establishes baselines (39 files file-size, 5 files class-in-function; §3). Deletion commit removed 62 unbaselined lines; zero baselined files touched. |
-| **R2** | This design doc; two pre-existing hygiene fixes (`remote_connection.py` pyright, `runner.py` ruff E501) reddening the ratchet-gated release path | **DONE** (this document) | `ee3120f` (hygiene fix), plus the commit landing this file | `feat/231-owner-modules` | Net zero — see §10.1 for the worked example (a naive fix would have regressed `runner.py`'s baseline 5758→5766). |
+| **R2** | This design doc; three pre-existing hygiene/gate fixes (`remote_connection.py` pyright, `runner.py` ruff E501, and — found by opus review B1 — a `ruff format` drift on `installation.py`/`remote_mcp.py`/`session_lifecycle.py`) reddening the ratchet-gated release path | **IN-REVIEW** — revising per opus review B1-B5 + F-list, this commit | `ee3120f` (hygiene fix), `e078d89` (gate fix, B1), plus the commit landing this revision | `feat/231-owner-modules` | Net zero on `runner.py` (§10.1) and `installation.py` (B1); `remote_mcp.py` 5309→5308 and `session_lifecycle.py` 8328→8326 ratchet down (B1). |
 | **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`) | PLANNED | — | — | — |
-| **R4** | `frp_link.py` — transport substrate shared by modes (a)/(b) | PLANNED | — | — | — |
+| **R4** | `frp_link.py` (~300-400 lines) — `transport_probe.py`'s local-visitor frp logic + `frp_check.py`, the substrate modes (a)/(b) build on. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | PLANNED | — | — | — |
 | **R5** | `frp_transport.py` — sibling `RelayTransport` implementations for modes (a)/(b) | PLANNED | — | — | — |
 | **R6** | `bounded_payload.py` — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1` | PLANNED | — | — | — |
-| **R7** | `release_identity.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
+| **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
 
 ---
@@ -120,10 +121,10 @@ parsing-only rule) are what R3+ execute against the map this document draws.
 |---|---|---|
 | Files over 800 lines (`scripts/check_file_size.py` baseline entries) | 39 | 0 baselined entries remaining (each either deleted, absorbed under 800, or its ceiling lowered slice by slice) |
 | Files with a class defined inside a function (`scripts/check_no_class_in_function.py` baseline entries) | 5 | 0 |
-| Release-identity pin sites that must move together on a version bump (#198) | 11+ (measured at 1.6.5; §7 recounts the current tree) | 1 (`release_identity.py`'s `PinSite` table) + 1 bump command |
+| Release-identity pin sites that must move together on a version bump (#198) | 11+ (measured at 1.6.5; §7 recounts the current tree) | 1 (`release_pins.py`'s `PinSite` table) + 1 bump command |
 | Bare/untyped error surfaces reaching a client (§6) | `http_api.py`: 107 hand-rolled `HTTPException` sites (`grep -c "raise HTTPException("`, 2026-08-14 — corrected from an earlier ~40 estimate; the file has grown), 0 global exception handlers; 1 deliberately-bare re-raise in `fastmcp_server.py:1106-1115` | 0 unclassified exceptions reach the wire; every surface routes through `door_errors.classify()` |
 | `cli.py` inlined domain concerns (§4.1) | 4+ identified (identity/verification, registry mutation, session orchestration, transport validation) | 0 — all delegate to an owner module |
-| `service_runtime.py` frp lifecycle copies (§4.3) | 3rd copy of frp deploy/start/stop logic, duplicating `relay_host.py`/`transport_probe.py` | 1 (absorbed into `frp_link.py`, R4) |
+| frp process-lifecycle copies (§4.3) | 3 independent copies (`service_runtime.py`, `transport_probe.py`, `frp_check.py`); `relay_host.py` duplicates none of them — it is the shared config-only renderer all three already import | R4 absorbs `transport_probe.py`'s local-visitor half + `frp_check.py` into `frp_link.py` (~300-400 lines); `service_runtime.py`'s copy + `transport_probe.py`'s remote-script half are #233's larger, later absorption (see §4.3/§8.2/§10) |
 
 ## 4. Concern inventory of the monoliths
 
@@ -208,24 +209,37 @@ logic, not just plumbing:
 
 ### 4.3 `service_runtime.py` (10,163 lines) incl. the THIRD copy of the frp lifecycle
 
-frp process lifecycle (render config, spawn `frpc`, track, kill) appears at
-more than the four hinted ranges — it is threaded through the file:
-`_local_connector_intent` (`:4488-4501`, desktop-frpc path identity),
-`_start_remote_connector` (`:5900-6107`, renders `render_frpc_config` at
-`:5978`, launches remotely via SSH script calls `:5999-6011`/`:6056-6064`),
-`_stop_allocation_connector` (`:6219-6296`), `_start_local_visitor`
-(`:6335-6420`, renders `render_frpc_visitor_config` at `:6355-6368` then
-directly `Popen`s the local frpc binary at `:6381`), `_start_browser_proxy`
-(`:6421-6508`), `_remote_allocation_frpc_start_script`
-(`:7661-7918`, generates the remote shell script that writes `frpc.toml` and
-launches `frpc` as a scheduler-durable step), `_remote_frpc_start_script`
-(`:7951-8188`, sibling generator for the non-allocation remote connector,
-launches `frpc` in the background at `:8126` and records
-`remote_frpc_pid`/`remote_frpc_pgid` at `:8162-8165`), `_remote_stop_script`
-(`:8421-8467`), `signal_owned_processes` (`:8565-8652`, local kill matching
-the `"frpc"` command marker at `:8607-8608`), plus discovery/status scripts
-(`:8189-8420`, `:8653-8749`) and local process-group verification
-(`:9732-9866`).
+frp process lifecycle (render config, spawn `frpc`, track, kill) is threaded
+through the file: `_local_connector_intent` (`:4488-4501`, desktop-frpc path
+identity), `_start_remote_connector` (`:5900-6107`, 208 lines, renders
+`render_frpc_config` at `:5978`, launches remotely via SSH script calls
+`:5999-6011`/`:6056-6064`), `_stop_allocation_connector` (`:6219-6296`),
+`_start_local_visitor` (`:6335-6420`, 86 lines, renders
+`render_frpc_visitor_config` at `:6355-6368` then directly `Popen`s the
+local frpc binary at `:6381`), `_start_browser_proxy` (`:6421-6508`),
+`_remote_allocation_frpc_start_script` (`:7661-7948`, 288 lines — corrected
+from an earlier `:7661-7918`/258, which stopped mid-function at a false
+`def` — see below), `_remote_frpc_start_script` (`:7951-8186`, 236 lines —
+corrected from an earlier `:7951-8188`), `_remote_stop_script`
+(`:8421-8650`, 230 lines — corrected from an earlier `:8421-8467`), plus
+discovery/status scripts (`:8189-8420`, `:8654+`) and local process-group
+verification (`:9732-9866`).
+
+**A double-count this document's own earlier pass made, corrected:**
+`signal_owned_processes` at `:8565` is not a second, real top-level function
+distinct from `_remote_stop_script` — it is literal shell/Python *text*
+inside `_remote_stop_script`'s own `return f"""..."""` body (`:8422-8650`),
+part of a `python3 - ... <<'__CLIO_STOP_CONNECTOR__'` heredoc the generator
+writes for the remote host to run; the `"frpc"` command-marker match at
+`:8607` is inside that same embedded string, not live matching logic in this
+module. The real, distinct, local (non-embedded) process-signaling
+implementation lives under different names entirely:
+`_signal_owned_posix_connector_processes` (`:9948`),
+`_open_posix_process_fd` (`:9977`), `_send_posix_process_fd_signal`
+(`:9986`). (The naive `grep '^def '` sweep that produced the earlier `:7918`
+end-point for `_remote_allocation_frpc_start_script` made the identical
+mistake — it matched `def atomic_json(path, payload):` at `:7919`, which is
+also embedded heredoc text, not a sibling function.)
 
 This is a genuine third copy, not merely config rendering. `relay_host.py`
 (132 lines) is the shared, config-only source — `render_frps_config`
@@ -233,16 +247,25 @@ This is a genuine third copy, not merely config rendering. `relay_host.py`
 (`:99-123`) — imported by both `service_runtime.py` and `transport_probe.py`.
 But two *other* files independently spawn and manage the `frpc` process
 themselves: `transport_probe.py`'s `run_frp_http_probe`
-(`:211-337`, spawns `[frpc_bin, "-c", str(visitor_config_path)]` at `:288`,
-tracks/kills it at `:299-315`, and embeds its own remote start/stop script at
-`:1213-1286`) and the 48-line `frp_check.py`'s
-`run_frpc_connection_check` (`:13-40`, spawns
+(`:211-337`, 127 lines, entirely local/visitor-side: writes the local
+visitor TOML at `:253-268`, spawns the local `frpc` visitor process at
+`:287-291`, polls `127.0.0.1` healthz at `:300-304` — it calls out to a
+separate function, `_remote_probe_script` `:1213-1351` (139 lines,
+corrected from an earlier `:1213-1286`/74, the same embedded-heredoc
+undercount as above), for remote-script generation rather than embedding it
+inline) and the 48-line `frp_check.py`'s `run_frpc_connection_check`
+(`:13-40`, 28 lines, spawns
 `subprocess.run([frpc_bin, "-c", str(config_path)], ...)` at `:25`). Three
 independent "write frpc TOML, then spawn `frpc -c <config>`, then track it"
-implementations for one substrate concern (§8.2 plans their absorption into
-one `frp_link.py`).
+implementations for one substrate concern — but they are not absorbed in one
+slice (§8.2, §9 correct an earlier version of this document that assumed
+they were): R4 takes `run_frp_http_probe`'s local-visitor logic and
+`frp_check.py` into `frp_link.py`; `service_runtime.py`'s much larger copy
+and `_remote_probe_script`'s remote-script generation are
+[#233](https://github.com/iowarp/clio-relay/issues/233), a later, separate
+absorption.
 
-### 4.4 `session_lifecycle.py` (8,328 lines): state machine + ~19-30 wire models + helpers
+### 4.4 `session_lifecycle.py` (8,326 lines): state machine + ~19-30 wire models + helpers
 
 The wire-model cluster sits at `:890-1433` (not `:891-1435` — the class
 statement for the first model, `RemoteSession`, is at `:891` but the
@@ -269,8 +292,8 @@ that cluster, not interleaved with it: `inspect_owned_session_recovery_status`
 (`:2417-3098`, explicitly documented as read-only — inspects durable
 metadata, process identity, and core-queue admission to classify
 recoverable/dead/running/mismatched), `execute_owned_session_start`
-(`:5315-6220`, ~900 lines), `execute_owned_session_teardown`
-(`:6751-7092`).
+(`:5315-6218`, ~900 lines), `execute_owned_session_teardown`
+(`:6749-7090`).
 
 ### 4.5 `bootstrap.py` / `endpoint.py` / `mcp_server.py` / `remote_mcp.py` / `mcp_call/runner.py`
 
@@ -295,25 +318,36 @@ recoverable/dead/running/mismatched), `execute_owned_session_start`
   concerns: Jarvis execution-recovery bookkeeping
   (`_durable_jarvis_execution_recovery` `:6005`) and Windows-specific
   sidecar-file handle cleanup (`_quarantine_windows_sidecar_by_handle`
-  `:7728`) — the same handle-cleanup shape duplicated in `runner.py` below.
+  `:7728`) — a near-duplicate of `runner.py`'s handle-cleanup helper below,
+  down to an identically-laid-out `_ByHandleFileInformation` ctypes
+  structure and matching Windows constant values (§5's owner-module row).
 - **`mcp_server.py` (5,920 lines)** — "Stdio MCP server for relay job
   submission tools." `serve_stdio` (`:421-459`) is the JSON-RPC read loop;
-  `_all_tool_definitions` (`:664-1762`, 1,098 lines) is one function
+  `_all_tool_definitions` (`:664-1764`, 1,101 lines) is one function
   returning the inline JSON-schema catalog for every relay MCP tool;
-  `_call_tool` (`:1778-2215`, 437 lines) is a string-match dispatcher
-  routing ~40 tool names to private business functions
-  (`_submit_jarvis_pipeline` `:4160`, `_wait_job` `:3885`).
-- **`remote_mcp.py` (5,309 lines)** — deliberately separates remote schema
+  `_call_tool` (`:1778-2217`, 440 lines) is an `if`/`elif` string-match
+  dispatcher with exactly 43 `name == "relay_..."` branches routing to
+  private business functions (`_submit_jarvis_pipeline` `:4160`, `_wait_job`
+  `:3885`), plus two further non-literal branches for dynamic/virtual tool
+  routing (`is_virtual_jarvis_tool(name)` `:1850`,
+  `catalog is not None and name in catalog.tools` `:1884`). Its own stdio
+  `_error(request_id, code, message, *, data=None)` helper (`:5906+`) is one
+  of §6's four distinct error-surface shapes (§6.2).
+- **`remote_mcp.py` (5,308 lines)** — deliberately separates remote schema
   discovery from local `tools/list` (docstring `:1-7`). 20 top-level
   classes, mostly pydantic models: `RemoteMcpSchemaCache` (`:664-789`, a
   `FileLock`-backed on-disk cache) and `RemoteMcpAcceptanceReport`
   (`:1136-1346`, itself carrying a business method,
   `to_live_validation_report` `:1157`). Catalog assembly
   (`build_virtual_remote_mcp_catalog` `:2126`) sits beside two large
-  domain-specific validator families — Spack (`_spack_fresh_install_check`
-  `:3379`, `_spack_user_contract_check` `:4354`) and scientific-catalog
-  (`_scientific_catalog_structured_result_check` `:3904`) — inside a module
-  whose own docstring frames it as generic virtualization.
+  domain-specific validator families, interleaved with each other and the
+  rest of the module rather than contiguous: 22 Spack functions spanning
+  `:1369-4524` (1,347 lines total — e.g. `_spack_fresh_install_check`
+  `:3378-3454`, `_spack_user_contract_check` `:4353-4524`) and 4
+  scientific-catalog functions spanning `:3903-4698` (393 lines total —
+  e.g. `_scientific_catalog_structured_result_check` `:3903-4048`) — inside
+  a module whose own docstring frames it as generic virtualization (§5's
+  validators-owner row).
 - **`mcp_call/runner.py` (5,758 lines)** — "Minimal stdio MCP client used by
   relay endpoint containment and legacy JARVIS adapters." A hand-rolled
   subprocess JSON-RPC client (`_open_process` `:5311`, `_write_message`
@@ -357,24 +391,36 @@ slice for exactly this reason — the coupling has to be paid down before
 
 | Concern | Owner module | Current home(s) | Slice |
 |---|---|---|---|
-| Error classification/translation | `door_errors.py` | scattered: `fastmcp_server.py` typed conversions (with one deliberately-bare exception, §6.1), `http_api.py` (~40 hand-rolled `HTTPException` sites), `mcp_server.py`, `runner.py` | R3 |
-| frp process substrate (render TOML → spawn `frpc` → track/kill) | `frp_link.py` | `service_runtime.py` (3rd copy, §4.3), `transport_probe.py`, `frp_check.py`; config-only rendering already centralized in `relay_host.py` | R4 |
+| Error classification/translation | `door_errors.py` | scattered: `fastmcp_server.py` typed conversions (with one deliberately-bare exception, §6.1), `http_api.py` (107 hand-rolled `HTTPException` sites), `mcp_server.py`'s stdio `_error()`, `browser_gateway.py`'s `_error()` (§6.2's fourth surface) | R3 |
+| frp process substrate, R4's actual scope: `transport_probe.py`'s local-visitor logic + `frp_check.py` | `frp_link.py` (~300-400 lines) | `transport_probe.py:211-337` (`run_frp_http_probe`, local/visitor-side only) + `frp_check.py:13-40`; config-only rendering already centralized in `relay_host.py` (reused, not moved) | R4 |
+| frp process substrate, the larger absorption: `service_runtime.py`'s copy (§4.3) + `transport_probe.py`'s remote-script generation (`_remote_probe_script:1213-1351`) | `frp_link.py` (extended) + new `frp_remote_scripts.py` (the two embedded remote-script generators, 288+236 = 524 lines, §4.3/§8.2/§10) | `service_runtime.py:5900-8650` (multiple functions), `transport_probe.py:1213-1351` | [#233](https://github.com/iowarp/clio-relay/issues/233) — explicitly NOT R4 (B4 correction to an earlier version of this document) |
 | `RelayTransport` implementations for modes (a)/(b) | `frp_transport.py` | `control_channel.py`'s `build_transport` refuses both (`TransportModeUnavailable`, §8.2); `transport_probe.py` has probe-only, non-production logic | R5 |
 | Byte-budget enforcement / truncation (T1/T2/T3, §6.4) | `bounded_payload.py` | constants scattered across `control_channel.py`, `remote_connection.py`, `mcp_server.py`, `runner.py` | R6 |
-| Release-identity + contract pins (§7) | `release_identity.py` | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files | R7 |
+| Release-identity + contract pins (§7) | `release_pins.py` | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files, plus the stale `docs/remote-mcp-federation.md` mirror (§7) | R7 |
 | `cli.py`↔test monkeypatch seam (§4.6) | rework the injection seam itself (no new module — a DI seam `cli.py` exposes so extractions don't break 236+28 patch sites) | `tests/test_cli.py`, `tests/test_acceptance_report_defaults.py` | R8+ |
+| `cli.py` shared plumbing (§4.1: `_run_or_exit` ×74, `_require_cluster` ×56, `_write_failed_acceptance_report` ×19, `_resolve_env_secret` ×19, `_acceptance_report_command` ×17, `default_report_path` ×18) | `cli_support.py` | `cli.py:19307`, `:19132`, `:18908`, `:19212`, `:838`; `default_report_path` imported from `validation_report.py:2006` | R8+ |
 | `relay-host` command-module extraction (parsing/rendering only, ground rule 2) | new `cli_commands/relay_host.py`-shaped module (exact name TBD at R8+; owns `relay_host_app`'s 7 commands) | `cli.py` (`relay_host_app`) | R8+, sequenced after R5 (§9 overlap) |
 | `session_lifecycle.py` wire models (§4.4) | a dedicated wire-model module (exact name TBD at R8+) | `session_lifecycle.py:890-1433` | R8+ |
+| `session_lifecycle.py`'s state machine (§4.4: `inspect_owned_session_recovery_status`, `execute_owned_session_start`, `execute_owned_session_teardown`) | `session_lifecycle.py` itself — already the correct home; this row exists because every §4 concern gets a §5 row, and the state machine's "extraction" is simply what remains once the wire-models row above moves out | `session_lifecycle.py:2417-3098`, `:5315-6218`, `:6749-7090` | completes alongside R8+'s wire-model split, not a separate extraction |
+| Sidecar/snapshot Windows file-handle cleanup (near-duplicated, not importable across the boundary) | no shared import is possible — `runner.py` is a separately wheel-packaged subprocess entry point (`pyproject.toml:44`/`:50`; no `src/clio_relay/mcp_call/`; launched via `sys.executable` at `endpoint.py:7157-7176`, own `__main__` at `runner.py:5757-5758`), so the honest resolution mirrors `process_containment.py`: keep two implementations, add a test policing byte-identity of the genuinely-shared substructure (the `_ByHandleFileInformation` ctypes layout + Windows constants), the same discipline as `tests/test_process_containment.py:50-55` (§7) | `endpoint.py:7728` (`_quarantine_windows_sidecar_by_handle` + 4 siblings `:7839-8000`), `runner.py:2691` (`_open_windows_snapshot_cleanup_handle` + 4 siblings `:2751-2959`) | unsequenced, R8+ or later — small and low-priority once named |
+| `remote_mcp.py`'s Spack + scientific-catalog validator families (§4.5) | a `validators`-shaped owner module (exact name TBD) | `remote_mcp.py:1369-4524` (Spack, 22 functions/1,347 lines) + `:3903-4698` (scientific-catalog, 4 functions/393 lines) — interleaved with each other and with catalog assembly, so extraction needs reordering, not just a cut | unsequenced, post-campaign |
+| `mcp_server.py`'s tool catalog + dispatcher (§4.5) | a catalog/dispatch owner module (exact name TBD) | `mcp_server.py:664-1764` (`_all_tool_definitions`, the JSON-schema catalog) + `:1778-2217` (`_call_tool`, the 43-branch dispatcher, §4.5) | unsequenced |
+| `bootstrap.py`'s three collided concerns (§4.5: archive packaging, SSH orchestration + receipt validation, two embedded shell-script-template renderers at ~50% of the file) | named, not yet split into owners | `bootstrap.py` (8,733 lines, whole file) | unsequenced |
+| `endpoint.py`'s `EndpointWorker` (job execution, scheduler cancellation, lease renewal, §4.5) plus its ~90 unrelated module-level functions (Jarvis execution-recovery bookkeeping, sidecar cleanup — row above) | named, not yet split into owners | `endpoint.py` (8,710 lines, whole file) | unsequenced |
 | Identity/verification (the six-sites example, §1) | not yet sequenced — needs its own slice number beyond R8+ | `cli.py:14786` (`_verify_owner_session_teardown`), `remote_mcp.py` (×2), `endpoint.py`, `session_lifecycle.py`, `remote_cli.py` | unsequenced (§9 flags this explicitly rather than silently dropping it) |
 | Registry mutation (`cli.py`'s `cluster_add`) | `ClusterRegistry.mutate` already exists as the storage primitive (`cluster_config.py`); the gap is the ~220 lines of construction/validation logic still inlined in the command | not yet sequenced | unsequenced |
 | Session orchestration (`cli.py`'s `session_teardown`, ~1365 lines) | `session_lifecycle.py` already owns session state; teardown orchestration should call into it instead of duplicating decisions in the command | not yet sequenced, overlaps the R8+ wire-model split | unsequenced |
 | Transport validation (`cli.py`'s `_run_transport_validation`) | folds naturally into `frp_transport.py` once modes (a)/(b) are real implementations, not probes | not yet sequenced | unsequenced, logically after R5 |
 | `core_queue.py`'s five concerns (§4.2: storage/idempotency/leases/task-projection/schemas) | five-way split, each concern its own owner | `core_queue.py` (16,137 lines, one class) | not yet sequenced — the largest remaining monolith and out of scope for R3-R8+ |
 
-Rows marked "not yet sequenced" are named here deliberately (ground rule 4:
-deletions and gaps are first-class, not silently dropped) rather than being
-assigned a slice number this document cannot yet justify with a concrete
-extraction plan.
+Rows marked "not yet sequenced"/"unsequenced" are named here deliberately
+(ground rule 4: deletions and gaps are first-class, not silently dropped)
+rather than being assigned a slice number this document cannot yet justify
+with a concrete extraction plan. Every concern inventoried in §4 now has a
+row above — the five that were missing in an earlier version of this
+document (sidecar cleanup, validators, catalog/dispatch, `cli.py` shared
+plumbing, the state machine) plus explicit `bootstrap.py`/`endpoint.py` rows
+were added per opus review B2.
 
 ## 6. Error-surface doctrine
 
@@ -396,13 +442,31 @@ it isn't lost (`:1003-1037`, citing #215), and `intercept_tool_call` maps
 `QueueConflictError` → `INVALID_PARAMS` (`:1060-1133`, citing #218). There are
 zero raw Python tracebacks anywhere under `src/clio_relay/`
 (`traceback.format_exc()`/`import traceback`: zero matches) — but `str(exc)`
-of an already-caught, already-typed exception reaching a wire response is a
-widespread pattern (56 sites in `http_api.py` alone, e.g. `:1222`,
-`:1224`, `:1339`; plus `mcp_server.py:525`/`:2326`, `fastmcp_server.py:1131`,
-`browser_gateway.py:510`/`:581` — ~59+ sites total). Every observed instance
-wraps a curated domain exception's message, not a bare traceback, but the
-volume and lack of a single owner is exactly the concern §5 assigns to
-`door_errors.py`.
+of an already-caught exception reaching a wire response is a widespread
+pattern: **199 sites in `src/clio_relay` (`grep -rn "str(exc)" src/clio_relay
+--include="*.py" | wc -l`), 208 including `jarvis-packages/`** (corrected
+from an earlier, badly undercounted "~59+" that mistook `http_api.py`'s own
+56 for most of the total, rather than ~28% of it). Top holders:
+`http_api.py` 56, `cli.py` 30, `session_lifecycle.py` 24,
+`service_runtime.py` 23, `endpoint.py` 9, `transport_probe.py` 7. Every
+observed instance wraps a curated domain exception's message, not a bare
+traceback, but the volume and lack of a single owner is exactly the concern
+§5 assigns to `door_errors.py`.
+
+**A fourth error surface, distinct from the other three.**
+`browser_gateway.py:692`'s `_error(self, status: int, message: str) -> None`
+(13 call sites, `:510-654`) is the error path of `CapabilityProxyHandler`
+(`:461+`), the `http.server`-based (not FastAPI, not FastMCP) loopback
+proxy that gates browser-originated requests to sandboxed viewer processes
+behind a capability token. It returns a bare `{"error": message}` JSON body
+with a raw HTTP status — no `code`, `data`, `reason`, or `detail` field at
+all, sharing none of the shapes of the other three surfaces below
+(`fastmcp_server.py`'s `MCPError`, `http_api.py`'s `HTTPException`,
+`mcp_server.py`'s own stdio `_error(request_id, code, message, *,
+data=None)` JSON-RPC envelope at `:5906+`). It is the surface with the
+least existing structure to build on, which is exactly why §6.2 folds it
+into R3's scope rather than deferring it: there is no partial migration to
+preserve, only a bare dict to replace.
 
 **Raw paths.** `runner.py` caps stdout/stderr at READ time
 (`MCP_SESSION_MAX_STDOUT_BYTES = 32 * 1024 * 1024` at `:47`,
@@ -445,9 +509,15 @@ raises something other than `HTTPException` emits FastAPI's default bare
 ### 6.2 The one translation owner
 
 `door_errors.py` (R3, PLANNED): a pure `classify(exc) -> RelayFault` function
-plus `as_mcp_error`/`as_http_problem` adapters over that one table — three
-call surfaces (`fastmcp_server.py`, `http_api.py`'s handlers, `mcp_server.py`'s
-stdio path), one classification. The 107 hand-rolled `HTTPException` sites in
+plus `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error` adapters
+over that one table — **four** call surfaces (`fastmcp_server.py`,
+`http_api.py`'s handlers, `mcp_server.py`'s stdio `_error`, and
+`browser_gateway.py`'s `_error`, §6.1), one classification. `browser_gateway.py`
+is folded into R3's scope despite being found only during this revision
+(B3): it is small (13 call sites, one helper function) and has the least
+existing structure of the four, so bringing it in now costs little and
+avoids leaving a freshly-discovered fourth surface unaddressed by the same
+slice that names it. The 107 hand-rolled `HTTPException` sites in
 `http_api.py` are explicitly **not** deleted by R3 — replacing 107 call
 sites mechanically is its own later slice, named here so R3 is not judged
 half-done for leaving them. R3's job is narrower and load-bearing: give every
@@ -457,16 +527,88 @@ mechanical instead of another archaeology expedition.
 ### 6.3 The agent-facing contract `clio-relay.error.v1`
 
 Proposed by this document for R3/R6 (no such schema exists in code today —
-confirmed by a repo-wide search): `schema_version`; `reason` (a frozen
-`REASONS` registry, snake_case, ≤64 chars); `message` ≤2000 chars (T1, §6.4);
-`retryable: bool`; `detail` ≤2000 chars, optional; `cluster`/`job_id`/`task_id`
-optional; `evidence: {artifact_id}` by reference, never inline bytes; a
-truncation record when any field was elided; the whole envelope ≤8KiB
-(overflow drops `detail`, then `evidence`, in that order). Tracebacks or raw
-`str(exc)` of an *unclassified* exception must never reach the wire — the
-existing `str(exc)`-of-a-typed-exception pattern (§6.1) is compatible with
-this contract once each of those 59+ sites routes through `door_errors.classify()`
-instead of formatting the exception locally.
+confirmed by a repo-wide search). **Codes are derived from the `REASONS`
+table, never chosen at call sites**: a raise site produces (or is classified
+into) a `reason`; `door_errors.classify()` looks up that reason's
+`retryable`/`mcp_code`/`http_status` from one table. A call site never picks
+its own status code — that is precisely the discipline the six-sites and
+13-copy examples (§1) show this codebase doesn't have today.
+
+**The seed `REASONS` set**, verified against real exception types and real
+raise sites rather than invented (adjusted from an initial candidate list —
+see corrections inline):
+
+| reason | retryable | mcp_code (proposed unless noted) | http_status | grounded in |
+|---|---|---|---|---|
+| `mcp_task_input_park_conflict` | true | `-32001` | 409 | `TaskInputParkConflictError` (`errors.py:20-31`), raised `fastmcp_server.py:528-530` inside `RelayMcpRuntime._park_agent_input` — **note:** `errors.py:27-30`'s own docstring says "`RelayTasksExtension._park_agent_input`," which is stale; `_park_agent_input` is a method of `RelayMcpRuntime` (`fastmcp_server.py:284+`), `RelayTasksExtension` (`:915`) is unrelated. Worth fixing the docstring in R3. |
+| `mcp_task_conflict` | false | `INVALID_PARAMS` (`-32602`) | 409 | the task-identity-reuse `QueueConflictError` raised in `put_mcp_task` (`core_queue.py:7502-7504`). **Caveat**: bare `QueueConflictError` is raised 651 times across `core_queue.py` for unrelated invariants (lease-capacity gates, index migration, sealed-checkpoint validation, ...) — classifying by `isinstance(exc, QueueConflictError)` alone would over-match. R3 must key this reason off the MCP-task-scoped call path, not the exception type alone. |
+| `mcp_task_status_reconciliation_failed` | true | `INTERNAL_ERROR` (`-32603`) | 500 | **already shipped, not just proposed**: `fastmcp_server.py:1003-1037`'s `_handle_get` catch-all already raises exactly `MCPError(code=INTERNAL_ERROR, ..., data={"reason": "mcp_task_status_reconciliation_failed", ...})` (citing #215). R3 adopts this reason string as-is into the frozen set rather than renaming shipped behavior. |
+| `jarvis_dispatch_refused` | false | `INVALID_PARAMS` (`-32602`) | 422 | `JarvisDispatchRefusal` (`jarvis_dispatch_failure.py:32-55`) — **a different shape than the other nine**: a frozen dataclass a durable `jarvis_run` result *carries*, not a raised-and-caught exception. `door_errors.classify()` needs an object-typed entry point (not just an `except`-clause dispatch) to route this one. |
+| `not_found` | false | `INVALID_PARAMS` (`-32602`) | 404 | `NotFoundError` (`errors.py:34-35`), 14 raise sites. Existing precedent (`fastmcp_server.py:994-1001`) already maps it to `INVALID_PARAMS`, not a not-found-shaped code — R3 keeps that mapping rather than "fixing" shipped behavior as a side effect of a naming pass. |
+| `configuration_error` | false | `INVALID_PARAMS` (`-32602`) | 400 | `ConfigurationError` (`errors.py:12-13`), by far the heaviest-used typed exception: **1,084 raise sites across 36 files**. Genuinely heterogeneous (client-schema mismatches and server-side misconfiguration both raise it) — flagged here, not resolved, as a bucket that may need finer-grained sub-reasons in a later slice rather than one blanket mapping. |
+| `storage_admission_refused` | true | `-32007` | 507 | `StorageAdmissionError(StorageRuntimeError)` (`storage_runtime.py:76-77`). **Already shipped, not proposed**: `mcp_server.py` already emits `-32007` with `data={"storage_decision": ...}`, `http_api.py:1225,1431` already map it to HTTP 507; `cli.py` renders it via `_echo_storage_admission_error` (`:11355`, `:12792`, `:19310`). R3 adopts both codes as-is. |
+| `observation_timeout` | true | `-32002` | 504 | `ObservationTimeoutError` (`errors.py:8-9`), 11 raise sites, all in `cli.py`. |
+| `launcher_resolution_failed` | false | `-32003` | 409 | the real function is `jarvis_mcp_command()` (`jarvis_mcp.py:236-346`), which raises bare `ValueError` at several sites (`:303`,`:312`,`:338`,`:342`,`:345`). **The gap**: `ValueError` is reused for dozens of unrelated failures throughout `jarvis_mcp.py` (contract loading, env parsing, discovery-cache validation), so type-based classification cannot isolate this reason on its own — either `jarvis_mcp_command` needs a distinct typed exception, or the two consumers (`http_api.py:1753-1758`, already mapping to HTTP 409, citing #228; `endpoint.py:5949-5951`, which today absorbs it into a bool+message tuple and never re-raises it at all) must convert before the door boundary. Out of scope for this document to fix; named so R3 doesn't silently assume a type-based mapping that doesn't work here. |
+| `internal_error` | false | `INTERNAL_ERROR` (`-32603`) | 500 | the fallback for any exception **not** in this table — new vocabulary, not an existing generic bucket (the one live use of `INTERNAL_ERROR` today, `fastmcp_server.py:1031`, already carries the *specific* `mcp_task_status_reconciliation_failed` reason, not a generic one — R3 keeps that specificity rather than collapsing it). Traceback logged server-side once via `logger.exception(...)` (the existing `fastmcp_server.py:1029` pattern), never placed on the wire — this is what makes §3's "0 unclassified exceptions reach the wire" criterion meetable: every exception gets *some* reason, `internal_error` is simply the one nothing else claims. |
+
+**Two gaps this verification pass found beyond the seed ten** (both already
+explicitly caught by name at a public boundary today, both currently
+reasonless): `StorageRuntimeViolation(StorageRuntimeError)`
+(`storage_runtime.py:80-81`, "raised after a running child crosses a durable
+storage safety boundary" — **not** a subclass of `StorageAdmissionError`
+above, so it needs its own `storage_safety_violation` reason rather than
+inheriting one) and `OwnerSessionIdentityError(RelayError)`
+(`job_identity.py:39-40+`, already caught by name at `http_api.py:1158-1159`
+and `:2965`, mapped to HTTP 422 today) needing `owner_session_identity_refused`.
+Both belong in R3's frozen set alongside the seed ten.
+
+**Frozen-set discipline.** `REASONS` is a closed, tested set (a
+parametrized test asserting the frozen collection's exact membership, in
+the spirit of `tests/test_file_size_ratchet.py`'s baseline-only-shrinks
+discipline but for a *set* rather than a *ceiling*). Adding a reason is a
+deliberate contract change that edits the test alongside the table — never
+a silent side effect of some other change. This is what makes `reason`
+safe for an agent to pattern-match on: the vocabulary doesn't drift under
+it between releases.
+
+**The HTTP envelope — RFC 7807 (`application/problem+json`) plus
+extensions.** `as_http_problem` produces:
+
+```json
+{
+  "type": "urn:clio-relay:error:mcp_task_input_park_conflict",
+  "title": "MCP task input park conflict",
+  "status": 409,
+  "detail": "the task's input round could not be admitted after CAS retries",
+
+  "schema_version": "clio-relay.error.v1",
+  "reason": "mcp_task_input_park_conflict",
+  "retryable": true,
+  "cluster": "ares",
+  "job_id": "job-...",
+  "task_id": "task-...",
+  "evidence": {"artifact_id": "art-..."},
+  "truncation": null
+}
+```
+
+The first four fields (`type`, `title`, `status`, `detail`) are the RFC 7807
+members — `type` is `urn:clio-relay:error:<reason>` (stable, dereferenceable
+in spirit even though nothing is served at that URN today), `title` a short
+human phrase derived from the reason, `status` and `detail` the HTTP-facing
+restatement of the same facts the MCP path carries as `mcp_code`/`message`.
+The remaining members are this document's extension: `schema_version`,
+`reason`, `retryable`, the optional `cluster`/`job_id`/`task_id` triple,
+`evidence` (an artifact-id *reference*, never inline bytes — §6.4's T3), and
+`truncation` (the `clio-relay.truncation.v1` record, §6.4, `null` when
+nothing was elided). `message`/`detail` stay ≤2000 chars (T1, §6.4); the
+whole envelope stays ≤8KiB (overflow drops `evidence` then `truncation`, in
+that order — the RFC 7807 core four and `reason`/`retryable` are never
+dropped). Tracebacks or raw `str(exc)` of an *unclassified* exception must
+never reach the wire — the existing `str(exc)`-of-a-typed-exception pattern
+(§6.1, 199/208 sites) is compatible with this contract once each site routes
+through `door_errors.classify()` instead of formatting the exception
+locally.
 
 ### 6.4 Byte budgets, three tiers
 
@@ -517,22 +659,34 @@ scoped correctly from the start.
 
 The `clio-relay.truncation.v1` schema below is this document's proposal for
 that still-to-be-built record-time bound, not a description of shipped code:
-`{schema_version, truncated, retention: "head"|"head_tail", original_bytes,
-retained_bytes, elided_bytes, marker, evidence_ref}`, with the marker string
-`"[clio-relay: elided N bytes of stdout]"` written full-line, in-band, at the
-elision point.
+`{schema_version, truncated, retention: "head"|"tail"|"head_tail",
+original_bytes, retained_head_bytes, retained_tail_bytes, elided_bytes,
+marker, evidence_ref}`. `retention` includes `"tail"` (not just
+`"head"`/`"head_tail"`) specifically to describe the *existing*
+`_BoundedTextTail` shape (§6.4) honestly once it adopts this schema, rather
+than forcing R6 to redesign a working tail-only precedent into a head+tail
+one it doesn't need. A single `retained_bytes` field is ambiguous once
+`retention` can be `"head_tail"` (two separate retained spans, not one), so
+the schema splits it into `retained_head_bytes`/`retained_tail_bytes` —
+either is `0` when `retention` doesn't include that side (e.g.
+`retained_head_bytes: 0` for `retention: "tail"`). The marker string
+`"[clio-relay: elided N bytes of stdout]"` is written full-line, in-band, at
+the elision point.
 
 ### 6.5 Specified-but-not-implemented ledger
 
 | Item | Spec status | Code status | Issue |
 |---|---|---|---|
-| `door_errors.py` — one classify/adapt owner | Specified (§6.2) | Not started | tracked under #231 (R3) |
-| `clio-relay.error.v1` agent-facing envelope | Specified (§6.3) | Not started | tracked under #231 (R3/R6) |
+| `door_errors.py` — one classify/adapt owner (four surfaces) | Specified (§6.2) | Not started | tracked under #231 (R3) |
+| `clio-relay.error.v1` agent-facing envelope (RFC 7807 + extensions) | Specified (§6.3) | Not started | tracked under #231 (R3/R6) |
+| `REASONS` frozen set + membership test | Specified (§6.3) | Not started — one reason (`mcp_task_status_reconciliation_failed`) and one code family (`storage_admission_refused`'s `-32007`/507) are already shipped and adopted as-is; the rest of the table is new | tracked under #231 (R3) |
+| `browser_gateway.py`'s `_error()` routed through `door_errors.classify()` | Specified (§6.1, §6.2) | Not started — currently a bare `{"error": message}` dict, 13 call sites | tracked under #231 (R3) |
 | `clio-relay.truncation.v1` + head+tail T3 record-time bounding | Specified (§6.4) | Not started — no head+tail bound exists in `runner.py` today, only the tail-only, non-split `_BoundedTextTail` in `jarvis_provider.py` | tracked under #231 (R6) |
 | `TaskInputParkConflictError` typed conversion (replace the bare re-raise) | Specified (§6.1) | Bare re-raise still in place, `fastmcp_server.py:1106-1115` | tracked under #231 (R3) |
 | `http_api.py`'s 107 `HTTPException` sites routed through `door_errors.classify()` | Specified (§6.2, explicitly deferred) | Not started | later slice beyond R3, named not tonight (§10) |
-| `release_identity.py`'s `PinSite` table + bump command + preflight | Specified (§7) | Not started | #198, tracked under #231 (R7) |
-| `frp_link.py` frp-substrate absorption | Specified (§4.3, §8.2) | Not started | tracked under #231 (R4) |
+| `release_pins.py`'s `PinSite` table + bump command + preflight | Specified (§7) | Not started | #198, tracked under #231 (R7) |
+| `frp_link.py` (R4 scope: `transport_probe.py` local-visitor + `frp_check.py`) | Specified (§4.3, §5, §8.2) | Not started | tracked under #231 (R4) |
+| `frp_link.py` extension + `frp_remote_scripts.py` (`service_runtime.py`'s copy) | Specified (§4.3, §5, §8.2, §10) | Not started | [#233](https://github.com/iowarp/clio-relay/issues/233), separate from R4 (B4 correction) |
 
 ## 7. Release-identity + contract pins (#198)
 
@@ -567,36 +721,99 @@ commits fixed sites sequentially as each one was discovered failing, and the
 count moves as the campaign both patches and re-audits; the concrete point —
 too many sites for a human to enumerate reliably — holds regardless of the
 exact number on any given day, which is precisely the failure mode
-`release_identity.py`'s `PinSite` table (§9) exists to end.
+`release_pins.py`'s `PinSite` table (§9) exists to end.
 
-**A live hole this document surfaces, not previously tracked:**
+**Live holes this document surfaces, not previously tracked (recounted
+exactly, correcting an earlier pass's approximate line list):**
 `docs/release-gate-1.0.yaml` pins the *retired* `clio-kit-jarvis-user-v3.6`
-contract (`:131`, `:320`) against a tree that has shipped `v3.7` for multiple
+contract or the bare string `v3.6` at exactly **4 lines** (`:131`, `:320`,
+`:1109`, `:1115`) against a tree that has shipped `v3.7` for multiple
 release cycles — a fixture that drifted because nothing regenerates it
 together with the source it's meant to validate, exactly the failure mode
-#198 describes. The same file *also* pins clio-kit `2.6.6`
-(`docs/release-gate-1.0.yaml:122`, `:231`, `:300`, `:302`) while
-`.github/workflows/ci.yml` (`:62-64`, `:166-168`, two separate build jobs)
-and `src/clio_relay/jarvis_mcp.py:32`
-(`CLIO_KIT_JARVIS_MCP_VERSION = "2.7.2"`, checked against a cluster's
-install spec at `bootstrap.py:5976-5977` and the remote bootstrap script
-template at `bootstrap.py:7367-7368`) all pin `2.7.2`. Two independent
+#198 describes. The same file *also* pins clio-kit `2.6.6` at exactly **13
+lines** (`:115`, `:121`, `:122`, `:226`, `:230`, `:231`, `:294`, `:299`,
+`:300`, `:302`, `:309`, `:374`, `:1187`) while `.github/workflows/ci.yml`
+(`:62-64`, `:166-168`, two separate build jobs) and
+`src/clio_relay/jarvis_mcp.py:32` (`CLIO_KIT_JARVIS_MCP_VERSION = "2.7.2"`,
+the sole literal `"2.7.2"` in the entire tree) all pin `2.7.2`. **Correction
+to an earlier version of this document**: there is no literal `"2.7.2"`
+duplicate at `bootstrap.py:5976-5977`/`:7367-7368` to go stale — both are
+indirect references to the `CLIO_KIT_JARVIS_MCP_VERSION` constant (an
+f-string interpolation and a shell case-arm respectively), not hardcoded
+copies. `bootstrap.py:7351` (`JARVIS_MCP_VERSION="${CLIO_KIT_JARVIS_MCP_VERSION}"`)
+is the one templated-placeholder site worth recording in `PinSite` — as a
+placeholder, not a literal (§7's selector taxonomy, below). Two independent
 staleness bugs in one fixture file, both symptoms of the same missing
 `PinSite` registry.
 
+**A third staleness bug, found verifying the "kit-pin digests" claim
+below — this one a real content bug, not a citation nit.**
+`docs/remote-mcp-federation.md:471` correctly names the default wheel as
+`clio_kit-2.7.2-py3-none-any.whl`, but `:474` then calls its "canonical
+contract" `clio-kit-jarvis-user-v3.6` and `:476` points at
+`_contracts/jarvis-user-v3.6.json` — both should read `v3.7`
+(`jarvis_mcp.py:41`'s `CLIO_KIT_JARVIS_USER_CONTRACT_ID`, `:80`'s contract
+path). Worse: the SHA-256 digests quoted at `:479`/`:481`/`:483` are not
+merely stale numbers — they are the exact **legacy v3.6** entries from
+`remote_mcp.py`'s `CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID`/
+`_WIRE_SHA256_BY_ID`/`_ARTIFACT_SHA256_BY_ID` tables (`:107`, `:115`,
+`:123`), not the current v3.7 entries (`:104-105`, `:112-113`, `:120-121`).
+The doc pairs the *current default wheel* with the *legacy* contract ID and
+its legacy digests — a doc that would mislead an integrator into pinning a
+retired contract against a current wheel, not just a cosmetic drift.
+
 **Kit-pin digests.** The clio-kit wheel identity — filename, download URL,
 and SHA-256 — is pinned twice in CI (`ci.yml:62-64` and `:166-168`, one pin
-per build job) and referenced in `docs/operations.md:719` and
-`docs/remote-mcp-federation.md:472`; `docs/release-gate-1.0.yaml` carries the
-stale `2.6.6` variant noted above instead.
+per build job) and referenced (correctly, for the wheel filename itself) in
+`docs/operations.md:719` and `docs/remote-mcp-federation.md:471`;
+`docs/release-gate-1.0.yaml` carries the stale `2.6.6` variant noted above
+instead, and `remote-mcp-federation.md`'s contract-ID/digest trio noted
+above is the separate, worse staleness bug just described.
 
-**R7's target:** one `release_identity.py` module holding a `PinSite` table
-(path, line-or-key selector, pin family) covering all three families above,
-one bump command that rewrites every site and recomputes self-digests (the
+**R7's target:** one `release_pins.py` module holding a `PinSite` table, one
+bump command that rewrites every site and recomputes self-digests (the
 `validate_release_acceptance_matrix` logic #198 proposes reusing), and one
 fast `release preflight` check that asserts the whole identity contract is
 internally consistent in seconds — replacing a full `validate-local` battery
 run as the only way to catch drift today.
+
+A single "line-or-key selector" is not enough to address every site found
+above; `PinSite` needs a small selector taxonomy, evidenced directly by the
+sites this section found:
+
+- **line** — a fixed line number holding a literal (`pyproject.toml:3`,
+  `src/clio_relay/__init__.py:5`).
+- **key** — a structured key inside a JSON/YAML document, addressed by key
+  path rather than line number since serialization can reorder keys
+  (`docs/release-gate-1.0.yaml`'s `release_version:`/`acceptance_matrix_sha256:`
+  keys, `examples/release-gate/report-matrix-1.0.json`'s
+  `"release_version"`/`"matrix_sha256"` keys).
+- **filename** — the pin is embedded in a filename or URL string, not a
+  standalone value (`clio_kit-2.7.2-py3-none-any.whl`, referenced whole in
+  `ci.yml`, `docs/operations.md`, `docs/remote-mcp-federation.md`).
+- **placeholder** — a site that references the single source of truth
+  indirectly (a variable interpolated into an embedded shell-script
+  template) rather than holding a literal copy — `bootstrap.py:7351`'s
+  `${CLIO_KIT_JARVIS_MCP_VERSION}`-shaped placeholder inside
+  `render_linux_user_bootstrap_script`'s template string (§13's correction:
+  there is no literal `"2.7.2"` duplicate at that site to go stale, only the
+  one real definition at `jarvis_mcp.py:32`) — `PinSite` should record these
+  too, distinctly, so a future audit doesn't re-flag a placeholder as a
+  missed literal.
+- **regex** — a pin recognized by pattern rather than an exact key/line, for
+  fixture files where the same value recurs at varying, not-otherwise-typed
+  locations (`docs/release-gate-1.0.yaml`'s repeated `2.6.6`/`v3.6` literals
+  across unrelated YAML blocks — 13 and 4 sites respectively, §7 recount).
+- **derived-digest-with-ordering** — a value computed FROM other pins
+  (`acceptance_matrix_sha256`/`matrix_sha256`) that must be recomputed
+  strictly *after* every other pin in its family is updated, never
+  independently — the bump command's ordering constraint, not just its
+  rewrite set.
+
+Four of these six kinds (filename, placeholder, regex,
+derived-digest-with-ordering) are not simple line/key literals — that is the
+evidence this section's own recount surfaces for why `PinSite` needs the
+taxonomy rather than a single selector shape.
 
 **Precedent for byte-identical enforcement:** `jarvis-packages/clio_relay/clio_relay/process_containment.py`
 is a deliberately vendored, byte-identical copy of
@@ -604,7 +821,7 @@ is a deliberately vendored, byte-identical copy of
 `test_embedded_containment_source_is_an_exact_isolated_runtime_mirror`
 (`tests/test_process_containment.py:50-55`), which reads both files
 (`:52-53`) and asserts `embedded.read_bytes() == source.read_bytes()`
-(`:55`). This is the model for how `release_identity.py` should treat any
+(`:55`). This is the model for how `release_pins.py` should treat any
 future *content* pin (not just a version literal): a test that asserts
 byte-identity rather than trusting two edits to stay in sync by convention.
 
@@ -631,31 +848,55 @@ implement the same five-method surface, they don't renegotiate it.
 
 ### 8.2 Modes (a)/(b) as sibling owner modules
 
-`frp_link.py` (R4, the substrate) absorbs the three independent "render TOML
-→ spawn `frpc` → track/kill" copies identified in §4.3:
-`service_runtime.py`'s scheduler-durable frp lifecycle (the largest, spread
-across `:4488-9866`), `transport_probe.py`'s `run_frp_http_probe`
-(`:211-337`, plus its own remote start/stop script at `:1213-1286`), and the
-48-line `frp_check.py`'s `run_frpc_connection_check` (`:13-40`). `frp_transport.py`
+**R4's actual budget, corrected** (an earlier version of this document
+assumed R4 absorbs all three frp-lifecycle copies from §4.3 in one slice —
+opus review B4 caught that the resulting ~1,900-line estimate silently
+folded in `service_runtime.py`'s copy, which is out of scope here):
+`frp_link.py` (R4, the substrate) is sized from just
+`transport_probe.py`'s `run_frp_http_probe` (`:211-337`, 127 lines, purely
+local/visitor-side) and the 48-line `frp_check.py`'s
+`run_frpc_connection_check` (`:13-40`, 28 lines) — roughly 300-400 lines
+with a reasonable amount of config/health glue, comfortably under the
+800-line new-file cap (§2, ground rule 6). `service_runtime.py`'s much
+larger copy (§4.3: `_start_remote_connector`, `_start_local_visitor`,
+`_remote_allocation_frpc_start_script`, `_remote_frpc_start_script`,
+`_remote_stop_script`, spanning `:5900-8650`) and `transport_probe.py`'s own
+remote-script generator (`_remote_probe_script`, `:1213-1351`, 139 lines) are
+**not** R4 — they are [#233](https://github.com/iowarp/clio-relay/issues/233),
+a later, separate absorption landing as a planned two-file split:
+`frp_link.py` (extended) plus a new `frp_remote_scripts.py` housing the two
+large embedded remote-script generators
+(`_remote_allocation_frpc_start_script` 288 lines +
+`_remote_frpc_start_script` 236 lines = 524 lines, §4.3). `frp_transport.py`
 (R5, the transports) hosts the new `RelayTransport` implementations for
 `brokered_tcp`/`udp_rendezvous`, built on `frp_link.py` rather than
-reimplementing process management a fourth time. Both new modules reuse
-`relay_host.py`'s existing config-only renderers (`render_frps_config`
-`:29-40`, `render_frpc_config` `:75-96`, `render_frpc_visitor_config`
-`:99-123`) unchanged — that file is already the correctly-scoped single
-owner for TOML rendering; nothing here duplicates it.
+reimplementing process management a fourth time. Both R4 and the eventual
+#233 modules reuse `relay_host.py`'s existing config-only renderers
+(`render_frps_config` `:29-40`, `render_frpc_config` `:75-96`,
+`render_frpc_visitor_config` `:99-123`) unchanged — that file is already
+the correctly-scoped single owner for TOML rendering; nothing here
+duplicates it.
 
 `transport_probe.py`'s `allow_stcp_fallback` parameter
-(`run_frp_direct_http_probe`, `:338-402`; declared `:352`, checked `:372`) is
-FORBIDDEN in production: on a `RelayError` from the XTCP direct-HTTP attempt
-(`:356-370`), when true it silently re-runs as an STCP relay-point-carried
-attempt (`:375-388`) — exactly the automatic mode-switching
-`connection-model.md`'s "Never do this" section rules out ("the relay never
-switches modes on its own"). It is reachable only from `cli.py`'s probe
-subcommands and `live_acceptance.py`, never from `control_channel.py`'s
+(`run_frp_direct_http_probe`, `:338-402`; declared `:352` with
+**`bool = True` — the default itself is the hazard**, not a call site
+opting in) is FORBIDDEN in production: on a `RelayError` from the XTCP
+direct-HTTP attempt (`:356-370`), when true it re-runs as an STCP
+relay-point-carried attempt (`:375-388`). This is *automatic*, not silent —
+it happens visibly whenever triggered — but defaulting to `True` means
+every caller gets it without opting in, which is the practical hazard:
+`connection-model.md:85-86` states, under the "(c) SSH port forward"
+transport-modes section (not, as an earlier version of this document
+mis-cited, under "Never do this" — that section's nine bullets, `:273-304`,
+don't mention mode-switching at all): *"The relay never switches modes on
+its own — a connection whose configured link fails reports a typed link
+failure and re-establishes the **same** configured mode; it does not try
+another transport."* `allow_stcp_fallback=True` does exactly what that
+sentence rules out. It is reachable only from `cli.py`'s probe subcommands
+and `live_acceptance.py`, never from `control_channel.py`'s
 `build_transport` — confirmed not wired into any production path today, and
-`frp_transport.py` must not inherit this fallback when modes (a)/(b) become
-real.
+`frp_transport.py` must not inherit either the fallback or its `True`
+default when modes (a)/(b) become real.
 
 Confirmed, both non-ssh modes currently refuse rather than degrade:
 
@@ -686,9 +927,18 @@ leaves the cluster, so the local relay cannot compute the expected identity
 In modes (a)/(b) there is no ssh act to carry that document over — no
 per-connection authenticated channel exists before the frp handshake joins
 the two outbound dials. **Ruling:** modes (a)/(b) declare a typed
-`identity_anchor="preshared_link_secret"` (the stcp secret key + API token
-pairing already named in `connection-model.md`'s mode (a) description),
-recorded on the `ChannelLink`, stamped on every `ChannelEvent`, surfaced in
+`identity_anchor="preshared_link_secret"` — precisely,
+`CLIO_RELAY_STCP_SECRET` (the mode-(a) pairing secret, `cluster_config.py:218`,
+`connection-model.md:66`) paired with `CLIO_RELAY_FRP_TOKEN` (the
+relay-point authentication token, `cluster_config.py:217`,
+`connection-model.md:67`) — **not** `CLIO_RELAY_API_TOKEN`, a third,
+genuinely distinct credential (owned-session/remote-API auth; all three are
+enumerated separately, alongside two more, in `RELAY_CREDENTIAL_ENV_NAMES`
+at `models.py:18-26`, confirming the codebase itself already treats them as
+five distinct env vars, not aliases — an earlier version of this document
+conflated the pairing with "the API token," which is precise about neither
+name). This pairing, recorded on the `ChannelLink`, stamped on every
+`ChannelEvent`, surfaced in
 `RemoteConnectionRegistry.event_report()`, and REFUSED unless the cluster
 definition explicitly opts in via a `FrpTransportConfig.identity_anchor`
 field. Not silent, not defaulted — a cluster that doesn't set it does not
@@ -722,7 +972,7 @@ must not render or attempt a connection speculatively.
 ## 9. Migration order + stopping points
 
 R3 (`door_errors.py`) → R4 (`frp_link.py`) → R5 (`frp_transport.py`) → R6
-(`bounded_payload.py`) → R7 (`release_identity.py`) → R8+ (`test_cli.py`
+(`bounded_payload.py`) → R7 (`release_pins.py`) → R8+ (`test_cli.py`
 monkeypatch-seam rework → `relay-host` command-module extraction →
 `session_lifecycle.py` wire-model extraction).
 
@@ -736,25 +986,72 @@ after R5 keeps the transport-adjacent T1 constants and the
 `ChannelEvent`/`identity_anchor` stamping from §8.3 landing in the same
 review pass, even though R6's `mcp_server.py`/`runner.py` scope is otherwise
 independent of transports. R7 last among the single-module slices:
-`release_identity.py`'s `PinSite` table is easiest to get right once R3-R6
+`release_pins.py`'s `PinSite` table is easiest to get right once R3-R6
 stop adding new scattered constants that would immediately need their own
 pin entries. R8+ last because it is gated on nothing structural — only on
 the monkeypatch-seam cost itself (§4.6), which doesn't shrink until someone
 pays it down deliberately.
 
-**Overlap analysis.** Transports (§8, R4/R5) and the rest of the
-decomposition were checked for overlap and found clean: `frp_link.py`/
-`frp_transport.py` touch `control_channel.py`, `service_runtime.py`,
-`transport_probe.py`, `frp_check.py`, and `relay_host.py` (read-only reuse) —
-none of which are targeted by R3, R6, R7, or R8+'s named extractions. The one
-genuine overlap is `cli.py`'s `relay_host_app` command group (7 commands,
-§4.1's sub-app inventory): its commands currently call directly into the
-frp-lifecycle and probe code R4/R5 are restructuring, so extracting it into
-its own command module (§5's `relay-host` row) before R5 lands would mean
-extracting it twice — once now, and again after its callees move. That is
-why the `relay-host` command-module extraction is sequenced inside R8+,
-strictly after R5, rather than bundled into the earlier `cli.py`-focused work
-implied by ground rule 2.
+**Overlap analysis.** Real overlaps exist between slices; they are resolved
+by ordering, not avoided by being independent:
+
+- `control_channel.py` and `remote_connection.py` are targets of **both**
+  R5 (the transport seam §8.1 rules must not move) **and** R6 (the T1 byte
+  budgets §6.4 finds there — `MAX_CHANNEL_EVENT_DETAIL_CHARS` in
+  `control_channel.py:68`, the inline `[:2_000]` slice in
+  `remote_connection.py:920`). `remote_connection.py` imports from
+  `control_channel.py` (`remote_connection.py:37`), so R6's edit to the
+  imported module's constants has to land after R5 stabilizes the
+  transport seam those two files share, not concurrently with it — this is
+  §9's stated reason R6 sequences strictly after R5, not merely a
+  scheduling preference.
+- `mcp_server.py` is a target of **both** R3 (§6.2's translation-owner
+  call surface) **and** R6 (§6.4's T2 precedent, `MAX_INLINE_MCP_RESULT_BYTES`
+  at `mcp_server.py:174`). `mcp_server.py` imports from `service_runtime.py`
+  (`mcp_server.py:153`) — that import is [#233](https://github.com/iowarp/clio-relay/issues/233)'s
+  concern, not R4's (§8.2's B4 correction: R4 does not touch
+  `service_runtime.py` at all), so `mcp_server.py`'s own R3/R6 edits are
+  independent of both R4 and #233 in practice; the dependency is named here
+  rather than asserted clean by omission.
+- `cli.py`'s `relay_host_app` command group (7 commands, §4.1's sub-app
+  inventory) is the one overlap that changes sequencing, not just ordering
+  within a file: its commands call directly into the frp-lifecycle and
+  probe code R4/R5 restructure, so extracting it into its own command
+  module (§5's `relay-host` row) before R5 lands would mean extracting it
+  twice — once now, and again after its callees move. That is why the
+  `relay-host` command-module extraction is sequenced inside R8+, strictly
+  after R5, rather than bundled into the earlier `cli.py`-focused work
+  implied by ground rule 2.
+
+**Why R4 is cheap where `cli.py` is not — concrete evidence, not just
+assertion.** `transport_probe.py` already exposes a clean dependency-
+injection seam for exactly the process-spawning logic R4 touches:
+`process_factory: ProcessFactory | None = None` is a parameter on every
+public probe entry point (`run_frp_http_probe:223`,
+`run_frp_direct_http_probe:350`, `run_ssh_forward_http_probe:414`) and the
+shared internal implementation (`_run_frp_http_probe_with_proxy_type:997`,
+required there), each defaulting to the real spawner via
+`factory = process_factory or _popen`. `tests/test_transport_probe.py`
+uses this seam at exactly 14 sites (`:97`, `:148`, `:174`, `:216`, `:389`,
+`:408`, `:449`, `:482`, `:522`, `:612`, `:695`, `:765`, `:840`, `:853`) —
+injecting fake process factories, including a negative-test factory that
+`raise`s if called at all (proving a "port already occupied" guard never
+spawns) — with **zero** `Popen`-style monkeypatches in that test file
+(`grep -n "Popen" tests/test_transport_probe.py`: no matches). Contrast
+`cli.py`: its own subprocess usage (`import subprocess` at `cli.py:17`) has
+no equivalent factory seam — `tests/test_cli.py` patches the module
+attribute directly, `monkeypatch.setattr(cli.subprocess, "run", fake_run)`
+at exactly 3 sites (`:9471`, `:9535`, `:9573`), the same
+where-it's-looked-up-not-where-it's-implemented coupling §4.6 describes for
+the other 236 patch sites. R4's extraction is cheap because the seam that
+makes it safe already exists; `cli.py`'s extractions are not, because it
+doesn't — this is why R8+ (which pays down exactly that coupling) is
+sequenced as its own slice rather than assumed free.
+
+None of these overlaps block the migration order in §9 — each is already
+resolved by the R3→R4→R5→R6→R7→R8+ ordering stated there — but "the same
+file has two owners across two slices" is a real property of this plan, not
+an absence of overlap, and is recorded as such rather than claimed clean.
 
 **Every stopping point is green.** Each slice above lands independently
 buildable: ruff/pyright/both ratchets clean, `uv run pytest tests/ -m "not
@@ -786,33 +1083,49 @@ ratchet, is the standing default; see the ratchet's own docstring
 
 **Planned (each named here so it isn't silently dropped when its slice lands):**
 
-- R4: the duplicated frp process-lifecycle logic in `transport_probe.py`
-  (`:211-337`, `:1213-1286`) and `frp_check.py` (`:13-40`) is deleted once
-  both delegate to `frp_link.py` — see
-  [#233](https://github.com/iowarp/clio-relay/issues/233).
+- R4: `transport_probe.py`'s local-visitor frp logic (`run_frp_http_probe`,
+  `:211-337`) and `frp_check.py`'s `run_frpc_connection_check`
+  (`:13-40`) are deleted from their current homes once both delegate to
+  `frp_link.py`.
 - R3: the per-site error-rationale comments scattered across
   `fastmcp_server.py` (e.g. the `TaskInputParkConflictError` block at
   `:1106-1115`) move into `door_errors.py`'s docstrings once the table they
   explain has one home; the comments are deleted from the call sites, not
-  duplicated.
+  duplicated. `browser_gateway.py`'s bare `{"error": message}` construction
+  at `:692` is deleted in favor of the `door_errors.as_http_problem`-shaped
+  response (§6.1, §6.2).
 - R5: `transport_probe.py`'s `allow_stcp_fallback` parameter
-  (`run_frp_direct_http_probe`, `:338-402`) — confirmed today to have zero
-  production reach (only `cli.py`'s probe subcommands and
-  `live_acceptance.py` call it, never `control_channel.py`) — must not gain
-  production reach when `frp_transport.py` lands. Either the parameter is
-  deleted outright once probe-only callers no longer need it, or it stays
-  permanently fenced to non-production probe code with a guard comment
-  naming why (`connection-model.md`'s "Never do this" section forbids the
-  behavior it enables).
+  (`run_frp_direct_http_probe`, `:338-402`, defaults `True`, §8.2) —
+  confirmed today to have zero production reach (only `cli.py`'s probe
+  subcommands and `live_acceptance.py` call it, never `control_channel.py`)
+  — must not gain production reach, nor its `True` default, when
+  `frp_transport.py` lands. Either the parameter is deleted outright once
+  probe-only callers no longer need it, or it stays permanently fenced to
+  non-production probe code with a guard comment naming why
+  (`connection-model.md:85-86` rules out the exact behavior it enables).
+
+**Planned, later ([#233](https://github.com/iowarp/clio-relay/issues/233),
+separate from R4 — §4.3, §8.2, §9 B4 correction):**
+
+- `service_runtime.py`'s copy — `_start_remote_connector`,
+  `_start_local_visitor`, `_remote_allocation_frpc_start_script`,
+  `_remote_frpc_start_script`, `_remote_stop_script` (`:5900-8650`) — and
+  `transport_probe.py`'s `_remote_probe_script` (`:1213-1351`) are deleted
+  from their current homes once delegating to `frp_link.py` (extended) and
+  the new `frp_remote_scripts.py`. This is explicitly **not** part of R4's
+  deletion above — an earlier version of this document folded it in by
+  assuming R4 absorbed all three copies at once.
 
 **Named-not-tonight (real, deferred, not forgotten):**
 
-- `service_runtime.py`'s status as the largest of the three frp-lifecycle
-  copies is tracked as its own issue rather than folded silently into R4's
-  general scope — [#233](https://github.com/iowarp/clio-relay/issues/233).
 - The 107 hand-rolled `HTTPException` sites in `http_api.py` (§6.2): R3
   gives every surface one table to route *through*; rewriting all 107 call
   sites to use it is explicitly a later, mechanical slice, not part of R3.
+- `errors.py:27-30`'s stale docstring on `TaskInputParkConflictError`
+  (names `RelayTasksExtension._park_agent_input`; the real raise site is
+  `RelayMcpRuntime._park_agent_input`, `fastmcp_server.py:483`, `:528-530`,
+  §6.3) — a small, real, currently-shippable doc-comment bug, worth fixing
+  in R3 alongside the reason it names, not deferred past it.
 
 ## 11. Known deviations
 
@@ -821,14 +1134,19 @@ are defects this design pass surfaced, not descriptions of intended
 behavior, and each is either already tracked or is tracked as of this
 document.
 
-- **`docs/release-gate-1.0.yaml` pins two retired identities.** It targets
-  the retired `clio-kit-jarvis-user-v3.6` contract (`:131`, `:320`) against a
-  tree that has shipped `v3.7` for multiple release cycles (§7), and pins
-  clio-kit `2.6.6` (`:122`, `:231`, `:300`, `:302`) against a tree pinned at
+- **`docs/release-gate-1.0.yaml` pins retired identities on 17 lines total.**
+  It targets the retired `clio-kit-jarvis-user-v3.6` contract or bare
+  `v3.6` string on 4 lines (`:131`, `:320`, `:1109`, `:1115`) against a tree
+  that has shipped `v3.7` for multiple release cycles (§7), and pins
+  clio-kit `2.6.6` on 13 lines (`:115`,`:121`,`:122`,`:226`,`:230`,`:231`,
+  `:294`,`:299`,`:300`,`:302`,`:309`,`:374`,`:1187`) against a tree pinned at
   `2.7.2` everywhere else (`jarvis_mcp.py:32`, `.github/workflows/ci.yml`
-  ×2). Both are symptoms of #198 (no single pin registry regenerates fixtures
-  together with source) and are exactly what R7's `release_identity.py` is
-  scoped to end.
+  ×2). `docs/remote-mcp-federation.md:474`/`:476`/`:479-483` compounds this
+  with a real content bug of its own — pairing the *current* 2.7.2 wheel
+  with the *legacy* v3.6 contract ID and its legacy SHA-256 digests, not
+  merely stale text (§7). All three are symptoms of #198 (no single pin
+  registry regenerates fixtures together with source) and are exactly what
+  R7's `release_pins.py` is scoped to end.
 - **No record-time head+tail bound exists for `runner.py`'s `mcp-result.json`
   today**, despite this document's own early working draft assuming one did
   (§6.4). `_write_mcp_result` writes stdout/stderr through unchanged from
@@ -836,12 +1154,15 @@ document.
   `jarvis_provider.py`'s `_BoundedTextTail`, is tail-only and shares one 1
   MiB bound across both streams rather than the asymmetric split originally
   hypothesized. Tracked in §6.5's ledger, scoped into R6.
-- **`allow_stcp_fallback` (`transport_probe.py:338-402`) is exactly the
-  automatic mode-switching `connection-model.md`'s "Never do this" section
-  forbids**, confined today to non-production probe code only by the
-  accident of nothing calling it from `control_channel.py` — not by any
-  guard that would stop it from being called that way. §10's deletion ledger
-  and §8.2 both flag this so R5 does not inherit it by copy-paste.
+- **`allow_stcp_fallback` (`transport_probe.py:338-402`, defaults `True`) is
+  exactly the automatic mode-switching `connection-model.md:85-86` rules
+  out** (under the "(c) SSH port forward" section, not "Never do this" — an
+  earlier version of this document mis-cited the location), confined today
+  to non-production probe code only by the accident of nothing calling it
+  from `control_channel.py` — not by any guard that would stop it from
+  being called that way, and its `True` default means most callers get the
+  behavior without opting in. §10's deletion ledger and §8.2 both flag this
+  so R5 does not inherit it, default included, by copy-paste.
 - **`RelayJob.last_error` (`models.py:1515`) carries no `max_length` at the
   type level**, unlike its sibling `SchedulerCancelDisposition.last_error`
   (`models.py:292`, `max_length=16_384`). In practice every write site bounds
@@ -864,24 +1185,44 @@ document.
 - [#215](https://github.com/iowarp/clio-relay/issues/215) — door `tasks/get` bare `Internal server error` on a terminal-at-birth task
 - [#228](https://github.com/iowarp/clio-relay/issues/228) — pinned jarvis-mcp-call endpoint resolves its launcher via the global `current` symlink
 - [#232](https://github.com/iowarp/clio-relay/issues/232) — **new, filed by this document.** Client-verifiable per-operation bring-up proof, superseding the connection-lifetime identity nonce (§8.3)
-- [#233](https://github.com/iowarp/clio-relay/issues/233) — **new, filed by this document.** Absorb `service_runtime.py`'s frp lifecycle into `frp_link.py` (R4; §4.3, §10)
+- [#233](https://github.com/iowarp/clio-relay/issues/233) — **new, filed by this document.** Absorb `service_runtime.py`'s frp lifecycle + `transport_probe.py`'s remote-script generation into `frp_link.py`/`frp_remote_scripts.py` — explicitly separate from R4, not R4 itself (§4.3, §5, §8.2, §9, §10; B4 correction)
 
 ## 13. Provenance
 
-All line numbers, counts, and code excerpts in this document were verified
-against `clio-relay` at commit `ee3120f702acd7dbb529e3548679c457c6b59088`
-(branch `feat/231-owner-modules`, tree state as of 2026-08-14) using direct
-reads plus targeted `grep`/`wc -l`/AST-parse checks — not from memory or the
-originating issue's hint numbers, several of which had drifted (documented
-inline at each correction: `cli.py`'s helper fan-out counts, the frp-lifecycle
-line ranges in `service_runtime.py`, the wire-model range in
+This document has been through two verification passes. The first pass's
+claims were checked against `clio-relay` at commit
+`ee3120f702acd7dbb529e3548679c457c6b59088` (branch `feat/231-owner-modules`),
+correcting several of the originating issue's hint numbers (documented
+inline at each correction: `cli.py`'s helper fan-out counts, the
+frp-lifecycle line ranges in `service_runtime.py`, the wire-model range in
 `session_lifecycle.py` (`:891-1435` → `:890-1433`), the owner-token doc
-comment (`:126-134` → `:127-134`, load-bearing sentence at `:127-128`), the
-v3.7 contract-pin count (13 named sequentially by commit message → 11
-non-test/15 total in the current tree), the `HTTPException` count (~40 → 107),
-and — most significantly — the claimed record-time head+tail bound in
-`runner.py`, which does not exist in code today and is corrected throughout
-§6.4/§6.5/§11 rather than reported as shipped).
+comment (`:126-134` → `:127-134`), the `HTTPException` count (~40 → 107),
+and — most significantly — a claimed record-time head+tail bound in
+`runner.py` that does not exist in code).
+
+A second pass (opus review, blockers B1-B5 plus an F-list) re-verified
+against the tree after `e078d89` (the B1 gate fix) and corrected: the frp
+R4-vs-`#233` scope split (an earlier version wrongly folded
+`service_runtime.py`'s ~1,900-line copy into R4's budget, and double-counted
+embedded-heredoc text as real functions in `service_runtime.py`'s line
+ranges); five missing §5 owner-module rows (§4's sidecar-cleanup,
+validators, catalog/dispatch, `cli.py` shared-plumbing, and state-machine
+concerns each now have one); the `str(exc)` count (an isolated "~59+"
+corrected to 199/208, with per-file holders); the release-gate/bootstrap.py/
+remote-mcp-federation.md staleness recount (exact line lists, and a real
+legacy-digest content bug in `remote-mcp-federation.md`, not just a citation
+drift); the mode-switching quote's actual location
+(`connection-model.md:85-86`, not "Never do this"); `allow_stcp_fallback`'s
+`True` default as the real hazard; the identity-anchor secret pairing's
+precise names (`CLIO_RELAY_STCP_SECRET` + `CLIO_RELAY_FRP_TOKEN`, not "the
+API token"); and the §9 overlap analysis's honesty (rewritten from "found
+clean" to "overlaps exist, resolved by ordering," with the
+`transport_probe.py` `process_factory` injection-seam evidence added as the
+concrete reason R4 is cheap where `cli.py` is not). The `release_identity.py`
+module name was also renamed to `release_pins.py` throughout (it collided
+with `session_lifecycle.py`'s unrelated `SessionApiReleaseIdentity` wire
+model). All second-pass corrections are marked inline at the sections they
+touch rather than only summarized here.
 
 Representative measurement commands:
 
@@ -902,6 +1243,14 @@ grep -rn 'v3\.7' src/clio_relay jarvis-packages/clio_relay --include='*.py'
 
 # release-gate self-consistency
 grep -n 'contract_id\|clio-kit-2\.\|release_version' docs/release-gate-1.0.yaml
+
+# str(exc)-of-caught-exception count, by file (F1)
+grep -rln 'str(exc)' src/clio_relay --include='*.py' | xargs -I{} sh -c 'grep -c "str(exc)" {}; echo {}'
+
+# a naive `grep '^def '` sweep double-counts embedded heredoc text as real
+# functions inside service_runtime.py's frp-script generators (§4.3, B4) --
+# use a triple-quote scan or an AST parse instead, e.g.:
+python3 -c "import ast; ast.parse(open('src/clio_relay/service_runtime.py').read())"
 
 # byte-budget precedents
 grep -rn 'MAX_.*BYTES\|MAX_.*CHARS' src/clio_relay/control_channel.py \
