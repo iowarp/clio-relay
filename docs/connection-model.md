@@ -382,7 +382,16 @@ recognize the shape.
   [relay-architecture-2026-08.md](design/relay-architecture-2026-08.md) §8.3).
   A cluster must opt into this explicitly (`frp_transport.identity_anchor`);
   it is never a silent default -- an unconfigured cluster refuses the mode
-  rather than falling through to the weaker anchor unannounced.
+  rather than falling through to the weaker anchor unannounced. **The anchor
+  does not cover the local bind end (the loopback port):** it authenticates
+  the two relays to each other, not what is already listening on the local
+  machine's loopback port before `frpc` connects there. Bring-up is
+  identity-first (the unauthenticated `/session-identity` challenge is fetched
+  and verified against this connection's pinned identity BEFORE the
+  bearer-authenticated `/session-status` request) precisely to bound this: a
+  process with no prior knowledge of this connection's pinned identity learns
+  nothing, though one that already knows it could still pass that specific
+  check.
   [#232](https://github.com/iowarp/clio-relay/issues/232) tracks the
   client-verifiable (asymmetric-signature) bring-up proof that supersedes
   this anchor for all three modes.

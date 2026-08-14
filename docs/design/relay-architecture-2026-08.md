@@ -18,8 +18,8 @@ Kept current as slices land.
 | **R1** | Port the file-size + class-in-function ratchet CI from clio-agent, wired into `local.file-size-ratchet`/`local.no-class-in-function` release-gate checks; delete dead `app_profiles/`, `package_adapters/`, stale `TASK.md` | **DONE** | `2713692` (ratchet CI), `429d3cb` (deletions) | `feat/231-owner-modules` | Establishes baselines (39 files file-size, 5 files class-in-function; §3). Deletion commit removed 62 unbaselined lines; zero baselined files touched. |
 | **R2** | This design doc; three pre-existing hygiene/gate fixes (`remote_connection.py` pyright, `runner.py` ruff E501, and — found by opus review B1 — a `ruff format` drift on `installation.py`/`remote_mcp.py`/`session_lifecycle.py`) reddening the ratchet-gated release path | **DONE** — re-review approved at `dca177d` | `ee3120f` (hygiene fix), `e078d89` (gate fix, B1), `dca177d` (opus review B1-B5 + F-list revision, approved) | `feat/231-owner-modules` | Net zero on `runner.py` (§10.1) and `installation.py` (B1); `remote_mcp.py` 5309→5308 and `session_lifecycle.py` 8328→8326 ratchet down (B1). |
 | **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; `mcp_server.py`'s stdio `_error()` (§6.1's third surface) is not wired, tracked as [#235](https://github.com/iowarp/clio-relay/issues/235) (§6.5) | **DONE** — opus re-review (F1-F16) applied in the same slice | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), `28e0fb4` (docs landing R3), `7a526e9` (re-review fixes F1-F16), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3122 and `browser_gateway.py` 826→885 ratchet UP across both passes (net +59/+59), justified in `scripts/check_file_size.py`'s own baseline comments each time (§2 ground rule 5: remove/redesign first — evaluated and rejected, since the growth is real structure — the one global handler, the fourth adapter, the F5 defense-in-depth guard, the F7 typed oversize marker — not a fix that could net negative). `door_errors.py` is new, 667 lines (cap 800). |
-| **R4** | `frp_link.py` (471 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** | `00aeaef` (frp_link.py + delegation + tests), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (−100, ratchet lowered); `control_channel.py` 751→676 (not baselined, no ratchet entry needed); `frp_link.py` is new, 471 lines (cap 800). |
-| **R5** | `frp_transport.py` (393 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** | `900f098` (frp_transport.py + wiring + tests), plus the commit landing this revision | `feat/231-owner-modules` | `frp_transport.py` is new, 393 lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 ratchet UP (§8.5, justified in `scripts/check_file_size.py`'s baseline comments). `control_channel.py` 676→749 (not baselined, no ratchet entry needed). |
+| **R4** | `frp_link.py` (656 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** — opus review fixes F1-F9 applied (`fff662d`); R5's own review then promoted three more shared dial-prep primitives here (§8.5, item R6) | `00aeaef` (frp_link.py + delegation + tests), `fff662d` (F1-F9: dual-stream stdout+stderr draining so a chatty `frpc` child never wedges, `config_cleanup_error` tracking, subject-parameterized health-wait text), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (R4, −100) →1795 (F1-F9, +46, justified); `control_channel.py` 751→676 (R4) →739 (R5 review item R6 shrinks it back down via delegation, still not baselined); `frp_link.py` is new, 471 (R4) →594 (F1-F9) →656 (R5 review item R6's promoted `select_loopback_port`/`assert_loopback_port_available`/`validate_channel_nonce`) lines (cap 800). |
+| **R5** | `frp_transport.py` (527 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** — opus review fix set (R1-R14) applied in the same slice, including a HIGH-severity security fix (R1) | `900f098` (frp_transport.py + wiring + tests), `053c928` (review fix set R1-R14: identity-first bring-up, R2/R7 `_establish` reorder, R6 primitive promotion, R9/R10/R13/R14 correctness fixes), `065431a`/plus the commit landing this revision (docs) | `feat/231-owner-modules` | `frp_transport.py` is new, 393 (initial) →527 (review fix set) lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 (initial) →1058 (review fix set, §8.5) ratchet UP, justified in `scripts/check_file_size.py`'s baseline comments each time. `control_channel.py` 676→749→739 (not baselined, no ratchet entry needed). |
 | **R6** | `bounded_payload.py` (269 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** | `babef74` (bounded_payload.py + wiring + tests), plus the commit landing this revision | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (+28, justified — the new T3 record-time bound doc §6.4/§6.5 named as never having existed) and `src/clio_relay/mcp_server.py` 5920→5930 (+10, justified — the T2 refusal-envelope guard in `_verified_local_mcp_result`), both recorded in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 269 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7 — `runner.py` must resolve it standalone on a JARVIS worker). `relay_ops.py` 530→556, `frp_check.py` 48→68, and `door_errors.py` 667→671 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
 | **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
@@ -1094,6 +1094,21 @@ per-operation proof"); filed as part of this document, see §12.
 lands — this document does not resolve it, only names the anchor gap
 precisely enough to scope the follow-up.
 
+**The anchor does not cover the LOCAL bind end (the loopback port)** — found
+by the R5 opus review (§8.6, item R1) implementing this ruling. The pairing
+above authenticates the two RELAYS to each other across the frp handshake; it
+says nothing about what is listening on the local machine's loopback port
+before `frpc` even connects there. A process already squatting on that exact
+port -- for any reason, benign or hostile -- is outside what
+`preshared_link_secret` protects. This is exactly why bring-up must be
+identity-first (fetch and verify the unauthenticated `/session-identity`
+challenge against this connection's pinned identity BEFORE issuing the
+bearer-authenticated `/session-status` request): it does not close the gap on
+its own (a rogue that already knows the pinned identity could still pass that
+check), but it stops the trivial case -- a rogue holding no prior knowledge of
+this connection learning the owner bearer token for free, which is what R1
+found and fixed.
+
 ### 8.4 Dial-count invariants per mode
 
 The unit contract for R5 (from `docs/connection-model.md`'s SSH-budget table
@@ -1114,11 +1129,12 @@ must not render or attempt a connection speculatively.
 
 ### 8.5 R5 as landed
 
-`frp_transport.py` is 393 lines (cap 800), not the "sibling `RelayTransport`
-implementations" estimate alone: `BrokeredTcpTransport`/`UdpRendezvousTransport`
-share one `_FrpChannelTransport` base (the held-visitor lifecycle, the bring-up
-fetch, `close`/`is_alive`/`failure_detail`/`open_stream_channel`) and differ only
-in `_visitor_type` and how a failed tunnel is translated, matching
+`frp_transport.py` was 393 lines as first landed (cap 800; 527 after the §8.6
+opus review fix set below), not the "sibling `RelayTransport` implementations"
+estimate alone: `BrokeredTcpTransport`/`UdpRendezvousTransport` share one
+`_FrpChannelTransport` base (the held-visitor lifecycle, the bring-up fetch,
+`close`/`is_alive`/`failure_detail`/`open_stream_channel`) and differ only in
+`_visitor_type` and how a failed tunnel is translated, matching
 `SshForwardTransport`'s reference shape without a second copy of it.
 
 **The §8.4 table's (b) row is corrected, not implemented as stated above.**
@@ -1127,12 +1143,15 @@ document's *target* design (`connection-model.md` states it too); R5 does not
 build the automatic in-mode fallback. A punch failure — the visitor exiting
 during bring-up, or its mapped port never answering the health-wait deadline —
 is instead a typed `TransportPunchFailed`, and this path never renders or
-spawns an stcp visitor to simulate the fallback (sabotage-tested:
-`tests/test_frp_transport_dials.py`'s punch-failure test asserts zero
-`type = "stcp"` in any rendered config). Automatically switching a held
-visitor's proxy type mid-connection is a bigger, separate change; the gap is
-recorded in `connection-model.md`'s "Still deviating" section rather than
-silently claimed done.
+spawns an stcp visitor to simulate the fallback -- sabotage-tested
+render-scoped, not merely text-scoped (§8.6's R6d):
+`tests/test_frp_transport_dials.py`'s punch-failure test spies directly on
+`frp_link.render_visitor_config` and asserts it is invoked with
+`visitor_type="xtcp"` only, in addition to asserting zero `type = "stcp"` in
+any rendered config text. Automatically switching a held visitor's proxy type
+mid-connection is a bigger, separate change; the gap is recorded in
+`connection-model.md`'s "Still deviating" section rather than silently claimed
+done.
 
 **The identity-anchor refusal (§8.3) lives in `build_transport`, not in either
 transport class.** A new `TransportIdentityAnchorRequired` (`control_channel.py`)
@@ -1152,18 +1171,21 @@ updated in the same slice to assert the new one — the rest of that file,
 "every stopping point is green" — re-run as this slice's mode-c regression
 gate).
 
-**Bring-up fetches `/session-identity` twice, not once.** Modes (a)/(b) have no
-ssh-authenticated act to compose the bootstrap document from, so
-`_FrpChannelTransport.establish` fetches `GET /session-status` (authed) and
-`GET /session-identity?nonce=` (unauthed, matching
-`_open_identity_bound_stream`'s existing pre-credential proof) directly over the
-held tunnel to compose it. `RemoteConnection._establish` — unchanged, per this
-document's own scope limit on that file — then re-proves the same identity a
-second time to open its first pooled operation stream
+**Bring-up fetches `/session-identity` twice, not once — and, since §8.6's R1
+fix, always before `/session-status`.** Modes (a)/(b) have no ssh-authenticated
+act to compose the bootstrap document from, so `_FrpChannelTransport.establish`
+fetches `GET /session-identity?nonce=` (unauthed, matching
+`_open_identity_bound_stream`'s existing pre-credential proof), verifies it
+against this connection's pinned cluster/session/generation/nonce, and ONLY
+THEN fetches `GET /session-status` (authed) — never the reverse — directly over
+the held tunnel to compose the bootstrap document. `RemoteConnection._establish`
+— unchanged, per this document's own scope limit on that file — then re-proves
+the same identity a second time to open its first pooled operation stream
 (`_open_identity_bound_stream`). Both hits use the identical nonce and resolve
 identically, so this costs one extra cheap HTTP GET per establish, never a new
 dial or frp pair; `ssh_forward` fetches it once because its bootstrap already
-arrives over the held SSH session's own stdout framing.
+arrives over the held SSH session's own stdout framing, carried by the
+ssh-authenticated act itself rather than needing this ordering discipline.
 
 `cluster_config.py` 1847→1863 (+16: `FrpTransportConfig.proxy_name`/
 `.identity_anchor` plus the `IdentityAnchor` type alias) and
@@ -1175,6 +1197,178 @@ surfaced in `event_report()`/`_retired_report()`) both ratchet UP, justified in
 evaluated and rejected — both are new, real fields/wiring, not a fixable
 regression). `control_channel.py` 676→749 (not baselined, still under the
 800-line cap, no ratchet entry needed).
+
+### 8.6 R5 opus review fix set (R1-R14)
+
+A review of the R5 landing above found one demonstrated security defect and
+thirteen further correctness/hygiene findings, all fixed in the same slice.
+
+**R1 [HIGH, security] — identity-first bring-up.** Pre-fix,
+`_fetch_channel_bootstrap` issued the AUTHENTICATED `GET /session-status`
+(bearer token + owner headers) as request #0, over a tunnel nothing had yet
+verified was the real remote relay. The review demonstrated a full takeover: a
+rogue loopback listener holding no secret of its own received the real owner
+bearer token on request #0 and reached `connected==True`. Fixed by reordering
+`_fetch_channel_bootstrap` to fetch `GET /session-identity?nonce=` FIRST — it
+carries no credential — and verify `schema_version` exact plus
+`nonce`/`cluster`/`session_id`/`session_generation_id` equal to this
+connection's PINNED values (`_verify_pinned_identity`) BEFORE the
+authenticated status request is ever issued. This is not a cryptographic
+proof: the transport has no owner token to check the response's `hmac_sha256`
+against (`OwnedSessionChannelBootstrap`'s own docstring — that token never
+leaves the cluster), so a rogue that already knows the pinned identity could
+still pass this specific check; only the later re-proof
+(`remote_connection.verify_session_identity`, against THIS document) closes
+that gap. **The `preshared_link_secret` anchor (§8.3) does not cover the LOCAL
+bind end (the loopback port)** — recorded here and in
+`docs/connection-model.md`'s "Still deviating" section, since a process
+already listening on that exact loopback port before `frpc` connects is
+outside what the anchor protects. Failing-first proof:
+`tests/test_frp_transport_dials.py::test_identity_first_bring_up_refuses_before_any_authenticated_request`
+uses a rogue-responder fake that answers the identity challenge with the
+wrong identity; no `/session-status` request is ever recorded, and no request
+of any kind ever carries an `Authorization` header.
+
+**R2 — the refusal must reach the ledger.** `build_transport` was called
+OUTSIDE `_establish`'s try, so `TransportIdentityAnchorRequired` (and any
+other refusal from that call) propagated with a dangling `establishing`
+event and no terminal `establish_failed`. Fixed by moving the call inside the
+try (`transport: RelayTransport | None = None` guards the `except` block's
+`transport.close()` for the case where `build_transport` itself never
+returned a transport to close).
+`test_unconfigured_identity_anchor_refuses_before_spawning_anything` now
+constructs a bare `RemoteConnection` and asserts the terminal event directly:
+`events == ["establish_failed"]`, `reason == "TransportIdentityAnchorRequired"`.
+
+**R7 — derive the authorization event from the transport (paired with R2's
+reordering).** `authorization_required` was gated on
+`settings.remote_transport_interactive` (default `True`), so a
+default-configured `brokered_tcp` connection emitted it despite
+`requires_user_authorization` being `False` on the transport itself. Fixed by
+gating on `transport.requires_user_authorization` instead — possible only
+once R2 moves `build_transport` inside the try, since the transport has to
+exist before this decision can read its property.
+`SshForwardTransport.requires_user_authorization` already returns
+`self._allow_interactive_authorization` verbatim, so `ssh_forward`'s event
+sequence is unchanged; `brokered_tcp`/`udp_rendezvous` hardcode `False`
+regardless of settings, so "no authorization event" is now a structural
+property of the mode. `test_brokered_mode_requires_no_interactive_authorization`
+drops its `interactive=False` workaround and proves the property at the
+actual default (`interactive=True`).
+
+**R3 — surface `HeldFrpVisitor.config_cleanup_error` from the R5 transports.**
+R4's F3 fix tracks a failed config-directory cleanup on the visitor itself,
+but the R5 transports never read it back. Fixed by folding it into
+`_FrpChannelTransport`'s own `failure_detail()` (via `_combined_failure_detail`,
+used on both establish-failure paths) and, on an ordinary `close()`, storing it
+directly so `RemoteConnection.close()` — which now reads
+`transport.failure_detail()` after `_release_locked` — can stamp
+`reason="config_cleanup_error"` on the "closed" event. Sabotage-tested
+(`tests/test_frp_transport_dials.py`'s `test_close_surfaces_a_residual_config_cleanup_error_as_a_typed_event`
+monkeypatches `TemporaryDirectory.cleanup` to always raise) with a clean twin
+proving an ordinary close never fabricates a reason.
+
+**R4 (F2 shape) — prefix, never replace.** The "visitor exited immediately"
+message was `visitor.failure_detail() or f"{mode} visitor exited immediately"`
+— a bare replacement that drops the mode/cluster context whenever there IS a
+detail. Fixed via `_visitor_failure_message`, mirroring
+`transport_probe.py`'s own F2 fix: `f"{mode} {visitor_type} visitor for
+cluster {cluster!r} {situation}"` is always the prefix, the combined detail is
+always appended, never substituted.
+
+**R6 — promote three duplicated primitives into `frp_link.py`.**
+`_select_loopback_port` (≡ `control_channel._available_loopback_port`),
+`_assert_bind_port_available` (≡ `transport_probe._assert_local_bind_port_available`),
+and `_validate_channel_nonce` (a third copy of the 64-hex check, alongside
+`session_api.session_identity_document`'s check on a related but distinct
+nonce concept — not consolidated, out of scope for this promotion) each
+existed twice. Promoted as `select_loopback_port`/`assert_loopback_port_available`/
+`validate_channel_nonce`, subject-parameterized so `control_channel.py` and
+`transport_probe.py`'s pre-promotion message text stays byte-identical by
+default; both files now delegate. `control_channel.py` shrinks (749→739);
+`transport_probe.py` stays flat (its own local function's body moved, not
+grew). R6's coverage set (below) exercises modes (a) and (b) directly, so no
+dedicated `frp_link.py`-level unit tests were added for the three promoted
+functions themselves — their behavior is proven through every existing
+call-site test (`SshForwardTransport`'s port selection/nonce validation,
+`transport_probe.py`'s occupied-port test, every `frp_transport.py` test that
+establishes a link).
+
+**R8 — drop `SO_REUSEADDR` from the availability check.** On Windows, setting
+it can let a bind succeed even while another socket is actively LISTENing on
+that port (not merely TIME_WAIT), making the "is this port free" check a
+no-op against a real active listener. Removed from
+`assert_loopback_port_available`. A residual TOCTOU remains regardless
+(something could start listening between this check and the actual spawn a
+few lines later); R1's identity-first ordering contains that residual's
+consequence for the frp modes specifically — even a race onto this exact port
+gets no credential, because the unauthenticated identity challenge is
+verified against this connection's pinned identity before anything
+authenticated is sent.
+
+**R9 — `identity_anchor` prefers the held link's snapshot.**
+`RemoteConnection.identity_anchor` read live cluster config unconditionally;
+the audit trail must describe the link that is actually held, not whatever
+the on-disk cluster definition says right now (which could have drifted since
+bring-up). Fixed: prefers `self._link.identity_anchor` when a link is held,
+falling back to live config only before the first `establish` succeeds (no
+link yet to describe).
+
+**R10 — match the reference lifecycle's commit point.** `_established` was
+set only after EVERYTHING (visitor spawn, health-wait, bootstrap fetch)
+succeeded, unlike `SshForwardTransport`, which sets it right after the dial
+itself succeeds — meaning a failed R5 `establish()` could be retried in place
+on the same instance, contradicting `RelayTransport`'s own Protocol docstring
+("establish may be called once per transport object"). Fixed: `_established`
+is now set immediately after `visitor.establish()` returns (the dial), before
+the health-wait/bring-up-fetch phase that can still fail — a failure from
+that point on permanently consumes the instance, exactly like
+`SshForwardTransport`.
+`test_established_permanently_consumes_a_failed_transport_instance` proves a
+second `establish()` call on the same failed instance raises "already
+established" rather than retrying.
+
+**R11 — type the anchor precisely.** `ChannelLink.identity_anchor`/
+`ChannelEvent.identity_anchor` were `str | None`; now
+`cluster_config.IdentityAnchor | None`, matching
+`FrpTransportConfig.identity_anchor`'s own type end to end.
+
+**R12 — doc corrections.** This document's own R4/R5 rows and §8.5 corrected
+(line counts, `fff662d` added to R4's commit list, the sabotage-twin claim
+made render-scoped per R6d, the bring-up-order description). Two now-anchor-
+blind strings in `remote_connection.py` corrected: `:995`'s
+`"...did not match the SSH-proven session"` → `"...did not match the
+bring-up-proven session"`, and `:544`'s (`_acquire_stream`'s docstring)
+`"out-of-band bring-up identity document"` → wording naming both the
+ssh-authenticated (mode c) and preshared-link (modes a/b) anchors explicitly.
+
+**R13 — close-then-read ordering.** The establish-failure paths read
+`visitor.failure_detail()` (which joins two pump threads, 2s bound each)
+BEFORE calling `visitor.close()` — while the process is typically still
+alive, so each join blocks its full timeout (up to ~4s wasted per failed
+establish). Reordered to `visitor.close()` first (which terminates the
+process, letting the pump threads hit EOF almost immediately), then read the
+now-fast `failure_detail()`.
+
+**R14 — omit the fabricated ledger resource.** `_finish_frp_probe_cleanup`
+always appended a "frpc-visitor" resource claiming
+`outcome=stopped, verified_after_operation=True`, even when `visitor is None`
+(F9's own fix made this reachable: a spawn failure before `HeldFrpVisitor`
+construction/`establish()` completed). Fixed: the resource is appended only
+when a visitor actually existed to verify.
+`test_finish_frp_probe_cleanup_omits_the_visitor_resource_when_none_was_ever_constructed`
+plus a reporting-unchanged sabotage twin.
+
+`remote_connection.py` 1006→1058 (+52: R2's try-reorder, R7's
+`transport.requires_user_authorization` gate, R9's link-snapshot preference,
+R3's `close()` residual-detail read, R12's wording), ratchet bumped and
+justified in `scripts/check_file_size.py`. `frp_transport.py` 393→527 (+134:
+R1's identity-first fetch and pinned-identity verification, R3/R4's message
+helpers, R6's delegated imports, R10's restructured `establish()`). Full gate
+battery: `test_frp_link`, `test_transport_probe`, `test_frp_transport_dials`,
+`test_owned_session_channel`, `test_session_api`, plus R6's
+`test_bounded_payload`/`test_door_errors` (unaffected, confirmed still green)
+— all pass; project-wide ruff/pyright clean; both ratchets clean.
 
 ## 9. Migration order + stopping points
 
