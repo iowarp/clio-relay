@@ -230,6 +230,8 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "local.ruff-check",
         "local.ruff-format",
         "local.pyright",
+        "local.file-size-ratchet",
+        "local.no-class-in-function",
         "local.pytest",
         "local.containment-hard-crash",
         "local.sidecar-reclamation",
