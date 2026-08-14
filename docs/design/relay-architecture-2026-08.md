@@ -1,6 +1,6 @@
 # clio-relay architecture — 2026-08 decomposition design
 
-**Status:** R1–R6 complete (2026-08-14); R7–R8+ open ·
+**Status:** R1–R7 complete (2026-08-14); R8+ open ·
 **Origin:** owner correction 2026-08-13 — clio-relay drifted back to
 monolithic god files · **Tracking:**
 [iowarp/clio-relay#231](https://github.com/iowarp/clio-relay/issues/231)
@@ -21,7 +21,7 @@ Kept current as slices land.
 | **R4** | `frp_link.py` (656 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** — opus review fixes F1-F9 applied (`fff662d`); R5's own review then promoted three more shared dial-prep primitives here (§8.5, item R6) | `00aeaef` (frp_link.py + delegation + tests), `fff662d` (F1-F9: dual-stream stdout+stderr draining so a chatty `frpc` child never wedges, `config_cleanup_error` tracking, subject-parameterized health-wait text), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (R4, −100) →1795 (F1-F9, +46, justified); `control_channel.py` 751→676 (R4) →739 (R5 review item R6 shrinks it back down via delegation, still not baselined); `frp_link.py` is new, 471 (R4) →594 (F1-F9) →656 (R5 review item R6's promoted `select_loopback_port`/`assert_loopback_port_available`/`validate_channel_nonce`) lines (cap 800). |
 | **R5** | `frp_transport.py` (527 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** — opus review fix set (R1-R14) applied in the same slice, including a HIGH-severity security fix (R1) | `900f098` (frp_transport.py + wiring + tests), `053c928` (review fix set R1-R14: identity-first bring-up, R2/R7 `_establish` reorder, R6 primitive promotion, R9/R10/R13/R14 correctness fixes), `065431a`/plus the commit landing this revision (docs) | `feat/231-owner-modules` | `frp_transport.py` is new, 393 (initial) →527 (review fix set) lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 (initial) →1058 (review fix set, §8.5) ratchet UP, justified in `scripts/check_file_size.py`'s baseline comments each time. `control_channel.py` 676→749→739 (not baselined, no ratchet entry needed). |
 | **R6** | `bounded_payload.py` (287 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** — opus review fix set (F1-F13) applied in the same slice, including a HIGH-severity `isError` correctness defect (F1) | `babef74` (bounded_payload.py + wiring + tests), `6972ebd` (docs landing R6), `eab1fc4` (review fix set F1-F13: shared `_delivery_refusal_failed` discriminator, the 413 `payload_too_large` door, five wrong-reason decode sites, `job read-artifact`'s exit code, the `_bounded_mcp_result` migration, `frp_check.py`'s discarded record + unbounded read, the degenerate-window refusal, wrong remediation advice, stale citations), plus the commit landing this revision (docs, §6.6) | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (T3 bound, unchanged by the review) and `src/clio_relay/mcp_server.py` 5920→5930→5943 (review fixes F1/F5/F7, +13 more), `src/clio_relay/cli.py` 19315→19333 (F5/F6, +18), `src/clio_relay/endpoint.py` 8710→8719 (F4, +9), `src/clio_relay/http_api.py` 3122→3151 (F2, +29), `src/clio_relay/jarvis_service_runtime.py` 1158→1169 (F5, +11), `src/clio_relay/live_acceptance.py` 5427→5447 (F5, +20), `src/clio_relay/remote_mcp.py` 5308→5319 (F5, +11) — all justified in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 287 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7). `relay_ops.py` 530→571, `frp_check.py` 48→104, and `door_errors.py` 667→676 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
-| **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
+| **R7** | `release_pins.py` (537 lines) + `release_pin_sites.py` (671 lines, its `PINSITES` data table -- split out to stay under the 800-line cap, §7.9) — the `PinSite` registry (71 sites: 33 line, 25 regex, 7 filename, 3 key, 2 derived-digest, 1 placeholder; 68 mutable + 3 frozen), `scripts/bump_release_version.py` (three independent axes, `--dry-run`), `scripts/check_release_identity.py` (the fast preflight, wired into `local.release-identity`), and the `release preflight` CLI verb (#198) | **DONE** | `7a22f9a` (registry + bump + preflight + wiring + tests; also fixes the "Live holes" §11 named -- `docs/release-gate-1.0.yaml`'s stale 2.6.6/v3.6 pins (17 lines) + their co-located wheel/contract digests, `docs/remote-mcp-federation.md`'s legacy-digest content bug), plus the commit landing this revision (docs, §7.9) | `feat/231-owner-modules` | `release_pins.py` and `release_pin_sites.py` are new, 537/671 lines (cap 800 each). `ci_validation.py` 3775→3787 (+12, `compute_release_acceptance_matrix_sha256` extracted for reuse rather than duplicated, §7's ordering rule). `cli.py` 19333→19353 (+20, one thin `release preflight` command, ground rule 2). All justified in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
 
 **R4 scope correction (`frp_check.py`).** §3's exit-criteria table and §8.2's
@@ -141,7 +141,7 @@ parsing-only rule) are what R3+ execute against the map this document draws.
 |---|---|---|
 | Files over 800 lines (`scripts/check_file_size.py` baseline entries) | 39 | 0 baselined entries remaining (each either deleted, absorbed under 800, or its ceiling lowered slice by slice) |
 | Files with a class defined inside a function (`scripts/check_no_class_in_function.py` baseline entries) | 5 | 0 |
-| Release-identity pin sites that must move together on a version bump (#198) | 11+ (measured at 1.6.5; §7 recounts the current tree) | 1 (`release_pins.py`'s `PinSite` table) + 1 bump command |
+| Release-identity pin sites that must move together on a version bump (#198) | **R7 DONE.** 71 sites (33 line, 25 regex, 7 filename, 3 key, 2 derived-digest, 1 placeholder), was 11+ (measured at 1.6.5; §7's recount found the true count much higher once fixture/mirror sites were included) | 1 (`release_pins.py` + `release_pin_sites.py`'s `PinSite` table) + 1 bump command (`scripts/bump_release_version.py`) + 1 preflight (`scripts/check_release_identity.py`, wired into `local.release-identity`) |
 | Bare/untyped error surfaces reaching a client (§6) | `http_api.py`: 107 hand-rolled `HTTPException` sites (`grep -c "raise HTTPException("`, 2026-08-14 — corrected from an earlier ~40 estimate; the file has grown), 0 global exception handlers; 1 deliberately-bare re-raise in `fastmcp_server.py:1106-1115` | 0 unclassified exceptions reach the wire; every surface routes through `door_errors.classify()` |
 | `cli.py` inlined domain concerns (§4.1) | 4+ identified (identity/verification, registry mutation, session orchestration, transport validation) | 0 — all delegate to an owner module |
 | frp process-lifecycle copies (§4.3) | **R4 DONE**: `transport_probe.py`'s local-visitor half now delegates to `frp_link.py` (471 lines) — the substrate modes (a)/(b) build on. 2 copies remain: `service_runtime.py` (proxy-shaped, `_start_remote_connector`/`_start_local_visitor`) and `frp_check.py` (proxy-shaped, `run_frpc_connection_check`); `relay_host.py` duplicates neither — it is the shared config-only renderer both still import | `service_runtime.py`'s copy + `frp_check.py` + `transport_probe.py`'s remote-script half are #233's later, proxy-shaped absorption (see §4.3/§8.2/§10 and the R4 scope-correction note after §0's table) |
@@ -422,7 +422,7 @@ slice for exactly this reason — the coupling has to be paid down before
 | frp process substrate, the larger absorption: `service_runtime.py`'s copy (§4.3) + `frp_check.py`'s `run_frpc_connection_check` (proxy-shaped, not visitor-shaped) + `transport_probe.py`'s remote-script generation (`_remote_probe_script:1122-1260`) | `frp_link.py` (extended) + new `frp_remote_scripts.py` (the two embedded remote-script generators, 288+236 = 524 lines, §4.3/§8.2/§10) | `service_runtime.py:5900-8650` (multiple functions), `frp_check.py:13-40`, `transport_probe.py:1122-1260` | [#233](https://github.com/iowarp/clio-relay/issues/233) — explicitly NOT R4 (B4 correction, and the R4 scope-correction note after §0's table) |
 | `RelayTransport` implementations for modes (a)/(b) | `frp_transport.py` | `control_channel.py`'s `build_transport` refuses both (`TransportModeUnavailable`, §8.2); `transport_probe.py` has probe-only, non-production logic | R5 |
 | Byte-budget enforcement / truncation (T1/T2/T3, §6.4) | `bounded_payload.py` | constants scattered across `control_channel.py`, `remote_connection.py`, `mcp_server.py`, `runner.py` | R6 |
-| Release-identity + contract pins (§7) | `release_pins.py` | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files, plus the stale `docs/remote-mcp-federation.md` mirror (§7) | R7 |
+| Release-identity + contract pins (§7) | `release_pins.py` + `release_pin_sites.py` (its `PINSITES` data table) | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files, plus the stale `docs/remote-mcp-federation.md` mirror (§7) | **R7 DONE** |
 | `cli.py`↔test monkeypatch seam (§4.6) | rework the injection seam itself (no new module — a DI seam `cli.py` exposes so extractions don't break 236+28 patch sites) | `tests/test_cli.py`, `tests/test_acceptance_report_defaults.py` | R8+ |
 | `cli.py` shared plumbing (§4.1: `_run_or_exit` ×74, `_require_cluster` ×56, `_write_failed_acceptance_report` ×19, `_resolve_env_secret` ×19, `_acceptance_report_command` ×17, `default_report_path` ×18) | `cli_support.py` | `cli.py:19307`, `:19132`, `:18908`, `:19212`, `:838`; `default_report_path` imported from `validation_report.py:2006` | R8+ |
 | `relay-host` command-module extraction (parsing/rendering only, ground rule 2) | new `cli_commands/relay_host.py`-shaped module (exact name TBD at R8+; owns `relay_host_app`'s 7 commands) | `cli.py` (`relay_host_app`) | R8+, sequenced after R5 (§9 overlap) |
@@ -1097,6 +1097,103 @@ is a deliberately vendored, byte-identical copy of
 future *content* pin (not just a version literal): a test that asserts
 byte-identity rather than trusting two edits to stay in sync by convention.
 
+### 7.9 R7 as-landed
+
+**Module split, and why.** The registry landed as two files, not the one
+this section originally named: `release_pins.py` (the logic — read/write
+per selector kind, per-`value_group` agreement, the completeness sweeps,
+the preflight, and the bump orchestration) and `release_pin_sites.py` (the
+`PINSITES` table itself plus the small row-construction helpers/shared
+patterns it needs). The real site count came in far higher than this
+section's own audit — 71, not the ~30 a literal reading of §7's line lists
+above would suggest — because landing the registry surfaced sites the
+original audit's line-count language didn't separately count: the clio-kit
+wheel SHA-256 recurring on 8 lines wherever the wheel identity is checked
+(not just the 13 version-literal lines), and the JARVIS contract's content/
+wire/artifact digests recurring on 2+2+2 mirror lines beyond the id literal
+itself. A `PinSite` row rendered through `ruff format` (one argument per
+line once a call does not fit in 100 columns) does not fit under 800 lines
+alongside the read/write/agreement/sweep/bump logic that consumes it — the
+same reasoning ground rule 6 gives for splitting `frp_transport.py` from
+`frp_link.py` in R4/R5. Both files stay under the cap (537 and 671 lines);
+callers only ever import from `release_pins.py`, which re-exports every
+name `release_pin_sites.py` defines.
+
+**Final site count per selector kind** (71 total; 68 mutable/
+agreement-checked, 3 frozen/tracked-only):
+
+| Kind | Count | What it covers |
+|---|---|---|
+| `line` | 33 | Stable, well-known source lines — the canonical definitions (`jarvis_mcp.py:32`/`:39`, `remote_mcp.py:106`/`:114`/`:122`) and their non-recurring mirrors (`ci.yml`, `docs/operations.md`, `docs/remote-mcp-federation.md`, the two frozen labels). |
+| `regex` | 25 | The `docs/release-gate-1.0.yaml` repeated-structural-block sites (13 kit-version-text, 8 kit-wheel-digest, 2 contract-id, 2 contract-digest) — each is still one line-anchored `PinSite` for precise read/write, but is additionally covered by a whole-file completeness sweep (`_SWEEPS`) so a newly added block cannot be silently missed. |
+| `filename` | 7 | Sites where the pin is embedded in a filename/URL/path string: `jarvis_mcp.py:80`, `remote_mcp.py:129`, the vendored contract file's own rename, `ci.yml` ×2 (URL lines), `docs/operations.md`, `docs/remote-mcp-federation.md`'s wheel-filename line. |
+| `key` | 3 | Structured-key reads: `report-matrix-1.0.json`'s `release_version` (real `json.loads`), plus the two YAML top-level scalar keys (`release_version`/matched by a line-anchored pattern rather than a YAML round-trip, to avoid reformatting a hand-maintained fixture) and the vendored contract file's own `contract_id` field. |
+| `placeholder` | 1 | `bootstrap.py:7351`'s `JARVIS_MCP_VERSION` f-string interpolation — tracked so a future audit does not re-flag it as a missed literal; never rewritten. |
+| `derived_digest` | 2 | The acceptance-matrix self-digest: `report-matrix-1.0.json`'s `matrix_sha256` (canonical, computed via `ci_validation.compute_release_acceptance_matrix_sha256`, extracted from `validate_release_acceptance_matrix`'s own inline computation so both call the same function) and `release-gate-1.0.yaml`'s `acceptance_matrix_sha256` mirror. |
+
+By family: `relay_version` 4, `matrix_digest` 2, `jarvis_contract` 31,
+`kit_version` 34.
+
+**Scope boundary: v3.7 only, and the wire/artifact digest canonical
+anchors.** The completeness sweep for the JARVIS contract family
+(`sweep_jarvis_contract_v37_completeness`) is deliberately restricted to
+the *current* contract revision literal (`v3.7`) — legacy `v3.1`-`v3.6`
+references are a real, permanent, deliberate multi-version compatibility
+surface (`remote_mcp.py`'s `..._LEGACY_CONTRACT_ID` tables, the 6
+`_contracts/jarvis-user-vN.json` files, `cluster_config.py`'s
+`RemoteMcpContract` Literal listing all seven), not a #198 pin needing to
+move together. Sweeping them would have produced dozens of false
+positives with no action to take. Beyond this section's own audit, the
+registry also anchors the contract's wire/artifact digests (not just its
+content digest) to their real canonical source — `remote_mcp.py`'s
+`CLIO_KIT_JARVIS_USER_WIRE_SHA256_BY_ID`/`..._ARTIFACT_SHA256_BY_ID`
+current-contract entries — because an agreement check between two fixture
+mirrors alone cannot catch the historical bug this section found (both
+mirrors held the *same* stale legacy value, so they agreed with each other
+while being wrong).
+
+**Bump CLI shape.** `scripts/bump_release_version.py` exposes the three
+axes as independent flags: `--relay-version X.Y.Z`; `--kit-version X.Y.Z
+--kit-wheel-sha256 HEX` (required together — a new wheel's digest cannot be
+derived, only supplied, the same reason `ci.yml` itself pins it as a
+literal); `--contract-version vX.Y [--contract-sha256/--contract-wire-
+sha256/--contract-artifact-sha256 HEX]` (the digest arguments are optional
+— omitting them leaves those value_groups unchanged, reported by
+`plan_bump`/`apply_bump`, never silently dropped). `--dry-run` calls
+`plan_bump` (read-only, per-site diff, zero writes); the default calls
+`apply_bump`, which rewrites every targeted mutable site and recomputes+
+writes the two `matrix_digest` sites strictly last, only when
+`--relay-version` is given (the digest is a function of the whole matrix
+document, and the matrix's own `release_version` field is one of the
+things a relay-version bump moves).
+
+**Tests (`tests/test_release_pins.py`, 83 cases).** `test_every_pin_site_
+currently_agrees` runs the preflight against the real tree; a parametrized
+sabotage twin (68 cases, one per mutable site) writes a wrong value via the
+module's own `write_site_value` and asserts the preflight fails naming
+exactly that site's `value_group`, with every unrelated group still
+agreeing; `test_bump_applies_relay_version_and_recomputes_matrix_digest_
+via_ci_validation` bumps a mirrored tmp tree and re-validates the result
+through `ci_validation.validate_release_acceptance_matrix` (the real
+consumer, not a hand-rolled digest check); `test_v37_contract_family_has_
+no_unregistered_site_in_the_real_tree` plus its two sabotage-direction
+twins exercise the grep-driven completeness sweep; `test_bump_dry_run_
+reports_every_kit_version_site_and_writes_nothing` is the dry-run golden.
+A `mirrored_root` fixture copies exactly the 19 real files `PINSITES`
+references into a tmp tree (not the whole repository) so sabotage/bump
+tests run against real file content without touching the working tree.
+
+**Fixtures fixed while landing this, not deferred.** `test_every_pin_site_
+currently_agrees` can only pass against the *real* tree if every mutable
+site currently agrees — so landing R7 required actually bumping
+`docs/release-gate-1.0.yaml` (kit `2.6.6`→`2.7.2` on 13+8 lines, contract
+`v3.6`→`v3.7` on 2+2 lines) and `docs/remote-mcp-federation.md` (the same
+contract-id/digest triple, plus the `:467` prose this document's own audit
+had not named) via the bump machinery itself, and updating
+`tests/test_release_workflows.py`'s five hardcoded assertions that had
+encoded the stale fixture values as expected (§11's "Live holes" bullet,
+now DONE).
+
 ## 8. Transports (#188) in the owner-module architecture
 
 ### 8.1 The seam that exists
@@ -1711,19 +1808,27 @@ are defects this design pass surfaced, not descriptions of intended
 behavior, and each is either already tracked or is tracked as of this
 document.
 
-- **`docs/release-gate-1.0.yaml` pins retired identities on 17 lines total.**
-  It targets the retired `clio-kit-jarvis-user-v3.6` contract or bare
-  `v3.6` string on 4 lines (`:131`, `:320`, `:1109`, `:1115`) against a tree
-  that has shipped `v3.7` for multiple release cycles (§7), and pins
-  clio-kit `2.6.6` on 13 lines (`:115`,`:121`,`:122`,`:226`,`:230`,`:231`,
-  `:294`,`:299`,`:300`,`:302`,`:309`,`:374`,`:1187`) against a tree pinned at
-  `2.7.2` everywhere else (`jarvis_mcp.py:32`, `.github/workflows/ci.yml`
-  ×2). `docs/remote-mcp-federation.md:474`/`:476`/`:479-483` compounds this
-  with a real content bug of its own — pairing the *current* 2.7.2 wheel
-  with the *legacy* v3.6 contract ID and its legacy SHA-256 digests, not
-  merely stale text (§7). All three are symptoms of #198 (no single pin
-  registry regenerates fixtures together with source) and are exactly what
-  R7's `release_pins.py` is scoped to end.
+- **DONE (R7).** `docs/release-gate-1.0.yaml` pinned retired identities on
+  17 lines total: the retired `clio-kit-jarvis-user-v3.6` contract on 2 of
+  its 4 `v3.6` lines (`:131`, `:320` — the other two, `:1109`/`:1115`, are a
+  stable requirement description and check-id that legitimately keep saying
+  "v3.6" permanently, registered `mutable=False`) against a tree that had
+  shipped `v3.7` for multiple release cycles, and clio-kit `2.6.6` on 13
+  lines (`:115`,`:121`,`:122`,`:226`,`:230`,`:231`,`:294`,`:299`,`:300`,
+  `:302`,`:309`,`:374`,`:1187`) against a tree pinned at `2.7.2` everywhere
+  else (`jarvis_mcp.py:32`, `.github/workflows/ci.yml` ×2). Landing R7's
+  registry found the true blast radius wider than this document's own
+  audit: the same 2.6.6 wheel's SHA-256 recurred stale on 8 lines (not just
+  the 13 version-literal ones), and the v3.6 contract's content/wire/
+  artifact digests recurred stale on 2+2+2 more. `docs/
+  remote-mcp-federation.md:474`/`:476`/`:479-483` had a real content bug of
+  its own — pairing the *current* 2.7.2 wheel with the *legacy* v3.6
+  contract ID and its legacy SHA-256 digests, not merely stale text — fixed
+  alongside it (`:467`'s "exact 2.6.6 artifact" prose too, found while
+  fixing the paragraph above it). All of this is now registered in
+  `release_pins.py`'s `PinSite` table (§7's as-landed subsection) and the
+  fixtures were bumped to agree; `scripts/check_release_identity.py`
+  verifies they stay that way.
 - **DONE (R6).** No record-time head+tail bound existed for `runner.py`'s
   `mcp-result.json`, despite this document's own early working draft
   assuming one did (§6.4) — `_write_mcp_result` wrote stdout/stderr through
