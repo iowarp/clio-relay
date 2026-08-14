@@ -24,15 +24,17 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     WebSocketException,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from clio_relay import door_errors
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -1007,6 +1009,27 @@ def _bound_owner_session_cluster_definition(
     return definition
 
 
+async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """The ONE global exception handler (#231 R3, doc §6.2/§6.3).
+
+    Starlette dispatches to the most specific registered handler, and
+    FastAPI already registers one for ``HTTPException`` -- so this broader
+    ``Exception`` handler never intercepts it, and the 107 hand-rolled
+    ``raise HTTPException(...)`` sites here keep their exact shape and
+    status codes (doc §6.2: rewriting them is a later, deferred slice).
+    This closes the rest of §3's "0 unclassified exceptions reach the wire"
+    criterion: anything that escapes every hand-rolled site now routes
+    through the same owner every other surface uses, instead of falling
+    through to FastAPI's bare default "Internal Server Error".
+    """
+    fault = door_errors.classify(exc)
+    return JSONResponse(
+        door_errors.as_http_problem(fault),
+        status_code=fault.http_status,
+        media_type="application/problem+json",
+    )
+
+
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
@@ -1044,6 +1067,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             queue.close()
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
+    app.add_exception_handler(Exception, _relay_unhandled_exception_handler)
     app.add_middleware(
         InputArtifactBodyLimitMiddleware,
         max_body_bytes=(

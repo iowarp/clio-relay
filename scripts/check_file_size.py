@@ -52,15 +52,27 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/bootstrap.py": 8733,
     "src/clio_relay/bootstrap_journal.py": 1497,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
-    "src/clio_relay/browser_gateway.py": 826,
+    # #231 R3: +34 net lines closing the fourth error surface (doc §6.2) --
+    # a shared _write_response + _error_document + _error_from_exception
+    # replace the bare {"error": message} shape at the two exception-path
+    # call sites, with the door_errors import kept function-local to avoid
+    # a real import cycle (browser_gateway -> door_errors -> storage_runtime
+    # -> core_queue -> browser_gateway). A justified, minimal ratchet-up.
+    "src/clio_relay/browser_gateway.py": 860,
     "src/clio_relay/ci_validation.py": 3775,
     "src/clio_relay/cli.py": 19315,
     "src/clio_relay/cluster_config.py": 1847,
     "src/clio_relay/core_queue.py": 16137,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/endpoint.py": 8710,
-    "src/clio_relay/fastmcp_server.py": 1223,
-    "src/clio_relay/http_api.py": 3063,
+    "src/clio_relay/fastmcp_server.py": 1212,
+    # #231 R3: +24 net lines (door_errors import + the ONE global
+    # Exception-handler function + its registration) -- deliberately not
+    # offset by deleting any of the 107 existing HTTPException sites, which
+    # the same slice's design doc explicitly keeps in place (§6.2). A
+    # justified, minimal ratchet-up rather than a same-file deletion this
+    # slice does not own.
+    "src/clio_relay/http_api.py": 3087,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,

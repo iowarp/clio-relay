@@ -507,7 +507,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         try:
             self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         requested_method = self.headers.get("Access-Control-Request-Method")
@@ -578,7 +578,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         config = self.capability_server.config
@@ -689,16 +689,50 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
 
-    def _error(self, status: int, message: str) -> None:
-        payload = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+    def _write_response(self, status: int, content_type: str, payload: bytes) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             with suppress(BrokenPipeError, ConnectionResetError, OSError):
                 self.wfile.write(payload)
+
+    def _error(self, status: int, message: str) -> None:
+        payload = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+        self._write_response(status, "application/json", payload)
+
+    def _error_document(self, status: int, document: dict[str, object]) -> None:
+        """Write a door_errors-owned RFC 7807 document (doc §6.2's fourth adapter).
+
+        Unlike ``_error``'s bare ``{"error": message}`` (still used by this
+        handler's other 11 call sites), the document's fields sit at the top
+        level, not nested under an ``"error"`` key.
+        """
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self._write_response(status, "application/problem+json", payload)
+
+    def _error_from_exception(self, exc: ValueError) -> None:
+        """Route a caught request-body-validation ``ValueError`` through door_errors (#231 R3).
+
+        Local import: a module-level ``from clio_relay import door_errors``
+        here creates a real import cycle (browser_gateway -> door_errors ->
+        storage_runtime -> core_queue -> browser_gateway, since core_queue
+        already imports ``BrowserAttachmentRecord`` from this module) --
+        confirmed by triggering it, not merely suspected.
+
+        ``_request_body``'s failures (chunked encoding, a malformed/oversized
+        ``Content-Length``) are protocol-level, not a domain reason this
+        module's frozen ``REASONS`` table names -- ``configuration_error``
+        (400, "client-schema mismatches") is the closest table-sanctioned
+        fit, chosen over inventing an unregistered reason for this one file.
+        """
+        from clio_relay import door_errors
+
+        fault = door_errors.classify(exc, reason="configuration_error")
+        status, document = door_errors.as_browser_gateway_error(fault)
+        self._error_document(status, document)
 
     def log_message(self, format: str, *args: object) -> None:
         """Emit bounded process-log entries without logging capability-bearing URLs."""
