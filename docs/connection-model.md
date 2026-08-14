@@ -122,6 +122,22 @@ connection pooling are explicitly **not** fixes for exceeding the budget. They
 preserve per-operation ssh semantics at lower cost, which reinforces the wrong
 model. The design has one link, and everything rides it.
 
+## The frp dial budget
+
+Modes (a)/(b) pay their per-connection budget in held frp visitor pairs
+(one local `frpc` process holding an stcp/xtcp visitor tunnel) instead of ssh
+connections. The same "operations never open new transport" rule applies, just
+counted in a different unit:
+
+| mode | bring-up | any number of later operations |
+|---|---|---|
+| (a) `brokered_tcp` | 1 frp visitor pair + 0 ssh (beyond the skippable deploy step above) | 0 new pairs; a dropped tunnel never respawns on its own -- the next operation surfaces a typed `dropped`/`ChannelDropped` failure; `reconnect()` costs exactly +1 pair |
+| (b) `udp_rendezvous` | same as (a), over an xtcp visitor | same as (a); a failed hole punch is a typed refusal (`TransportPunchFailed`) in this release -- see Known deviations -- never a second, silently-rendered stcp visitor |
+
+A build that opens a second frp visitor pair for the same held connection, or
+renders an stcp config for a udp_rendezvous connection that never asked for
+one, is broken even when the pair it opens succeeds.
+
 ## The 2FA operating assumption
 
 Establishing an ssh connection to a protected cluster requires interactive
@@ -357,10 +373,26 @@ recognize the shape.
   `event_report()`, and `close_all()` exist and are covered by tests, but no
   door calls them, so a dropped channel surfaces as a typed failure rather than
   a recovery a user can authorize.
-- **Only mode (c) is implemented.** `brokered_tcp` and `udp_rendezvous` are
-  declared and refuse with `TransportModeUnavailable` rather than degrading into
-  per-operation ssh. Until they are built, the primary modes are design, not
-  shipped behavior.
+- **`brokered_tcp`/`udp_rendezvous`'s identity anchor is weaker than an
+  ssh-authenticated bring-up.** Mode (c) carries its bring-up identity document
+  over the ssh-authenticated act that establishes the channel; modes (a)/(b)
+  have no such act, so they fetch it as plain HTTP over the tunnel itself and
+  anchor it to the preshared stcp/xtcp pairing secret instead
+  (`ChannelLink.identity_anchor="preshared_link_secret"`,
+  [relay-architecture-2026-08.md](design/relay-architecture-2026-08.md) §8.3).
+  A cluster must opt into this explicitly (`frp_transport.identity_anchor`);
+  it is never a silent default -- an unconfigured cluster refuses the mode
+  rather than falling through to the weaker anchor unannounced.
+  [#232](https://github.com/iowarp/clio-relay/issues/232) tracks the
+  client-verifiable (asymmetric-signature) bring-up proof that supersedes
+  this anchor for all three modes.
+- **`udp_rendezvous`'s hole-punch failure is a typed refusal, not yet the
+  automatic in-mode fallback to `brokered_tcp`'s stcp visitor this page
+  describes above.** A failed punch raises a typed `TransportPunchFailed`; it
+  never renders or spawns an stcp visitor to simulate the fallback
+  automatically. Reconfigure the cluster's `remote_transport_mode` to
+  `brokered_tcp` directly, or reconnect to retry the same xtcp handshake,
+  until that automatic degradation is built.
 - **Live service streams still ride a compute-node-side `frpc`** that dials the
   relay host directly, instead of reaching the cluster relay over
   cluster-internal connectivity and riding the connection's link. It also
