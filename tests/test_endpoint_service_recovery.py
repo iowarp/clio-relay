@@ -245,7 +245,7 @@ def test_cluster_endpoint_service_status_prints_machine_readable_evidence(
         observed.update(cluster=cluster, ssh_host=ssh_host)
         return evidence
 
-    monkeypatch.setattr(cli, "endpoint_service_readiness_over_ssh", inspect)
+    monkeypatch.setattr(service_status, "endpoint_service_readiness_over_ssh", inspect)
 
     result = CliRunner().invoke(
         app,

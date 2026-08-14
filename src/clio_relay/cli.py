@@ -16,6 +16,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
@@ -24,7 +25,6 @@ from datetime import UTC, datetime
 from importlib import import_module
 from json import JSONDecodeError
 from pathlib import Path, PurePosixPath
-from time import monotonic, sleep
 from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
@@ -35,23 +35,42 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from pydantic import ValidationError
 
-from clio_relay.application_profiles import install_cluster_app_over_ssh
-from clio_relay.bootstrap import (
-    bootstrap_cluster_over_ssh,
-    install_local_frp,
-    package_source_root,
-)
-from clio_relay.bootstrap_acceptance import bootstrap_reuse_acceptance_evidence
-from clio_relay.bootstrap_reconcile import (
-    BootstrapDesiredState,
-    bootstrap_invocation_lock,
-    inspect_exact_bootstrap_noop,
-    make_bootstrap_receipt,
-    proven_active_generation_mismatch,
-    write_bootstrap_receipt,
-)
+import clio_relay.application_profiles as application_profiles
+import clio_relay.bootstrap as bootstrap
+import clio_relay.bootstrap_acceptance as bootstrap_acceptance
+import clio_relay.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.bounded_process as bounded_process
+import clio_relay.cluster_config as cluster_config
+import clio_relay.core_queue as core_queue
+import clio_relay.deployment as deployment
+import clio_relay.endpoint as endpoint
+import clio_relay.endpoint_service_status as endpoint_service_status
+import clio_relay.fastmcp_server as fastmcp_server
+import clio_relay.frp_check as frp_check
+import clio_relay.installation as installation
+import clio_relay.jarvis_mcp as jarvis_mcp
+import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
+import clio_relay.live_acceptance as live_acceptance
+import clio_relay.mcp_server as mcp_server_module
+import clio_relay.mcp_stdio_validation as mcp_stdio_validation
+import clio_relay.owner_session_admission as owner_session_admission
+import clio_relay.queue_validation as queue_validation
+import clio_relay.relay_ops as relay_ops
+import clio_relay.release_validation as release_validation
+import clio_relay.remote_cli as remote_cli
+import clio_relay.remote_mcp as remote_mcp
+import clio_relay.scheduler_providers as scheduler_providers
+import clio_relay.scheduler_validation as scheduler_validation
+import clio_relay.service_runtime as service_runtime
+import clio_relay.session_api as session_api
+import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.storage_runtime as storage_runtime
+import clio_relay.transport_probe as transport_probe
+import clio_relay.validation_report as validation_report_module
+from clio_relay.bootstrap import install_local_frp
+from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
 from clio_relay.bounded_payload import is_delivery_refusal
-from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
+from clio_relay.bounded_process import BoundedProcessError
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
@@ -63,46 +82,25 @@ from clio_relay.cluster_config import (
     RemoteMcpProfile,
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
-    acquire_private_configuration_windows_parent_guard,
     cluster_route_revision,
     default_registry_path,
     ensure_private_configuration_windows_handle,
-    open_private_atomic_file,
     open_private_configuration_windows_descriptor,
     release_private_configuration_windows_parent_guard,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.deployment import (
-    install_endpoint_user_service_over_ssh,
-    render_endpoint_user_service,
-    restart_endpoint_user_service_over_ssh,
-    write_endpoint_user_service,
-)
+from clio_relay.deployment import render_endpoint_user_service, write_endpoint_user_service
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
 from clio_relay.doctor import run_cluster_doctor, run_doctor
-from clio_relay.endpoint import EndpointWorker
-from clio_relay.endpoint_service_status import endpoint_service_readiness_over_ssh
-from clio_relay.errors import (
-    ConfigurationError,
-    NotFoundError,
-    ObservationTimeoutError,
-    RelayError,
-)
-from clio_relay.fastmcp_server import run_fastmcp_http, run_fastmcp_stdio
+from clio_relay.errors import ConfigurationError, NotFoundError, ObservationTimeoutError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.frp_check import run_frpc_connection_check
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
     InstallReceipt,
     attach_verified_worker_identity,
     default_install_receipt_path,
-    installation_info,
-    verified_session_api_install_receipt,
     verify_remote_worker_info,
-    worker_runtime_info,
-    write_self_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
@@ -112,22 +110,16 @@ from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_artifact_binding_from_entry,
     jarvis_mcp_env_from,
-    jarvis_mcp_server,
     jarvis_mcp_server_args,
     require_handle_first_jarvis_run_schema,
 )
-from clio_relay.jarvis_mcp_validation import build_jarvis_mcp_validation_report
 from clio_relay.jarvis_service_runtime import (
     private_jarvis_service_runtime_authority_document,
     resolve_local_jarvis_service_runtime_authority,
 )
-from clio_relay.live_acceptance import LiveAcceptanceOptions, run_live_acceptance
-from clio_relay.mcp_server import (
-    load_registered_remote_mcp_catalog,
-    render_agent_mcp_profile,
-    static_mcp_tool_names,
-)
-from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession, run_packaged_mcp_stdio_session
+from clio_relay.live_acceptance import LiveAcceptanceOptions
+from clio_relay.mcp_server import render_agent_mcp_profile, static_mcp_tool_names
+from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactUse,
@@ -165,13 +157,9 @@ from clio_relay.owner_session_admission import (
 )
 from clio_relay.owner_session_admission import (
     owner_session_admission_status,
-    owner_session_gateway_admission,
     owner_session_transition_lock,
 )
-from clio_relay.pagination import (
-    DEFAULT_RESPONSE_PAGE_RECORDS,
-    MAX_RESPONSE_PAGE_RECORDS,
-)
+from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.process_containment import consume_broker_child_environment
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.public_records import public_gateway_session
@@ -186,7 +174,6 @@ from clio_relay.queue_management import (
     list_queue_jobs,
     worker_status,
 )
-from clio_relay.queue_validation import run_queue_management_validation
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -196,36 +183,17 @@ from clio_relay.relay_host import (
     render_frpc_visitor_config,
     render_frps_config,
 )
-from clio_relay.relay_ops import (
-    cancel_job as request_cancel_job,
-)
+from clio_relay.relay_ops import cancel_job as request_cancel_job
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
     job_wait_result,
     monitor_job,
-    observe_until_terminal,
     read_artifact_bytes,
     read_job_log,
-    wait_for_terminal,
-)
-from clio_relay.relay_ops import (
-    job_status as get_job_status,
 )
 from clio_relay.release_pins import render_preflight, run_preflight
-from clio_relay.release_validation import (
-    LocalReleaseValidationOptions,
-    run_local_release_validation,
-)
-from clio_relay.remote_cli import (
-    remote_command_timeout,
-    remove_remote_file,
-    run_remote_clio,
-    run_remote_shell,
-    should_execute_on_cluster,
-    stage_jarvis_yaml,
-    staged_remote_cluster_registry,
-    write_remote_file,
-)
+from clio_relay.release_validation import LocalReleaseValidationOptions
+from clio_relay.remote_cli import stage_jarvis_yaml, staged_remote_cluster_registry
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
@@ -237,7 +205,6 @@ from clio_relay.remote_mcp import (
     RemoteMcpSpackConfigurationObservation,
     RemoteMcpStructuredResultExpectation,
     VirtualRemoteMcpCatalog,
-    build_remote_mcp_acceptance_report,
     build_remote_mcp_spack_fresh_install_transition_report,
     cache_entry_from_discovery_artifact,
     default_remote_mcp_cache_path,
@@ -247,20 +214,8 @@ from clio_relay.remote_mcp import (
 )
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, native_execution_documents
-from clio_relay.scheduler_providers import (
-    allocation_connector_provider_for_scheduler,
-    provider_for_scheduler,
-    validation_provider_for_scheduler,
-)
-from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
-from clio_relay.service_runtime import (
-    ServiceRuntimePendingResult,
-    ServiceRuntimeSupervisor,
-)
-from clio_relay.session_api import (
-    OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS,
-    submit_owned_session_job,
-)
+from clio_relay.service_runtime import ServiceRuntimePendingResult
+from clio_relay.session_api import OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
 from clio_relay.session_lifecycle import (
     MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
@@ -276,38 +231,20 @@ from clio_relay.session_lifecycle import (
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     cleanup_connectors_cover_gateways,
-    detach_remote_session,
     execute_owned_session_cleanup_finalize,
     execute_owned_session_cleanup_report_read,
     execute_owned_session_identity_challenge,
     execute_owned_session_start,
     execute_owned_session_teardown,
-    finalize_remote_session_cleanup_report,
-    inspect_owned_session_recovery_status,
     open_owned_session_transaction,
     plan_remote_session_start,
-    publish_owned_session_api_startup_receipt,
     query_remote_session_start,
-    read_remote_session_cleanup_report,
     session_lifecycle_report_bytes,
     session_lifecycle_report_sha256,
-    start_remote_session,
-    start_remote_session_durable,
-    status_remote_session,
-    teardown_remote_session,
     wait_owned_session_start_status,
     watch_remote_session_start,
 )
-from clio_relay.storage_runtime import (
-    StorageAdmissionError,
-    StorageManagedQueue,
-    storage_managed_queue,
-)
-from clio_relay.transport_probe import (
-    run_frp_direct_http_probe,
-    run_frp_http_probe,
-    run_ssh_forward_http_probe,
-)
+from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (
     CleanupEvidence,
     EvidenceReference,
@@ -326,7 +263,6 @@ from clio_relay.validation_report import (
     redact_sensitive_values,
     sha256_file,
     write_release_gate_result,
-    write_validation_report,
 )
 from clio_relay.worker_concurrency import parse_kind_concurrency_options
 
@@ -661,7 +597,9 @@ def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
     windows_handle: ctypes.c_void_p | None = None
     windows_parent_guard: tuple[Path, ctypes.c_void_p] | None = None
     try:
-        windows_parent_guard = acquire_private_configuration_windows_parent_guard(parent_directory)
+        windows_parent_guard = cluster_config.acquire_private_configuration_windows_parent_guard(
+            parent_directory
+        )
         windows_parent = _open_windows_pinned_directory(
             parent_directory,
             expected=parent_status,
@@ -671,7 +609,7 @@ def _acquire_cleanup_evidence_lock() -> _CleanupEvidenceLock:
             lock_status = os.lstat(storage_lock_path)
         except FileNotFoundError:
             try:
-                with open_private_atomic_file(storage_lock_path) as stream:
+                with cluster_config.open_private_atomic_file(storage_lock_path) as stream:
                     stream.flush()
                     os.fsync(stream.fileno())
             except FileExistsError:
@@ -927,7 +865,7 @@ def jarvis_runtime_authority(
 @storage_app.command("status")
 def storage_status() -> None:
     """Return machine-readable storage admission readiness."""
-    queue = storage_managed_queue(RelaySettings.from_env())
+    queue = storage_runtime.storage_managed_queue(RelaySettings.from_env())
     typer.echo(json.dumps(queue.storage_runtime.status(), indent=2))
 
 
@@ -945,7 +883,7 @@ def init(
 ) -> None:
     """Initialize local queue, spool, and cluster registry files."""
     settings = RelaySettings.from_env()
-    storage_managed_queue(settings, migrate_legacy_output=migrate_legacy_output)
+    storage_runtime.storage_managed_queue(settings, migrate_legacy_output=migrate_legacy_output)
     registry = ClusterRegistry.load(default_registry_path())
     typer.echo(
         f"initialized core={settings.core_dir} spool={settings.spool_dir} "
@@ -988,11 +926,11 @@ def release_validate_local(
         scenario="local-release",
         cluster="local",
     )
-    write_validation_report(seed_report, report_path)
+    validation_report_module.write_validation_report(seed_report, report_path)
 
     def _run() -> None:
         try:
-            result = run_local_release_validation(
+            result = release_validation.run_local_release_validation(
                 LocalReleaseValidationOptions(
                     project_root=project_root,
                     report_path=report_path,
@@ -1392,7 +1330,7 @@ def test_http_transport(
                 validation_launcher=validation_launcher,
                 validation_install_source=validation_install_source,
                 validation_artifact=validation_artifact,
-                probe=lambda: run_frp_http_probe(
+                probe=lambda: transport_probe.run_frp_http_probe(
                     cluster=cluster,
                     definition=definition,
                     frpc_bin=settings.frpc_bin,
@@ -1497,7 +1435,7 @@ def test_direct_transport(
                 validation_launcher=validation_launcher,
                 validation_install_source=validation_install_source,
                 validation_artifact=validation_artifact,
-                probe=lambda: run_frp_direct_http_probe(
+                probe=lambda: transport_probe.run_frp_direct_http_probe(
                     cluster=cluster,
                     definition=definition,
                     frpc_bin=settings.frpc_bin,
@@ -1595,7 +1533,7 @@ def test_ssh_transport(
                 validation_launcher=validation_launcher,
                 validation_install_source=validation_install_source,
                 validation_artifact=validation_artifact,
-                probe=lambda: run_ssh_forward_http_probe(
+                probe=lambda: transport_probe.run_ssh_forward_http_probe(
                     cluster=cluster,
                     definition=definition,
                     local_bind_port=local_bind_port,
@@ -1710,7 +1648,7 @@ def endpoint_start(
     selected_scheduler = scheduler_provider
     if selected_scheduler is None and definition is not None:
         selected_scheduler = definition.scheduler_provider
-    worker = EndpointWorker(
+    worker = endpoint.EndpointWorker(
         role=role,
         settings=settings,
         cluster=cluster or "local",
@@ -1718,7 +1656,9 @@ def endpoint_start(
         control_query_concurrency=resolved_control_query_concurrency,
         kind_concurrency=resolved_kind_concurrency,
         scheduler_provider=(
-            provider_for_scheduler(selected_scheduler) if role == EndpointRole.WORKER else None
+            scheduler_providers.provider_for_scheduler(selected_scheduler)
+            if role == EndpointRole.WORKER
+            else None
         ),
     )
     try:
@@ -1752,7 +1692,7 @@ def endpoint_status(
 ) -> None:
     """Show one stable source window of durable endpoint registrations."""
     settings = RelaySettings.from_env()
-    queue = ClioCoreQueue(settings.core_dir)
+    queue = core_queue.ClioCoreQueue(settings.core_dir)
     queue.initialize()
     endpoints, next_cursor, total = queue.list_endpoints_page(
         cursor=cursor,
@@ -1861,7 +1801,7 @@ def endpoint_worker_info(
     _run_or_exit(
         lambda: typer.echo(
             json.dumps(
-                worker_runtime_info(
+                installation.worker_runtime_info(
                     cluster=cluster,
                     freshness_seconds=freshness_seconds,
                     readiness_only=readiness_only,
@@ -1884,7 +1824,7 @@ def endpoint_target_info(
     """Report physical host and scheduler identity from the cluster process context."""
 
     def action() -> None:
-        provider = provider_for_scheduler(scheduler_provider)
+        provider = scheduler_providers.provider_for_scheduler(scheduler_provider)
         scheduler_cluster_name = provider.scheduler_cluster_name()
         typer.echo(
             json.dumps(
@@ -2389,7 +2329,7 @@ def installation_write_receipt(
     findings = VerificationFindings()
 
     def action() -> None:
-        receipt = write_self_install_receipt(
+        receipt = installation.write_self_install_receipt(
             output,
             force=force,
             components_from=components_from,
@@ -2601,7 +2541,7 @@ def remote_mcp_reload(
     """Reload local config/cache and report the exact next tools/list catalog."""
     if profile not in {"user", "admin", "operator", "all"}:
         raise typer.BadParameter("--profile must be user, admin, operator, or all")
-    catalog = load_registered_remote_mcp_catalog(profile)
+    catalog = mcp_server_module.load_registered_remote_mcp_catalog(profile)
     typer.echo(
         json.dumps(
             {
@@ -2654,7 +2594,7 @@ def remote_mcp_refresh(
     key = idempotency_key or f"remote-mcp-discovery:{cluster}:{name}:{uuid4().hex}"
 
     def action() -> None:
-        if should_execute_on_cluster(definition):
+        if remote_cli.should_execute_on_cluster(definition):
             remote_args = [
                 "mcp-call",
                 "--cluster",
@@ -2674,14 +2614,14 @@ def remote_mcp_refresh(
                 remote_args.extend(["--env-from", f"{child_name}={source_name}"])
             with staged_remote_cluster_registry(definition) as remote_registry_path:
                 job_id = _last_nonempty_line(
-                    run_remote_clio(
+                    remote_cli.run_remote_clio(
                         definition,
                         remote_args,
                         cluster_registry_path=remote_registry_path,
                     )
                 )
             wait_result = _json_output(
-                run_remote_clio(
+                remote_cli.run_remote_clio(
                     definition,
                     [
                         "job",
@@ -2740,7 +2680,7 @@ def remote_mcp_refresh(
                     metadata=metadata,
                 )
             )
-            terminal = wait_for_terminal(
+            terminal = relay_ops.wait_for_terminal(
                 queue,
                 job.job_id,
                 timeout_seconds=wait_timeout_seconds,
@@ -2761,7 +2701,7 @@ def remote_mcp_refresh(
         cache_path = default_remote_mcp_cache_path(registry_path=registry_path)
         RemoteMcpSchemaCache.update_entry(cache_path, entry)
         catalogs = {
-            profile_name: load_registered_remote_mcp_catalog(profile_name)
+            profile_name: mcp_server_module.load_registered_remote_mcp_catalog(profile_name)
             for profile_name in registration.profiles
         }
         typer.echo(
@@ -2957,7 +2897,7 @@ def remote_mcp_validate(
                 raise typer.BadParameter(
                     "structured-result expectation contract must match the registered contract"
                 )
-        catalog = load_registered_remote_mcp_catalog(profile)
+        catalog = mcp_server_module.load_registered_remote_mcp_catalog(profile)
         fresh_transition = (
             result_expectation is not None
             and result_expectation.fresh_install_store_root is not None
@@ -3017,9 +2957,9 @@ def remote_mcp_validate(
 
     def action() -> None:
         settings = RelaySettings.from_env()
-        queue = storage_managed_queue(settings)
+        queue = storage_runtime.storage_managed_queue(settings)
         queue.initialize()
-        execute_remotely = should_execute_on_cluster(prepared.definition)
+        execute_remotely = remote_cli.should_execute_on_cluster(prepared.definition)
         remote_install_info = _remote_worker_info(prepared.definition) if execute_remotely else None
         cache = RemoteMcpSchemaCache.load(
             default_remote_mcp_cache_path(registry_path=prepared.registry_path)
@@ -3137,7 +3077,7 @@ def remote_mcp_validate(
         )
         if remote_install_info is not None:
             attach_verified_worker_identity(canonical_report, remote_install_info)
-        write_validation_report(canonical_report, canonical_report_path)
+        validation_report_module.write_validation_report(canonical_report, canonical_report_path)
         canonical_written[0] = True
         rendered = report.model_dump_json(indent=2)
         if output_json is not None:
@@ -3176,7 +3116,7 @@ def remote_mcp_validate(
 
 def _execute_remote_mcp_validation_call(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     execute_remotely: bool,
     registry: ClusterRegistry,
@@ -3193,7 +3133,7 @@ def _execute_remote_mcp_validation_call(
     reserved_names: set[str],
 ) -> _RemoteMcpValidationCall:
     """Run one virtual alias and build its ordinary durable acceptance report."""
-    stdio_session = run_packaged_mcp_stdio_session(
+    stdio_session = mcp_stdio_validation.run_packaged_mcp_stdio_session(
         profile=profile,
         tool=route.alias,
         arguments=(
@@ -3204,7 +3144,7 @@ def _execute_remote_mcp_validation_call(
     )
     job_id = _mcp_response_job_id(stdio_session.tools_call_response)
     if execute_remotely:
-        run_remote_clio(
+        remote_cli.run_remote_clio(
             definition,
             [
                 "job",
@@ -3217,7 +3157,7 @@ def _execute_remote_mcp_validation_call(
             ],
         )
         call_status = _json_output(
-            run_remote_clio(definition, ["job", "status", job_id]),
+            remote_cli.run_remote_clio(definition, ["job", "status", job_id]),
             "remote MCP validation job status",
         )
         artifacts = _remote_artifact_records(definition, job_id)
@@ -3232,13 +3172,13 @@ def _execute_remote_mcp_validation_call(
             kind="provenance",
         )
     else:
-        wait_for_terminal(
+        relay_ops.wait_for_terminal(
             queue,
             job_id,
             timeout_seconds=wait_timeout_seconds,
             poll_seconds=poll_seconds,
         )
-        call_status = get_job_status(queue, job_id)
+        call_status = relay_ops.job_status(queue, job_id)
         artifacts = _complete_local_artifact_records(queue, job_id)
         mcp_result = _read_local_json_artifact_kind(
             queue,
@@ -3255,7 +3195,7 @@ def _execute_remote_mcp_validation_call(
         if mcp_result is not None and isinstance(mcp_result.get("protocol_result"), dict)
         else None
     )
-    report = build_remote_mcp_acceptance_report(
+    report = remote_mcp.build_remote_mcp_acceptance_report(
         registry=registry,
         cache=cache,
         cluster=cluster,
@@ -3375,8 +3315,8 @@ def _collect_remote_spack_configuration_observation(
             str(MAX_SPACK_CONFIGURATION_TREE_ENTRIES),
         )
     )
-    with remote_command_timeout(SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS):
-        output = run_remote_shell(definition, command)
+    with remote_cli.remote_command_timeout(SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS):
+        output = remote_cli.run_remote_shell(definition, command)
     if len(output.encode("utf-8")) > MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES:
         raise RelayError("remote Spack configuration observation output exceeded its bound")
     payload = _json_output(output, f"{phase} Spack configuration observation")
@@ -3899,7 +3839,7 @@ def cluster_bootstrap(
         raise
 
     def action() -> None:
-        action_started = monotonic()
+        action_started = time.monotonic()
         expected_artifact_sha256 = relay_artifact_sha256
         if expected_artifact_sha256 is not None and (
             re.fullmatch(r"[0-9a-f]{64}", expected_artifact_sha256) is None
@@ -3923,10 +3863,10 @@ def cluster_bootstrap(
                 "cluster.bootstrap",
                 "execute the real cluster bootstrap and retrieve its durable receipt",
             ) as evidence:
-                lines = bootstrap_cluster_over_ssh(
+                lines = bootstrap.bootstrap_cluster_over_ssh(
                     bootstrap_profile=definition.bootstrap_profile,
                     ssh_host=ssh_host or definition.ssh_host,
-                    source_root=package_source_root(),
+                    source_root=bootstrap.package_source_root(),
                     cluster=definition.name,
                     core_dir=definition.core_dir,
                     spool_dir=definition.spool_dir,
@@ -4032,9 +3972,9 @@ def cluster_bootstrap(
                     "cluster.bootstrap.reuse-slo",
                     "enforce the bounded payload-free bootstrap reuse contract",
                 ) as reuse_evidence:
-                    reuse_acceptance = bootstrap_reuse_acceptance_evidence(
+                    reuse_acceptance = bootstrap_acceptance.bootstrap_reuse_acceptance_evidence(
                         receipt,
-                        elapsed_seconds=monotonic() - action_started,
+                        elapsed_seconds=time.monotonic() - action_started,
                     )
                     if reuse_acceptance is None:
                         raise RelayError(
@@ -4075,7 +4015,7 @@ def cluster_install_app(
     definition = _require_cluster(cluster)
     _run_or_exit(
         lambda: _echo_lines(
-            install_cluster_app_over_ssh(
+            application_profiles.install_cluster_app_over_ssh(
                 ssh_host=ssh_host or definition.ssh_host,
                 app_name=app_name,
             )
@@ -4156,7 +4096,7 @@ def cluster_install_endpoint_service(
     )
     _run_or_exit(
         lambda: _echo_lines(
-            install_endpoint_user_service_over_ssh(
+            deployment.install_endpoint_user_service_over_ssh(
                 cluster=cluster,
                 ssh_host=ssh_host or definition.ssh_host,
                 service_text=service_text,
@@ -4190,7 +4130,7 @@ def cluster_restart_endpoint_service(
     definition = _require_cluster(cluster)
     _run_or_exit(
         lambda: _echo_lines(
-            restart_endpoint_user_service_over_ssh(
+            deployment.restart_endpoint_user_service_over_ssh(
                 cluster=cluster,
                 ssh_host=ssh_host or definition.ssh_host,
                 expected_capacity=definition.worker_capacity,
@@ -4212,7 +4152,7 @@ def cluster_endpoint_service_status(
     definition = _require_cluster(cluster)
 
     def _status() -> None:
-        evidence = endpoint_service_readiness_over_ssh(
+        evidence = endpoint_service_status.endpoint_service_readiness_over_ssh(
             cluster=cluster,
             ssh_host=ssh_host or definition.ssh_host,
         )
@@ -4345,12 +4285,12 @@ def session_start(
                 cluster=cluster,
                 session_id=session_id,
             )
-            result = start_remote_session_durable(
+            result = session_lifecycle.start_remote_session_durable(
                 definition=definition,
                 plan=plan,
                 api_token=settings.api_token if require_token else None,
                 expected_api_release_identity=api_release_identity,
-                starter=start_remote_session,
+                starter=session_lifecycle.start_remote_session,
             )
             typer.echo(result.model_dump_json(indent=2))
             if result.state in {"failed", "not_current"}:
@@ -4371,7 +4311,7 @@ def _finalize_completed_cleanup_receipt_before_start(
     session_id: str,
 ) -> None:
     """Finish the exact teardown commit if reconnect observes its completed receipt."""
-    raw_status = status_remote_session(
+    raw_status = session_lifecycle.status_remote_session(
         definition=definition,
         session_id=session_id,
         pre_start_cleanup_probe=True,
@@ -4382,7 +4322,7 @@ def _finalize_completed_cleanup_receipt_before_start(
         return
     if not status.cleanup_receipt:
         return
-    report = read_remote_session_cleanup_report(
+    report = session_lifecycle.read_remote_session_cleanup_report(
         definition=definition,
         cluster=cluster,
         session_id=session_id,
@@ -4424,7 +4364,7 @@ def _finalize_completed_cleanup_receipt_before_start(
         queue=queue,
         definition=definition,
         cluster=cluster,
-        remote_execution=should_execute_on_cluster(definition),
+        remote_execution=remote_cli.should_execute_on_cluster(definition),
         session_id=session_id,
         local_admission_session_id=local_admission_session_id,
         session_generation_id=generation_id,
@@ -4433,7 +4373,7 @@ def _finalize_completed_cleanup_receipt_before_start(
         finalized_report=report,
     )
     refreshed = OwnedSessionRecoveryStatus.model_validate(
-        status_remote_session(definition=definition, session_id=session_id)
+        session_lifecycle.status_remote_session(definition=definition, session_id=session_id)
     )
     if not (
         refreshed.recovery_verified
@@ -4703,8 +4643,10 @@ def _persist_local_cleanup_report_artifact(
                 handle=directory_windows_anchor.handle,
                 directory=True,
             )
-            directory_windows_guard = acquire_private_configuration_windows_parent_guard(
-                artifact_directory
+            directory_windows_guard = (
+                cluster_config.acquire_private_configuration_windows_parent_guard(
+                    artifact_directory
+                )
             )
             _verify_windows_pinned_directory(directory_windows_anchor)
             if evidence_lock is not None:
@@ -5171,7 +5113,7 @@ def _persist_local_cleanup_report_artifact(
                         artifact_directory / pending_name,
                         force_extended=True,
                     )
-                    with open_private_atomic_file(pending_path) as stream:
+                    with cluster_config.open_private_atomic_file(pending_path) as stream:
                         view = memoryview(content)
                         while view:
                             written = stream.write(view)
@@ -5355,7 +5297,7 @@ def _persist_verified_cleanup_report_before_closure(
     cleanup_operation_id = report.cleanup_operation_id
     if cleanup_operation_id is None:
         raise RelayError("coordinator cleanup report omitted its operation id")
-    finalized_status = finalize_remote_session_cleanup_report(
+    finalized_status = session_lifecycle.finalize_remote_session_cleanup_report(
         definition=definition,
         cluster=cluster,
         session_id=session_id,
@@ -5364,7 +5306,7 @@ def _persist_verified_cleanup_report_before_closure(
         cleanup_policy=report.cleanup_policy,
         report=report,
     )
-    retrieved_report = read_remote_session_cleanup_report(
+    retrieved_report = session_lifecycle.read_remote_session_cleanup_report(
         definition=definition,
         cluster=cluster,
         session_id=session_id,
@@ -5405,7 +5347,7 @@ def _verify_session_start_worker_release_identity(
     """
     findings = findings if findings is not None else VerificationFindings()
     local_identity = _session_api_release_identity_from_installation(
-        installation_info(),
+        installation.installation_info(),
         label="local clio-relay",
     )
     remote_receipt = verify_remote_worker_info(
@@ -5486,7 +5428,7 @@ def _require_process_bound_session_api_release() -> None:
         return
     if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
         raise ConfigurationError("session API release identity marker is invalid")
-    receipt = verified_session_api_install_receipt()
+    receipt = installation.verified_session_api_install_receipt()
     artifact_sha256 = receipt.artifact_sha256
     if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
         if not dev_mode_enabled():
@@ -5511,7 +5453,10 @@ def session_status(
     _run_or_exit(
         lambda: typer.echo(
             json.dumps(
-                status_remote_session(definition=definition, session_id=session_id), indent=2
+                session_lifecycle.status_remote_session(
+                    definition=definition, session_id=session_id
+                ),
+                indent=2,
             )
         )
     )
@@ -5662,7 +5607,7 @@ def session_submit_jarvis(
     definition = _require_cluster(cluster)
 
     def action() -> None:
-        job = submit_owned_session_job(
+        job = session_api.submit_owned_session_job(
             definition=definition,
             settings=settings,
             path="/jobs/jarvis",
@@ -5705,7 +5650,7 @@ def session_quiesce_intake(
     """Durably stop one owned API session from accepting new work."""
 
     def action() -> None:
-        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
         cleanup_intent = queue.set_owner_session_closing(
             session_id,
             session_generation_id=session_generation_id,
@@ -5739,7 +5684,7 @@ def session_admission_status(
     """Return machine-readable intake state for one exact session generation."""
 
     def action() -> None:
-        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
         typer.echo(
             json.dumps(
                 queue.owner_session_generation_status(
@@ -5941,22 +5886,22 @@ def _inspect_owned_session_recovery_after_transition(
     selected_home = home or Path.home()
     session_dir = selected_home / ".local" / "share" / "clio-relay" / "sessions" / session_id
     transition_path = session_dir / "transition.lock"
-    deadline = monotonic() + timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     transition_status: os.stat_result | None = None
     while transition_status is None:
         try:
             transition_status = transition_path.lstat()
         except FileNotFoundError:
-            remaining = deadline - monotonic()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RelayError(
                     "owned session transition lock did not materialize during the bounded "
                     "recovery wait; a delayed remote start cannot be ruled out"
                 ) from None
-            sleep(min(0.05, remaining))
+            time.sleep(min(0.05, remaining))
     if not stat.S_ISREG(transition_status.st_mode):
         raise RelayError("owned session transition lock is not a regular file")
-    remaining = deadline - monotonic()
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise RelayError(
             "owned session start transition could not be inspected during the bounded recovery wait"
@@ -5974,7 +5919,7 @@ def _inspect_owned_session_recovery_after_transition(
                 transition_status.st_ino,
             ):
                 raise RelayError("owned session transition lock changed during recovery")
-            return inspect_owned_session_recovery_status(
+            return session_lifecycle.inspect_owned_session_recovery_status(
                 cluster=cluster,
                 session_id=session_id,
                 core_dir=core_dir,
@@ -5994,7 +5939,7 @@ def _inspect_owned_session_recovery_after_transition(
             ) != (transition_status.st_dev, transition_status.st_ino)
             if not stat.S_ISREG(locked_status.st_mode) or lock_identity_changed:
                 raise RelayError("owned session transition lock changed during recovery")
-            return inspect_owned_session_recovery_status(
+            return session_lifecycle.inspect_owned_session_recovery_status(
                 cluster=cluster,
                 session_id=session_id,
                 core_dir=core_dir,
@@ -6069,7 +6014,7 @@ def session_prepare_start(
     """Atomically select the authoritative generation for an owned API start."""
 
     def action() -> None:
-        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
         generation_id = queue.prepare_owner_session_start(
             session_id,
             recorded_generation_id=recorded_generation_id,
@@ -6098,7 +6043,7 @@ def session_resume_intake(
     """Clear durable intake quiescence for a new owned API generation."""
 
     def action() -> None:
-        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
         queue.clear_owner_session_closing(
             session_id,
             session_generation_id=session_generation_id,
@@ -6131,7 +6076,7 @@ def session_mark_closed(
     """Durably close one verified, already-quiesced owner session generation."""
 
     def action() -> None:
-        queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+        queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
         closure = queue.set_owner_session_closed(
             session_id,
             session_generation_id=session_generation_id,
@@ -6195,7 +6140,7 @@ def session_detach(
         artifact=validation_artifact,
     )
     canonical_report: list[LiveValidationReport | None] = [seed_report]
-    write_validation_report(seed_report, canonical_report_path)
+    validation_report_module.write_validation_report(seed_report, canonical_report_path)
     try:
         definition = _require_cluster(cluster)
     except BaseException as exc:
@@ -6214,10 +6159,10 @@ def session_detach(
         raise
 
     def action() -> None:
-        remote_execution = should_execute_on_cluster(definition)
+        remote_execution = remote_cli.should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
         cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
-        pre_detach_report = detach_remote_session(
+        pre_detach_report = session_lifecycle.detach_remote_session(
             definition=definition,
             session_id=session_id,
             cluster=cluster,
@@ -6274,7 +6219,7 @@ def session_detach(
                 owner_session_generation_id=session_generation_id,
                 scheduler_provider=definition.scheduler_provider,
             )
-        report = detach_remote_session(
+        report = session_lifecycle.detach_remote_session(
             definition=definition,
             session_id=session_id,
             cluster=cluster,
@@ -6350,7 +6295,7 @@ def session_detach(
 
     def locked_action() -> None:
         with (
-            remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
+            remote_cli.remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
             _session_transition_lock(cluster=cluster, session_id=session_id),
         ):
             guarded_action()
@@ -6449,7 +6394,7 @@ def session_teardown(
             artifact=validation_artifact,
         )
         canonical_report: list[LiveValidationReport | None] = [seed_report]
-        write_validation_report(seed_report, canonical_report_path)
+        validation_report_module.write_validation_report(seed_report, canonical_report_path)
     except BaseException:
         _release_cleanup_evidence_lock(evidence_lock)
         raise
@@ -6485,7 +6430,7 @@ def session_teardown(
         raise
 
     def action() -> None:
-        remote_execution = should_execute_on_cluster(definition)
+        remote_execution = remote_cli.should_execute_on_cluster(definition)
         queue = _managed_queue_from_env()
         cleanup_worker_info, cleanup_worker_error = _observe_worker_before_cleanup(definition)
 
@@ -6611,7 +6556,7 @@ def session_teardown(
                     metadata={"cleanup_operation_id": operation_id},
                 )
             )
-            write_validation_report(pending, canonical_report_path)
+            validation_report_module.write_validation_report(pending, canonical_report_path)
             _verify_cleanup_evidence_lock(
                 active_evidence_lock,
                 expected_parent=_cleanup_evidence_state_parent(),
@@ -7004,7 +6949,7 @@ def session_teardown(
 
         initial_status_error: str | None = None
         try:
-            pre_teardown_status = status_remote_session(
+            pre_teardown_status = session_lifecycle.status_remote_session(
                 definition=definition,
                 session_id=session_id,
             )
@@ -7033,7 +6978,7 @@ def session_teardown(
                 recovery_resource.metadata["initial_status_error"] = initial_status_error
             seed_report.resources.append(recovery_resource)
             canonical_report[0] = seed_report
-            write_validation_report(seed_report, canonical_report_path)
+            validation_report_module.write_validation_report(seed_report, canonical_report_path)
             session_generation_id = _verified_recovered_owner_session_generation(
                 recovery_status,
                 cluster=cluster,
@@ -7062,7 +7007,7 @@ def session_teardown(
             and recovery_status.cleanup_receipt
             and recovery_status.coordinator_report_bound
         ):
-            retrieved_report = read_remote_session_cleanup_report(
+            retrieved_report = session_lifecycle.read_remote_session_cleanup_report(
                 definition=definition,
                 cluster=cluster,
                 session_id=session_id,
@@ -7244,7 +7189,7 @@ def session_teardown(
         partial.resources.extend([admission_resource, api_resource])
         partial.cleanup.remaining_resources.extend([admission_resource, api_resource])
         canonical_report[0] = partial
-        write_validation_report(partial, canonical_report_path)
+        validation_report_module.write_validation_report(partial, canonical_report_path)
         cleanup_intent = _quiesce_owner_session_intake(
             queue=queue,
             definition=definition,
@@ -7267,7 +7212,7 @@ def session_teardown(
                 "verified_after_operation": True,
             }
         )
-        write_validation_report(partial, canonical_report_path)
+        validation_report_module.write_validation_report(partial, canonical_report_path)
 
         def list_owned_jobs(*, include_terminal: bool = False) -> list[_OwnedRelayJob]:
             if remote_execution:
@@ -7336,7 +7281,7 @@ def session_teardown(
                 )
                 partial.resources.append(resource)
                 partial.cleanup.remaining_resources.append(resource)
-            write_validation_report(partial, canonical_report_path)
+            validation_report_module.write_validation_report(partial, canonical_report_path)
             raise RelayError(
                 "owner-session cleanup found unversioned legacy jobs whose generation cannot be "
                 "proven; no relay or scheduler cancellation was attempted: "
@@ -7372,7 +7317,7 @@ def session_teardown(
                         "residual": True,
                     }
                 )
-            write_validation_report(partial, canonical_report_path)
+            validation_report_module.write_validation_report(partial, canonical_report_path)
         gateway_scheduler_job_ids = (
             _owned_gateway_scheduler_job_ids(
                 queue=queue,
@@ -7413,7 +7358,7 @@ def session_teardown(
                 }
             )
         if gateway_scheduler_job_ids:
-            write_validation_report(partial, canonical_report_path)
+            validation_report_module.write_validation_report(partial, canonical_report_path)
         scheduler_sentinel_pre_phases = _preflight_scheduler_sentinels(
             definition,
             scheduler_sentinel_ids,
@@ -7447,7 +7392,7 @@ def session_teardown(
                                 "detail": str(exc),
                             }
                         )
-                write_validation_report(partial, canonical_report_path)
+                validation_report_module.write_validation_report(partial, canonical_report_path)
                 raise
             canceled_ids = set(canceled)
             for index, resource in enumerate(partial.resources):
@@ -7470,7 +7415,7 @@ def session_teardown(
                             "residual": False,
                         }
                     )
-            write_validation_report(partial, canonical_report_path)
+            validation_report_module.write_validation_report(partial, canonical_report_path)
         gateway_reports = _cleanup_owned_runtime_sessions(
             cluster=cluster,
             definition=definition,
@@ -7481,7 +7426,7 @@ def session_teardown(
             scheduler_sentinel_ids=scheduler_sentinel_ids,
             owned_jobs=owned_jobs,
         )
-        report = teardown_remote_session(
+        report = session_lifecycle.teardown_remote_session(
             definition=definition,
             session_id=session_id,
             expected_session_generation_id=session_generation_id,
@@ -7716,7 +7661,7 @@ def session_teardown(
 
     def locked_action() -> None:
         with (
-            remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
+            remote_cli.remote_command_timeout(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
             _session_transition_lock(cluster=cluster, session_id=session_id),
         ):
             guarded_action()
@@ -7768,7 +7713,7 @@ def job_submit(
         _file_idempotency_key(jarvis_yaml, yaml_text)
         + _artifact_use_idempotency_suffix(artifact_uses)
     )
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         remote_yaml = stage_jarvis_yaml(
             definition,
             jarvis_yaml=jarvis_yaml,
@@ -7827,7 +7772,7 @@ def job_submit_pipeline(
         f"jarvis-pipeline:{cluster}:{pipeline_name}"
         + _artifact_use_idempotency_suffix(artifact_uses)
     )
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         remote_command = [
             "job",
             "submit-pipeline",
@@ -7873,7 +7818,7 @@ def job_watch(
         ["job", "watch", job_id, "--cursor", str(cursor), "--limit", str(limit)],
     ):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     events, next_cursor = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
     for event in events:
         typer.echo(f"{event.seq} {event.created_at.isoformat()} {event.event_type} {event.message}")
@@ -7898,7 +7843,7 @@ def job_monitor(
     ):
         return
     result = monitor_job(
-        ClioCoreQueue(RelaySettings.from_env().core_dir),
+        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir),
         job_id,
         cursor=cursor,
         limit=limit,
@@ -7917,7 +7862,9 @@ def job_status(
     """Read job, relay queue, and scheduler status as JSON."""
     if _try_remote_cluster_passthrough(cluster, ["job", "status", job_id]):
         return
-    result = get_job_status(ClioCoreQueue(RelaySettings.from_env().core_dir), job_id)
+    result = relay_ops.job_status(
+        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir), job_id
+    )
     typer.echo(json.dumps(result, indent=2))
 
 
@@ -7953,7 +7900,7 @@ def job_tasks(
     ]
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     tasks, next_cursor, total = queue.list_tasks_page(
         job_id,
         cursor=cursor,
@@ -7996,7 +7943,9 @@ def job_task_events(
         ["job", "task-events", task_id, "--cursor", str(cursor), "--limit", str(limit)],
     ):
         return
-    events, next_cursor = ClioCoreQueue(RelaySettings.from_env().core_dir).drain_task_events(
+    events, next_cursor = core_queue.ClioCoreQueue(
+        RelaySettings.from_env().core_dir
+    ).drain_task_events(
         task_id,
         cursor=cursor,
         limit=limit,
@@ -8069,7 +8018,7 @@ def job_record_task_event(
         remote_args.extend(["--artifact-ref", value])
     if _try_remote_cluster_passthrough(cluster, remote_args):
         return
-    event = ClioCoreQueue(RelaySettings.from_env().core_dir).append_task_event(
+    event = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).append_task_event(
         TaskTimelineEvent(
             task_id=task_id,
             event_type=event_type,
@@ -8110,8 +8059,8 @@ def job_wait(
         poll_seconds=poll_seconds,
     ):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
-    job = observe_until_terminal(
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
+    job = relay_ops.observe_until_terminal(
         queue,
         job_id,
         timeout_seconds=timeout_seconds,
@@ -8148,7 +8097,7 @@ def job_read_log(
     ):
         return
     settings = RelaySettings.from_env()
-    queue = ClioCoreQueue(settings.core_dir)
+    queue = core_queue.ClioCoreQueue(settings.core_dir)
     if stream not in {"stdout", "stderr"}:
         raise typer.BadParameter("--stream must be stdout or stderr")
     result = read_job_log(
@@ -8172,7 +8121,9 @@ def job_read_artifact(
     """Read an artifact payload as base64 JSON."""
     if _try_remote_cluster_passthrough(cluster, ["job", "read-artifact", artifact_id]):
         return
-    result = read_artifact_bytes(ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id)
+    result = read_artifact_bytes(
+        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id
+    )
     typer.echo(json.dumps(result, indent=2))
     if is_delivery_refusal(result):
         # F6 (#231 R6 review): a T2 refusal (doc §6.4) is not a successful
@@ -8216,7 +8167,7 @@ def job_list_artifacts(
         ],
     ):
         return
-    artifacts, next_cursor, total = ClioCoreQueue(
+    artifacts, next_cursor, total = core_queue.ClioCoreQueue(
         RelaySettings.from_env().core_dir
     ).list_artifacts_page(job_id, cursor=cursor, limit=limit)
     typer.echo(
@@ -8260,7 +8211,7 @@ def job_used_artifacts(
         remote_args.extend(["--cursor", cursor])
     if _try_remote_cluster_passthrough(cluster, remote_args):
         return
-    records, next_cursor, total = ClioCoreQueue(
+    records, next_cursor, total = core_queue.ClioCoreQueue(
         RelaySettings.from_env().core_dir
     ).list_used_artifacts_page(job_id, cursor=cursor, limit=limit)
     typer.echo(
@@ -8303,7 +8254,7 @@ def job_used_by(
         remote_args.extend(["--cursor", cursor])
     if _try_remote_cluster_passthrough(cluster, remote_args):
         return
-    records, next_cursor, total = ClioCoreQueue(
+    records, next_cursor, total = core_queue.ClioCoreQueue(
         RelaySettings.from_env().core_dir
     ).list_artifact_users_page(artifact_id, cursor=cursor, limit=limit)
     typer.echo(
@@ -8354,7 +8305,7 @@ def job_progress(
         ],
     ):
         return
-    progress, next_cursor, total = ClioCoreQueue(
+    progress, next_cursor, total = core_queue.ClioCoreQueue(
         RelaySettings.from_env().core_dir
     ).list_progress_page(job_id, cursor=cursor, limit=limit)
     typer.echo(
@@ -8391,7 +8342,7 @@ def job_record_progress(
 ) -> None:
     """Record a structured progress observation for a job."""
     metadata = external_progress_metadata("external_cli", _json_object(metadata_json))
-    progress = ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
+    progress = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
         ProgressRecord(
             job_id=job_id,
             label=label,
@@ -8458,7 +8409,7 @@ def queue_list(
     )
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     try:
         result = list_queue_jobs(
             queue,
@@ -8520,7 +8471,7 @@ def queue_owner_jobs(
         args.extend(["--cursor", cursor])
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     try:
         jobs, next_cursor, total, source_window_count = queue.list_owner_session_jobs_page(
             owner_session_id,
@@ -8574,7 +8525,7 @@ def queue_migrate_indexes(
         args.append("--all")
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     try:
         result = queue.migrate_indexes_batch(batch_size=batch_size)
         while all_batches and result.get("complete") is not True:
@@ -8594,7 +8545,9 @@ def queue_migration_status(
     """Read the crash-safe queue index migration checkpoint without mutation."""
     if _try_remote_cluster_passthrough(cluster, ["queue", "migration-status"]):
         return
-    status_payload = ClioCoreQueue(RelaySettings.from_env().core_dir).index_migration_status()
+    status_payload = core_queue.ClioCoreQueue(
+        RelaySettings.from_env().core_dir
+    ).index_migration_status()
     typer.echo(json.dumps(status_payload, indent=2))
 
 
@@ -8609,7 +8562,7 @@ def queue_readiness_info(
     if _try_remote_cluster_passthrough(cluster, ["queue", "readiness-info"]):
         return
     try:
-        payload = ClioCoreQueue(RelaySettings.from_env().core_dir).readiness_info()
+        payload = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).readiness_info()
     except (RelayError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(json.dumps(payload, indent=2))
@@ -8636,7 +8589,7 @@ def queue_repair_lease_indexes(
         args.extend(["--cluster", cluster])
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     try:
         result = queue.repair_lease_operational_indexes(limit=limit)
     except (RelayError, ValueError) as exc:
@@ -8665,7 +8618,9 @@ def queue_audit_lease_capacity(
         args.extend(["--cluster", cluster])
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    report = ClioCoreQueue(RelaySettings.from_env().core_dir).audit_lease_capacity(limit=limit)
+    report = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).audit_lease_capacity(
+        limit=limit
+    )
     typer.echo(json.dumps(report, indent=2))
     if report.get("valid") is not True:
         raise typer.Exit(code=1)
@@ -8701,7 +8656,7 @@ def queue_diagnose(
         args.extend(["--cluster", cluster])
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     try:
         result = diagnose_job(
             queue,
@@ -8759,7 +8714,7 @@ def queue_stale(
         return
     try:
         result = discover_stale_jobs(
-            ClioCoreQueue(RelaySettings.from_env().core_dir),
+            core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir),
             cluster=cluster,
             older_than_seconds=_parse_age_seconds(older_than),
             job_id=job_id,
@@ -8907,7 +8862,7 @@ def queue_retention_plan(
         return
     settings = RelaySettings.from_env()
     coordinator = TerminalRetentionCoordinator(
-        ClioCoreQueue(settings.core_dir),
+        core_queue.ClioCoreQueue(settings.core_dir),
         settings.spool_dir,
     )
     plan = coordinator.plan(
@@ -8938,7 +8893,7 @@ def queue_retention_status(
         return
     settings = RelaySettings.from_env()
     plan = TerminalRetentionCoordinator(
-        ClioCoreQueue(settings.core_dir),
+        core_queue.ClioCoreQueue(settings.core_dir),
         settings.spool_dir,
     ).plan(job_id)
     typer.echo(
@@ -8997,8 +8952,10 @@ def queue_retention_collect(
 
     def action() -> None:
         settings = RelaySettings.from_env()
-        queue: ClioCoreQueue = (
-            storage_managed_queue(settings) if execute else ClioCoreQueue(settings.core_dir)
+        queue: core_queue.ClioCoreQueue = (
+            storage_runtime.storage_managed_queue(settings)
+            if execute
+            else core_queue.ClioCoreQueue(settings.core_dir)
         )
         result = TerminalRetentionCoordinator(queue, settings.spool_dir).collect(
             job_id,
@@ -9092,7 +9049,7 @@ def queue_validate(
     def action() -> None:
         definition = _require_cluster(cluster)
         selected_provider = provider or definition.scheduler_provider
-        if should_execute_on_cluster(definition):
+        if remote_cli.should_execute_on_cluster(definition):
             args = [
                 "queue",
                 "validate",
@@ -9123,20 +9080,22 @@ def queue_validate(
             if artifact_sha256 is not None:
                 args.extend(["--validation-artifact-sha256", artifact_sha256])
             canonical = LiveValidationReport.model_validate_json(
-                run_remote_clio(definition, args).strip()
+                remote_cli.run_remote_clio(definition, args).strip()
             )
             _write_remote_verified_report(canonical, definition, resolved_report)
             if markdown_report is not None:
                 ValidationRecorder(canonical).write(resolved_report, markdown_report)
         else:
-            canonical = run_queue_management_validation(
+            canonical = queue_validation.run_queue_management_validation(
                 _managed_queue_from_env(),
                 job_id=job_id,
                 cluster=cluster,
                 kind=kind,
                 older_than_seconds=_parse_age_seconds(older_than),
                 scan_limit=scan_limit,
-                scheduler_provider=validation_provider_for_scheduler(selected_provider),
+                scheduler_provider=scheduler_providers.validation_provider_for_scheduler(
+                    selected_provider
+                ),
                 scheduler_run_seconds=scheduler_run_seconds,
                 scheduler_timeout_seconds=scheduler_timeout_seconds,
                 scheduler_poll_seconds=scheduler_poll_seconds,
@@ -9188,7 +9147,7 @@ def worker_status_command(
         args.extend(["--cluster", cluster])
     if _try_remote_cluster_passthrough(cluster, args):
         return
-    queue = ClioCoreQueue(RelaySettings.from_env().core_dir)
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
     typer.echo(json.dumps(worker_status(queue, cluster=cluster), indent=2))
 
 
@@ -9213,12 +9172,14 @@ def scheduler_status_command(
         "--provider",
         selected,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
     _run_or_exit(
         lambda: typer.echo(
-            provider_for_scheduler(selected).poll(scheduler_job_id).model_dump_json(indent=2)
+            scheduler_providers.provider_for_scheduler(selected)
+            .poll(scheduler_job_id)
+            .model_dump_json(indent=2)
         )
     )
 
@@ -9248,12 +9209,12 @@ def scheduler_status_batch_command(
     args = ["scheduler", "status-batch", "--cluster", cluster, "--provider", selected]
     for scheduler_job_id in scheduler_job_ids:
         args.extend(["--scheduler-job-id", scheduler_job_id])
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        scheduler = provider_for_scheduler(selected)
+        scheduler = scheduler_providers.provider_for_scheduler(selected)
         statuses = [
             scheduler.poll(scheduler_job_id).model_dump(mode="json")
             for scheduler_job_id in scheduler_job_ids
@@ -9293,12 +9254,12 @@ def scheduler_cancel_command(
         "--provider",
         selected,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        result = provider_for_scheduler(selected).cancel(scheduler_job_id)
+        result = scheduler_providers.provider_for_scheduler(selected).cancel(scheduler_job_id)
         payload = {
             "scheduler": selected,
             "scheduler_job_id": scheduler_job_id,
@@ -9336,12 +9297,12 @@ def scheduler_connector_placement_command(
         "--provider",
         selected,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
     _run_or_exit(
         lambda: typer.echo(
-            allocation_connector_provider_for_scheduler(selected)
+            scheduler_providers.allocation_connector_provider_for_scheduler(selected)
             .connector_placement(scheduler_job_id)
             .model_dump_json(indent=2)
         )
@@ -9397,12 +9358,12 @@ def scheduler_connector_step_start_command(
         "--",
         *connector_command,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
     _run_or_exit(
         lambda: typer.echo(
-            allocation_connector_provider_for_scheduler(selected)
+            scheduler_providers.allocation_connector_provider_for_scheduler(selected)
             .launch_connector_step(
                 scheduler_job_id,
                 placement_host=placement_host,
@@ -9445,12 +9406,12 @@ def scheduler_connector_step_status_command(
         "--placement-host",
         placement_host,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
     _run_or_exit(
         lambda: typer.echo(
-            allocation_connector_provider_for_scheduler(selected)
+            scheduler_providers.allocation_connector_provider_for_scheduler(selected)
             .poll_connector_step(
                 scheduler_job_id,
                 scheduler_step_id=scheduler_step_id,
@@ -9485,12 +9446,14 @@ def scheduler_connector_step_cancel_command(
         "--provider",
         selected,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        result = allocation_connector_provider_for_scheduler(selected).cancel_connector_step(
+        result = scheduler_providers.allocation_connector_provider_for_scheduler(
+            selected
+        ).cancel_connector_step(
             scheduler_job_id,
             scheduler_step_id=scheduler_step_id,
         )
@@ -9548,12 +9511,14 @@ def scheduler_connector_step_reconcile_command(
         "--step-marker",
         step_marker,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        step = allocation_connector_provider_for_scheduler(selected).find_connector_step(
+        step = scheduler_providers.allocation_connector_provider_for_scheduler(
+            selected
+        ).find_connector_step(
             scheduler_job_id,
             step_marker=step_marker,
             placement_host=placement_host,
@@ -9601,14 +9566,14 @@ def scheduler_submit_held_validation(
         "--run-seconds",
         str(run_seconds),
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        scheduler_job_id = validation_provider_for_scheduler(selected).submit_held_validation_job(
-            job_name=job_name, run_seconds=run_seconds
-        )
+        scheduler_job_id = scheduler_providers.validation_provider_for_scheduler(
+            selected
+        ).submit_held_validation_job(job_name=job_name, run_seconds=run_seconds)
         typer.echo(
             json.dumps(
                 {
@@ -9645,14 +9610,14 @@ def scheduler_release_validation(
         "--provider",
         selected,
     ]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         _run_remote_or_exit(definition, args)
         return
 
     def action() -> None:
-        result = validation_provider_for_scheduler(selected).release_validation_job(
-            scheduler_job_id
-        )
+        result = scheduler_providers.validation_provider_for_scheduler(
+            selected
+        ).release_validation_job(scheduler_job_id)
         payload = {
             "scheduler": selected,
             "scheduler_job_id": scheduler_job_id,
@@ -9735,7 +9700,7 @@ def scheduler_validate_lifecycle(
     canonical_report: list[LiveValidationReport | None] = [None]
 
     def action() -> None:
-        report = run_scheduler_lifecycle_validation(
+        report = scheduler_validation.run_scheduler_lifecycle_validation(
             cluster=cluster,
             definition=definition,
             provider=selected,
@@ -9749,7 +9714,7 @@ def scheduler_validate_lifecycle(
             ),
         )
         canonical_report[0] = report
-        if should_execute_on_cluster(definition):
+        if remote_cli.should_execute_on_cluster(definition):
             try:
                 attach_verified_worker_identity(
                     report,
@@ -9763,9 +9728,9 @@ def scheduler_validate_lifecycle(
                     exc,
                 )
                 recorder.finish(exc)
-                write_validation_report(report, resolved_report)
+                validation_report_module.write_validation_report(report, resolved_report)
                 raise
-        write_validation_report(report, resolved_report)
+        validation_report_module.write_validation_report(report, resolved_report)
         if markdown_report is not None:
             ValidationRecorder(report).write(resolved_report, markdown_report)
         typer.echo(f"validation.report={resolved_report.resolve()}")
@@ -9970,7 +9935,7 @@ def gateway_create(
         remote_args.extend(["--artifact", value])
     if _try_remote_gateway_session_passthrough(cluster, remote_args):
         return
-    session = ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
+    session = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).create_gateway_session(
         GatewaySession(
             cluster=cluster,
             name=name,
@@ -10005,7 +9970,7 @@ def _local_gateway_session(
     return session
 
 
-def _local_gateway_queue() -> ClioCoreQueue:
+def _local_gateway_queue() -> core_queue.ClioCoreQueue:
     """Open the desktop queue without resolving unrelated executable settings."""
     configured = os.getenv("CLIO_RELAY_CORE_DIR")
     if configured:
@@ -10013,7 +9978,7 @@ def _local_gateway_queue() -> ClioCoreQueue:
     else:
         bootstrap_dir = Path.home() / ".local" / "share" / "clio-relay" / "core"
         core_dir = bootstrap_dir.resolve() if bootstrap_dir.exists() else Path(".clio-relay/core")
-    return ClioCoreQueue(core_dir)
+    return core_queue.ClioCoreQueue(core_dir)
 
 
 @gateway_app.command("list")
@@ -10072,7 +10037,7 @@ def gateway_list(
             assert cluster is not None
             definition = _require_cluster(cluster)
             cluster_sessions, cluster_next_cursor, cluster_total = _parse_gateway_page(
-                run_remote_clio(definition, remote_args),
+                remote_cli.run_remote_clio(definition, remote_args),
                 limit=limit,
                 expected_cluster=cluster,
             )
@@ -10124,7 +10089,7 @@ def _should_query_remote_cluster(cluster: str) -> bool:
     """Return whether a CLI read should include the configured remote store."""
     if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
         return False
-    return should_execute_on_cluster(_require_cluster(cluster))
+    return remote_cli.should_execute_on_cluster(_require_cluster(cluster))
 
 
 def _parse_gateway_page(
@@ -10182,7 +10147,9 @@ def gateway_get(
     remote_args = ["gateway", "get", session_id]
     if _try_remote_gateway_session_passthrough(cluster, remote_args):
         return
-    session = ClioCoreQueue(RelaySettings.from_env().core_dir).get_gateway_session(session_id)
+    session = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).get_gateway_session(
+        session_id
+    )
     typer.echo(_public_json(public_gateway_session(session)))
 
 
@@ -10296,7 +10263,9 @@ def gateway_update(
         lambda: typer.echo(
             _public_json(
                 public_gateway_session(
-                    ClioCoreQueue(RelaySettings.from_env().core_dir).update_gateway_session(
+                    core_queue.ClioCoreQueue(
+                        RelaySettings.from_env().core_dir
+                    ).update_gateway_session(
                         session_id,
                         state=state,
                         metadata=metadata_payload,
@@ -10327,9 +10296,9 @@ def gateway_close(
         lambda: typer.echo(
             _public_json(
                 public_gateway_session(
-                    ClioCoreQueue(RelaySettings.from_env().core_dir).close_gateway_session(
-                        session_id
-                    )
+                    core_queue.ClioCoreQueue(
+                        RelaySettings.from_env().core_dir
+                    ).close_gateway_session(session_id)
                 )
             )
         )
@@ -10400,8 +10369,8 @@ def gateway_start_runtime(
             runtime_json_file.read_text(encoding="utf-8-sig")
         )
         settings = RelaySettings.from_env()
-        queue = storage_managed_queue(settings)
-        supervisor = ServiceRuntimeSupervisor(
+        queue = storage_runtime.storage_managed_queue(settings)
+        supervisor = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
             queue=queue,
             cluster=cluster,
@@ -10417,14 +10386,14 @@ def gateway_start_runtime(
         if owner_session_id is None or owner_session_generation_id is None:
             result = supervisor.start(name=name, spec=spec)
         else:
-            with owner_session_gateway_admission(
+            with owner_session_admission.owner_session_gateway_admission(
                 queue=queue,
                 definition=definition,
                 cluster=cluster,
                 session_id=owner_session_id,
                 session_generation_id=owner_session_generation_id,
                 transition_lock_factory=_session_transition_lock,
-                session_status_reader=status_remote_session,
+                session_status_reader=session_lifecycle.status_remote_session,
                 admission_status_reader=_owner_session_admission_status,
             ) as admission:
                 result = supervisor.start(
@@ -10446,7 +10415,7 @@ def gateway_start_runtime(
             # A nonterminal report cannot satisfy the release gate. Persist and
             # return its exact retry selector without adding another fallible
             # remote observation that could hide the already-durable result.
-            write_validation_report(canonical, canonical_report_path)
+            validation_report_module.write_validation_report(canonical, canonical_report_path)
         else:
             _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload = public_gateway_session(result.session)
@@ -10536,8 +10505,8 @@ def gateway_resume_runtime(
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        queue = storage_managed_queue(settings)
-        supervisor = ServiceRuntimeSupervisor(
+        queue = storage_runtime.storage_managed_queue(settings)
+        supervisor = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
             queue=queue,
             cluster=cluster,
@@ -10570,14 +10539,14 @@ def gateway_resume_runtime(
             )
             if typed_owner_admission_id != expected_admission_id:
                 raise RelayError("owned gateway runtime admission identity changed")
-            with owner_session_gateway_admission(
+            with owner_session_admission.owner_session_gateway_admission(
                 queue=queue,
                 definition=definition,
                 cluster=cluster,
                 session_id=typed_owner_session_id,
                 session_generation_id=typed_owner_generation_id,
                 transition_lock_factory=_session_transition_lock,
-                session_status_reader=status_remote_session,
+                session_status_reader=session_lifecycle.status_remote_session,
                 admission_status_reader=_owner_session_admission_status,
             ) as admission:
                 if admission.owner_session_admission_id != typed_owner_admission_id:
@@ -10595,7 +10564,7 @@ def gateway_resume_runtime(
             # Pending is an operational checkpoint, not release evidence. Its
             # successful return must not depend on a second worker-provenance
             # observation after the exact runtime query already completed.
-            write_validation_report(canonical, canonical_report_path)
+            validation_report_module.write_validation_report(canonical, canonical_report_path)
         else:
             _write_remote_verified_report(canonical, definition, canonical_report_path)
         payload = public_gateway_session(result.session)
@@ -10660,9 +10629,9 @@ def gateway_browser_attach(
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        result = ServiceRuntimeSupervisor(
+        result = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=storage_runtime.storage_managed_queue(settings),
             cluster=cluster,
             definition=definition,
             token="",
@@ -10693,9 +10662,9 @@ def gateway_browser_detach(
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        result = ServiceRuntimeSupervisor(
+        result = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=storage_runtime.storage_managed_queue(settings),
             cluster=cluster,
             definition=definition,
             token="",
@@ -10751,14 +10720,14 @@ def gateway_detach_runtime(
         artifact=validation_artifact,
     )
     canonical_report: list[LiveValidationReport | None] = [seed_report]
-    write_validation_report(seed_report, canonical_report_path)
+    validation_report_module.write_validation_report(seed_report, canonical_report_path)
 
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        supervisor = ServiceRuntimeSupervisor(
+        supervisor = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=storage_runtime.storage_managed_queue(settings),
             cluster=cluster,
             definition=definition,
             token="",
@@ -10829,9 +10798,9 @@ def gateway_attach_runtime(
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        supervisor = ServiceRuntimeSupervisor(
+        supervisor = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=storage_runtime.storage_managed_queue(settings),
             cluster=cluster,
             definition=definition,
             token=_resolve_env_secret(token, definition.frp_transport.token_env, "frp token"),
@@ -10928,14 +10897,14 @@ def gateway_stop_runtime(
         artifact=validation_artifact,
     )
     canonical_report: list[LiveValidationReport | None] = [seed_report]
-    write_validation_report(seed_report, canonical_report_path)
+    validation_report_module.write_validation_report(seed_report, canonical_report_path)
 
     def action() -> None:
         definition = _require_cluster(cluster)
         settings = RelaySettings.from_env()
-        supervisor = ServiceRuntimeSupervisor(
+        supervisor = service_runtime.ServiceRuntimeSupervisor(
             settings=settings,
-            queue=storage_managed_queue(settings),
+            queue=storage_runtime.storage_managed_queue(settings),
             cluster=cluster,
             definition=definition,
             token="",
@@ -11007,7 +10976,7 @@ def monitor_add_regex(
 ) -> None:
     """Create a generic regex monitor rule over a job event stream."""
     action_payload = _json_object(action_payload_json)
-    rule = ClioCoreQueue(RelaySettings.from_env().core_dir).append_monitor_rule(
+    rule = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).append_monitor_rule(
         MonitorRule(
             job_id=job_id,
             pattern=pattern,
@@ -11039,7 +11008,7 @@ def monitor_list(
     ] = DEFAULT_RESPONSE_PAGE_RECORDS,
 ) -> None:
     """List one stable source window of durable monitor rules as JSON."""
-    rules, next_cursor, total = ClioCoreQueue(
+    rules, next_cursor, total = core_queue.ClioCoreQueue(
         RelaySettings.from_env().core_dir
     ).list_monitor_rules_page(
         cursor=cursor,
@@ -11100,7 +11069,7 @@ def agent_run(
     key = idempotency_key or (
         f"agent:{cluster}:{prompt}:{mcp_config}" + _artifact_use_idempotency_suffix(artifact_uses)
     )
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         args = [
             "agent",
             "run",
@@ -11228,7 +11197,7 @@ def mcp_call(
     server_args = server_arg or []
     environment_references = _environment_references(env_from)
     artifact_uses = _artifact_use_refs(used_artifact)
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         remote_arguments_path: str | None = None
         remote_command = [
             "mcp-call",
@@ -11274,7 +11243,7 @@ def mcp_call(
         with staged_remote_cluster_registry(definition) as remote_registry_path:
             try:
                 if remote_arguments_path is not None:
-                    write_remote_file(
+                    remote_cli.write_remote_file(
                         definition,
                         remote_arguments_path,
                         json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode(
@@ -11294,7 +11263,7 @@ def mcp_call(
                 )
             finally:
                 if remote_arguments_path is not None:
-                    remove_remote_file(
+                    remote_cli.remove_remote_file(
                         definition,
                         remote_arguments_path,
                         remove_empty_parent=True,
@@ -11479,7 +11448,7 @@ def jarvis_mcp_call(
             f"timeout={timeout_seconds}"
         )
     )
-    if definition is not None and should_execute_on_cluster(definition):
+    if definition is not None and remote_cli.should_execute_on_cluster(definition):
         remote_args: str | None = None
         remote_command = [
             "jarvis-mcp-call",
@@ -11507,7 +11476,7 @@ def jarvis_mcp_call(
             remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
         try:
             if remote_args is not None:
-                write_remote_file(
+                remote_cli.write_remote_file(
                     definition,
                     remote_args,
                     json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8"),
@@ -11523,9 +11492,9 @@ def jarvis_mcp_call(
             )
         finally:
             if remote_args is not None:
-                remove_remote_file(definition, remote_args, remove_empty_parent=True)
+                remote_cli.remove_remote_file(definition, remote_args, remove_empty_parent=True)
         return
-    server = jarvis_mcp_server()
+    server = jarvis_mcp.jarvis_mcp_server()
     server_args = jarvis_mcp_server_args()
     metadata = (
         {}
@@ -11756,13 +11725,13 @@ def jarvis_mcp_validate(
 
     def action() -> None:
         settings = RelaySettings.from_env()
-        queue = storage_managed_queue(settings)
+        queue = storage_runtime.storage_managed_queue(settings)
         queue.initialize()
 
         def emit(validation: LiveValidationReport, *, attach_worker: bool = False) -> None:
-            if attach_worker and should_execute_on_cluster(definition):
+            if attach_worker and remote_cli.should_execute_on_cluster(definition):
                 attach_verified_worker_identity(validation, _remote_worker_info(definition))
-            write_validation_report(validation, report_path)
+            validation_report_module.write_validation_report(validation, report_path)
             report_written[0] = True
             typer.echo(validation.model_dump_json(indent=2))
             if validation.status is ValidationStatus.FAILED:
@@ -11805,7 +11774,7 @@ def jarvis_mcp_validate(
                     checkpoint=checkpoint,
                 )
             else:
-                validation = build_jarvis_mcp_validation_report(
+                validation = jarvis_mcp_validation.build_jarvis_mcp_validation_report(
                     **builder_inputs,
                     query_tools_list_response=execution_query.tools_list_response,
                     query_call_response=execution_query.call_response,
@@ -11943,14 +11912,16 @@ def jarvis_mcp_validate(
             )
             # Persist the replayable identity before crossing the ambiguous stdio boundary.
             # A process or host failure can therefore resume with this exact key.
-            write_validation_report(_new_jarvis_intent_pending_report(checkpoint), report_path)
+            validation_report_module.write_validation_report(
+                _new_jarvis_intent_pending_report(checkpoint), report_path
+            )
         else:
             execution_intent = cast(dict[str, object], checkpoint["execution_intent"])
             pre_dispatch_inputs = cast(dict[str, Any], checkpoint["pre_dispatch_inputs"])
 
         if checkpoint["phase"] == _JARVIS_VALIDATION_PHASE_INTENT:
             try:
-                stdio_session = run_packaged_mcp_stdio_session(
+                stdio_session = mcp_stdio_validation.run_packaged_mcp_stdio_session(
                     profile=checkpoint_profile,
                     tool="jarvis_run",
                     arguments=cast(dict[str, Any], execution_intent["arguments"]),
@@ -12086,9 +12057,9 @@ def mcp_server(
 ) -> None:
     """Serve relay tools with native FastMCP and relay-backed SEP-2663 tasks."""
     if transport == "stdio":
-        run_fastmcp_stdio(profile=profile)
+        fastmcp_server.run_fastmcp_stdio(profile=profile)
         return
-    run_fastmcp_http(profile=profile, host=host, port=port, path=path)
+    fastmcp_server.run_fastmcp_http(profile=profile, host=host, port=port, path=path)
 
 
 @api_app.command("start")
@@ -12112,7 +12083,7 @@ def api_start(
     # the app retains the validated settings needed to prove this session's identity.
     from clio_relay.http_api import app as relay_http_app
 
-    publish_owned_session_api_startup_receipt()
+    session_lifecycle.publish_owned_session_api_startup_receipt()
     uvicorn.run(relay_http_app, host=host, port=port)
 
 
@@ -12136,7 +12107,9 @@ def agent_render_mcp_config(
 @app.command("installation-info")
 def show_installation_info() -> None:
     """Print the current package identity and durable cluster install receipt."""
-    _run_or_exit(lambda: typer.echo(json.dumps(installation_info(), indent=2, default=str)))
+    _run_or_exit(
+        lambda: typer.echo(json.dumps(installation.installation_info(), indent=2, default=str))
+    )
 
 
 @app.command("bootstrap-inspect", hidden=True)
@@ -12168,7 +12141,7 @@ def bootstrap_inspect(
             desired = BootstrapDesiredState.model_validate_json(raw)
         except (binascii.Error, UnicodeError, ValidationError, ValueError) as exc:
             raise ConfigurationError("bootstrap desired state is invalid") from exc
-        active_generation = proven_active_generation_mismatch(desired)
+        active_generation = bootstrap_reconcile.proven_active_generation_mismatch(desired)
         if active_generation is not None:
             payload: dict[str, object] = {
                 "schema_version": "clio-relay.bootstrap-preflight.v1",
@@ -12186,7 +12159,7 @@ def bootstrap_inspect(
             )
             return
         started_at = datetime.now(UTC)
-        started = monotonic()
+        started = time.monotonic()
         deadline = started + (
             BOOTSTRAP_REPAIR_DEADLINE_SECONDS
             if repair
@@ -12196,11 +12169,11 @@ def bootstrap_inspect(
         def run_systemctl(
             arguments: list[str], *, timeout_seconds: float
         ) -> subprocess.CompletedProcess[str]:
-            remaining = deadline - monotonic()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ConfigurationError("bootstrap inspection exceeded its total deadline")
             try:
-                return run_bounded_process(
+                return bounded_process.run_bounded_process(
                     ["systemctl", "--user", *arguments],
                     timeout_seconds=min(timeout_seconds, remaining),
                     stdout_maximum_bytes=4096,
@@ -12211,8 +12184,8 @@ def bootstrap_inspect(
                     f"bounded systemd inspection failed: {arguments[0]}"
                 ) from exc
 
-        inspection_started = monotonic()
-        current_installation = installation_info()
+        inspection_started = time.monotonic()
+        current_installation = installation.installation_info()
         service_active: bool | None = None
         service_enabled: bool | None = None
         if desired.worker_service is not None:
@@ -12226,11 +12199,13 @@ def bootstrap_inspect(
             )
             service_active = active_result.returncode == 0
             service_enabled = enabled_result.returncode == 0
-        queue_evidence = ClioCoreQueue(RelaySettings.from_env().core_dir).readiness_info()
+        queue_evidence = core_queue.ClioCoreQueue(
+            RelaySettings.from_env().core_dir
+        ).readiness_info()
         worker_evidence: dict[str, object] | None = None
         if service_active is True and desired.cluster is not None:
             try:
-                worker_evidence = worker_runtime_info(
+                worker_evidence = installation.worker_runtime_info(
                     cluster=desired.cluster,
                     current_installation=current_installation,
                 )
@@ -12241,7 +12216,7 @@ def bootstrap_inspect(
                     "running": False,
                     "error": str(exc),
                 }
-        inspection = inspect_exact_bootstrap_noop(
+        inspection = bootstrap_reconcile.inspect_exact_bootstrap_noop(
             desired,
             service_was_active=service_active,
             service_was_enabled=service_enabled,
@@ -12312,23 +12287,23 @@ def bootstrap_inspect(
                     if started_service.returncode != 0:
                         raise ConfigurationError("managed endpoint service could not be started")
                     service_start_count = 1
-                worker_deadline = min(deadline, monotonic() + 30)
+                worker_deadline = min(deadline, time.monotonic() + 30)
                 worker_evidence = None
-                while monotonic() < worker_deadline:
+                while time.monotonic() < worker_deadline:
                     try:
-                        worker_evidence = worker_runtime_info(
+                        worker_evidence = installation.worker_runtime_info(
                             cluster=desired.cluster or "",
                             current_installation=current_installation,
                         )
                     except (RelayError, ValueError):
-                        sleep(0.25)
+                        time.sleep(0.25)
                         continue
                     if worker_evidence.get("running") is True:
                         break
-                    sleep(0.25)
+                    time.sleep(0.25)
                 service_active = True
                 service_enabled = True
-                inspection = inspect_exact_bootstrap_noop(
+                inspection = bootstrap_reconcile.inspect_exact_bootstrap_noop(
                     desired,
                     service_was_active=True,
                     service_was_enabled=True,
@@ -12348,7 +12323,7 @@ def bootstrap_inspect(
             "receipt": None,
         }
         if inspection.exact_match:
-            inspection_duration = monotonic() - inspection_started
+            inspection_duration = time.monotonic() - inspection_started
             outcome: Literal["noop_verified", "repaired"] = (
                 "repaired"
                 if service_start_count or service_enable_count or service_restart_count
@@ -12363,7 +12338,7 @@ def bootstrap_inspect(
                 transaction=None,
                 previous_generation=inspection.active_generation,
                 active_generation=inspection.active_generation,
-                duration_seconds=monotonic() - started,
+                duration_seconds=time.monotonic() - started,
                 inspection_duration_seconds=inspection_duration,
                 service_start_count=service_start_count,
                 service_enable_count=service_enable_count,
@@ -12375,7 +12350,7 @@ def bootstrap_inspect(
                 service_active_after=service_active,
                 service_enabled_after=service_enabled,
             )
-            write_bootstrap_receipt(
+            bootstrap_reconcile.write_bootstrap_receipt(
                 Path.home() / ".local/share/clio-relay/bootstrap-receipt.json",
                 receipt,
             )
@@ -12395,7 +12370,7 @@ def bootstrap_inspect(
         )
 
     def _inspect() -> None:
-        with bootstrap_invocation_lock(timeout_seconds=2):
+        with bootstrap_reconcile.bootstrap_invocation_lock(timeout_seconds=2):
             _inspect_locked()
 
     _run_or_exit(_inspect)
@@ -12613,7 +12588,7 @@ def live_test(
         ),
     )
     if resume_report is None:
-        write_validation_report(seed_report, report_path)
+        validation_report_module.write_validation_report(seed_report, report_path)
     try:
         definition = _require_cluster(cluster)
         should_verify_transport = (
@@ -12652,7 +12627,7 @@ def live_test(
     def _run() -> None:
         settings = RelaySettings.from_env()
         try:
-            lines = run_live_acceptance(
+            lines = live_acceptance.run_live_acceptance(
                 LiveAcceptanceOptions(
                     cluster=cluster,
                     definition=definition,
@@ -12718,8 +12693,9 @@ def live_test(
             )
             if current_report is None:
                 raise RelayError("live acceptance did not persist the current invocation report")
-            if current_report.status is ValidationStatus.PASSED and should_execute_on_cluster(
-                definition
+            if (
+                current_report.status is ValidationStatus.PASSED
+                and remote_cli.should_execute_on_cluster(definition)
             ):
                 _write_remote_verified_report(
                     current_report,
@@ -12809,7 +12785,7 @@ def _bounded_cleanup_public_json(value: object) -> str | None:
 
 def _managed_queue_from_env() -> StorageManagedQueue:
     """Open the production queue with durable storage reconciliation enabled."""
-    return storage_managed_queue(RelaySettings.from_env())
+    return storage_runtime.storage_managed_queue(RelaySettings.from_env())
 
 
 def _submit_managed_job(job: RelayJob) -> RelayJob:
@@ -12911,7 +12887,7 @@ class _OwnedRelayJob:
 
 def _quiesce_owner_session_intake(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     remote_execution: bool,
     session_id: str,
@@ -12974,7 +12950,7 @@ def _quiesce_owner_session_intake(
     raw_result = cast(
         object,
         json.loads(
-            run_remote_clio(
+            remote_cli.run_remote_clio(
                 definition,
                 command,
             )
@@ -13038,7 +13014,7 @@ def _require_matching_cleanup_intents(
 
 def _owner_session_admission_status(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     remote_execution: bool,
     session_id: str,
@@ -13051,7 +13027,7 @@ def _owner_session_admission_status(
         remote_execution=remote_execution,
         session_id=session_id,
         session_generation_id=session_generation_id,
-        remote_cli_runner=run_remote_clio,
+        remote_cli_runner=remote_cli.run_remote_clio,
     )
 
 
@@ -13109,7 +13085,7 @@ def _select_owner_session_cleanup_operation(
 
 
 def _list_owned_active_cluster_jobs(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     cluster: str,
     *,
     owner_session_id: str,
@@ -13191,7 +13167,7 @@ def _list_remote_owned_active_cluster_jobs(
             if cursor is not None:
                 command.extend(["--cursor", cursor])
             payload = _json_output(
-                run_remote_clio(definition, command),
+                remote_cli.run_remote_clio(definition, command),
                 f"remote owner-session jobs for {cluster}",
             )
             raw_jobs = payload.get("jobs")
@@ -13259,7 +13235,7 @@ def _list_remote_owned_active_cluster_jobs(
 
 
 def _cancel_local_owned_jobs(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     jobs: list[_OwnedRelayJob],
 ) -> list[str]:
     requested: list[str] = []
@@ -13295,7 +13271,7 @@ def _cancel_remote_owned_jobs(
         raw_result = cast(
             object,
             json.loads(
-                run_remote_clio(
+                remote_cli.run_remote_clio(
                     definition,
                     [
                         "queue",
@@ -13345,7 +13321,7 @@ def _require_durable_relay_cancellation(job: _OwnedRelayJob) -> None:
 
 def _read_owned_relay_job(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     remote_execution: bool,
     cluster: str,
@@ -13357,7 +13333,7 @@ def _read_owned_relay_job(
     if remote_execution:
         raw_status = cast(
             object,
-            json.loads(run_remote_clio(definition, ["job", "status", job_id])),
+            json.loads(remote_cli.run_remote_clio(definition, ["job", "status", job_id])),
         )
         if not isinstance(raw_status, dict):
             raise RelayError(f"remote relay cancellation status was not an object: {job_id}")
@@ -13397,11 +13373,11 @@ def _wait_for_owned_relay_cancellations(
     pending = dict.fromkeys(job_ids)
     if len(pending) != len(job_ids):
         raise RelayError("relay cancellation targets must be unique")
-    deadline = monotonic() + timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     last_states: dict[str, str] = {}
     while pending:
         for job_id in list(pending):
-            remaining = deadline - monotonic()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 detail = ", ".join(
                     f"{pending_id}={last_states.get(pending_id, 'missing')}"
@@ -13410,7 +13386,9 @@ def _wait_for_owned_relay_cancellations(
                 raise RelayError(
                     "timed out waiting for worker-acknowledged relay cancellation: " + detail
                 )
-            with remote_command_timeout(min(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS, remaining)):
+            with remote_cli.remote_command_timeout(
+                min(REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS, remaining)
+            ):
                 observed = read_owned_job(job_id)
             last_states[job_id] = observed.relay_state.value
             _require_durable_relay_cancellation(observed)
@@ -13429,7 +13407,7 @@ def _wait_for_owned_relay_cancellations(
                 )
         if not pending:
             break
-        remaining = deadline - monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             detail = ", ".join(
                 f"{job_id}={last_states.get(job_id, 'missing')}" for job_id in sorted(pending)
@@ -13437,7 +13415,7 @@ def _wait_for_owned_relay_cancellations(
             raise RelayError(
                 "timed out waiting for worker-acknowledged relay cancellation: " + detail
             )
-        sleep(min(poll_seconds, remaining))
+        time.sleep(min(poll_seconds, remaining))
     return list(job_ids)
 
 
@@ -13668,7 +13646,7 @@ def _normalize_scheduler_sentinel_ids(values: list[str]) -> tuple[str, ...]:
 
 def _owned_gateway_scheduler_job_ids(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     cluster: str,
     owner_session_id: str,
@@ -13685,7 +13663,7 @@ def _owned_gateway_scheduler_job_ids(
             "no scheduler cancellation was attempted"
         )
     documents = [gateway.model_dump(mode="json") for gateway in local_gateways]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         documents.extend(
             _complete_remote_source_collection(
                 definition,
@@ -14028,11 +14006,11 @@ def _scheduler_phase_after_operation(
     provider: str,
 ) -> tuple[str | None, str | None]:
     try:
-        if should_execute_on_cluster(definition):
+        if remote_cli.should_execute_on_cluster(definition):
             raw_status = cast(
                 object,
                 json.loads(
-                    run_remote_clio(
+                    remote_cli.run_remote_clio(
                         definition,
                         [
                             "scheduler",
@@ -14053,7 +14031,7 @@ def _scheduler_phase_after_operation(
             if phase == SchedulerPhase.UNKNOWN.value and active_record_found is False:
                 return "missing", None
             return (str(phase), None) if isinstance(phase, str) else (None, None)
-        status = provider_for_scheduler(provider).poll(scheduler_job_id)
+        status = scheduler_providers.provider_for_scheduler(provider).poll(scheduler_job_id)
         if status.phase is SchedulerPhase.UNKNOWN and status.active_record_found is False:
             return "missing", None
         return status.phase.value, None
@@ -14067,7 +14045,7 @@ def _scheduler_phases_after_operation(
 ) -> dict[tuple[str, str], tuple[str | None, str | None]]:
     """Observe exact scheduler identities with bounded remote process reuse."""
     unique_identities = tuple(dict.fromkeys(identities))
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return {
             identity: _scheduler_phase_after_operation(
                 definition,
@@ -14095,7 +14073,7 @@ def _scheduler_phases_after_operation(
             for scheduler_job_id in batch:
                 args.extend(["--scheduler-job-id", scheduler_job_id])
             try:
-                raw = cast(object, json.loads(run_remote_clio(definition, args)))
+                raw = cast(object, json.loads(remote_cli.run_remote_clio(definition, args)))
                 if not isinstance(raw, dict):
                     raise RelayError("scheduler status batch did not return a JSON object")
                 document = cast(dict[str, object], raw)
@@ -14169,21 +14147,21 @@ def _cancel_owned_scheduler_job(
     timeout_seconds: float,
     poll_seconds: float,
 ) -> tuple[CleanupResource, str | None]:
-    deadline = monotonic() + timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     accepted = False
     cancel_detail: str | None = None
     try:
-        if should_execute_on_cluster(definition):
-            with remote_command_timeout(
+        if remote_cli.should_execute_on_cluster(definition):
+            with remote_cli.remote_command_timeout(
                 min(
                     REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
-                    max(0.01, deadline - monotonic()),
+                    max(0.01, deadline - time.monotonic()),
                 )
             ):
                 raw_cancel = cast(
                     object,
                     json.loads(
-                        run_remote_clio(
+                        remote_cli.run_remote_clio(
                             definition,
                             [
                                 "scheduler",
@@ -14202,26 +14180,26 @@ def _cancel_owned_scheduler_job(
                 and cast(dict[str, object], raw_cancel).get("accepted") is True
             )
         else:
-            result = provider_for_scheduler(provider).cancel(scheduler_job_id)
+            result = scheduler_providers.provider_for_scheduler(provider).cancel(scheduler_job_id)
             accepted = result.returncode == 0
             cancel_detail = result.stderr.strip() or result.stdout.strip() or None
     except (RelayError, json.JSONDecodeError) as exc:
         cancel_detail = str(exc)
 
     last_phase = "unknown"
-    while monotonic() < deadline:
+    while time.monotonic() < deadline:
         try:
-            if should_execute_on_cluster(definition):
-                with remote_command_timeout(
+            if remote_cli.should_execute_on_cluster(definition):
+                with remote_cli.remote_command_timeout(
                     min(
                         REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
-                        max(0.01, deadline - monotonic()),
+                        max(0.01, deadline - time.monotonic()),
                     )
                 ):
                     raw_status = cast(
                         object,
                         json.loads(
-                            run_remote_clio(
+                            remote_cli.run_remote_clio(
                                 definition,
                                 [
                                     "scheduler",
@@ -14240,7 +14218,11 @@ def _cancel_owned_scheduler_job(
                 phase = cast(dict[str, object], raw_status).get("phase")
                 last_phase = str(phase) if phase is not None else "unknown"
             else:
-                last_phase = provider_for_scheduler(provider).poll(scheduler_job_id).phase.value
+                last_phase = (
+                    scheduler_providers.provider_for_scheduler(provider)
+                    .poll(scheduler_job_id)
+                    .phase.value
+                )
         except (RelayError, json.JSONDecodeError) as exc:
             cancel_detail = str(exc)
         if last_phase == "canceled":
@@ -14281,7 +14263,7 @@ def _cancel_owned_scheduler_job(
                 ),
                 None,
             )
-        sleep(poll_seconds)
+        time.sleep(poll_seconds)
 
     detail = (
         f"scheduler cancellation was not confirmed: accepted={accepted}, phase={last_phase}"
@@ -14316,7 +14298,7 @@ def _cleanup_owned_runtime_sessions(
     owned_jobs: list[_OwnedRelayJob] | None = None,
 ) -> list[dict[str, object]]:
     """Clean exact owned gateways and rescan boundedly until admission is stable."""
-    queue = storage_managed_queue(RelaySettings.from_env())
+    queue = storage_runtime.storage_managed_queue(RelaySettings.from_env())
     reports: list[dict[str, object]] = []
     if mode == "detach":
         target_ids = _owned_runtime_gateway_ids_needing_cleanup(
@@ -14390,7 +14372,7 @@ def _cleanup_owned_runtime_sessions(
 
 def _owned_runtime_gateway_ids_needing_cleanup(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     cluster: str,
     owner_session_id: str,
@@ -14407,7 +14389,7 @@ def _owned_runtime_gateway_ids_needing_cleanup(
             "no gateway cleanup was attempted"
         )
     documents = [gateway.model_dump(mode="json") for gateway in local_gateways]
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         documents.extend(
             _complete_remote_source_collection(
                 definition,
@@ -14453,9 +14435,9 @@ def _cleanup_owned_runtime_sessions_once(
     target_session_ids: set[str],
 ) -> list[dict[str, object]]:
     settings = RelaySettings.from_env()
-    queue = storage_managed_queue(settings)
+    queue = storage_runtime.storage_managed_queue(settings)
     queue.initialize()
-    supervisor = ServiceRuntimeSupervisor(
+    supervisor = service_runtime.ServiceRuntimeSupervisor(
         settings=settings,
         queue=queue,
         cluster=cluster,
@@ -14475,7 +14457,7 @@ def _cleanup_owned_runtime_sessions_once(
             f"{MAX_INTERNAL_COLLECTION_RECORDS}; no gateway cleanup was attempted"
         )
     remote_gateways: list[dict[str, Any]] = []
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         remote_gateways = _complete_remote_source_collection(
             definition,
             ["gateway", "list", "--cluster", cluster],
@@ -14566,7 +14548,7 @@ def _cleanup_owned_runtime_sessions_once(
                 cluster,
                 ("--cancel-scheduler-job" if cancel_scheduler_jobs else "--keep-scheduler-job"),
             ]
-        remote_report = cast(object, json.loads(run_remote_clio(definition, args)))
+        remote_report = cast(object, json.loads(remote_cli.run_remote_clio(definition, args)))
         if not isinstance(remote_report, dict):
             raise RelayError(
                 f"remote gateway cleanup did not return a JSON object: {remote_session_id}"
@@ -14661,7 +14643,7 @@ def _verified_owner_session_generation(
 
 def _owned_session_recovery_status(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     remote_execution: bool,
     cluster: str,
@@ -14672,7 +14654,7 @@ def _owned_session_recovery_status(
         raw_status = cast(
             object,
             json.loads(
-                run_remote_clio(
+                remote_cli.run_remote_clio(
                     definition,
                     [
                         "session",
@@ -15141,7 +15123,7 @@ def _require_exact_owner_session_admission(
 
 def _mark_owner_session_closed(
     *,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     definition: ClusterDefinition,
     cluster: str,
     remote_execution: bool,
@@ -15203,7 +15185,7 @@ def _mark_owner_session_closed(
             args.extend(["--legacy-unversioned-job-id", job_id])
         raw_payload = cast(
             object,
-            json.loads(run_remote_clio(definition, args)),
+            json.loads(remote_cli.run_remote_clio(definition, args)),
         )
         if not isinstance(raw_payload, dict):
             raise RelayError("remote owner-session closure did not return a JSON object")
@@ -15339,13 +15321,13 @@ def _run_jarvis_remote_contract_discovery(
     *,
     cluster: str,
     definition: ClusterDefinition,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     wait_timeout_seconds: float,
     poll_seconds: float,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
     """Discover the actual cluster-side JARVIS MCP before accepting its virtual route."""
     idempotency_key = f"mcp:jarvis-contract:{cluster}:{uuid4().hex}"
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         remote_args = [
             "jarvis-mcp-call",
             "--cluster",
@@ -15362,9 +15344,9 @@ def _run_jarvis_remote_contract_discovery(
                 )
             ),
         ]
-        job_id = _last_nonempty_line(run_remote_clio(definition, remote_args))
+        job_id = _last_nonempty_line(remote_cli.run_remote_clio(definition, remote_args))
         terminal = _json_output(
-            run_remote_clio(
+            remote_cli.run_remote_clio(
                 definition,
                 [
                     "job",
@@ -15386,7 +15368,7 @@ def _run_jarvis_remote_contract_discovery(
             kind="mcp_result",
         )
     else:
-        server = jarvis_mcp_server()
+        server = jarvis_mcp.jarvis_mcp_server()
         server_args = jarvis_mcp_server_args()
         admission_class, admission_authority = resolve_pinned_mcp_admission(
             operation=McpOperation.TOOLS_LIST,
@@ -15418,7 +15400,7 @@ def _run_jarvis_remote_contract_discovery(
             )
         )
         job_id = submitted.job_id
-        terminal_job = wait_for_terminal(
+        terminal_job = relay_ops.wait_for_terminal(
             queue,
             job_id,
             timeout_seconds=wait_timeout_seconds,
@@ -15533,7 +15515,7 @@ def _read_remote_mcp_result_artifact(
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError("remote MCP result artifact has no artifact_id")
     envelope = _json_output(
-        run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
+        remote_cli.run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
         "remote discovery artifact payload",
     )
     return artifact, _decode_artifact_envelope(envelope)
@@ -15609,7 +15591,7 @@ def _read_remote_artifact_kind_bytes(
 
 
 def _read_local_json_artifact_kind(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     artifacts: list[dict[str, Any]],
     *,
     kind: str,
@@ -15619,7 +15601,7 @@ def _read_local_json_artifact_kind(
 
 
 def _read_local_artifact_kind_bytes(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     artifacts: list[dict[str, Any]],
     *,
     kind: str,
@@ -15666,7 +15648,7 @@ def _mcp_response_job_id(response: dict[str, Any] | None) -> str:
 
 
 def _read_local_mcp_result_artifact(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     job_id: str,
 ) -> tuple[dict[str, object], bytes]:
     artifacts = _complete_local_artifact_records(queue, job_id)
@@ -15722,14 +15704,14 @@ def _run_jarvis_package_search_query(
     *,
     cluster: str,
     definition: ClusterDefinition,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     profile: str,
     query: str,
     wait_timeout_seconds: float,
     poll_seconds: float,
 ) -> _JarvisPackageSearchAcceptance:
     """Exercise bounded package discovery through the local virtual MCP surface."""
-    session = run_packaged_mcp_stdio_session(
+    session = mcp_stdio_validation.run_packaged_mcp_stdio_session(
         profile=profile,
         tool="jarvis_describe",
         arguments={
@@ -15740,7 +15722,7 @@ def _run_jarvis_package_search_query(
         },
     )
     call_job_id = _mcp_response_job_id(session.tools_call_response)
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         call_status = _wait_for_remote_job_terminal(
             definition,
             call_job_id,
@@ -16082,7 +16064,7 @@ def _build_jarvis_dispatch_pending_report(
     """Retain one accepted relay job while its terminal result remains unobserved."""
     builder_inputs = cast(dict[str, Any], checkpoint["builder_inputs"])
     selector = cast(dict[str, object], checkpoint["retry_selector"])
-    report = build_jarvis_mcp_validation_report(
+    report = jarvis_mcp_validation.build_jarvis_mcp_validation_report(
         **builder_inputs,
         query_tools_list_response=None,
         query_call_response=None,
@@ -16134,7 +16116,7 @@ def _build_unobserved_jarvis_query_pending_report(
 ) -> LiveValidationReport:
     """Retain exact execution identity when no query result arrives in the window."""
     selector = execution_query.retry_selector()
-    report = build_jarvis_mcp_validation_report(
+    report = jarvis_mcp_validation.build_jarvis_mcp_validation_report(
         **builder_inputs,
         query_tools_list_response=None,
         query_call_response=None,
@@ -16815,7 +16797,7 @@ def _require_jarvis_run_dispatch_job_identity(
 def _complete_jarvis_run_dispatch(
     *,
     definition: ClusterDefinition,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     checkpoint: dict[str, Any],
     wait_timeout_seconds: float,
     poll_seconds: float,
@@ -16826,7 +16808,7 @@ def _complete_jarvis_run_dispatch(
     job_id = cast(str, selector["relay_job_id"])
     pipeline_id = cast(str, selector["pipeline_id"])
     idempotency_key = cast(str, selector["idempotency_key"])
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         call_status = _wait_for_remote_job_terminal(
             definition,
             job_id,
@@ -17579,7 +17561,7 @@ def _run_post_run_jarvis_execution_query(
     *,
     cluster: str,
     definition: ClusterDefinition,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     profile: str,
     pipeline_id: str,
     execution_id: str,
@@ -17595,11 +17577,11 @@ def _run_post_run_jarvis_execution_query(
         "execution_id": execution_id,
         "include_progress": True,
     }
-    deadline = monotonic() + wait_timeout_seconds
+    deadline = time.monotonic() + wait_timeout_seconds
     lifecycle_observations: list[dict[str, Any]] = []
     latest_attempt: _JarvisExecutionQueryAttempt | None = None
     while True:
-        remaining = deadline - monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             if latest_attempt is not None:
                 return _nonterminal_jarvis_execution_query_acceptance(
@@ -17651,7 +17633,7 @@ def _run_post_run_jarvis_execution_query(
             observation,
         )
         if observation["terminal"] is True:
-            remaining = deadline - monotonic()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return _nonterminal_jarvis_execution_query_acceptance(
                     cluster=cluster,
@@ -17709,7 +17691,7 @@ def _run_post_run_jarvis_execution_query(
                 stdio_evidence=terminal_attempt.session.evidence(),
                 lifecycle_observations=lifecycle_observations,
             )
-        remaining = deadline - monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return _nonterminal_jarvis_execution_query_acceptance(
                 cluster=cluster,
@@ -17718,7 +17700,7 @@ def _run_post_run_jarvis_execution_query(
                 attempt=attempt,
                 lifecycle_observations=lifecycle_observations,
             )
-        sleep(min(poll_seconds, remaining))
+        time.sleep(min(poll_seconds, remaining))
 
 
 def _unobserved_jarvis_execution_query_pending(
@@ -17786,30 +17768,30 @@ def _nonterminal_jarvis_execution_query_acceptance(
 def _execute_jarvis_execution_query(
     *,
     definition: ClusterDefinition,
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     profile: str,
     arguments: dict[str, Any],
     deadline: float,
     poll_seconds: float,
 ) -> _JarvisExecutionQueryAttempt:
     """Execute one query with the workload deadline applied to every boundary."""
-    remaining = deadline - monotonic()
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ObservationTimeoutError("JARVIS execution query deadline expired before MCP dispatch")
     timeout_seconds = min(60.0, max(0.001, remaining))
-    session = run_packaged_mcp_stdio_session(
+    session = mcp_stdio_validation.run_packaged_mcp_stdio_session(
         profile=profile,
         tool="jarvis_get_execution",
         arguments=arguments,
         timeout_seconds=timeout_seconds,
     )
     call_job_id = _mcp_response_job_id(session.tools_call_response)
-    timeout_seconds = deadline - monotonic()
+    timeout_seconds = deadline - time.monotonic()
     if timeout_seconds <= 0:
         raise ObservationTimeoutError(
             f"JARVIS execution query dispatch exceeded its deadline: {call_job_id}"
         )
-    if should_execute_on_cluster(definition):
+    if remote_cli.should_execute_on_cluster(definition):
         call_status = _wait_for_remote_job_terminal(
             definition,
             call_job_id,
@@ -17928,7 +17910,7 @@ def _wait_for_remote_job_terminal(
 ) -> dict[str, object]:
     """Wait for one remote relay job without requiring progress observations."""
     _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
-    timeout_deadline = monotonic() + timeout_seconds
+    timeout_deadline = time.monotonic() + timeout_seconds
     effective_deadline = timeout_deadline if deadline is None else min(timeout_deadline, deadline)
     while True:
         status = _json_output(
@@ -17941,16 +17923,16 @@ def _wait_for_remote_job_terminal(
         )
         if status.get("terminal") is True:
             return status
-        remaining = effective_deadline - monotonic()
+        remaining = effective_deadline - time.monotonic()
         if remaining <= 0:
             raise ObservationTimeoutError(
                 f"job did not reach terminal state before timeout: {job_id}"
             )
-        sleep(min(poll_seconds, remaining))
+        time.sleep(min(poll_seconds, remaining))
 
 
 def _wait_for_local_job_terminal(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     job_id: str,
     *,
     timeout_seconds: float,
@@ -17958,17 +17940,17 @@ def _wait_for_local_job_terminal(
 ) -> dict[str, object]:
     """Wait for one local relay job without requiring progress observations."""
     _validate_progress_wait(timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
-    deadline = monotonic() + timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     while True:
-        status = get_job_status(queue, job_id)
+        status = relay_ops.job_status(queue, job_id)
         if status.get("terminal") is True:
             return status
-        remaining = deadline - monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ObservationTimeoutError(
                 f"job did not reach terminal state before timeout: {job_id}"
             )
-        sleep(min(poll_seconds, remaining))
+        time.sleep(min(poll_seconds, remaining))
 
 
 def _validate_progress_wait(*, timeout_seconds: float, poll_seconds: float) -> None:
@@ -17993,7 +17975,7 @@ def _json_output(value: str, label: str) -> dict[str, object]:
 
 
 def _complete_local_artifact_records(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     job_id: str,
     *,
     max_records: int = MAX_INTERNAL_COLLECTION_RECORDS,
@@ -18027,7 +18009,7 @@ def _complete_local_artifact_records(
 
 
 def _complete_local_progress_records(
-    queue: ClioCoreQueue,
+    queue: core_queue.ClioCoreQueue,
     job_id: str,
     *,
     max_records: int = MAX_INTERNAL_COLLECTION_RECORDS,
@@ -18142,7 +18124,7 @@ def _complete_remote_source_collection(
     records: list[dict[str, Any]] = []
     while True:
         payload = _json_output(
-            run_remote_clio(
+            remote_cli.run_remote_clio(
                 definition,
                 [
                     *command,
@@ -18232,7 +18214,7 @@ def _remote_worker_info(
     """
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    deadline = None if timeout_seconds is None else monotonic() + timeout_seconds
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     args = ["endpoint", "worker-info", "--cluster", definition.name]
     if definition.relay_install_receipt is not None:
         args = [*args, "--pinned-install-receipt-path", definition.relay_install_receipt]
@@ -18264,12 +18246,12 @@ def _run_remote_clio_before_deadline(
 ) -> str:
     """Run one remote observation without exceeding a shared monotonic deadline."""
     if deadline is None:
-        return run_remote_clio(definition, args)
-    remaining = deadline - monotonic()
+        return remote_cli.run_remote_clio(definition, args)
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ObservationTimeoutError("remote worker identity observation timed out")
-    with remote_command_timeout(remaining):
-        return run_remote_clio(definition, args)
+    with remote_cli.remote_command_timeout(remaining):
+        return remote_cli.run_remote_clio(definition, args)
 
 
 def _remote_target_identity(
@@ -18442,7 +18424,7 @@ def _remote_observation_subprocess_timeout(
     """Return a positive subprocess timeout inside one shared observation budget."""
     if deadline is None:
         return default_seconds
-    remaining = deadline - monotonic()
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ConfigurationError("remote worker identity observation timed out")
     return min(default_seconds, remaining)
@@ -18735,7 +18717,7 @@ def _run_frpc_connection_validation(
             "transport.frpc-connection",
             "frpc stayed connected for the bounded probe interval",
         ) as evidence:
-            lines = run_frpc_connection_check(
+            lines = frp_check.run_frpc_connection_check(
                 frpc_bin=frpc_bin,
                 config=config,
                 timeout_seconds=timeout_seconds,
@@ -18784,7 +18766,7 @@ def _attach_verified_remote_worker(
     observed_worker_info: dict[str, object] | None = None,
 ) -> None:
     """Attach exact remote installation identity when the target executes over SSH."""
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return
     remote_info = (
         observed_worker_info
@@ -18798,7 +18780,7 @@ def _observe_worker_before_cleanup(
     definition: ClusterDefinition,
 ) -> tuple[dict[str, object] | None, Exception | None]:
     """Capture bounded worker evidence before cleanup can stop remote services."""
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return None, None
     try:
         return (
@@ -18848,7 +18830,7 @@ def _write_remote_verified_report(
         recorder.finish(exc)
         recorder.write(path)
         raise
-    write_validation_report(report, path)
+    validation_report_module.write_validation_report(report, path)
 
 
 def _write_cleanup_validation_report(
@@ -18874,7 +18856,7 @@ def _write_cleanup_validation_report(
     Return ``True`` only when that optional provenance warning was recorded.
     """
     if report.install_source.artifact_sha256 is None:
-        write_validation_report(report, path)
+        validation_report_module.write_validation_report(report, path)
         return False
     if worker_observation_error is not None:
         recorder = ValidationRecorder(report)
@@ -19033,11 +19015,11 @@ def _try_remote_gateway_session_passthrough(cluster: str | None, args: list[str]
     if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
         return False
     definition = _require_cluster(cluster)
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return False
 
     def action() -> None:
-        payload = run_remote_clio(definition, args)
+        payload = remote_cli.run_remote_clio(definition, args)
         try:
             decoded = json.loads(payload)
         except json.JSONDecodeError as exc:
@@ -19060,7 +19042,7 @@ def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> boo
     if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
         return False
     definition = _require_cluster(cluster)
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return False
     _run_remote_or_exit(definition, args)
     return True
@@ -19079,7 +19061,7 @@ def _try_remote_job_wait_passthrough(
     if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
         return False
     definition = _require_cluster(cluster)
-    if not should_execute_on_cluster(definition):
+    if not remote_cli.should_execute_on_cluster(definition):
         return False
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise typer.BadParameter("timeout-seconds must be positive and finite")
@@ -19088,10 +19070,10 @@ def _try_remote_job_wait_passthrough(
 
     def action() -> None:
         try:
-            with remote_command_timeout(
+            with remote_cli.remote_command_timeout(
                 timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
             ):
-                payload = run_remote_clio(
+                payload = remote_cli.run_remote_clio(
                     definition,
                     [
                         "job",
@@ -19115,9 +19097,9 @@ def _try_remote_job_wait_passthrough(
                     timeout_seconds=timeout_seconds,
                 )
         except ObservationTimeoutError as observation_error:
-            with remote_command_timeout(REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS):
+            with remote_cli.remote_command_timeout(REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS):
                 status = _json_output(
-                    run_remote_clio(definition, ["job", "status", job_id]),
+                    remote_cli.run_remote_clio(definition, ["job", "status", job_id]),
                     "remote job status after bounded wait",
                 )
             job = RelayJob.model_validate(status.get("job"))
@@ -19148,7 +19130,7 @@ def _run_remote_or_exit(
     if cluster_registry_path is None:
         _run_or_exit(
             lambda: typer.echo(
-                _console_safe_text(run_remote_clio(definition, args)),
+                _console_safe_text(remote_cli.run_remote_clio(definition, args)),
                 nl=False,
             )
         )
@@ -19156,7 +19138,7 @@ def _run_remote_or_exit(
     _run_or_exit(
         lambda: typer.echo(
             _console_safe_text(
-                run_remote_clio(
+                remote_cli.run_remote_clio(
                     definition,
                     args,
                     cluster_registry_path=cluster_registry_path,

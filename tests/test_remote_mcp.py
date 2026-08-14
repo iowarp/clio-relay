@@ -22,7 +22,7 @@ from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.cli as relay_cli
-from clio_relay import remote_mcp
+from clio_relay import remote_cli, remote_mcp
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -3231,7 +3231,7 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
         queue.append_artifact(spool.artifact_for(result_path, kind="mcp_result"))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="discovery complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", complete_discovery)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", complete_discovery)
 
     result = CliRunner().invoke(
         app,
@@ -3340,7 +3340,7 @@ def test_cli_remote_refresh_stages_exact_registry_for_tools_list_and_cleans_it(
 
     monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
     monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
-    monkeypatch.setattr(relay_cli, "run_remote_clio", run_remote)
+    monkeypatch.setattr(remote_cli, "run_remote_clio", run_remote)
     monkeypatch.setattr(relay_cli, "_read_remote_mcp_result_artifact", read_artifact)
 
     result = CliRunner().invoke(
@@ -4989,7 +4989,7 @@ def test_cli_fresh_spack_preflight_resolves_every_alias_before_dispatch(
     def load_catalog(_profile: str) -> Any:
         return catalog
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     dispatched = False
 
     def reject_dispatch(**_kwargs: object) -> None:
@@ -5028,7 +5028,7 @@ def test_cli_fresh_spack_runs_ordered_transition_and_emits_combined_report(
     def load_catalog(_profile: str) -> Any:
         return _fake_spack_validation_catalog()
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     spec = "zlib@1.3.1"
     dag_hash = "a" * 32
     store_root = "/scratch/acceptance/spack-store"
@@ -5121,7 +5121,7 @@ def test_cli_fresh_spack_refuses_install_when_preinstall_is_not_absent(
     def load_catalog(_profile: str) -> Any:
         return _fake_spack_validation_catalog()
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     calls: list[str] = []
 
     def execute(**kwargs: object) -> Any:
@@ -5187,7 +5187,7 @@ def test_remote_spack_configuration_observation_uses_bounded_bash_command(
         observed_timeout.append(timeout_context.get())
         return json.dumps(payload)
 
-    monkeypatch.setattr("clio_relay.cli.run_remote_shell", run_shell)
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
     collect_remote = relay_cli.__dict__["_collect_remote_spack_configuration_observation"]
     observation = collect_remote(
         definition=ClusterDefinition(name="alpha", ssh_host="ares"),
@@ -5334,7 +5334,7 @@ def test_remote_spack_configuration_observation_fails_closed(
     def run_shell(_definition: ClusterDefinition, _script: str) -> str:
         return output
 
-    monkeypatch.setattr("clio_relay.cli.run_remote_shell", run_shell)
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
     collect = relay_cli.__dict__["_collect_spack_configuration_observation"]
 
     with pytest.raises(RelayError):
@@ -5738,7 +5738,7 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
             queue.append_artifact(spool.artifact_for(path, kind=kind))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="call complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", complete_virtual_call)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", complete_virtual_call)
     output_path = tmp_path / "validation" / "remote-mcp.json"
 
     result = CliRunner().invoke(
@@ -5883,7 +5883,7 @@ def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
             queue.append_artifact(spool.artifact_for(path, kind=kind))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="call complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", finish_or_leave_queued)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", finish_or_leave_queued)
     output_path = tmp_path / "validation" / "catalog-domain.json"
     canonical_path = tmp_path / "validation" / "catalog-live.json"
 

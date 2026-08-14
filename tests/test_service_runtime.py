@@ -23,7 +23,9 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
+import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import cli as relay_cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
@@ -5537,7 +5539,7 @@ def test_owned_gateway_start_requires_live_exact_remote_generation_before_side_e
     def fake_process_status(**_kwargs: object) -> dict[str, object]:
         return status
 
-    monkeypatch.setattr(relay_cli, "status_remote_session", fake_process_status)
+    monkeypatch.setattr(session_lifecycle, "status_remote_session", fake_process_status)
 
     def forbidden_start(
         _self: ServiceRuntimeSupervisor,
@@ -5678,8 +5680,8 @@ def test_owned_gateway_start_holds_transition_lock_through_runtime_start(
         )
 
     monkeypatch.setattr(relay_cli, "_session_transition_lock", make_lock)
-    monkeypatch.setattr(relay_cli, "status_remote_session", process_status)
-    monkeypatch.setattr(relay_cli, "run_remote_clio", remote_status)
+    monkeypatch.setattr(session_lifecycle, "status_remote_session", process_status)
+    monkeypatch.setattr(remote_cli, "run_remote_clio", remote_status)
 
     def skip_worker_identity(
         _report: LiveValidationReport,

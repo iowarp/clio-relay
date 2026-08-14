@@ -86,7 +86,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # registration delegating entirely to `release_pins.run_preflight`/
     # `render_preflight` (ground rule 2: cli.py parses and renders only). A
     # justified, minimal ratchet-up.
-    "src/clio_relay/cli.py": 19353,
+    # #231 R8(i): -18 net lines -- the monkeypatch-seam rework (doc §4.6/§9)
+    # converts every collaborator symbol cli.py imported by bare name into a
+    # module-attribute call site (`import clio_relay.X as X`, `X.symbol(...)`
+    # instead of `from clio_relay.X import symbol`), so tests patch the
+    # symbol where it is looked up (the owner module) and survive future
+    # command-module extraction. Net negative: the added `import ... as ...`
+    # lines are outweighed by the removed multi-line `from ... import (...)`
+    # blocks they replace. A ratchet-down.
+    "src/clio_relay/cli.py": 19335,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

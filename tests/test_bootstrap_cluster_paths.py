@@ -1280,8 +1280,8 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
     def fake_remote_target_identity(_definition: ClusterDefinition) -> dict[str, Any]:
         return {"verified": True}
 
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "package")
-    monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
+    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
     monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
 
     result = CliRunner().invoke(
