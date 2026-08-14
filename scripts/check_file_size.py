@@ -116,7 +116,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # frp_link.py substrate (HeldFrpVisitor) instead of duplicating it;
     # run_frp_http_probe collapses into a thin proxy_type="stcp" wrapper
     # around _run_frp_http_probe_with_proxy_type. -100 net (1849 -> 1749).
-    "src/clio_relay/transport_probe.py": 1749,
+    # +46 more from the R4 opus review fix set (F2/F3/F9): a residual-
+    # secret-config-file resource in the cleanup ledger (F3, a real new
+    # resource kind, not fixable by deletion), the visitor-failure-message
+    # prefix helper (F2), and threading `visitor` through as Optional so a
+    # spawn failure still reaches cleanup (F9). Evaluated ground rule 5
+    # (remove/redesign first) and rejected -- this is the review's required
+    # safety/diagnostic behavior, not accreted duplication. 1749 -> 1795.
+    "src/clio_relay/transport_probe.py": 1795,
     "src/clio_relay/validation_report.py": 5458,
 }
 

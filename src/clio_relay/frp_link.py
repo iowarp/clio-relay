@@ -29,15 +29,23 @@ This module owns two concerns:
     ``pump_stderr``, and ``wait_for_channel_health`` were promoted from
     ``control_channel.py`` -- they were already mode-agnostic there, so
     ``control_channel.py`` now imports them from here instead of keeping a
-    second copy, and its own behavior is unchanged. ``HeldFrpVisitor`` is one
-    spawned local ``frpc -c <toml>`` process holding an stcp/xtcp visitor
-    tunnel, built with ``control_channel.SshForwardTransport``'s exact
-    lifecycle discipline (the mode-(c) reference implementation): a bounded,
-    continuously drained stderr buffer so the process never blocks writing
-    diagnostics; ``poll()``-based liveness, never a blocking wait; ``close()``
-    escalating terminate -> kill with timeouts; a 0600 rendered config file in
-    its own temporary directory, removed on ``close()``; and a bounded stderr
-    excerpt as the only failure detail exposed -- never a raw dump.
+    second copy, and its own behavior is unchanged (both the thread name and
+    the ``wait_for_channel_health`` message text are parameterized rather
+    than hardcoded, so control_channel.py's defaults stay byte-equivalent).
+    ``HeldFrpVisitor`` is one spawned local ``frpc -c <toml>`` process
+    holding an stcp/xtcp visitor tunnel, built with
+    ``control_channel.SshForwardTransport``'s exact lifecycle discipline
+    (the mode-(c) reference implementation), extended by one thing
+    ``SshForwardTransport`` doesn't need: ``frpc`` logs to stdout by
+    default, so both stdout and stderr are drained into their own bounded
+    buffers (never just stderr -- an unread stdout pipe wedges the child
+    once its OS pipe buffer fills). Otherwise identical discipline:
+    ``poll()``-based liveness, never a blocking wait; ``close()`` escalating
+    terminate -> kill with timeouts; a config file written 0600 (POSIX --
+    Windows has no mode-bit equivalent and relies on the per-user ``%TEMP%``
+    ACL instead) in its own temporary directory, removed on ``close()``; and
+    a bounded excerpt of both streams as the only failure detail exposed --
+    never a raw dump.
 
 ``frp_transport.py`` (R5) builds the ``brokered_tcp``/``udp_rendezvous``
 ``RelayTransport`` implementations on top of ``HeldFrpVisitor`` rather than
@@ -70,6 +78,14 @@ from clio_relay.relay_host import (
     render_frpc_visitor_config,
 )
 
+# Deliberately the same value as control_channel.py's
+# MAX_CHANNEL_EVENT_DETAIL_CHARS -- a different concern (this bounds a
+# process's retained diagnostic output; that one bounds a ChannelEvent's
+# detail field) that happens to want the same "how much diagnostic text do
+# we keep" budget today. Not derived from one another (they may need to
+# diverge later for reasons specific to either concern), but pinned equal by
+# tests/test_frp_link.py::test_stderr_buffer_bound_matches_channel_event_detail_bound
+# so a future change to either is a conscious decision, not silent drift.
 DEFAULT_STDERR_BUFFER_MAX_BYTES: Final = 2_000
 DEFAULT_FRP_VISITOR_HEALTH_TIMEOUT_SECONDS: Final = 30.0
 
@@ -201,14 +217,18 @@ def render_visitor_config(
 
 
 class BoundedStderrBuffer:
-    """A drained, bounded record of what a held process wrote to stderr.
+    """A drained, bounded record of what a held process wrote to one stream.
 
     Promoted from ``control_channel.py`` (mode-agnostic there already): a
-    long-held process's stderr pipe must be read continuously or it fills and
-    the process blocks writing to it, with no error and no event. This is
-    reached in ordinary operation -- ``ssh -L`` writes one line per refused
-    forwarded connection, and ``frpc`` logs connection churn to stderr -- and
-    the pipe buffer is only about 4 KiB on Windows.
+    long-held process's stdout/stderr pipe must be read continuously or it
+    fills and the process blocks writing to it, with no error and no event.
+    This is reached in ordinary operation -- ``ssh -L`` writes one line per
+    refused forwarded connection to stderr, and ``frpc`` logs connection
+    churn and login diagnostics to stdout by default -- and the pipe buffer
+    is only about 4 KiB on Windows. The name predates ``HeldFrpVisitor``
+    needing this for stdout too; the class itself is stream-agnostic (one
+    bounded buffer fed by one pump), so it is reused rather than duplicated
+    per stream.
     """
 
     def __init__(self, *, maximum_bytes: int = DEFAULT_STDERR_BUFFER_MAX_BYTES) -> None:
@@ -235,8 +255,20 @@ class BoundedStderrBuffer:
         return detail[-self._maximum_bytes :] or None
 
 
-def pump_stderr(stream: IO[bytes], buffer: BoundedStderrBuffer) -> threading.Thread:
-    """Continuously drain one process's stderr into a bounded buffer."""
+def pump_stderr(
+    stream: IO[bytes],
+    buffer: BoundedStderrBuffer,
+    *,
+    thread_name: str = "clio-relay-held-stderr",
+) -> threading.Thread:
+    """Continuously drain one process's stdout or stderr into a bounded buffer.
+
+    ``thread_name`` has a neutral default rather than one naming a specific
+    caller: this pump is shared by ``control_channel.SshForwardTransport``
+    (ssh, not frp) and :class:`HeldFrpVisitor` (frp, both its stdout and
+    stderr pumps) -- a hardcoded "frp"-branded name here would mislabel the
+    ssh_forward thread in any thread dump or deadlock trace.
+    """
 
     def _pump() -> None:
         try:
@@ -245,7 +277,7 @@ def pump_stderr(stream: IO[bytes], buffer: BoundedStderrBuffer) -> threading.Thr
         except (OSError, ValueError):
             pass
 
-    thread = threading.Thread(target=_pump, name="clio-relay-frp-stderr", daemon=True)
+    thread = threading.Thread(target=_pump, name=thread_name, daemon=True)
     thread.start()
     return thread
 
@@ -258,25 +290,33 @@ class _HealthPollable(Protocol):
         ...
 
 
+DEFAULT_HEALTH_WAIT_SUBJECT: Final = "owned session channel"
+
+
 def wait_for_channel_health(
     process: _HealthPollable,
     *,
     base_url: str,
     timeout_seconds: float,
+    subject: str = DEFAULT_HEALTH_WAIT_SUBJECT,
 ) -> None:
     """Wait for the mapped port to answer without opening any new transport.
 
     Mode-agnostic, promoted from ``control_channel.py``: the ``ssh_forward``
     control channel (``SshForwardTransport.establish``) and a held frp
     visitor (:class:`HeldFrpVisitor`, below) both use this identically to
-    verify their held link is ready.
+    verify their held link is ready. ``subject`` names what's being waited
+    on in the raised messages -- the default reproduces
+    ``SshForwardTransport``'s exact pre-promotion text byte-for-byte, so its
+    callers need not pass anything; a held frp visitor passes its own label
+    (e.g. ``"frp stcp visitor"``).
     """
     deadline = time.monotonic() + timeout_seconds
     last_error = "channel forward did not become ready"
     with httpx.Client(trust_env=False) as client:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RelayError(f"owned session channel exited during bring-up: {last_error}")
+                raise RelayError(f"{subject} exited during bring-up: {last_error}")
             try:
                 response = client.get(base_url + "/healthz", timeout=min(0.5, timeout_seconds))
                 if response.status_code == 200 and response.json().get("ok") is True:
@@ -285,7 +325,7 @@ def wait_for_channel_health(
             except (httpx.HTTPError, TypeError, ValueError) as exc:
                 last_error = str(exc)
             time.sleep(0.05)
-    raise RelayError(f"owned session channel did not become ready: {last_error}")
+    raise RelayError(f"{subject} did not become ready: {last_error}")
 
 
 class FrpProcess(Protocol):
@@ -332,12 +372,16 @@ class HeldFrpVisitor:
     ``udp_rendezvous`` :class:`~clio_relay.control_channel.RelayTransport`
     implementations on, and what ``transport_probe.py``'s local-visitor probe
     logic delegates to today. Lifecycle discipline mirrors
-    ``SshForwardTransport`` (``control_channel.py``): a continuously drained,
-    bounded stderr buffer so the process never blocks writing diagnostics;
-    ``poll()``-based liveness, never a blocking wait; ``close()`` escalating
-    terminate -> kill with timeouts; a 0600 rendered config file in its own
-    temporary directory, removed on ``close()``; and a bounded stderr excerpt
-    as the only failure detail exposed -- never a raw dump.
+    ``SshForwardTransport`` (``control_channel.py``): ``poll()``-based
+    liveness, never a blocking wait; ``close()`` escalating terminate -> kill
+    with timeouts; a config file written 0600 (POSIX -- Windows has no
+    mode-bit equivalent) in its own temporary directory, removed on
+    ``close()``. Extended by one thing ``SshForwardTransport`` doesn't need:
+    ``frpc`` logs to stdout by default, so BOTH stdout and stderr are
+    continuously drained into their own bounded buffers -- an unread pipe of
+    either stream fills and wedges the child, invisibly, since
+    :meth:`is_alive` stays true and nothing ever raises. Both bounded
+    excerpts, not a raw dump, are the only failure detail exposed.
     """
 
     def __init__(
@@ -359,10 +403,13 @@ class HeldFrpVisitor:
         self._keep_tunnel_open = keep_tunnel_open
         self._process_factory = process_factory or spawn_frp_process
         self._process: FrpProcess | None = None
+        self._stdout_buffer: BoundedStderrBuffer | None = None
+        self._stdout_thread: threading.Thread | None = None
         self._stderr_buffer: BoundedStderrBuffer | None = None
         self._stderr_thread: threading.Thread | None = None
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._config_path: Path | None = None
+        self._config_cleanup_error: str | None = None
         self._established = False
 
     @property
@@ -389,7 +436,19 @@ class HeldFrpVisitor:
                 keep_tunnel_open=self._keep_tunnel_open,
             )
             config_path.write_text(rendered, encoding="utf-8")
+            # POSIX only: chmod is a no-op on Windows, which has no mode-bit
+            # equivalent and instead relies on the per-user %TEMP% ACL to
+            # keep this plaintext-secret-bearing file private.
             config_path.chmod(0o600)
+            # Deliberately NOT isolated into its own process group
+            # (contrast service_runtime.py's isolate_process_group=True for
+            # its long-lived, independently-signalable connector): this
+            # visitor's lifetime is scoped to its holder -- a transport_probe
+            # call or a future held R5 connection -- and should die with
+            # that parent rather than survive it as an orphan if cleanup
+            # code never runs (crash, Ctrl+C). No CREATE_NEW_PROCESS_GROUP /
+            # start_new_session, matching SshForwardTransport's own
+            # unisolated spawn.
             process = self._process_factory(
                 [self._frpc_bin, "-c", str(config_path)],
                 stdout=subprocess.PIPE,
@@ -403,20 +462,48 @@ class HeldFrpVisitor:
         self._config_path = config_path
         self._process = process
         self._established = True
+        # Both streams, not just stderr: frpc logs connection/login
+        # diagnostics to stdout by default (F1/F2 of the R4 opus review --
+        # an unread stdout pipe wedges the child, silently, once its OS pipe
+        # buffer fills, well before is_alive()/failure_detail() would ever
+        # notice anything wrong).
+        if process.stdout is not None:
+            self._stdout_buffer = BoundedStderrBuffer()
+            self._stdout_thread = pump_stderr(
+                process.stdout,
+                self._stdout_buffer,
+                thread_name="clio-relay-frp-stdout",
+            )
         if process.stderr is not None:
             self._stderr_buffer = BoundedStderrBuffer()
-            self._stderr_thread = pump_stderr(process.stderr, self._stderr_buffer)
+            self._stderr_thread = pump_stderr(
+                process.stderr,
+                self._stderr_buffer,
+                thread_name="clio-relay-frp-stderr",
+            )
 
     def wait_healthy(
         self,
         *,
         timeout_seconds: float = DEFAULT_FRP_VISITOR_HEALTH_TIMEOUT_SECONDS,
+        subject: str | None = None,
     ) -> None:
-        """Wait for this visitor's mapped port to answer, using the shared health-wait."""
+        """Wait for this visitor's mapped port to answer, using the shared health-wait.
+
+        ``subject`` defaults to a visitor-type-specific label (e.g. "frp
+        stcp visitor"); pass an explicit one (e.g. "frp stcp link") to name
+        the connection instead of the process holding it.
+        """
         process = self._process
         if process is None:
             raise RelayError("frp visitor has not been established")
-        wait_for_channel_health(process, base_url=self.base_url, timeout_seconds=timeout_seconds)
+        label = subject if subject is not None else f"frp {self._visitor_type} visitor"
+        wait_for_channel_health(
+            process,
+            base_url=self.base_url,
+            timeout_seconds=timeout_seconds,
+            subject=label,
+        )
 
     def is_alive(self) -> bool:
         """Return whether the held frpc visitor process is still running."""
@@ -424,20 +511,39 @@ class HeldFrpVisitor:
         return process is not None and process.poll() is None
 
     def failure_detail(self) -> str | None:
-        """Return bounded stderr captured from the visitor -- never a raw dump.
+        """Return bounded stdout+stderr captured from the visitor -- never a raw dump.
 
-        Joins the stderr-pump thread with a short bound first: once the
-        process is confirmed dead its remaining stderr is finite and the pump
-        drains it almost immediately, so this is safe without risking a hang
-        on a still-live process (the join simply times out).
+        Joins both pump threads with a short bound first: once the process
+        is confirmed dead its remaining output is finite and the pumps drain
+        it almost immediately, so this is safe without risking a hang on a
+        still-live process (each join simply times out). Each stream is
+        labeled so a caller doesn't have to guess which one carried the
+        diagnostic -- frpc's own login/connection failures are typically on
+        stdout, not stderr.
         """
-        thread = self._stderr_thread
-        if thread is not None:
-            thread.join(timeout=2.0)
-        buffer = self._stderr_buffer
-        if buffer is None:
-            return None
-        return buffer.text()
+        for thread in (self._stdout_thread, self._stderr_thread):
+            if thread is not None:
+                thread.join(timeout=2.0)
+        parts: list[str] = []
+        stdout_text = self._stdout_buffer.text() if self._stdout_buffer is not None else None
+        if stdout_text:
+            parts.append(f"stdout: {stdout_text}")
+        stderr_text = self._stderr_buffer.text() if self._stderr_buffer is not None else None
+        if stderr_text:
+            parts.append(f"stderr: {stderr_text}")
+        return "\n".join(parts) if parts else None
+
+    @property
+    def config_cleanup_error(self) -> str | None:
+        """Return why the rendered (secret-bearing) config could not be removed.
+
+        None once :meth:`close` has run and either cleanup wasn't needed or
+        it succeeded. Set only when :meth:`close` caught an ``OSError``
+        removing the config directory -- callers (``_finish_frp_probe_cleanup``
+        in particular) must surface this as a residual resource rather than
+        treat a closed visitor as fully torn down.
+        """
+        return self._config_cleanup_error
 
     def close(self) -> None:
         """Stop the visitor process (terminate -> kill escalation) and its config.
@@ -451,6 +557,12 @@ class HeldFrpVisitor:
         process = self._process
         if process is not None:
             if process.poll() is None:
+                # On Windows, Popen.terminate() calls TerminateProcess -- an
+                # unconditional, immediate kill with no graceful-shutdown
+                # signal. There is no SIGTERM there, so terminate() and
+                # kill() are the same operation on Windows and this
+                # escalation is a real two-step only on POSIX (SIGTERM, then
+                # SIGKILL).
                 process.terminate()
                 try:
                     process.wait(timeout=5)
@@ -464,7 +576,19 @@ class HeldFrpVisitor:
                         stream.close()
         temp_dir = self._temp_dir
         self._temp_dir = None
-        self._config_path = None
         if temp_dir is not None:
-            with suppress(OSError):
+            try:
                 temp_dir.cleanup()
+            except OSError as exc:
+                # Never suppressed: the rendered config carries a plaintext
+                # frp token/STCP secret, so a failed cleanup leaves a secret
+                # readable on disk. self._config_path is deliberately left
+                # set (not nulled below) so the caller can report exactly
+                # which file is residual.
+                self._config_cleanup_error = (
+                    f"failed to remove the visitor config directory "
+                    f"({self._config_path}), which still holds a plaintext "
+                    f"token/secret: {exc}"
+                )
+                return
+        self._config_path = None

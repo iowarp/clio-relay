@@ -523,11 +523,14 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
         allow_stcp_fallback=True,
     )
 
+    # #231 R4 opus review F2: the visitor-failure message is now always
+    # "<label>: <detail>" (a prefix, never a bare replacement of the label)
+    # so a reader always sees WHICH process failed, not just its raw output.
     assert lines[:4] == [
         "direct_transport.cluster=test-cluster",
         "direct_transport.mode=xtcp",
         "direct_transport.result=frp_stcp",
-        "direct_transport.xtcp_error=xtcp hole punching failed",
+        "direct_transport.xtcp_error=local frpc visitor failed: stderr: xtcp hole punching failed",
     ]
     assert "transport.healthz=ok" in lines
     assert any(

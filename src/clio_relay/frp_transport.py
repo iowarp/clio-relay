@@ -208,7 +208,13 @@ class _FrpChannelTransport:
         visitor.establish()
         if not visitor.is_alive():
             raise RelayError(visitor.failure_detail() or f"{self._mode} visitor exited immediately")
-        visitor.wait_healthy(timeout_seconds=self._ready_timeout_seconds)
+        # Names the CONNECTION, not the process holding it (contrast
+        # HeldFrpVisitor.wait_healthy's own "frp {type} visitor" default) --
+        # #231 R4 opus review F4.
+        visitor.wait_healthy(
+            timeout_seconds=self._ready_timeout_seconds,
+            subject=f"frp {self._visitor_type} link",
+        )
 
     def _translate_tunnel_failure(self, exc: BaseException) -> BaseException:
         """Return the exception to raise for a failed tunnel establish.

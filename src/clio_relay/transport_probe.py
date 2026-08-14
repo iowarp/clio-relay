@@ -956,35 +956,39 @@ def _run_frp_http_probe_with_proxy_type(
     )
     remote.stdin.close()
 
-    # The local-visitor half (write the 0600 config, spawn `frpc -c <toml>`,
-    # track/terminate it) delegates to the shared substrate (#231 R4) rather
-    # than reimplementing it here -- the remote-side script above is the only
-    # part of this probe that stays local to transport_probe.py.
-    visitor = HeldFrpVisitor(
-        frpc_bin=frpc_bin,
-        config=FrpLinkConfig(
-            server_addr=server_addr,
-            server_port=transport.server_port,
-            protocol=protocol,
-            token=token,
-            secret_key=secret_key,
-            proxy_name=proxy_name,
-        ),
-        local_bind_port=local_bind_port,
-        visitor_type=cast(FrpVisitorType, proxy_type),
-        keep_tunnel_open=proxy_type == "xtcp",
-        process_factory=process_factory,
-    )
-    visitor.establish()
-
     lines: list[str] = []
     primary_error: BaseException | None = None
+    visitor: HeldFrpVisitor | None = None
     try:
+        # The local-visitor half (write the 0600 config, spawn `frpc -c <toml>`,
+        # track/terminate it) delegates to the shared substrate (#231 R4) rather
+        # than reimplementing it here -- the remote-side script above is the only
+        # part of this probe that stays local to transport_probe.py. establish()
+        # is inside this try (not before it) so a spawn failure still reaches
+        # _finish_frp_probe_cleanup below instead of leaking the remote process
+        # (#231 R4 opus review F9).
+        visitor = HeldFrpVisitor(
+            frpc_bin=frpc_bin,
+            config=FrpLinkConfig(
+                server_addr=server_addr,
+                server_port=transport.server_port,
+                protocol=protocol,
+                token=token,
+                secret_key=secret_key,
+                proxy_name=proxy_name,
+            ),
+            local_bind_port=local_bind_port,
+            visitor_type=cast(FrpVisitorType, proxy_type),
+            keep_tunnel_open=proxy_type == "xtcp",
+            process_factory=process_factory,
+        )
+        visitor.establish()
+
         time.sleep(1)
         if remote.poll() is not None:
             raise RelayError(_process_output_message(remote, "remote transport probe failed"))
         if not visitor.is_alive():
-            raise RelayError(visitor.failure_detail() or "local frpc visitor failed")
+            raise RelayError(_visitor_failure_message(visitor, "local frpc visitor failed"))
         try:
             _wait_for_healthz(
                 f"{visitor.base_url}/healthz",
@@ -996,11 +1000,11 @@ def _run_frp_http_probe_with_proxy_type(
             details = [
                 str(exc),
                 _process_output_message(remote, "remote transport probe still running"),
-                visitor.failure_detail() or "local frpc visitor still running",
+                _visitor_failure_message(visitor, "local frpc visitor still running"),
             ]
             raise RelayError("\n".join(details)) from exc
         if not visitor.is_alive():
-            raise RelayError(visitor.failure_detail() or "local frpc visitor failed")
+            raise RelayError(_visitor_failure_message(visitor, "local frpc visitor failed"))
         lines = [
             f"transport.cluster={cluster}",
             f"transport.server={server_addr}:{transport.server_port}",
@@ -1029,24 +1033,33 @@ def _finish_frp_probe_cleanup(
     cluster: str,
     definition: ClusterDefinition,
     probe_id: str,
-    visitor: HeldFrpVisitor,
+    visitor: HeldFrpVisitor | None,
     remote: ManagedProcess,
     primary_error: BaseException | None,
 ) -> list[str]:
     """Verify local and remote probe teardown before reporting cleanup success."""
     cleanup_errors: list[str] = []
     cleanup_lines: list[str] = []
-    local_stopped = False
+    local_stopped = True
     local_detail: str | None = None
-    try:
-        visitor.close()
-        local_stopped = not visitor.is_alive()
-        if not local_stopped:
-            local_detail = "local frpc visitor remains running"
+    config_cleanup_error: str | None = None
+    if visitor is not None:
+        local_stopped = False
+        try:
+            visitor.close()
+            local_stopped = not visitor.is_alive()
+            if not local_stopped:
+                local_detail = "local frpc visitor remains running"
+                cleanup_errors.append(local_detail)
+            config_cleanup_error = visitor.config_cleanup_error
+            if config_cleanup_error is not None:
+                # Never folded into local_detail: this is a distinct resource
+                # (a leaked plaintext-secret file, not the process) and gets
+                # its own ledger entry below (#231 R4 opus review F3).
+                cleanup_errors.append(config_cleanup_error)
+        except BaseException as exc:
+            local_detail = f"local frpc cleanup failed: {type(exc).__name__}: {exc}"
             cleanup_errors.append(local_detail)
-    except BaseException as exc:
-        local_detail = f"local frpc cleanup failed: {type(exc).__name__}: {exc}"
-        cleanup_errors.append(local_detail)
     try:
         cleanup_lines.extend(
             _cleanup_remote_probe(
@@ -1070,37 +1083,56 @@ def _finish_frp_probe_cleanup(
     except BaseException as exc:
         remote_control_detail = f"remote SSH cleanup failed: {type(exc).__name__}: {exc}"
         cleanup_errors.append(remote_control_detail)
+    resources = [
+        _process_cleanup_resource(
+            kind="connector",
+            resource_id=f"frpc-visitor:{probe_id}",
+            role="desktop_frpc_visitor",
+            location="desktop",
+            ownership_verified=True,
+            outcome="stopped" if local_stopped else "failed",
+            verified_after_operation=local_stopped,
+            observed_state="stopped" if local_stopped else "running_or_unknown",
+            residual=not local_stopped,
+            detail=local_detail,
+        ),
+        _process_cleanup_resource(
+            kind="connector",
+            resource_id=f"ssh-probe-control:{probe_id}",
+            role="desktop_ssh_probe_control",
+            location="desktop",
+            ownership_verified=True,
+            outcome="stopped" if remote_control_stopped else "failed",
+            verified_after_operation=remote_control_stopped,
+            observed_state=("stopped" if remote_control_stopped else "running_or_unknown"),
+            residual=not remote_control_stopped,
+            detail=remote_control_detail,
+        ),
+    ]
+    if config_cleanup_error is not None:
+        # A residual, secret-bearing config file is a distinct resource from
+        # the process above: the process can be confirmed stopped while its
+        # config directory still failed to delete (#231 R4 opus review F3).
+        resources.append(
+            _process_cleanup_resource(
+                kind="secret_config_file",
+                resource_id=f"frpc-visitor-config:{probe_id}",
+                role="desktop_frpc_visitor_config",
+                location="desktop",
+                ownership_verified=True,
+                outcome="residual",
+                verified_after_operation=False,
+                observed_state="residual",
+                residual=True,
+                detail=config_cleanup_error,
+            )
+        )
     cleanup_lines.append(
         _transport_resource_line(
             probe_id=probe_id,
             cluster=cluster,
             cleanup_mode="transport_probe_teardown",
-            resources=[
-                _process_cleanup_resource(
-                    kind="connector",
-                    resource_id=f"frpc-visitor:{probe_id}",
-                    role="desktop_frpc_visitor",
-                    location="desktop",
-                    ownership_verified=True,
-                    outcome="stopped" if local_stopped else "failed",
-                    verified_after_operation=local_stopped,
-                    observed_state="stopped" if local_stopped else "running_or_unknown",
-                    residual=not local_stopped,
-                    detail=local_detail,
-                ),
-                _process_cleanup_resource(
-                    kind="connector",
-                    resource_id=f"ssh-probe-control:{probe_id}",
-                    role="desktop_ssh_probe_control",
-                    location="desktop",
-                    ownership_verified=True,
-                    outcome="stopped" if remote_control_stopped else "failed",
-                    verified_after_operation=remote_control_stopped,
-                    observed_state=("stopped" if remote_control_stopped else "running_or_unknown"),
-                    residual=not remote_control_stopped,
-                    detail=remote_control_detail,
-                ),
-            ],
+            resources=resources,
         )
     )
     if cleanup_errors:
@@ -1709,6 +1741,20 @@ def _terminate(process: ManagedProcess) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _visitor_failure_message(visitor: HeldFrpVisitor, label: str) -> str:
+    """Return ``label``, plus the visitor's bounded stdout/stderr as detail.
+
+    ``label`` is always a PREFIX, never a replacement (#231 R4 opus review
+    F2): the pre-R4 code read both of the visitor's streams via
+    ``_process_output_message`` and included them alongside a fixed label
+    like "local frpc visitor failed"; delegating to
+    ``HeldFrpVisitor.failure_detail()`` must not regress that to a bare label
+    with no diagnostic content.
+    """
+    detail = visitor.failure_detail()
+    return f"{label}: {detail}" if detail else label
 
 
 def _process_output_message(process: ManagedProcess, fallback: str) -> str:
