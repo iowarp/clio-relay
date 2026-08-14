@@ -1972,6 +1972,7 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         cluster: str | None = None,
         dev_mode: bool | None = None,
         findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
     ) -> str:
         observed.append(
             {"fn": "server", "receipt_path": receipt_path, "cluster": cluster, "dev_mode": dev_mode}
@@ -1983,6 +1984,7 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         receipt_path: Path | None = None,
         cluster: str | None = None,
         dev_mode: bool | None = None,
+        registered_command: list[str] | None = None,
     ) -> list[str]:
         observed.append(
             {
@@ -2057,6 +2059,7 @@ def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict
         cluster: str | None = None,
         dev_mode: bool | None = None,
         findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
     ) -> str:
         raise ValueError("receipt-bound clio-kit runtime identity did not verify")
 
