@@ -2040,12 +2040,11 @@ def resolve_registered_remote_mcp_admission(
         if not dev_mode_enabled():
             raise ValueError("MCP discovery did not verify an immutable server artifact")
     else:
-        observed_server_digest = remote_mcp_server_artifact_digest(
-            entry.provenance.server_artifact
-        )
-        if not hmac.compare_digest(
-            observed_server_digest, expected_server_artifact_digest
-        ) and not dev_mode_enabled():
+        observed_server_digest = remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+        if (
+            not hmac.compare_digest(observed_server_digest, expected_server_artifact_digest)
+            and not dev_mode_enabled()
+        ):
             raise ValueError("MCP server artifact does not match the discovered route binding")
     return (
         McpAdmissionClass.CONTROL_QUERY,

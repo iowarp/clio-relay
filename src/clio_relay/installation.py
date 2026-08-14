@@ -355,8 +355,7 @@ def verify_distribution_file_source(
     if not isinstance(loaded, dict):
         raise ConfigurationError("distribution direct_url.json must contain an object")
     payload = cast(dict[str, object], loaded)
-    source_url = payload.get("url")
-    if not isinstance(source_url, str) or not source_url:
+    if not isinstance(source_url := payload.get("url"), str) or not source_url:
         raise ConfigurationError("distribution direct_url.json does not name a source URL")
     try:
         parsed = urlsplit(source_url)
@@ -2187,9 +2186,10 @@ def _require_native_execution_query_contract(tool: dict[str, object]) -> None:
     }:
         raise ConfigurationError("clio-kit native JARVIS artifact filter surface did not match")
     raw_content_max_bytes = artifact_properties.get("content_max_bytes")
-    if not isinstance(raw_content_max_bytes, dict) or cast(
-        dict[str, object], raw_content_max_bytes
-    ).get("default") is not None:
+    if (
+        not isinstance(raw_content_max_bytes, dict)
+        or cast(dict[str, object], raw_content_max_bytes).get("default") is not None
+    ):
         raise ConfigurationError(
             "clio-kit native JARVIS artifact content_max_bytes selector did not match"
         )
