@@ -69,14 +69,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # its own payload_too_large reason instead of blanket configuration_error.
     # A justified, minimal ratchet-up both times.
     "src/clio_relay/browser_gateway.py": 885,
-    "src/clio_relay/ci_validation.py": 3775,
+    # #231 R7: +13 net lines -- compute_release_acceptance_matrix_sha256 is
+    # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
+    # call so release_pins.py's bump command can reuse the exact same digest
+    # computation (doc's §7 "derived-digest-with-ordering" rule: never
+    # recompute the hash independently). Single owner, ground rule 1 -- a
+    # justified, minimal ratchet-up.
+    "src/clio_relay/ci_validation.py": 3787,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
     # `_decode_artifact_envelope` (four callers) reports a refusal's own
     # message/code instead of the generic "must use base64 encoding". A
     # justified, minimal ratchet-up.
-    "src/clio_relay/cli.py": 19333,
+    # #231 R7: +20 net lines -- `release preflight`, one thin command
+    # registration delegating entirely to `release_pins.run_preflight`/
+    # `render_preflight` (ground rule 2: cli.py parses and renders only). A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/cli.py": 19353,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

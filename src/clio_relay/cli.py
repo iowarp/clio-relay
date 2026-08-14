@@ -211,6 +211,7 @@ from clio_relay.relay_ops import (
 from clio_relay.relay_ops import (
     job_status as get_job_status,
 )
+from clio_relay.release_pins import render_preflight, run_preflight
 from clio_relay.release_validation import (
     LocalReleaseValidationOptions,
     run_local_release_validation,
@@ -1078,6 +1079,25 @@ def release_gate(
         if output is not None:
             write_release_gate_result(result, output)
         typer.echo(result.model_dump_json(indent=2))
+        if not result.passed:
+            raise typer.Exit(code=1)
+
+    _run_or_exit(_run)
+
+
+@release_app.command("preflight")
+def release_preflight(
+    project_root: Annotated[
+        Path,
+        typer.Option(help="Clean source checkout to check."),
+    ] = Path("."),
+) -> None:
+    """Verify every release-identity pin agrees (clio-relay#198's fast local check)."""
+
+    def _run() -> None:
+        result = run_preflight(project_root)
+        for line in render_preflight(result):
+            typer.echo(line)
         if not result.passed:
             raise typer.Exit(code=1)
 

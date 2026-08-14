@@ -358,16 +358,16 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         if resource["kind"] == "relay_worker"
     )
     clio_kit_component = worker["metadata_equals"]["component_artifacts"]["clio-kit"]
-    assert clio_kit_component["distribution_version"] == "2.6.6"
+    assert clio_kit_component["distribution_version"] == "2.7.2"
     assert clio_kit_component["persistent_tool"]["manager"] == "uv"
     assert clio_kit_component["persistent_tool"]["uv_version"] == "0.11.28"
     assert clio_kit_component["persistent_tool"]["source_artifact_sha256"] == (
-        "fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91"
+        "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
     )
     native_execution = clio_kit_component["native_execution"]
-    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.6"
+    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.7"
     assert native_execution["contract_sha256"] == (
-        "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
+        "d34761523f39e75b144a0567eb368c3cb51c199ea40da0010aaf572afdd2cec4"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.8.0"
@@ -583,7 +583,7 @@ def test_spack_release_requirements_split_existing_resolution_from_fresh_install
     )
     assert fresh_server["metadata_equals"]["server_name"] == "spack-fresh"
     assert fresh_server["metadata_equals"]["install_artifact_sha256"] == (
-        "fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91"
+        "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
     )
     assert fresh_server["metadata_equals"]["contract_id"] == "clio-kit-spack-user-v2.1"
     assert fresh_server["metadata_equals"]["contract_sha256"] == (

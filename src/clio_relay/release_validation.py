@@ -183,6 +183,15 @@ def run_local_release_validation(
         )
         _run_check(
             recorder,
+            "local.release-identity",
+            "release-identity pin registry: every value_group agrees and no "
+            "unregistered site pins the same family (clio-relay#198)",
+            ["uv", "run", "--no-sync", "python", "scripts/check_release_identity.py"],
+            root=root,
+            runner=command_runner,
+        )
+        _run_check(
+            recorder,
             "local.pytest",
             (
                 "native-platform pytest partition with no failed, skipped, xfailed, "

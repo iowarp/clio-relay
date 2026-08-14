@@ -232,6 +232,7 @@ def test_local_release_validation_runs_all_checks_and_records_artifacts(
         "local.pyright",
         "local.file-size-ratchet",
         "local.no-class-in-function",
+        "local.release-identity",
         "local.pytest",
         "local.containment-hard-crash",
         "local.sidecar-reclamation",
