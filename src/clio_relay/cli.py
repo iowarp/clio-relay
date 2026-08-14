@@ -50,6 +50,7 @@ from clio_relay.bootstrap_reconcile import (
     proven_active_generation_mismatch,
     write_bootstrap_receipt,
 )
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -8153,6 +8154,12 @@ def job_read_artifact(
         return
     result = read_artifact_bytes(ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id)
     typer.echo(json.dumps(result, indent=2))
+    if is_delivery_refusal(result):
+        # F6 (#231 R6 review): a T2 refusal (doc §6.4) is not a successful
+        # read -- exit 1 so scripts piping this command's exit code (not
+        # just grepping its stdout) still observe the failure, instead of
+        # a silent 0 alongside a body that says result_available: false.
+        raise typer.Exit(code=1)
 
 
 @job_app.command("list-artifacts")
@@ -15654,6 +15661,17 @@ def _read_local_mcp_result_artifact(
 
 
 def _decode_artifact_envelope(envelope: dict[str, object]) -> bytes:
+    if is_delivery_refusal(envelope):
+        # F5 (#231 R6 review): a T2 refusal (doc §6.4) is not a malformed
+        # envelope -- report the refusal's own message/code instead of the
+        # generic "must use base64 encoding" below, which misdescribes why
+        # the artifact is unavailable. Shared by every caller of this
+        # function (_read_remote_mcp_result_artifact,
+        # _read_remote_artifact_kind_bytes, _read_local_artifact_kind_bytes,
+        # _read_local_mcp_result_artifact) -- fixed once here for all four.
+        delivery = cast(dict[str, object], envelope.get("delivery", {}))
+        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
+        raise RelayError(f"artifact delivery refused ({delivery.get('code')}): {message}")
     if envelope.get("encoding") != "base64":
         raise RelayError("remote MCP result artifact must use base64 encoding")
     encoded = envelope.get("data")

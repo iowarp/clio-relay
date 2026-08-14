@@ -30,6 +30,7 @@ from clio_relay.live_acceptance import (
     _browser_json_observation,  # pyright: ignore[reportPrivateUsage]
     _browser_sse_observation,  # pyright: ignore[reportPrivateUsage]
     _BrowserHttpRequestError,  # pyright: ignore[reportPrivateUsage]
+    _decode_artifact_text,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
@@ -302,6 +303,43 @@ def test_transport_http_client_sends_exact_owned_session_binding(
             owner_session_id="desktop-session-1",
             timeout_seconds=5,
         )
+
+
+def test_decode_artifact_text_reports_a_delivery_refusal_by_its_own_message(
+    tmp_path: Path,
+) -> None:
+    """F5 (#231 R6 review): a T2 refusal (doc §6.4) is not a "not base64
+    encoded" envelope -- ``_decode_artifact_text`` must report the
+    refusal's own ``delivery.message``/``code`` instead of the generic,
+    misleading base64 complaint.
+    """
+    del tmp_path
+    payload = {
+        "artifact": {"artifact_id": "a"},
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": "clio-relay.mcp-result-delivery.v1",
+            "status": "failed",
+            "code": "artifact_content_too_large",
+            "max_inline_bytes": 16 * 1_048_576,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": False,
+            "message": "artifact content exceeds the 16777216-byte transfer limit",
+        },
+    }
+
+    with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
+        _decode_artifact_text(payload)
+
+
+def test_decode_artifact_text_still_rejects_a_genuinely_malformed_envelope() -> None:
+    """Sabotage twin: a payload that is merely missing base64 fields (not a
+    typed refusal) must still raise the original, distinct complaint --
+    the F5 fix must not swallow every non-base64 payload as a refusal.
+    """
+    with pytest.raises(RelayError, match="not base64 encoded"):
+        _decode_artifact_text({"encoding": "raw"})
 
 
 def test_live_acceptance_requires_configured_workload() -> None:

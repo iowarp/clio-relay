@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from base64 import b64decode
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -30,6 +30,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay import __version__
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
@@ -4596,6 +4597,8 @@ def _verify_completed_job(
         ["job", "read-artifact", str(stdout_artifact["artifact_id"])],
         runner=runner,
     )
+    if is_delivery_refusal(artifact_payload):
+        raise _delivery_refusal_error(artifact_payload, label="acceptance artifact payload")
     if artifact_payload.get("encoding") != "base64":
         raise RelayError("acceptance artifact payload was not base64 encoded")
     lines.append(f"{line_prefix}.artifact_read=ok")
@@ -4608,6 +4611,8 @@ def _verify_completed_job(
         ["job", "read-artifact", str(provenance_artifact["artifact_id"])],
         runner=runner,
     )
+    if is_delivery_refusal(provenance_payload):
+        raise _delivery_refusal_error(provenance_payload, label="acceptance provenance payload")
     if provenance_payload.get("encoding") != "base64":
         raise RelayError("acceptance provenance payload was not base64 encoded")
     lines.append(f"{line_prefix}.provenance=ok")
@@ -5192,7 +5197,22 @@ def _parse_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _delivery_refusal_error(payload: Mapping[str, Any], *, label: str) -> RelayError:
+    """Build the typed error for a T2 refusal (doc §6.4) an acceptance read hit.
+
+    F5 (#231 R6 review): a refusal is not a malformed/missing-encoding
+    envelope -- its own ``delivery.message``/``code`` is the accurate,
+    typed reason a caller should report, not a generic "not base64
+    encoded" that misdescribes why the artifact is unavailable.
+    """
+    delivery = cast(dict[str, object], payload.get("delivery", {}))
+    message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
+    return RelayError(f"{label} delivery refused ({delivery.get('code')}): {message}")
+
+
 def _decode_artifact_text(payload: dict[str, Any]) -> str:
+    if is_delivery_refusal(payload):
+        raise _delivery_refusal_error(payload, label="acceptance artifact payload")
     if payload.get("encoding") != "base64":
         raise RelayError("acceptance artifact payload was not base64 encoded")
     data = payload.get("data")

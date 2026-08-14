@@ -36,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clio_relay import door_errors
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -2497,13 +2498,41 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/artifacts/{artifact_id}/content", dependencies=[auth_dependency])
-    def get_artifact_content(artifact_id: DurableRecordId) -> dict[str, object]:
+    @app.get(
+        "/artifacts/{artifact_id}/content",
+        dependencies=[auth_dependency],
+        response_model=None,
+    )
+    def get_artifact_content(artifact_id: DurableRecordId) -> dict[str, object] | JSONResponse:
         try:
             require_owned_artifact(artifact_id)
-            return _public_payload(read_artifact_bytes(queue, artifact_id))
+            document = read_artifact_bytes(queue, artifact_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if is_delivery_refusal(document):
+            # F2 (#231 R6 review): an over-budget artifact read must not
+            # answer 200 with a body that merely SAYS result_available:
+            # false -- route it through door_errors' existing
+            # payload_too_large door (413, door_errors.py:336-341) instead
+            # of a silent success. The refusal document itself rides along
+            # as the envelope's extension data (F4: the contract's type/
+            # title/status/detail/schema_version/reason/retryable always
+            # win over a colliding key in it).
+            delivery = cast(dict[str, object], document.get("delivery", {}))
+            message = cast(
+                str,
+                delivery.get("message", "artifact content exceeds the transfer limit"),
+            )
+            fault = door_errors.classify(
+                RelayError(message),
+                reason="payload_too_large",
+                data=document,
+            )
+            problem = door_errors.as_http_problem(fault)
+            return JSONResponse(
+                problem, status_code=fault.http_status, media_type="application/problem+json"
+            )
+        return _public_payload(document)
 
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob, dependencies=[auth_dependency])
     def cancel_job(

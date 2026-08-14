@@ -77,6 +77,7 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
+from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES
 from clio_relay.remote_mcp import MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
 from clio_relay.scheduler_providers import SchedulerProvider
@@ -1204,6 +1205,115 @@ def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     assert page["limit"] == 100
     assert page["next_cursor"] is None
     assert page["total"] == 1
+
+
+def test_cli_read_artifact_prints_document_and_exits_zero_on_a_normal_read(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-read-artifact-ok",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "stdout.log"
+    artifact_path.write_text("hello\n", encoding="utf-8")
+    artifact = queue.append_artifact(
+        ArtifactRef(job_id=job.job_id, uri=artifact_path.as_uri(), kind="stdout")
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.output)
+    assert document["artifact"]["artifact_id"] == artifact.artifact_id
+
+
+def test_cli_read_artifact_over_budget_prints_the_refusal_and_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """F6 (#231 R6 review): ``clio job read-artifact`` used to exit 0 while
+    printing a T2 refusal document (doc §6.4) -- a script checking only the
+    exit code would treat an over-budget read as success. It must exit 1.
+    """
+    core_dir = tmp_path / "core"
+    queue = ClioCoreQueue(core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="cli-read-artifact-oversized",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    oversized_path = owned_root / "large.bin"
+    with oversized_path.open("wb") as stream:
+        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=oversized_path.as_uri(),
+            kind="stdout",
+            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
+
+    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
+
+    assert result.exit_code == 1, result.output
+    document = json.loads(result.output)
+    assert document["result_available"] is False
+    assert document["delivery"]["code"] == "artifact_content_too_large"
+
+
+def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message() -> None:
+    """F5 (#231 R6 review): ``_decode_artifact_envelope`` (shared by
+    ``_read_remote_mcp_result_artifact``, ``_read_remote_artifact_kind_bytes``,
+    ``_read_local_artifact_kind_bytes``, and ``_read_local_mcp_result_artifact``)
+    used to report a generic, misleading "must use base64 encoding" for a
+    T2 refusal (doc §6.4) -- fixed once here for all four callers.
+    """
+    envelope: dict[str, object] = {
+        "artifact": {"artifact_id": "a"},
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": "clio-relay.mcp-result-delivery.v1",
+            "status": "failed",
+            "code": "artifact_content_too_large",
+            "max_inline_bytes": 16 * 1_048_576,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": False,
+            "message": "artifact content exceeds the 16777216-byte transfer limit",
+        },
+    }
+
+    with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
+        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            envelope
+        )
+
+
+def test_decode_artifact_envelope_still_rejects_a_genuinely_malformed_envelope() -> None:
+    """Sabotage twin: a payload merely missing base64 fields (not a typed
+    refusal) must still raise the original, distinct complaint.
+    """
+    with pytest.raises(RelayError, match="must use base64 encoding"):
+        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            {"encoding": "raw"}
+        )
 
 
 def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

@@ -13,11 +13,13 @@ three independent tiers, each with its own budget shape --
 * **T2 -- agent-parsed payload.** Never truncated; overflow is a typed
   delivery-failure document instead. :func:`build_delivery_refusal` and
   :func:`is_delivery_refusal` generalize the precedent ``mcp_server.py``'s
-  ``_bounded_mcp_result`` already implements (``MAX_INLINE_MCP_RESULT_BYTES``/
-  ``MCP_RESULT_DELIVERY_SCHEMA``, ``mcp_server.py:174-175``, used
-  ``:3505-3528``) -- the same document schema, mirrored by value rather than
-  imported (importing ``mcp_server`` here would cycle back through
-  ``relay_ops.read_artifact_bytes``, one of this module's own T2 consumers).
+  ``_bounded_mcp_result`` originated (``MAX_INLINE_MCP_RESULT_BYTES`` stays
+  local there; its own former ``MCP_RESULT_DELIVERY_SCHEMA`` literal was
+  retired in the F7 review-fix migration -- ``_bounded_mcp_result`` now
+  imports and calls :func:`build_delivery_refusal` directly, since
+  ``mcp_server.py`` already imports ``relay_ops.read_artifact_bytes``, one
+  of this module's own T2 consumers, so the reverse import here would
+  cycle).
 * **T3 -- durable operator evidence.** Read bounds stay generous (doc's own
   correction: narrowing a read-time cap breaks chatty-server protocol
   parses); :func:`bound_stream_capture` is the record-time head+tail bound
@@ -45,12 +47,12 @@ Retention = Literal["head", "tail", "head_tail"]
 TRUNCATION_SCHEMA_VERSION: Final = "clio-relay.truncation.v1"
 
 #: T2 (doc §6.4) delivery-failure schema for a payload that would otherwise
-#: need mid-body truncation. Mirrors ``mcp_server.py``'s
-#: ``MCP_RESULT_DELIVERY_SCHEMA`` precedent (``mcp_server.py:174-175``, used
-#: ``:3505-3528``) by value, not by import -- ``mcp_server.py`` already
-#: imports ``relay_ops.read_artifact_bytes``, which becomes a consumer of
-#: this constant below, so importing ``mcp_server`` from here would cycle.
-#: Same schema tag, same document shape, no second vocabulary.
+#: need mid-body truncation. Originated as ``mcp_server.py``'s own
+#: ``MCP_RESULT_DELIVERY_SCHEMA`` precedent; that local literal is retired
+#: (F7, #231 R6 review) -- ``mcp_server.py``'s ``_bounded_mcp_result`` now
+#: imports this constant (via :func:`build_delivery_refusal`) instead of
+#: carrying an independent copy. Single owner, one schema tag, no second
+#: vocabulary.
 DELIVERY_FAILURE_SCHEMA_VERSION: Final = "clio-relay.mcp-result-delivery.v1"
 
 # T1 (doc §6.4): byte-bounded tail-retention budget for raw-payload paths
@@ -173,8 +175,24 @@ def bound_stream_capture(
         result uses ``errors="replace"`` at the cut boundary: the head/tail
         split happens on raw bytes, which is not guaranteed to land on a
         UTF-8 character boundary, and this is diagnostic evidence, not a
-        byte-exact round trip.
+        byte-exact round trip -- a character straddling the cut renders as
+        U+FFFD (the replacement character), never a decode crash or silent
+        corruption.
+
+    Raises:
+        ValueError: If ``head_max`` or ``tail_max`` is negative, or both are
+            ``0`` (#231 R6 review, F9) -- retaining nothing from either side
+            has no correct ``retention`` label to report (neither ``"head"``,
+            ``"tail"``, nor ``"head_tail"`` is honest), so this is refused as
+            a caller bug rather than silently mislabeled.
     """
+    if head_max < 0 or tail_max < 0:
+        raise ValueError("bound_stream_capture: head_max and tail_max must be non-negative")
+    if head_max == 0 and tail_max == 0:
+        raise ValueError(
+            "bound_stream_capture: head_max and tail_max cannot both be 0 -- "
+            "retaining nothing from either side has no correct retention label"
+        )
     is_text = isinstance(data, str)
     raw = data.encode("utf-8") if is_text else data
     original_bytes = len(raw)

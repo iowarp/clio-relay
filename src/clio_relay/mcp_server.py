@@ -22,7 +22,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from clio_relay import __version__
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import build_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -173,7 +173,6 @@ MCP_PROFILE_ENV = "CLIO_RELAY_MCP_PROFILE"
 MAX_INTERNAL_COLLECTION_RECORDS = 10_000
 MAX_AGENT_LOG_READ_BYTES = 32_768
 MAX_INLINE_MCP_RESULT_BYTES = 65_536
-MCP_RESULT_DELIVERY_SCHEMA = "clio-relay.mcp-result-delivery.v1"
 MCP_RESULT_INLINE_LIMIT_CODE = "inline_result_limit_exceeded"
 MCP_RESULT_INLINE_LIMIT_MESSAGE = (
     "The remote MCP operation reached a terminal state, but its result exceeded the safe "
@@ -3522,19 +3521,16 @@ def _bounded_mcp_result(
     # agent-readable result, while exposing selected fields could disclose
     # application-defined secrets. Keep the full artifact private and fail the
     # MCP delivery explicitly without changing the immutable remote job state.
-    failure: JSON = {
-        "content_truncated": True,
-        "result_available": False,
-        "delivery": {
-            "schema_version": MCP_RESULT_DELIVERY_SCHEMA,
-            "status": "failed",
-            "code": MCP_RESULT_INLINE_LIMIT_CODE,
-            "max_inline_bytes": MAX_INLINE_MCP_RESULT_BYTES,
-            "private_evidence_preserved": True,
-            "remote_side_effects_may_have_occurred": True,
-            "message": MCP_RESULT_INLINE_LIMIT_MESSAGE,
-        },
-    }
+    # F7 (#231 R6 review): built through bounded_payload.build_delivery_refusal
+    # -- the T2 precedent this function originated -- instead of its own
+    # inline dict literal, so every raw payload path shares one constructor
+    # (single owner, the slice's own rule).
+    failure: JSON = build_delivery_refusal(
+        code=MCP_RESULT_INLINE_LIMIT_CODE,
+        message=MCP_RESULT_INLINE_LIMIT_MESSAGE,
+        max_bytes=MAX_INLINE_MCP_RESULT_BYTES,
+        remote_side_effects_may_have_occurred=True,
+    )
     if sensitive_values_redacted:
         failure["sensitive_values_redacted"] = True
     return failure
@@ -3599,8 +3595,33 @@ def _jarvis_service_runtime_items(result: JSON) -> list[JSON] | None:
     return [cast(JSON, runtime) for runtime in typed_runtimes]
 
 
+def _delivery_refusal_failed(document: object) -> bool:
+    """Whether ``document`` is a T2 refusal (doc §6.4) with ``delivery.status == "failed"``.
+
+    F1 (#231 R6 review): discriminates on the refusal shape itself, not a
+    single named code -- a per-code match silently misses every OTHER
+    typed refusal (e.g. ``artifact_content_too_large``, doc §6.5).
+    """
+    if not isinstance(document, dict):
+        return False
+    typed_document = cast(dict[str, object], document)
+    if not is_delivery_refusal(typed_document):
+        return False
+    delivery = typed_document.get("delivery")
+    if not isinstance(delivery, dict):
+        return False
+    return cast(dict[str, object], delivery).get("status") == "failed"
+
+
 def _mcp_tool_result_failed(result: JSON) -> bool:
     """Keep failed terminal remote MCP operations failed at the agent tool boundary."""
+
+    if _delivery_refusal_failed(result):
+        # F5 (#231 R6 review): a tool's OWN result document can be a T2
+        # refusal directly (e.g. relay_read_artifact/_read_model_artifact_
+        # bytes reading a too-large artifact) -- not only nested under
+        # mcp_result below (relay_wait's job-status shape).
+        return True
 
     if (
         result.get("kind") == JobKind.MCP_CALL.value
@@ -3626,15 +3647,7 @@ def _mcp_tool_result_failed(result: JSON) -> bool:
         and cast(dict[str, object], protocol_result).get("isError") is True
     ):
         return True
-    delivery = typed_result.get("delivery")
-    if not isinstance(delivery, dict):
-        return False
-    typed_delivery = cast(dict[str, object], delivery)
-    return (
-        typed_delivery.get("schema_version") == MCP_RESULT_DELIVERY_SCHEMA
-        and typed_delivery.get("status") == "failed"
-        and typed_delivery.get("code") == MCP_RESULT_INLINE_LIMIT_CODE
-    )
+    return _delivery_refusal_failed(typed_result)
 
 
 def _read_model_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, object]:

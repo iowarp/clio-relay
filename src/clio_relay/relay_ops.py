@@ -252,6 +252,15 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     }
 
 
+#: Artifact kinds the cursor-based log endpoint (:func:`read_job_log`,
+#: keyed on ``Literal["stdout", "stderr"]``) actually serves. F10 (#231 R6
+#: review): the refusal below used to point every over-budget artifact at
+#: that endpoint regardless of kind -- correct for a log stream, actively
+#: wrong for e.g. an oversized ``mcp_result`` artifact, which the log
+#: endpoint has no path to serve at all.
+_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr"})
+
+
 def _artifact_content_too_large_refusal(artifact: JSON, artifact_id: str) -> JSON:
     """Build the T2 refusal :func:`read_artifact_bytes` returns over budget.
 
@@ -261,11 +270,17 @@ def _artifact_content_too_large_refusal(artifact: JSON, artifact_id: str) -> JSO
     file itself is untouched either way, so
     ``remote_side_effects_may_have_occurred`` is always ``False`` here.
     """
+    kind = artifact.get("kind")
+    remediation = (
+        "use the cursor-based log endpoint for job logs"
+        if kind in _CURSOR_LOG_SERVED_KINDS
+        else "the full content remains available only through durable operator evidence"
+    )
     refusal = build_delivery_refusal(
         code="artifact_content_too_large",
         message=(
             f"artifact content exceeds the {MAX_ARTIFACT_CONTENT_BYTES}-byte transfer limit: "
-            f"{artifact_id}; use the cursor-based log endpoint for job logs"
+            f"{artifact_id}; {remediation}"
         ),
         max_bytes=MAX_ARTIFACT_CONTENT_BYTES,
         remote_side_effects_may_have_occurred=False,

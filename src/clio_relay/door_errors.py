@@ -105,7 +105,12 @@ import mcp_types
 from mcp.shared.exceptions import MCPError
 
 from clio_relay.bounded_payload import (
-    TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,  # re-exported, see below
+    # Re-exported (not redefined, F12 #231 R6 review): bounded_payload.py is
+    # the single owner of the "clio-relay.truncation.v1" schema tag; R6
+    # moved this module's own record CONSTRUCTION there too (see
+    # _bounded_text below), closing the "second copy of the same schema"
+    # gap an earlier revision of this comment described.
+    TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,
 )
 from clio_relay.bounded_payload import build_truncation_record
 from clio_relay.errors import (
@@ -129,19 +134,19 @@ JSON = dict[str, Any]
 #: Schema tag stamped on every :func:`as_http_problem` document (doc §6.3).
 SCHEMA_VERSION: Final = "clio-relay.error.v1"
 
-#: Schema tag for the T1 refusal-text truncation record (doc §6.4).
-#: ``TRUNCATION_SCHEMA_VERSION`` re-exported here (not redefined) is
-#: ``bounded_payload.py``'s single owner of the ``clio-relay.truncation.v1``
-#: name -- R6 moved this module's own record CONSTRUCTION there too (see
-#: :func:`_bounded_text`), closing the "second copy of the same schema"
-#: gap this comment used to describe.
-
 # T1 (doc §6.4): refusal/detail text budget, hard-truncated. A fourth
 # independent literal agreeing with jarvis_dispatch_failure.py's
 # MAX_REFUSAL_MESSAGE_CHARS, control_channel.py's
 # MAX_CHANNEL_EVENT_DETAIL_CHARS, and remote_connection.py's inline
-# [:2_000] slice -- R6 is scoped to name one shared constant instead of the
-# four that now independently agree (§6.4).
+# [:2_000] slice -- six literals total counting this one, frp_link.py's
+# DEFAULT_STDERR_BUFFER_MAX_BYTES, and bounded_payload.T1_TEXT_MAX_BYTES
+# (recounted honestly by the R6 review, F12/F13; an earlier revision of
+# this comment undercounted at four). Unifying them into one shared
+# constant was floated as an aspiration when this comment was first
+# written, but it was never R6's actual delivered scope (the three RAW
+# PAYLOAD PATHS named in doc §6.4/§6.5, not these six already-agreeing
+# refusal-text literals) -- tracked as
+# https://github.com/iowarp/clio-relay/issues/236.
 MAX_MESSAGE_CHARS: Final = 2_000
 
 # Whole-envelope budget (doc §6.4 T1): as_http_problem drops "evidence" then

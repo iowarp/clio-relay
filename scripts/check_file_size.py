@@ -70,7 +70,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # A justified, minimal ratchet-up both times.
     "src/clio_relay/browser_gateway.py": 885,
     "src/clio_relay/ci_validation.py": 3775,
-    "src/clio_relay/cli.py": 19315,
+    # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
+    # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
+    # a body that says result_available: false; F5, the shared
+    # `_decode_artifact_envelope` (four callers) reports a refusal's own
+    # message/code instead of the generic "must use base64 encoding". A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/cli.py": 19333,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
@@ -79,7 +85,12 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/cluster_config.py": 1863,
     "src/clio_relay/core_queue.py": 16137,
     "src/clio_relay/deployment.py": 1243,
-    "src/clio_relay/endpoint.py": 8710,
+    # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
+    # run_result`'s `recovered_document` now nulls `stdout_truncation`/
+    # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
+    # of inheriting a stale populated record from the spread source
+    # document. A justified, minimal ratchet-up.
+    "src/clio_relay/endpoint.py": 8719,
     "src/clio_relay/fastmcp_server.py": 1212,
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
@@ -89,21 +100,45 @@ RATCHET_BASELINE: dict[str, int] = {
     # document so the handler survives door_errors itself failing, plus the
     # corrected build_middleware_stack docstring. A justified, minimal
     # ratchet-up rather than a same-file deletion this slice does not own.
-    "src/clio_relay/http_api.py": 3122,
+    # #231 R6 review fixes: +29 more -- F2, `GET /artifacts/{id}/content`
+    # routes an over-budget read through door_errors' existing
+    # payload_too_large door (413) instead of answering 200 with a body
+    # that merely says result_available: false. A justified, minimal
+    # ratchet-up.
+    "src/clio_relay/http_api.py": 3151,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
     "src/clio_relay/jarvis_mcp_validation.py": 2671,
-    "src/clio_relay/jarvis_service_runtime.py": 1158,
-    "src/clio_relay/live_acceptance.py": 5427,
+    # #231 R6 review fixes: +11 net lines -- F5, `_load_source` checks
+    # is_delivery_refusal on the source envelope FIRST and raises the
+    # refusal's own message/code, instead of the generic "is not a base64
+    # envelope" that misdescribes why the artifact is unavailable. A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/jarvis_service_runtime.py": 1169,
+    # #231 R6 review fixes: +20 net lines -- F5, both `_verify_completed_
+    # job`'s inline artifact/provenance checks and the new shared
+    # `_delivery_refusal_error` helper now recognize a T2 refusal by its
+    # own message/code before falling into the generic "not base64
+    # encoded" complaint. A justified, minimal ratchet-up.
+    "src/clio_relay/live_acceptance.py": 5447,
     # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
     # bounded_payload.is_delivery_refusal on the envelope
     # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
     # mcp_result artifact itself over MAX_ARTIFACT_CONTENT_BYTES) surfaces
     # as-is instead of falling into _decode_verified_mcp_result's generic
-    # malformed-envelope ValueError. A justified, minimal ratchet-up.
-    "src/clio_relay/mcp_server.py": 5930,
+    # malformed-envelope ValueError. R6 review fixes: +13 more (5930 ->
+    # 5943) -- F1, _mcp_tool_result_failed discriminates on the refusal
+    # shape (is_delivery_refusal + delivery.status) instead of one named
+    # code, via a new shared _delivery_refusal_failed helper; F5, the same
+    # helper is also checked against the tool's own top-level result (not
+    # only nested under mcp_result), covering relay_read_artifact reading a
+    # too-large artifact directly; F7, _bounded_mcp_result's inline failure
+    # dict migrated onto bounded_payload.build_delivery_refusal, retiring
+    # the local MCP_RESULT_DELIVERY_SCHEMA constant (single owner, the
+    # slice's own rule). Each pass justified, minimal.
+    "src/clio_relay/mcp_server.py": 5943,
     "src/clio_relay/mcp_stdio_validation.py": 1269,
     "src/clio_relay/models.py": 2296,
     "src/clio_relay/process_containment.py": 2678,
@@ -126,7 +161,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # (R12). Real behavioral fixes from a security-relevant review, not a
     # deletable regression.
     "src/clio_relay/remote_connection.py": 1058,
-    "src/clio_relay/remote_mcp.py": 5308,
+    # #231 R6 review fixes: +11 net lines -- F5,
+    # `_control_query_discovery_artifact_bytes` checks is_delivery_refusal
+    # on the envelope FIRST and raises the refusal's own message/code,
+    # instead of the generic "encoding is unsupported" that misdescribes
+    # why the artifact is unavailable. A justified, minimal ratchet-up.
+    "src/clio_relay/remote_mcp.py": 5319,
     "src/clio_relay/retention.py": 944,
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,

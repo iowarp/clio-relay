@@ -38,6 +38,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -2111,6 +2112,16 @@ def _control_query_discovery_artifact_bytes(
     from clio_relay.relay_ops import read_artifact_bytes
 
     envelope = read_artifact_bytes(queue, artifact_id)
+    if is_delivery_refusal(envelope):
+        # F5 (#231 R6 review): a T2 refusal (doc §6.4) is not an unsupported
+        # encoding -- report the refusal's own message/code rather than the
+        # generic "encoding is unsupported", which misdescribes why the
+        # artifact is unavailable.
+        delivery = cast(dict[str, object], envelope.get("delivery", {}))
+        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
+        raise ValueError(
+            f"MCP discovery artifact delivery refused ({delivery.get('code')}): {message}"
+        )
     if envelope.get("encoding") != "base64":
         raise ValueError("MCP discovery artifact encoding is unsupported")
     encoded = envelope.get("data")

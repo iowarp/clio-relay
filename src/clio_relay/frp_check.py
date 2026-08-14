@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Final
 
 from clio_relay.bounded_payload import T1_TEXT_MAX_BYTES, bound_stream_capture
 from clio_relay.errors import ConfigurationError
 from clio_relay.relay_host import FrpcConfig, render_frpc_config
+
+logger = logging.getLogger(__name__)
+
+# F8 (#231 R6 review): a T3-shaped read-time cap (doc §6.4), generous and
+# distinct from _bounded_failure_detail's much smaller T1 tail budget below.
+# subprocess.run() has no native output-byte limit of its own -- the capture
+# is bounded here, immediately once control returns, so nothing downstream
+# (splitlines(), the ConfigurationError detail) ever holds or returns an
+# unbounded string.
+FRPC_CHECK_READ_HEAD_MAX_BYTES: Final = 8 * 1024 * 1024
+FRPC_CHECK_READ_TAIL_MAX_BYTES: Final = 8 * 1024 * 1024
 
 
 def run_frpc_connection_check(
@@ -31,14 +44,26 @@ def run_frpc_connection_check(
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            output = _decode_timeout_output(exc.stdout)
+            output = _bounded_capture(_decode_timeout_output(exc.stdout))
             return ["frpc stayed connected until timeout", *output.splitlines()]
+        stdout = _bounded_capture(result.stdout)
         if result.returncode == 0:
-            return ["frpc exited cleanly", *result.stdout.splitlines()]
+            return ["frpc exited cleanly", *stdout.splitlines()]
         raise ConfigurationError(
             f"frpc exited before timeout with code {result.returncode}: "
-            + _bounded_failure_detail(result.stdout)
+            + _bounded_failure_detail(stdout)
         )
+
+
+def _bounded_capture(text: str) -> str:
+    """Bound one raw frpc capture to the T3 read-time budget (doc §6.4)."""
+    bounded, _truncation = bound_stream_capture(
+        text,
+        head_max=FRPC_CHECK_READ_HEAD_MAX_BYTES,
+        tail_max=FRPC_CHECK_READ_TAIL_MAX_BYTES,
+        stream_name="frpc output",
+    )
+    return bounded
 
 
 def _bounded_failure_detail(stdout: str) -> str:
@@ -51,12 +76,23 @@ def _bounded_failure_detail(stdout: str) -> str:
     message is almost always at the end -- with the in-band elision marker
     ``bound_stream_capture`` writes when it actually cuts something.
     """
-    bounded, _truncation = bound_stream_capture(
+    bounded, truncation = bound_stream_capture(
         stdout,
         head_max=0,
         tail_max=T1_TEXT_MAX_BYTES,
         stream_name="frpc output",
     )
+    if truncation is not None:
+        # F8 (#231 R6 review): the structured record was previously
+        # discarded outright -- ConfigurationError has no typed data
+        # channel of its own to carry it (unlike door_errors.classify()'s
+        # exception dispatch), so it is logged here instead of silently
+        # dropped. The raised exception's own message still carries the
+        # bounded text plus the in-band marker either way.
+        logger.warning(
+            "clio-relay: frpc connection-check failure detail was elided: %s",
+            truncation,
+        )
     return bounded
 
 

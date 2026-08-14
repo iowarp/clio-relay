@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from clio_relay.bounded_payload import (
     DELIVERY_FAILURE_SCHEMA_VERSION,
     STDERR_HEAD_MAX_BYTES,
@@ -180,6 +182,45 @@ def test_default_stream_budgets_match_the_doc() -> None:
     assert STDERR_TAIL_MAX_BYTES == 256 * 1024
 
 
+def test_sabotage_twin_the_degenerate_zero_zero_window_is_refused_not_mislabeled() -> None:
+    """F9 (#231 R6 review): ``head_max=0, tail_max=0`` has no correct
+    ``retention`` label -- the pre-fix implementation fell through to
+    ``"tail"`` even though NOTHING is retained from either side, a silent
+    mislabel rather than a caller-bug refusal.
+    """
+    with pytest.raises(ValueError, match="cannot both be 0"):
+        bound_stream_capture("some data", head_max=0, tail_max=0, stream_name="stdout")
+
+
+def test_bound_stream_capture_rejects_negative_budgets() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        bound_stream_capture("some data", head_max=-1, tail_max=10, stream_name="stdout")
+
+
+def test_a_character_straddling_the_cut_boundary_renders_as_u_fffd() -> None:
+    """F9 (#231 R6 review): the head/tail split happens on raw UTF-8 bytes,
+    which is not guaranteed to land on a character boundary. ``errors=
+    "replace"`` is the documented behavior at that boundary -- a split
+    multi-byte character renders as U+FFFD, never a decode crash or silent
+    byte corruption.
+    """
+    # '€' (EURO SIGN) is the 3-byte UTF-8 sequence E2 82 AC. Placing
+    # head_max at 1 byte past its start cuts it mid-character.
+    euro = "€"
+    data = ("A" * 5) + euro + ("B" * 5)
+    head_max = 5 + 1  # "AAAAA" (5 bytes) plus the euro sign's first byte only
+
+    retained, record = bound_stream_capture(
+        data, head_max=head_max, tail_max=5, stream_name="stdout"
+    )
+
+    assert record is not None
+    assert "�" in retained
+    assert euro not in retained
+    assert retained.startswith("AAAAA")
+    assert retained.endswith("BBBBB")
+
+
 # --------------------------------------------------------------------------- #
 # build_delivery_refusal / is_delivery_refusal (T2)
 # --------------------------------------------------------------------------- #
@@ -221,6 +262,17 @@ def test_build_delivery_refusal_private_evidence_preserved_defaults_true() -> No
         remote_side_effects_may_have_occurred=False,
     )
     assert document["delivery"]["private_evidence_preserved"] is True
+
+
+def test_delivery_failure_schema_version_is_pinned_to_the_mcp_server_precedent() -> None:
+    """F7 (#231 R6 review): ``mcp_server.py``'s ``_bounded_mcp_result`` (the
+    T2 precedent this module generalizes) migrated onto
+    ``build_delivery_refusal`` and no longer carries its own independent
+    ``MCP_RESULT_DELIVERY_SCHEMA`` literal to cross-check against -- this
+    locks the wire value itself so a future edit here cannot silently drift
+    the schema tag every already-shipped T2 consumer keys on.
+    """
+    assert DELIVERY_FAILURE_SCHEMA_VERSION == "clio-relay.mcp-result-delivery.v1"
 
 
 def test_sabotage_twin_is_delivery_refusal_rejects_a_lookalike_missing_the_schema_tag() -> None:

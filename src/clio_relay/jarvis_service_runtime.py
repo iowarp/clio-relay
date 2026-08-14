@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -912,6 +913,16 @@ def _load_source(
     job = RelayJob.model_validate(raw_job)
     if job.job_id != source_job_id:
         raise ValueError("JARVIS service source returned a different relay job")
+    if is_delivery_refusal(envelope):
+        # F5 (#231 R6 review): a T2 refusal (doc §6.4) is not a malformed
+        # envelope -- report the refusal's own message/code instead of the
+        # generic "is not a base64 envelope" the checks below would raise,
+        # which misdescribes WHY the artifact is unavailable.
+        delivery = cast(dict[str, object], envelope.get("delivery", {}))
+        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
+        raise ValueError(
+            f"JARVIS service source artifact delivery refused ({delivery.get('code')}): {message}"
+        )
     raw_artifact = envelope.get("artifact")
     artifact = ArtifactRef.model_validate(raw_artifact)
     if (

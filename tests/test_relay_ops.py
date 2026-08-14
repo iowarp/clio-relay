@@ -205,6 +205,47 @@ def test_artifact_read_over_the_inline_budget_refuses_with_the_delivery_document
     assert delivery["private_evidence_preserved"] is True
     assert delivery["remote_side_effects_may_have_occurred"] is False
     assert "transfer limit" in delivery["message"]
+    assert "cursor-based log endpoint" in delivery["message"]
+
+
+def test_oversized_non_log_artifact_refusal_does_not_recommend_the_log_endpoint(
+    tmp_path: Path,
+) -> None:
+    """F10 (#231 R6 review): the cursor-based log endpoint only serves
+    ``stdout``/``stderr`` streams (``relay_ops.read_job_log``) -- an
+    oversized ``mcp_result`` artifact (or any other non-log kind) must not
+    be told to use it, since that endpoint has no path to serve it at all.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.MCP_CALL,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="mcp-result-transfer-bound",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "mcp-result.json"
+    with artifact_path.open("wb") as stream:
+        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
+            metadata=_owned_artifact_metadata(owned_root),
+        )
+    )
+
+    document = read_artifact_bytes(queue, artifact.artifact_id)
+
+    delivery = document["delivery"]
+    assert isinstance(delivery, dict)
+    assert "transfer limit" in delivery["message"]
+    assert "cursor-based log endpoint" not in delivery["message"]
 
 
 def test_artifact_read_delivery_refusal_is_not_reported_for_an_ordinary_envelope(
