@@ -15,6 +15,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from clio_relay import mcp_server as mcp_server_module
+from clio_relay import relay_ops as relay_ops_module
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -3782,6 +3784,55 @@ def test_oversized_terminal_mcp_result_sets_tool_error_and_preserves_job_evidenc
     assert "Remote side effects may have occurred" in serialized
     assert secret not in serialized
     assert parsed.document["structured_result"] == {"application_payload": secret}
+
+
+def test_verified_local_mcp_result_surfaces_an_oversized_artifact_as_a_typed_refusal(
+    tmp_path: Path,
+) -> None:
+    """T2 (doc §6.4): when the durable ``mcp_result`` artifact itself exceeds
+    ``relay_ops.MAX_ARTIFACT_CONTENT_BYTES`` (16 MiB), ``read_artifact_bytes``
+    now returns a typed delivery-refusal document instead of raising (R6,
+    #231). ``_verified_local_mcp_result`` must surface that refusal as-is --
+    not fall into ``_decode_verified_mcp_result``, which expects a base64
+    envelope and would otherwise misreport this as a generic malformed-
+    artifact ``ValueError`` (an internal_error on the wire, losing the typed
+    signal entirely).
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(server="science-mcp", tool="inspect"),
+            idempotency_key="oversized-local-mcp-result",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "mcp-result.json"
+    with artifact_path.open("wb") as stream:
+        stream.truncate(relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+
+    verified = mcp_server_module._verified_local_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue, job.job_id
+    )
+
+    assert verified is not None
+    assert verified.document == verified.public
+    assert is_delivery_refusal(verified.document)
+    assert verified.document["artifact"]["artifact_id"] == artifact.artifact_id
+    delivery = verified.document["delivery"]
+    assert delivery["code"] == "artifact_content_too_large"
+    assert delivery["private_evidence_preserved"] is True
+    assert delivery["remote_side_effects_may_have_occurred"] is False
 
 
 def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(

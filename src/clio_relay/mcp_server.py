@@ -22,6 +22,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from clio_relay import __version__
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -3391,6 +3392,15 @@ def _verified_local_mcp_result(
     if not isinstance(artifact_id, str) or not artifact_id:
         raise ValueError("local MCP result artifact has no artifact_id")
     envelope = cast(JSON, read_artifact_bytes(queue, artifact_id))
+    if is_delivery_refusal(envelope):
+        # T2 (doc §6.4): the durable mcp_result artifact itself exceeded
+        # relay_ops.MAX_ARTIFACT_CONTENT_BYTES -- read_artifact_bytes already
+        # refused delivery with a typed document instead of raising. Surface
+        # that refusal as-is rather than let it fall into
+        # _decode_verified_mcp_result, which expects a base64 envelope and
+        # would otherwise misreport this as a generic malformed-artifact
+        # ValueError.
+        return _VerifiedMcpResult(document=envelope, public=envelope)
     return _decode_verified_mcp_result(
         envelope,
         artifact=artifact,

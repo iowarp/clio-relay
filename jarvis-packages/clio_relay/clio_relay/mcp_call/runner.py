@@ -31,6 +31,13 @@ from queue import Empty, Queue
 from typing import Any, cast
 from urllib.parse import unquote, urlsplit
 
+from clio_relay.bounded_payload import (
+    STDERR_HEAD_MAX_BYTES,
+    STDERR_TAIL_MAX_BYTES,
+    STDOUT_HEAD_MAX_BYTES,
+    STDOUT_TAIL_MAX_BYTES,
+    bound_stream_capture,
+)
 from clio_relay.process_containment import (
     CONTAINMENT_ENV,
     nested_popen_kwargs,
@@ -2277,6 +2284,25 @@ def _write_mcp_result(
         )
     if observed_server_artifact_digest is None:
         observed_server_artifact_digest = _server_artifact_digest(server_artifact)
+    # T3 (doc §6.4): bound the durable capture at RECORD time only, after every
+    # protocol/pagination/initialize parse above has already run against the
+    # full, unbounded stdout -- narrowing this earlier would corrupt a chatty
+    # server's JSON-RPC parse (the read-time caps, MCP_SESSION_MAX_STDOUT_BYTES/
+    # MCP_SESSION_MAX_STDERR_BYTES, stay generous and untouched). This is the
+    # head+tail record-time bound doc §6.4/§6.5 named as R6's actual, larger-
+    # than-a-lift scope: no such bound existed here before.
+    bounded_stdout, stdout_truncation = bound_stream_capture(
+        stdout,
+        head_max=STDOUT_HEAD_MAX_BYTES,
+        tail_max=STDOUT_TAIL_MAX_BYTES,
+        stream_name="stdout",
+    )
+    bounded_stderr, stderr_truncation = bound_stream_capture(
+        stderr,
+        head_max=STDERR_HEAD_MAX_BYTES,
+        tail_max=STDERR_TAIL_MAX_BYTES,
+        stream_name="stderr",
+    )
     result_document: dict[str, Any] = {
         "server": server,
         "server_args": server_args,
@@ -2295,8 +2321,10 @@ def _write_mcp_result(
         "observed_server_artifact_digest": observed_server_artifact_digest,
         "pagination": pagination,
         "returncode": returncode,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": bounded_stdout,
+        "stderr": bounded_stderr,
+        "stdout_truncation": stdout_truncation,
+        "stderr_truncation": stderr_truncation,
         "timed_out": timed_out,
         "protocol_error": protocol_error,
         "package_progress_bridge": progress_bridge,

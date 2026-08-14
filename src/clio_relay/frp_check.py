@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from clio_relay.bounded_payload import T1_TEXT_MAX_BYTES, bound_stream_capture
 from clio_relay.errors import ConfigurationError
 from clio_relay.relay_host import FrpcConfig, render_frpc_config
 
@@ -36,8 +37,27 @@ def run_frpc_connection_check(
             return ["frpc exited cleanly", *result.stdout.splitlines()]
         raise ConfigurationError(
             f"frpc exited before timeout with code {result.returncode}: "
-            + "\n".join(result.stdout.splitlines()[-12:])
+            + _bounded_failure_detail(result.stdout)
         )
+
+
+def _bounded_failure_detail(stdout: str) -> str:
+    """Bound frpc's captured output to the T1 tail budget (doc §6.4).
+
+    Was previously ``"\\n".join(result.stdout.splitlines()[-12:])`` -- a
+    line-count heuristic with no byte guarantee at all (a handful of very
+    long lines could still embed an unbounded detail). Tail retention (not
+    head) keeps frpc's most recent, most diagnostic output -- its failure
+    message is almost always at the end -- with the in-band elision marker
+    ``bound_stream_capture`` writes when it actually cuts something.
+    """
+    bounded, _truncation = bound_stream_capture(
+        stdout,
+        head_max=0,
+        tail_max=T1_TEXT_MAX_BYTES,
+        stream_name="frpc output",
+    )
+    return bounded
 
 
 def _decode_timeout_output(value: str | bytes | None) -> str:

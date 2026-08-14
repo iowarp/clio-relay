@@ -47,7 +47,14 @@ DEFAULT_MAX_LINES = 800
 # in the same change. Paths are relative to the repository root and use
 # forward slashes.
 RATCHET_BASELINE: dict[str, int] = {
-    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5758,
+    # #231 R6: +28 net lines -- the T3 record-time head+tail bound (doc §6.4)
+    # applied where _write_mcp_result builds the durable result document:
+    # a bounded_payload import, the bound_stream_capture call pair, and the
+    # two new stdout_truncation/stderr_truncation result fields. No deletion
+    # offsets it -- this is genuinely new structure the doc's own §6.4/§6.5
+    # ledger names as never having existed before R6, not a fixable
+    # regression. A justified, minimal ratchet-up.
+    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5786,
     "jarvis-packages/clio_relay/clio_relay/process_containment.py": 2678,
     "src/clio_relay/bootstrap.py": 8733,
     "src/clio_relay/bootstrap_journal.py": 1497,
@@ -90,7 +97,13 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/jarvis_mcp_validation.py": 2671,
     "src/clio_relay/jarvis_service_runtime.py": 1158,
     "src/clio_relay/live_acceptance.py": 5427,
-    "src/clio_relay/mcp_server.py": 5920,
+    # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
+    # bounded_payload.is_delivery_refusal on the envelope
+    # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
+    # mcp_result artifact itself over MAX_ARTIFACT_CONTENT_BYTES) surfaces
+    # as-is instead of falling into _decode_verified_mcp_result's generic
+    # malformed-envelope ValueError. A justified, minimal ratchet-up.
+    "src/clio_relay/mcp_server.py": 5930,
     "src/clio_relay/mcp_stdio_validation.py": 1269,
     "src/clio_relay/models.py": 2296,
     "src/clio_relay/process_containment.py": 2678,

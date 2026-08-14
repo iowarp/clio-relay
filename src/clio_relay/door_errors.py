@@ -104,6 +104,10 @@ from typing import Any, Final
 import mcp_types
 from mcp.shared.exceptions import MCPError
 
+from clio_relay.bounded_payload import (
+    TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,  # re-exported, see below
+)
+from clio_relay.bounded_payload import build_truncation_record
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -125,11 +129,12 @@ JSON = dict[str, Any]
 #: Schema tag stamped on every :func:`as_http_problem` document (doc §6.3).
 SCHEMA_VERSION: Final = "clio-relay.error.v1"
 
-#: Schema tag for the T1 refusal-text truncation record (doc §6.4). Reuses
-#: the ``clio-relay.truncation.v1`` name R6's T3 record-time bound is also
-#: scoped to use -- both describe the identical elision shape, just at
-#: different budgets (2,000 chars here vs. head+tail byte windows there).
-TRUNCATION_SCHEMA_VERSION: Final = "clio-relay.truncation.v1"
+#: Schema tag for the T1 refusal-text truncation record (doc §6.4).
+#: ``TRUNCATION_SCHEMA_VERSION`` re-exported here (not redefined) is
+#: ``bounded_payload.py``'s single owner of the ``clio-relay.truncation.v1``
+#: name -- R6 moved this module's own record CONSTRUCTION there too (see
+#: :func:`_bounded_text`), closing the "second copy of the same schema"
+#: gap this comment used to describe.
 
 # T1 (doc §6.4): refusal/detail text budget, hard-truncated. A fourth
 # independent literal agreeing with jarvis_dispatch_failure.py's
@@ -387,24 +392,23 @@ def _bounded_text(text: str) -> tuple[str, JSON | None]:
     happened, a populated ``clio-relay.truncation.v1`` record -- ``None``
     only when nothing was elided. F2: the envelope must never claim
     ``"truncation": null`` on a document whose ``detail`` was in fact cut.
+    The record itself is built by :func:`~clio_relay.bounded_payload.
+    build_truncation_record` (R6, #231) -- this module supplies the T1
+    char-count policy (what gets kept), bounded_payload owns the record
+    shape (how the cut is described), so the schema has exactly one
+    constructor regardless of which tier or module is bounding.
     """
     truncated = text[:MAX_MESSAGE_CHARS]
     if truncated == text:
         return truncated, None
     original_bytes = len(text.encode("utf-8"))
     retained_bytes = len(truncated.encode("utf-8"))
-    elided_bytes = original_bytes - retained_bytes
-    record: JSON = {
-        "schema_version": TRUNCATION_SCHEMA_VERSION,
-        "truncated": True,
-        "retention": "head",
-        "original_bytes": original_bytes,
-        "retained_head_bytes": retained_bytes,
-        "retained_tail_bytes": 0,
-        "elided_bytes": elided_bytes,
-        "marker": f"[clio-relay: elided {elided_bytes} bytes of message]",
-        "evidence_ref": None,
-    }
+    record = build_truncation_record(
+        retention="head",
+        original_bytes=original_bytes,
+        retained_head_bytes=retained_bytes,
+        stream="message",
+    )
     return truncated, record
 
 
