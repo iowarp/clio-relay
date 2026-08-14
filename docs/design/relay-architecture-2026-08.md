@@ -1,6 +1,6 @@
 # clio-relay architecture — 2026-08 decomposition design
 
-**Status:** R1–R3 complete (2026-08-14); R4–R8+ open ·
+**Status:** R1–R4 complete (2026-08-14); R5–R8+ open ·
 **Origin:** owner correction 2026-08-13 — clio-relay drifted back to
 monolithic god files · **Tracking:**
 [iowarp/clio-relay#231](https://github.com/iowarp/clio-relay/issues/231)
@@ -18,11 +18,30 @@ Kept current as slices land.
 | **R1** | Port the file-size + class-in-function ratchet CI from clio-agent, wired into `local.file-size-ratchet`/`local.no-class-in-function` release-gate checks; delete dead `app_profiles/`, `package_adapters/`, stale `TASK.md` | **DONE** | `2713692` (ratchet CI), `429d3cb` (deletions) | `feat/231-owner-modules` | Establishes baselines (39 files file-size, 5 files class-in-function; §3). Deletion commit removed 62 unbaselined lines; zero baselined files touched. |
 | **R2** | This design doc; three pre-existing hygiene/gate fixes (`remote_connection.py` pyright, `runner.py` ruff E501, and — found by opus review B1 — a `ruff format` drift on `installation.py`/`remote_mcp.py`/`session_lifecycle.py`) reddening the ratchet-gated release path | **DONE** — re-review approved at `dca177d` | `ee3120f` (hygiene fix), `e078d89` (gate fix, B1), `dca177d` (opus review B1-B5 + F-list revision, approved) | `feat/231-owner-modules` | Net zero on `runner.py` (§10.1) and `installation.py` (B1); `remote_mcp.py` 5309→5308 and `session_lifecycle.py` 8328→8326 ratchet down (B1). |
 | **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; `mcp_server.py`'s stdio `_error()` (§6.1's third surface) is not wired, tracked as [#235](https://github.com/iowarp/clio-relay/issues/235) (§6.5) | **DONE** — opus re-review (F1-F16) applied in the same slice | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), `28e0fb4` (docs landing R3), `7a526e9` (re-review fixes F1-F16), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3122 and `browser_gateway.py` 826→885 ratchet UP across both passes (net +59/+59), justified in `scripts/check_file_size.py`'s own baseline comments each time (§2 ground rule 5: remove/redesign first — evaluated and rejected, since the growth is real structure — the one global handler, the fourth adapter, the F5 defense-in-depth guard, the F7 typed oversize marker — not a fix that could net negative). `door_errors.py` is new, 667 lines (cap 800). |
-| **R4** | `frp_link.py` (~300-400 lines) — `transport_probe.py`'s local-visitor frp logic + `frp_check.py`, the substrate modes (a)/(b) build on. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | PLANNED | — | — | — |
+| **R4** | `frp_link.py` (471 lines) — `transport_probe.py`'s local-visitor frp logic, the substrate modes (a)/(b) build on, plus `control_channel.py`'s `BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` promoted to the same shared owner (§8.1's seam unchanged). `frp_check.py`'s `run_frpc_connection_check` was **not** absorbed — scope-corrected, see the note after this table. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | **DONE** | `00aeaef` (frp_link.py + delegation + tests), plus the commit landing this revision | `feat/231-owner-modules` | `transport_probe.py` 1849→1749 (−100, ratchet lowered); `control_channel.py` 751→676 (not baselined, no ratchet entry needed); `frp_link.py` is new, 471 lines (cap 800). |
 | **R5** | `frp_transport.py` — sibling `RelayTransport` implementations for modes (a)/(b) | PLANNED | — | — | — |
 | **R6** | `bounded_payload.py` — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1` | PLANNED | — | — | — |
 | **R7** | `release_pins.py` — one `PinSite` registry + bump command + preflight (#198) | PLANNED | — | — | — |
 | **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
+
+**R4 scope correction (`frp_check.py`).** §3's exit-criteria table and §8.2's
+sizing both named `frp_check.py`'s 28-line `run_frpc_connection_check` as
+absorbed alongside `transport_probe.py`'s local-visitor half. Implementing
+R4 found that assumption wrong: `run_frpc_connection_check` renders a
+*proxy*-shaped `FrpcConfig` (frps-side registration — `name`/`type`/
+`secretKey`/`localIP`/`localPort`, the same shape `service_runtime.py`'s
+remote connector uses) and blocks on `subprocess.run(..., timeout=...)`
+until frpc exits or the bounded interval elapses, capturing combined output
+synchronously. `HeldFrpVisitor` is shaped for the opposite case — a
+*visitor*-shaped `FrpcVisitorConfig`, held open indefinitely, polled instead
+of waited-on. Forcing `run_frpc_connection_check` onto the visitor substrate
+would not be a substrate reuse, it would be a second, ill-fitting shape
+bolted onto `frp_link.py` to hit a line count. `frp_check.py` is unchanged
+by R4 and still duplicates config-write + spawn + track against
+`service_runtime.py`'s proxy-side copy; that duplication is real and
+un-absorbed, folded into [#233](https://github.com/iowarp/clio-relay/issues/233)'s
+later, proxy-shaped absorption alongside `service_runtime.py`'s copy rather
+than R4's visitor-shaped one.
 
 ---
 
@@ -107,11 +126,12 @@ parsing-only rule) are what R3+ execute against the map this document draws.
    `scripts/check_file_size.py` is 800; a brand-new file over that cap fails
    CI immediately (no baseline grandfathering for new files). This is why the
    transport work (§8) is planned as two files rather than one:
-   `src/clio_relay/control_channel.py` is 750 lines today (the existing
-   `RelayTransport` seam), already close to the cap, so the new sibling
-   transports land in their own `frp_transport.py` (the `RelayTransport`
-   implementations) with the frp-specific wire/process substrate factored
-   into a separate `frp_link.py` (R4) rather than accreting either into
+   `src/clio_relay/control_channel.py` was 750 lines when this rule was
+   written (676 today, post-R4 — the existing `RelayTransport` seam), already
+   close to the cap, so the new sibling transports land in their own
+   `frp_transport.py` (the `RelayTransport` implementations) with the
+   frp-specific wire/process substrate factored into a separate
+   `frp_link.py` (R4, landed) rather than accreting either into
    `control_channel.py` or into one combined file that would immediately
    need to split again.
 
@@ -124,7 +144,7 @@ parsing-only rule) are what R3+ execute against the map this document draws.
 | Release-identity pin sites that must move together on a version bump (#198) | 11+ (measured at 1.6.5; §7 recounts the current tree) | 1 (`release_pins.py`'s `PinSite` table) + 1 bump command |
 | Bare/untyped error surfaces reaching a client (§6) | `http_api.py`: 107 hand-rolled `HTTPException` sites (`grep -c "raise HTTPException("`, 2026-08-14 — corrected from an earlier ~40 estimate; the file has grown), 0 global exception handlers; 1 deliberately-bare re-raise in `fastmcp_server.py:1106-1115` | 0 unclassified exceptions reach the wire; every surface routes through `door_errors.classify()` |
 | `cli.py` inlined domain concerns (§4.1) | 4+ identified (identity/verification, registry mutation, session orchestration, transport validation) | 0 — all delegate to an owner module |
-| frp process-lifecycle copies (§4.3) | 3 independent copies (`service_runtime.py`, `transport_probe.py`, `frp_check.py`); `relay_host.py` duplicates none of them — it is the shared config-only renderer all three already import | R4 absorbs `transport_probe.py`'s local-visitor half + `frp_check.py` into `frp_link.py` (~300-400 lines); `service_runtime.py`'s copy + `transport_probe.py`'s remote-script half are #233's larger, later absorption (see §4.3/§8.2/§10) |
+| frp process-lifecycle copies (§4.3) | **R4 DONE**: `transport_probe.py`'s local-visitor half now delegates to `frp_link.py` (471 lines) — the substrate modes (a)/(b) build on. 2 copies remain: `service_runtime.py` (proxy-shaped, `_start_remote_connector`/`_start_local_visitor`) and `frp_check.py` (proxy-shaped, `run_frpc_connection_check`); `relay_host.py` duplicates neither — it is the shared config-only renderer both still import | `service_runtime.py`'s copy + `frp_check.py` + `transport_probe.py`'s remote-script half are #233's later, proxy-shaped absorption (see §4.3/§8.2/§10 and the R4 scope-correction note after §0's table) |
 
 ## 4. Concern inventory of the monoliths
 
@@ -246,22 +266,28 @@ This is a genuine third copy, not merely config rendering. `relay_host.py`
 (`:29-40`), `render_frpc_config` (`:75-96`), `render_frpc_visitor_config`
 (`:99-123`) — imported by both `service_runtime.py` and `transport_probe.py`.
 But two *other* files independently spawn and manage the `frpc` process
-themselves: `transport_probe.py`'s `run_frp_http_probe`
+themselves (line numbers below are as measured pre-R4; R4 has since landed,
+moving `run_frp_http_probe`'s local-visitor body -- see the "R4 as landed"
+note in §8.2 for the current `transport_probe.py` shape):
+`transport_probe.py`'s `run_frp_http_probe`
 (`:211-337`, 127 lines, entirely local/visitor-side: writes the local
 visitor TOML at `:253-268`, spawns the local `frpc` visitor process at
 `:287-291`, polls `127.0.0.1` healthz at `:300-304` — it calls out to a
-separate function, `_remote_probe_script` `:1213-1351` (139 lines,
-corrected from an earlier `:1213-1286`/74, the same embedded-heredoc
-undercount as above), for remote-script generation rather than embedding it
-inline) and the 48-line `frp_check.py`'s `run_frpc_connection_check`
+separate function, `_remote_probe_script` `:1213-1351` pre-R4
+(`:1122-1260` post-R4, 139 lines either way — the function itself is
+unmoved content, only its offset in the file shifted), for remote-script
+generation rather than embedding it inline) and the 48-line `frp_check.py`'s
+`run_frpc_connection_check`
 (`:13-40`, 28 lines, spawns
 `subprocess.run([frpc_bin, "-c", str(config_path)], ...)` at `:25`). Three
 independent "write frpc TOML, then spawn `frpc -c <config>`, then track it"
 implementations for one substrate concern — but they are not absorbed in one
 slice (§8.2, §9 correct an earlier version of this document that assumed
-they were): R4 takes `run_frp_http_probe`'s local-visitor logic and
-`frp_check.py` into `frp_link.py`; `service_runtime.py`'s much larger copy
-and `_remote_probe_script`'s remote-script generation are
+they were, and the R4 scope-correction note after §0's table corrects a
+second assumption): R4 took `run_frp_http_probe`'s local-visitor logic into
+`frp_link.py`; `frp_check.py` turned out proxy-shaped, not visitor-shaped,
+so it stayed put. `service_runtime.py`'s much larger copy, `frp_check.py`,
+and `_remote_probe_script`'s remote-script generation are all
 [#233](https://github.com/iowarp/clio-relay/issues/233), a later, separate
 absorption.
 
@@ -392,8 +418,8 @@ slice for exactly this reason — the coupling has to be paid down before
 | Concern | Owner module | Current home(s) | Slice |
 |---|---|---|---|
 | Error classification/translation | `door_errors.py` | scattered: `fastmcp_server.py` typed conversions (with one deliberately-bare exception, §6.1), `http_api.py` (107 hand-rolled `HTTPException` sites), `mcp_server.py`'s stdio `_error()`, `browser_gateway.py`'s `_error()` (§6.2's fourth surface) | R3 |
-| frp process substrate, R4's actual scope: `transport_probe.py`'s local-visitor logic + `frp_check.py` | `frp_link.py` (~300-400 lines) | `transport_probe.py:211-337` (`run_frp_http_probe`, local/visitor-side only) + `frp_check.py:13-40` (`run_frpc_connection_check`); config-only rendering already centralized in `relay_host.py` (reused, not moved) | R4 |
-| frp process substrate, the larger absorption: `service_runtime.py`'s copy (§4.3) + `transport_probe.py`'s remote-script generation (`_remote_probe_script:1213-1351`) | `frp_link.py` (extended) + new `frp_remote_scripts.py` (the two embedded remote-script generators, 288+236 = 524 lines, §4.3/§8.2/§10) | `service_runtime.py:5900-8650` (multiple functions), `transport_probe.py:1213-1351` | [#233](https://github.com/iowarp/clio-relay/issues/233) — explicitly NOT R4 (B4 correction to an earlier version of this document) |
+| frp process substrate, R4's actual (landed) scope: `transport_probe.py`'s local-visitor logic + `control_channel.py`'s held-process primitives | `frp_link.py` (471 lines) — `HeldFrpVisitor`, `FrpLinkConfig`, `render_visitor_config`, `BoundedStderrBuffer`/`pump_stderr`/`wait_for_channel_health` | `transport_probe.py`'s `run_frp_http_probe`/`_run_frp_http_probe_with_proxy_type` now delegate (`HeldFrpVisitor`); `control_channel.py` imports the promoted primitives; config-only rendering stays centralized in `relay_host.py` (reused, not moved). `frp_check.py` was **not** absorbed — see the R4 scope-correction note after §0's table | **R4 DONE** |
+| frp process substrate, the larger absorption: `service_runtime.py`'s copy (§4.3) + `frp_check.py`'s `run_frpc_connection_check` (proxy-shaped, not visitor-shaped) + `transport_probe.py`'s remote-script generation (`_remote_probe_script:1122-1260`) | `frp_link.py` (extended) + new `frp_remote_scripts.py` (the two embedded remote-script generators, 288+236 = 524 lines, §4.3/§8.2/§10) | `service_runtime.py:5900-8650` (multiple functions), `frp_check.py:13-40`, `transport_probe.py:1122-1260` | [#233](https://github.com/iowarp/clio-relay/issues/233) — explicitly NOT R4 (B4 correction, and the R4 scope-correction note after §0's table) |
 | `RelayTransport` implementations for modes (a)/(b) | `frp_transport.py` | `control_channel.py`'s `build_transport` refuses both (`TransportModeUnavailable`, §8.2); `transport_probe.py` has probe-only, non-production logic | R5 |
 | Byte-budget enforcement / truncation (T1/T2/T3, §6.4) | `bounded_payload.py` | constants scattered across `control_channel.py`, `remote_connection.py`, `mcp_server.py`, `runner.py` | R6 |
 | Release-identity + contract pins (§7) | `release_pins.py` | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files, plus the stale `docs/remote-mcp-federation.md` mirror (§7) | R7 |
@@ -884,19 +910,21 @@ byte-identity rather than trusting two edits to stay in sync by convention.
 
 ### 8.1 The seam that exists
 
-`src/clio_relay/control_channel.py` (750 lines) already carries the seam
-modes (a)/(b) slot into. `RelayTransport` is a Protocol at `:305-347` with
+`src/clio_relay/control_channel.py` (676 lines post-R4, down from 750 —
+`BoundedStderrBuffer`/`pump_stderr`/`_wait_for_channel_health` moved to
+`frp_link.py`, §8.2's "R4 as landed" note) already carries the seam modes
+(a)/(b) slot into. `RelayTransport` is a Protocol at `:255-297` with
 `mode`/`requires_user_authorization` properties and
 `establish`/`open_stream_channel`/`is_alive`/`failure_detail`/`close`
-methods. `SshForwardTransport` (`:350-562`) is the mode-(c) implementation
+methods. `SshForwardTransport` (`:300-512`) is the mode-(c) implementation
 and the lifecycle template: `argv()` renders the exact ssh command
-(`:405-435`), `establish` dials once and reads the framed bootstrap document
-(`:437-467`), `open_stream_channel` unconditionally raises
-`StreamChannelsUnavailable` (`:469-480` — multiplexing onto the held forward
+(`:355-385`), `establish` dials once and reads the framed bootstrap document
+(`:387-417`), `open_stream_channel` unconditionally raises
+`StreamChannelsUnavailable` (`:419-430` — multiplexing onto the held forward
 isn't built for any mode yet), `close` closes stdin so the remote holder
-exits before falling back to terminate/kill with timeouts (`:491-515`).
-`build_transport` (`:614-659`) is the factory: `"ssh_forward"` →
-`SshForwardTransport(...)` (`:635-652`); anything else falls through to the
+exits before falling back to terminate/kill with timeouts (`:441-465`).
+`build_transport` (`:564-609`) is the factory: `"ssh_forward"` →
+`SshForwardTransport(...)` (`:586-602`); anything else falls through to the
 refusal in §8.2. What must not move in R4/R5: the `RelayTransport` Protocol
 shape and `SshForwardTransport` as the reference lifecycle — new transports
 implement the same five-method surface, they don't renegotiate it.
@@ -916,7 +944,8 @@ with a reasonable amount of config/health glue, comfortably under the
 larger copy (§4.3: `_start_remote_connector`, `_start_local_visitor`,
 `_remote_allocation_frpc_start_script`, `_remote_frpc_start_script`,
 `_remote_stop_script`, spanning `:5900-8650`) and `transport_probe.py`'s own
-remote-script generator (`_remote_probe_script`, `:1213-1351`, 139 lines) are
+remote-script generator (`_remote_probe_script`, `:1213-1351` pre-R4,
+`:1122-1260` post-R4, 139 lines either way) are
 **not** R4 — they are [#233](https://github.com/iowarp/clio-relay/issues/233),
 a later, separate absorption landing as a planned two-file split:
 `frp_link.py` (extended) plus a new `frp_remote_scripts.py` housing the two
@@ -932,12 +961,34 @@ reimplementing process management a fourth time. Both R4 and the eventual
 the correctly-scoped single owner for TOML rendering; nothing here
 duplicates it.
 
+**R4 as landed, a second correction on top of B4's.** `frp_link.py` is 471
+lines, not the 300-400 estimated above, because it absorbed one more thing
+the estimate didn't count: `control_channel.py`'s `BoundedStderrBuffer`,
+`pump_stderr`, and `_wait_for_channel_health` (`:729-750`) are promoted here
+too, becoming the shared held-process substrate `SshForwardTransport` and
+`HeldFrpVisitor` both use — still comfortably under the 800-line cap, and a
+real reduction in `control_channel.py` (751→676 lines), so ground rule 1
+(one owner) is better served by the promotion than by leaving a second
+stderr-buffer/health-wait pair to diverge later. `frp_check.py`'s
+28-line `run_frpc_connection_check`, part of the 300-400 estimate above, was
+**not** absorbed — implementing R4 found it proxy-shaped
+(`FrpcConfig`/`service_runtime.py`'s registration shape), not
+visitor-shaped like `HeldFrpVisitor`; see the scope-correction note after
+§0's table. `transport_probe.py`'s local-visitor half (`run_frp_http_probe`
+and `_run_frp_http_probe_with_proxy_type`) delegates to `HeldFrpVisitor` as
+planned; `run_frp_http_probe` additionally collapsed into a thin
+`proxy_type="stcp"` wrapper around `_run_frp_http_probe_with_proxy_type`
+(the two functions' remote-side bodies were themselves near-duplicates,
+not only their visitor halves), landing `transport_probe.py` at 1749 lines
+(−100 from 1849).
+
 `transport_probe.py`'s `allow_stcp_fallback` parameter
-(`run_frp_direct_http_probe`, `:338-402`; declared `:352` with
+(`run_frp_direct_http_probe`, `:250-314` post-R4 (`:338-402` pre-R4);
+declared `:264` post-R4 with
 **`bool = True` — the default itself is the hazard**, not a call site
 opting in) is FORBIDDEN in production: on a `RelayError` from the XTCP
-direct-HTTP attempt (`:356-370`), when true it re-runs as an STCP
-relay-point-carried attempt (`:375-388`). This is *automatic*, not silent —
+direct-HTTP attempt (`:268-282` post-R4), when true it re-runs as an STCP
+relay-point-carried attempt (`:287-300` post-R4). This is *automatic*, not silent —
 it happens visibly whenever triggered — but defaulting to `True` means
 every caller gets it without opting in, which is the practical hazard:
 `connection-model.md:85-86` states, under the "(c) SSH port forward"
@@ -956,7 +1007,7 @@ default when modes (a)/(b) become real.
 Confirmed, both non-ssh modes currently refuse rather than degrade:
 
 ```python
-# control_channel.py:653-658
+# control_channel.py:603-608
 if mode in ("brokered_tcp", "udp_rendezvous"):
     raise TransportModeUnavailable(
         f"relay transport mode {mode!r} is declared by the design but not implemented in "
@@ -967,11 +1018,11 @@ if mode in ("brokered_tcp", "udp_rendezvous"):
 
 Mode (c) carries the bring-up identity document out of band, over the
 ssh-authenticated act: `owned_session_channel_bootstrap_script()`
-(`control_channel.py:565-611`) composes `session recovery-status` and
+(`control_channel.py:515-561`) composes `session recovery-status` and
 `session challenge-owned` output into one framed JSON document, printed
 between `CHANNEL_BOOTSTRAP_BEGIN`/`END` markers, then blocks on
-`exec cat >/dev/null` to hold the session open (`:610-611`) —
-`SshForwardTransport._read_bootstrap` (`:517-549`) consumes it. It verifies
+`exec cat >/dev/null` to hold the session open (`:560-561`) —
+`SshForwardTransport._read_bootstrap` (`:467-499`) consumes it. It verifies
 against a cluster-side owner token that never leaves the cluster,
 documented directly on `OwnedSessionChannelBootstrap`
 (`control_channel.py:124-134`, the load-bearing sentence at `:127-128`):
@@ -1079,7 +1130,10 @@ by ordering, not avoided by being independent:
   implied by ground rule 2.
 
 **Why R4 is cheap where `cli.py` is not — concrete evidence, not just
-assertion.** `transport_probe.py` already exposes a clean dependency-
+assertion** (line numbers below are as measured pre-R4, when this argument
+was made; R4 has since landed and used exactly this seam — post-R4 the same
+four parameters sit at `:229`/`:262`/`:326`/`:909` respectively).
+`transport_probe.py` already exposes a clean dependency-
 injection seam for exactly the process-spawning logic R4 touches:
 `process_factory: ProcessFactory | None = None` is a parameter on every
 public probe entry point (`run_frp_http_probe:223`,
@@ -1122,6 +1176,18 @@ overlaps named above.
 `src/clio_relay/package_adapters/__init__.py` (each a docstring-only stub with
 zero importers), and the superseded `TASK.md` checklist.
 
+**Done (R4):** `transport_probe.py`'s local-visitor frp logic (the inline
+config-write/spawn/poll/cleanup blocks previously duplicated across
+`run_frp_http_probe` and `_run_frp_http_probe_with_proxy_type`) is deleted
+from `transport_probe.py` in favor of delegating to `frp_link.py`'s
+`HeldFrpVisitor`; `run_frp_http_probe`'s own ~124-line body is deleted
+entirely, replaced by a thin wrapper. `control_channel.py`'s
+`BoundedStderrBuffer`, `pump_stderr`, and `_wait_for_channel_health`
+definitions are deleted in favor of importing the promoted versions from
+`frp_link.py` (§8.2's "R4 as landed" note). `frp_check.py`'s
+`run_frpc_connection_check` is **not** deleted here — see the next bullet
+and the R4 scope-correction note after §0's table.
+
 ### 10.1 R2 worked example: resolving a ratchet conflict honestly
 
 R2's `runner.py` E501 fix is the first worked example of ground rule 5 (§2):
@@ -1138,10 +1204,6 @@ ratchet, is the standing default; see the ratchet's own docstring
 
 **Planned (each named here so it isn't silently dropped when its slice lands):**
 
-- R4: `transport_probe.py`'s local-visitor frp logic (`run_frp_http_probe`,
-  `:211-337`) and `frp_check.py`'s `run_frpc_connection_check`
-  (`:13-40`) are deleted from their current homes once both delegate to
-  `frp_link.py`.
 - R3: the per-site error-rationale comments scattered across
   `fastmcp_server.py` (e.g. the `TaskInputParkConflictError` block at
   `:1106-1115`) move into `door_errors.py`'s docstrings once the table they
@@ -1150,7 +1212,7 @@ ratchet, is the standing default; see the ratchet's own docstring
   at `:692` is deleted in favor of the `door_errors.as_http_problem`-shaped
   response (§6.1, §6.2).
 - R5: `transport_probe.py`'s `allow_stcp_fallback` parameter
-  (`run_frp_direct_http_probe`, `:338-402`, defaults `True`, §8.2) —
+  (`run_frp_direct_http_probe`, `:250-314` post-R4, defaults `True`, §8.2) —
   confirmed today to have zero production reach (only `cli.py`'s probe
   subcommands and `live_acceptance.py` call it, never `control_channel.py`)
   — must not gain production reach, nor its `True` default, when
@@ -1165,11 +1227,20 @@ separate from R4 — §4.3, §8.2, §9 B4 correction):**
 - `service_runtime.py`'s copy — `_start_remote_connector`,
   `_start_local_visitor`, `_remote_allocation_frpc_start_script`,
   `_remote_frpc_start_script`, `_remote_stop_script` (`:5900-8650`) — and
-  `transport_probe.py`'s `_remote_probe_script` (`:1213-1351`) are deleted
+  `transport_probe.py`'s `_remote_probe_script` (`:1122-1260` post-R4) are deleted
   from their current homes once delegating to `frp_link.py` (extended) and
   the new `frp_remote_scripts.py`. This is explicitly **not** part of R4's
   deletion above — an earlier version of this document folded it in by
   assuming R4 absorbed all three copies at once.
+- `frp_check.py`'s `run_frpc_connection_check` (`:13-40`) is deleted from
+  its current home once it delegates to the proxy-shaped substrate #233
+  adds. R4 sized this into `frp_link.py` (§8.2's original budget) but did
+  not do it: `run_frpc_connection_check` renders a proxy-shaped
+  `FrpcConfig` and runs `frpc` to bounded completion via
+  `subprocess.run(..., timeout=...)`, the same shape as
+  `service_runtime.py`'s remote connector, not `HeldFrpVisitor`'s held,
+  polled, visitor-shaped one — see the R4 scope-correction note after
+  §0's table.
 
 **Named-not-tonight (real, deferred, not forgotten):**
 
@@ -1209,7 +1280,7 @@ document.
   `jarvis_provider.py`'s `_BoundedTextTail`, is tail-only and shares one 1
   MiB bound across both streams rather than the asymmetric split originally
   hypothesized. Tracked in §6.5's ledger, scoped into R6.
-- **`allow_stcp_fallback` (`transport_probe.py:338-402`, defaults `True`) is
+- **`allow_stcp_fallback` (`transport_probe.py:250-314` post-R4, defaults `True`) is
   exactly the automatic mode-switching `connection-model.md:85-86` rules
   out** (under the "(c) SSH port forward" section, not "Never do this" — an
   earlier version of this document mis-cited the location), confined today
