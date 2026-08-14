@@ -297,3 +297,7 @@ validation, and exact-job cancellation.
 JARVIS runtime metadata is the preferred source for provider name, job id, phase,
 paths, and allocation. The configured worker provider must match structured runtime
 metadata before relay-owned polling or cancellation is allowed.
+
+## Related pages
+
+- [relay architecture — 2026-08 decomposition design](design/relay-architecture-2026-08.md) — the owner-module map this monolith is decomposing into.

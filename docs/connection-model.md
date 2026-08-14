@@ -388,3 +388,4 @@ recognize the shape.
 - [remote MCP federation](remote-mcp-federation.md) — the virtual layer and the
   staging contract in operational detail.
 - [operations](operations.md) — operator paths for each mode.
+- [relay architecture — 2026-08 decomposition design](design/relay-architecture-2026-08.md) — the owner-module map this document's transport modes feed into (§8), including the identity-anchor ruling for modes (a)/(b).
