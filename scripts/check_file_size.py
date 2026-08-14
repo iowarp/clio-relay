@@ -64,7 +64,12 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/browser_gateway.py": 885,
     "src/clio_relay/ci_validation.py": 3775,
     "src/clio_relay/cli.py": 19315,
-    "src/clio_relay/cluster_config.py": 1847,
+    # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
+    # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
+    # refusal reads) plus the IdentityAnchor type alias and its docstring. No
+    # deletion offsets it: these are two new, real config fields, not a fixable
+    # regression.
+    "src/clio_relay/cluster_config.py": 1863,
     "src/clio_relay/core_queue.py": 16137,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/endpoint.py": 8710,
@@ -91,7 +96,13 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/process_containment.py": 2678,
     "src/clio_relay/queue_management.py": 1671,
     "src/clio_relay/queue_validation.py": 1530,
-    "src/clio_relay/remote_connection.py": 978,
+    # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
+    # cluster config, independent of link state, §8.3) plus stamping it on
+    # every `channel_event(...)` call site (9) and surfacing it in
+    # `event_report()`/`_retired_report()`. No logic here is rewritten --
+    # `_verify_bootstrap`'s own checks are untouched -- only this wiring is
+    # new, so nothing in the file was a candidate for deletion first.
+    "src/clio_relay/remote_connection.py": 1006,
     "src/clio_relay/remote_mcp.py": 5308,
     "src/clio_relay/retention.py": 944,
     "src/clio_relay/runtime_metadata.py": 1749,

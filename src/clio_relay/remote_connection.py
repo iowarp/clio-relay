@@ -202,6 +202,21 @@ class RemoteConnection:
         return self._transport_mode
 
     @property
+    def identity_anchor(self) -> str | None:
+        """Return this connection's declared identity anchor (§8.3).
+
+        Independent of link state -- derived from cluster config, not from
+        whether a channel is currently held -- so it is stable and available
+        for every recorded event, including the ones before the first
+        ``establish`` succeeds. ``brokered_tcp``/``udp_rendezvous`` declare
+        ``"preshared_link_secret"``; ``ssh_forward`` has none: its identity
+        document is carried by the ssh-authenticated bootstrap act itself.
+        """
+        if self._transport_mode in ("brokered_tcp", "udp_rendezvous"):
+            return self._definition.frp_transport.identity_anchor
+        return None
+
+    @property
     def connected(self) -> bool:
         """Return whether the channel is currently held."""
         transport = self._transport
@@ -258,6 +273,7 @@ class RemoteConnection:
                         reason="channel_dropped_dev_mode_auto",
                         detail=detail,
                         user_authorization_required=self._allow_interactive_authorization,
+                        identity_anchor=self.identity_anchor,
                     )
                 )
                 self._establish(event="reestablished")
@@ -279,6 +295,7 @@ class RemoteConnection:
                     reason="channel_dropped",
                     detail=detail,
                     user_authorization_required=self._allow_interactive_authorization,
+                    identity_anchor=self.identity_anchor,
                 )
             )
             self._establish(event="reestablished")
@@ -375,6 +392,7 @@ class RemoteConnection:
                     mode=self._transport_mode,
                     event="closed",
                     attempt=self._attempt,
+                    identity_anchor=self.identity_anchor,
                 )
             )
 
@@ -416,6 +434,7 @@ class RemoteConnection:
                     attempt=self._attempt,
                     reason="transport_requires_user_authorization",
                     user_authorization_required=True,
+                    identity_anchor=self.identity_anchor,
                 )
             )
         self._record(
@@ -424,6 +443,7 @@ class RemoteConnection:
                 mode=self._transport_mode,
                 event="establishing",
                 attempt=self._attempt,
+                identity_anchor=self.identity_anchor,
             )
         )
         transport = build_transport(
@@ -433,6 +453,8 @@ class RemoteConnection:
             session_generation_id=self._generation_id,
             remote_api_port=self._remote_api_port,
             nonce=nonce,
+            api_token=self._api_token,
+            frpc_bin=self._settings.frpc_bin,
             process_factory=self._process_factory,
             ready_timeout_seconds=self._timeout_seconds,
             allow_interactive_authorization=self._allow_interactive_authorization,
@@ -458,6 +480,7 @@ class RemoteConnection:
                     attempt=self._attempt,
                     reason=type(exc).__name__,
                     detail=str(exc),
+                    identity_anchor=self.identity_anchor,
                 )
             )
             raise
@@ -475,6 +498,7 @@ class RemoteConnection:
                 mode=self._transport_mode,
                 event=event,
                 attempt=self._attempt,
+                identity_anchor=self.identity_anchor,
             )
         )
 
@@ -537,6 +561,7 @@ class RemoteConnection:
                         attempt=self._attempt,
                         reason="transport_exited",
                         detail=transport.failure_detail(),
+                        identity_anchor=self.identity_anchor,
                     )
                 )
                 raise ChannelDropped(
@@ -582,6 +607,7 @@ class RemoteConnection:
                         event="stream_reproven",
                         attempt=self._attempt,
                         reason=reason,
+                        identity_anchor=self.identity_anchor,
                     )
                 )
         return proven
@@ -765,6 +791,7 @@ class RemoteConnectionRegistry:
             events = connection.events
             clusters[cluster] = {
                 "transport_mode": connection.transport_mode,
+                "identity_anchor": connection.identity_anchor,
                 "session_id": connection.session_id,
                 "session_generation_id": connection.session_generation_id,
                 "remote_api_port": connection.remote_api_port,
@@ -795,6 +822,7 @@ def _retired_report(connection: RemoteConnection) -> dict[str, object]:
         "session_id": connection.session_id,
         "session_generation_id": connection.session_generation_id,
         "transport_mode": connection.transport_mode,
+        "identity_anchor": connection.identity_anchor,
         "transport_connections_opened": sum(
             1 for event in events if event.event in {"established", "reestablished"}
         ),

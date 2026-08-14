@@ -24,9 +24,13 @@ configured mode.
     For infrastructure that permits nothing else: one SSH process holding one
     port forward for the lifetime of the connection.
 
-Only ``ssh_forward`` is implemented here.  Configuring either other mode raises
-a typed error, so a missing implementation is visible rather than silently
-served by SSH.
+``ssh_forward`` is implemented directly in this module (:class:`SshForwardTransport`,
+the reference lifecycle).  ``brokered_tcp``/``udp_rendezvous`` are implemented in
+:mod:`clio_relay.frp_transport`, built on the held-frp-visitor substrate in
+:mod:`clio_relay.frp_link`; :func:`build_transport` dispatches to them but refuses
+either mode with a typed error for a cluster that has not opted into the
+``preshared_link_secret`` identity anchor their bring-up requires (§8.3), so a
+missing opt-in is visible rather than silently served by a weaker anchor.
 """
 
 from __future__ import annotations
@@ -47,8 +51,8 @@ from typing import IO, Any, Final, Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import REMOTE_TRANSPORT_MODE_ENV, TransportMode
-from clio_relay.errors import RelayError
+from clio_relay.config import TransportMode
+from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import BoundedStderrBuffer, pump_stderr
 from clio_relay.frp_link import wait_for_channel_health as _wait_for_channel_health
 from clio_relay.remote_cli import remote_env
@@ -65,6 +69,8 @@ CHANNEL_BOOTSTRAP_BEGIN: Final = b"CLIO_RELAY_CHANNEL_BOOTSTRAP_BEGIN"
 CHANNEL_BOOTSTRAP_END: Final = b"CLIO_RELAY_CHANNEL_BOOTSTRAP_END"
 
 MAX_CHANNEL_BOOTSTRAP_BYTES: Final = 256 * 1024
+# Deliberately pinned equal to frp_link.py's DEFAULT_STDERR_BUFFER_MAX_BYTES
+# by tests/test_frp_link.py -- see that constant's comment.
 MAX_CHANNEL_EVENT_DETAIL_CHARS: Final = 2_000
 DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS: Final = 30.0
 
@@ -87,7 +93,25 @@ ChannelEventName = Literal[
 
 
 class TransportModeUnavailable(RelayError):
-    """A declared transport mode has no implementation in this build."""
+    """A declared transport mode has no implementation in this build.
+
+    Every mode :data:`~clio_relay.config.TransportMode` currently declares has
+    an implementation (#231 R5), so nothing raises this today; it stays
+    reserved for a future mode added to that type before its own
+    implementation lands. It is distinct from
+    :class:`TransportIdentityAnchorRequired`, which is an *implemented* mode
+    refusing a specific cluster's configuration, not a missing build.
+    """
+
+
+class TransportIdentityAnchorRequired(RelayError):
+    """A frp-based mode is implemented but this cluster has not opted into it.
+
+    ``brokered_tcp``/``udp_rendezvous`` have no ssh-authenticated act to carry the
+    bring-up identity document over, so they require a cluster to explicitly accept
+    the weaker ``preshared_link_secret`` anchor (§8.3) before either mode is used --
+    a cluster that has not opted in does not fall through to it unannounced.
+    """
 
 
 class ChannelBootstrapError(RelayError):
@@ -161,11 +185,17 @@ class ChannelLink:
     No mode implements it yet; :meth:`RelayTransport.open_stream_channel`
     refuses with a typed error until one does, so adding it later extends this
     interface instead of breaking it.
+
+    ``identity_anchor`` names what proves the bring-up identity document
+    authentic (§8.3). ``None`` means the ssh-authenticated bootstrap act itself
+    (``ssh_forward``); ``brokered_tcp``/``udp_rendezvous`` stamp
+    ``"preshared_link_secret"`` here instead.
     """
 
     control_endpoint: ChannelEndpoint
     bootstrap: OwnedSessionChannelBootstrap
     stream_channels: bool = False
+    identity_anchor: str | None = None
 
 
 class ChannelEvent(BaseModel):
@@ -186,6 +216,7 @@ class ChannelEvent(BaseModel):
     reason: str | None = None
     detail: str | None = None
     user_authorization_required: bool = False
+    identity_anchor: str | None = None
 
 
 ChannelEventSink = Callable[[ChannelEvent], None]
@@ -200,6 +231,7 @@ def channel_event(
     reason: str | None = None,
     detail: str | None = None,
     user_authorization_required: bool = False,
+    identity_anchor: str | None = None,
 ) -> ChannelEvent:
     """Build one bounded transport event with a machine-readable reason."""
     return ChannelEvent(
@@ -211,6 +243,7 @@ def channel_event(
         reason=reason,
         detail=None if detail is None else detail[:MAX_CHANNEL_EVENT_DETAIL_CHARS],
         user_authorization_required=user_authorization_required,
+        identity_anchor=identity_anchor,
     )
 
 
@@ -401,7 +434,13 @@ class SshForwardTransport:
         self._established = True
         if process.stderr is not None:
             self._stderr_buffer = BoundedStderrBuffer()
-            pump_stderr(process.stderr, self._stderr_buffer)
+            # Explicit name restores this thread's pre-promotion identity
+            # (pump_stderr's own default is deliberately neutral, not
+            # "frp"-branded -- this is ssh_forward, not frp; #231 R4 opus
+            # review F5).
+            pump_stderr(
+                process.stderr, self._stderr_buffer, thread_name="clio-relay-channel-stderr"
+            )
         try:
             bootstrap = self._read_bootstrap(process)
             endpoint = ChannelEndpoint(host="127.0.0.1", port=local_port)
@@ -569,6 +608,8 @@ def build_transport(
     session_generation_id: str,
     remote_api_port: int,
     nonce: str,
+    api_token: str | None = None,
+    frpc_bin: str = "frpc",
     process_factory: ChannelProcessFactory | None = None,
     local_bind_port: int | None = None,
     ready_timeout_seconds: float = DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS,
@@ -576,11 +617,10 @@ def build_transport(
 ) -> RelayTransport:
     """Build the transport for the mode this connection is configured to use.
 
-    ``brokered_tcp`` and ``udp_rendezvous`` are part of the design and slot in
-    here as sibling implementations.  Until they exist, asking for one is a
-    typed refusal: this function never substitutes a different mode, so a
-    connection configured for a server-brokered pathway can never quietly be
-    served by SSH instead.
+    ``brokered_tcp`` and ``udp_rendezvous`` slot in here as sibling
+    implementations of ``ssh_forward``: this function never substitutes a
+    different mode, so a connection configured for a server-brokered pathway
+    can never quietly be served by SSH instead.
     """
     if mode == "ssh_forward":
         return SshForwardTransport(
@@ -601,10 +641,43 @@ def build_transport(
             allow_interactive_authorization=allow_interactive_authorization,
         )
     if mode in ("brokered_tcp", "udp_rendezvous"):
-        raise TransportModeUnavailable(
-            f"relay transport mode {mode!r} is declared by the design but not implemented in "
-            f"this build; set {REMOTE_TRANSPORT_MODE_ENV} to a mode this build implements "
-            "rather than expecting another mode to serve the connection"
+        # §8.3's ruling: refuse BEFORE spawning anything unless the cluster
+        # definition explicitly opted into the weaker preshared-link anchor.
+        # Not silent, not defaulted -- a cluster that never set this does not
+        # fall through to using these modes unannounced.
+        anchor = definition.frp_transport.identity_anchor
+        if anchor != "preshared_link_secret":
+            raise TransportIdentityAnchorRequired(
+                f"cluster {definition.name!r} is configured for transport mode {mode!r} but "
+                "has not opted into an identity anchor; set frp_transport.identity_anchor to "
+                '"preshared_link_secret" in this cluster\'s definition before this mode can be '
+                "used -- brokered_tcp/udp_rendezvous have no ssh-authenticated act to carry the "
+                "bring-up identity document over (relay-architecture-2026-08.md §8.3)"
+            )
+        if not api_token:
+            raise ConfigurationError(
+                f"relay transport mode {mode!r} requires CLIO_RELAY_API_TOKEN to authenticate "
+                "the owned session bring-up fetched over the held link"
+            )
+        # Local import: frp_transport.py needs ChannelLink/ChannelEndpoint/
+        # OwnedSessionChannelBootstrap from this module, so the reverse import at
+        # module top would cycle. Deferred here, both modules are fully loaded by
+        # the time this function is ever called.
+        from clio_relay.frp_transport import BrokeredTcpTransport, UdpRendezvousTransport
+
+        transport_cls = BrokeredTcpTransport if mode == "brokered_tcp" else UdpRendezvousTransport
+        return transport_cls(
+            definition=definition,
+            cluster=definition.name,
+            session_id=session_id,
+            session_generation_id=session_generation_id,
+            remote_api_port=remote_api_port,
+            api_token=api_token,
+            identity_anchor=anchor,
+            frpc_bin=frpc_bin,
+            process_factory=process_factory,
+            local_bind_port=local_bind_port,
+            ready_timeout_seconds=ready_timeout_seconds,
         )
     raise ValueError(f"unknown relay transport mode: {mode!r}")
 

@@ -38,7 +38,7 @@ from clio_relay.control_channel import (
     ChannelDropped,
     SshForwardTransport,
     StreamChannelsUnavailable,
-    TransportModeUnavailable,
+    TransportIdentityAnchorRequired,
     build_transport,
     owned_session_channel_bootstrap_script,
 )
@@ -656,9 +656,16 @@ def test_noninteractive_transport_opts_out_of_the_authorization_prompt() -> None
 
 
 @pytest.mark.parametrize("mode", ["brokered_tcp", "udp_rendezvous"])
-def test_declared_transport_modes_refuse_instead_of_falling_back(mode: str) -> None:
-    """An unbuilt mode must never quietly become per-operation SSH."""
-    with pytest.raises(TransportModeUnavailable, match=mode):
+def test_unconfigured_frp_modes_refuse_instead_of_falling_back_to_ssh(mode: str) -> None:
+    """A cluster that never opted into the identity anchor must never fall back to SSH.
+
+    #231 R5: brokered_tcp/udp_rendezvous are implemented, but §8.3 requires a
+    cluster to explicitly opt into the weaker preshared-link identity anchor
+    before either is used. ``_definition()`` here declares neither, so this
+    must refuse with the typed anchor error -- never quietly serve the
+    connection over ssh_forward or any other substituted mode.
+    """
+    with pytest.raises(TransportIdentityAnchorRequired, match=mode):
         build_transport(
             mode=cast(Any, mode),
             definition=_definition(),
@@ -666,6 +673,7 @@ def test_declared_transport_modes_refuse_instead_of_falling_back(mode: str) -> N
             session_generation_id="generation-1",
             remote_api_port=8765,
             nonce=NONCE,
+            api_token="owner-api-token",
         )
 
 
