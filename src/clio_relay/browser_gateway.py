@@ -458,6 +458,17 @@ class CapabilityProxyServer(ThreadingHTTPServer):
                 self._overload_slots.release()
 
 
+class _RequestBodyTooLargeError(ValueError):
+    """A declared/actual request body exceeded ``MAX_REQUEST_BODY_BYTES``.
+
+    A distinct type (not a message match) so ``_error_from_exception`` can
+    route this one condition to ``door_errors.REASONS["payload_too_large"]``
+    while ``_request_body``'s other three failures (chunked encoding, a
+    malformed ``Content-Length``, a body that ended early) stay the
+    catch-all ``configuration_error`` (#231 R3 re-review, F7+F14).
+    """
+
+
 class CapabilityProxyHandler(BaseHTTPRequestHandler):
     """Authorize and proxy one narrowly scoped browser request."""
 
@@ -669,7 +680,14 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ValueError("request Content-Length is invalid") from exc
         if length < 0 or length > MAX_REQUEST_BODY_BYTES:
-            raise ValueError("request body exceeds the browser gateway limit")
+            # A distinct exception TYPE (F7+F14, opus review), not a message
+            # match: this is the one _request_body failure that is a
+            # well-known HTTP concept (413) in its own right, not a generic
+            # protocol-validation mistake -- _error_from_exception routes it
+            # to door_errors.REASONS["payload_too_large"] instead of the
+            # blanket configuration_error the other three conditions here
+            # still use.
+            raise _RequestBodyTooLargeError("request body exceeds the browser gateway limit")
         body = self.rfile.read(length)
         if len(body) != length:
             deadline = self._request_input_deadline
@@ -722,15 +740,22 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         already imports ``BrowserAttachmentRecord`` from this module) --
         confirmed by triggering it, not merely suspected.
 
-        ``_request_body``'s failures (chunked encoding, a malformed/oversized
-        ``Content-Length``) are protocol-level, not a domain reason this
-        module's frozen ``REASONS`` table names -- ``configuration_error``
+        A ``_RequestBodyTooLargeError`` (the oversize branch specifically,
+        F7+F14 opus review) is a well-known HTTP concept in its own right
+        and routes to the dedicated ``payload_too_large`` reason (413).
+        ``_request_body``'s other three failures (chunked encoding, a
+        malformed ``Content-Length``, a body that ended early) are generic
+        protocol-level mistakes, not a distinct domain reason this module's
+        frozen ``REASONS`` table names on their own -- ``configuration_error``
         (400, "client-schema mismatches") is the closest table-sanctioned
-        fit, chosen over inventing an unregistered reason for this one file.
+        fit for those, chosen over inventing three more unregistered reasons
+        for this one file.
         """
         from clio_relay import door_errors
 
-        fault = door_errors.classify(exc, reason="configuration_error")
+        is_oversized = isinstance(exc, _RequestBodyTooLargeError)
+        reason = "payload_too_large" if is_oversized else "configuration_error"
+        fault = door_errors.classify(exc, reason=reason)
         status, document = door_errors.as_browser_gateway_error(fault)
         self._error_document(status, document)
 

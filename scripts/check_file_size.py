@@ -57,8 +57,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # replace the bare {"error": message} shape at the two exception-path
     # call sites, with the door_errors import kept function-local to avoid
     # a real import cycle (browser_gateway -> door_errors -> storage_runtime
-    # -> core_queue -> browser_gateway). A justified, minimal ratchet-up.
-    "src/clio_relay/browser_gateway.py": 860,
+    # -> core_queue -> browser_gateway). +25 more from the opus re-review's
+    # F7+F14: a typed _RequestBodyTooLargeError so the oversize branch gets
+    # its own payload_too_large reason instead of blanket configuration_error.
+    # A justified, minimal ratchet-up both times.
+    "src/clio_relay/browser_gateway.py": 885,
     "src/clio_relay/ci_validation.py": 3775,
     "src/clio_relay/cli.py": 19315,
     "src/clio_relay/cluster_config.py": 1847,
@@ -69,10 +72,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which
-    # the same slice's design doc explicitly keeps in place (§6.2). A
-    # justified, minimal ratchet-up rather than a same-file deletion this
-    # slice does not own.
-    "src/clio_relay/http_api.py": 3087,
+    # the same slice's design doc explicitly keeps in place (§6.2). +35 more
+    # from the opus re-review's F5/F15: a logger + a hardcoded fallback
+    # document so the handler survives door_errors itself failing, plus the
+    # corrected build_middleware_stack docstring. A justified, minimal
+    # ratchet-up rather than a same-file deletion this slice does not own.
+    "src/clio_relay/http_api.py": 3122,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,

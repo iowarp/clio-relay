@@ -9,6 +9,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -153,6 +154,8 @@ from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
+
+logger = logging.getLogger(__name__)
 
 ModelRecord = TypeVar("ModelRecord", bound=BaseModel)
 OWNED_SESSION_STATUS_SCHEMA = "clio-relay.owned-session-status.v1"
@@ -1009,25 +1012,57 @@ def _bound_owner_session_cluster_definition(
     return definition
 
 
+_FALLBACK_PROBLEM_DOCUMENT: dict[str, object] = {
+    "type": "urn:clio-relay:error:internal_error",
+    "title": "Internal error",
+    "status": 500,
+    "detail": "relay encountered an internal error.",
+    "schema_version": door_errors.SCHEMA_VERSION,
+    "reason": "internal_error",
+    "retryable": False,
+    "truncation": None,
+}
+
+
 async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
     """The ONE global exception handler (#231 R3, doc §6.2/§6.3).
 
-    Starlette dispatches to the most specific registered handler, and
-    FastAPI already registers one for ``HTTPException`` -- so this broader
-    ``Exception`` handler never intercepts it, and the 107 hand-rolled
-    ``raise HTTPException(...)`` sites here keep their exact shape and
-    status codes (doc §6.2: rewriting them is a later, deferred slice).
+    FastAPI's ``build_middleware_stack`` pulls any handler registered under
+    the bare ``Exception`` key OUT of ``ExceptionMiddleware`` and installs it
+    as ``ServerErrorMiddleware``'s own ``handler`` -- a separate middleware
+    layer, positioned OUTSIDE ``ExceptionMiddleware`` in the stack, not "the
+    most specific match" within one dispatch table. ``HTTPException`` stays
+    handled by ``ExceptionMiddleware`` (FastAPI's own default handler for
+    it), which is why the 107 hand-rolled ``raise HTTPException(...)`` sites
+    here keep their exact shape and status codes untouched (doc §6.2:
+    rewriting them is a later, deferred slice) -- they never reach this
+    function at all, by construction of where each handler lives, not by a
+    priority contest between them.
+
     This closes the rest of §3's "0 unclassified exceptions reach the wire"
     criterion: anything that escapes every hand-rolled site now routes
     through the same owner every other surface uses, instead of falling
-    through to FastAPI's bare default "Internal Server Error".
+    through to FastAPI's bare default "Internal Server Error". Guarded
+    end-to-end (F5): even if ``door_errors`` itself somehow fails to
+    classify or render ``exc`` -- a non-JSON-serializable value smuggled
+    into ``fault.data``, or a defect in door_errors.py itself -- this
+    handler still returns the fixed, hardcoded internal_error document
+    rather than let a second exception replace the first and collapse into
+    Starlette's own bodyless default.
     """
-    fault = door_errors.classify(exc)
-    return JSONResponse(
-        door_errors.as_http_problem(fault),
-        status_code=fault.http_status,
-        media_type="application/problem+json",
-    )
+    try:
+        fault = door_errors.classify(exc)
+        document = door_errors.as_http_problem(fault)
+        status_code = fault.http_status
+    except Exception:
+        logger.exception(
+            "clio-relay: door_errors could not classify/render %s; "
+            "falling back to the hardcoded internal_error document",
+            type(exc).__name__,
+        )
+        document = _FALLBACK_PROBLEM_DOCUMENT
+        status_code = 500
+    return JSONResponse(document, status_code=status_code, media_type="application/problem+json")
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
