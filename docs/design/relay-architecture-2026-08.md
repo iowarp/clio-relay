@@ -17,7 +17,7 @@ Kept current as slices land.
 |---|---|---|---|---|---|
 | **R1** | Port the file-size + class-in-function ratchet CI from clio-agent, wired into `local.file-size-ratchet`/`local.no-class-in-function` release-gate checks; delete dead `app_profiles/`, `package_adapters/`, stale `TASK.md` | **DONE** | `2713692` (ratchet CI), `429d3cb` (deletions) | `feat/231-owner-modules` | Establishes baselines (39 files file-size, 5 files class-in-function; §3). Deletion commit removed 62 unbaselined lines; zero baselined files touched. |
 | **R2** | This design doc; three pre-existing hygiene/gate fixes (`remote_connection.py` pyright, `runner.py` ruff E501, and — found by opus review B1 — a `ruff format` drift on `installation.py`/`remote_mcp.py`/`session_lifecycle.py`) reddening the ratchet-gated release path | **DONE** — re-review approved at `dca177d` | `ee3120f` (hygiene fix), `e078d89` (gate fix, B1), `dca177d` (opus review B1-B5 + F-list revision, approved) | `feat/231-owner-modules` | Net zero on `runner.py` (§10.1) and `installation.py` (B1); `remote_mcp.py` 5309→5308 and `session_lifecycle.py` 8328→8326 ratchet down (B1). |
-| **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; the fourth surface, `mcp_server.py`'s stdio `_error()`, is not wired (§6.5) | **DONE** | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3087 and `browser_gateway.py` 826→860 ratchet UP (net +24/+34), both justified in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5: remove/redesign first — evaluated and rejected here, since the growth is the one global handler / the fourth adapter's real structure, not a fix that could net negative). `door_errors.py` is new, 470 lines (cap 800). |
+| **R3** | `door_errors.py` — the one error-translation owner (`classify(exc) -> RelayFault`, `as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`), wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`; `mcp_server.py`'s stdio `_error()` (§6.1's third surface) is not wired, tracked as [#235](https://github.com/iowarp/clio-relay/issues/235) (§6.5) | **DONE** — opus re-review (F1-F16) applied in the same slice | `8d65b91` (pre-existing test-fake fix, found gating this slice), `c2a3a70` (door_errors + the three surfaces), `28e0fb4` (docs landing R3), `7a526e9` (re-review fixes F1-F16), plus the commit landing this revision | `feat/231-owner-modules` | `fastmcp_server.py` 1223→1212 (net −11, deletion outweighs the new call sites); `http_api.py` 3063→3122 and `browser_gateway.py` 826→885 ratchet UP across both passes (net +59/+59), justified in `scripts/check_file_size.py`'s own baseline comments each time (§2 ground rule 5: remove/redesign first — evaluated and rejected, since the growth is real structure — the one global handler, the fourth adapter, the F5 defense-in-depth guard, the F7 typed oversize marker — not a fix that could net negative). `door_errors.py` is new, 667 lines (cap 800). |
 | **R4** | `frp_link.py` (~300-400 lines) — `transport_probe.py`'s local-visitor frp logic + `frp_check.py`, the substrate modes (a)/(b) build on. Does **not** include `service_runtime.py`'s copy or `transport_probe.py`'s remote-script generation — that larger absorption is [#233](https://github.com/iowarp/clio-relay/issues/233), sequenced later (§4.3, §8.2, §10) | PLANNED | — | — | — |
 | **R5** | `frp_transport.py` — sibling `RelayTransport` implementations for modes (a)/(b) | PLANNED | — | — | — |
 | **R6** | `bounded_payload.py` — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1` | PLANNED | — | — | — |
@@ -537,31 +537,34 @@ its own status code — that is precisely the discipline the six-sites and
 
 **The seed `REASONS` set**, verified against real exception types and real
 raise sites rather than invented (adjusted from an initial candidate list —
-see corrections inline):
+see corrections inline). **`mcp_code` reflects the shipped, post-re-review
+values** — the opus review of the initial R3 landing (F1) found five of
+these custom codes squatting on the MCP SDK's own reserved `-32000..-32019`
+band (`mcp_types.jsonrpc.REQUEST_TIMEOUT` is `-32001`, the exact value
+`mcp_task_input_park_conflict` originally used — a client that discriminates
+by code alone, e.g. clio-agent's `tools/mcp_errors.py`, would have read a
+park conflict as a transport timeout and retried it with timeout semantics).
+Relay-owned custom codes now live in `-32050..-32059` instead; `-32007`
+(`storage_admission_refused`) is the one deliberate exception, kept because
+it is already shipped and pinned (`tests/test_production_admin_surfaces.py`):
 
-| reason | retryable | mcp_code (proposed unless noted) | http_status | grounded in |
+| reason | retryable | mcp_code (shipped unless noted) | http_status | grounded in |
 |---|---|---|---|---|
-| `mcp_task_input_park_conflict` | true | `-32001` | 409 | `TaskInputParkConflictError` (`errors.py:20-31`), raised `fastmcp_server.py:528-530` inside `RelayMcpRuntime._park_agent_input` — **note:** `errors.py:27-30`'s own docstring says "`RelayTasksExtension._park_agent_input`," which is stale; `_park_agent_input` is a method of `RelayMcpRuntime` (`fastmcp_server.py:284+`), `RelayTasksExtension` (`:915`) is unrelated. Worth fixing the docstring in R3. |
-| `mcp_task_conflict` | false | `INVALID_PARAMS` (`-32602`) | 409 | the task-identity-reuse `QueueConflictError` raised in `put_mcp_task` (`core_queue.py:7502-7504`). **Caveat**: bare `QueueConflictError` is raised 651 times across `core_queue.py` for unrelated invariants (lease-capacity gates, index migration, sealed-checkpoint validation, ...) — classifying by `isinstance(exc, QueueConflictError)` alone would over-match. R3 must key this reason off the MCP-task-scoped call path, not the exception type alone. |
+| `mcp_task_input_park_conflict` | true | `-32050` (was `-32001`, reallocated by F1) | 409 | `TaskInputParkConflictError` (`errors.py:20-31`), raised `fastmcp_server.py:528-530` inside `RelayMcpRuntime._park_agent_input` — **note:** `errors.py:27-30`'s docstring used to say "`RelayTasksExtension._park_agent_input`," which was stale; fixed in R3 to name the real owner, `RelayMcpRuntime`. |
+| `mcp_task_conflict` | false | `INVALID_PARAMS` (`-32602`) | 409 | the task-identity-reuse `QueueConflictError` raised in `put_mcp_task` (`core_queue.py:7502-7504`). **Caveat**: bare `QueueConflictError` is raised 651 times across `core_queue.py` for unrelated invariants (lease-capacity gates, index migration, sealed-checkpoint validation, ...) — classifying by `isinstance(exc, QueueConflictError)` alone would over-match. R3 keys this reason off the MCP-task-scoped call path (`classify(exc, reason="mcp_task_conflict")`), not the exception type alone. |
 | `mcp_task_status_reconciliation_failed` | true | `INTERNAL_ERROR` (`-32603`) | 500 | **already shipped, not just proposed**: `fastmcp_server.py:1003-1037`'s `_handle_get` catch-all already raises exactly `MCPError(code=INTERNAL_ERROR, ..., data={"reason": "mcp_task_status_reconciliation_failed", ...})` (citing #215). R3 adopts this reason string as-is into the frozen set rather than renaming shipped behavior. |
-| `jarvis_dispatch_refused` | false | `INVALID_PARAMS` (`-32602`) | 422 | `JarvisDispatchRefusal` (`jarvis_dispatch_failure.py:32-55`) — **a different shape than the other nine**: a frozen dataclass a durable `jarvis_run` result *carries*, not a raised-and-caught exception. `door_errors.classify()` needs an object-typed entry point (not just an `except`-clause dispatch) to route this one. |
+| `jarvis_dispatch_refused` | false | `INVALID_PARAMS` (`-32602`) | 422 | `JarvisDispatchRefusal` (`jarvis_dispatch_failure.py:32-55`) — **a different shape than the other nine**: a frozen dataclass a durable `jarvis_run` result *carries*, not a raised-and-caught exception. `door_errors.classify()` has an object-typed entry point (not just an `except`-clause dispatch) for it. **Declared, not yet emitted** (F11): no production call site constructs a durable `jarvis_run` result and hands its refusal to `classify()` today — this reason is forward-declared contract, exercised only by `tests/test_door_errors.py`'s own unit test. |
 | `not_found` | false | `INVALID_PARAMS` (`-32602`) | 404 | `NotFoundError` (`errors.py:34-35`), 14 raise sites. Existing precedent (`fastmcp_server.py:994-1001`) already maps it to `INVALID_PARAMS`, not a not-found-shaped code — R3 keeps that mapping rather than "fixing" shipped behavior as a side effect of a naming pass. |
 | `configuration_error` | false | `INVALID_PARAMS` (`-32602`) | 400 | `ConfigurationError` (`errors.py:12-13`), by far the heaviest-used typed exception: **1,084 raise sites across 35 files**. Genuinely heterogeneous (client-schema mismatches and server-side misconfiguration both raise it) — flagged here, not resolved, as a bucket that may need finer-grained sub-reasons in a later slice rather than one blanket mapping. |
-| `storage_admission_refused` | true | `-32007` | 507 | `StorageAdmissionError(StorageRuntimeError)` (`storage_runtime.py:76-77`). **Already shipped, not proposed**: `mcp_server.py` already emits `-32007` with `data={"storage_decision": ...}`, `http_api.py:1225,1431` already map it to HTTP 507; `cli.py` renders it via `_echo_storage_admission_error` (`:11355`, `:12792`, `:19310`). R3 adopts both codes as-is. |
-| `observation_timeout` | true | `-32002` | 504 | `ObservationTimeoutError` (`errors.py:8-9`), 11 raise sites split across four files: `cli.py` ×5, `mcp_stdio_validation.py` ×4, `remote_cli.py` ×1, `remote_connection.py` ×1 (corrected from an earlier "all in `cli.py`"). |
-| `launcher_resolution_failed` | false | `-32003` | 409 | the real function is `jarvis_mcp_command()` (`jarvis_mcp.py:236-346`), which raises bare `ValueError` at several sites (`:303`,`:312`,`:338`,`:342`,`:345`). **The gap**: `ValueError` is reused for dozens of unrelated failures throughout `jarvis_mcp.py` (contract loading, env parsing, discovery-cache validation), so type-based classification cannot isolate this reason on its own — either `jarvis_mcp_command` needs a distinct typed exception, or the two consumers (`http_api.py:1753-1758`, already mapping to HTTP 409, citing #228; `endpoint.py:5949-5951`, which today absorbs it into a bool+message tuple and never re-raises it at all) must convert before the door boundary. Out of scope for this document to fix; named so R3 doesn't silently assume a type-based mapping that doesn't work here. |
-| `internal_error` | false | `INTERNAL_ERROR` (`-32603`) | 500 | the fallback for any exception **not** in this table — new vocabulary, not an existing generic bucket (the one live use of `INTERNAL_ERROR` today, `fastmcp_server.py:1031`, already carries the *specific* `mcp_task_status_reconciliation_failed` reason, not a generic one — R3 keeps that specificity rather than collapsing it). Traceback logged server-side once via `logger.exception(...)` (the existing `fastmcp_server.py:1029` pattern), never placed on the wire — this is what makes §3's "0 unclassified exceptions reach the wire" criterion meetable: every exception gets *some* reason, `internal_error` is simply the one nothing else claims. |
+| `storage_admission_refused` | true | `-32007` | 507 | `StorageAdmissionError(StorageRuntimeError)` (`storage_runtime.py:76-77`). **Already shipped, not proposed**: `mcp_server.py` already emits `-32007` with `data={"storage_decision": ...}`, `http_api.py:1225,1431` already map it to HTTP 507; `cli.py` renders it via `_echo_storage_admission_error` (`:11355`, `:12792`, `:19310`). R3 adopts both codes as-is, and is the one reason F1's -32050..-32059 reallocation deliberately did NOT touch (see above). |
+| `storage_safety_violation` | false | `-32051` (reallocated by F1, was `-32008`) | 507 | a verification-pass gap beyond the seed ten: `StorageRuntimeViolation(StorageRuntimeError)` (`storage_runtime.py:80-81`), "raised after a running child crosses a durable storage safety boundary" — **not** a subclass of `StorageAdmissionError` above, so it needs its own reason rather than inheriting one. Not retryable — unlike admission, the boundary was already crossed, so retrying the same job does not undo it. Already caught by name at a public boundary, previously reasonless. |
+| `observation_timeout` | true | `-32052` (reallocated by F1, was `-32002`) | 504 | `ObservationTimeoutError` (`errors.py:8-9`), 11 raise sites split across four files: `cli.py` ×5, `mcp_stdio_validation.py` ×4, `remote_cli.py` ×1, `remote_connection.py` ×1 (corrected from an earlier "all in `cli.py`"). |
+| `launcher_resolution_failed` | false | `-32053` (reallocated by F1, was `-32003`) | 409 | the real function is `jarvis_mcp_command()` (`jarvis_mcp.py:236-346`), which raises bare `ValueError` at several sites (`:303`,`:312`,`:338`,`:342`,`:345`). **The gap**: `ValueError` is reused for dozens of unrelated failures throughout `jarvis_mcp.py` (contract loading, env parsing, discovery-cache validation), so type-based classification cannot isolate this reason on its own — either `jarvis_mcp_command` needs a distinct typed exception, or the two consumers (`http_api.py:1753-1758`, already mapping to HTTP 409, citing #228; `endpoint.py:5949-5951`, which today absorbs it into a bool+message tuple and never re-raises it at all) must convert before the door boundary. Out of scope for R3 to fix at the real site; named so R3 doesn't silently assume a type-based mapping that doesn't work here. **Declared, not yet emitted** (F11): the real #228 site is not wired through `door_errors` — this reason's shape is proven by an adapter-contract test on a synthetic route (`tests/test_door_errors.py`), not a live regression. |
+| `owner_session_identity_refused` | false | `-32054` (reallocated by F1, was `-32004`) | 422 | a verification-pass gap beyond the seed ten: `OwnerSessionIdentityError(RelayError)` (`job_identity.py:39-40+`), already caught by name at `http_api.py:1158-1159` and `:2965`, mapped to HTTP 422 today. |
+| `internal_error` | false | `INTERNAL_ERROR` (`-32603`) | 500 | the fallback for any exception **not** in this table — new vocabulary, not an existing generic bucket (the one live use of `INTERNAL_ERROR` today, `fastmcp_server.py:1031`, already carries the *specific* `mcp_task_status_reconciliation_failed` reason, not a generic one — R3 keeps that specificity rather than collapsing it). Traceback logged once, server-side, via `logger.exception(...)` (the existing `fastmcp_server.py:1029` pattern), never placed on the wire — this is what makes §3's "0 unclassified exceptions reach the wire" criterion meetable: every exception gets *some* reason, `internal_error` is simply the one nothing else claims. |
+| `payload_too_large` | false | `-32055` (F7+F14, added by the R3 re-review) | 413 | `browser_gateway.py`'s `_request_body`'s own oversize check (`length > MAX_REQUEST_BODY_BYTES`) — a distinct, well-known HTTP concept in its own right, given its own typed `_RequestBodyTooLargeError` marker rather than folded into `configuration_error`'s blanket 400 alongside three unrelated protocol-validation failures (chunked encoding, a malformed `Content-Length`, a body that ended early), which still map to `configuration_error`. |
 
-**Two gaps this verification pass found beyond the seed ten** (both already
-explicitly caught by name at a public boundary today, both currently
-reasonless): `StorageRuntimeViolation(StorageRuntimeError)`
-(`storage_runtime.py:80-81`, "raised after a running child crosses a durable
-storage safety boundary" — **not** a subclass of `StorageAdmissionError`
-above, so it needs its own `storage_safety_violation` reason rather than
-inheriting one) and `OwnerSessionIdentityError(RelayError)`
-(`job_identity.py:39-40+`, already caught by name at `http_api.py:1158-1159`
-and `:2965`, mapped to HTTP 422 today) needing `owner_session_identity_refused`.
-Both belong in R3's frozen set alongside the seed ten.
+All 13 rows are frozen-set members (`tests/test_door_errors.py::test_every_reason_is_registered`); §6.5 below tracks which are live-emitting vs. declared-but-not-yet-emitted contract.
 
 **Frozen-set discipline.** `REASONS` is a closed, tested set (a
 parametrized test asserting the frozen collection's exact membership, in
@@ -601,15 +604,65 @@ restatement of the same facts the MCP path carries as `mcp_code`/`message`.
 The remaining members are this document's extension: `schema_version`,
 `reason`, `retryable`, the optional `cluster`/`job_id`/`task_id` triple,
 `evidence` (an artifact-id *reference*, never inline bytes — §6.4's T3), and
-`truncation` (the `clio-relay.truncation.v1` record, §6.4, `null` when
-nothing was elided). `message`/`detail` stay ≤2000 chars (T1, §6.4); the
-whole envelope stays ≤8KiB (overflow drops `evidence` then `truncation`, in
-that order — the RFC 7807 core four and `reason`/`retryable` are never
-dropped). Tracebacks or raw `str(exc)` of an *unclassified* exception must
-never reach the wire — the existing `str(exc)`-of-a-typed-exception pattern
-(§6.1, 199/208 sites) is compatible with this contract once each site routes
-through `door_errors.classify()` instead of formatting the exception
-locally.
+`truncation` (the `clio-relay.truncation.v1` record, §6.4). `message`/`detail`
+stay ≤2000 chars (T1, §6.4, hard-truncated by `_bounded_text`) — `truncation`
+is `null` only when nothing was actually elided; a document whose `detail`
+*was* cut must never claim `"truncation": null` (F2, opus re-review — the
+original R3 landing hardcoded `null` unconditionally, a false statement on
+any truncated document).
+
+**Contract members always win (F4).** The envelope is built as
+`{**fault.data, <the fields above>}` — `fault.data`'s keys are spread
+first, and the RFC 7807/extension fields above are applied on top, so a
+colliding data key (e.g. a caller accidentally passing
+`data={"status": ...}`) can never shadow the real classified value.
+`as_mcp_error`'s `data={**fault.data, "reason": fault.reason}` follows the
+same discipline for `reason`.
+
+**The whole envelope stays ≤8KiB, with no silent pass-through (F3).**
+Overflow drops `evidence` first, then `truncation`, then any OTHER
+extension member in a deterministic order — a single oversized or
+non-JSON-serializable extension value that isn't literally named
+`evidence` must not sail through unbounded (the original enforcement's
+exact gap: an injected 9KiB member reached the wire at 11,213 bytes). Only
+once every extension member is gone does the fallback truncate `detail`
+itself and stamp `envelope_overflow: true`; the RFC 7807 core four plus
+`reason`/`retryable` are never dropped, and `detail` is never reduced to an
+empty string. Size is measured with `ensure_ascii=False` (F10) — the
+default `ensure_ascii=True` inflates every non-ASCII character to a 6-byte
+`\uXXXX` escape, materially overstating cost against the actual wire
+encoding.
+
+**Guarded against hostile input, not just malformed structure (F5).** A
+raising `__str__` on the classified exception, or a typed exception whose
+extension-data extraction (`.decision`/`.detail`) itself raises, must never
+escape `classify()` — on the HTTP surface an unguarded crash there would
+collapse straight into Starlette's `ServerErrorMiddleware`, replacing the
+original exception with a new, undiagnosable one and losing the typed
+response this contract exists to guarantee. `http_api.py`'s global handler
+adds a second, independent guard around the whole
+`classify()`/`as_http_problem()` call, falling back to a hardcoded
+`internal_error` document if `door_errors` itself somehow still fails.
+
+Tracebacks or raw `str(exc)` of an *unclassified* exception must never
+reach the wire — the existing `str(exc)`-of-a-typed-exception pattern
+(§6.1, 199/208 sites) is compatible with this contract once each site
+routes through `door_errors.classify()` instead of formatting the
+exception locally. `REASONS` itself is a `MappingProxyType` (F9) — read-only
+at the type level, not merely by convention — and `classify()`'s table
+injection point for tests is the private `_table=` keyword, not a public
+part of the contract.
+
+**Logging is "once" per this module, not per process (F6).** `internal_error`
+logs its traceback exactly once here, via `logger.exception`. On the HTTP
+surface, Starlette's `ServerErrorMiddleware` re-raises after sending the
+response it built from the handler's return value (by design, so a real
+ASGI server can still observe the error) and uvicorn logs that re-raise too
+— a second, server-side-only log line there is expected, not a defect. A
+streaming response that has already started sending bytes before an
+exception is never covered by this contract either way: nothing can rewrite
+headers/status once a response is underway, so a mid-stream failure stays a
+transport-level cut, not a `clio-relay.error.v1` document.
 
 ### 6.4 Byte budgets, three tiers
 
@@ -678,11 +731,12 @@ the elision point.
 
 | Item | Spec status | Code status | Issue |
 |---|---|---|---|
-| `door_errors.py` — one classify/adapt owner (four surfaces) | Specified (§6.2) | **DONE (R3)** — `classify`/`as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`; `mcp_server.py`'s stdio `_error()` (§6.2's fourth surface) is not wired through it yet, left unwired by R3's own scoping | tracked under #231 (R3) |
-| `clio-relay.error.v1` agent-facing envelope (RFC 7807 + extensions) | Specified (§6.3) | **DONE (R3)** — the core four plus `schema_version`/`reason`/`retryable`/`truncation`; `cluster`/`job_id`/`task_id`/`evidence` context threading is not yet wired at any call site (R6 scope, §6.4) | tracked under #231 (R3/R6) |
-| `REASONS` frozen set + membership test | Specified (§6.3) | **DONE (R3)** — 12 rows (the seed ten plus the two verification-pass gaps), `tests/test_door_errors.py::test_every_reason_is_registered` | tracked under #231 (R3) |
-| `browser_gateway.py`'s `_error()` routed through `door_errors.classify()` | Specified (§6.1, §6.2) | **DONE (R3)** for the two exception-path call sites (`:509`/`:580` `except ValueError`); the other 11 `_error()` call sites are access-control decisions with hardcoded statuses, out of R3's stated scope | tracked under #231 (R3) |
-| `clio-relay.truncation.v1` + head+tail T3 record-time bounding | Specified (§6.4) | Not started — no head+tail bound exists in `runner.py` today, only the tail-only, non-split `_BoundedTextTail` in `jarvis_provider.py`; `as_http_problem`'s `truncation` field exists and is wire-ready (R3) but nothing populates it yet | tracked under #231 (R6) |
+| `door_errors.py` — one classify/adapt owner (four surfaces) | Specified (§6.2) | **DONE (R3)** — `classify`/`as_mcp_error`/`as_http_problem`/`as_browser_gateway_error`, wired into `fastmcp_server.py`/`http_api.py`/`browser_gateway.py`. `mcp_server.py`'s stdio `_error()` (§6.1's *third* surface named, not the fourth — `browser_gateway.py` is §6.1's fourth surface; an earlier revision of this ledger mislabeled the two) is not wired through it yet | [iowarp/clio-relay#235](https://github.com/iowarp/clio-relay/issues/235), tracked under #231 (R3) |
+| `clio-relay.error.v1` agent-facing envelope (RFC 7807 + extensions) | Specified (§6.3) | **DONE (R3)** — the core four plus `schema_version`/`reason`/`retryable`/`truncation`, contract-members-always-win construction (F4), the ≤8KiB budget fully enforced with no silent pass-through (F3), hostile-input guards (F5); `cluster`/`job_id`/`task_id`/`evidence` context threading is not yet wired at any call site (R6 scope, §6.4) | tracked under #231 (R3/R6) |
+| `REASONS` frozen set + membership test | Specified (§6.3) | **DONE (R3)** — 13 rows (the seed ten, the two verification-pass gaps, and `payload_too_large` added by the re-review), `tests/test_door_errors.py::test_every_reason_is_registered`; all relay-owned MCP codes moved out of the SDK's reserved `-32000..-32019` band (F1). Two rows (`jarvis_dispatch_refused`, `launcher_resolution_failed`) are declared, tested contract with no production call site emitting them yet (F11) | tracked under #231 (R3) |
+| `browser_gateway.py`'s `_error()` routed through `door_errors.classify()` | Specified (§6.1, §6.2) | **DONE (R3)** for the two exception-path call sites (`:509`/`:580` `except ValueError`); the oversize branch specifically gets the dedicated `payload_too_large` reason (F7+F14), the other three `_request_body` failures stay `configuration_error`. The other 11 `_error()` call sites are access-control decisions with hardcoded statuses, out of R3's stated scope | tracked under #231 (R3) |
+| T1 refusal-text truncation (`_bounded_text`, §6.4) | Specified (§6.3/§6.4) | **DONE (R3 re-review, F2)** — `_bounded_text` returns a populated `clio-relay.truncation.v1` record whenever it actually cuts a message; `as_http_problem`'s `truncation` field reflects it (never a hardcoded `null` on a truncated document) | tracked under #231 (R3) |
+| `clio-relay.truncation.v1` + head+tail T3 record-time bounding | Specified (§6.4) | Not started — no head+tail bound exists in `runner.py` today, only the tail-only, non-split `_BoundedTextTail` in `jarvis_provider.py`. Distinct from the T1 row above, which R3's re-review did implement | tracked under #231 (R6) |
 | `TaskInputParkConflictError` typed conversion (replace the bare re-raise) | Specified (§6.1) | **DONE (R3)** — `fastmcp_server.py`'s `intercept_tool_call` now raises `door_errors.as_mcp_error(door_errors.classify(exc))`, closing the live hole | tracked under #231 (R3) |
 | `http_api.py`'s 107 `HTTPException` sites routed through `door_errors.classify()` | Specified (§6.2, explicitly deferred) | Not started | later slice beyond R3, named not tonight (§10) |
 | `release_pins.py`'s `PinSite` table + bump command + preflight | Specified (§7) | Not started | #198, tracked under #231 (R7) |
@@ -1174,6 +1228,29 @@ document.
   skips `bounded_error_detail()` would silently regress it. Worth a
   `max_length` on the field itself when R6's byte-budget work touches
   `models.py`.
+- **`browser_gateway.py`'s `_request_body` failures split 413 into 413 and
+  400.** Before R3, all four `_request_body` conditions (chunked encoding,
+  a malformed `Content-Length`, an oversized body, a body that ended early)
+  returned a uniform, ad hoc 413 via `_error(413, str(exc))`. R3's initial
+  landing routed all four to `door_errors.REASONS["configuration_error"]`
+  (400) uniformly — collapsing a real distinction (a genuinely oversized
+  body vs. three protocol-validation mistakes) into one bucket. The R3
+  re-review (F7+F14) restored 413 for the oversize condition specifically,
+  via a dedicated `payload_too_large` reason and a typed
+  `_RequestBodyTooLargeError` marker distinguishing it from the other
+  three, which remain 400/`configuration_error` — a genuine, permanent
+  deviation from the pre-R3 behavior for those three (not merely a
+  transient regression fixed later), since none of them has its own
+  dedicated reason in the frozen table today.
+- **`fastmcp_server.py:1031`'s original "traceback logged exactly once"
+  framing (§6.3) undercounted the HTTP surface.** `door_errors.classify()`
+  itself logs the traceback exactly once, but on the HTTP surface
+  Starlette's `ServerErrorMiddleware` re-raises after `_relay_unhandled_
+  exception_handler` returns (by design, so a real ASGI server can still
+  observe the error), and uvicorn logs that re-raise too — a second,
+  server-side-only log line there is expected, not a `door_errors` defect.
+  Corrected in §6.3 and `door_errors.py`'s own module docstring by the R3
+  re-review (F6).
 
 ## 12. Issue map
 
@@ -1187,6 +1264,7 @@ document.
 - [#228](https://github.com/iowarp/clio-relay/issues/228) — pinned jarvis-mcp-call endpoint resolves its launcher via the global `current` symlink
 - [#232](https://github.com/iowarp/clio-relay/issues/232) — **new, filed by this document.** Client-verifiable per-operation bring-up proof, superseding the connection-lifetime identity nonce (§8.3)
 - [#233](https://github.com/iowarp/clio-relay/issues/233) — **new, filed by this document.** Absorb `service_runtime.py`'s frp lifecycle + `transport_probe.py`'s remote-script generation into `frp_link.py`/`frp_remote_scripts.py` — explicitly separate from R4, not R4 itself (§4.3, §5, §8.2, §9, §10; B4 correction)
+- [#235](https://github.com/iowarp/clio-relay/issues/235) — **new, filed by the R3 re-review.** Route `mcp_server.py`'s stdio `_error()` through `door_errors` — the one call surface named in §6.1/§6.2 that R3's own scoping left unwired (§6.5)
 
 ## 13. Provenance
 
@@ -1224,6 +1302,28 @@ module name was also renamed to `release_pins.py` throughout (it collided
 with `session_lifecycle.py`'s unrelated `SessionApiReleaseIdentity` wire
 model). All second-pass corrections are marked inline at the sections they
 touch rather than only summarized here.
+
+A third pass (opus review of the R3 *implementation*, findings F1-F16, all
+verified by execution rather than reading) landed against the door_errors
+code this document specifies and corrected: a real MCP-SDK reserved-code
+collision (F1, five custom codes squatting on `-32000..-32019`); a false
+"`truncation`: null" statement on documents this document's own T1 budget
+had actually truncated (F2); an unenforced ≤8KiB budget that let a
+non-"evidence"-named oversized extension member through at 11,213 bytes
+(F3); contract fields losing to a colliding `fault.data` key instead of
+always winning (F4); a hostile `__str__`/typed-data-extractor collapsing
+classification entirely rather than degrading (F5); an over-broad "logged
+exactly once" claim that did not account for Starlette's own re-raise +
+uvicorn's second log line (F6); the browser_gateway 413→400 deviation this
+document itself did not yet record (F7); a mislabeled "fourth surface"
+(`mcp_server.py` vs. `browser_gateway.py`, §6.1/§6.5) and an un-owned
+residual for the one surface R3 left unwired (F14, closed by
+[#235](https://github.com/iowarp/clio-relay/issues/235)); plus F9/F10/F11/
+F13/F15/F16 (a mutable `REASONS`, `ensure_ascii=True` byte measurement, two
+declared-but-unemitted reasons presented as live regressions, a real port
+TOCTOU in the test suite, and the same dispatch-mechanism error repeated in
+two places). All third-pass corrections are marked inline at the sections
+they touch.
 
 Representative measurement commands:
 
