@@ -247,7 +247,7 @@ class RemoteConnection:
                 # Dev channel: auto-replace the dropped channel (recorded, one
                 # attempt) instead of requiring the explicit reconnect().
                 previous = self._transport
-                detail = None if previous is None else previous.failure_detail()
+                detail = previous.failure_detail()
                 self._release_locked(reason="dev_mode_auto_reconnect")
                 self._record(
                     channel_event(
