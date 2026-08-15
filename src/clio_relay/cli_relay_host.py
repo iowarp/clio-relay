@@ -26,37 +26,50 @@ call are NOT owned by any of the three modules above, and this slice does
 not relocate them:
 
 - ``_run_transport_validation``/``_run_frpc_connection_validation``/
-  ``_require_frp_server_addr`` (the validation-report bookkeeping and the
-  cluster-config guard) still live in ``cli.py`` itself. §5's target map
-  gives ``_run_transport_validation`` its own future, unsequenced row
-  (folding into ``frp_transport.py`` once that becomes its rightful owner);
-  moving its body here now would just relocate §2 ground rule 2's violation
-  from one file to another rather than fix it. ``_require_frp_server_addr``
-  and ``_run_frpc_connection_validation`` have no other callers, but they
-  share ``_attach_verified_remote_worker`` (a `cli.py` helper also used by
-  session teardown, well outside this group) as a private collaborator, so
-  splitting them out on their own would just add a second cross-module hop
-  for no structural gain.
-- The six cross-cutting helpers named in §4.1's fan-out table
-  (``_run_or_exit``, ``_require_cluster``, ``_write_failed_acceptance_report``,
+  ``_require_frp_server_addr``/``_echo_lines`` (the validation-report
+  bookkeeping, the cluster-config guard, and the report-line printer) still
+  live in ``cli.py`` itself. §5's target map gives ``_run_transport_validation``
+  its own future, unsequenced row (folding into ``frp_transport.py`` once
+  that becomes its rightful owner); moving its body here now would just
+  relocate §2 ground rule 2's violation from one file to another rather than
+  fix it. ``_require_frp_server_addr`` and ``_run_frpc_connection_validation``
+  have no other callers, but they share ``_attach_verified_remote_worker`` (a
+  `cli.py` helper also used by session teardown, well outside this group) as
+  a private collaborator, so splitting them out on their own would just add
+  a second cross-module hop for no structural gain.
+- The cross-cutting helpers named in §4.1's fan-out table (``_run_or_exit``,
+  ``_require_cluster``, ``_write_failed_acceptance_report``,
   ``_resolve_env_secret``, ``_acceptance_report_command``, plus
   ``default_report_path``) moved to ``cli_support.py`` in this same slice
-  (see that module's docstring); this group reaches the first five through
-  ``cli.py``'s re-export (below), since that is the one name every existing
-  test already patches, and imports ``default_report_path`` straight from
-  its true owner, ``validation_report.py``.
+  (see that module's docstring). This group applies the marker decorator,
+  ``@cli_support._acceptance_report_command``, straight from its true owner
+  -- a real attribute read that fires at this module's own import time, so it
+  cannot go through ``cli.py`` without recreating the cycle this module's
+  import discipline (below) exists to avoid. The other four reach
+  ``cli.py``'s thin forwarders at call time, same as the ``cli.py``-owned
+  helpers above, and ``default_report_path`` is imported straight from its
+  true owner, ``validation_report.py``, since it never moved.
 
-Both categories are reached the same way: ``import clio_relay.cli as cli``,
-then ``cli.<symbol>(...)`` at call time -- never a bare
+**The import-cycle discipline.** ``cli.py`` imports this module to register
+``relay_host_app``, and this module reaches back into ``cli.py`` for the
+collaborators named above -- a real cycle between the two files. It resolves
+cleanly because ``cli`` is never bound as a module-level name here at all
+(runtime or ``TYPE_CHECKING`` -- see the comment above ``relay_host_app``
+for why not even the latter earns its keep in this file): it is imported
+function-locally, as the first statement of each of this module's seven
+command bodies (``import clio_relay.cli as cli``, then ``cli.<symbol>(...)``),
+which defers the real import until a command actually runs and ``cli.py``
+has finished loading. There are **no** module-level attribute reads on
+``cli`` anywhere in this file -- the marker decorator above reads
+``cli_support`` instead, for exactly this reason. Never use a bare
 ``from clio_relay.cli import <symbol>``, which would silently un-patch every
 test targeting the owner and break the moment a future slice moves the
 symbol again (the coupling ``tests/test_cli_patch_seam.py`` polices, R8(i)).
-This creates a real import cycle with ``cli.py`` (which imports this module
-to register ``relay_host_app``); it resolves cleanly because every reference
-to ``cli.<symbol>`` here is deferred inside a function body, evaluated only
-once a real CLI invocation runs and ``cli.py`` has finished loading -- see
-``cli.py``'s own comment beside the ``import clio_relay.cli_relay_host``
-line for why that import is placed where it is.
+``tests/test_cli_relay_host.py``'s subprocess regression test is the guard
+for this discipline: in a fresh interpreter it asserts that
+``import clio_relay.cli_relay_host`` succeeds first, that
+``import clio_relay.cli`` succeeds first, and that ``python -m
+clio_relay.cli`` exits 0.
 """
 
 # Every `cli.<symbol>` reference below is intentional cross-module access to
@@ -68,6 +81,8 @@ line for why that import is placed where it is.
 # `reportUnusedFunction=false` for its own decorator-registered-only
 # handlers; this is the same "pyright can't see the real caller" shape, one
 # rule over.
+# Scope (F6, iowarp/clio-relay#231 R8(ii) review): covers only the audited
+# `cli.<seam>` private-attribute reads inside the seven command bodies below.
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
@@ -77,7 +92,7 @@ from typing import Annotated
 
 import typer
 
-import clio_relay.cli as cli
+import clio_relay.cli_support as cli_support
 import clio_relay.transport_probe as transport_probe
 from clio_relay.config import RelaySettings
 from clio_relay.relay_host import (
@@ -91,6 +106,17 @@ from clio_relay.relay_host import (
 )
 from clio_relay.validation_report import default_report_path
 
+# `cli` (`clio_relay.cli`) is deliberately NOT imported at module level, not
+# even under `TYPE_CHECKING`: nothing in this file uses `cli` in a type
+# annotation position, only as `cli.<symbol>(...)` expressions inside
+# function bodies -- each of the seven command bodies below re-imports it
+# locally as their first statement (`import clio_relay.cli as cli`), which
+# both binds it at runtime and gives pyright everything it needs within that
+# function's scope. A module-level `TYPE_CHECKING` import was tried and
+# measured dead weight here (both ruff `reportUnusedImport`/F401 and pyright
+# `reportUnusedImport` flag it, since there is no annotation consumer to
+# keep it alive) -- see the module docstring for the discipline this
+# supports.
 relay_host_app = typer.Typer(no_args_is_help=True)
 
 
@@ -111,6 +137,8 @@ def render_frps(
     ] = None,
 ) -> None:
     """Render an frps config with no relay application state."""
+    import clio_relay.cli as cli
+
     cli._run_or_exit(
         lambda: typer.echo(
             render_frps_config(
@@ -140,6 +168,7 @@ def render_frpc(
     proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
 ) -> None:
     """Render an frpc config using the cluster's configured frp transport."""
+    import clio_relay.cli as cli
 
     def action() -> None:
         definition = cli._require_cluster(cluster)
@@ -167,7 +196,7 @@ def render_frpc(
 
 
 @relay_host_app.command("test-frpc-connection")
-@cli._acceptance_report_command
+@cli_support._acceptance_report_command
 def test_frpc(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
@@ -208,6 +237,7 @@ def test_frpc(
     ] = None,
 ) -> None:
     """Run a live frpc login check and persist canonical success or failure evidence."""
+    import clio_relay.cli as cli
 
     canonical_report_path = validation_report or default_report_path(cluster)
 
@@ -284,6 +314,7 @@ def render_frpc_visitor(
     ] = "127.0.0.1",
 ) -> None:
     """Render a desktop-side frpc STCP visitor config."""
+    import clio_relay.cli as cli
 
     def action() -> None:
         definition = cli._require_cluster(cluster)
@@ -313,7 +344,7 @@ def render_frpc_visitor(
 
 
 @relay_host_app.command("test-http-transport")
-@cli._acceptance_report_command
+@cli_support._acceptance_report_command
 def test_http_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
@@ -353,6 +384,8 @@ def test_http_transport(
     ] = None,
 ) -> None:
     """Run an end-to-end HTTP health check through frp STCP."""
+    import clio_relay.cli as cli
+
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
         settings = RelaySettings.from_env()
@@ -408,7 +441,7 @@ def test_http_transport(
 
 
 @relay_host_app.command("test-direct-transport")
-@cli._acceptance_report_command
+@cli_support._acceptance_report_command
 def test_direct_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
@@ -458,6 +491,8 @@ def test_direct_transport(
     ] = None,
 ) -> None:
     """Run an end-to-end HTTP health check through frp XTCP direct transport."""
+    import clio_relay.cli as cli
+
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
         settings = RelaySettings.from_env()
@@ -514,7 +549,7 @@ def test_direct_transport(
 
 
 @relay_host_app.command("test-ssh-transport")
-@cli._acceptance_report_command
+@cli_support._acceptance_report_command
 def test_ssh_transport(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     local_bind_port: Annotated[int, typer.Option(help="Local desktop SSH-forward bind port.")],
@@ -556,6 +591,8 @@ def test_ssh_transport(
     ] = None,
 ) -> None:
     """Run an end-to-end HTTP health check through SSH local port forwarding."""
+    import clio_relay.cli as cli
+
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
         settings = RelaySettings.from_env()

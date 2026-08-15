@@ -40,6 +40,7 @@ import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_acceptance as bootstrap_acceptance
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
+import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_support as cli_support
 import clio_relay.cluster_config as cluster_config
 import clio_relay.core_queue as core_queue
@@ -766,13 +767,15 @@ BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS = 24.0
 BOOTSTRAP_REPAIR_DEADLINE_SECONDS = 55.0
 # R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
 # these two symbols' real bodies moved to cli_support.py -- see the longer
-# note beside `_write_failed_acceptance_report`'s re-export below. This one
-# must stay bound here, under this exact name, before `cli_relay_host` is
-# imported (a few lines down): its commands apply `@_acceptance_report_command`
-# as a decorator, which cli_relay_host.py reaches as `@cli._acceptance_report_command`
-# -- a real attribute lookup evaluated at cli_relay_host.py's own import time,
-# not deferred to a later call, so the name must already exist on this module
-# by then.
+# note beside `_write_failed_acceptance_report`'s re-export below. Bound
+# here, under this exact name, purely for cli.py's own ~15 other command
+# groups' `@_acceptance_report_command` decorator applications (a real
+# attribute lookup evaluated at each of *those* def sites' module-load time,
+# so this must be defined before the first one runs). `cli_relay_host.py`
+# does NOT reach this through `cli.py` -- its own four commands apply
+# `@cli_support._acceptance_report_command` straight from the owner (see
+# that module's docstring), specifically to avoid the import-cycle hazard
+# a `cli.<symbol>` module-level decorator read would create.
 _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = (
     cli_support._ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -798,14 +801,6 @@ release_app = typer.Typer(no_args_is_help=True)
 storage_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
-# `cli_relay_host` is imported here, not with the top-of-file module-attribute
-# imports, because its commands apply `@cli._acceptance_report_command`
-# (defined just above) as a decorator -- a real attribute read at
-# cli_relay_host.py's own import time. Importing it any earlier would read
-# that name off a still-partially-initialized `cli` module and raise
-# AttributeError; importing it later just delays add_typer for no reason.
-import clio_relay.cli_relay_host as cli_relay_host  # noqa: E402
-
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
@@ -12296,9 +12291,18 @@ def _submit_managed_job(job: RelayJob) -> RelayJob:
         raise typer.Exit(code=1) from exc
 
 
-_echo_storage_admission_error = (
-    cli_support._echo_storage_admission_error  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-)
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): a bare object re-binding
+# (`_echo_storage_admission_error = cli_support._echo_storage_admission_error`)
+# captures the owner's function object at import time, so
+# `monkeypatch.setattr(cli_support, "_echo_storage_admission_error", ...)`
+# never reaches this module's own two call sites -- a silent no-op patch.
+# A thin forwarder re-reads `cli_support.<symbol>` on every call, so both
+# `monkeypatch.setattr(cli_support, ...)` and the pre-existing
+# `monkeypatch.setattr(cli, ...)` patch points bite.
+def _echo_storage_admission_error(error: StorageAdmissionError) -> None:
+    cli_support._echo_storage_admission_error(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        error
+    )
 
 
 def _record_page_payload(
@@ -18419,17 +18423,48 @@ def _new_cleanup_acceptance_report(
 
 
 # R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
-# these six symbols' real bodies moved to cli_support.py -- the doc's
-# cli_support.py row for cli.py's shared-plumbing fan-out. cli.py keeps each
-# bound under its original name at its original definition site so its own
-# ~200 existing bare-name call sites and every existing
-# `monkeypatch.setattr(cli, "_X", ...)` test patch keep working unchanged;
-# migrating cli.py's other 15 sub-apps onto `cli_support.X(...)` directly is
-# separate, unsequenced future work, not something this slice's `relay-host`
-# extraction should absorb as a side effect.
-_write_failed_acceptance_report = (
-    cli_support._write_failed_acceptance_report  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-)
+# this symbol's real body moved to cli_support.py -- the doc's cli_support.py
+# row for cli.py's shared-plumbing fan-out. cli.py keeps it defined under its
+# original name at its original definition site so its own ~200 existing
+# bare-name call sites keep working unchanged; migrating cli.py's other 15
+# sub-apps onto `cli_support.X(...)` directly is separate, unsequenced future
+# work, not something this slice's `relay-host` extraction should absorb as
+# a side effect.
+#
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): this is a thin forwarder,
+# not a bare object re-binding (`_write_failed_acceptance_report =
+# cli_support._write_failed_acceptance_report`). The bare form captures the
+# owner's function object at import time, so
+# `monkeypatch.setattr(cli_support, "_write_failed_acceptance_report", ...)`
+# never reaches callers here -- a silent no-op patch that only
+# `monkeypatch.setattr(cli, "_write_failed_acceptance_report", ...)` could
+# see. Re-reading `cli_support.<symbol>` on every call restores both patch
+# directions.
+def _write_failed_acceptance_report(
+    *,
+    path: Path,
+    scenario: str,
+    cluster: str,
+    check_id: str,
+    summary: str,
+    error: BaseException,
+    launcher: str | None,
+    install_source: str | None,
+    artifact: Path | None,
+    partial_report: LiveValidationReport | None = None,
+) -> None:
+    cli_support._write_failed_acceptance_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path=path,
+        scenario=scenario,
+        cluster=cluster,
+        check_id=check_id,
+        summary=summary,
+        error=error,
+        launcher=launcher,
+        install_source=install_source,
+        artifact=artifact,
+        partial_report=partial_report,
+    )
 
 
 def _load_current_acceptance_report(
@@ -18603,7 +18638,16 @@ def _run_remote_or_exit(
     )
 
 
-_require_cluster = cli_support._require_cluster  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._require_cluster` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_require_cluster", ...)` and
+# `monkeypatch.setattr(cli, "_require_cluster", ...)` effective.
+def _require_cluster(cluster: str) -> ClusterDefinition:
+    return cli_support._require_cluster(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster
+    )
 
 
 def _session_transition_lock(*, cluster: str, session_id: str) -> FileLock:
@@ -18684,9 +18728,16 @@ def _require_frp_server_addr(  # pyright: ignore[reportUnusedFunction]
     )
 
 
-_resolve_env_secret = (
-    cli_support._resolve_env_secret  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-)
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._resolve_env_secret` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_resolve_env_secret", ...)` and
+# `monkeypatch.setattr(cli, "_resolve_env_secret", ...)` effective.
+def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
+    return cli_support._resolve_env_secret(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        value, env_name, label
+    )
 
 
 def _environment_references(items: list[str] | None) -> dict[str, str]:
@@ -18756,4 +18807,11 @@ def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
     return f":uses-{hashlib.sha256(encoded).hexdigest()}"
 
 
-_run_or_exit = cli_support._run_or_exit  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._run_or_exit` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_run_or_exit", ...)` and
+# `monkeypatch.setattr(cli, "_run_or_exit", ...)` effective.
+def _run_or_exit(action: Callable[[], None]) -> None:
+    cli_support._run_or_exit(action)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

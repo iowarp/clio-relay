@@ -118,7 +118,21 @@ RATCHET_BASELINE: dict[str, int] = {
     # shape `http_api.py`'s own `reportUnusedFunction=false` already covers
     # for decorator-registered-only route handlers. The largest single
     # ratchet-down of the #231 campaign so far.
-    "src/clio_relay/cli.py": 18759,
+    # #231 R8(ii) review fix (F3/F4): +58 net lines -- the five cli_support.py
+    # re-exports (`_run_or_exit`, `_require_cluster`,
+    # `_write_failed_acceptance_report`, `_resolve_env_secret`,
+    # `_echo_storage_admission_error`) become thin forwarders instead of bare
+    # object re-bindings: a bare `_run_or_exit = cli_support._run_or_exit`
+    # captures the owner's function object at import time, so
+    # `monkeypatch.setattr(cli_support, "_run_or_exit", ...)` never reached a
+    # caller holding the old reference -- a silent no-op that only
+    # `monkeypatch.setattr(cli, ...)` could see. A forwarder re-reads
+    # `cli_support.<symbol>` on every call, restoring both patch directions.
+    # Interim layer, not a final shape -- net deletion arrives when the other
+    # ~15 sub-apps migrate onto `cli_support.X(...)` directly (unsequenced
+    # future work, same as the R8(ii) note above). A justified, minimal
+    # ratchet-up.
+    "src/clio_relay/cli.py": 18817,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

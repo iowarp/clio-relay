@@ -25,14 +25,48 @@ was extracted, per that module's own docstring. It is deliberately
 independent of any future refactor's own bookkeeping -- it reads the live
 AST of the guarded source files, so a regression is caught the moment it
 lands, without needing anyone to remember this list exists.
+
+**F3/F4 sabotage guard (iowarp/clio-relay#231 R8(ii) review).** The static
+AST checks above prove `cli.py` and `cli_relay_host.py` never bare-import an
+audited collaborator; they do not prove a *forwarder* actually forwards. The
+five ``cli_support.py`` collaborators `cli.py` still exposes under their
+original names (`_run_or_exit`, `_require_cluster`,
+`_write_failed_acceptance_report`, `_resolve_env_secret`,
+`_echo_storage_admission_error`) used to be bound as bare object re-exports
+(`_run_or_exit = cli_support._run_or_exit`), which capture the owner's
+function *object* at import time -- `monkeypatch.setattr(cli_support,
+"_run_or_exit", fake)` after that point never reaches a caller holding the
+old reference, a silent no-op. They are now thin forwarders that re-read
+`cli_support.<symbol>` on every call. The tests below prove both patch
+directions bite on a real command's actual call path (not a synthetic direct
+call): `monkeypatch.setattr(cli_support, "<name>", fake)` and
+`monkeypatch.setattr(cli, "<name>", fake)` must each change what a real
+`relay-host` (or, for `_echo_storage_admission_error`, `agent run`) command
+does. This is why `test_cli_patch_seam` grew from 63 parametrized cases
+(R8(i), one guarded caller) to 124 (R8(ii) added `cli_relay_host` as a
+second guarded caller to the negative-half AST check) to 124 + these 10
+new sabotage cases in this fix.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
+from typer.testing import CliRunner
+
+import clio_relay.cli_support as cli_support
+from clio_relay import cli
+from clio_relay.cli import app
+from clio_relay.errors import ConfigurationError
+from clio_relay.storage_policy import StorageDecision, StorageReason
+from clio_relay.storage_runtime import StorageAdmissionError
+from tests.test_cli import (
+    _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
 
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "clio_relay"
 
@@ -153,7 +187,7 @@ def _module_attribute_imports(tree: ast.Module) -> set[str]:
 
 
 _AUDITED_MODULE_SYMBOLS: tuple[tuple[str, str], ...] = tuple(
-    {(module, symbol) for module, symbol, _caller in AUDITED_COLLABORATORS}
+    dict.fromkeys((module, symbol) for module, symbol, _caller in AUDITED_COLLABORATORS)
 )
 
 
@@ -216,3 +250,241 @@ def test_audited_collaborators_cover_every_family_named_in_the_design_doc() -> N
     """Sanity: the inventory isn't accidentally empty or truncated."""
     assert len(AUDITED_COLLABORATORS) == 61
     assert len({module for module, _symbol, _caller in AUDITED_COLLABORATORS}) == 32
+
+
+# ---------------------------------------------------------------------------
+# F3/F4 sabotage guard: the five cli.py forwarders for cli_support.py's
+# collaborators (see the module docstring). Each pair below drives a real
+# command through `CliRunner` -- not a synthetic direct call -- and proves
+# the patched fake, not the real body, actually ran.
+# ---------------------------------------------------------------------------
+
+
+def _storage_admission_error() -> StorageAdmissionError:
+    decision = StorageDecision(
+        allowed=False, reason=StorageReason.CORE_HIGH_WATER, message="storage refused"
+    )
+    return StorageAdmissionError(decision)
+
+
+def test_sabotage_run_or_exit_via_cli_support(monkeypatch: MonkeyPatch) -> None:
+    """Patching `cli_support._run_or_exit` must reach `relay-host
+    render-frps-config`'s real call path through `cli.py`'s forwarder."""
+    calls: list[str] = []
+
+    def fake_run_or_exit(action: object) -> None:
+        del action  # the real action (which would render the config) is never called
+        calls.append("fake")
+
+    monkeypatch.setattr(cli_support, "_run_or_exit", fake_run_or_exit)
+    result = CliRunner().invoke(app, ["relay-host", "render-frps-config"])
+    assert calls == ["fake"], result.output
+    assert "bindPort" not in result.output
+
+
+def test_sabotage_run_or_exit_via_cli(monkeypatch: MonkeyPatch) -> None:
+    """The pre-existing patch direction (`monkeypatch.setattr(cli, ...)`)
+    must still bite after the object re-export became a forwarder."""
+    calls: list[str] = []
+
+    def fake_run_or_exit(action: object) -> None:
+        del action
+        calls.append("fake")
+
+    monkeypatch.setattr(cli, "_run_or_exit", fake_run_or_exit)
+    result = CliRunner().invoke(app, ["relay-host", "render-frps-config"])
+    assert calls == ["fake"], result.output
+    assert "bindPort" not in result.output
+
+
+def _fake_resolve_env_secret_cli_support(value: str | None, env_name: str, label: str) -> str:
+    del value, env_name, label
+    return "SABOTAGE-CLI-SUPPORT-TOKEN"
+
+
+def _fake_resolve_env_secret_cli(value: str | None, env_name: str, label: str) -> str:
+    del value, env_name, label
+    return "SABOTAGE-CLI-TOKEN"
+
+
+def test_sabotage_resolve_env_secret_via_cli_support(monkeypatch: MonkeyPatch) -> None:
+    """Patching `cli_support._resolve_env_secret` must reach `relay-host
+    render-frps-config`'s rendered output through `cli.py`'s forwarder."""
+    monkeypatch.setattr(cli_support, "_resolve_env_secret", _fake_resolve_env_secret_cli_support)
+    result = CliRunner().invoke(app, ["relay-host", "render-frps-config"])
+    assert result.exit_code == 0, result.output
+    assert "SABOTAGE-CLI-SUPPORT-TOKEN" in result.output
+
+
+def test_sabotage_resolve_env_secret_via_cli(monkeypatch: MonkeyPatch) -> None:
+    """The pre-existing patch direction must still bite."""
+    monkeypatch.setattr(cli, "_resolve_env_secret", _fake_resolve_env_secret_cli)
+    result = CliRunner().invoke(app, ["relay-host", "render-frps-config"])
+    assert result.exit_code == 0, result.output
+    assert "SABOTAGE-CLI-TOKEN" in result.output
+
+
+def test_sabotage_require_cluster_via_cli_support(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Patching `cli_support._require_cluster` must reach `relay-host
+    render-frpc-config`'s real call path through `cli.py`'s forwarder."""
+    monkeypatch.chdir(tmp_path)
+
+    def fake_require_cluster(cluster: str) -> object:
+        raise ConfigurationError(f"SABOTAGE-CLI-SUPPORT-REQUIRE-CLUSTER:{cluster}")
+
+    monkeypatch.setattr(cli_support, "_require_cluster", fake_require_cluster)
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "render-frpc-config", "--cluster", "ares", "--local-port", "1"],
+    )
+    assert result.exit_code == 1
+    assert "SABOTAGE-CLI-SUPPORT-REQUIRE-CLUSTER:ares" in result.output
+
+
+def test_sabotage_require_cluster_via_cli(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """The pre-existing patch direction must still bite."""
+    monkeypatch.chdir(tmp_path)
+
+    def fake_require_cluster(cluster: str) -> object:
+        raise ConfigurationError(f"SABOTAGE-CLI-REQUIRE-CLUSTER:{cluster}")
+
+    monkeypatch.setattr(cli, "_require_cluster", fake_require_cluster)
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "render-frpc-config", "--cluster", "ares", "--local-port", "1"],
+    )
+    assert result.exit_code == 1
+    assert "SABOTAGE-CLI-REQUIRE-CLUSTER:ares" in result.output
+
+
+def test_sabotage_write_failed_acceptance_report_via_cli_support(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """Patching `cli_support._write_failed_acceptance_report` must reach
+    `relay-host test-frpc-connection`'s real preflight-failure call path
+    through `cli.py`'s forwarder: a genuine unknown-cluster failure drives
+    the real except-block call, and the fake's own report content -- not the
+    real canonical failure envelope -- lands on disk."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    report_path = tmp_path / "report.json"
+
+    def fake_write(**kwargs: object) -> None:
+        path = kwargs["path"]
+        assert isinstance(path, Path)
+        path.write_text(json.dumps({"sentinel": "cli_support-sabotage"}), encoding="utf-8")
+
+    monkeypatch.setattr(cli_support, "_write_failed_acceptance_report", fake_write)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-frpc-connection",
+            "--cluster",
+            "does-not-exist",
+            "--local-port",
+            "1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {
+        "sentinel": "cli_support-sabotage"
+    }
+
+
+def test_sabotage_write_failed_acceptance_report_via_cli(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The pre-existing patch direction must still bite."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    report_path = tmp_path / "report.json"
+
+    def fake_write(**kwargs: object) -> None:
+        path = kwargs["path"]
+        assert isinstance(path, Path)
+        path.write_text(json.dumps({"sentinel": "cli-sabotage"}), encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_write_failed_acceptance_report", fake_write)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relay-host",
+            "test-frpc-connection",
+            "--cluster",
+            "does-not-exist",
+            "--local-port",
+            "1",
+            "--validation-report",
+            str(report_path),
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {"sentinel": "cli-sabotage"}
+
+
+def test_sabotage_echo_storage_admission_error_via_cli_support(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """`_echo_storage_admission_error` has no `relay-host` caller (see
+    `cli_relay_host.py`'s own docstring) -- its two real callers are
+    elsewhere in `cli.py` (`_submit_managed_job` and the JARVIS MCP call
+    path). `agent run` is the lightest real command that reaches
+    `_submit_managed_job`; a fake managed queue forces the real
+    `StorageAdmissionError` handling path without needing live storage
+    infrastructure. Patching `cli_support._echo_storage_admission_error`
+    must reach it through `cli.py`'s forwarder."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("hi", encoding="utf-8")
+
+    class _FakeQueue:
+        def submit_job(self, job: object) -> object:
+            del job
+            raise _storage_admission_error()
+
+    def _fake_echo_cli_support(error: StorageAdmissionError) -> None:
+        del error
+        print("SABOTAGE-CLI-SUPPORT-ECHO")  # noqa: T201
+
+    monkeypatch.setattr(cli, "_managed_queue_from_env", lambda: _FakeQueue())
+    monkeypatch.setattr(cli_support, "_echo_storage_admission_error", _fake_echo_cli_support)
+    result = CliRunner().invoke(
+        app, ["agent", "run", "--cluster", "ares", "--prompt", str(prompt_file)]
+    )
+    assert result.exit_code == 1
+    assert "SABOTAGE-CLI-SUPPORT-ECHO" in result.output
+    assert "storage_admission_denied" not in result.output
+
+
+def test_sabotage_echo_storage_admission_error_via_cli(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The pre-existing patch direction must still bite."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("hi", encoding="utf-8")
+
+    class _FakeQueue:
+        def submit_job(self, job: object) -> object:
+            del job
+            raise _storage_admission_error()
+
+    def _fake_echo_cli(error: StorageAdmissionError) -> None:
+        del error
+        print("SABOTAGE-CLI-ECHO")  # noqa: T201
+
+    monkeypatch.setattr(cli, "_managed_queue_from_env", lambda: _FakeQueue())
+    monkeypatch.setattr(cli, "_echo_storage_admission_error", _fake_echo_cli)
+    result = CliRunner().invoke(
+        app, ["agent", "run", "--cluster", "ares", "--prompt", str(prompt_file)]
+    )
+    assert result.exit_code == 1
+    assert "SABOTAGE-CLI-ECHO" in result.output
+    assert "storage_admission_denied" not in result.output

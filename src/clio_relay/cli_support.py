@@ -38,6 +38,9 @@ name cli.py always exposed it under.
 # reference from inside this file. `http_api.py` sets the same
 # `reportUnusedFunction=false` for its own decorator-registered-only route
 # handlers; this is the same "the real caller is invisible from here" shape.
+# Scope (F6, iowarp/clio-relay#231 R8(ii) review): covers only this module's
+# re-exported entry points (called through cli.py's forwarders/re-exports
+# and cli_relay_host.py's direct `cli_support.<symbol>` reads).
 # pyright: reportUnusedFunction=false
 
 from __future__ import annotations

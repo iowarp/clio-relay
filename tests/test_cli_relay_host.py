@@ -19,11 +19,29 @@ R8(i) idiom, unaffected by which file calls it), and
 ``cli._attach_verified_remote_worker`` still patches ``cli.py`` because that
 helper was never part of this extraction -- it stays in ``cli.py``, shared
 with session teardown (see ``cli_relay_host.py``'s own docstring for why).
+
+**F2 subprocess regression guard (iowarp/clio-relay#231 R8(ii) review).**
+``cli.py`` and ``cli_relay_host.py`` form a real, deliberate import cycle
+(see ``cli_relay_host.py``'s own docstring for the discipline that resolves
+it). Before that fix, importing ``clio_relay.cli_relay_host`` before
+``clio_relay.cli`` in a fresh interpreter raised ``AttributeError:
+partially initialized module 'clio_relay.cli_relay_host' has no attribute
+'relay_host_app'``, and ``python -m clio_relay.cli`` regressed from exit 0
+to exit 1 for the same underlying reason (``runpy`` executes ``cli.py`` as
+``__main__``, a distinct module object from ``clio_relay.cli`` in
+``sys.modules``, so ``cli_relay_host.py``'s import of ``clio_relay.cli``
+mid-way through ``__main__``'s own load re-enters the same cycle). The
+three subprocess tests at the bottom of this file are the regression guard:
+each spawns a fresh interpreter (in-process re-import cannot reproduce this
+-- ``sys.modules`` caching would hide it after the first successful import
+in any order) and asserts the exact shape the review measured as broken.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -581,3 +599,63 @@ def test_cli_direct_transport_is_strict_xtcp_by_default(
 
     assert result.exit_code == 0
     assert calls[0]["allow_stcp_fallback"] is False
+
+
+# ---------------------------------------------------------------------------
+# F2 subprocess regression guard (iowarp/clio-relay#231 R8(ii) review) -- see
+# the module docstring. Each test spawns a fresh interpreter: importing
+# either module inside THIS test process would reuse whatever import order
+# pytest's own collection already established, which can never reproduce a
+# reverse-first regression.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_relay_host_reverse_first_import_succeeds() -> None:
+    """A fresh interpreter importing ``clio_relay.cli_relay_host`` before
+    ``clio_relay.cli`` must succeed. Before the F2 fix this raised
+    ``AttributeError: partially initialized module 'clio_relay.cli_relay_host'
+    has no attribute 'relay_host_app'`` -- ``cli_relay_host.py`` read
+    ``cli.py`` as a module-level runtime import, and ``cli.py``'s own
+    module-level import of ``cli_relay_host`` (to register
+    ``relay_host_app``) re-entered a still-loading ``cli.py``.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import clio_relay.cli_relay_host"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cli_first_import_still_succeeds() -> None:
+    """A fresh interpreter importing ``clio_relay.cli`` first must also
+    succeed -- the direction that already worked before the F2 fix, guarded
+    here so a future change to the cycle can't silently break it while
+    fixing (or re-breaking) the reverse direction.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import clio_relay.cli"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cli_module_invocation_exits_zero() -> None:
+    """``python -m clio_relay.cli`` -- the real end-user launch path -- must
+    exit 0. ``runpy`` executes ``cli.py`` as ``__main__``, a module object
+    distinct from ``clio_relay.cli`` in ``sys.modules``; ``cli_relay_host.py``
+    importing ``clio_relay.cli`` mid-way through ``__main__``'s own load
+    then re-enters the same cycle the reverse-first-import test above
+    guards, so this regressed the same way: exit 0 -> exit 1 with the same
+    ``AttributeError``, before the F2 fix.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "clio_relay.cli"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
