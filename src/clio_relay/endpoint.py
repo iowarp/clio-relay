@@ -62,7 +62,7 @@ from clio_relay.jarvis_run_environment import (
 )
 from clio_relay.models import (
     CLIO_PROVENANCE_METADATA_KEY,
-    REGISTERED_JARVIS_USER_CONTRACT,
+    REGISTERED_JARVIS_EXECUTION_CONTRACTS,
     ArtifactRef,
     EndpointRegistration,
     EndpointRole,
@@ -5947,7 +5947,7 @@ def _trusted_jarvis_mcp_route(
     if job.spec.tool != expected_tool:
         return False, f"MCP tool is not the owned {expected_tool} operation"
     if job.spec.expected_registered_contract is not None:
-        if job.spec.expected_registered_contract != REGISTERED_JARVIS_USER_CONTRACT:
+        if job.spec.expected_registered_contract not in REGISTERED_JARVIS_EXECUTION_CONTRACTS:
             return False, "registered MCP call does not use the supported JARVIS contract"
         if job.spec.expected_jarvis_cd_lock_binding is not None:
             return False, "registered JARVIS route also supplied a built-in lock pin"

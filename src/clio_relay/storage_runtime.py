@@ -27,7 +27,13 @@ from clio_relay.core_queue import (
     QueueSealRequiresExclusive,
     _job_matches_mcp_admission_class,  # pyright: ignore[reportPrivateUsage]
 )
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
+from clio_relay.errors import (
+    ConfigurationError,
+    NotFoundError,
+    PublicMessageError,
+    QueueConflictError,
+    RelayError,
+)
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (
     TERMINAL_STATES,
@@ -65,12 +71,17 @@ _MIGRATION_FIXED_BATCHES = 32
 QUEUE_SEAL_LIFETIME_TIMEOUT_SECONDS = 30.0
 
 
-class StorageRuntimeError(RelayError):
+class StorageRuntimeError(PublicMessageError, RelayError):
     """Base class for a stable machine-readable storage runtime failure."""
 
     def __init__(self, decision: StorageDecision) -> None:
         self.decision = decision
         super().__init__(json.dumps(decision.to_dict(), sort_keys=True, separators=(",", ":")))
+
+    @property
+    def public_message(self) -> str:
+        """Return the storage policy's relay-authored course correction."""
+        return self.decision.message
 
 
 class StorageAdmissionError(StorageRuntimeError):

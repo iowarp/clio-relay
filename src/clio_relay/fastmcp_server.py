@@ -44,7 +44,7 @@ from mcp_types.jsonrpc import HEADER_MISMATCH
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import PrivateAttr
 
-from clio_relay import __version__, door_errors
+from clio_relay import __version__, door_error_adapters, door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError, TaskInputParkConflictError
@@ -993,7 +993,7 @@ class RelayTasksExtension(ServerExtension):
         try:
             return await asyncio.to_thread(self._runtime.queue.get_mcp_task, task_id)
         except NotFoundError as exc:
-            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
+            raise door_error_adapters.as_mcp_error(door_errors.classify(exc)) from exc
 
     async def _handle_get(
         self,
@@ -1015,7 +1015,7 @@ class RelayTasksExtension(ServerExtension):
             # catch-all), so the traceback is logged here or it is lost
             # entirely.
             logger.exception("relay could not reconcile task %r's status", params.task_id)
-            raise door_errors.as_mcp_error(
+            raise door_error_adapters.as_mcp_error(
                 door_errors.classify(
                     exc,
                     reason="mcp_task_status_reconciliation_failed",
@@ -1098,7 +1098,7 @@ class RelayTasksExtension(ServerExtension):
             # never reaches the broader except below) is what makes this a
             # non-heuristic discrimination rather than a message/keyword
             # match against the genuine task-identity conflict below.
-            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
+            raise door_error_adapters.as_mcp_error(door_errors.classify(exc)) from exc
         except QueueConflictError as exc:
             # relay#218, grounding now owned by
             # door_errors.REASONS["mcp_task_conflict"]'s docstring.
@@ -1111,7 +1111,7 @@ class RelayTasksExtension(ServerExtension):
                 if isinstance(outcome.structured_content, dict)
                 else None
             )
-            raise door_errors.as_mcp_error(
+            raise door_error_adapters.as_mcp_error(
                 door_errors.classify(
                     exc,
                     reason="mcp_task_conflict",

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 
+from clio_relay import door_errors
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -497,6 +499,11 @@ def test_input_ingest_body_limit_rejects_chunked_payload_before_downstream() -> 
     assert downstream_called is False
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 413
+    assert dict(sent[0]["headers"])[b"content-type"] == b"application/problem+json"
+    oversized = json.loads(sent[1]["body"])
+    assert oversized["schema_version"] == door_errors.SCHEMA_VERSION
+    assert oversized["reason"] == "payload_too_large"
+    assert oversized["status"] == 413
 
 
 def test_input_ingest_body_limit_authenticates_before_receiving_body() -> None:
@@ -548,6 +555,10 @@ def test_input_ingest_body_limit_authenticates_before_receiving_body() -> None:
     assert downstream_called is False
     assert receive_called is False
     assert sent[0]["status"] == 401
+    denied = json.loads(sent[1]["body"])
+    assert denied["schema_version"] == door_errors.SCHEMA_VERSION
+    assert denied["reason"] == "authentication_required"
+    assert denied["status"] == 401
 
 
 def test_owned_input_ingest_rejects_auth_drift_payload_drift_and_oversize(

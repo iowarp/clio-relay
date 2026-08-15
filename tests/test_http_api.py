@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
 from clio_relay import door_errors as door_errors_module
@@ -405,6 +406,109 @@ def test_http_websocket_limits_reject_huge_values_before_accept_or_queue_reads(
         with pytest.raises(WebSocketDisconnect) as caught, client.websocket_connect(path):
             pass
         assert caught.value.code == 1008
+        assert caught.value.reason == "websocket_page_limit_invalid"
+
+
+def test_http_websocket_refusal_classes_have_registered_close_reasons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain_settings = RelaySettings(
+        core_dir=tmp_path / "plain-core",
+        spool_dir=tmp_path / "plain-spool",
+    )
+    plain_client = cast(Any, TestClient(create_app(plain_settings)))
+    authenticated_client = cast(
+        Any,
+        TestClient(
+            create_app(
+                RelaySettings(
+                    core_dir=tmp_path / "auth-core",
+                    spool_dir=tmp_path / "auth-spool",
+                    api_token="api-token",
+                )
+            )
+        ),
+    )
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    owned_settings = RelaySettings(
+        core_dir=tmp_path / "owned-core",
+        spool_dir=tmp_path / "owned-spool",
+        api_token="api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    owned_queue = ClioCoreQueue(owned_settings.core_dir)
+    unowned_job = owned_queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="websocket-unowned-job",
+        )
+    )
+    owned_client = cast(Any, TestClient(create_app(owned_settings)))
+    owner_headers = {
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+
+    cases: tuple[tuple[Any, str, dict[str, str], str], ...] = (
+        (
+            authenticated_client,
+            "/jobs/missing-job/monitor/ws",
+            {},
+            "websocket_authentication_failed",
+        ),
+        (
+            owned_client,
+            "/jobs/missing-job/monitor/ws?token=api-token",
+            {},
+            "websocket_session_binding_failed",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?limit=1000000000000",
+            {},
+            "websocket_page_limit_invalid",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?poll_seconds=0",
+            {},
+            "websocket_poll_interval_invalid",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?cursor=0",
+            {},
+            "websocket_cursor_invalid",
+        ),
+        (
+            owned_client,
+            f"/jobs/{unowned_job.job_id}/monitor/ws?token=api-token",
+            owner_headers,
+            "websocket_resource_ownership_refused",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws",
+            {},
+            "websocket_resource_not_found",
+        ),
+    )
+
+    for client, path, headers, expected_reason in cases:
+        with (
+            pytest.raises(WebSocketDisconnect) as caught,
+            client.websocket_connect(path, headers=headers),
+        ):
+            pass
+        assert caught.value.code == 1008
+        assert caught.value.reason == expected_reason
 
 
 def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
@@ -596,10 +700,15 @@ def test_http_remote_agent_submission_requires_typed_owner_session_identity(
 
     assert response.status_code == 422
     assert jarvis_response.status_code == 422
-    assert jarvis_response.json()["detail"]["code"] == "owner_session_identity_required"
-    assert jarvis_response.json()["detail"]["job_kind"] == "jarvis"
+    assert jarvis_response.json()["reason"] == "owner_session_identity_refused"
+    assert jarvis_response.json()["code"] == "owner_session_identity_required"
+    assert jarvis_response.json()["job_kind"] == "jarvis"
     assert identity_without_bearer.status_code == 401
-    assert response.json()["detail"] == {
+    assert response.json()["reason"] == "owner_session_identity_refused"
+    assert {
+        key: response.json()[key]
+        for key in ("schema", "code", "job_kind", "required_headers", "message")
+    } == {
         "schema": "clio-relay.owner-session-identity-error.v1",
         "code": "owner_session_identity_required",
         "job_kind": "remote_agent",
@@ -733,7 +842,8 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
     assert jobs[3].owner_session_id is None
     assert jobs[3].owner_session_generation_id is None
     assert incomplete_mcp.status_code == 422
-    assert incomplete_mcp.json()["detail"]["code"] == "owner_session_identity_incomplete"
+    assert incomplete_mcp.json()["reason"] == "owner_session_identity_refused"
+    assert incomplete_mcp.json()["code"] == "owner_session_identity_incomplete"
 
 
 def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
@@ -1267,6 +1377,24 @@ def test_owned_session_api_allows_explicit_unauthenticated_loopback_session(
     assert response.json() == {"ok": True, "auth": False}
 
 
+def test_owned_session_api_reports_missing_server_generation_identity(
+    tmp_path: Path,
+) -> None:
+    app = create_app(RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"))
+
+    @app.get("/__missing_server_generation")
+    def missing_server_generation() -> None:  # pyright: ignore[reportUnusedFunction]
+        raise door_errors_module.http_problem(
+            "session_generation_identity_unavailable",
+            "relay session has no exact generation identity",
+        )
+
+    response = cast(Any, TestClient(app)).get("/__missing_server_generation")
+
+    assert response.status_code == 409
+    assert response.json()["reason"] == "session_generation_identity_unavailable"
+
+
 def test_owned_session_api_fails_closed_without_exact_process_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1620,7 +1748,35 @@ def test_owned_session_identity_challenge_is_public_and_exact(
         generation_id="generation-1",
         nonce=nonce,
     )
-    assert client.get("/session-identity", params={"nonce": "not-a-nonce"}).status_code == 422
+    invalid_nonce = client.get("/session-identity", params={"nonce": "not-a-nonce"})
+    assert invalid_nonce.status_code == 422
+    assert invalid_nonce.json()["reason"] == "request_validation_failed"
+    assert invalid_nonce.json()["status"] == 422
+    assert invalid_nonce.json()["detail"] == "Request validation failed."
+
+
+def test_framework_http_errors_are_owner_rendered_without_status_drift(tmp_path: Path) -> None:
+    app = create_app(RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"))
+
+    @app.get("/__framework_teapot")
+    def framework_teapot() -> None:  # pyright: ignore[reportUnusedFunction]
+        raise StarletteHTTPException(status_code=418, detail="framework internals")
+
+    client = cast(Any, TestClient(app))
+    responses = (
+        (client.get("/__missing_route"), 404, "route_not_found"),
+        (client.post("/healthz"), 405, "method_not_allowed"),
+        (client.get("/__framework_teapot"), 418, "framework_http_error"),
+    )
+
+    for response, expected_status, expected_reason in responses:
+        assert response.status_code == expected_status
+        assert response.headers["content-type"].startswith("application/problem+json")
+        document = response.json()
+        assert document["schema_version"] == "clio-relay.error.v1"
+        assert document["status"] == expected_status
+        assert document["reason"] == expected_reason
+        assert "framework internals" not in document["detail"]
 
 
 def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
@@ -1779,10 +1935,15 @@ def test_session_job_submission_rejects_missing_and_stale_identity(
     )
 
     assert missing.status_code == 409
+    assert missing.json()["reason"] == "session_binding_headers_required"
     assert stale.status_code == 409
+    assert stale.json()["reason"] == "session_binding_identity_mismatch"
     assert wrong_session.status_code == 409
+    assert wrong_session.json()["reason"] == "session_binding_identity_mismatch"
     assert missing_gateway.status_code == 409
+    assert missing_gateway.json()["reason"] == "session_binding_headers_required"
     assert stale_gateway.status_code == 409
+    assert stale_gateway.json()["reason"] == "session_binding_identity_mismatch"
     assert wrong_cluster_gateway.status_code == 409
     assert queue.list_jobs() == []
     assert queue.list_gateway_sessions() == []
@@ -1804,9 +1965,8 @@ def test_session_job_submission_rejects_missing_and_stale_identity(
         },
         json=payload,
     )
-    assert unbound.status_code == 200
-    assert unbound.json()["owner_session_id"] == "desktop-session-1"
-    assert unbound.json()["owner_session_generation_id"] == "generation-1"
+    assert unbound.status_code == 409
+    assert unbound.json()["reason"] == "unbound_session_api"
 
 
 def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cache(
@@ -2953,14 +3113,15 @@ def test_owned_session_api_filters_jobs_redacts_capabilities_and_quiesces_intake
         spec=JarvisRunSpec(command=["true"]),
         idempotency_key="rejected-after-quiesce",
     )
-    assert client.post("/jobs", json=new_job.model_dump(mode="json")).status_code == 409
-    assert (
-        client.post(
-            "/gateway-sessions",
-            json={"cluster": "test-cluster", "name": "rejected-after-quiesce"},
-        ).status_code
-        == 409
+    rejected_job = client.post("/jobs", json=new_job.model_dump(mode="json"))
+    rejected_gateway = client.post(
+        "/gateway-sessions",
+        json={"cluster": "test-cluster", "name": "rejected-after-quiesce"},
     )
+    assert rejected_job.status_code == 409
+    assert rejected_job.json()["reason"] == "session_intake_closed"
+    assert rejected_gateway.status_code == 409
+    assert rejected_gateway.json()["reason"] == "session_intake_closed"
 
 
 def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> None:

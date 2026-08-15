@@ -9,14 +9,15 @@ surface named in §6.1 -- the shape with the least existing structure), and
 through this module -- tracked as its own live issue,
 `iowarp/clio-relay#235 <https://github.com/iowarp/clio-relay/issues/235>`_)
 -- each translated exceptions to their own locally-invented wire shape.
-This module is the single owner: :func:`classify`
-turns a caught exception (or a durable, never-raised
+This module is the single classification owner: :func:`classify` turns a
+caught exception (or a durable, never-raised
 :class:`~clio_relay.jarvis_dispatch_failure.JarvisDispatchRefusal`) into a
-:class:`RelayFault`, and :func:`as_mcp_error`, :func:`as_http_problem`, and
-:func:`as_browser_gateway_error` render that one fault onto each surface's
-wire shape. A call site never picks its own status code: every ``reason``,
-and everything that follows from it (``retryable``/``mcp_code``/
-``http_status``), comes from the frozen :data:`REASONS` table (§6.3).
+:class:`RelayFault`. The cohesive renderers live in
+:mod:`clio_relay.door_error_adapters` and are re-exported here for the
+established public and test patch surface. A call site never picks its own
+status code: every ``reason``, and everything that follows from it
+(``retryable``/``mcp_code``/``http_status``), comes from the frozen
+:data:`REASONS` table (§6.3).
 
 **Dispatch order** (see :func:`classify`):
 
@@ -34,8 +35,9 @@ and everything that follows from it (``retryable``/``mcp_code``/
    exception's type). These call sites already know their own reason; this
    module still owns everything that follows from it.
 3. Seven exception types have an unambiguous 1:1 reason and are dispatched
-   by ``isinstance`` with no call-site help: :class:`TaskInputParkConflictError`,
-   :class:`NotFoundError`, :class:`ConfigurationError`,
+   by ``isinstance`` with no call-site help:
+   :class:`TaskInputParkConflictError`, :class:`NotFoundError`,
+   :class:`ConfigurationError`,
    :class:`~clio_relay.storage_runtime.StorageAdmissionError`,
    :class:`~clio_relay.storage_runtime.StorageRuntimeViolation`,
    :class:`ObservationTimeoutError`, and
@@ -85,16 +87,14 @@ this slice deletes at their old call sites, per doc §10):
     ``data`` is the queryable signal, handler internals (``str(exc)``) never
     reach ``message``.
 
-See docs/design/relay-architecture-2026-08.md §6.3 for the remaining ten
-rows' grounding (already-shipped precedents, verified raise sites, the two
-reasons this design pass's own verification found beyond the seed ten, and
-``payload_too_large``, added by the R3 re-review that also moved every
-relay-owned MCP code out of the SDK's reserved -32000..-32019 band).
+See docs/design/relay-architecture-2026-08.md §6.3 for the original 13 rows.
+R9 adds the HTTP-originated rows that replace ``http_api.py``'s 107 legacy
+sites and outer request-body middleware serializer; each keeps its shipped
+status while gaining a specific, frozen agent-facing reason.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -102,7 +102,6 @@ from types import MappingProxyType
 from typing import Any, Final
 
 import mcp_types
-from mcp.shared.exceptions import MCPError
 
 from clio_relay.bounded_payload import (
     # Re-exported (not redefined, F12 #231 R6 review): bounded_payload.py is
@@ -113,12 +112,22 @@ from clio_relay.bounded_payload import (
     TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,
 )
 from clio_relay.bounded_payload import build_truncation_record
+from clio_relay.door_error_adapters import MAX_ENVELOPE_BYTES as MAX_ENVELOPE_BYTES
+from clio_relay.door_error_adapters import SCHEMA_VERSION as SCHEMA_VERSION
+from clio_relay.door_error_adapters import as_browser_gateway_error as as_browser_gateway_error
+from clio_relay.door_error_adapters import as_http_problem as as_http_problem
+from clio_relay.door_error_adapters import as_mcp_error as as_mcp_error
+from clio_relay.door_error_adapters import websocket_refusal as websocket_refusal
+from clio_relay.door_error_messages import public_message, resolved_public_message
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
     ObservationTimeoutError,
+    PublicMessageError,
+    RelayAuthoredError,
     TaskInputParkConflictError,
 )
+from clio_relay.errors import public_message_error as public_message_error
 from clio_relay.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
 from clio_relay.storage_runtime import (
@@ -131,39 +140,8 @@ logger = logging.getLogger(__name__)
 
 JSON = dict[str, Any]
 
-#: Schema tag stamped on every :func:`as_http_problem` document (doc §6.3).
-SCHEMA_VERSION: Final = "clio-relay.error.v1"
-
-# T1 (doc §6.4): refusal/detail text budget, hard-truncated. A fourth
-# independent literal agreeing with jarvis_dispatch_failure.py's
-# MAX_REFUSAL_MESSAGE_CHARS, control_channel.py's
-# MAX_CHANNEL_EVENT_DETAIL_CHARS, and remote_connection.py's inline
-# [:2_000] slice -- six literals total counting this one, frp_link.py's
-# DEFAULT_STDERR_BUFFER_MAX_BYTES, and bounded_payload.T1_TEXT_MAX_BYTES
-# (recounted honestly by the R6 review, F12/F13; an earlier revision of
-# this comment undercounted at four). Unifying them into one shared
-# constant was floated as an aspiration when this comment was first
-# written, but it was never R6's actual delivered scope (the three RAW
-# PAYLOAD PATHS named in doc §6.4/§6.5, not these six already-agreeing
-# refusal-text literals) -- tracked as
-# https://github.com/iowarp/clio-relay/issues/236.
+# T1 refusal/detail text budget from design §6.4.
 MAX_MESSAGE_CHARS: Final = 2_000
-
-# Whole-envelope budget (doc §6.4 T1): as_http_problem drops "evidence" then
-# "truncation", then any other extension member, before ever touching the
-# RFC 7807 core four (type/title/status/detail) or reason/retryable -- those
-# are never dropped (F3: silently exceeding this budget is forbidden; see
-# _bounded_document's "detail" truncation + "envelope_overflow" backstop).
-MAX_ENVELOPE_BYTES: Final = 8 * 1024
-
-_DROP_ORDER: Final[tuple[str, ...]] = ("evidence", "truncation")
-
-#: RFC 7807 core four plus this contract's load-bearing extension members --
-#: never dropped by :func:`_bounded_document`, never overwritten by
-#: ``fault.data`` (F4: a colliding data key must not shadow a contract field).
-_PROTECTED_KEYS: Final[frozenset[str]] = frozenset(
-    {"type", "title", "status", "detail", "schema_version", "reason", "retryable"}
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,22 +172,25 @@ def _row(
     )
 
 
-# F1 (opus review): the MCP SDK reserves -32000..-32019 for its OWN
-# transport-level codes (mcp_types.jsonrpc.CONNECTION_CLOSED=-32000,
-# .REQUEST_TIMEOUT=-32001, .HEADER_MISMATCH=-32020's neighbors, etc.) --
-# relay's own custom codes MUST NOT land in that band. A client that
-# discriminates by code alone (not this contract's typed ``reason``, e.g.
-# clio-agent's tools/mcp_errors.py) would read relay's own
-# mcp_task_input_park_conflict (formerly -32001) as the SDK's
-# REQUEST_TIMEOUT and retry it with timeout semantics -- silently wrong.
-# Relay-owned custom codes live in -32050..-32059 instead, a band the SDK
-# does not use. -32007 (storage_admission_refused) is the one deliberate
-# exception: it is already shipped and pinned
-# (mcp_server.py's StorageAdmissionError handler,
-# tests/test_production_admin_surfaces.py's ``denied["error"]["code"] ==
-# -32007`` assertion) -- renumbering a live, tested wire value is a
-# separate, riskier change than reallocating five never-shipped codes this
-# same slice introduced.
+def _http_row(
+    reason: str,
+    http_status: int,
+    title: str,
+    *,
+    retryable: bool = False,
+) -> ReasonSpec:
+    """Define an HTTP-originated reason without inventing a second code table."""
+    return _row(
+        reason,
+        retryable=retryable,
+        mcp_code=mcp_types.INTERNAL_ERROR if http_status >= 500 else mcp_types.INVALID_PARAMS,
+        http_status=http_status,
+        title=title,
+    )
+
+
+# Relay-owned MCP codes avoid the SDK-reserved -32000..-32019 band.
+# The already-shipped storage admission code -32007 remains pinned.
 _RELAY_CUSTOM_CODE_BAND_START: Final = -32059
 _RELAY_CUSTOM_CODE_BAND_END: Final = -32050  # inclusive
 
@@ -344,6 +325,101 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 http_status=413,
                 title="Payload too large",
             ),
+            _http_row("http_request_malformed", 400, "HTTP request malformed"),
+            _http_row("poll_interval_invalid", 400, "Poll interval invalid"),
+            _http_row("log_stream_invalid", 400, "Log stream invalid"),
+            _http_row("authentication_required", 401, "Authentication required"),
+            _http_row("resource_ownership_refused", 403, "Resource ownership refused"),
+            _http_row("session_scope_refused", 403, "Session scope refused"),
+            _http_row("session_identity_unavailable", 404, "Session identity unavailable"),
+            _http_row("session_status_unavailable", 404, "Session status unavailable"),
+            _http_row(
+                "jarvis_runtime_authority_unavailable",
+                404,
+                "JARVIS runtime authority unavailable",
+            ),
+            _http_row("input_ingest_unavailable", 404, "Input ingest unavailable"),
+            _http_row("job_not_found", 404, "Job not found"),
+            _http_row("task_not_found", 404, "Task not found"),
+            _http_row("gateway_not_found", 404, "Gateway not found"),
+            _http_row("artifact_not_found", 404, "Artifact not found"),
+            _http_row(
+                "session_generation_identity_unavailable",
+                409,
+                "Session generation identity unavailable",
+            ),
+            _http_row("session_intake_closed", 409, "Session intake closed"),
+            _http_row("session_binding_headers_required", 409, "Session binding headers required"),
+            _http_row(
+                "session_binding_identity_mismatch", 409, "Session binding identity mismatch"
+            ),
+            _http_row("unbound_session_api", 409, "Unbound session API"),
+            _http_row("job_cluster_mismatch", 409, "Job cluster mismatch"),
+            _http_row("job_submission_conflict", 409, "Job submission conflict"),
+            _http_row("mcp_submission_conflict", 409, "MCP submission conflict"),
+            _http_row(
+                "jarvis_runtime_authority_conflict",
+                409,
+                "JARVIS runtime authority conflict",
+            ),
+            _http_row("jarvis_artifact_conflict", 409, "JARVIS artifact conflict"),
+            _http_row("input_ingest_conflict", 409, "Input ingest conflict", retryable=True),
+            _http_row("transform_conflict", 409, "Transform conflict"),
+            _http_row("gateway_cluster_mismatch", 409, "Gateway cluster mismatch"),
+            _http_row("gateway_conflict", 409, "Gateway conflict"),
+            _http_row("queue_operation_conflict", 409, "Queue operation conflict"),
+            _http_row("retention_conflict", 409, "Retention conflict"),
+            _http_row("job_submission_refused", 422, "Job submission refused"),
+            _http_row("mcp_admission_refused", 422, "MCP admission refused"),
+            _http_row("input_ingest_refused", 422, "Input ingest refused"),
+            _http_row("job_route_refused", 422, "Job route refused"),
+            _http_row("jarvis_submission_refused", 422, "JARVIS submission refused"),
+            _http_row("transform_refused", 422, "Transform refused"),
+            _http_row("wait_parameters_invalid", 422, "Wait parameters invalid"),
+            _http_row("queue_query_refused", 422, "Queue query refused"),
+            _http_row(
+                "input_ingest_terminalization_failed",
+                500,
+                "Input ingest terminalization failed",
+            ),
+            _http_row(
+                "session_authentication_unavailable",
+                503,
+                "Session authentication unavailable",
+                retryable=True,
+            ),
+            _http_row("request_validation_failed", 422, "Request validation failed"),
+            _http_row("route_not_found", 404, "Route not found"),
+            _http_row("method_not_allowed", 405, "Method not allowed"),
+            _http_row("framework_http_error", 500, "Framework HTTP error"),
+            _http_row(
+                "browser_gateway_overloaded",
+                503,
+                "Browser gateway overloaded",
+                retryable=True,
+            ),
+            _http_row("browser_preflight_refused", 403, "Browser preflight refused"),
+            _http_row("browser_attachment_not_found", 404, "Browser attachment not found"),
+            _http_row("browser_origin_refused", 403, "Browser origin refused"),
+            _http_row("browser_capability_refused", 401, "Browser capability refused"),
+            _http_row("browser_method_not_allowed", 405, "Browser method not allowed"),
+            _http_row(
+                "browser_upstream_unavailable",
+                502,
+                "Browser upstream unavailable",
+                retryable=True,
+            ),
+            _http_row("websocket_authentication_failed", 401, "WebSocket authentication failed"),
+            _http_row("websocket_session_binding_failed", 409, "WebSocket session binding failed"),
+            _http_row("websocket_page_limit_invalid", 422, "WebSocket page limit invalid"),
+            _http_row("websocket_poll_interval_invalid", 400, "WebSocket poll interval invalid"),
+            _http_row("websocket_cursor_invalid", 400, "WebSocket cursor invalid"),
+            _http_row(
+                "websocket_resource_ownership_refused",
+                403,
+                "WebSocket resource ownership refused",
+            ),
+            _http_row("websocket_resource_not_found", 404, "WebSocket resource not found"),
         )
     }
 )
@@ -373,6 +449,14 @@ class RelayFault:
     message: str
     data: Mapping[str, Any] = field(default_factory=_empty_data)
     truncation: JSON | None = None
+
+
+class HTTPProblemError(Exception):
+    """Carry one preclassified fault through FastAPI without shaping its body there."""
+
+    def __init__(self, fault: RelayFault) -> None:
+        super().__init__(fault.reason)
+        self.fault = fault
 
 
 # The seven exception types with an unambiguous 1:1 reason (doc §6.3
@@ -417,8 +501,8 @@ def _bounded_text(text: str) -> tuple[str, JSON | None]:
     return truncated, record
 
 
-def _safe_str(exc: BaseException) -> str:
-    """Render ``str(exc)`` without letting a hostile ``__str__`` escape (F5).
+def _safe_str(exc: BaseException) -> str | None:
+    """Render ``str(exc)`` for server logging without letting it escape.
 
     A raising ``__str__`` (or one that returns something ``str()`` itself
     cannot coerce) must never propagate out of :func:`classify` -- on the
@@ -428,13 +512,28 @@ def _safe_str(exc: BaseException) -> str:
     exists to guarantee.
     """
     try:
-        return str(exc)
+        detail: Any = exc.public_message if isinstance(exc, PublicMessageError) else str(exc)
+        if not isinstance(detail, str):
+            raise TypeError("public exception message must be a string")
+        return detail
     except Exception:
         logger.exception(
             "clio-relay: %s.__str__() raised; door_errors could not render its message",
             type(exc).__name__,
         )
-        return f"<{type(exc).__name__}: message unavailable>"
+        return None
+
+
+def _log_classified_exception(exc: BaseException, *, reason: str) -> str | None:
+    """Log a classified exception once and return its safely rendered text."""
+    detail = _safe_str(exc)
+    logger.info(
+        "clio-relay: classified %s as %s: %s",
+        type(exc).__name__,
+        reason,
+        detail if detail is not None else "<message unavailable>",
+    )
+    return detail
 
 
 def _typed_data(exc: BaseException) -> JSON:
@@ -445,11 +544,13 @@ def _typed_data(exc: BaseException) -> JSON:
     that raises on access) must degrade to no extension payload, never crash
     classification.
     """
+    if isinstance(exc, RelayAuthoredError):
+        exc = exc.source
     try:
         if isinstance(exc, StorageRuntimeError):
             return {"storage_decision": exc.decision.to_dict()}
         if isinstance(exc, OwnerSessionIdentityError):
-            return dict(exc.detail)
+            return {key: value for key, value in exc.detail.items() if key != "message"}
     except Exception:
         logger.exception(
             "clio-relay: could not extract %s's typed extension payload",
@@ -473,6 +574,73 @@ def _build(spec: ReasonSpec, *, message: str, data: Mapping[str, Any]) -> RelayF
     )
 
 
+def fault_for_reason(
+    reason: str,
+    message: str,
+    *,
+    data: Mapping[str, Any] | None = None,
+) -> RelayFault:
+    """Build a bounded fault for one deliberate, registered refusal site."""
+    try:
+        spec = REASONS[reason]
+    except KeyError as exc:
+        raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry") from exc
+    return _build(spec, message=message, data=data if data is not None else {})
+
+
+def fault_for_http_status(
+    reason: str,
+    http_status: int,
+    *,
+    message: str | None = None,
+) -> RelayFault:
+    """Build an owner-rendered framework fault while preserving its exact status."""
+    if not 400 <= http_status <= 599:
+        raise ValueError("door_errors: framework HTTP status must be between 400 and 599")
+    try:
+        registered = REASONS[reason]
+    except KeyError as exc:
+        raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry") from exc
+    spec = ReasonSpec(
+        reason=registered.reason,
+        retryable=http_status >= 500,
+        mcp_code=(mcp_types.INTERNAL_ERROR if http_status >= 500 else mcp_types.INVALID_PARAMS),
+        http_status=http_status,
+        title=registered.title,
+    )
+    return _build(
+        spec,
+        message=(
+            message
+            if message is not None
+            else public_message(reason=registered.reason, title=registered.title)
+        ),
+        data={},
+    )
+
+
+def http_problem(
+    reason: str,
+    message: str | None = None,
+    *,
+    exc: BaseException | None = None,
+    data: Mapping[str, Any] | None = None,
+) -> HTTPProblemError:
+    """Create FastAPI control flow for one deliberate registered HTTP problem."""
+    if exc is None:
+        if message is None:
+            raise ValueError("door_errors.http_problem() requires message or exc")
+        fault = fault_for_reason(reason, message, data=data)
+    else:
+        fault = classify(
+            exc,
+            reason=reason,
+            message=message,
+            data=_typed_data(exc) if data is None else data,
+        )
+    return HTTPProblemError(fault)
+
+
 def classify(
     exc: BaseException | JarvisDispatchRefusal,
     *,
@@ -491,13 +659,9 @@ def classify(
         reason: A call-path-scope override (dispatch rule 2). Must already be
             a key in the reason table; an unregistered reason is a caller
             bug, not a silent fallback, and raises :class:`ValueError`.
-        message: Overrides the default ``str(exc)`` (or, for a refusal,
-            ``exc.message``) wire message. Used by call sites whose typed
-            message must never depend on an arbitrary underlying exception's
-            text (e.g. ``mcp_task_status_reconciliation_failed``'s fixed,
-            handler-internals-free message). ``str(exc)`` itself is never
-            called unguarded (F5) -- a hostile ``__str__`` degrades to a
-            generic placeholder rather than escaping classification.
+        message: Deliberate bounded public detail. When omitted, a marked
+            exception's relay-authored message is used; unmarked exception
+            text is logging-only and the reason's stable formatter is used.
         data: Overrides the default reason-specific extension payload
             (:func:`_typed_data`, or ``{}``).
         _table: Private, test-only override of :data:`REASONS` (F9) -- lets
@@ -513,13 +677,17 @@ def classify(
         ``ServerErrorMiddleware`` still re-raises after the response is sent
         (by design, so a real ASGI server can log it too), so a second,
         server-side-only log line from uvicorn is expected, not a bug (F6).
-        Exception internals never reach the wire either way.
+        Unmarked exception internals never reach the wire either way.
     """
     if isinstance(exc, JarvisDispatchRefusal):
         spec = _table["jarvis_dispatch_refused"]
         return _build(
             spec,
-            message=message if message is not None else exc.message,
+            message=(
+                message
+                if message is not None
+                else public_message(reason=spec.reason, title=spec.title)
+            ),
             data=data
             if data is not None
             else {
@@ -532,16 +700,32 @@ def classify(
         if reason not in _table:
             msg = f"door_errors.classify(): {reason!r} is not a registered REASONS entry"
             raise ValueError(msg)
+        logged_detail = _log_classified_exception(exc, reason=reason)
+        spec = _table[reason]
         return _build(
-            _table[reason],
-            message=message if message is not None else _safe_str(exc),
-            data=data if data is not None else {},
+            spec,
+            message=resolved_public_message(
+                exc,
+                logged_detail=logged_detail,
+                explicit=message,
+                reason=spec.reason,
+                title=spec.title,
+            ),
+            data=data if data is not None else _typed_data(exc),
         )
     for exc_type, mapped_reason in _TYPE_REASONS:
         if isinstance(exc, exc_type):
+            logged_detail = _log_classified_exception(exc, reason=mapped_reason)
+            spec = _table[mapped_reason]
             return _build(
-                _table[mapped_reason],
-                message=message if message is not None else _safe_str(exc),
+                spec,
+                message=resolved_public_message(
+                    exc,
+                    logged_detail=logged_detail,
+                    explicit=message,
+                    reason=spec.reason,
+                    title=spec.title,
+                ),
                 data=data if data is not None else _typed_data(exc),
             )
     logger.exception(
@@ -553,124 +737,3 @@ def classify(
         message="relay encountered an internal error.",
         data={},
     )
-
-
-def as_mcp_error(fault: RelayFault) -> MCPError:
-    """Render a :class:`RelayFault` as the MCP wire shape.
-
-    ``data`` always carries ``reason`` (the queryable, frozen-vocabulary
-    signal) merged with whatever reason-specific payload :func:`classify`
-    attached -- ``fault.data`` first, ``reason`` applied on top (F4's same
-    contract-wins discipline as :func:`as_http_problem`), so a colliding
-    ``"reason"`` key in ``fault.data`` can never shadow the real one.
-    """
-    payload: JSON = {**fault.data, "reason": fault.reason}
-    return MCPError(code=fault.mcp_code, message=fault.message, data=payload)
-
-
-def _document_bytes(document: JSON) -> int | None:
-    """Return the document's UTF-8 JSON-encoded byte length, or ``None`` if unmeasurable.
-
-    ``ensure_ascii=False`` (F10): measures the actual wire encoding. The
-    default ``ensure_ascii=True`` inflates every non-ASCII character to a
-    6-byte ``\\uXXXX`` escape, materially overstating cost for ordinary
-    non-ASCII ``detail``/``data`` text and mismeasuring the real budget.
-
-    ``None`` (F5) means ``json.dumps`` could not serialize something in
-    ``document`` (a non-JSON-safe value someone put in ``fault.data``) --
-    every caller treats that identically to "over budget," so the drop
-    order below still proceeds and removes the offending member instead of
-    crashing.
-    """
-    try:
-        payload = json.dumps(document, separators=(",", ":"), ensure_ascii=False)
-    except TypeError:
-        return None
-    return len(payload.encode("utf-8"))
-
-
-def _fits_budget(document: JSON) -> bool:
-    size = _document_bytes(document)
-    return size is not None and size <= MAX_ENVELOPE_BYTES
-
-
-def _bounded_document(document: JSON) -> JSON:
-    """Enforce the whole-envelope ≤8KiB budget (doc §6.4).
-
-    Drop order: ``"evidence"`` first, then ``"truncation"`` (§6.4's named
-    precedent), then any OTHER extension member in a deterministic (sorted)
-    order -- F3: a single oversized or non-serializable extension value that
-    is not literally named ``"evidence"`` must not sail through unbounded.
-    Only once every extension member is gone does this fall back to
-    truncating ``"detail"`` itself and stamping ``envelope_overflow: true``;
-    the RFC 7807 core four plus ``reason``/``retryable`` are never dropped,
-    and ``detail`` is never reduced to an empty string. Silent pass-through
-    of an oversized document is forbidden.
-    """
-    if _fits_budget(document):
-        return document
-    shrunk = dict(document)
-    for key in _DROP_ORDER:
-        if key not in shrunk:
-            continue
-        del shrunk[key]
-        if _fits_budget(shrunk):
-            return shrunk
-    for key in sorted(set(shrunk) - _PROTECTED_KEYS):
-        del shrunk[key]
-        if _fits_budget(shrunk):
-            return shrunk
-    # Every optional/extension member is gone; the core seven alone still
-    # exceed budget (or one of them, in practice only "detail", could not be
-    # measured). Truncate "detail" directly and record the overflow rather
-    # than pass an oversized or unmeasurable document through.
-    shrunk["envelope_overflow"] = True
-    overhead = _document_bytes({**shrunk, "detail": ""}) or MAX_ENVELOPE_BYTES
-    budget_for_detail = max(MAX_ENVELOPE_BYTES - overhead, 0)
-    detail_text = shrunk.get("detail")
-    detail_bytes = detail_text.encode("utf-8") if isinstance(detail_text, str) else b""
-    shrunk["detail"] = detail_bytes[:budget_for_detail].decode("utf-8", errors="ignore") or "…"
-    return shrunk
-
-
-def as_http_problem(fault: RelayFault) -> JSON:
-    """Render a :class:`RelayFault` as an RFC 7807 ``application/problem+json`` document.
-
-    The doc §6.3 worked example's shape: ``type``/``title``/``status``/
-    ``detail`` are the RFC 7807 core four; ``schema_version``/``reason``/
-    ``retryable`` are this contract's load-bearing extension members (never
-    dropped); ``truncation`` is the T1 elision record :func:`_bounded_text`
-    populated, or ``null`` when nothing was elided (§6.4). Anything
-    :func:`classify` attached via ``fault.data`` (a ``task_id``, a storage
-    decision, ...) rides along as additional extension members, subject to
-    the same ≤8KiB budget -- but F4: ``fault.data`` is spread FIRST and the
-    contract members are applied on top, so a colliding data key (e.g. a
-    stray ``"status"``) can never shadow a contract field.
-    """
-    document: JSON = {
-        **fault.data,
-        "type": f"urn:clio-relay:error:{fault.reason}",
-        "title": fault.title,
-        "status": fault.http_status,
-        "detail": fault.message,
-        "schema_version": SCHEMA_VERSION,
-        "reason": fault.reason,
-        "retryable": fault.retryable,
-        "truncation": fault.truncation,
-    }
-    return _bounded_document(document)
-
-
-def as_browser_gateway_error(fault: RelayFault) -> tuple[int, JSON]:
-    """Render a :class:`RelayFault` onto ``CapabilityProxyHandler._error``'s two-arg shape.
-
-    ``browser_gateway.py``'s ``_error(self, status: int, message: str)`` is
-    the fourth error surface (doc §6.1) and the one with the least existing
-    structure: a bare ``{"error": message}`` dict with no ``code``/``data``/
-    ``reason``/``detail`` field at all. This adapter reuses the same RFC 7807
-    document :func:`as_http_problem` already builds for the HTTP surface --
-    one shape across the two HTTP-shaped surfaces -- paired with
-    ``fault.http_status`` so a call site can hand both straight to a
-    document-aware sibling of ``_error``.
-    """
-    return fault.http_status, as_http_problem(fault)
