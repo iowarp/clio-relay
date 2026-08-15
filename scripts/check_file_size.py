@@ -114,7 +114,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # of inheriting a stale populated record from the spread source
     # document. A justified, minimal ratchet-up.
     "src/clio_relay/endpoint.py": 8719,
-    "src/clio_relay/fastmcp_server.py": 1212,
+    "src/clio_relay/fastmcp_server.py": 1210,
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which
