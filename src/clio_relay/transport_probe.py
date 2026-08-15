@@ -26,14 +26,13 @@ from clio_relay.frp_link import assert_loopback_port_available as _assert_local_
 from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
-    CleanupResource,
-    OwnedSessionStartResult,
     SessionLifecycleReport,
     detach_remote_session,
     plan_remote_session_start,
     start_remote_session_durable,
     teardown_remote_session,
 )
+from clio_relay.session_wire_models import CleanupResource, OwnedSessionStartResult
 from clio_relay.validation_report import (
     TransportCleanupAction,
     TransportCleanupOutcome,

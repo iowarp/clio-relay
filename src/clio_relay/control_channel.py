@@ -58,7 +58,7 @@ from clio_relay.frp_link import validate_channel_nonce as _validate_channel_nonc
 from clio_relay.frp_link import wait_for_channel_health as _wait_for_channel_health
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
-from clio_relay.session_lifecycle import OwnedSessionIdentityChallengeRequest
+from clio_relay.session_wire_models import OwnedSessionIdentityChallengeRequest
 
 CHANNEL_BOOTSTRAP_SCHEMA: Final = "clio-relay.channel-bootstrap.v1"
 CHANNEL_EVENT_SCHEMA: Final = "clio-relay.control-channel-event.v1"
