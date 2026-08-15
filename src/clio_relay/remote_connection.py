@@ -32,6 +32,7 @@ import urllib.parse
 from contextlib import suppress
 from typing import Final, Literal, cast
 
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
@@ -989,6 +990,20 @@ def _request_json_on_stream(
         response = stream.getresponse()
         document = read_json_response(response, label=f"{method} {path}")
         if not 200 <= response.status < 300:
+            # A1 (#231 R6 review): door_errors.as_http_problem spreads the
+            # original T2 refusal document's fields (doc §6.4) into the 413
+            # problem body (fault.data, F4) -- recognized here so its own
+            # typed code/message surfaces instead of the generic "HTTP
+            # {status}: {raw json blob}" that discards the structure.
+            typed_document = (
+                cast(dict[str, object], document) if isinstance(document, dict) else None
+            )
+            if typed_document is not None and is_delivery_refusal(typed_document):
+                code = cast(dict[str, object], typed_document.get("delivery", {})).get("code")
+                raise RelayError(
+                    f"owned session API request refused delivery ({code}): "
+                    f"{describe_delivery_refusal(typed_document)}"
+                )
             detail = json.dumps(document, ensure_ascii=False)[:2_000]
             raise RelayError(
                 f"owned session API request failed: {method} {path}: "

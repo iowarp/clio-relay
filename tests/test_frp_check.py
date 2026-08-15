@@ -122,15 +122,19 @@ def test_no_truncation_logs_nothing(tmp_path: Path, caplog: pytest.LogCaptureFix
     assert "elided" not in caplog.text
 
 
-def test_bounded_capture_applies_the_generous_t3_read_cap() -> None:
+def test_bounded_capture_applies_the_generous_t3_record_cap() -> None:
     """F8 (#231 R6 review): subprocess.run() has no native output-byte cap
-    of its own -- a generous T3-shaped read-time bound (doc §6.4) is
-    applied immediately after capture, distinct from (and much larger
-    than) ``_bounded_failure_detail``'s later, much smaller T1 tail budget.
+    of its own -- Popen.communicate() has already drained the pipe to EOF
+    (holding the full unbounded string) by the time this function ever
+    runs, so a generous T3-shaped RECORD-time bound (doc §6.4) is applied
+    right after that unavoidable read completes, distinct from (and much
+    larger than) ``_bounded_failure_detail``'s later, much smaller T1 tail
+    budget. A3 (#231 R6-fix review): the constants were renamed off
+    "READ_*" -- this was never actually bounding the read itself.
     """
     huge = "Q" * (
-        frp_check_module.FRPC_CHECK_READ_HEAD_MAX_BYTES
-        + frp_check_module.FRPC_CHECK_READ_TAIL_MAX_BYTES
+        frp_check_module.FRPC_CHECK_CAPTURE_HEAD_MAX_BYTES
+        + frp_check_module.FRPC_CHECK_CAPTURE_TAIL_MAX_BYTES
         + 1_000_000
     )
 
@@ -142,19 +146,57 @@ def test_bounded_capture_applies_the_generous_t3_read_cap() -> None:
     assert "[clio-relay: elided" in bounded
 
 
+def test_bounded_capture_logs_the_discarded_truncation_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A3 (#231 R6-fix review): ``_bounded_capture`` used to build the
+    structured truncation record then discard it outright -- the same gap
+    its sibling ``_bounded_failure_detail`` already closed (see
+    ``test_frpc_failure_detail_logs_the_discarded_truncation_record``
+    above) for the T1 tail budget. Exercised directly against the private
+    helper since triggering this from ``run_frpc_connection_check`` would
+    require an 8 MiB+8 MiB fixture payload.
+    """
+    huge = "Q" * (
+        frp_check_module.FRPC_CHECK_CAPTURE_HEAD_MAX_BYTES
+        + frp_check_module.FRPC_CHECK_CAPTURE_TAIL_MAX_BYTES
+        + 1_000_000
+    )
+
+    with caplog.at_level("WARNING", logger="clio_relay.frp_check"):
+        frp_check_module._bounded_capture(huge)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert "frpc raw output capture was elided" in caplog.text
+
+
+def test_bounded_capture_logs_nothing_when_nothing_is_elided(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sabotage twin: an under-budget capture must not log a fabricated
+    elision record.
+    """
+    with caplog.at_level("WARNING", logger="clio_relay.frp_check"):
+        bounded = frp_check_module._bounded_capture(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "short"
+        )
+
+    assert bounded == "short"
+    assert "elided" not in caplog.text
+
+
 def test_timeout_path_output_is_bounded_before_splitlines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The timeout branch's ``splitlines()`` return (frpc staying connected
     IS this probe's success signal) must not be able to hold an unbounded
-    capture -- the read-time cap applies before this return, not only the
+    capture -- the record-time cap applies before this return, not only the
     failure detail. The module-level cap constants are shrunk here so the
     fixture payload can stay small and fast rather than needing a genuinely
     multi-megabyte subprocess dump.
     """
-    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_READ_HEAD_MAX_BYTES", 10)
-    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_READ_TAIL_MAX_BYTES", 10)
+    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_CAPTURE_HEAD_MAX_BYTES", 10)
+    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_CAPTURE_TAIL_MAX_BYTES", 10)
     fake = _write_fake_frpc_with_output(
         tmp_path,
         "login to server success\n" + "Q" * 500,
@@ -186,8 +228,8 @@ def test_clean_exit_output_is_bounded_before_splitlines(
     """The ``returncode == 0`` branch's ``splitlines()`` return must not be
     able to hold an unbounded capture either.
     """
-    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_READ_HEAD_MAX_BYTES", 10)
-    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_READ_TAIL_MAX_BYTES", 10)
+    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_CAPTURE_HEAD_MAX_BYTES", 10)
+    monkeypatch.setattr(frp_check_module, "FRPC_CHECK_CAPTURE_TAIL_MAX_BYTES", 10)
     fake = _write_fake_frpc_with_output(tmp_path, "Q" * 500, exits_cleanly=True)
 
     lines = run_frpc_connection_check(

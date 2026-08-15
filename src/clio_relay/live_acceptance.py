@@ -30,7 +30,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay import __version__
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import (
+    describe_delivery_refusal,
+    is_delivery_refusal,
+    parse_delivery_refusal,
+)
 from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
@@ -5205,9 +5209,10 @@ def _delivery_refusal_error(payload: Mapping[str, Any], *, label: str) -> RelayE
     typed reason a caller should report, not a generic "not base64
     encoded" that misdescribes why the artifact is unavailable.
     """
-    delivery = cast(dict[str, object], payload.get("delivery", {}))
-    message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
-    return RelayError(f"{label} delivery refused ({delivery.get('code')}): {message}")
+    # A2 (#231 R6 review): the message extraction itself now delegates to
+    # bounded_payload.describe_delivery_refusal, the single owner.
+    code = cast(dict[str, object], payload.get("delivery", {})).get("code")
+    return RelayError(f"{label} delivery refused ({code}): {describe_delivery_refusal(payload)}")
 
 
 def _decode_artifact_text(payload: dict[str, Any]) -> str:
@@ -5398,8 +5403,26 @@ def _remote_job_collection(
 def _remote_shell(ssh_host: str, script: str, *, runner: CommandRunner) -> str:
     result = runner(["ssh", ssh_host, f"bash -lc {shlex.quote(script)}"])
     if result.returncode != 0:
-        raise RelayError(_command_error("remote command failed", result))
+        raise _remote_command_failure(result)
     return result.stdout.decode("utf-8", errors="replace")
+
+
+def _remote_command_failure(result: subprocess.CompletedProcess[bytes]) -> RelayError:
+    """Build the typed error for a failed remote command.
+
+    A1 (#231 R6 review): a remote CLI guard already exits non-zero *after*
+    printing a T2 delivery-refusal document (doc §6.4) to stdout --
+    recognized first, via ``bounded_payload.parse_delivery_refusal``, so
+    its own typed code/message surfaces instead of the generic "remote
+    command failed: <raw stdout+stderr blob>" that discards the structure.
+    """
+    refusal = parse_delivery_refusal(result.stdout)
+    if refusal is not None:
+        code = cast(dict[str, object], refusal.get("delivery", {})).get("code")
+        return RelayError(
+            f"remote command refused delivery ({code}): {describe_delivery_refusal(refusal)}"
+        )
+    return RelayError(_command_error("remote command failed", result))
 
 
 def _remote_env(definition: ClusterDefinition) -> str:

@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clio_relay import door_errors
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -2518,11 +2518,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             # as the envelope's extension data (F4: the contract's type/
             # title/status/detail/schema_version/reason/retryable always
             # win over a colliding key in it).
-            delivery = cast(dict[str, object], document.get("delivery", {}))
-            message = cast(
-                str,
-                delivery.get("message", "artifact content exceeds the transfer limit"),
-            )
+            # A2 (#231 R6 review): the message extraction itself now
+            # delegates to bounded_payload.describe_delivery_refusal.
+            message = describe_delivery_refusal(document)
             fault = door_errors.classify(
                 RelayError(message),
                 reason="payload_too_large",

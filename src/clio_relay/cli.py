@@ -69,7 +69,7 @@ import clio_relay.transport_probe as transport_probe
 import clio_relay.validation_report as validation_report_module
 from clio_relay.bootstrap import install_local_frp
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.bounded_process import BoundedProcessError
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -15671,9 +15671,12 @@ def _decode_artifact_envelope(envelope: dict[str, object]) -> bytes:
         # function (_read_remote_mcp_result_artifact,
         # _read_remote_artifact_kind_bytes, _read_local_artifact_kind_bytes,
         # _read_local_mcp_result_artifact) -- fixed once here for all four.
-        delivery = cast(dict[str, object], envelope.get("delivery", {}))
-        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
-        raise RelayError(f"artifact delivery refused ({delivery.get('code')}): {message}")
+        # A2 (#231 R6 review): the message extraction itself now delegates
+        # to bounded_payload.describe_delivery_refusal, the single owner.
+        code = cast(dict[str, object], envelope.get("delivery", {})).get("code")
+        raise RelayError(
+            f"artifact delivery refused ({code}): {describe_delivery_refusal(envelope)}"
+        )
     if envelope.get("encoding") != "base64":
         raise RelayError("remote MCP result artifact must use base64 encoding")
     encoded = envelope.get("data")

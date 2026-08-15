@@ -33,6 +33,7 @@ long-running process's captured stdout/stderr kept as durable evidence.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any, Final, Literal, cast, overload
 
@@ -285,3 +286,80 @@ def is_delivery_refusal(document: Mapping[str, Any]) -> bool:
         and isinstance(delivery, dict)
         and cast(JSON, delivery).get("schema_version") == DELIVERY_FAILURE_SCHEMA_VERSION
     )
+
+
+#: The fallback text every T2 refusal reader has historically hardcoded by
+#: hand when a refusal document happened to omit its own ``delivery.message``
+#: -- centralized in :func:`describe_delivery_refusal` (#231 R6 review, A2)
+#: so a future refusal-message change never needs updating in five places.
+_DELIVERY_REFUSAL_FALLBACK_MESSAGE = "artifact content exceeds the transfer limit"
+
+
+def describe_delivery_refusal(document: Mapping[str, Any]) -> str:
+    """The refusal's own human-readable message, with the shared fallback text.
+
+    Every caller that SURFACES a delivery refusal's reason (as a CLI error,
+    an HTTP problem detail, a ``ValueError``/``RelayError`` message) --
+    not merely detects one, see :func:`is_delivery_refusal` -- uses this
+    instead of re-deriving the same
+    ``delivery.get("message", "artifact content exceeds the transfer
+    limit")`` extraction independently. Five near-identical copies existed
+    across ``cli.py``, ``http_api.py``, ``jarvis_service_runtime.py``,
+    ``live_acceptance.py``, and ``remote_mcp.py``, each spelling the same
+    fallback text by hand -- this is the single owner now (ground rule 1).
+
+    Args:
+        document: A document :func:`is_delivery_refusal` already verified
+            ``True`` for.
+    """
+    delivery = cast(JSON, document.get("delivery", {}))
+    return cast(str, delivery.get("message", _DELIVERY_REFUSAL_FALLBACK_MESSAGE))
+
+
+def is_delivery_refusal_failed(document: object) -> bool:
+    """Whether ``document`` is a T2 refusal (doc §6.4) with ``delivery.status == "failed"``.
+
+    Promoted from ``mcp_server.py``'s private ``_delivery_refusal_failed``
+    (#231 R6 review F1) to the single owner here (#231 R6 review, A4) so
+    every FAILURE-discriminating caller -- not only the MCP tool-result
+    boundary -- shares the one ``delivery.status`` check: a per-code match
+    silently misses every OTHER typed refusal (e.g.
+    ``artifact_content_too_large``, doc §6.5).
+    """
+    if not isinstance(document, dict):
+        return False
+    typed_document = cast(dict[str, object], document)
+    if not is_delivery_refusal(typed_document):
+        return False
+    delivery = typed_document.get("delivery")
+    if not isinstance(delivery, dict):
+        return False
+    return cast(dict[str, object], delivery).get("status") == "failed"
+
+
+def parse_delivery_refusal(data: bytes) -> JSON | None:
+    """Recognize a T2 delivery-refusal document (doc §6.4) in raw bytes.
+
+    For a caller whose only failure signal is a subprocess exit code, not
+    a return value that already carries a typed document -- a remote
+    command's stdout (#231 R6 review, A1). A remote CLI guard (e.g.
+    ``job read-artifact``) already exits non-zero *after* printing the
+    refusal JSON; without this, a blanket non-zero-exit check discards
+    that structure and reports a generic "remote command failed: <blob>"
+    instead of the refusal's own typed code/message.
+
+    Returns the parsed document only when it genuinely is a refusal shape
+    (not merely valid JSON) -- never raises, so callers can use this as an
+    unconditional first check before falling back to their own generic
+    failure handling.
+    """
+    try:
+        document = json.loads(data.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    typed_document = cast(JSON, document)
+    if not is_delivery_refusal(typed_document):
+        return None
+    return typed_document

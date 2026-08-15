@@ -38,7 +38,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -2117,11 +2117,11 @@ def _control_query_discovery_artifact_bytes(
         # encoding -- report the refusal's own message/code rather than the
         # generic "encoding is unsupported", which misdescribes why the
         # artifact is unavailable.
-        delivery = cast(dict[str, object], envelope.get("delivery", {}))
-        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
-        raise ValueError(
-            f"MCP discovery artifact delivery refused ({delivery.get('code')}): {message}"
-        )
+        # A2 (#231 R6 review): the message extraction itself now delegates
+        # to bounded_payload.describe_delivery_refusal, the single owner.
+        code = cast(dict[str, object], envelope.get("delivery", {})).get("code")
+        message = describe_delivery_refusal(envelope)
+        raise ValueError(f"MCP discovery artifact delivery refused ({code}): {message}")
     if envelope.get("encoding") != "base64":
         raise ValueError("MCP discovery artifact encoding is unsupported")
     encoded = envelope.get("data")

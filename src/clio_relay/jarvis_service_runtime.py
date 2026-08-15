@@ -12,7 +12,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from clio_relay.bounded_payload import is_delivery_refusal
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -918,10 +918,12 @@ def _load_source(
         # envelope -- report the refusal's own message/code instead of the
         # generic "is not a base64 envelope" the checks below would raise,
         # which misdescribes WHY the artifact is unavailable.
-        delivery = cast(dict[str, object], envelope.get("delivery", {}))
-        message = cast(str, delivery.get("message", "artifact content exceeds the transfer limit"))
+        # A2 (#231 R6 review): the message extraction itself now delegates
+        # to bounded_payload.describe_delivery_refusal, the single owner.
+        code = cast(dict[str, object], envelope.get("delivery", {})).get("code")
         raise ValueError(
-            f"JARVIS service source artifact delivery refused ({delivery.get('code')}): {message}"
+            f"JARVIS service source artifact delivery refused ({code}): "
+            f"{describe_delivery_refusal(envelope)}"
         )
     raw_artifact = envelope.get("artifact")
     artifact = ArtifactRef.model_validate(raw_artifact)

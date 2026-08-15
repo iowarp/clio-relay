@@ -94,7 +94,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # command-module extraction. Net negative: the added `import ... as ...`
     # lines are outweighed by the removed multi-line `from ... import (...)`
     # blocks they replace. A ratchet-down.
-    "src/clio_relay/cli.py": 19335,
+    # #231 R6-fix review, A2: +3 net lines -- `_decode_artifact_envelope`'s
+    # delivery-refusal message extraction delegates to
+    # `bounded_payload.describe_delivery_refusal` (single owner) instead of
+    # re-deriving the same fallback-text extraction inline. A justified,
+    # minimal ratchet-up.
+    "src/clio_relay/cli.py": 19338,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
@@ -123,7 +128,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # payload_too_large door (413) instead of answering 200 with a body
     # that merely says result_available: false. A justified, minimal
     # ratchet-up.
-    "src/clio_relay/http_api.py": 3151,
+    # #231 R6-fix review, A2: -2 net lines -- the same route's delivery-
+    # refusal message extraction now delegates to
+    # `bounded_payload.describe_delivery_refusal` instead of a 4-line
+    # inline `delivery.get("message", ...)` extraction. A ratchet-down.
+    "src/clio_relay/http_api.py": 3149,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
@@ -141,13 +150,27 @@ RATCHET_BASELINE: dict[str, int] = {
     # refusal's own message/code, instead of the generic "is not a base64
     # envelope" that misdescribes why the artifact is unavailable. A
     # justified, minimal ratchet-up.
-    "src/clio_relay/jarvis_service_runtime.py": 1169,
+    # #231 R6-fix review, A2: +2 net lines -- the message extraction now
+    # delegates to `bounded_payload.describe_delivery_refusal`; the
+    # multi-line f-string it feeds grew by one line in exchange. A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/jarvis_service_runtime.py": 1171,
     # #231 R6 review fixes: +20 net lines -- F5, both `_verify_completed_
     # job`'s inline artifact/provenance checks and the new shared
     # `_delivery_refusal_error` helper now recognize a T2 refusal by its
     # own message/code before falling into the generic "not base64
     # encoded" complaint. A justified, minimal ratchet-up.
-    "src/clio_relay/live_acceptance.py": 5447,
+    # #231 R6-fix review, A2: +1 net line -- `_delivery_refusal_error`'s
+    # message extraction now delegates to
+    # `bounded_payload.describe_delivery_refusal`. A justified, minimal
+    # ratchet-up.
+    # #231 R6-fix review, A1: +22 net lines -- `_remote_shell`'s non-zero-
+    # exit path now recognizes a T2 delivery-refusal document on stdout
+    # (`bounded_payload.parse_delivery_refusal`) via a new
+    # `_remote_command_failure` helper, before falling into the generic
+    # "remote command failed: <blob>" that discarded the refusal's own
+    # typed code/message. A justified, minimal ratchet-up.
+    "src/clio_relay/live_acceptance.py": 5470,
     # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
     # bounded_payload.is_delivery_refusal on the envelope
     # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
@@ -163,7 +186,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # dict migrated onto bounded_payload.build_delivery_refusal, retiring
     # the local MCP_RESULT_DELIVERY_SCHEMA constant (single owner, the
     # slice's own rule). Each pass justified, minimal.
-    "src/clio_relay/mcp_server.py": 5943,
+    # #231 R6-fix review, A4: -14 net lines -- `_delivery_refusal_failed`
+    # is promoted to `bounded_payload.is_delivery_refusal_failed` (the
+    # single owner every FAILURE-discriminating caller shares, not only
+    # the MCP tool-result boundary); its local definition here is deleted,
+    # the two call sites now call the imported name (-12), plus a stray
+    # doubled blank line `ruff format` collapsed at the deletion site
+    # (-2). A ratchet-down.
+    "src/clio_relay/mcp_server.py": 5929,
     "src/clio_relay/mcp_stdio_validation.py": 1269,
     "src/clio_relay/models.py": 2296,
     "src/clio_relay/process_containment.py": 2678,
@@ -185,7 +215,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # `config_cleanup_error` (R3), plus anchor-aware wording corrections
     # (R12). Real behavioral fixes from a security-relevant review, not a
     # deletable regression.
-    "src/clio_relay/remote_connection.py": 1058,
+    # #231 R6-fix review, A1: +15 net lines -- the owned-session API's non-
+    # 2xx path now recognizes a T2 delivery-refusal document
+    # `door_errors.as_http_problem` spread into the 413 problem body (doc
+    # §6.4, F4) via `bounded_payload.is_delivery_refusal`, surfacing its
+    # own typed code/message instead of the generic "HTTP {status}: {raw
+    # json blob}". A justified, minimal ratchet-up.
+    "src/clio_relay/remote_connection.py": 1073,
     # #231 R6 review fixes: +11 net lines -- F5,
     # `_control_query_discovery_artifact_bytes` checks is_delivery_refusal
     # on the envelope FIRST and raises the refusal's own message/code,
