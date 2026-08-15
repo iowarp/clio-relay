@@ -99,7 +99,26 @@ RATCHET_BASELINE: dict[str, int] = {
     # `bounded_payload.describe_delivery_refusal` (single owner) instead of
     # re-deriving the same fallback-text extraction inline. A justified,
     # minimal ratchet-up.
-    "src/clio_relay/cli.py": 19338,
+    # #231 R8(ii): -579 net lines -- the first cli.py command-module
+    # extraction (doc §5's `relay-host` row): the seven `relay_host_app`
+    # commands move to the new `cli_relay_host.py` (600 lines, its own new
+    # ratchet-exempt file, cap 800), and the six shared-plumbing helpers the
+    # doc's cli_support.py row names (`_run_or_exit`, `_require_cluster`,
+    # `_write_failed_acceptance_report`, `_resolve_env_secret`,
+    # `_acceptance_report_command`, plus the private `_local_secret`/
+    # `_echo_storage_admission_error` each depends on) move to the new
+    # `cli_support.py` (185 lines), with cli.py keeping each under its
+    # original name as a one-line re-export so its ~200 other bare-name
+    # call sites and every existing `monkeypatch.setattr(cli, "_X", ...)`
+    # test patch keep working unchanged. A handful of the re-export lines
+    # (and the two new modules' own top-of-file directives) carry a
+    # `# pyright: ignore[reportPrivateUsage]`/`reportUnusedFunction=false`
+    # comment -- both files legitimately reach the other's underscore-
+    # prefixed names by design (their own docstrings explain why), the same
+    # shape `http_api.py`'s own `reportUnusedFunction=false` already covers
+    # for decorator-registered-only route handlers. The largest single
+    # ratchet-down of the #231 campaign so far.
+    "src/clio_relay/cli.py": 18759,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
