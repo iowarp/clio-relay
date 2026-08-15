@@ -408,7 +408,7 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
         return path.open("xb")
 
     monkeypatch.setattr(
-        "clio_relay.core_queue.open_private_atomic_file",
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
         _open_atomic,
     )
 
@@ -586,7 +586,10 @@ def _mock_local_job_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     def _open_atomic(path: Path) -> BinaryIO:
         return path.open("xb")
 
-    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+    monkeypatch.setattr(
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        _open_atomic,
+    )
 
     def _no_cluster(_cluster: str) -> None:
         return None
@@ -1487,7 +1490,10 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
     def _open_atomic(path: Path) -> BinaryIO:
         return path.open("xb")
 
-    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+    monkeypatch.setattr(
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        _open_atomic,
+    )
 
     def _no_cluster(_cluster: str) -> None:
         return None

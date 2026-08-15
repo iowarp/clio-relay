@@ -15,26 +15,28 @@ import json
 import logging
 import os
 import stat
-import threading
-import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import TracebackType
 from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
 
-from filelock import FileLock, Timeout
 from pydantic import BaseModel
 
-from clio_relay import queue_context, queue_jarvis_inputs, queue_layout
+from clio_relay import (
+    queue_context,
+    queue_jarvis_inputs,
+    queue_layout,
+    queue_store_lock,
+    queue_store_read,
+    queue_store_write,
+)
 from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.cluster_config import (
     ensure_private_configuration_directory,
-    ensure_private_configuration_path,
-    open_private_atomic_file,
+    ensure_private_configuration_path,  # pyright: ignore[reportUnusedImport]  # noqa: F401 - live compatibility patch seam
 )
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import (
@@ -111,7 +113,7 @@ from clio_relay.worker_lifetime_lock import (
 )
 
 logger = logging.getLogger(__name__)
-
+_STORE_READ_FACADE_SYMBOL = queue_store_read.bind_facade_symbol(globals().__getitem__)
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = queue_layout.LeaseExpiryReference
 _UNSET = queue_layout.UNSET
@@ -181,281 +183,18 @@ RECORD_FAMILY_MAX_BYTES = queue_layout.RECORD_FAMILY_MAX_BYTES
 _TransientRecordReplacement = queue_layout.TransientRecordReplacement
 
 
-class _UnsafeQueueDirectoryProtection(ConfigurationError):
-    """Pinned repair found a linked canonical family before queue initialization."""
-
-    def __init__(self, *, family: str, path: Path, cause: OSError) -> None:
-        self.family = family
-        self.path = path
-        super().__init__(
-            "queue directory protections cannot be repaired through the pinned root: "
-            f"{path}: {cause}"
-        )
-
-
-class LegacyQueueStateError(QueueConflictError):
-    """Machine-readable refusal for unsafe pre-1.0 canonical queue state."""
-
-    def __init__(
-        self,
-        *,
-        family: str,
-        path: Path,
-        reason: str,
-        action: str | None = None,
-    ) -> None:
-        self.report: dict[str, str] = {
-            "schema_version": "clio-relay.legacy-state-audit.v1",
-            "family": family,
-            "path": str(logical_filesystem_path(path)),
-            "reason": reason,
-            "action": action
-            or (
-                "move the unsafe state aside or export records with portable durable IDs "
-                "before retrying"
-            ),
-        }
-        super().__init__(json.dumps(self.report, sort_keys=True))
-
-
-class QueueSealRequiresExclusive(ConfigurationError):
-    """Refuse to create the indexed-era seal without exclusive writer fencing."""
-
-
-_ORDER_FAMILIES = ("tasks", "artifacts", "progress")
-_GLOBAL_ORDER_FAMILIES = (
-    "endpoints",
-    "jobs",
-    "gateway_sessions",
-    "monitor_rules",
-)
-_RETENTION_INDEX_FAMILIES = (
-    "jobs",
-    "tasks",
-    "artifacts",
-    "monitor_rules",
-    "gateway_sessions",
-)
-_OPERATIONAL_INDEX_FAMILIES = (
-    "endpoints",
-    "jobs",
-    "gateway_sessions",
-    "leases",
-)
-_INITIALIZED_QUEUE_FAMILIES = (
-    "endpoints",
-    "endpoints_fresh",
-    "endpoints_fresh_by_id",
-    "jobs",
-    "tasks",
-    "leases",
-    "lease_indexes",
-    "lease_identity_refs",
-    "leases_by_endpoint",
-    "leases_by_cluster_kind",
-    "leases_by_expiry",
-    "lease_capacity",
-    "events",
-    "legacy_output_archives",
-    "legacy_output_receipts",
-    "legacy_output_retired",
-    "artifacts",
-    "artifact_user_order",
-    "artifact_users",
-    "progress",
-    "task_events",
-    "gateway_sessions",
-    "gateway_reverse_refs_by_session",
-    "gateways_by_artifact",
-    "gateways_by_scheduler",
-    "active_gateway_refs_by_job",
-    "active_gateway_refs_by_session",
-    "idempotency",
-    "monitor_rules",
-    "monitor_rules_by_job",
-    "active_monitor_rules_by_job",
-    "owner_sessions",
-    "owner_session_jobs",
-    "owner_session_legacy_jobs",
-    "job_indexes",
-    "tasks_by_job",
-    "leases_by_job",
-    "artifacts_by_job",
-    "used_artifacts_by_job",
-    "progress_by_job",
-    "jobs_active",
-    "jobs_queued",
-    "task_event_heads",
-    "migrations",
-    "task_order_by_job",
-    "transition_intents",
-    "artifact_order_by_job",
-    "progress_order_by_job",
-    "active_tasks_by_job",
-    "scheduler_refs_by_job",
-    "scheduler_protections_by_job",
-    "scheduler_jobs",
-    "scheduler_cancel_pending",
-    "scheduler_cancel_dispositions",
-    "job_tombstones",
-    "gc_runs",
-    "gc_trash",
-    "global_order",
-)
-_ADDITIVE_QUEUE_FAMILIES = ("transforms", "mcp_tasks")
-_LEGACY_ONLY_QUEUE_FAMILIES = ("cursors",)
-_GC_TERMINAL_SCHEDULER_PHASES = {
-    SchedulerPhase.COMPLETED.value,
-    SchedulerPhase.FAILED.value,
-    SchedulerPhase.CANCELED.value,
-}
-
-
-class _FairBoundedFileLock:
-    """Serialize local waiters fairly before taking one cross-process file lock.
-
-    ``filelock`` retries a busy Windows lock by polling.  Several hot threads in
-    one relay process can repeatedly acquire the short-lived filesystem lock in
-    those polling gaps and starve an older local waiter until its bounded
-    timeout expires.  Ticket admission prevents local overtaking while the
-    underlying ``FileLock`` preserves cross-process exclusion.  Both waits
-    share one deadline so lock failure remains explicit and bounded.
-    """
-
-    def __init__(self, lock_file: str, *, timeout: float) -> None:
-        self.lock_file = lock_file
-        self.timeout = timeout
-        self._file_lock = FileLock(lock_file, timeout=timeout)
-        self._condition = threading.Condition()
-        self._owner_thread_id: int | None = None
-        self._owner_depth = 0
-        self._next_ticket = 0
-        self._serving_ticket = 0
-        self._abandoned_tickets: set[int] = set()
-
-    def __enter__(self) -> _FairBoundedFileLock:
-        self.acquire()
-        return self
-
-    @property
-    def is_locked(self) -> bool:
-        """Report this thread's underlying ``FileLock`` ownership state."""
-        return self._file_lock.is_locked
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc_value, traceback
-        self.release()
-
-    def acquire(self, *, timeout: float | None = None) -> None:
-        """Acquire local admission and the filesystem lock within one deadline."""
-        bounded_timeout = self.timeout if timeout is None else timeout
-        if bounded_timeout < 0:
-            raise ValueError("lock timeout must be non-negative")
-        deadline = time.monotonic() + bounded_timeout
-        thread_id = threading.get_ident()
-        with self._condition:
-            if self._owner_thread_id == thread_id:
-                self._owner_depth += 1
-                return
-            ticket = self._next_ticket
-            self._next_ticket += 1
-            while self._owner_thread_id is not None or ticket != self._serving_ticket:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._abandoned_tickets.add(ticket)
-                    self._skip_abandoned_tickets_locked()
-                    self._condition.notify_all()
-                    raise Timeout(self.lock_file)
-                self._condition.wait(timeout=remaining)
-            self._owner_thread_id = thread_id
-            self._owner_depth = 1
-
-        try:
-            remaining = max(0.0, deadline - time.monotonic())
-            self._file_lock.acquire(timeout=remaining)
-        except BaseException:
-            with self._condition:
-                self._owner_thread_id = None
-                self._owner_depth = 0
-                self._serving_ticket += 1
-                self._skip_abandoned_tickets_locked()
-                self._condition.notify_all()
-            raise
-
-    def release(self) -> None:
-        """Release one reentrant level and admit the next local ticket."""
-        thread_id = threading.get_ident()
-        with self._condition:
-            if self._owner_thread_id != thread_id or self._owner_depth == 0:
-                raise RuntimeError("core queue lock released by a non-owner thread")
-            if self._owner_depth > 1:
-                self._owner_depth -= 1
-                return
-            self._file_lock.release()
-            self._owner_thread_id = None
-            self._owner_depth = 0
-            self._serving_ticket += 1
-            self._skip_abandoned_tickets_locked()
-            self._condition.notify_all()
-
-    def _skip_abandoned_tickets_locked(self) -> None:
-        while self._serving_ticket in self._abandoned_tickets:
-            self._abandoned_tickets.remove(self._serving_ticket)
-            self._serving_ticket += 1
-
-
-class _CoreQueueStoreAdapter:
-    """Temporarily adapt the facade's private store to extracted queue owners."""
-
-    def __init__(self, queue: ClioCoreQueue) -> None:
-        self._queue = queue
-
-    @property
-    def storage_root(self) -> Path:
-        """Return the facade's internal durable storage root."""
-        return self._queue._storage_root  # pyright: ignore[reportPrivateUsage]
-
-    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
-        """Return the facade's migration-pinned queue-root descriptor and identity."""
-        return (
-            self._queue._locked_storage_root_descriptor,  # pyright: ignore[reportPrivateUsage]
-            self._queue._locked_storage_root_identity,  # pyright: ignore[reportPrivateUsage]
-        )
-
-    @property
-    def lock(self) -> queue_context.QueueLockProtocol:
-        """Return the facade's shared storage lock."""
-        return self._queue._lock  # pyright: ignore[reportPrivateUsage]
-
-    def initialize(self) -> None:
-        """Initialize the facade's current private store."""
-        self._queue.initialize()
-
-    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
-        """Read one optional record through the facade's private store."""
-        return self._queue._read_optional(  # pyright: ignore[reportPrivateUsage]
-            path,
-            model,
-        )
-
-    def write(self, path: Path, record: BaseModel) -> None:
-        """Write one record through the facade's private store."""
-        self._queue._write(path, record)  # pyright: ignore[reportPrivateUsage]
-
-    def bounded_regular_json_count(
-        self,
-        directory: Path,
-        *,
-        limit: int,
-        label: str,
-    ) -> tuple[int, bool]:
-        """Count bounded regular JSON records with the existing store helper."""
-        return _bounded_regular_json_count(directory, limit=limit, label=label)
+_UnsafeQueueDirectoryProtection = queue_store_lock.UnsafeQueueDirectoryProtection
+LegacyQueueStateError = queue_store_lock.LegacyQueueStateError
+QueueSealRequiresExclusive = queue_store_lock.QueueSealRequiresExclusive
+_ORDER_FAMILIES = queue_store_lock.ORDER_FAMILIES
+_GLOBAL_ORDER_FAMILIES = queue_store_lock.GLOBAL_ORDER_FAMILIES
+_RETENTION_INDEX_FAMILIES = queue_store_lock.RETENTION_INDEX_FAMILIES
+_OPERATIONAL_INDEX_FAMILIES = queue_store_lock.OPERATIONAL_INDEX_FAMILIES
+_INITIALIZED_QUEUE_FAMILIES = queue_store_lock.INITIALIZED_QUEUE_FAMILIES
+_ADDITIVE_QUEUE_FAMILIES = queue_store_lock.ADDITIVE_QUEUE_FAMILIES
+_LEGACY_ONLY_QUEUE_FAMILIES = queue_store_lock.LEGACY_ONLY_QUEUE_FAMILIES
+_GC_TERMINAL_SCHEDULER_PHASES = queue_store_lock.GC_TERMINAL_SCHEDULER_PHASES
+_FairBoundedFileLock = queue_store_lock.FairBoundedFileLock
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,9 +350,41 @@ class ClioCoreQueue:
         self._migration_lifetime_guarded = False
         self._locked_storage_root_descriptor: int | None = None
         self._locked_storage_root_identity: tuple[int, int] | None = None
-        self._jarvis_input_store: queue_context.QueueStoreProtocol = _CoreQueueStoreAdapter(self)
+        self._jarvis_input_store: queue_context.QueueStoreProtocol = self
         self._layout = queue_layout.QueueLayout(self._jarvis_input_store)
         self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._jarvis_input_store)
+
+    @property
+    def storage_root(self) -> Path:
+        """Return the internal filesystem root for durable queue records."""
+        return self._storage_root
+
+    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
+        """Return the migration-pinned queue-root descriptor and identity."""
+        return self._locked_storage_root_descriptor, self._locked_storage_root_identity
+
+    @property
+    def lock(self) -> queue_context.QueueLockProtocol:
+        """Return the shared queue storage lock."""
+        return self._lock
+
+    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
+        """Read one optional typed record through the store-read owner."""
+        return self._read_optional(path, model)
+
+    def write(self, path: Path, record: BaseModel) -> None:
+        """Persist one typed record through the store-write owner."""
+        self._write(path, record)
+
+    def bounded_regular_json_count(
+        self,
+        directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[int, bool]:
+        """Count bounded regular JSON records without following unsafe entries."""
+        return _bounded_regular_json_count(directory, limit=limit, label=label)
 
     def _storage_root_stat(self) -> os.stat_result:
         """Inspect the queue root through its held descriptor when migration-pinned."""
@@ -13774,199 +13545,40 @@ class ClioCoreQueue:
         return queue_layout.QueueLayout.label_key(value, domain=domain)
 
     def _write(self, path: Path, record: BaseModel) -> None:
-        # Scheduler cancellation records may contain the contract maximum of
-        # 1,000 dispositions.  Claim fields were added after v1.0.7, so writing
-        # six explicit nulls per legacy disposition would make a previously
-        # valid record exceed its durable family limit.  Missing optional fields
-        # retain the same Pydantic defaults; an active claim is still serialized
-        # in full because each of its values is non-null.
-        exclude_none = isinstance(record, SchedulerCancelPending)
-        self._write_text(path, record.model_dump_json(indent=2, exclude_none=exclude_none))
+        queue_store_write.write_model(self._storage_root, path, record)
 
     def _write_json(self, path: Path, record: dict[str, object]) -> None:
-        self._write_text(path, json.dumps(record))
+        queue_store_write.write_json(self._storage_root, path, record)
 
     def _require_safe_write_directory(self, directory: Path) -> os.stat_result:
-        """Create and validate one owner-controlled directory below the queue root."""
-        try:
-            logical_directory = logical_filesystem_path(directory)
-            internal_directory = internal_filesystem_path(
-                logical_directory,
-                force_extended=True,
-            )
-        except ValueError as error:
-            raise QueueConflictError(
-                f"write directory has an unsupported path: {directory}"
-            ) from error
-        try:
-            relative = internal_directory.relative_to(self._storage_root)
-        except ValueError as error:
-            raise QueueConflictError(
-                f"write directory escaped queue root: {logical_directory}"
-            ) from error
-        if any(part in {"", ".", ".."} for part in relative.parts):
-            raise QueueConflictError(f"write directory has unsafe ancestry: {logical_directory}")
-        current = self._storage_root
-        for part in relative.parts:
-            current /= part
-            try:
-                current_stat = os.lstat(current)
-            except FileNotFoundError:
-                with suppress(FileExistsError):
-                    current.mkdir(mode=0o700)
-                current_stat = os.lstat(current)
-            if not stat.S_ISDIR(current_stat.st_mode) or _record_is_reparse(current_stat):
-                raise QueueConflictError(
-                    f"write directory ancestry is unsafe: {logical_filesystem_path(current)}"
-                )
-            if os.name != "nt" and hasattr(os, "geteuid") and current_stat.st_uid != os.geteuid():
-                raise QueueConflictError(
-                    f"write directory is not owned by this user: {logical_filesystem_path(current)}"
-                )
-        return os.lstat(internal_directory)
+        return queue_store_write.require_safe_write_directory(self._storage_root, directory)
 
     def _require_private_write_staging(self) -> tuple[Path, os.stat_result]:
-        """Return the private non-reparse staging directory used for atomic writes."""
-        staging = self._storage_root / WRITE_STAGING_FAMILY
-        try:
-            if not os.path.lexists(staging):
-                ensure_private_configuration_directory(staging)
-            if os.name != "nt":
-                os.chmod(staging, 0o700)
-            ensure_private_configuration_path(staging, directory=True)
-        except (ConfigurationError, OSError) as error:
-            raise QueueConflictError(
-                f"queue write staging is not owner-private: {logical_filesystem_path(staging)}"
-            ) from error
-        staging_stat = self._require_safe_write_directory(staging)
-        if not stat.S_ISDIR(staging_stat.st_mode) or _record_is_reparse(staging_stat):
-            raise QueueConflictError(
-                f"queue write staging is not a safe directory: {logical_filesystem_path(staging)}"
-            )
-        return staging, staging_stat
+        return queue_store_write.require_private_write_staging(self._storage_root)
 
     def _purge_write_staging_unlocked(self) -> None:
-        """Remove bounded crash leftovers while holding the cross-process queue lock."""
-        staging, _ = self._require_private_write_staging()
-        leftovers: list[Path] = []
-        try:
-            with os.scandir(staging) as entries:
-                for entry in entries:
-                    if len(leftovers) >= WRITE_STAGING_MAX_LEFTOVERS:
-                        raise QueueConflictError(
-                            f"queue write staging exceeds the bounded cleanup limit: {staging}"
-                        )
-                    path = Path(entry.path)
-                    stem = entry.name.removesuffix(".tmp")
-                    entry_stat = os.lstat(path)
-                    if (
-                        not entry.name.endswith(".tmp")
-                        or len(stem) != 32
-                        or any(character not in "0123456789abcdef" for character in stem)
-                        or not stat.S_ISREG(entry_stat.st_mode)
-                        or _record_is_reparse(entry_stat)
-                        or entry_stat.st_nlink != 1
-                    ):
-                        raise QueueConflictError(
-                            f"queue write staging contains an unsafe entry: {path}"
-                        )
-                    leftovers.append(path)
-        except QueueConflictError:
-            raise
-        except OSError as error:
-            raise QueueConflictError(f"cannot scan queue write staging: {staging}") from error
-        for path in leftovers:
-            _unlink_durable_path(path)
-        if leftovers:
-            self._fsync_write_directory(staging)
+        queue_store_write.purge_write_staging(self._storage_root)
 
     def _write_text(self, path: Path, text: str) -> None:
-        self._write_bytes(
-            path,
-            text.encode("utf-8"),
-            max_bytes=_record_max_bytes(path),
-        )
+        queue_store_write.write_text(self._storage_root, path, text)
 
     def _write_bytes(self, path: Path, payload: bytes, *, max_bytes: int) -> None:
-        """Atomically write owner-private bytes below the queue root."""
-        try:
-            logical_path = logical_filesystem_path(path)
-            internal_path = internal_filesystem_path(logical_path, force_extended=True)
-        except ValueError as error:
-            raise QueueConflictError(f"queue write path is unsupported: {path}") from error
-        if max_bytes < 1 or len(payload) > max_bytes:
-            raise QueueConflictError(
-                f"{_record_family(internal_path)} record exceeds the {max_bytes}-byte limit: "
-                f"{logical_path}"
-            )
-        target_parent_stat = self._require_safe_write_directory(internal_path.parent)
-        staging, staging_stat = self._require_private_write_staging()
-        if staging_stat.st_dev != target_parent_stat.st_dev:
-            raise QueueConflictError(
-                "atomic queue replacement crosses filesystems: "
-                f"{logical_filesystem_path(staging)} -> {logical_path.parent}"
-            )
-        temporary = staging / f"{uuid4().hex}.tmp"
-        try:
-            try:
-                with open_private_atomic_file(temporary) as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except (ConfigurationError, OSError) as error:
-                raise QueueConflictError(
-                    "cannot create private staged queue record: "
-                    f"{logical_filesystem_path(temporary)}"
-                ) from error
-            observed_staging = os.lstat(staging)
-            observed_parent = os.lstat(internal_path.parent)
-            if not os.path.samestat(staging_stat, observed_staging):
-                raise QueueConflictError(
-                    "queue write staging changed before replace: "
-                    f"{logical_filesystem_path(staging)}"
-                )
-            if not os.path.samestat(target_parent_stat, observed_parent):
-                raise QueueConflictError(
-                    f"queue write target directory changed before replace: {logical_path.parent}"
-                )
-            for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
-                try:
-                    temporary.replace(internal_path)
-                    break
-                except PermissionError:
-                    if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
-                        raise
-                    time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
-        finally:
-            _unlink_durable_path(temporary, missing_ok=True)
-        self._fsync_write_directory(staging)
-        self._fsync_write_directory(internal_path.parent)
+        queue_store_write.write_bytes(
+            self._storage_root,
+            path,
+            payload,
+            max_bytes=max_bytes,
+        )
 
     @staticmethod
     def _fsync_write_directory(path: Path) -> None:
-        """Persist directory metadata where the platform exposes directory fsync."""
-        try:
-            directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        except OSError:
-            return
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        queue_store_write.fsync_write_directory(path)
 
     def _read_canonical_record(self, path: Path, model: type[Record]) -> Record:
-        """Read one canonical record and bind its content to its storage identity."""
-        record = self._read_json_file(path, model)
-        queue_layout.validate_canonical_access(self._storage_root, path, record)
-        return record
+        return queue_store_read.read_canonical_record(self._storage_root, path, model)
 
     def _read_optional(self, path: Path, model: type[Record]) -> Record | None:
-        if _path_lstat(path) is None:
-            return None
-        try:
-            record = self._read_canonical_record(path, model)
-        except FileNotFoundError:
-            return None
+        record = queue_store_read.read_optional(self._storage_root, path, model)
         if isinstance(record, RelayEvent) and _is_canonical_event_path(
             self._storage_root,
             path,
@@ -13983,29 +13595,12 @@ class ClioCoreQueue:
         *,
         identity_field: str | None = None,
     ) -> Iterable[Record]:
-        identity_field = identity_field or _record_identity_field(model)
-        paths, truncated = cls._scan_json_record_paths(
+        del cls
+        return queue_store_read.read_many(
             directory,
-            limit=MAX_BOUNDED_SCAN_RECORDS,
-            label=f"canonical {identity_field} records",
+            model,
+            identity_field=identity_field,
         )
-        if truncated:
-            raise QueueConflictError(
-                "canonical record family exceeds the bounded read limit of "
-                f"{MAX_BOUNDED_SCAN_RECORDS}: {directory}"
-            )
-        records: list[Record] = []
-        for path in paths:
-            try:
-                record = cls._read_json_file(path, model)
-            except FileNotFoundError:
-                continue
-            if getattr(record, identity_field, None) != path.stem:
-                raise QueueConflictError(
-                    f"canonical {identity_field} filename/content identity mismatch: {path}"
-                )
-            records.append(record)
-        return records
 
     @classmethod
     def _scan_many(
@@ -14016,26 +13611,13 @@ class ClioCoreQueue:
         limit: int,
         identity_field: str | None = None,
     ) -> tuple[list[Record], bool]:
-        if limit < 1:
-            raise ValueError("record scan limit must be at least 1")
-        identity_field = identity_field or _record_identity_field(model)
-        paths, truncated = cls._scan_json_record_paths(
+        del cls
+        return queue_store_read.scan_many(
             directory,
+            model,
             limit=limit,
-            label=f"canonical {identity_field} records",
+            identity_field=identity_field,
         )
-        records: list[Record] = []
-        for path in paths:
-            try:
-                record = cls._read_json_file(path, model)
-            except FileNotFoundError:
-                continue
-            if getattr(record, identity_field, None) != path.stem:
-                raise QueueConflictError(
-                    f"canonical {identity_field} filename/content identity mismatch: {path}"
-                )
-            records.append(record)
-        return records, truncated
 
     @staticmethod
     def _scan_json_record_paths(
@@ -14044,38 +13626,11 @@ class ClioCoreQueue:
         limit: int,
         label: str,
     ) -> tuple[list[Path], bool]:
-        """Scan regular JSON children without following a replaced directory or entry."""
-        try:
-            directory_stat = os.lstat(directory)
-        except FileNotFoundError:
-            return [], False
-        except OSError as error:
-            raise QueueConflictError(f"cannot inspect {label}: {directory}") from error
-        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
-            raise QueueConflictError(f"{label} is not a safe directory: {directory}")
-        paths: list[Path] = []
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    path = Path(entry.path)
-                    if (
-                        not entry.name.endswith(".json")
-                        or not stat.S_ISREG(entry_stat.st_mode)
-                        or _record_is_reparse(entry_stat)
-                    ):
-                        raise QueueConflictError(f"{label} contains an unsafe record: {path}")
-                    if len(paths) >= limit:
-                        return paths, True
-                    paths.append(path)
-        except QueueConflictError:
-            raise
-        except OSError as error:
-            raise QueueConflictError(f"cannot scan {label}: {directory}") from error
-        return paths, False
+        return queue_store_read.scan_json_record_paths(
+            directory,
+            limit=limit,
+            label=label,
+        )
 
     @staticmethod
     def _bounded_json_record_paths(
@@ -14084,69 +13639,19 @@ class ClioCoreQueue:
         limit: int,
         label: str,
     ) -> list[Path]:
-        """Return bounded regular JSON children or fail closed on ambiguous layout."""
-        try:
-            directory_stat = os.lstat(directory)
-        except FileNotFoundError:
-            return []
-        if not stat.S_ISDIR(directory_stat.st_mode) or _record_is_reparse(directory_stat):
-            raise QueueConflictError(f"{label} is not a safe directory: {directory}")
-        paths: list[Path] = []
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if len(paths) >= limit:
-                        raise QueueConflictError(
-                            f"{label} exceeded its safety bound of {limit} records"
-                        )
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    path = Path(entry.path)
-                    if (
-                        not entry.name.endswith(".json")
-                        or not stat.S_ISREG(entry_stat.st_mode)
-                        or _record_is_reparse(entry_stat)
-                    ):
-                        raise QueueConflictError(f"{label} contains an unsafe record: {path}")
-                    paths.append(path)
-        except OSError as exc:
-            raise queue_conflict_from_cause(
-                f"cannot scan {label}",
-                cause=exc,
-                logger=logger,
-            ) from exc
-        return paths
+        return queue_store_read.bounded_json_record_paths(
+            directory,
+            limit=limit,
+            label=label,
+        )
 
     @staticmethod
     def _read_json_file(path: Path, model: type[Record]) -> Record:
-        last_error: OSError | json.JSONDecodeError | QueueConflictError | None = None
-        for _ in range(ATOMIC_REPLACE_ATTEMPTS):
-            try:
-                return model.model_validate_json(_read_bounded_record_bytes(path))
-            except (PermissionError, json.JSONDecodeError) as exc:
-                last_error = exc
-                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
-            except QueueConflictError as exc:
-                if not _transient_record_access_conflict(exc):
-                    raise
-                last_error = exc
-                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
-        if last_error is not None:
-            raise last_error
-        return model.model_validate_json(_read_bounded_record_bytes(path))
+        return queue_store_read.read_json_file(path, model)
 
     @staticmethod
     def _read_json_document(path: Path) -> object:
-        try:
-            return json.loads(_read_bounded_record_bytes(path))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise queue_conflict_from_cause(
-                f"invalid JSON record {path}",
-                cause=exc,
-                logger=logger,
-            ) from exc
+        return queue_store_read.read_json_document(path)
 
 
 def _read_unique_json_document(path: Path) -> object:
@@ -14173,8 +13678,7 @@ def _read_unique_json_document(path: Path) -> object:
         ) from exc
 
 
-def _record_identity_field(model: type[BaseModel]) -> str:
-    return queue_layout.record_identity_field(model)
+_record_identity_field = queue_layout.record_identity_field
 
 
 def _is_canonical_event_path(storage_root: Path, path: Path, family: str) -> bool:
@@ -15234,10 +14738,7 @@ def _parse_lease_expiry_ref_name(
 
 
 def _path_lstat(path: Path) -> os.stat_result | None:
-    try:
-        return os.lstat(path)
-    except FileNotFoundError:
-        return None
+    return queue_store_read.path_lstat(path)
 
 
 def _ensure_gc_parent(path: Path) -> None:
@@ -15447,8 +14948,7 @@ def _record_family(path: Path) -> str:
     return queue_layout.record_family(path)
 
 
-def _record_max_bytes(path: Path) -> int:
-    return queue_layout.record_max_bytes(path)
+_record_max_bytes = queue_layout.record_max_bytes
 
 
 def _record_is_reparse(file_stat: os.stat_result) -> bool:
@@ -15459,152 +14959,22 @@ def _validate_record_stat(file_stat: os.stat_result, *, path: Path) -> None:
     queue_layout.validate_record_stat(file_stat, path=path)
 
 
-def _record_stats_match(
-    expected: os.stat_result,
-    observed: os.stat_result,
-    *,
-    compare_ctime: bool,
-) -> bool:
-    return queue_layout.record_stats_match(
-        expected,
-        observed,
-        compare_ctime=compare_ctime,
-    )
+_record_stats_match = queue_layout.record_stats_match
 
 
 def _read_bounded_record_bytes_once(path: Path, *, limit: int) -> bytes:
-    """Read one stable record generation or identify a transient replacement."""
-    before = os.lstat(path)
-    _validate_record_stat(before, path=path)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    descriptor = -1
-    try:
-        try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError as exc:
-            raise _TransientRecordReplacement(
-                f"durable record disappeared while opening: {path}"
-            ) from exc
-        opened = os.fstat(descriptor)
-        _validate_record_stat(opened, path=path)
-        try:
-            after_open = os.lstat(path)
-        except FileNotFoundError as exc:
-            raise _TransientRecordReplacement(
-                f"durable record disappeared after opening: {path}"
-            ) from exc
-        _validate_record_stat(after_open, path=path)
-        if (
-            not _record_stats_match(before, opened, compare_ctime=False)
-            or not _record_stats_match(opened, after_open, compare_ctime=False)
-            or not _record_stats_match(before, after_open, compare_ctime=True)
-        ):
-            raise _TransientRecordReplacement(f"durable record changed while opening: {path}")
-        chunks: list[bytes] = []
-        total = 0
-        while total <= limit:
-            before_chunk = os.fstat(descriptor)
-            _validate_record_stat(before_chunk, path=path)
-            if not _record_stats_match(opened, before_chunk, compare_ctime=True):
-                raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
-            chunk = os.read(descriptor, min(65_536, limit + 1 - total))
-            after_chunk = os.fstat(descriptor)
-            _validate_record_stat(after_chunk, path=path)
-            if not _record_stats_match(opened, after_chunk, compare_ctime=True):
-                raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        final = os.fstat(descriptor)
-        _validate_record_stat(final, path=path)
-        try:
-            after_read = os.lstat(path)
-        except FileNotFoundError as exc:
-            raise _TransientRecordReplacement(
-                f"durable record disappeared after reading: {path}"
-            ) from exc
-        _validate_record_stat(after_read, path=path)
-        if (
-            not _record_stats_match(opened, final, compare_ctime=True)
-            or not _record_stats_match(final, after_read, compare_ctime=False)
-            or not _record_stats_match(before, after_read, compare_ctime=True)
-        ):
-            raise _TransientRecordReplacement(f"durable record changed while reading: {path}")
-        if total > limit:
-            raise QueueConflictError(
-                f"{_record_family(path)} record exceeds the {limit}-byte limit: {path}"
-            )
-        if total != final.st_size:
-            raise _TransientRecordReplacement(f"durable record changed size while reading: {path}")
-        return b"".join(chunks)
-    except (_TransientRecordReplacement, QueueConflictError):
-        raise
-    except OSError as exc:
-        raise queue_conflict_from_cause(
-            f"cannot read durable record {path}",
-            cause=exc,
-            logger=logger,
-        ) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    return queue_store_read.read_bounded_record_bytes_once(path, limit=limit)
 
 
 def _read_bounded_record_bytes(path: Path) -> bytes:
-    """Read one stable bounded record, retrying only atomic replacement races."""
-    limit = _record_max_bytes(path)
-    last_replacement: _TransientRecordReplacement | None = None
-    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
-        try:
-            return _read_bounded_record_bytes_once(path, limit=limit)
-        except FileNotFoundError as exc:
-            if last_replacement is None:
-                raise
-            last_replacement = _TransientRecordReplacement(
-                f"durable record remained absent during atomic replacement: {path}"
-            )
-            last_replacement.__cause__ = exc
-        except _TransientRecordReplacement as exc:
-            last_replacement = exc
-        if attempt + 1 < ATOMIC_REPLACE_ATTEMPTS:
-            time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
-    raise QueueConflictError(
-        f"durable record did not stabilize after {ATOMIC_REPLACE_ATTEMPTS} "
-        f"atomic replacement attempts: {path}"
-    ) from last_replacement
+    return queue_store_read.read_bounded_record_bytes(path)
 
 
-def _transient_record_access_conflict(error: QueueConflictError) -> bool:
-    """Return whether a durable read failed only on a transient sharing denial."""
-    cause = error.__cause__
-    if not isinstance(cause, OSError):
-        return False
-    return (
-        isinstance(cause, PermissionError)
-        or cause.errno in {errno.EACCES, errno.EPERM}
-        or getattr(cause, "winerror", None) in {5, 32, 33}
-    )
+_transient_record_access_conflict = queue_store_read.transient_record_access_conflict
 
 
 def _unlink_durable_path(path: Path, *, missing_ok: bool = False) -> None:
-    """Delete one durable path after bounded Windows sharing-violation retries."""
-    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
-        try:
-            path.unlink(missing_ok=missing_ok)
-            return
-        except OSError as error:
-            if (
-                getattr(error, "winerror", None) not in {5, 32, 33}
-                or attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS
-            ):
-                raise
-            time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
+    queue_store_write.unlink_durable_path(path, missing_ok=missing_ok)
 
 
 def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

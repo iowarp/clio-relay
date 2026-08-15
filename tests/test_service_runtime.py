@@ -1423,7 +1423,7 @@ def _start_lifecycle_frp_runtime(
             yield handle
 
     monkeypatch.setattr(
-        "clio_relay.core_queue.open_private_atomic_file",
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
         open_test_atomic_file,
     )
     settings = RelaySettings(

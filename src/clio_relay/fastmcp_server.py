@@ -1113,7 +1113,7 @@ class RelayTasksExtension(ServerExtension):
             )
             raise door_error_adapters.as_mcp_error(
                 door_errors.classify(
-                    exc,
+                    door_errors.public_message_error(exc),
                     reason="mcp_task_conflict",
                     data={"task_id": conflicting_task_id},
                 )

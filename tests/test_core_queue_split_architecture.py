@@ -12,7 +12,14 @@ from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
-_OWNER_ORDER = ("queue_context", "queue_jarvis_inputs", "queue_layout")
+_OWNER_ORDER = (
+    "queue_context",
+    "queue_jarvis_inputs",
+    "queue_layout",
+    "queue_store_lock",
+    "queue_store_read",
+    "queue_store_write",
+)
 _JARVIS_INPUT_SYMBOLS = (
     "get_jarvis_package_input_contract",
     "put_jarvis_package_input_contract",
@@ -119,6 +126,15 @@ def test_split_owner_dependencies_follow_the_migration_topology() -> None:
         if order[edge.collaborator] >= order[edge.caller]
     ]
     assert violations == []
+
+
+def test_queue_store_protocol_is_implemented_by_the_concrete_queue(
+    tmp_path: Path,
+) -> None:
+    """CQ3 removes the temporary facade adapter from the JARVIS owner binding."""
+    queue = ClioCoreQueue(tmp_path)
+
+    assert queue._jarvis_input_store is queue  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_jarvis_input_facade_signatures_match_the_owner() -> None:
