@@ -27,11 +27,11 @@ from fastapi import (
     Request,
     WebSocket,
     WebSocketDisconnect,
-    WebSocketException,
-    status,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clio_relay import door_errors
@@ -311,7 +311,7 @@ class InputArtifactBodyLimitMiddleware:
         )
         if len(session_ids) != 1 or len(generation_ids) != 1:
             return (
-                "session_binding_conflict",
+                "session_binding_headers_required",
                 "exact owner session and generation headers are required",
             )
         if not (
@@ -319,7 +319,7 @@ class InputArtifactBodyLimitMiddleware:
             and secrets.compare_digest(generation_ids[0], self._session_generation_id)
         ):
             return (
-                "session_binding_conflict",
+                "session_binding_identity_mismatch",
                 "owner session or generation does not match this API process",
             )
         return None
@@ -1082,6 +1082,44 @@ async def _relay_http_problem_handler(
     )
 
 
+async def _relay_request_validation_handler(
+    _request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    """Serve framework request validation through the relay error owner."""
+    if not isinstance(exc, RequestValidationError):
+        raise exc
+    fault = door_errors.fault_for_reason(
+        "request_validation_failed",
+        "Request validation failed.",
+    )
+    return JSONResponse(
+        door_errors.as_http_problem(fault),
+        status_code=fault.http_status,
+        media_type="application/problem+json",
+    )
+
+
+async def _relay_framework_http_handler(
+    _request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    """Serve Starlette HTTP failures without losing framework status or headers."""
+    if not isinstance(exc, StarletteHTTPException):
+        raise exc
+    reason = {
+        404: "route_not_found",
+        405: "method_not_allowed",
+    }.get(exc.status_code, "framework_http_error")
+    fault = door_errors.fault_for_http_status(reason, exc.status_code)
+    return JSONResponse(
+        door_errors.as_http_problem(fault),
+        status_code=exc.status_code,
+        headers=exc.headers,
+        media_type="application/problem+json",
+    )
+
+
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
@@ -1120,6 +1158,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
     app.add_exception_handler(door_errors.HTTPProblemError, _relay_http_problem_handler)
+    app.add_exception_handler(RequestValidationError, _relay_request_validation_handler)
+    app.add_exception_handler(StarletteHTTPException, _relay_framework_http_handler)
     app.add_exception_handler(Exception, _relay_unhandled_exception_handler)
     app.add_middleware(
         InputArtifactBodyLimitMiddleware,
@@ -1144,7 +1184,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         generation_id = resolved.owner_session_generation_id
         if generation_id is None:
             raise door_errors.http_problem(
-                "session_binding_conflict", "relay session has no exact generation identity"
+                "session_generation_identity_unavailable",
+                "relay session has no exact generation identity",
             )
         admission = queue.owner_session_generation_status(
             resolved.owner_session_id,
@@ -1152,7 +1193,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         )
         if admission.get("open") is not True:
             raise door_errors.http_problem(
-                "session_binding_conflict", "relay session generation is not open for new work"
+                "session_intake_closed", "relay session generation is not open for new work"
             )
 
     def owns_job(job: RelayJob) -> bool:
@@ -1298,9 +1339,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             return _public_record(queue.submit_job(job.model_copy(update={"metadata": metadata})))
         except ValueError as exc:
-            raise door_errors.http_problem("job_submission_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "job_submission_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
         except QueueConflictError as exc:
-            raise door_errors.http_problem("job_submission_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "job_submission_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except StorageAdmissionError as exc:
             raise door_errors.http_problem("storage_admission_refused", exc=exc) from exc
 
@@ -1420,7 +1465,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise door_errors.http_problem("jarvis_runtime_authority_unavailable", exc=exc) from exc
         except (ConfigurationError, RelayError, ValueError) as exc:
-            raise door_errors.http_problem("jarvis_runtime_authority_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "jarvis_runtime_authority_conflict",
+                exc=door_errors.public_message_error(exc),
+            ) from exc
 
     @app.post(
         "/input-artifacts/ingest",
@@ -1450,7 +1498,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 sha256=request.sha256,
             )
         except ValueError as exc:
-            raise door_errors.http_problem("input_ingest_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "input_ingest_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
 
         input_ingest_policy = InputArtifactIngestPolicy(
             max_file_count=resolved.input_file_max_count,
@@ -1527,7 +1577,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                             "input artifact ingest failed and its attempt could not be terminalized"
                         ),
                     ) from cleanup_exc
-            raise door_errors.http_problem("input_ingest_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "input_ingest_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
         except (OSError, RuntimeError, QueueConflictError) as exc:
             if claimed:
                 try:
@@ -1544,7 +1596,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                             "input artifact ingest failed and its attempt could not be terminalized"
                         ),
                     ) from cleanup_exc
-            raise door_errors.http_problem("input_ingest_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "input_ingest_conflict",
+                exc=(
+                    door_errors.public_message_error(exc)
+                    if isinstance(exc, QueueConflictError)
+                    else exc
+                ),
+            ) from exc
         return {
             "job": _public_record(current).model_dump(mode="json"),
             "artifact": _public_record(artifact).model_dump(mode="json"),
@@ -1667,7 +1726,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 timeout_seconds=request.timeout_seconds,
             )
         except (ConfigurationError, ValueError) as exc:
-            raise door_errors.http_problem("mcp_submission_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "mcp_submission_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -1713,7 +1774,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 timeout_seconds=request.timeout_seconds,
             )
         except ValueError as exc:
-            raise door_errors.http_problem("jarvis_submission_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "jarvis_submission_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
         timeout_seconds = request.timeout_seconds
         if admission_class is McpAdmissionClass.CONTROL_QUERY and timeout_seconds is None:
             timeout_seconds = MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
@@ -1736,7 +1799,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             try:
                 observed_digest = jarvis_mcp_artifact_binding(request.cluster)
             except ValueError as exc:
-                raise door_errors.http_problem("jarvis_artifact_conflict", exc=exc) from exc
+                raise door_errors.http_problem(
+                    "jarvis_artifact_conflict", exc=door_errors.public_message_error(exc)
+                ) from exc
             if not secrets.compare_digest(expected_digest, observed_digest):
                 raise door_errors.http_problem(
                     "jarvis_artifact_conflict",
@@ -1815,7 +1880,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             env_from = jarvis_mcp_env_from()
         except (ValueError, ConfigurationError) as exc:
             # A failed explicit launcher identity never falls back (#228).
-            raise door_errors.http_problem("launcher_resolution_failed", exc=exc) from exc
+            raise door_errors.http_problem(
+                "launcher_resolution_failed", exc=door_errors.public_message_error(exc)
+            ) from exc
         # clio-relay#228 rework round 2 (design ruling): dev mode relaxes
         # VERIFICATION of a receipt, it must never SILENTLY substitute a
         # different binary with no queryable trace. When resolution above
@@ -1891,7 +1958,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise door_errors.http_problem("transform_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "transform_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
 
     @app.get(
         "/jobs/{job_id}/transform",
@@ -2046,13 +2115,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> None:
         """Stream task timeline events over a WebSocket."""
         _require_websocket_token(resolved, websocket)
-        if poll_seconds <= 0 or cursor < 1:
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        if poll_seconds <= 0:
+            raise door_errors.websocket_refusal("websocket_poll_interval_invalid")
+        if cursor < 1:
+            raise door_errors.websocket_refusal("websocket_cursor_invalid")
         _require_websocket_page_limit(limit)
         try:
             require_owned_task(task_id)
-        except (NotFoundError, door_errors.HTTPProblemError) as exc:
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+        except NotFoundError as exc:
+            raise door_errors.websocket_refusal("websocket_resource_not_found") from exc
+        except door_errors.HTTPProblemError as exc:
+            raise door_errors.websocket_refusal("websocket_resource_ownership_refused") from exc
         await websocket.accept()
         try:
             async for payload in _task_stream_payloads(
@@ -2120,13 +2193,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> None:
         """Stream job monitor updates over a WebSocket."""
         _require_websocket_token(resolved, websocket)
-        if poll_seconds <= 0 or cursor < 1:
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        if poll_seconds <= 0:
+            raise door_errors.websocket_refusal("websocket_poll_interval_invalid")
+        if cursor < 1:
+            raise door_errors.websocket_refusal("websocket_cursor_invalid")
         _require_websocket_page_limit(limit)
         try:
             require_owned_job(job_id)
-        except (NotFoundError, door_errors.HTTPProblemError) as exc:
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+        except NotFoundError as exc:
+            raise door_errors.websocket_refusal("websocket_resource_not_found") from exc
+        except door_errors.HTTPProblemError as exc:
+            raise door_errors.websocket_refusal("websocket_resource_ownership_refused") from exc
         await websocket.accept()
         try:
             async for payload in _monitor_stream_payloads(
@@ -2357,7 +2434,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except QueueConflictError as exc:
-            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "gateway_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
 
     @app.get(
         "/gateway-sessions",
@@ -2455,7 +2534,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except QueueConflictError as exc:
-            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "gateway_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
 
@@ -2469,7 +2550,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_gateway(session_id)
             return _public_record(queue.close_gateway_session(session_id))
         except QueueConflictError as exc:
-            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "gateway_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
 
@@ -2561,7 +2644,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
@@ -2593,7 +2678,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             generation_id = resolved.owner_session_generation_id
             if generation_id is None:
                 raise door_errors.http_problem(
-                    "session_binding_conflict", "owned session generation is missing"
+                    "session_generation_identity_unavailable",
+                    "owned session generation is missing",
                 )
             try:
                 return _public_payload(
@@ -2611,9 +2697,13 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     )
                 )
             except QueueConflictError as exc:
-                raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+                raise door_errors.http_problem(
+                    "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+                ) from exc
             except ValueError as exc:
-                raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
+                raise door_errors.http_problem(
+                    "queue_query_refused", exc=door_errors.public_message_error(exc)
+                ) from exc
         try:
             payload = list_queue_jobs(
                 queue,
@@ -2626,11 +2716,15 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 scan_limit=scan_limit,
             )
         except ConfigurationError as exc:
-            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_query_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
         return _public_payload(payload)
 
     @app.get("/queue/jobs/{job_id}/diagnose", dependencies=[auth_dependency])
@@ -2652,7 +2746,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
@@ -2675,7 +2771,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "retention_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         return _public_payload(
             {
                 "plan": plan.model_dump(mode="json"),
@@ -2696,7 +2794,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "retention_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         return {
             "job_id": job_id,
             "receipt_id": plan.receipt_id,
@@ -2728,7 +2828,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "retention_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         return _public_payload(result.model_dump(mode="json"))
 
     @app.get("/queue/stale", dependencies=[auth_dependency])
@@ -2758,11 +2860,15 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_query_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
 
     @app.get("/queue/diagnostics", dependencies=[auth_dependency])
     def diagnose_queue_route(cluster: str | None = None) -> dict[str, object]:
@@ -2806,11 +2912,15 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_operation_conflict", exc=door_errors.public_message_error(exc)
+            ) from exc
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
+            raise door_errors.http_problem(
+                "queue_query_refused", exc=door_errors.public_message_error(exc)
+            ) from exc
 
     @app.get("/workers", dependencies=[auth_dependency])
     def worker_status_route(cluster: str | None = None) -> dict[str, object]:
@@ -3008,7 +3118,7 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
             return
         if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
             raise door_errors.http_problem(
-                "session_binding_conflict",
+                "session_binding_headers_required",
                 "exact owner session and generation headers are required",
             )
         if expected_generation_id is None or not (
@@ -3019,7 +3129,7 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
             )
         ):
             raise door_errors.http_problem(
-                "session_binding_conflict",
+                "session_binding_identity_mismatch",
                 "owner session or generation does not match this API process",
             )
 
@@ -3073,7 +3183,7 @@ def _require_session_submission_binding(
                 or x_clio_relay_session_generation_id is not None
             ):
                 raise door_errors.http_problem(
-                    "session_binding_conflict", "relay API is not bound to an owner session"
+                    "unbound_session_api", "relay API is not bound to an owner session"
                 )
             return
         if settings.api_token is None:
@@ -3083,7 +3193,7 @@ def _require_session_submission_binding(
             )
         if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
             raise door_errors.http_problem(
-                "session_binding_conflict",
+                "session_binding_headers_required",
                 "exact owner session and generation headers are required",
             )
         if expected_generation_id is None or not (
@@ -3094,7 +3204,7 @@ def _require_session_submission_binding(
             )
         ):
             raise door_errors.http_problem(
-                "session_binding_conflict",
+                "session_binding_identity_mismatch",
                 "owner session or generation does not match this API process",
             )
 
@@ -3105,7 +3215,7 @@ def _require_websocket_page_limit(limit: object) -> None:
     try:
         validate_response_page_limit(limit)
     except ValueError as exc:
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+        raise door_errors.websocket_refusal("websocket_page_limit_invalid") from exc
 
 
 def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> None:
@@ -3115,7 +3225,7 @@ def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> N
     if supplied is None:
         supplied = _extract_token(websocket.headers.get("authorization"), None)
     if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        raise door_errors.websocket_refusal("websocket_authentication_failed")
     if settings.owner_session_id is None:
         return
     session_id = websocket.headers.get(OWNER_SESSION_ID_HEADER)
@@ -3127,7 +3237,7 @@ def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> N
         or not secrets.compare_digest(session_id, settings.owner_session_id)
         or not secrets.compare_digest(generation_id, settings.owner_session_generation_id)
     ):
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        raise door_errors.websocket_refusal("websocket_session_binding_failed")
 
 
 def _extract_token(authorization: str | None, header_token: str | None) -> str | None:

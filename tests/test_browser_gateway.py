@@ -233,6 +233,98 @@ def test_browser_gateway_preflight_methods_stream_and_command_are_narrow(
             ]
 
 
+def test_browser_gateway_ad_hoc_error_sites_serve_owner_documents(tmp_path: Path) -> None:
+    with _backend_server() as (backend_port, requests):
+        capability = "e" * 43
+        with _capability_proxy(
+            backend_port=backend_port,
+            capability=capability,
+            revocation_path=tmp_path / "revoked-owner-errors",
+        ) as proxy_port:
+            query = urlencode({"capability": capability})
+            responses = (
+                (
+                    httpx.get(
+                        f"http://127.0.0.1:{proxy_port}/missing?{query}",
+                        headers={"Origin": "null"},
+                    ),
+                    404,
+                    "browser_attachment_not_found",
+                ),
+                (
+                    httpx.get(
+                        f"http://127.0.0.1:{proxy_port}/healthz?{query}",
+                        headers={"Origin": "https://example.invalid"},
+                    ),
+                    403,
+                    "browser_origin_refused",
+                ),
+                (
+                    httpx.get(
+                        f"http://127.0.0.1:{proxy_port}/healthz",
+                        headers={"Origin": "null"},
+                    ),
+                    401,
+                    "browser_capability_refused",
+                ),
+                (
+                    httpx.options(
+                        f"http://127.0.0.1:{proxy_port}/commands?{query}",
+                        headers={"Origin": "null", "Access-Control-Request-Method": "DELETE"},
+                    ),
+                    403,
+                    "browser_preflight_refused",
+                ),
+                (
+                    httpx.options(
+                        f"http://127.0.0.1:{proxy_port}/state?{query}",
+                        headers={"Origin": "null", "Access-Control-Request-Method": "POST"},
+                    ),
+                    403,
+                    "browser_preflight_refused",
+                ),
+                (
+                    httpx.options(
+                        f"http://127.0.0.1:{proxy_port}/commands?{query}",
+                        headers={
+                            "Origin": "null",
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "X-Private",
+                        },
+                    ),
+                    403,
+                    "browser_preflight_refused",
+                ),
+                (
+                    httpx.delete(
+                        f"http://127.0.0.1:{proxy_port}/healthz?{query}",
+                        headers={"Origin": "null"},
+                    ),
+                    405,
+                    "browser_method_not_allowed",
+                ),
+                (
+                    httpx.post(
+                        f"http://127.0.0.1:{proxy_port}/state?{query}",
+                        headers={"Origin": "null"},
+                    ),
+                    405,
+                    "browser_method_not_allowed",
+                ),
+            )
+
+            for response, expected_status, expected_reason in responses:
+                assert response.status_code == expected_status
+                assert response.headers["content-type"].startswith("application/problem+json")
+                document = response.json()
+                assert document["schema_version"] == "clio-relay.error.v1"
+                assert document["status"] == expected_status
+                assert document["reason"] == expected_reason
+                assert "error" not in document
+
+        assert requests == []
+
+
 def test_browser_gateway_extends_response_header_timeout_only_for_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -268,7 +360,9 @@ def test_browser_gateway_extends_response_header_timeout_only_for_commands(
                 timeout=2.0,
             )
             assert state.status_code == 502
-            assert state.json() == {"error": "upstream service is unavailable"}
+            assert state.json()["reason"] == "browser_upstream_unavailable"
+            assert state.json()["status"] == 502
+            assert state.json()["detail"] == "upstream service is unavailable"
 
         assert requests == [
             ("POST", "/commands", b'{"operation":"measure-field"}'),
@@ -487,9 +581,13 @@ def test_browser_gateway_bounds_long_lived_requests_and_recovers_slots(
                     )
                     assert overloaded.status_code == 503
                     assert overloaded.headers["connection"] == "close"
-                    assert overloaded.json() == {
-                        "error": "browser attachment request capacity exhausted"
-                    }
+                    assert overloaded.json()["reason"] == "browser_gateway_overloaded"
+                    assert overloaded.json()["status"] == 503
+                    assert overloaded.json()["detail"] == (
+                        "browser attachment request capacity exhausted"
+                    )
+                    assert overloaded.headers["access-control-allow-origin"] == "null"
+                    assert overloaded.headers["retry-after"] == "1"
                 released = httpx.post(
                     f"http://127.0.0.1:{backend_port}/commands",
                     headers={"Content-Type": "application/json"},
@@ -544,9 +642,10 @@ def test_browser_gateway_reclaims_idle_pre_auth_connection_slot(
                 )
                 overloaded = httpx.get(url, headers={"Origin": "null"}, timeout=2.0)
                 assert overloaded.status_code == 503
-                assert overloaded.json() == {
-                    "error": "browser attachment request capacity exhausted"
-                }
+                assert overloaded.json()["reason"] == "browser_gateway_overloaded"
+                assert overloaded.json()["status"] == 503
+                assert overloaded.headers["access-control-allow-origin"] == "null"
+                assert overloaded.headers["retry-after"] == "1"
                 assert server.wait_for_active_request_count(0, timeout=2.0)
                 recovered = httpx.get(url, headers={"Origin": "null"}, timeout=2.0)
                 assert recovered.status_code == 200
@@ -687,6 +786,8 @@ def test_browser_gateway_revocation_and_expiry_fail_closed(tmp_path: Path) -> No
             revocation_path.write_text("revoked\n", encoding="utf-8")
             revoked = httpx.get(url, headers={"Origin": "null"})
             assert revoked.status_code == 401
+            assert revoked.json()["reason"] == "browser_capability_refused"
+            assert revoked.json()["detail"] == "browser capability is revoked"
             assert "access-control-allow-origin" not in revoked.headers
         with _capability_proxy(
             backend_port=backend_port,
@@ -699,6 +800,8 @@ def test_browser_gateway_revocation_and_expiry_fail_closed(tmp_path: Path) -> No
             )
             expired = httpx.get(expired_url, headers={"Origin": "null"})
             assert expired.status_code == 401
+            assert expired.json()["reason"] == "browser_capability_refused"
+            assert expired.json()["detail"] == "browser capability is expired"
         assert requests == [("GET", "/healthz", b"")]
 
 

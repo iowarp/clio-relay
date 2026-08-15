@@ -59,16 +59,10 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/bootstrap.py": 8733,
     "src/clio_relay/bootstrap_journal.py": 1497,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
-    # #231 R3: +34 net lines closing the fourth error surface (doc §6.2) --
-    # a shared _write_response + _error_document + _error_from_exception
-    # replace the bare {"error": message} shape at the two exception-path
-    # call sites, with the door_errors import kept function-local to avoid
-    # a real import cycle (browser_gateway -> door_errors -> storage_runtime
-    # -> core_queue -> browser_gateway). +25 more from the opus re-review's
-    # F7+F14: a typed _RequestBodyTooLargeError so the oversize branch gets
-    # its own payload_too_large reason instead of blanket configuration_error.
-    # A justified, minimal ratchet-up both times.
-    "src/clio_relay/browser_gateway.py": 885,
+    # #231 R9 fix batch: -32 net lines after moving overload/error rendering
+    # into browser_gateway_errors.py; every former ad-hoc gateway response now
+    # uses the door owner without recreating the core/gateway import cycle.
+    "src/clio_relay/browser_gateway.py": 853,
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest
@@ -165,10 +159,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # refusal message extraction now delegates to
     # `bounded_payload.describe_delivery_refusal` instead of a 4-line
     # inline `delivery.get("message", ...)` extraction. A ratchet-down.
-    # #231 R9: -12 net lines while deleting all 107 legacy HTTPException
-    # sites and the middleware's ad hoc detail serializer in favor of the
-    # door_errors owner and registered error.v1 reasons.
-    "src/clio_relay/http_api.py": 3137,
+    # #231 R9: the original -12-site migration baseline was recorded as
+    # 3,137 before a later 7-line handler-variance fix; the pre-batch file
+    # was honestly 3,144 lines. This fix batch adds owner registrations for
+    # framework validation/HTTP errors, typed WebSocket close reasons, and
+    # split session-binding courses of action. Final physical count: 3,194.
+    # #231 R9 fix round 2: +60 lines make the 58 exception-backed sites'
+    # public-message disposition explicit. Relay-authored validation and
+    # conflict catches opt into the typed marker; the mixed ingest catch
+    # marks QueueConflictError only and keeps OS/runtime text private.
+    "src/clio_relay/http_api.py": 3254,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
@@ -231,7 +231,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # (-2). A ratchet-down.
     "src/clio_relay/mcp_server.py": 5929,
     "src/clio_relay/mcp_stdio_validation.py": 1269,
-    "src/clio_relay/models.py": 2296,
+    # #231 R9 fix round 2: +3 lines retain v3.6 as a handle-first execution
+    # contract while v3.7 remains the current input-staging contract.
+    "src/clio_relay/models.py": 2299,
     "src/clio_relay/process_containment.py": 2678,
     "src/clio_relay/queue_management.py": 1671,
     "src/clio_relay/queue_validation.py": 1530,
@@ -277,7 +279,10 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/session_lifecycle.py": 7801,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
-    "src/clio_relay/storage_runtime.py": 1111,
+    # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
+    # while exposing only StorageDecision.message, never its serialized
+    # exception payload.
+    "src/clio_relay/storage_runtime.py": 1122,
     # #231 R4: local-visitor spawn/health/cleanup delegates to the new
     # frp_link.py substrate (HeldFrpVisitor) instead of duplicating it;
     # run_frp_http_probe collapses into a thin proxy_type="stcp" wrapper

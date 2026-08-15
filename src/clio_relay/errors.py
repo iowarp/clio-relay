@@ -1,11 +1,40 @@
 """Relay-specific exceptions."""
 
+from __future__ import annotations
+
+
+class PublicMessageError:
+    """Mark an exception whose message is relay-authored public guidance."""
+
+    @property
+    def public_message(self) -> str:
+        """Return the authored message that may be served on relay wires."""
+        return str(self)
+
 
 class RelayError(RuntimeError):
     """Base class for relay errors."""
 
 
-class ObservationTimeoutError(RelayError):
+class RelayAuthoredError(PublicMessageError, RelayError):
+    """Carry an explicitly reviewed exception message across a door boundary."""
+
+    def __init__(self, source: BaseException) -> None:
+        self.source = source
+        super().__init__()
+
+    @property
+    def public_message(self) -> str:
+        """Return the reviewed source exception's authored message."""
+        return str(self.source)
+
+
+def public_message_error(exc: BaseException) -> BaseException:
+    """Explicitly mark a reviewed relay-authored exception for wire delivery."""
+    return exc if isinstance(exc, PublicMessageError) else RelayAuthoredError(exc)
+
+
+class ObservationTimeoutError(PublicMessageError, RelayError):
     """A bounded observation transport expired without changing durable work."""
 
 
@@ -31,5 +60,5 @@ class TaskInputParkConflictError(QueueConflictError):
     """
 
 
-class NotFoundError(RelayError):
+class NotFoundError(PublicMessageError, RelayError):
     """Raised when a requested record is missing."""

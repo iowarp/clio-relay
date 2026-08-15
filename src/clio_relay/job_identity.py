@@ -6,7 +6,7 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from clio_relay.errors import RelayError
+from clio_relay.errors import PublicMessageError, RelayError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.models import JobKind
 
@@ -36,7 +36,7 @@ class JobOwnerSessionIdentity(BaseModel):
     owner_session_generation_id: DurableRecordId
 
 
-class OwnerSessionIdentityError(RelayError):
+class OwnerSessionIdentityError(PublicMessageError, RelayError):
     """A typed owner-session attribution refusal."""
 
     def __init__(

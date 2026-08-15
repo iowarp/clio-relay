@@ -50,6 +50,7 @@ from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
     ObservationTimeoutError,
+    PublicMessageError,
     QueueConflictError,
     TaskInputParkConflictError,
 )
@@ -95,7 +96,11 @@ _EXPECTED_REASONS = frozenset(
         "task_not_found",
         "gateway_not_found",
         "artifact_not_found",
-        "session_binding_conflict",
+        "session_generation_identity_unavailable",
+        "session_intake_closed",
+        "session_binding_headers_required",
+        "session_binding_identity_mismatch",
+        "unbound_session_api",
         "job_cluster_mismatch",
         "job_submission_conflict",
         "mcp_submission_conflict",
@@ -117,6 +122,24 @@ _EXPECTED_REASONS = frozenset(
         "queue_query_refused",
         "input_ingest_terminalization_failed",
         "session_authentication_unavailable",
+        "request_validation_failed",
+        "route_not_found",
+        "method_not_allowed",
+        "framework_http_error",
+        "browser_gateway_overloaded",
+        "browser_preflight_refused",
+        "browser_attachment_not_found",
+        "browser_origin_refused",
+        "browser_capability_refused",
+        "browser_method_not_allowed",
+        "browser_upstream_unavailable",
+        "websocket_authentication_failed",
+        "websocket_session_binding_failed",
+        "websocket_page_limit_invalid",
+        "websocket_poll_interval_invalid",
+        "websocket_cursor_invalid",
+        "websocket_resource_ownership_refused",
+        "websocket_resource_not_found",
     }
 )
 
@@ -139,7 +162,11 @@ _EXPECTED_R9_HTTP_STATUSES = {
     ),
     **dict.fromkeys(
         {
-            "session_binding_conflict",
+            "session_generation_identity_unavailable",
+            "session_intake_closed",
+            "session_binding_headers_required",
+            "session_binding_identity_mismatch",
+            "unbound_session_api",
             "job_cluster_mismatch",
             "job_submission_conflict",
             "mcp_submission_conflict",
@@ -169,13 +196,29 @@ _EXPECTED_R9_HTTP_STATUSES = {
     ),
     "input_ingest_terminalization_failed": 500,
     "session_authentication_unavailable": 503,
+    "request_validation_failed": 422,
+    "route_not_found": 404,
+    "method_not_allowed": 405,
+    "framework_http_error": 500,
+    "browser_gateway_overloaded": 503,
+    **dict.fromkeys({"browser_preflight_refused", "browser_origin_refused"}, 403),
+    "browser_attachment_not_found": 404,
+    "browser_capability_refused": 401,
+    "browser_method_not_allowed": 405,
+    "browser_upstream_unavailable": 502,
+    "websocket_authentication_failed": 401,
+    "websocket_session_binding_failed": 409,
+    "websocket_page_limit_invalid": 422,
+    **dict.fromkeys({"websocket_poll_interval_invalid", "websocket_cursor_invalid"}, 400),
+    "websocket_resource_ownership_refused": 403,
+    "websocket_resource_not_found": 404,
 }
 
 
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 49
+    assert len(door_errors.REASONS) == 71
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -184,7 +227,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 36
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 58
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -297,7 +340,10 @@ def _storage_decision(reason: StorageReason) -> StorageDecision:
 @pytest.mark.parametrize(
     ("exc", "expected_reason"),
     [
-        (TaskInputParkConflictError("park conflict"), "mcp_task_input_park_conflict"),
+        (
+            TaskInputParkConflictError("private CAS internals 7a"),
+            "mcp_task_input_park_conflict",
+        ),
         (NotFoundError("missing"), "not_found"),
         (ConfigurationError("bad config"), "configuration_error"),
         (
@@ -326,8 +372,13 @@ def test_classify_type_dispatch_for_each_of_the_seven_typed_reasons(
     """The seven exception types with an unambiguous 1:1 reason (doc §6.3)."""
     fault = door_errors.classify(exc)
     assert fault.reason == expected_reason
-    assert fault.message == str(exc)
     spec = door_errors.REASONS[expected_reason]
+    expected_message = (
+        exc.public_message if isinstance(exc, PublicMessageError) else f"{spec.title}."
+    )
+    assert fault.message == expected_message
+    if not isinstance(exc, PublicMessageError):
+        assert str(exc) not in fault.message
     assert fault.retryable == spec.retryable
     assert fault.mcp_code == spec.mcp_code
     assert fault.http_status == spec.http_status
@@ -346,8 +397,9 @@ def test_classify_carries_owner_session_identity_detail_as_extension_data() -> N
         message="owner-session identity headers are invalid",
     )
     fault = door_errors.classify(exc)
-    assert fault.data == exc.detail
+    assert fault.data == {key: value for key, value in exc.detail.items() if key != "message"}
     assert fault.data["code"] == "owner_session_identity_invalid"
+    assert str(exc) not in json.dumps(fault.data)
 
 
 def test_classify_jarvis_dispatch_refusal_is_an_object_entry_point() -> None:
@@ -368,7 +420,8 @@ def test_classify_jarvis_dispatch_refusal_is_an_object_entry_point() -> None:
     )
     fault = door_errors.classify(refusal)
     assert fault.reason == "jarvis_dispatch_refused"
-    assert fault.message == refusal.message
+    assert fault.message == "JARVIS dispatch refused."
+    assert refusal.message not in fault.message
     assert fault.data == {
         "code": "jarvis_tool_error",
         "pipeline_id": "pipeline-1",
@@ -459,7 +512,7 @@ def test_classify_guards_a_hostile_str_and_never_raises(
         fault = door_errors.classify(_HostileConfigurationError("irrelevant"))
 
     assert fault.reason == "configuration_error"
-    assert "message unavailable" in fault.message
+    assert fault.message == "Configuration error."
     assert "hostile __str__ payload" not in fault.message
 
     logged = [
@@ -509,7 +562,7 @@ def test_message_is_hard_truncated_to_the_t1_budget_with_a_truthful_record() -> 
     chars AND carries a populated, byte-accurate truncation record.
     """
     oversized = "x" * 50_000
-    fault = door_errors.classify(ConfigurationError(oversized))
+    fault = door_errors.classify(ConfigurationError("logged only"), message=oversized)
     assert len(fault.message) == door_errors.MAX_MESSAGE_CHARS
     assert fault.truncation is not None
     assert fault.truncation["schema_version"] == door_errors.TRUNCATION_SCHEMA_VERSION
@@ -639,7 +692,7 @@ def test_as_http_problem_truncates_detail_and_flags_overflow_when_core_alone_is_
     pass-through of an over-budget document.
     """
     message = "\U0001f600" * 2_500  # 4-byte-per-char emoji; truncates to 2,000 chars = 8,000 bytes
-    fault = door_errors.classify(ConfigurationError(message))
+    fault = door_errors.classify(ConfigurationError("logged only"), message=message)
     assert fault.truncation is not None  # T1 already cut this at the char level
 
     document = door_errors.as_http_problem(fault)
@@ -657,7 +710,10 @@ def test_as_http_problem_measures_bytes_with_ensure_ascii_false() -> None:
     character to a 6-byte ``\\uXXXX`` escape, materially overstating cost
     for ordinary non-ASCII text.
     """
-    fault = door_errors.classify(ConfigurationError("café " * 50))
+    fault = door_errors.classify(
+        ConfigurationError("logged only"),
+        message="café " * 50,
+    )
     document = door_errors.as_http_problem(fault)
     honest = json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     inflated = json.dumps(document, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -671,6 +727,25 @@ def test_as_browser_gateway_error_maps_onto_the_two_arg_shape() -> None:
     assert status == fault.http_status == 400
     assert document == door_errors.as_http_problem(fault)
     assert "error" not in document  # not the old bare {"error": message} shape
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "websocket_authentication_failed",
+        "websocket_session_binding_failed",
+        "websocket_page_limit_invalid",
+        "websocket_poll_interval_invalid",
+        "websocket_cursor_invalid",
+        "websocket_resource_ownership_refused",
+        "websocket_resource_not_found",
+    ],
+)
+def test_websocket_refusal_adapter_preserves_policy_code_and_reason(reason: str) -> None:
+    refusal = door_errors.websocket_refusal(reason)
+    assert refusal.code == 1008
+    assert refusal.reason == reason
+    assert len(refusal.reason.encode("utf-8")) <= 123
 
 
 # --------------------------------------------------------------------------- #
@@ -733,7 +808,8 @@ def test_task_input_park_conflict_is_typed_not_bare(
             assert failure.value.code != mcp_types.INVALID_PARAMS
             assert spec.retryable is True
             assert failure.value.data == {"reason": "mcp_task_input_park_conflict"}
-            assert "forced park conflict" in failure.value.message
+            assert failure.value.message == "MCP task input park conflict."
+            assert "forced park conflict" not in failure.value.message
 
     asyncio.run(scenario())
 
@@ -753,7 +829,8 @@ def test_218_regression_mcp_task_conflict_reason_comes_from_the_table() -> None:
     mcp_error = door_errors.as_mcp_error(fault)
     assert mcp_error.code == mcp_types.INVALID_PARAMS
     assert mcp_error.data == {"reason": "mcp_task_conflict", "task_id": "job-1"}
-    assert "different semantics" in mcp_error.message
+    assert mcp_error.message == "MCP task conflict."
+    assert "different semantics" not in mcp_error.message
 
 
 def test_215_regression_reconciliation_failure_never_leaks_str_exc() -> None:
@@ -899,7 +976,13 @@ def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reaso
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
     assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 122
-    assert "HTTPException" not in source
+    assert not any(
+        isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id in {"HTTPException", "StarletteHTTPException"}
+        for node in ast.walk(tree)
+    )
     assert 'json.dumps({"detail"' not in source
 
 
@@ -933,16 +1016,88 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
+def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None:
+    """Every migrated ``exc=`` site rejects raw exception text as wire detail."""
+    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "http_problem"
+        and any(keyword.arg == "exc" for keyword in node.keywords)
+        and len(node.args) == 1
+        and not any(keyword.arg == "message" for keyword in node.keywords)
+    ]
+    assert len(calls) == 58
+
+    for index, call in enumerate(calls):
+        reason = ast.literal_eval(call.args[0])
+        distinctive = f"private exception detail {index:02d} 6d71aa"
+        error = door_errors.http_problem(reason, exc=RuntimeError(distinctive))
+        document = door_errors.as_http_problem(error.fault)
+
+        assert document["detail"] == f"{door_errors.REASONS[reason].title}."
+        assert distinctive not in json.dumps(document)
+
+
+def test_session_binding_course_corrections_are_distinct_at_the_five_sites() -> None:
+    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
+        encoding="utf-8"
+    )
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "http_problem"
+        and len(node.args) >= 2
+        and all(isinstance(argument, ast.Constant) for argument in node.args[:2])
+    ]
+    reason_by_detail = {
+        cast(str, cast(ast.Constant, call.args[1]).value): cast(
+            str, cast(ast.Constant, call.args[0]).value
+        )
+        for call in calls
+    }
+    assert {
+        detail: reason_by_detail[detail]
+        for detail in (
+            "relay session has no exact generation identity",
+            "relay session generation is not open for new work",
+            "exact owner session and generation headers are required",
+            "owner session or generation does not match this API process",
+            "relay API is not bound to an owner session",
+        )
+    } == {
+        "relay session has no exact generation identity": (
+            "session_generation_identity_unavailable"
+        ),
+        "relay session generation is not open for new work": "session_intake_closed",
+        "exact owner session and generation headers are required": (
+            "session_binding_headers_required"
+        ),
+        "owner session or generation does not match this API process": (
+            "session_binding_identity_mismatch"
+        ),
+        "relay API is not bound to an owner session": "unbound_session_api",
+    }
+
+
 def test_launcher_resolution_failed_adapter_contract_on_a_synthetic_route() -> None:
-    """The launcher reason retains its adapter contract over an HTTP round trip."""
+    """Typed launcher prose is public while foreign text stays generic."""
     app = FastAPI()
 
     @app.get("/probe")
-    def probe() -> JSONResponse:  # pyright: ignore[reportUnusedFunction]
+    def probe(authored: bool) -> JSONResponse:  # pyright: ignore[reportUnusedFunction]
         try:
             raise ValueError("receipt-bound clio-kit runtime identity did not verify")
         except ValueError as exc:
-            fault = door_errors.classify(exc, reason="launcher_resolution_failed")
+            classified = door_errors.public_message_error(exc) if authored else exc
+            fault = door_errors.classify(classified, reason="launcher_resolution_failed")
             return JSONResponse(
                 door_errors.as_http_problem(fault),
                 status_code=fault.http_status,
@@ -950,16 +1105,22 @@ def test_launcher_resolution_failed_adapter_contract_on_a_synthetic_route() -> N
             )
 
     client = TestClient(app)
-    response = client.get("/probe")
+    authored_response = client.get("/probe", params={"authored": "true"})
+    foreign_response = client.get("/probe", params={"authored": "false"})
 
-    assert response.status_code == 409
-    document = response.json()
+    assert authored_response.status_code == 409
+    document = authored_response.json()
     assert document["status"] == 409
     assert document["reason"] == "launcher_resolution_failed"
     assert document["retryable"] is False
     assert document["schema_version"] == door_errors.SCHEMA_VERSION
     assert document["type"] == "urn:clio-relay:error:launcher_resolution_failed"
-    assert "did not verify" in document["detail"]
+    assert document["detail"] == "receipt-bound clio-kit runtime identity did not verify"
+
+    assert foreign_response.status_code == 409
+    foreign_document = foreign_response.json()
+    assert foreign_document["detail"] == "Launcher resolution failed."
+    assert "did not verify" not in foreign_document["detail"]
 
 
 def test_sabotage_twin_novel_exception_via_testclient_returns_typed_internal_error(
@@ -1236,7 +1397,8 @@ def test_browser_gateway_exception_path_returns_7807_document_not_bare_error(
     assert document["reason"] == "configuration_error"
     assert document["schema_version"] == door_errors.SCHEMA_VERSION
     assert document["status"] == 400
-    assert "chunked" in document["detail"]
+    assert document["detail"] == "Configuration error."
+    assert "chunked" not in document["detail"]
 
 
 def test_browser_gateway_oversized_body_gets_its_own_payload_too_large_reason(

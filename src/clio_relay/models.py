@@ -41,6 +41,9 @@ MAX_MCP_TASK_PROJECTION_BYTES = 768 * 1024
 MAX_MCP_TASK_JSON_DEPTH = 64
 MAX_MCP_TASK_JSON_NODES = 100_000
 REGISTERED_JARVIS_USER_CONTRACT = "clio-kit-jarvis-user-v3.7"
+REGISTERED_JARVIS_EXECUTION_CONTRACTS = frozenset(
+    {"clio-kit-jarvis-user-v3.6", REGISTERED_JARVIS_USER_CONTRACT}
+)
 
 
 def validate_mcp_env_from(value: dict[str, str]) -> dict[str, str]:
@@ -1449,7 +1452,7 @@ def is_owned_jarvis_run_spec(kind: JobKind, spec: JobSpec) -> bool:
         and spec.expected_registered_contract is None
     ) or (
         spec.expected_jarvis_cd_lock_binding is None
-        and spec.expected_registered_contract == REGISTERED_JARVIS_USER_CONTRACT
+        and spec.expected_registered_contract in REGISTERED_JARVIS_EXECUTION_CONTRACTS
     )
 
 

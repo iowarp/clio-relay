@@ -1,94 +1,10 @@
-"""The one error-translation owner for every relay error surface (#231, R3).
+"""Own relay error classification and rendering across every wire surface.
 
-``docs/design/relay-architecture-2026-08.md`` §6 is the governing design:
-four call surfaces -- ``fastmcp_server.py`` (SEP-2663 task handlers plus
-``intercept_tool_call``), ``http_api.py`` (FastAPI routes),
-``browser_gateway.py`` (``CapabilityProxyHandler._error``, the fourth
-surface named in §6.1 -- the shape with the least existing structure), and
-``mcp_server.py`` (the stdio JSON-RPC ``_error`` helper, not yet wired
-through this module -- tracked as its own live issue,
-`iowarp/clio-relay#235 <https://github.com/iowarp/clio-relay/issues/235>`_)
--- each translated exceptions to their own locally-invented wire shape.
-This module is the single owner: :func:`classify`
-turns a caught exception (or a durable, never-raised
-:class:`~clio_relay.jarvis_dispatch_failure.JarvisDispatchRefusal`) into a
-:class:`RelayFault`, and :func:`as_mcp_error`, :func:`as_http_problem`, and
-:func:`as_browser_gateway_error` render that one fault onto each surface's
-wire shape. A call site never picks its own status code: every ``reason``,
-and everything that follows from it (``retryable``/``mcp_code``/
-``http_status``), comes from the frozen :data:`REASONS` table (§6.3).
+The frozen registry supplies reason, retryability, MCP code, HTTP status,
+title, and a stable public-message formatter. Marked relay-authored exception
+messages may supply bounded public detail; unmarked exception text is
+logging-only. See ``docs/design/relay-architecture-2026-08.md`` §6.
 
-**Dispatch order** (see :func:`classify`):
-
-1. A :class:`JarvisDispatchRefusal` is a frozen dataclass a durable
-   ``jarvis_run`` result *carries* -- never raised and caught -- so it gets
-   its own object-typed entry point ahead of exception dispatch.
-2. An explicit ``reason=`` keyword is the call-path-scope override: a small
-   number of raise sites cannot be told apart by exception type alone (a
-   bare ``QueueConflictError`` means a genuine MCP task-identity conflict
-   only on the ``intercept_tool_call`` path -- the same type is raised 651
-   other times in ``core_queue.py`` for unrelated invariants) or already
-   have a shipped, call-path-fixed reason (``fastmcp_server.py``'s
-   ``_handle_get`` catch-all always means
-   ``mcp_task_status_reconciliation_failed``, regardless of the underlying
-   exception's type). These call sites already know their own reason; this
-   module still owns everything that follows from it.
-3. Seven exception types have an unambiguous 1:1 reason and are dispatched
-   by ``isinstance`` with no call-site help: :class:`TaskInputParkConflictError`,
-   :class:`NotFoundError`, :class:`ConfigurationError`,
-   :class:`~clio_relay.storage_runtime.StorageAdmissionError`,
-   :class:`~clio_relay.storage_runtime.StorageRuntimeViolation`,
-   :class:`ObservationTimeoutError`, and
-   :class:`~clio_relay.job_identity.OwnerSessionIdentityError`.
-4. Anything else is ``internal_error``: the traceback is logged once, here,
-   via ``logger.exception`` -- and never reaches ``message`` (nor, by
-   construction, the wire). This is what makes §3's "0 unclassified
-   exceptions reach the wire" exit criterion meetable. "Once" describes
-   this module's own logging, not the whole process: on the HTTP surface,
-   Starlette's ``ServerErrorMiddleware`` re-raises after sending the
-   response it built from the handler's return value (by design, so a real
-   ASGI server can still observe the error), and uvicorn logs that re-raise
-   too -- a second, server-side-only log line is expected there, not a
-   ``door_errors`` defect (F6). A streaming response that has already
-   started sending bytes before an exception is never covered by this
-   module either way: nothing can rewrite headers/status once a response
-   is underway, so mid-stream failures stay a transport-level cut, not a
-   ``clio-relay.error.v1`` document.
-
-**Per-reason grounding** (moved here from the per-site rationale comments
-this slice deletes at their old call sites, per doc §10):
-
-``mcp_task_input_park_conflict``
-    ``RelayMcpRuntime._park_agent_input`` (``fastmcp_server.py``, not
-    ``RelayTasksExtension`` -- see the corrected docstring on
-    :class:`~clio_relay.errors.TaskInputParkConflictError`) exhausts 8 CAS
-    retries when ``update_mcp_task_projection``'s optimistic-concurrency
-    check keeps losing a race. This is a transient concurrency conflict,
-    never a client parameter problem (clio-relay#218 rework) -- before this
-    slice, ``intercept_tool_call`` left it deliberately unwrapped rather than
-    mistype it as ``INVALID_PARAMS``, so it escaped through FastMCP's generic
-    handler as a bare internal error. Routing it through :func:`classify`
-    closes that hole with a correctly-typed, retryable conversion instead.
-``mcp_task_conflict``
-    ``put_mcp_task``'s genuine task-identity-reuse ``QueueConflictError``
-    (clio-relay#218), refused as a typed, queryable ``MCPError`` rather than
-    escaping through FastMCP's generic handler as a bare, typeless
-    ``INTERNAL_ERROR`` (the original #218 symptom). Call-path-scoped (see
-    dispatch rule 2 above): a bare ``QueueConflictError`` means this only on
-    the MCP-task-creation path.
-``mcp_task_status_reconciliation_failed``
-    ``_handle_get``'s catch-all (clio-relay#215): ``task_status`` can
-    re-derive a task's status over network round trips, and an unwrapped
-    failure there previously escaped as a bare, typeless "Internal server
-    error". Always this reason on this call path, regardless of the
-    underlying exception's type -- the typed reason plus ``task_id`` in
-    ``data`` is the queryable signal, handler internals (``str(exc)``) never
-    reach ``message``.
-
-See docs/design/relay-architecture-2026-08.md §6.3 for the original 13 rows.
-R9 adds the HTTP-originated rows that replace ``http_api.py``'s 107 legacy
-sites and outer request-body middleware serializer; each keeps its shipped
-status while gaining a specific, frozen agent-facing reason.
 """
 
 from __future__ import annotations
@@ -102,6 +18,7 @@ from typing import Any, Final
 
 import mcp_types
 from mcp.shared.exceptions import MCPError
+from starlette.exceptions import WebSocketException
 
 from clio_relay.bounded_payload import (
     # Re-exported (not redefined, F12 #231 R6 review): bounded_payload.py is
@@ -112,12 +29,16 @@ from clio_relay.bounded_payload import (
     TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,
 )
 from clio_relay.bounded_payload import build_truncation_record
+from clio_relay.door_error_messages import public_message, resolved_public_message
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
     ObservationTimeoutError,
+    PublicMessageError,
+    RelayAuthoredError,
     TaskInputParkConflictError,
 )
+from clio_relay.errors import public_message_error as public_message_error
 from clio_relay.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
 from clio_relay.storage_runtime import (
@@ -133,19 +54,7 @@ JSON = dict[str, Any]
 #: Schema tag stamped on every :func:`as_http_problem` document (doc §6.3).
 SCHEMA_VERSION: Final = "clio-relay.error.v1"
 
-# T1 (doc §6.4): refusal/detail text budget, hard-truncated. A fourth
-# independent literal agreeing with jarvis_dispatch_failure.py's
-# MAX_REFUSAL_MESSAGE_CHARS, control_channel.py's
-# MAX_CHANNEL_EVENT_DETAIL_CHARS, and remote_connection.py's inline
-# [:2_000] slice -- six literals total counting this one, frp_link.py's
-# DEFAULT_STDERR_BUFFER_MAX_BYTES, and bounded_payload.T1_TEXT_MAX_BYTES
-# (recounted honestly by the R6 review, F12/F13; an earlier revision of
-# this comment undercounted at four). Unifying them into one shared
-# constant was floated as an aspiration when this comment was first
-# written, but it was never R6's actual delivered scope (the three RAW
-# PAYLOAD PATHS named in doc §6.4/§6.5, not these six already-agreeing
-# refusal-text literals) -- tracked as
-# https://github.com/iowarp/clio-relay/issues/236.
+# T1 refusal/detail text budget from design §6.4.
 MAX_MESSAGE_CHARS: Final = 2_000
 
 # Whole-envelope budget (doc §6.4 T1): as_http_problem drops "evidence" then
@@ -210,22 +119,8 @@ def _http_row(
     )
 
 
-# F1 (opus review): the MCP SDK reserves -32000..-32019 for its OWN
-# transport-level codes (mcp_types.jsonrpc.CONNECTION_CLOSED=-32000,
-# .REQUEST_TIMEOUT=-32001, .HEADER_MISMATCH=-32020's neighbors, etc.) --
-# relay's own custom codes MUST NOT land in that band. A client that
-# discriminates by code alone (not this contract's typed ``reason``, e.g.
-# clio-agent's tools/mcp_errors.py) would read relay's own
-# mcp_task_input_park_conflict (formerly -32001) as the SDK's
-# REQUEST_TIMEOUT and retry it with timeout semantics -- silently wrong.
-# Relay-owned custom codes live in -32050..-32059 instead, a band the SDK
-# does not use. -32007 (storage_admission_refused) is the one deliberate
-# exception: it is already shipped and pinned
-# (mcp_server.py's StorageAdmissionError handler,
-# tests/test_production_admin_surfaces.py's ``denied["error"]["code"] ==
-# -32007`` assertion) -- renumbering a live, tested wire value is a
-# separate, riskier change than reallocating five never-shipped codes this
-# same slice introduced.
+# Relay-owned MCP codes avoid the SDK-reserved -32000..-32019 band.
+# The already-shipped storage admission code -32007 remains pinned.
 _RELAY_CUSTOM_CODE_BAND_START: Final = -32059
 _RELAY_CUSTOM_CODE_BAND_END: Final = -32050  # inclusive
 
@@ -378,7 +273,17 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("task_not_found", 404, "Task not found"),
             _http_row("gateway_not_found", 404, "Gateway not found"),
             _http_row("artifact_not_found", 404, "Artifact not found"),
-            _http_row("session_binding_conflict", 409, "Session binding conflict"),
+            _http_row(
+                "session_generation_identity_unavailable",
+                409,
+                "Session generation identity unavailable",
+            ),
+            _http_row("session_intake_closed", 409, "Session intake closed"),
+            _http_row("session_binding_headers_required", 409, "Session binding headers required"),
+            _http_row(
+                "session_binding_identity_mismatch", 409, "Session binding identity mismatch"
+            ),
+            _http_row("unbound_session_api", 409, "Unbound session API"),
             _http_row("job_cluster_mismatch", 409, "Job cluster mismatch"),
             _http_row("job_submission_conflict", 409, "Job submission conflict"),
             _http_row("mcp_submission_conflict", 409, "MCP submission conflict"),
@@ -413,6 +318,38 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 "Session authentication unavailable",
                 retryable=True,
             ),
+            _http_row("request_validation_failed", 422, "Request validation failed"),
+            _http_row("route_not_found", 404, "Route not found"),
+            _http_row("method_not_allowed", 405, "Method not allowed"),
+            _http_row("framework_http_error", 500, "Framework HTTP error"),
+            _http_row(
+                "browser_gateway_overloaded",
+                503,
+                "Browser gateway overloaded",
+                retryable=True,
+            ),
+            _http_row("browser_preflight_refused", 403, "Browser preflight refused"),
+            _http_row("browser_attachment_not_found", 404, "Browser attachment not found"),
+            _http_row("browser_origin_refused", 403, "Browser origin refused"),
+            _http_row("browser_capability_refused", 401, "Browser capability refused"),
+            _http_row("browser_method_not_allowed", 405, "Browser method not allowed"),
+            _http_row(
+                "browser_upstream_unavailable",
+                502,
+                "Browser upstream unavailable",
+                retryable=True,
+            ),
+            _http_row("websocket_authentication_failed", 401, "WebSocket authentication failed"),
+            _http_row("websocket_session_binding_failed", 409, "WebSocket session binding failed"),
+            _http_row("websocket_page_limit_invalid", 422, "WebSocket page limit invalid"),
+            _http_row("websocket_poll_interval_invalid", 400, "WebSocket poll interval invalid"),
+            _http_row("websocket_cursor_invalid", 400, "WebSocket cursor invalid"),
+            _http_row(
+                "websocket_resource_ownership_refused",
+                403,
+                "WebSocket resource ownership refused",
+            ),
+            _http_row("websocket_resource_not_found", 404, "WebSocket resource not found"),
         )
     }
 )
@@ -494,8 +431,8 @@ def _bounded_text(text: str) -> tuple[str, JSON | None]:
     return truncated, record
 
 
-def _safe_str(exc: BaseException) -> str:
-    """Render ``str(exc)`` without letting a hostile ``__str__`` escape (F5).
+def _safe_str(exc: BaseException) -> str | None:
+    """Render ``str(exc)`` for server logging without letting it escape.
 
     A raising ``__str__`` (or one that returns something ``str()`` itself
     cannot coerce) must never propagate out of :func:`classify` -- on the
@@ -505,13 +442,28 @@ def _safe_str(exc: BaseException) -> str:
     exists to guarantee.
     """
     try:
-        return str(exc)
+        detail: Any = exc.public_message if isinstance(exc, PublicMessageError) else str(exc)
+        if not isinstance(detail, str):
+            raise TypeError("public exception message must be a string")
+        return detail
     except Exception:
         logger.exception(
             "clio-relay: %s.__str__() raised; door_errors could not render its message",
             type(exc).__name__,
         )
-        return f"<{type(exc).__name__}: message unavailable>"
+        return None
+
+
+def _log_classified_exception(exc: BaseException, *, reason: str) -> str | None:
+    """Log a classified exception once and return its safely rendered text."""
+    detail = _safe_str(exc)
+    logger.info(
+        "clio-relay: classified %s as %s: %s",
+        type(exc).__name__,
+        reason,
+        detail if detail is not None else "<message unavailable>",
+    )
+    return detail
 
 
 def _typed_data(exc: BaseException) -> JSON:
@@ -522,11 +474,13 @@ def _typed_data(exc: BaseException) -> JSON:
     that raises on access) must degrade to no extension payload, never crash
     classification.
     """
+    if isinstance(exc, RelayAuthoredError):
+        exc = exc.source
     try:
         if isinstance(exc, StorageRuntimeError):
             return {"storage_decision": exc.decision.to_dict()}
         if isinstance(exc, OwnerSessionIdentityError):
-            return dict(exc.detail)
+            return {key: value for key, value in exc.detail.items() if key != "message"}
     except Exception:
         logger.exception(
             "clio-relay: could not extract %s's typed extension payload",
@@ -562,6 +516,46 @@ def fault_for_reason(
     except KeyError as exc:
         raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry") from exc
     return _build(spec, message=message, data=data if data is not None else {})
+
+
+def fault_for_http_status(
+    reason: str,
+    http_status: int,
+    *,
+    message: str | None = None,
+) -> RelayFault:
+    """Build an owner-rendered framework fault while preserving its exact status."""
+    if not 400 <= http_status <= 599:
+        raise ValueError("door_errors: framework HTTP status must be between 400 and 599")
+    try:
+        registered = REASONS[reason]
+    except KeyError as exc:
+        raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry") from exc
+    spec = ReasonSpec(
+        reason=registered.reason,
+        retryable=http_status >= 500,
+        mcp_code=(mcp_types.INTERNAL_ERROR if http_status >= 500 else mcp_types.INVALID_PARAMS),
+        http_status=http_status,
+        title=registered.title,
+    )
+    return _build(
+        spec,
+        message=(
+            message
+            if message is not None
+            else public_message(reason=registered.reason, title=registered.title)
+        ),
+        data={},
+    )
+
+
+def websocket_refusal(reason: str) -> WebSocketException:
+    """Create a byte-bounded policy close carrying only a registered reason token."""
+    if reason not in REASONS:
+        raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry")
+    if len(reason.encode("ascii")) > 123:
+        raise ValueError("door_errors: WebSocket refusal reason exceeds 123 bytes")
+    return WebSocketException(code=1008, reason=reason)
 
 
 def http_problem(
@@ -604,13 +598,9 @@ def classify(
         reason: A call-path-scope override (dispatch rule 2). Must already be
             a key in the reason table; an unregistered reason is a caller
             bug, not a silent fallback, and raises :class:`ValueError`.
-        message: Overrides the default ``str(exc)`` (or, for a refusal,
-            ``exc.message``) wire message. Used by call sites whose typed
-            message must never depend on an arbitrary underlying exception's
-            text (e.g. ``mcp_task_status_reconciliation_failed``'s fixed,
-            handler-internals-free message). ``str(exc)`` itself is never
-            called unguarded (F5) -- a hostile ``__str__`` degrades to a
-            generic placeholder rather than escaping classification.
+        message: Deliberate bounded public detail. When omitted, a marked
+            exception's relay-authored message is used; unmarked exception
+            text is logging-only and the reason's stable formatter is used.
         data: Overrides the default reason-specific extension payload
             (:func:`_typed_data`, or ``{}``).
         _table: Private, test-only override of :data:`REASONS` (F9) -- lets
@@ -626,13 +616,17 @@ def classify(
         ``ServerErrorMiddleware`` still re-raises after the response is sent
         (by design, so a real ASGI server can log it too), so a second,
         server-side-only log line from uvicorn is expected, not a bug (F6).
-        Exception internals never reach the wire either way.
+        Unmarked exception internals never reach the wire either way.
     """
     if isinstance(exc, JarvisDispatchRefusal):
         spec = _table["jarvis_dispatch_refused"]
         return _build(
             spec,
-            message=message if message is not None else exc.message,
+            message=(
+                message
+                if message is not None
+                else public_message(reason=spec.reason, title=spec.title)
+            ),
             data=data
             if data is not None
             else {
@@ -645,16 +639,32 @@ def classify(
         if reason not in _table:
             msg = f"door_errors.classify(): {reason!r} is not a registered REASONS entry"
             raise ValueError(msg)
+        logged_detail = _log_classified_exception(exc, reason=reason)
+        spec = _table[reason]
         return _build(
-            _table[reason],
-            message=message if message is not None else _safe_str(exc),
+            spec,
+            message=resolved_public_message(
+                exc,
+                logged_detail=logged_detail,
+                explicit=message,
+                reason=spec.reason,
+                title=spec.title,
+            ),
             data=data if data is not None else _typed_data(exc),
         )
     for exc_type, mapped_reason in _TYPE_REASONS:
         if isinstance(exc, exc_type):
+            logged_detail = _log_classified_exception(exc, reason=mapped_reason)
+            spec = _table[mapped_reason]
             return _build(
-                _table[mapped_reason],
-                message=message if message is not None else _safe_str(exc),
+                spec,
+                message=resolved_public_message(
+                    exc,
+                    logged_detail=logged_detail,
+                    explicit=message,
+                    reason=spec.reason,
+                    title=spec.title,
+                ),
                 data=data if data is not None else _typed_data(exc),
             )
     logger.exception(
