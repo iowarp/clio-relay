@@ -23,7 +23,6 @@ from fastapi import (
     Depends,
     FastAPI,
     Header,
-    HTTPException,
     Query,
     Request,
     WebSocket,
@@ -200,13 +199,13 @@ class InputArtifactBodyLimitMiddleware:
 
         raw_headers = scope.get("headers", [])
         if not isinstance(raw_headers, list):
-            await self._send_error(send, 400, "invalid HTTP request headers")
+            await self._send_error(send, "http_request_malformed", "invalid HTTP request headers")
             return
         headers = cast(list[tuple[bytes, bytes]], raw_headers)
         authentication_error = self._authentication_error(headers)
         if authentication_error is not None:
-            status_code, detail = authentication_error
-            await self._send_error(send, status_code, detail)
+            reason, detail = authentication_error
+            await self._send_error(send, reason, detail)
             return
 
         async with self._body_slot:
@@ -221,17 +220,21 @@ class InputArtifactBodyLimitMiddleware:
     ) -> None:
         content_length_values = self._header_values(headers, b"content-length")
         if len(content_length_values) > 1:
-            await self._send_error(send, 400, "invalid Content-Length header")
+            await self._send_error(send, "http_request_malformed", "invalid Content-Length header")
             return
         raw_content_length = content_length_values[0] if content_length_values else None
         if raw_content_length is not None:
             try:
                 content_length = int(raw_content_length.decode("ascii"))
             except (UnicodeDecodeError, ValueError):
-                await self._send_error(send, 400, "invalid Content-Length header")
+                await self._send_error(
+                    send, "http_request_malformed", "invalid Content-Length header"
+                )
                 return
             if content_length < 0:
-                await self._send_error(send, 400, "invalid Content-Length header")
+                await self._send_error(
+                    send, "http_request_malformed", "invalid Content-Length header"
+                )
                 return
             if content_length > self.max_body_bytes:
                 await self._send_too_large(send)
@@ -244,11 +247,15 @@ class InputArtifactBodyLimitMiddleware:
             if message_type == "http.disconnect":
                 return
             if message_type != "http.request":
-                await self._send_error(send, 400, "invalid HTTP request body stream")
+                await self._send_error(
+                    send, "http_request_malformed", "invalid HTTP request body stream"
+                )
                 return
             chunk = message.get("body", b"")
             if not isinstance(chunk, bytes):
-                await self._send_error(send, 400, "invalid HTTP request body chunk")
+                await self._send_error(
+                    send, "http_request_malformed", "invalid HTTP request body chunk"
+                )
                 return
             if len(body) + len(chunk) > self.max_body_bytes:
                 await self._send_too_large(send)
@@ -271,31 +278,31 @@ class InputArtifactBodyLimitMiddleware:
     def _authentication_error(
         self,
         headers: list[tuple[bytes, bytes]],
-    ) -> tuple[int, str] | None:
+    ) -> tuple[str, str] | None:
         """Authenticate the private route before allocating its bounded body."""
         if (
             self._api_token is None
             or self._owner_session_id is None
             or self._session_generation_id is None
         ):
-            return 404, "owned-session input artifact ingest is unavailable"
+            return "input_ingest_unavailable", "owned-session input artifact ingest is unavailable"
 
         header_tokens = self._header_values(headers, b"x-clio-relay-token")
         authorizations = self._header_values(headers, b"authorization")
         supplied: bytes | None = None
         if header_tokens:
             if len(header_tokens) != 1 or not header_tokens[0]:
-                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+                return "authentication_required", "missing or invalid relay API token"
             supplied = header_tokens[0]
         elif authorizations:
             if len(authorizations) != 1:
-                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+                return "authentication_required", "missing or invalid relay API token"
             scheme, separator, token = authorizations[0].partition(b" ")
             if separator != b" " or scheme.lower() != b"bearer" or not token:
-                return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+                return "authentication_required", "missing or invalid relay API token"
             supplied = token
         if supplied is None or not secrets.compare_digest(supplied, self._api_token):
-            return status.HTTP_401_UNAUTHORIZED, "missing or invalid relay API token"
+            return "authentication_required", "missing or invalid relay API token"
 
         session_ids = self._header_values(headers, OWNER_SESSION_ID_HEADER.lower().encode("ascii"))
         generation_ids = self._header_values(
@@ -303,12 +310,18 @@ class InputArtifactBodyLimitMiddleware:
             SESSION_GENERATION_ID_HEADER.lower().encode("ascii"),
         )
         if len(session_ids) != 1 or len(generation_ids) != 1:
-            return 409, "exact owner session and generation headers are required"
+            return (
+                "session_binding_conflict",
+                "exact owner session and generation headers are required",
+            )
         if not (
             secrets.compare_digest(session_ids[0], self._owner_session_id)
             and secrets.compare_digest(generation_ids[0], self._session_generation_id)
         ):
-            return 409, "owner session or generation does not match this API process"
+            return (
+                "session_binding_conflict",
+                "owner session or generation does not match this API process",
+            )
         return None
 
     @staticmethod
@@ -321,19 +334,22 @@ class InputArtifactBodyLimitMiddleware:
     async def _send_too_large(self, send: Send) -> None:
         await self._send_error(
             send,
-            status.HTTP_413_CONTENT_TOO_LARGE,
+            "payload_too_large",
             f"input artifact request body exceeds the {self.max_body_bytes}-byte limit",
         )
 
     @staticmethod
-    async def _send_error(send: Send, status_code: int, detail: str) -> None:
-        payload = json.dumps({"detail": detail}, separators=(",", ":")).encode("utf-8")
+    async def _send_error(send: Send, reason: str, detail: str) -> None:
+        fault = door_errors.fault_for_reason(reason, detail)
+        payload = json.dumps(
+            door_errors.as_http_problem(fault), separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
         await send(
             {
                 "type": "http.response.start",
-                "status": status_code,
+                "status": fault.http_status,
                 "headers": [
-                    (b"content-type", b"application/json"),
+                    (b"content-type", b"application/problem+json"),
                     (b"content-length", str(len(payload)).encode("ascii")),
                 ],
             }
@@ -1026,30 +1042,10 @@ _FALLBACK_PROBLEM_DOCUMENT: dict[str, object] = {
 
 
 async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """The ONE global exception handler (#231 R3, doc §6.2/§6.3).
+    """Translate a novel route failure through the one door owner.
 
-    FastAPI's ``build_middleware_stack`` pulls any handler registered under
-    the bare ``Exception`` key OUT of ``ExceptionMiddleware`` and installs it
-    as ``ServerErrorMiddleware``'s own ``handler`` -- a separate middleware
-    layer, positioned OUTSIDE ``ExceptionMiddleware`` in the stack, not "the
-    most specific match" within one dispatch table. ``HTTPException`` stays
-    handled by ``ExceptionMiddleware`` (FastAPI's own default handler for
-    it), which is why the 107 hand-rolled ``raise HTTPException(...)`` sites
-    here keep their exact shape and status codes untouched (doc §6.2:
-    rewriting them is a later, deferred slice) -- they never reach this
-    function at all, by construction of where each handler lives, not by a
-    priority contest between them.
-
-    This closes the rest of §3's "0 unclassified exceptions reach the wire"
-    criterion: anything that escapes every hand-rolled site now routes
-    through the same owner every other surface uses, instead of falling
-    through to FastAPI's bare default "Internal Server Error". Guarded
-    end-to-end (F5): even if ``door_errors`` itself somehow fails to
-    classify or render ``exc`` -- a non-JSON-serializable value smuggled
-    into ``fault.data``, or a defect in door_errors.py itself -- this
-    handler still returns the fixed, hardcoded internal_error document
-    rather than let a second exception replace the first and collapse into
-    Starlette's own bodyless default.
+    Deliberate faults use the more-specific handler below. The guard keeps a
+    door defect from replacing a novel exception with Starlette's bare body.
     """
     try:
         fault = door_errors.classify(exc)
@@ -1064,6 +1060,26 @@ async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) 
         document = _FALLBACK_PROBLEM_DOCUMENT
         status_code = 500
     return JSONResponse(document, status_code=status_code, media_type="application/problem+json")
+
+
+async def _relay_http_problem_handler(
+    _request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    """Serve one deliberate preclassified route fault as error.v1.
+
+    Starlette's handler contract is (Request, Exception); registration pins
+    this handler to HTTPProblemError, so any other type re-raises into the
+    unhandled-exception handler's typed internal_error path.
+    """
+    if not isinstance(exc, door_errors.HTTPProblemError):
+        raise exc
+    document = door_errors.as_http_problem(exc.fault)
+    return JSONResponse(
+        document,
+        status_code=exc.fault.http_status,
+        media_type="application/problem+json",
+    )
 
 
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
@@ -1103,6 +1119,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             queue.close()
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
+    app.add_exception_handler(door_errors.HTTPProblemError, _relay_http_problem_handler)
     app.add_exception_handler(Exception, _relay_unhandled_exception_handler)
     app.add_middleware(
         InputArtifactBodyLimitMiddleware,
@@ -1126,18 +1143,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             return
         generation_id = resolved.owner_session_generation_id
         if generation_id is None:
-            raise HTTPException(
-                status_code=409,
-                detail="relay session has no exact generation identity",
+            raise door_errors.http_problem(
+                "session_binding_conflict", "relay session has no exact generation identity"
             )
         admission = queue.owner_session_generation_status(
             resolved.owner_session_id,
             session_generation_id=generation_id,
         )
         if admission.get("open") is not True:
-            raise HTTPException(
-                status_code=409,
-                detail="relay session generation is not open for new work",
+            raise door_errors.http_problem(
+                "session_binding_conflict", "relay session generation is not open for new work"
             )
 
     def owns_job(job: RelayJob) -> bool:
@@ -1155,7 +1170,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def require_owned_job(job_id: DurableRecordId) -> RelayJob:
         job = queue.get_job(job_id)
         if not owns_job(job):
-            raise HTTPException(status_code=403, detail="job is not owned by this relay session")
+            raise door_errors.http_problem(
+                "resource_ownership_refused", "job is not owned by this relay session"
+            )
         return job
 
     def require_owned_task(task_id: DurableRecordId) -> RelayTask:
@@ -1177,9 +1194,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> RelayJob:
         ensure_intake_open()
         if owner_session_cluster is not None and job.cluster != owner_session_cluster:
-            raise HTTPException(
-                status_code=409,
-                detail="job cluster does not match this owned relay session",
+            raise door_errors.http_problem(
+                "job_cluster_mismatch", "job cluster does not match this owned relay session"
             )
         metadata = dict(job.metadata)
         protected = sorted(
@@ -1195,17 +1211,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             }.intersection(metadata)
         )
         if protected:
-            raise HTTPException(
-                status_code=422,
-                detail=(
+            raise door_errors.http_problem(
+                "job_submission_refused",
+                message=(
                     "job ownership metadata is server-managed and cannot be supplied: "
                     + ", ".join(protected)
                 ),
             )
         if job.owner_session_id is not None or job.owner_session_generation_id is not None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
+            raise door_errors.http_problem(
+                "job_submission_refused",
+                message=(
                     "job owner-session identity is server-managed and must be "
                     "supplied through headers"
                 ),
@@ -1216,40 +1232,43 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 owner_session_identity,
             )
         except OwnerSessionIdentityError as exc:
-            raise HTTPException(status_code=422, detail=exc.detail) from exc
+            raise door_errors.http_problem("owner_session_identity_refused", exc=exc) from exc
         if job.kind is JobKind.MCP_CALL:
             if not isinstance(job.spec, McpCallSpec):
-                raise HTTPException(status_code=422, detail="MCP job has an invalid specification")
+                raise door_errors.http_problem(
+                    "mcp_admission_refused",
+                    message="MCP job has an invalid specification",
+                )
             if job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY:
                 if mcp_admission_authority is None:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="control-query MCP admission requires server authority",
+                    raise door_errors.http_problem(
+                        "mcp_admission_refused",
+                        message="control-query MCP admission requires server authority",
                     )
                 metadata[MCP_ADMISSION_AUTHORITY_METADATA_KEY] = mcp_admission_authority.model_dump(
                     mode="json"
                 )
             elif mcp_admission_authority is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="workload MCP admission must not carry control-query authority",
+                raise door_errors.http_problem(
+                    "mcp_admission_refused",
+                    message="workload MCP admission must not carry control-query authority",
                 )
         elif mcp_admission_authority is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="MCP admission authority cannot be attached to another job kind",
+            raise door_errors.http_problem(
+                "mcp_admission_refused",
+                message="MCP admission authority cannot be attached to another job kind",
             )
         if job.kind is JobKind.INPUT_INGEST:
             if input_ingest_policy is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="input ingest requires server-owned generation quota policy",
+                raise door_errors.http_problem(
+                    "input_ingest_refused",
+                    message="input ingest requires server-owned generation quota policy",
                 )
             metadata[INPUT_INGEST_POLICY_METADATA_KEY] = input_ingest_policy.model_dump(mode="json")
         elif input_ingest_policy is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="input ingest policy cannot be attached to another job kind",
+            raise door_errors.http_problem(
+                "input_ingest_refused",
+                message="input ingest policy cannot be attached to another job kind",
             )
         if resolved.owner_session_id is not None:
             for use in job.used_artifact_refs:
@@ -1279,11 +1298,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             return _public_record(queue.submit_job(job.model_copy(update={"metadata": metadata})))
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_submission_refused", exc=exc) from exc
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_submission_conflict", exc=exc) from exc
         except StorageAdmissionError as exc:
-            raise HTTPException(status_code=507, detail=exc.decision.to_dict()) from exc
+            raise door_errors.http_problem("storage_admission_refused", exc=exc) from exc
 
     def require_owned_gateway(session_id: DurableRecordId) -> GatewaySession:
         session = queue.get_gateway_session(session_id)
@@ -1295,9 +1314,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             or session.metadata.get("owner_session_generation_id")
             != resolved.owner_session_generation_id
         ):
-            raise HTTPException(
-                status_code=403,
-                detail="gateway session is not owned by this relay session",
+            raise door_errors.http_problem(
+                "resource_ownership_refused", "gateway session is not owned by this relay session"
             )
         return session
 
@@ -1314,7 +1332,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             or owner_session_cluster is None
             or resolved.session_owner_token is None
         ):
-            raise HTTPException(status_code=404, detail="owned session identity is unavailable")
+            raise door_errors.http_problem(
+                "session_identity_unavailable", "owned session identity is unavailable"
+            )
         return session_identity_document(
             owner_token=resolved.session_owner_token,
             cluster=owner_session_cluster,
@@ -1340,7 +1360,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             or resolved.owner_session_generation_id is None
             or owner_session_cluster is None
         ):
-            raise HTTPException(status_code=404, detail="owned session status is unavailable")
+            raise door_errors.http_problem(
+                "session_status_unavailable", "owned session status is unavailable"
+            )
         return {
             "schema_version": OWNED_SESSION_STATUS_SCHEMA,
             "owner": "clio-relay",
@@ -1371,9 +1393,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             or owner_session_cluster_definition is None
             or not resolved.api_token
         ):
-            raise HTTPException(
-                status_code=404,
-                detail="owned JARVIS runtime authority resolver is unavailable",
+            raise door_errors.http_problem(
+                "jarvis_runtime_authority_unavailable",
+                "owned JARVIS runtime authority resolver is unavailable",
             )
         binding = request.binding
         try:
@@ -1396,9 +1418,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             # identity-bound owned-session connection and is never persisted.
             return private_jarvis_service_runtime_authority_document(authority)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("jarvis_runtime_authority_unavailable", exc=exc) from exc
         except (ConfigurationError, RelayError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("jarvis_runtime_authority_conflict", exc=exc) from exc
 
     @app.post(
         "/input-artifacts/ingest",
@@ -1414,9 +1436,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             or resolved.owner_session_generation_id is None
             or owner_session_cluster is None
         ):
-            raise HTTPException(
-                status_code=404,
-                detail="owned-session input artifact ingest is unavailable",
+            raise door_errors.http_problem(
+                "input_ingest_unavailable", "owned-session input artifact ingest is unavailable"
             )
         try:
             payload = _decode_input_artifact_payload(
@@ -1429,7 +1450,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 sha256=request.sha256,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("input_ingest_refused", exc=exc) from exc
 
         input_ingest_policy = InputArtifactIngestPolicy(
             max_file_count=resolved.input_file_max_count,
@@ -1489,7 +1510,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 attempt_id=attempt_id,
             )
         except StorageAdmissionError as exc:
-            raise HTTPException(status_code=507, detail=exc.decision.to_dict()) from exc
+            raise door_errors.http_problem("storage_admission_refused", exc=exc) from exc
         except ValueError as exc:
             if claimed:
                 try:
@@ -1499,14 +1520,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                         error=str(exc),
                     )
                 except (QueueConflictError, StorageAdmissionError) as cleanup_exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "input artifact ingest failed and its attempt could not be "
-                            f"terminalized: {cleanup_exc}"
+                    raise door_errors.http_problem(
+                        "input_ingest_terminalization_failed",
+                        exc=cleanup_exc,
+                        message=(
+                            "input artifact ingest failed and its attempt could not be terminalized"
                         ),
                     ) from cleanup_exc
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("input_ingest_refused", exc=exc) from exc
         except (OSError, RuntimeError, QueueConflictError) as exc:
             if claimed:
                 try:
@@ -1516,14 +1537,14 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                         error=str(exc),
                     )
                 except (QueueConflictError, StorageAdmissionError) as cleanup_exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "input artifact ingest failed and its attempt could not be "
-                            f"terminalized: {cleanup_exc}"
+                    raise door_errors.http_problem(
+                        "input_ingest_terminalization_failed",
+                        exc=cleanup_exc,
+                        message=(
+                            "input artifact ingest failed and its attempt could not be terminalized"
                         ),
                     ) from cleanup_exc
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("input_ingest_conflict", exc=exc) from exc
         return {
             "job": _public_record(current).model_dump(mode="json"),
             "artifact": _public_record(artifact).model_dump(mode="json"),
@@ -1539,9 +1560,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
     ) -> RelayJob:
         if job.kind in {JobKind.MCP_CALL, JobKind.INPUT_INGEST}:
-            raise HTTPException(
-                status_code=422,
-                detail=("this job kind must use its dedicated authenticated internal route"),
+            raise door_errors.http_problem(
+                "job_route_refused",
+                "this job kind must use its dedicated authenticated internal route",
             )
         return submit_owned(job, owner_session_identity=owner_session_identity)
 
@@ -1646,7 +1667,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 timeout_seconds=request.timeout_seconds,
             )
         except (ConfigurationError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("mcp_submission_conflict", exc=exc) from exc
         return submit_owned(
             RelayJob(
                 cluster=request.cluster,
@@ -1692,7 +1713,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 timeout_seconds=request.timeout_seconds,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("jarvis_submission_refused", exc=exc) from exc
         timeout_seconds = request.timeout_seconds
         if admission_class is McpAdmissionClass.CONTROL_QUERY and timeout_seconds is None:
             timeout_seconds = MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
@@ -1701,16 +1722,12 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             and request.operation is McpOperation.TOOLS_CALL
             and expected_digest is None
         ):
-            raise HTTPException(
-                status_code=422,
-                detail=("owned JARVIS MCP submission requires expected_server_artifact_digest"),
+            raise door_errors.http_problem(
+                "jarvis_submission_refused",
+                "owned JARVIS MCP submission requires expected_server_artifact_digest",
             )
-        # An owned cluster-side API receives the discovery binding from its
-        # authenticated desktop owner. Its operator cache is intentionally
-        # process-local and may not contain the desktop's discovery entry. Do
-        # not substitute a second, unrelated cache as authority here: preserve
-        # the supplied digest in the durable spec and let the MCP runner compare
-        # it with the server artifact observed immediately before launch.
+        # An owned API preserves its desktop-supplied digest because discovery
+        # caches are process-local; the runner verifies it immediately before launch.
         if (
             request.operation is McpOperation.TOOLS_CALL
             and expected_digest is not None
@@ -1719,30 +1736,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             try:
                 observed_digest = jarvis_mcp_artifact_binding(request.cluster)
             except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                raise door_errors.http_problem("jarvis_artifact_conflict", exc=exc) from exc
             if not secrets.compare_digest(expected_digest, observed_digest):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
+                raise door_errors.http_problem(
+                    "jarvis_artifact_conflict",
+                    message=(
                         "JARVIS MCP artifact identity changed; refresh discovery before submission"
                     ),
                 )
-        # clio-relay#228: resolve the launcher from the CLUSTER's own pinned
-        # runtime (the owned session's frozen relay_install_receipt/dev_mode,
-        # the same per-cluster pins #205 introduced) rather than this
-        # process's ambient current installation -- a multi-tenant host
-        # running more than one relay deployment must never let this pinned
-        # endpoint resolve through another deployment's shared box-global
-        # state. No owned session means no cluster-scoped pin is available;
-        # fall back to the ambient identity exactly as before.
-        #
-        # dev_mode is OR-composed with the host's CLIO_RELAY_DEV_MODE switch
-        # (clio-relay#211: "either is sufficient"). jarvis_mcp_command()
-        # only overrides the host env when it receives a non-None dev_mode,
-        # so an explicit cluster-level ``dev_mode: false`` must still pass
-        # None here rather than False -- otherwise a cluster that never
-        # opted in to dev mode would silently mask CLIO_RELAY_DEV_MODE=1 set
-        # on the host running this session API process.
+        # Resolve through the cluster pin when one exists (#228); otherwise use
+        # the ambient identity. ``None`` preserves host dev-mode OR semantics (#211).
         pinned_dev_mode = (
             True
             if owner_session_cluster_definition is not None
@@ -1811,11 +1814,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             )
             env_from = jarvis_mcp_env_from()
         except (ValueError, ConfigurationError) as exc:
-            # clio-relay#228: a launcher-identity verification failure --
-            # including a missing/unloadable EXPLICIT cluster pin -- must
-            # surface typed, never escape as a bare unhandled 500 nor
-            # silently fall back to the default launcher.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # A failed explicit launcher identity never falls back (#228).
+            raise door_errors.http_problem("launcher_resolution_failed", exc=exc) from exc
         # clio-relay#228 rework round 2 (design ruling): dev mode relaxes
         # VERIFICATION of a receipt, it must never SILENTLY substitute a
         # different binary with no queryable trace. When resolution above
@@ -1871,7 +1871,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             return _public_record(require_owned_job(job_id))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.post(
         "/jobs/{job_id}/transform",
@@ -1883,12 +1883,15 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             require_owned_job(job_id)
             if transform.job_id != job_id:
-                raise HTTPException(status_code=422, detail="transform job_id does not match path")
+                raise door_errors.http_problem(
+                    "transform_refused",
+                    message="transform job_id does not match path",
+                )
             return _public_record(queue.record_transform_ref(transform))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("transform_conflict", exc=exc) from exc
 
     @app.get(
         "/jobs/{job_id}/transform",
@@ -1901,7 +1904,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_job(job_id)
             transform = queue.get_transform_ref(job_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         return None if transform is None else _public_record(transform)
 
     @app.get("/jobs/{job_id}/status", dependencies=[auth_dependency])
@@ -1910,7 +1913,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_job(job_id)
             return _public_payload(get_job_status_operation(queue, job_id))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get(
         "/jobs/{job_id}/events",
@@ -1973,7 +1976,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             events, _ = queue.drain_task_events(task_id, cursor=cursor, limit=limit)
             return [_public_record(event) for event in events]
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("task_not_found", exc=exc) from exc
 
     @app.post(
         "/tasks/{task_id}/events",
@@ -2002,7 +2005,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("task_not_found", exc=exc) from exc
 
     @app.get("/tasks/{task_id}/events/sse", dependencies=[auth_dependency])
     def task_events_sse(
@@ -2016,11 +2019,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> StreamingResponse:
         """Stream task timeline events as Server-Sent Events."""
         if poll_seconds <= 0:
-            raise HTTPException(status_code=400, detail="poll_seconds must be positive")
+            raise door_errors.http_problem("poll_interval_invalid", "poll_seconds must be positive")
         try:
             require_owned_task(task_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("task_not_found", exc=exc) from exc
         return StreamingResponse(
             _task_sse_events(
                 queue,
@@ -2048,7 +2051,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         _require_websocket_page_limit(limit)
         try:
             require_owned_task(task_id)
-        except (NotFoundError, HTTPException) as exc:
+        except (NotFoundError, door_errors.HTTPProblemError) as exc:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
         await websocket.accept()
         try:
@@ -2075,7 +2078,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_job(job_id)
             return _public_payload(monitor_job(queue, job_id, cursor=cursor, limit=limit))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get("/jobs/{job_id}/monitor/sse", dependencies=[auth_dependency])
     def monitor_sse(
@@ -2089,11 +2092,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> StreamingResponse:
         """Stream job monitor updates as Server-Sent Events."""
         if poll_seconds <= 0:
-            raise HTTPException(status_code=400, detail="poll_seconds must be positive")
+            raise door_errors.http_problem("poll_interval_invalid", "poll_seconds must be positive")
         try:
             require_owned_job(job_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         return StreamingResponse(
             _monitor_sse_events(
                 queue,
@@ -2122,7 +2125,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         _require_websocket_page_limit(limit)
         try:
             require_owned_job(job_id)
-        except (NotFoundError, HTTPException) as exc:
+        except (NotFoundError, door_errors.HTTPProblemError) as exc:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
         await websocket.accept()
         try:
@@ -2152,14 +2155,12 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         poll_seconds: float = 2,
     ) -> JobWaitResult:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-            raise HTTPException(
-                status_code=422,
-                detail="timeout_seconds must be positive and finite",
+            raise door_errors.http_problem(
+                "wait_parameters_invalid", "timeout_seconds must be positive and finite"
             )
         if not math.isfinite(poll_seconds) or poll_seconds <= 0:
-            raise HTTPException(
-                status_code=422,
-                detail="poll_seconds must be positive and finite",
+            raise door_errors.http_problem(
+                "wait_parameters_invalid", "poll_seconds must be positive and finite"
             )
         try:
             require_owned_job(job_id)
@@ -2172,7 +2173,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get("/jobs/{job_id}/logs/{stream_name}", dependencies=[auth_dependency])
     def get_log(
@@ -2183,7 +2184,10 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> dict[str, object]:
         try:
             if stream_name not in {"stdout", "stderr"}:
-                raise HTTPException(status_code=400, detail="stream must be stdout or stderr")
+                raise door_errors.http_problem(
+                    "log_stream_invalid",
+                    message="stream must be stdout or stderr",
+                )
             return _public_payload(
                 read_job_log(
                     resolved,
@@ -2194,7 +2198,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get(
         "/jobs/{job_id}/artifacts",
@@ -2320,9 +2324,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def create_gateway_session(request: GatewaySessionCreateRequest) -> GatewaySession:
         ensure_intake_open()
         if owner_session_cluster is not None and request.cluster != owner_session_cluster:
-            raise HTTPException(
-                status_code=409,
-                detail="gateway cluster does not match this owned relay session",
+            raise door_errors.http_problem(
+                "gateway_cluster_mismatch",
+                "gateway cluster does not match this owned relay session",
             )
         metadata = dict(request.metadata)
         if resolved.owner_session_id is not None:
@@ -2353,7 +2357,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
 
     @app.get(
         "/gateway-sessions",
@@ -2406,7 +2410,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             return _public_record(require_owned_gateway(session_id))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
 
     @app.patch(
         "/gateway-sessions/{session_id}",
@@ -2420,11 +2424,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         try:
             existing = require_owned_gateway(session_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
         if request.gateway is not None and _has_relay_managed_gateway_state(existing.gateway):
-            raise HTTPException(
-                status_code=409,
-                detail=(
+            raise door_errors.http_problem(
+                "gateway_conflict",
+                message=(
                     "relay-managed runtime gateway state can only be changed by the "
                     "runtime supervisor"
                 ),
@@ -2451,9 +2455,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
 
     @app.post(
         "/gateway-sessions/{session_id}/close",
@@ -2465,9 +2469,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_gateway(session_id)
             return _public_record(queue.close_gateway_session(session_id))
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("gateway_not_found", exc=exc) from exc
 
     @app.post(
         "/jobs/{job_id}/progress",
@@ -2496,7 +2500,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get(
         "/artifacts/{artifact_id}/content",
@@ -2508,18 +2512,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_artifact(artifact_id)
             document = read_artifact_bytes(queue, artifact_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("artifact_not_found", exc=exc) from exc
         if is_delivery_refusal(document):
-            # F2 (#231 R6 review): an over-budget artifact read must not
-            # answer 200 with a body that merely SAYS result_available:
-            # false -- route it through door_errors' existing
-            # payload_too_large door (413, door_errors.py:336-341) instead
-            # of a silent success. The refusal document itself rides along
-            # as the envelope's extension data (F4: the contract's type/
-            # title/status/detail/schema_version/reason/retryable always
-            # win over a colliding key in it).
-            # A2 (#231 R6 review): the message extraction itself now
-            # delegates to bounded_payload.describe_delivery_refusal.
+            # An over-budget read is a typed refusal, never a 200-shaped failure.
             message = describe_delivery_refusal(document)
             fault = door_errors.classify(
                 RelayError(message),
@@ -2539,9 +2534,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> RelayJob:
         job = require_owned_job(job_id)
         if request is not None and request.cluster is not None and request.cluster != job.cluster:
-            raise HTTPException(
-                status_code=409,
-                detail=(
+            raise door_errors.http_problem(
+                "job_cluster_mismatch",
+                (
                     f"job {job_id} belongs to cluster {job.cluster}, "
                     f"not requested cluster {request.cluster}"
                 ),
@@ -2566,9 +2561,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get("/queue", dependencies=[auth_dependency])
     def list_queue(
@@ -2585,16 +2580,21 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             try:
                 job_state = JobState(state)
             except ValueError as exc:
-                raise HTTPException(status_code=422, detail=f"unknown job state: {state}") from exc
+                raise door_errors.http_problem(
+                    "queue_query_refused",
+                    exc=exc,
+                    message=f"unknown job state: {state}",
+                ) from exc
         if scan_limit < limit:
-            raise HTTPException(
-                status_code=422,
-                detail="scan_limit must be greater than or equal to limit",
+            raise door_errors.http_problem(
+                "queue_query_refused", "scan_limit must be greater than or equal to limit"
             )
         if resolved.owner_session_id is not None:
             generation_id = resolved.owner_session_generation_id
             if generation_id is None:
-                raise HTTPException(status_code=409, detail="owned session generation is missing")
+                raise door_errors.http_problem(
+                    "session_binding_conflict", "owned session generation is missing"
+                )
             try:
                 return _public_payload(
                     _list_owned_session_queue(
@@ -2611,9 +2611,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                     )
                 )
             except QueueConflictError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
             except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
+                raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
         try:
             payload = list_queue_jobs(
                 queue,
@@ -2626,11 +2626,11 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 scan_limit=scan_limit,
             )
         except ConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
         return _public_payload(payload)
 
     @app.get("/queue/jobs/{job_id}/diagnose", dependencies=[auth_dependency])
@@ -2652,9 +2652,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get("/retention/jobs/{job_id}/plan", dependencies=[auth_dependency])
     def retention_plan(
@@ -2663,9 +2663,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> dict[str, object]:
         """Build a read-only terminal-retention plan."""
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot inspect global retention state",
+            raise door_errors.http_problem(
+                "session_scope_refused",
+                "session-scoped APIs cannot inspect global retention state",
             )
         try:
             plan = TerminalRetentionCoordinator(queue, resolved.spool_dir).plan(
@@ -2673,9 +2673,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 expected_updated_at=expected_updated_at,
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
         return _public_payload(
             {
                 "plan": plan.model_dump(mode="json"),
@@ -2687,16 +2687,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     def retention_status(job_id: DurableRecordId) -> dict[str, object]:
         """Read the current crash-resumable retention phase without mutation."""
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot inspect global retention state",
+            raise door_errors.http_problem(
+                "session_scope_refused",
+                "session-scoped APIs cannot inspect global retention state",
             )
         try:
             plan = TerminalRetentionCoordinator(queue, resolved.spool_dir).plan(job_id)
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
         return {
             "job_id": job_id,
             "receipt_id": plan.receipt_id,
@@ -2714,9 +2714,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     ) -> dict[str, object]:
         """Dry-run by default or advance bounded retention without scheduler cancellation."""
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot mutate global retention state",
+            raise door_errors.http_problem(
+                "session_scope_refused", "session-scoped APIs cannot mutate global retention state"
             )
         options = request or RetentionCollectRequest()
         try:
@@ -2727,9 +2726,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 expected_updated_at=options.expected_updated_at,
             )
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except QueueConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("retention_conflict", exc=exc) from exc
         return _public_payload(result.model_dump(mode="json"))
 
     @app.get("/queue/stale", dependencies=[auth_dependency])
@@ -2742,9 +2741,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         scan_limit: Annotated[int, Query(ge=1, le=10_000)] = DEFAULT_STALE_SCAN_LIMIT,
     ) -> dict[str, object]:
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot inspect global stale-job state",
+            raise door_errors.http_problem(
+                "session_scope_refused",
+                "session-scoped APIs cannot inspect global stale-job state",
             )
         try:
             return _public_payload(
@@ -2759,18 +2758,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
 
     @app.get("/queue/diagnostics", dependencies=[auth_dependency])
     def diagnose_queue_route(cluster: str | None = None) -> dict[str, object]:
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot inspect global queue diagnostics",
+            raise door_errors.http_problem(
+                "session_scope_refused",
+                "session-scoped APIs cannot inspect global queue diagnostics",
             )
         return _public_payload(diagnose_queue(queue, cluster=cluster))
 
@@ -2787,9 +2786,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         scan_limit: Annotated[int, Query(ge=1, le=10_000)] = DEFAULT_STALE_SCAN_LIMIT,
     ) -> dict[str, object]:
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot mutate global stale-job state",
+            raise door_errors.http_problem(
+                "session_scope_refused",
+                "session-scoped APIs cannot mutate global stale-job state",
             )
         try:
             return _public_payload(
@@ -2807,18 +2806,17 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 )
             )
         except ConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_operation_conflict", exc=exc) from exc
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise door_errors.http_problem("queue_query_refused", exc=exc) from exc
 
     @app.get("/workers", dependencies=[auth_dependency])
     def worker_status_route(cluster: str | None = None) -> dict[str, object]:
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot inspect global worker state",
+            raise door_errors.http_problem(
+                "session_scope_refused", "session-scoped APIs cannot inspect global worker state"
             )
         return _public_payload(worker_status(queue, cluster=cluster))
 
@@ -2829,7 +2827,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             require_owned_job(rule.job_id)
             return _public_record(queue.append_monitor_rule(rule))
         except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
 
     @app.get("/monitor/rules", dependencies=[auth_dependency])
     def list_monitor_rules(
@@ -2872,9 +2870,8 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         ),
     ) -> list[dict[str, object]]:
         if resolved.owner_session_id is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="session-scoped APIs cannot evaluate global monitor rules",
+            raise door_errors.http_problem(
+                "session_scope_refused", "session-scoped APIs cannot evaluate global monitor rules"
             )
         return [_public_payload(item) for item in evaluate_monitor_rules(queue, limit=limit)]
 
@@ -3002,18 +2999,17 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
         if settings.api_token is not None:
             supplied = _extract_token(authorization, x_clio_relay_token)
             if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="missing or invalid relay API token",
+                raise door_errors.http_problem(
+                    "authentication_required", "missing or invalid relay API token"
                 )
         expected_session_id = settings.owner_session_id
         expected_generation_id = settings.owner_session_generation_id
         if expected_session_id is None:
             return
         if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
-            raise HTTPException(
-                status_code=409,
-                detail="exact owner session and generation headers are required",
+            raise door_errors.http_problem(
+                "session_binding_conflict",
+                "exact owner session and generation headers are required",
             )
         if expected_generation_id is None or not (
             secrets.compare_digest(x_clio_relay_owner_session_id, expected_session_id)
@@ -3022,9 +3018,9 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
                 expected_generation_id,
             )
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="owner session or generation does not match this API process",
+            raise door_errors.http_problem(
+                "session_binding_conflict",
+                "owner session or generation does not match this API process",
             )
 
     return dependency
@@ -3049,7 +3045,7 @@ def _job_owner_session_identity() -> Callable[..., Awaitable[JobOwnerSessionIden
                 x_clio_relay_session_generation_id,
             )
         except OwnerSessionIdentityError as exc:
-            raise HTTPException(status_code=422, detail=exc.detail) from exc
+            raise door_errors.http_problem("owner_session_identity_refused", exc=exc) from exc
 
     return dependency
 
@@ -3076,20 +3072,19 @@ def _require_session_submission_binding(
                 x_clio_relay_owner_session_id is not None
                 or x_clio_relay_session_generation_id is not None
             ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="relay API is not bound to an owner session",
+                raise door_errors.http_problem(
+                    "session_binding_conflict", "relay API is not bound to an owner session"
                 )
             return
         if settings.api_token is None:
-            raise HTTPException(
-                status_code=503,
-                detail="owned relay session submissions require API token authentication",
+            raise door_errors.http_problem(
+                "session_authentication_unavailable",
+                "owned relay session submissions require API token authentication",
             )
         if x_clio_relay_owner_session_id is None or x_clio_relay_session_generation_id is None:
-            raise HTTPException(
-                status_code=409,
-                detail="exact owner session and generation headers are required",
+            raise door_errors.http_problem(
+                "session_binding_conflict",
+                "exact owner session and generation headers are required",
             )
         if expected_generation_id is None or not (
             secrets.compare_digest(x_clio_relay_owner_session_id, expected_session_id)
@@ -3098,9 +3093,9 @@ def _require_session_submission_binding(
                 expected_generation_id,
             )
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="owner session or generation does not match this API process",
+            raise door_errors.http_problem(
+                "session_binding_conflict",
+                "owner session or generation does not match this API process",
             )
 
     return dependency

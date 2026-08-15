@@ -596,10 +596,15 @@ def test_http_remote_agent_submission_requires_typed_owner_session_identity(
 
     assert response.status_code == 422
     assert jarvis_response.status_code == 422
-    assert jarvis_response.json()["detail"]["code"] == "owner_session_identity_required"
-    assert jarvis_response.json()["detail"]["job_kind"] == "jarvis"
+    assert jarvis_response.json()["reason"] == "owner_session_identity_refused"
+    assert jarvis_response.json()["code"] == "owner_session_identity_required"
+    assert jarvis_response.json()["job_kind"] == "jarvis"
     assert identity_without_bearer.status_code == 401
-    assert response.json()["detail"] == {
+    assert response.json()["reason"] == "owner_session_identity_refused"
+    assert {
+        key: response.json()[key]
+        for key in ("schema", "code", "job_kind", "required_headers", "message")
+    } == {
         "schema": "clio-relay.owner-session-identity-error.v1",
         "code": "owner_session_identity_required",
         "job_kind": "remote_agent",
@@ -733,7 +738,8 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
     assert jobs[3].owner_session_id is None
     assert jobs[3].owner_session_generation_id is None
     assert incomplete_mcp.status_code == 422
-    assert incomplete_mcp.json()["detail"]["code"] == "owner_session_identity_incomplete"
+    assert incomplete_mcp.json()["reason"] == "owner_session_identity_refused"
+    assert incomplete_mcp.json()["code"] == "owner_session_identity_incomplete"
 
 
 def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(

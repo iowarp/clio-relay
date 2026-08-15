@@ -14,9 +14,11 @@ collision, silent truncation, the unenforced byte budget, a hostile
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -79,20 +81,113 @@ _EXPECTED_REASONS = frozenset(
         "owner_session_identity_refused",
         "internal_error",
         "payload_too_large",
+        "http_request_malformed",
+        "poll_interval_invalid",
+        "log_stream_invalid",
+        "authentication_required",
+        "resource_ownership_refused",
+        "session_scope_refused",
+        "session_identity_unavailable",
+        "session_status_unavailable",
+        "jarvis_runtime_authority_unavailable",
+        "input_ingest_unavailable",
+        "job_not_found",
+        "task_not_found",
+        "gateway_not_found",
+        "artifact_not_found",
+        "session_binding_conflict",
+        "job_cluster_mismatch",
+        "job_submission_conflict",
+        "mcp_submission_conflict",
+        "jarvis_runtime_authority_conflict",
+        "jarvis_artifact_conflict",
+        "input_ingest_conflict",
+        "transform_conflict",
+        "gateway_cluster_mismatch",
+        "gateway_conflict",
+        "queue_operation_conflict",
+        "retention_conflict",
+        "job_submission_refused",
+        "mcp_admission_refused",
+        "input_ingest_refused",
+        "job_route_refused",
+        "jarvis_submission_refused",
+        "transform_refused",
+        "wait_parameters_invalid",
+        "queue_query_refused",
+        "input_ingest_terminalization_failed",
+        "session_authentication_unavailable",
     }
 )
+
+_EXPECTED_R9_HTTP_STATUSES = {
+    **dict.fromkeys({"http_request_malformed", "poll_interval_invalid", "log_stream_invalid"}, 400),
+    "authentication_required": 401,
+    **dict.fromkeys({"resource_ownership_refused", "session_scope_refused"}, 403),
+    **dict.fromkeys(
+        {
+            "session_identity_unavailable",
+            "session_status_unavailable",
+            "jarvis_runtime_authority_unavailable",
+            "input_ingest_unavailable",
+            "job_not_found",
+            "task_not_found",
+            "gateway_not_found",
+            "artifact_not_found",
+        },
+        404,
+    ),
+    **dict.fromkeys(
+        {
+            "session_binding_conflict",
+            "job_cluster_mismatch",
+            "job_submission_conflict",
+            "mcp_submission_conflict",
+            "jarvis_runtime_authority_conflict",
+            "jarvis_artifact_conflict",
+            "input_ingest_conflict",
+            "transform_conflict",
+            "gateway_cluster_mismatch",
+            "gateway_conflict",
+            "queue_operation_conflict",
+            "retention_conflict",
+        },
+        409,
+    ),
+    **dict.fromkeys(
+        {
+            "job_submission_refused",
+            "mcp_admission_refused",
+            "input_ingest_refused",
+            "job_route_refused",
+            "jarvis_submission_refused",
+            "transform_refused",
+            "wait_parameters_invalid",
+            "queue_query_refused",
+        },
+        422,
+    ),
+    "input_ingest_terminalization_failed": 500,
+    "session_authentication_unavailable": 503,
+}
 
 
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 13
+    assert len(door_errors.REASONS) == 49
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
+        assert len(reason) <= 64
+        assert re.fullmatch(r"[a-z][a-z0-9_]*", reason)
         assert isinstance(spec.retryable, bool)
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 36
+    assert {
+        reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
+    } == _EXPECTED_R9_HTTP_STATUSES
 
 
 def test_reasons_is_a_read_only_mapping() -> None:
@@ -751,20 +846,95 @@ def test_mcp_error_pass_through_is_never_reclassified_by_the_owner(
 # --------------------------------------------------------------------------- #
 
 
-def test_launcher_resolution_failed_adapter_contract_on_a_synthetic_route() -> None:
-    """F11: an adapter-contract proof, not a #228-path regression.
+def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 107 raises plus 15 middleware refusals."""
+    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    calls = [
+        node.exc
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Attribute)
+        and isinstance(node.exc.func.value, ast.Name)
+        and node.exc.func.value.id == "door_errors"
+        and node.exc.func.attr == "http_problem"
+    ]
 
-    ``launcher_resolution_failed`` is declared in the frozen table (grounded
-    in the real #228 scenario, ``http_api.py:1753-1758``) but that real site
-    is not wired through ``door_errors`` -- ``jarvis_mcp_command()`` raises a
-    bare ``ValueError`` for dozens of unrelated failures (doc §6.3's own
-    caveat), so type-based dispatch cannot isolate it, and converting the
-    live site is out of R3's scope. This test proves the reason's own
-    classify()/as_http_problem() shape is correct over a real HTTP round
-    trip on a purpose-built route, exercised exactly the way a future,
-    properly-scoped conversion of the real site would use it -- it is not
-    evidence that the real #228 route emits this document today.
-    """
+    assert len(calls) == 107
+    reasons = {
+        call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
+    }
+    assert len(reasons) > 1
+    assert reasons <= set(door_errors.REASONS)
+    assert all(
+        call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+        for call in calls
+    )
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    middleware_direct = sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_send_error"
+        and len(node.args) > 1
+        and isinstance(node.args[1], ast.Constant)
+        for function_name in ("__call__", "_buffer_and_dispatch")
+        for node in ast.walk(functions[function_name])
+    )
+    middleware_too_large = sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_send_too_large"
+        for node in ast.walk(functions["_buffer_and_dispatch"])
+    )
+    middleware_authentication = sum(
+        isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple)
+        for node in ast.walk(functions["_authentication_error"])
+    )
+    assert middleware_direct + middleware_too_large + middleware_authentication == 15
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 122
+    assert "HTTPException" not in source
+    assert 'json.dumps({"detail"' not in source
+
+
+def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
+    """Every frozen reason survives the real FastAPI exception-handler boundary."""
+    app = create_app(RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"))
+
+    def route_for(reason: str) -> Any:
+        def route() -> None:
+            raise door_errors.http_problem(reason, f"deliberate {reason} probe")
+
+        return route
+
+    for reason in door_errors.REASONS:
+        app.add_api_route(f"/__door_reason/{reason}", route_for(reason), methods=["GET"])
+
+    client = cast(Any, TestClient(app))
+    for reason, spec in door_errors.REASONS.items():
+        response = client.get(f"/__door_reason/{reason}")
+        document = response.json()
+
+        assert response.status_code == spec.http_status
+        assert response.headers["content-type"].startswith("application/problem+json")
+        assert document["schema_version"] == door_errors.SCHEMA_VERSION
+        assert document["reason"] == reason
+        assert document["status"] == spec.http_status
+        assert document["retryable"] is spec.retryable
+        assert document["type"] == f"urn:clio-relay:error:{reason}"
+        assert isinstance(document["detail"], str)
+        assert len(document["detail"]) <= door_errors.MAX_MESSAGE_CHARS
+        assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
+
+
+def test_launcher_resolution_failed_adapter_contract_on_a_synthetic_route() -> None:
+    """The launcher reason retains its adapter contract over an HTTP round trip."""
     app = FastAPI()
 
     @app.get("/probe")
@@ -880,27 +1050,21 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     assert len(logged) == 1
 
 
-def test_107_existing_httpexception_sites_are_unaffected_by_the_global_handler(
+def test_deliberate_route_failure_uses_specific_handler_before_global_fallback(
     tmp_path: Path,
 ) -> None:
-    """The global Exception handler must never intercept HTTPException.
-    FastAPI's ``build_middleware_stack`` pulls a bare-``Exception``-keyed
-    handler out into ``ServerErrorMiddleware``, a separate layer outside
-    ``ExceptionMiddleware`` (which keeps handling ``HTTPException`` via
-    FastAPI's own default) -- not a "most specific handler wins" contest
-    within one dispatch table. Either way, the 107 hand-rolled
-    ``raise HTTPException(...)`` sites this slice explicitly does not touch
-    (doc §6.2) keep their exact existing bare-string shape.
-    """
+    """A migrated route serves its specific reason instead of internal_error."""
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     app = create_app(settings)
     client = cast(Any, TestClient(app))
 
     response = client.get("/jobs/does-not-exist/monitor")
 
-    assert response.status_code in (401, 403, 404)
+    assert response.status_code == 404
     body = response.json()
-    assert "schema_version" not in body
+    assert body["schema_version"] == door_errors.SCHEMA_VERSION
+    assert body["reason"] == "job_not_found"
+    assert body["status"] == 404
 
 
 # --------------------------------------------------------------------------- #

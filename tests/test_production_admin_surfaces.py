@@ -135,7 +135,9 @@ def test_http_storage_status_and_507_decision_are_machine_readable(tmp_path: Pat
     assert status.json()["schema"] == "clio-relay.storage-runtime-status.v1"
     assert first.status_code == 200
     assert denied.status_code == 507
-    decision = denied.json()["detail"]
+    assert denied.json()["schema_version"] == "clio-relay.error.v1"
+    assert denied.json()["reason"] == "storage_admission_refused"
+    decision = denied.json()["storage_decision"]
     assert decision["schema"] == "clio-relay.storage-decision.v1"
     assert decision["allowed"] is False
     assert decision["reason"] == "ledger_capacity"

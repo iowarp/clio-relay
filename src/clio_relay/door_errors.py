@@ -85,11 +85,10 @@ this slice deletes at their old call sites, per doc §10):
     ``data`` is the queryable signal, handler internals (``str(exc)``) never
     reach ``message``.
 
-See docs/design/relay-architecture-2026-08.md §6.3 for the remaining ten
-rows' grounding (already-shipped precedents, verified raise sites, the two
-reasons this design pass's own verification found beyond the seed ten, and
-``payload_too_large``, added by the R3 re-review that also moved every
-relay-owned MCP code out of the SDK's reserved -32000..-32019 band).
+See docs/design/relay-architecture-2026-08.md §6.3 for the original 13 rows.
+R9 adds the HTTP-originated rows that replace ``http_api.py``'s 107 legacy
+sites and outer request-body middleware serializer; each keeps its shipped
+status while gaining a specific, frozen agent-facing reason.
 """
 
 from __future__ import annotations
@@ -189,6 +188,23 @@ def _row(
         reason=reason,
         retryable=retryable,
         mcp_code=mcp_code,
+        http_status=http_status,
+        title=title,
+    )
+
+
+def _http_row(
+    reason: str,
+    http_status: int,
+    title: str,
+    *,
+    retryable: bool = False,
+) -> ReasonSpec:
+    """Define an HTTP-originated reason without inventing a second code table."""
+    return _row(
+        reason,
+        retryable=retryable,
+        mcp_code=mcp_types.INTERNAL_ERROR if http_status >= 500 else mcp_types.INVALID_PARAMS,
         http_status=http_status,
         title=title,
     )
@@ -344,6 +360,59 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 http_status=413,
                 title="Payload too large",
             ),
+            _http_row("http_request_malformed", 400, "HTTP request malformed"),
+            _http_row("poll_interval_invalid", 400, "Poll interval invalid"),
+            _http_row("log_stream_invalid", 400, "Log stream invalid"),
+            _http_row("authentication_required", 401, "Authentication required"),
+            _http_row("resource_ownership_refused", 403, "Resource ownership refused"),
+            _http_row("session_scope_refused", 403, "Session scope refused"),
+            _http_row("session_identity_unavailable", 404, "Session identity unavailable"),
+            _http_row("session_status_unavailable", 404, "Session status unavailable"),
+            _http_row(
+                "jarvis_runtime_authority_unavailable",
+                404,
+                "JARVIS runtime authority unavailable",
+            ),
+            _http_row("input_ingest_unavailable", 404, "Input ingest unavailable"),
+            _http_row("job_not_found", 404, "Job not found"),
+            _http_row("task_not_found", 404, "Task not found"),
+            _http_row("gateway_not_found", 404, "Gateway not found"),
+            _http_row("artifact_not_found", 404, "Artifact not found"),
+            _http_row("session_binding_conflict", 409, "Session binding conflict"),
+            _http_row("job_cluster_mismatch", 409, "Job cluster mismatch"),
+            _http_row("job_submission_conflict", 409, "Job submission conflict"),
+            _http_row("mcp_submission_conflict", 409, "MCP submission conflict"),
+            _http_row(
+                "jarvis_runtime_authority_conflict",
+                409,
+                "JARVIS runtime authority conflict",
+            ),
+            _http_row("jarvis_artifact_conflict", 409, "JARVIS artifact conflict"),
+            _http_row("input_ingest_conflict", 409, "Input ingest conflict", retryable=True),
+            _http_row("transform_conflict", 409, "Transform conflict"),
+            _http_row("gateway_cluster_mismatch", 409, "Gateway cluster mismatch"),
+            _http_row("gateway_conflict", 409, "Gateway conflict"),
+            _http_row("queue_operation_conflict", 409, "Queue operation conflict"),
+            _http_row("retention_conflict", 409, "Retention conflict"),
+            _http_row("job_submission_refused", 422, "Job submission refused"),
+            _http_row("mcp_admission_refused", 422, "MCP admission refused"),
+            _http_row("input_ingest_refused", 422, "Input ingest refused"),
+            _http_row("job_route_refused", 422, "Job route refused"),
+            _http_row("jarvis_submission_refused", 422, "JARVIS submission refused"),
+            _http_row("transform_refused", 422, "Transform refused"),
+            _http_row("wait_parameters_invalid", 422, "Wait parameters invalid"),
+            _http_row("queue_query_refused", 422, "Queue query refused"),
+            _http_row(
+                "input_ingest_terminalization_failed",
+                500,
+                "Input ingest terminalization failed",
+            ),
+            _http_row(
+                "session_authentication_unavailable",
+                503,
+                "Session authentication unavailable",
+                retryable=True,
+            ),
         )
     }
 )
@@ -373,6 +442,14 @@ class RelayFault:
     message: str
     data: Mapping[str, Any] = field(default_factory=_empty_data)
     truncation: JSON | None = None
+
+
+class HTTPProblemError(Exception):
+    """Carry one preclassified fault through FastAPI without shaping its body there."""
+
+    def __init__(self, fault: RelayFault) -> None:
+        super().__init__(fault.reason)
+        self.fault = fault
 
 
 # The seven exception types with an unambiguous 1:1 reason (doc §6.3
@@ -473,6 +550,42 @@ def _build(spec: ReasonSpec, *, message: str, data: Mapping[str, Any]) -> RelayF
     )
 
 
+def fault_for_reason(
+    reason: str,
+    message: str,
+    *,
+    data: Mapping[str, Any] | None = None,
+) -> RelayFault:
+    """Build a bounded fault for one deliberate, registered refusal site."""
+    try:
+        spec = REASONS[reason]
+    except KeyError as exc:
+        raise ValueError(f"door_errors: {reason!r} is not a registered REASONS entry") from exc
+    return _build(spec, message=message, data=data if data is not None else {})
+
+
+def http_problem(
+    reason: str,
+    message: str | None = None,
+    *,
+    exc: BaseException | None = None,
+    data: Mapping[str, Any] | None = None,
+) -> HTTPProblemError:
+    """Create FastAPI control flow for one deliberate registered HTTP problem."""
+    if exc is None:
+        if message is None:
+            raise ValueError("door_errors.http_problem() requires message or exc")
+        fault = fault_for_reason(reason, message, data=data)
+    else:
+        fault = classify(
+            exc,
+            reason=reason,
+            message=message,
+            data=_typed_data(exc) if data is None else data,
+        )
+    return HTTPProblemError(fault)
+
+
 def classify(
     exc: BaseException | JarvisDispatchRefusal,
     *,
@@ -535,7 +648,7 @@ def classify(
         return _build(
             _table[reason],
             message=message if message is not None else _safe_str(exc),
-            data=data if data is not None else {},
+            data=data if data is not None else _typed_data(exc),
         )
     for exc_type, mapped_reason in _TYPE_REASONS:
         if isinstance(exc, exc_type):

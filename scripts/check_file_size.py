@@ -165,7 +165,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # refusal message extraction now delegates to
     # `bounded_payload.describe_delivery_refusal` instead of a 4-line
     # inline `delivery.get("message", ...)` extraction. A ratchet-down.
-    "src/clio_relay/http_api.py": 3149,
+    # #231 R9: -12 net lines while deleting all 107 legacy HTTPException
+    # sites and the middleware's ad hoc detail serializer in favor of the
+    # door_errors owner and registered error.v1 reasons.
+    "src/clio_relay/http_api.py": 3137,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
