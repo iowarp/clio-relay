@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+from pytest import MonkeyPatch
+
+from clio_relay import core_queue as core_queue_module
+from clio_relay import (
+    queue_lease_records,
+    queue_legacy_output_codec,
+    queue_scheduler_cancel_records,
+)
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.models import JobKind
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
 
@@ -19,7 +31,15 @@ _OWNER_ORDER = (
     "queue_store_lock",
     "queue_store_read",
     "queue_store_write",
+    "queue_lease_records",
+    "queue_scheduler_cancel_records",
+    "queue_legacy_output_codec",
 )
+_CQ4_CODEC_OWNERS = {
+    "queue_lease_records": 680,
+    "queue_scheduler_cancel_records": 260,
+    "queue_legacy_output_codec": 500,
+}
 _JARVIS_INPUT_SYMBOLS = (
     "get_jarvis_package_input_contract",
     "put_jarvis_package_input_contract",
@@ -37,6 +57,10 @@ _LAYOUT_METHODS = {
     "_require_durable_record_id": "require_durable_record_id",
     "_label_key": "label_key",
 }
+
+
+class _CodecLookupSabotage(RuntimeError):
+    """Raised only when a CQ4 owner decoder lookup is live."""
 
 
 @dataclass(frozen=True)
@@ -128,6 +152,20 @@ def test_split_owner_dependencies_follow_the_migration_topology() -> None:
     assert violations == []
 
 
+def test_cq4_codecs_are_store_independent_and_within_design_budgets() -> None:
+    """CQ4 owners depend on codecs/layout only and honor their planned caps."""
+    store_owners = {"queue_store_lock", "queue_store_read", "queue_store_write"}
+    violations = [
+        f"{edge.caller} -> {edge.collaborator}"
+        for edge in _owner_dependencies()
+        if edge.caller in _CQ4_CODEC_OWNERS and edge.collaborator in store_owners
+    ]
+    assert violations == []
+    for owner, budget in _CQ4_CODEC_OWNERS.items():
+        line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
+        assert line_count <= budget, f"{owner}: {line_count} > {budget}"
+
+
 def test_queue_store_protocol_is_implemented_by_the_concrete_queue(
     tmp_path: Path,
 ) -> None:
@@ -151,3 +189,88 @@ def test_layout_facade_signatures_match_the_owner() -> None:
         facade_signature = inspect.signature(getattr(ClioCoreQueue, facade_symbol))
         owner_signature = inspect.signature(getattr(QueueLayout, owner_symbol))
         assert facade_signature == owner_signature, facade_symbol
+
+
+def test_lease_decoder_lookup_is_owned_by_the_cq4_module(monkeypatch: MonkeyPatch) -> None:
+    """The facade's lease decoder must re-resolve the CQ4 owner lookup."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _CodecLookupSabotage("queue_lease_records decoder lookup engaged")
+
+    monkeypatch.setattr(queue_lease_records, "lease_index_identity_from_document", sabotage)
+    document = {
+        "schema_version": "clio-relay.lease-operational-index.v2",
+        "lease_id": "lease-cq4",
+        "job_id": "job-cq4",
+        "endpoint_id": "endpoint-cq4",
+        "cluster": "cluster-cq4",
+        "job_kind": JobKind.JARVIS.value,
+        "expires_at": datetime(2026, 8, 15, 12, tzinfo=UTC).isoformat(),
+    }
+
+    with pytest.raises(
+        _CodecLookupSabotage,
+        match="queue_lease_records decoder lookup engaged",
+    ):
+        core_queue_module._lease_index_identity_from_document(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            document,
+            label="CQ4 lease",
+        )
+
+
+def test_scheduler_decoder_lookup_is_owned_by_the_cq4_module(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The facade's scheduler decoder must re-resolve the CQ4 owner lookup."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _CodecLookupSabotage("queue_scheduler_cancel_records decoder lookup engaged")
+
+    monkeypatch.setattr(queue_scheduler_cancel_records, "cancellation_requested_at", sabotage)
+
+    with pytest.raises(
+        _CodecLookupSabotage,
+        match="queue_scheduler_cancel_records decoder lookup engaged",
+    ):
+        core_queue_module._cancellation_requested_at(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            {"requested_at": "2026-08-15T12:00:00+00:00"}
+        )
+
+
+def test_legacy_output_decoder_lookup_is_owned_by_the_cq4_module(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The facade's legacy decoder must re-resolve the CQ4 owner lookup."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _CodecLookupSabotage("queue_legacy_output_codec decoder lookup engaged")
+
+    monkeypatch.setattr(queue_legacy_output_codec, "decode_v09_legacy_output_record", sabotage)
+    text = "x" * (core_queue_module.RECORD_FAMILY_MAX_BYTES["events"] + 1)
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "job_id": "job-cq4",
+                "seq": 1,
+                "event_type": "stdout.delta",
+                "message": text,
+                "level": "info",
+                "created_at": "2026-08-15T12:00:00Z",
+                "payload": {"stream": "stdout", "text": text},
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        _CodecLookupSabotage,
+        match="queue_legacy_output_codec decoder lookup engaged",
+    ):
+        ClioCoreQueue(tmp_path)._read_v09_legacy_output_record(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path,
+            job_id="job-cq4",
+            seq=1,
+        )

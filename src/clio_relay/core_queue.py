@@ -29,6 +29,9 @@ from clio_relay import (
     queue_context,
     queue_jarvis_inputs,
     queue_layout,
+    queue_lease_records,
+    queue_legacy_output_codec,
+    queue_scheduler_cancel_records,
     queue_store_lock,
     queue_store_read,
     queue_store_write,
@@ -206,79 +209,15 @@ class IdempotentSubmissionResolution:
     existing_job: RelayJob | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class SchedulerCancelIdentityRegistration:
-    """Atomic result for one durable scheduler-cancellation identity registration."""
-
-    record: SchedulerCancelPending
-    disposition_created: bool
-
-
-@dataclass(frozen=True, slots=True)
-class SchedulerCancelAttemptClaim:
-    """Exclusive durable lease for one external scheduler cancellation attempt."""
-
-    claim_id: str
-    scheduler_job_id: str
-    provider: str
-    attempt: int
-    claimed_at: datetime
-    expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class SchedulerCancelConfirmationClaim:
-    """Exclusive durable lease for one scheduler cancellation confirmation poll."""
-
-    claim_id: str
-    scheduler_job_id: str
-    provider: str
-    confirmation_attempt: int
-    claimed_at: datetime
-    expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class _LeaseIndexIdentity:
-    """Exact immutable fields used by every operational lease reference."""
-
-    lease_id: str
-    job_id: str
-    endpoint_id: str
-    cluster: str
-    job_kind: JobKind
-    expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class _LeaseCapacityAggregate:
-    """Validated O(1) lease admission counts for one durable epoch."""
-
-    epoch_id: str
-    generation: int
-    checkpoint_id: str
-    global_live_leases: int
-    cluster_kind_counts: dict[str, dict[JobKind, int]]
-    document_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class _LeaseCapacityCheckpoint:
-    """Independent anchor for one exact lease-capacity aggregate generation."""
-
-    epoch_id: str
-    generation: int
-    checkpoint_id: str
-    aggregate_document_sha256: str
-    document_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class _LeaseCapacityPair:
-    """One mutually bound aggregate/checkpoint pair."""
-
-    aggregate: _LeaseCapacityAggregate
-    checkpoint: _LeaseCapacityCheckpoint
+SchedulerCancelIdentityRegistration = (
+    queue_scheduler_cancel_records.SchedulerCancelIdentityRegistration
+)
+SchedulerCancelAttemptClaim = queue_scheduler_cancel_records.SchedulerCancelAttemptClaim
+SchedulerCancelConfirmationClaim = queue_scheduler_cancel_records.SchedulerCancelConfirmationClaim
+_LeaseIndexIdentity = queue_lease_records.LeaseIndexIdentity
+_LeaseCapacityAggregate = queue_lease_records.LeaseCapacityAggregate
+_LeaseCapacityCheckpoint = queue_lease_records.LeaseCapacityCheckpoint
+_LeaseCapacityPair = queue_lease_records.LeaseCapacityPair
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,18 +232,7 @@ class _LegacyOutputAudit:
     receipt_manifest_sha256: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _LegacyOutputRecord:
-    """One exact v0.9 output event and its deterministic replacement."""
-
-    original: RelayEvent
-    original_bytes: bytes
-    original_sha256: str
-    archive_relative_path: str
-    replacement: RelayEvent
-    replacement_bytes: bytes
-    replacement_sha256: str
-    representation: Literal["payload_text", "archive"]
+_LegacyOutputRecord = queue_legacy_output_codec.LegacyOutputRecord
 
 
 def _artifact_with_sequence(artifact: ArtifactRef, sequence: int) -> ArtifactRef:
@@ -1224,115 +1152,20 @@ class ClioCoreQueue:
             path,
             limit=MAX_LEGACY_OUTPUT_RECORD_BYTES,
         )
-        try:
-            raw = json.loads(original_bytes)
-        except json.JSONDecodeError as error:
-            raise ValueError("legacy output event is not valid JSON") from error
-        expected_keys = {
-            "job_id",
-            "seq",
-            "event_type",
-            "message",
-            "level",
-            "created_at",
-            "payload",
-        }
-        if not isinstance(raw, dict):
-            raise ValueError("legacy output event has an unknown top-level shape")
-        document = cast(dict[str, object], raw)
-        if set(document) != expected_keys:
-            raise ValueError("legacy output event has an unknown top-level shape")
-        payload = document.get("payload")
-        if not isinstance(payload, dict):
-            raise ValueError("legacy output event payload is not the exact v0.9 shape")
-        typed_payload = cast(dict[str, object], payload)
-        if set(typed_payload) != {"stream", "text"}:
-            raise ValueError("legacy output event payload is not the exact v0.9 shape")
-        event_type = document.get("event_type")
-        stream = typed_payload.get("stream")
-        text = typed_payload.get("text")
-        message = document.get("message")
-        if (
-            event_type not in {"stdout.delta", "stderr.delta"}
-            or stream not in {"stdout", "stderr"}
-            or event_type != f"{stream}.delta"
-            or document.get("level") != "info"
-            or not isinstance(text, str)
-            or not isinstance(message, str)
-            or (text.rstrip("\n") or f"{stream} output") != message
-        ):
-            raise ValueError("legacy output event is not an exact duplicated v0.9 delta")
-        original = RelayEvent.model_validate(document)
-        if original.job_id != job_id or original.seq != seq:
-            raise ValueError("legacy output filename/content identity mismatch")
-        original_sha256 = hashlib.sha256(original_bytes).hexdigest()
-        archive_relative_path = (
-            Path("legacy_output_archives") / job_id / f"{seq:020d}.json"
-        ).as_posix()
-
-        def replacement(representation: Literal["payload_text", "archive"]) -> RelayEvent:
-            compatibility = {
-                "schema_version": LEGACY_OUTPUT_COMPATIBILITY_SCHEMA,
-                "archive_path": archive_relative_path,
-                "archive_sha256": original_sha256,
-                "archive_size_bytes": len(original_bytes),
-                "original_message_utf8_bytes": len(message.encode("utf-8")),
-                "original_payload_text_utf8_bytes": len(text.encode("utf-8")),
-                "representation": representation,
-            }
-            replacement_message = (
-                f"Legacy {stream} output preserved in payload.text "
-                f"({len(text.encode('utf-8'))} UTF-8 bytes)"
-                if representation == "payload_text"
-                else f"Legacy {stream} output archived ({len(text.encode('utf-8'))} UTF-8 bytes)"
-            )
-            replacement_payload: dict[str, object] = {
-                "stream": stream,
-                "legacy_output": compatibility,
-            }
-            if representation == "payload_text":
-                replacement_payload["text"] = text
-            return original.model_copy(
-                update={
-                    "message": replacement_message,
-                    "payload": replacement_payload,
-                }
-            )
-
-        representation: Literal["payload_text", "archive"] = "payload_text"
-        replacement_record = replacement(representation)
-        replacement_bytes = replacement_record.model_dump_json(indent=2).encode("utf-8")
-        if len(replacement_bytes) > ordinary_limit:
-            representation = "archive"
-            replacement_record = replacement(representation)
-            replacement_bytes = replacement_record.model_dump_json(indent=2).encode("utf-8")
-        if len(replacement_bytes) > ordinary_limit:
-            raise QueueConflictError("legacy output compatibility event exceeds the event limit")
-        return _LegacyOutputRecord(
-            original=original,
-            original_bytes=original_bytes,
-            original_sha256=original_sha256,
-            archive_relative_path=archive_relative_path,
-            replacement=replacement_record,
-            replacement_bytes=replacement_bytes,
-            replacement_sha256=hashlib.sha256(replacement_bytes).hexdigest(),
-            representation=representation,
+        return queue_legacy_output_codec.decode_v09_legacy_output_record(
+            original_bytes,
+            job_id=job_id,
+            seq=seq,
+            ordinary_limit=ordinary_limit,
+            compatibility_schema=LEGACY_OUTPUT_COMPATIBILITY_SCHEMA,
         )
 
     @staticmethod
     def _legacy_output_receipt(record: _LegacyOutputRecord) -> dict[str, object]:
-        return {
-            "schema_version": LEGACY_OUTPUT_RECEIPT_SCHEMA,
-            "job_id": record.original.job_id,
-            "seq": record.original.seq,
-            "event_type": record.original.event_type,
-            "archive_path": record.archive_relative_path,
-            "archive_sha256": record.original_sha256,
-            "archive_size_bytes": len(record.original_bytes),
-            "replacement_sha256": record.replacement_sha256,
-            "replacement_size_bytes": len(record.replacement_bytes),
-            "representation": record.representation,
-        }
+        return queue_legacy_output_codec.legacy_output_receipt(
+            record,
+            receipt_schema=LEGACY_OUTPUT_RECEIPT_SCHEMA,
+        )
 
     def _validate_legacy_output_archive(
         self,
@@ -13963,79 +13796,22 @@ def _job_matches_mcp_admission_class(
 
 
 def _scheduler_cancellation_request(job: RelayJob) -> dict[str, object] | None:
-    raw = job.metadata.get("cancellation_request")
-    if not isinstance(raw, dict):
-        return None
-    request = cast(dict[str, object], raw)
-    if request.get("schema_version") != "clio-relay.cancellation-request.v1":
-        return None
-    return request
+    return queue_scheduler_cancel_records.scheduler_cancellation_request(job)
 
 
 def _cancellation_requested_at(request: dict[str, object]) -> datetime | None:
-    raw = request.get("requested_at")
-    if not isinstance(raw, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return queue_scheduler_cancel_records.cancellation_requested_at(request)
 
 
 def _scheduler_cancel_record_is_due(
     record: SchedulerCancelPending,
     now: datetime,
 ) -> bool:
-    if record.complete:
-        return False
-    if record.identity_resolution == "pending":
-        return True
-    return any(_scheduler_cancel_disposition_is_due(item, now) for item in record.dispositions)
-
-
-def _scheduler_cancel_disposition_is_due(
-    disposition: SchedulerCancelDisposition,
-    now: datetime,
-) -> bool:
-    """Return whether one disposition has work not held by a live attempt claim."""
-    if disposition.state in {
-        SchedulerCancelDispositionState.PENDING,
-        SchedulerCancelDispositionState.RETRY_WAIT,
-    }:
-        if (
-            disposition.attempt_claim_id is not None
-            and disposition.attempt_claim_expires_at is not None
-            and disposition.attempt_claim_expires_at > now
-        ):
-            return False
-        return disposition.next_attempt_at is None or disposition.next_attempt_at <= now
-    if disposition.state is not SchedulerCancelDispositionState.CANCEL_REQUESTED:
-        return False
-    if (
-        disposition.confirmation_claim_id is not None
-        and disposition.confirmation_claim_expires_at is not None
-        and disposition.confirmation_claim_expires_at > now
-    ):
-        return False
-    return disposition.next_attempt_at is None or disposition.next_attempt_at <= now
+    return queue_scheduler_cancel_records.scheduler_cancel_record_is_due(record, now)
 
 
 def _scheduler_cancel_due_sort_key(record: SchedulerCancelPending) -> tuple[datetime, str]:
-    due_times = [
-        item.attempt_claim_expires_at
-        or item.confirmation_claim_expires_at
-        or item.next_attempt_at
-        or record.requested_at
-        for item in record.dispositions
-        if item.state
-        in {
-            SchedulerCancelDispositionState.PENDING,
-            SchedulerCancelDispositionState.RETRY_WAIT,
-            SchedulerCancelDispositionState.CANCEL_REQUESTED,
-        }
-    ]
-    return (min(due_times, default=record.requested_at), record.job_id)
+    return queue_scheduler_cancel_records.scheduler_cancel_due_sort_key(record)
 
 
 def _bounded_regular_json_count(
@@ -14149,116 +13925,29 @@ def _lease_operational_records_present(root: Path) -> bool:
 
 
 def _lease_scope_ref_name(identity: _LeaseIndexIdentity, *scope: str) -> str:
-    return _lease_scope_ref_name_from_tokens(*_lease_reference(identity), *scope)
-
-
-def _lease_scope_ref_name_from_tokens(
-    lease_token: str,
-    identity_token: str,
-    *scope: str,
-) -> str:
-    scope_token = _stable_ref_token(
-        "lease-scope",
-        lease_token,
-        identity_token,
-        *scope,
-    )[:16]
-    return f"{lease_token}.{identity_token}.{scope_token}.ref"
+    return queue_lease_records.lease_scope_ref_name(identity, *scope)
 
 
 def _lease_index_document(identity: _LeaseIndexIdentity) -> dict[str, object]:
-    return {
-        "schema_version": LEASE_OPERATIONAL_INDEX_SCHEMA,
-        "lease_id": identity.lease_id,
-        "job_id": identity.job_id,
-        "endpoint_id": identity.endpoint_id,
-        "cluster": identity.cluster,
-        "job_kind": identity.job_kind.value,
-        "expires_at": identity.expires_at.isoformat(),
-    }
+    return queue_lease_records.lease_index_document(identity)
 
 
 def _lease_capacity_aggregate_document(
     aggregate: _LeaseCapacityAggregate,
 ) -> dict[str, object]:
-    """Serialize one validated lease-capacity aggregate."""
-    return {
-        **_lease_capacity_aggregate_digest_payload(
-            epoch_id=aggregate.epoch_id,
-            generation=aggregate.generation,
-            checkpoint_id=aggregate.checkpoint_id,
-            global_live_leases=aggregate.global_live_leases,
-            cluster_kind_counts=aggregate.cluster_kind_counts,
-        ),
-        "document_sha256": aggregate.document_sha256,
-    }
-
-
-def _lease_capacity_aggregate_digest_payload(
-    *,
-    epoch_id: str,
-    generation: int,
-    checkpoint_id: str,
-    global_live_leases: int,
-    cluster_kind_counts: dict[str, dict[JobKind, int]],
-) -> dict[str, object]:
-    serialized_counts = _serialized_lease_capacity_counts(cluster_kind_counts)
-    return {
-        "schema_version": LEASE_CAPACITY_AGGREGATE_SCHEMA,
-        "epoch_id": epoch_id,
-        "generation": generation,
-        "checkpoint_id": checkpoint_id,
-        "global_live_leases": global_live_leases,
-        "cluster_kind_counts": serialized_counts,
-    }
+    return queue_lease_records.lease_capacity_aggregate_document(aggregate)
 
 
 def _serialized_lease_capacity_counts(
     cluster_kind_counts: dict[str, dict[JobKind, int]],
 ) -> dict[str, dict[str, int]]:
-    return {
-        cluster_token: {
-            kind.value: kind_counts[kind]
-            for kind in sorted(kind_counts, key=lambda item: item.value)
-        }
-        for cluster_token, kind_counts in sorted(cluster_kind_counts.items())
-    }
+    return queue_lease_records.serialized_lease_capacity_counts(cluster_kind_counts)
 
 
 def _lease_capacity_checkpoint_document(
     checkpoint: _LeaseCapacityCheckpoint,
 ) -> dict[str, object]:
-    """Serialize one validated lease-capacity checkpoint."""
-    return {
-        **_lease_capacity_checkpoint_digest_payload(
-            epoch_id=checkpoint.epoch_id,
-            generation=checkpoint.generation,
-            checkpoint_id=checkpoint.checkpoint_id,
-            aggregate_document_sha256=checkpoint.aggregate_document_sha256,
-        ),
-        "document_sha256": checkpoint.document_sha256,
-    }
-
-
-def _lease_capacity_checkpoint_digest_payload(
-    *,
-    epoch_id: str,
-    generation: int,
-    checkpoint_id: str,
-    aggregate_document_sha256: str,
-) -> dict[str, object]:
-    return {
-        "schema_version": LEASE_CAPACITY_CHECKPOINT_SCHEMA,
-        "epoch_id": epoch_id,
-        "generation": generation,
-        "checkpoint_id": checkpoint_id,
-        "aggregate_document_sha256": aggregate_document_sha256,
-    }
-
-
-def _canonical_document_sha256(document: dict[str, object]) -> str:
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return queue_lease_records.lease_capacity_checkpoint_document(checkpoint)
 
 
 def _new_lease_capacity_pair(
@@ -14268,75 +13957,18 @@ def _new_lease_capacity_pair(
     generation: int = 0,
     checkpoint_id: str | None = None,
 ) -> _LeaseCapacityPair:
-    normalized = _normalize_lease_capacity_counts(counts)
-    selected_epoch = epoch_id or uuid4().hex
-    selected_checkpoint = checkpoint_id or uuid4().hex
-    global_total = sum(sum(by_kind.values()) for by_kind in normalized.values())
-    payload = _lease_capacity_aggregate_digest_payload(
-        epoch_id=selected_epoch,
+    return queue_lease_records.new_lease_capacity_pair(
+        counts,
+        epoch_id=epoch_id,
         generation=generation,
-        checkpoint_id=selected_checkpoint,
-        global_live_leases=global_total,
-        cluster_kind_counts=normalized,
+        checkpoint_id=checkpoint_id,
     )
-    aggregate_digest = _canonical_document_sha256(payload)
-    aggregate = _LeaseCapacityAggregate(
-        epoch_id=selected_epoch,
-        generation=generation,
-        checkpoint_id=selected_checkpoint,
-        global_live_leases=global_total,
-        cluster_kind_counts=normalized,
-        document_sha256=aggregate_digest,
-    )
-    checkpoint_payload = _lease_capacity_checkpoint_digest_payload(
-        epoch_id=selected_epoch,
-        generation=generation,
-        checkpoint_id=selected_checkpoint,
-        aggregate_document_sha256=aggregate_digest,
-    )
-    checkpoint = _LeaseCapacityCheckpoint(
-        epoch_id=selected_epoch,
-        generation=generation,
-        checkpoint_id=selected_checkpoint,
-        aggregate_document_sha256=aggregate_digest,
-        document_sha256=_canonical_document_sha256(checkpoint_payload),
-    )
-    return _LeaseCapacityPair(aggregate=aggregate, checkpoint=checkpoint)
 
 
 def _normalize_lease_capacity_counts(
     counts: dict[str, dict[JobKind, int]],
 ) -> dict[str, dict[JobKind, int]]:
-    normalized: dict[str, dict[JobKind, int]] = {}
-    scopes = 0
-    total = 0
-    for cluster_token, kind_counts in counts.items():
-        if not _is_short_ref_token(cluster_token):
-            raise QueueConflictError("lease capacity aggregate has an invalid cluster scope")
-        selected: dict[JobKind, int] = {}
-        for kind, count in kind_counts.items():
-            if isinstance(count, bool) or count <= 0:
-                raise QueueConflictError(
-                    "lease capacity aggregate counts must be positive integers"
-                )
-            if kind in selected:
-                raise QueueConflictError("lease capacity aggregate repeats a job kind")
-            selected[kind] = count
-            scopes += 1
-            total += count
-        if not selected:
-            raise QueueConflictError("lease capacity aggregate contains an empty cluster scope")
-        normalized[cluster_token] = selected
-    if scopes > MAX_LEASE_CAPACITY_SCOPES:
-        raise QueueConflictError(
-            "lease capacity aggregate exceeds its nonzero scope bound of "
-            f"{MAX_LEASE_CAPACITY_SCOPES}"
-        )
-    if total > MAX_LIVE_LEASE_RECORDS:
-        raise QueueConflictError(
-            f"lease capacity aggregate exceeds its live lease bound of {MAX_LIVE_LEASE_RECORDS}"
-        )
-    return normalized
+    return queue_lease_records.normalize_lease_capacity_counts(counts)
 
 
 def _lease_capacity_aggregate_from_document(
@@ -14344,80 +13976,7 @@ def _lease_capacity_aggregate_from_document(
     *,
     label: str,
 ) -> _LeaseCapacityAggregate:
-    if not isinstance(value, dict):
-        raise QueueConflictError(f"{label} is not an object")
-    document = cast(dict[str, object], value)
-    expected_fields = {
-        "schema_version",
-        "epoch_id",
-        "generation",
-        "checkpoint_id",
-        "global_live_leases",
-        "cluster_kind_counts",
-        "document_sha256",
-    }
-    if set(document) != expected_fields or document.get("schema_version") != (
-        LEASE_CAPACITY_AGGREGATE_SCHEMA
-    ):
-        raise QueueConflictError(f"{label} has an unsupported schema or fields")
-    epoch_id = document.get("epoch_id")
-    generation = document.get("generation")
-    checkpoint_id = document.get("checkpoint_id")
-    global_total = document.get("global_live_leases")
-    raw_counts = document.get("cluster_kind_counts")
-    digest = document.get("document_sha256")
-    if (
-        not _is_capacity_identity(epoch_id)
-        or isinstance(generation, bool)
-        or not isinstance(generation, int)
-        or generation < 0
-        or not _is_capacity_identity(checkpoint_id)
-        or isinstance(global_total, bool)
-        or not isinstance(global_total, int)
-        or not 0 <= global_total <= MAX_LIVE_LEASE_RECORDS
-        or not isinstance(raw_counts, dict)
-        or not _is_sha256_digest(digest)
-    ):
-        raise QueueConflictError(f"{label} has invalid identity or count fields")
-    counts: dict[str, dict[JobKind, int]] = {}
-    for cluster_token, raw_kind_counts in cast(dict[object, object], raw_counts).items():
-        if not isinstance(cluster_token, str) or not isinstance(raw_kind_counts, dict):
-            raise QueueConflictError(f"{label} has an invalid cluster scope")
-        parsed: dict[JobKind, int] = {}
-        for raw_kind, raw_count in cast(dict[object, object], raw_kind_counts).items():
-            if not isinstance(raw_kind, str):
-                raise QueueConflictError(f"{label} has an invalid job kind")
-            try:
-                kind = JobKind(raw_kind)
-            except ValueError as exc:
-                raise QueueConflictError(f"{label} has an invalid job kind") from exc
-            if kind.value != raw_kind:
-                raise QueueConflictError(f"{label} has a noncanonical job kind")
-            if isinstance(raw_count, bool) or not isinstance(raw_count, int):
-                raise QueueConflictError(f"{label} has an invalid lease count")
-            parsed[kind] = raw_count
-        counts[cluster_token] = parsed
-    normalized = _normalize_lease_capacity_counts(counts)
-    observed_total = sum(sum(by_kind.values()) for by_kind in normalized.values())
-    if observed_total != global_total:
-        raise QueueConflictError(f"{label} global and scoped counts disagree")
-    payload = _lease_capacity_aggregate_digest_payload(
-        epoch_id=cast(str, epoch_id),
-        generation=generation,
-        checkpoint_id=cast(str, checkpoint_id),
-        global_live_leases=global_total,
-        cluster_kind_counts=normalized,
-    )
-    if _canonical_document_sha256(payload) != digest:
-        raise QueueConflictError(f"{label} checksum mismatch")
-    return _LeaseCapacityAggregate(
-        epoch_id=cast(str, epoch_id),
-        generation=generation,
-        checkpoint_id=cast(str, checkpoint_id),
-        global_live_leases=global_total,
-        cluster_kind_counts=normalized,
-        document_sha256=cast(str, digest),
-    )
+    return queue_lease_records.lease_capacity_aggregate_from_document(value, label=label)
 
 
 def _lease_capacity_checkpoint_from_document(
@@ -14425,98 +13984,23 @@ def _lease_capacity_checkpoint_from_document(
     *,
     label: str,
 ) -> _LeaseCapacityCheckpoint:
-    if not isinstance(value, dict):
-        raise QueueConflictError(f"{label} is not an object")
-    document = cast(dict[str, object], value)
-    expected_fields = {
-        "schema_version",
-        "epoch_id",
-        "generation",
-        "checkpoint_id",
-        "aggregate_document_sha256",
-        "document_sha256",
-    }
-    if set(document) != expected_fields or document.get("schema_version") != (
-        LEASE_CAPACITY_CHECKPOINT_SCHEMA
-    ):
-        raise QueueConflictError(f"{label} has an unsupported schema or fields")
-    epoch_id = document.get("epoch_id")
-    generation = document.get("generation")
-    checkpoint_id = document.get("checkpoint_id")
-    aggregate_digest = document.get("aggregate_document_sha256")
-    digest = document.get("document_sha256")
-    if (
-        not _is_capacity_identity(epoch_id)
-        or isinstance(generation, bool)
-        or not isinstance(generation, int)
-        or generation < 0
-        or not _is_capacity_identity(checkpoint_id)
-        or not _is_sha256_digest(aggregate_digest)
-        or not _is_sha256_digest(digest)
-    ):
-        raise QueueConflictError(f"{label} has invalid identity fields")
-    payload = _lease_capacity_checkpoint_digest_payload(
-        epoch_id=cast(str, epoch_id),
-        generation=generation,
-        checkpoint_id=cast(str, checkpoint_id),
-        aggregate_document_sha256=cast(str, aggregate_digest),
-    )
-    if _canonical_document_sha256(payload) != digest:
-        raise QueueConflictError(f"{label} checksum mismatch")
-    return _LeaseCapacityCheckpoint(
-        epoch_id=cast(str, epoch_id),
-        generation=generation,
-        checkpoint_id=cast(str, checkpoint_id),
-        aggregate_document_sha256=cast(str, aggregate_digest),
-        document_sha256=cast(str, digest),
-    )
+    return queue_lease_records.lease_capacity_checkpoint_from_document(value, label=label)
 
 
 def _validate_lease_capacity_pair(pair: _LeaseCapacityPair, *, label: str) -> None:
-    aggregate = pair.aggregate
-    checkpoint = pair.checkpoint
-    if (
-        checkpoint.epoch_id != aggregate.epoch_id
-        or checkpoint.generation != aggregate.generation
-        or checkpoint.checkpoint_id != aggregate.checkpoint_id
-        or checkpoint.aggregate_document_sha256 != aggregate.document_sha256
-    ):
-        raise QueueConflictError(f"{label} aggregate and checkpoint disagree")
+    queue_lease_records.validate_lease_capacity_pair(pair, label=label)
 
 
 def _lease_capacity_pair_payload(pair: _LeaseCapacityPair) -> dict[str, object]:
-    return {
-        "aggregate": _lease_capacity_aggregate_document(pair.aggregate),
-        "checkpoint": _lease_capacity_checkpoint_document(pair.checkpoint),
-    }
+    return queue_lease_records.lease_capacity_pair_payload(pair)
 
 
 def _lease_capacity_pair_from_payload(value: object, *, label: str) -> _LeaseCapacityPair:
-    if not isinstance(value, dict):
-        raise QueueConflictError(f"{label} is not a lease capacity pair")
-    payload = cast(dict[str, object], value)
-    if set(payload) != {"aggregate", "checkpoint"}:
-        raise QueueConflictError(f"{label} is not a lease capacity pair")
-    pair = _LeaseCapacityPair(
-        aggregate=_lease_capacity_aggregate_from_document(
-            payload.get("aggregate"),
-            label=f"{label} aggregate",
-        ),
-        checkpoint=_lease_capacity_checkpoint_from_document(
-            payload.get("checkpoint"),
-            label=f"{label} checkpoint",
-        ),
-    )
-    _validate_lease_capacity_pair(pair, label=label)
-    return pair
+    return queue_lease_records.lease_capacity_pair_from_payload(value, label=label)
 
 
 def _is_capacity_identity(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 32
-        and all(character in "0123456789abcdef" for character in value)
-    )
+    return queue_lease_records.is_capacity_identity(value)
 
 
 def _lease_index_identity_from_document(
@@ -14524,217 +14008,60 @@ def _lease_index_identity_from_document(
     *,
     label: str,
 ) -> _LeaseIndexIdentity:
-    if not isinstance(value, dict):
-        raise QueueConflictError(f"{label} is not an object")
-    document = cast(dict[str, object], value)
-    expires_at_value = document.get("expires_at")
-    job_kind_value = document.get("job_kind")
-    try:
-        if not isinstance(expires_at_value, str) or not isinstance(job_kind_value, str):
-            raise ValueError("lease index temporal or kind identity is invalid")
-        expires_at = datetime.fromisoformat(expires_at_value)
-        job_kind = JobKind(job_kind_value)
-    except ValueError as exc:
-        raise QueueConflictError(f"{label} has invalid fields") from exc
-    lease_id = document.get("lease_id")
-    job_id = document.get("job_id")
-    endpoint_id = document.get("endpoint_id")
-    cluster = document.get("cluster")
-    if (
-        document.get("schema_version") != LEASE_OPERATIONAL_INDEX_SCHEMA
-        or not _safe_global_record_id(lease_id)
-        or not _safe_global_record_id(job_id)
-        or not _safe_global_record_id(endpoint_id)
-        or not isinstance(cluster, str)
-        or not cluster
-        or expires_at.tzinfo is None
-    ):
-        raise QueueConflictError(f"{label} identity mismatch")
-    return _LeaseIndexIdentity(
-        lease_id=cast(str, lease_id),
-        job_id=cast(str, job_id),
-        endpoint_id=cast(str, endpoint_id),
-        cluster=cluster,
-        job_kind=job_kind,
-        expires_at=expires_at,
-    )
+    return queue_lease_records.lease_index_identity_from_document(value, label=label)
 
 
 def _lease_reference_from_scope_ref(
     name: str,
     *scope: str,
 ) -> tuple[str, str] | None:
-    parts = name.split(".")
-    if len(parts) != 4 or parts[3] != "ref":
-        return None
-    lease_token, identity_token, _scope_token, _suffix = parts
-    if not all(_is_short_ref_token(token) for token in parts[:3]):
-        return None
-    expected = _lease_scope_ref_name_from_tokens(
-        lease_token,
-        identity_token,
-        *scope,
-    )
-    if name != expected:
-        return None
-    return lease_token, identity_token
+    return queue_lease_records.lease_reference_from_scope_ref(name, *scope)
 
 
 def _lease_reference(identity: _LeaseIndexIdentity) -> tuple[str, str]:
-    return _lease_index_token(identity.lease_id), _lease_identity_token(identity)
-
-
-def _parse_lease_reference_key(value: str) -> tuple[str, str] | None:
-    parts = value.split(".")
-    if len(parts) != 2 or not all(_is_short_ref_token(token) for token in parts):
-        return None
-    return parts[0], parts[1]
+    return queue_lease_records.lease_reference(identity)
 
 
 def _parse_lease_identity_ref_name(name: str) -> tuple[str, str] | None:
-    if not name.endswith(".ref"):
-        return None
-    return _parse_lease_reference_key(name[: -len(".ref")])
+    return queue_lease_records.parse_lease_identity_ref_name(name)
 
 
 def _is_short_ref_token(value: str) -> bool:
-    return len(value) == 16 and all(character in "0123456789abcdef" for character in value)
+    return queue_lease_records.is_short_ref_token(value)
 
 
 def _lease_index_token(lease_id: str) -> str:
-    return _stable_ref_token("lease", lease_id)[:16]
+    return queue_lease_records.lease_index_token(lease_id)
 
 
 def _lease_job_token(job_id: str) -> str:
-    return _stable_ref_token("job", job_id)[:16]
+    return queue_lease_records.lease_job_token(job_id)
 
 
 def _lease_endpoint_token(endpoint_id: str) -> str:
-    return _stable_ref_token("endpoint", endpoint_id)[:16]
+    return queue_lease_records.lease_endpoint_token(endpoint_id)
 
 
 def _lease_cluster_token(cluster: str) -> str:
-    return _stable_ref_token("cluster", cluster)[:16]
+    return queue_lease_records.lease_cluster_token(cluster)
 
 
 def _lease_expiry_key(value: datetime) -> int:
-    observed = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    delta = observed.astimezone(UTC) - datetime(1970, 1, 1, tzinfo=UTC)
-    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+    return queue_lease_records.lease_expiry_key(value)
 
 
 def _lease_expiry_ref_name(identity: _LeaseIndexIdentity) -> str:
-    expires_key = _lease_expiry_key(identity.expires_at)
-    cluster_token = _lease_cluster_token(identity.cluster)
-    endpoint_token = _lease_endpoint_token(identity.endpoint_id)
-    job_token = _lease_job_token(identity.job_id)
-    kind_code = _lease_kind_code(identity.job_kind)
-    lease_token, identity_token = _lease_reference(identity)
-    return (
-        f"{expires_key:020d}.{cluster_token}.{kind_code}."
-        f"{endpoint_token}.{job_token}.{lease_token}.{identity_token}.ref"
-    )
-
-
-def _lease_kind_code(job_kind: JobKind) -> str:
-    return {
-        JobKind.JARVIS: "j",
-        JobKind.REMOTE_AGENT: "r",
-        JobKind.MCP_CALL: "m",
-        JobKind.INPUT_INGEST: "i",
-    }[job_kind]
+    return queue_lease_records.lease_expiry_ref_name(identity)
 
 
 def _lease_identity_token(identity: _LeaseIndexIdentity) -> str:
-    return _lease_identity_token_from_parts(
-        _lease_expiry_key(identity.expires_at),
-        _lease_cluster_token(identity.cluster),
-        _lease_kind_code(identity.job_kind),
-        _lease_endpoint_token(identity.endpoint_id),
-        _lease_job_token(identity.job_id),
-        _lease_index_token(identity.lease_id),
-    )
-
-
-def _lease_identity_token_from_parts(
-    expires_key: int,
-    cluster_token: str,
-    kind_code: str,
-    endpoint_token: str,
-    job_token: str,
-    lease_token: str,
-) -> str:
-    return _stable_ref_token(
-        "lease-identity-v2",
-        f"{expires_key:020d}",
-        cluster_token,
-        kind_code,
-        endpoint_token,
-        job_token,
-        lease_token,
-    )[:16]
+    return queue_lease_records.lease_identity_token(identity)
 
 
 def _parse_lease_expiry_ref_name(
     name: str,
 ) -> tuple[int, str, JobKind, str, str, str, str] | None:
-    parts = name.split(".")
-    if len(parts) != 8 or parts[7] != "ref":
-        return None
-    (
-        expires_raw,
-        cluster_token,
-        kind_code,
-        endpoint_token,
-        job_token,
-        lease_token,
-        identity_token,
-        _suffix,
-    ) = parts
-    try:
-        job_kind = {
-            "j": JobKind.JARVIS,
-            "r": JobKind.REMOTE_AGENT,
-            "m": JobKind.MCP_CALL,
-            "i": JobKind.INPUT_INGEST,
-        }[kind_code]
-        expires_key = int(expires_raw)
-    except (KeyError, ValueError):
-        return None
-    if (
-        len(expires_raw) != 20
-        or not expires_raw.isdigit()
-        or expires_key < 0
-        or not all(
-            _is_short_ref_token(token)
-            for token in (
-                cluster_token,
-                endpoint_token,
-                job_token,
-                lease_token,
-                identity_token,
-            )
-        )
-        or identity_token
-        != _lease_identity_token_from_parts(
-            expires_key,
-            cluster_token,
-            kind_code,
-            endpoint_token,
-            job_token,
-            lease_token,
-        )
-    ):
-        return None
-    return (
-        expires_key,
-        cluster_token,
-        job_kind,
-        endpoint_token,
-        job_token,
-        lease_token,
-        identity_token,
-    )
+    return queue_lease_records.parse_lease_expiry_ref_name(name)
 
 
 def _path_lstat(path: Path) -> os.stat_result | None:
