@@ -9,9 +9,10 @@ from pathlib import Path
 
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
+from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
-_OWNER_ORDER = ("queue_context", "queue_jarvis_inputs")
+_OWNER_ORDER = ("queue_context", "queue_jarvis_inputs", "queue_layout")
 _JARVIS_INPUT_SYMBOLS = (
     "get_jarvis_package_input_contract",
     "put_jarvis_package_input_contract",
@@ -22,6 +23,13 @@ _JARVIS_INPUT_SYMBOLS = (
     "put_jarvis_run_input_manifest",
     "merge_jarvis_pipeline_input_lineage",
 )
+_LAYOUT_METHODS = {
+    "_storage_root_stat": "storage_root_stat",
+    "_job_record_path": "job_record_path",
+    "_durable_key": "durable_key",
+    "_require_durable_record_id": "require_durable_record_id",
+    "_label_key": "label_key",
+}
 
 
 @dataclass(frozen=True)
@@ -119,3 +127,11 @@ def test_jarvis_input_facade_signatures_match_the_owner() -> None:
         facade_signature = inspect.signature(getattr(ClioCoreQueue, symbol))
         owner_signature = inspect.signature(getattr(QueueJarvisInputs, symbol))
         assert facade_signature == owner_signature, symbol
+
+
+def test_layout_facade_signatures_match_the_owner() -> None:
+    """CQ2 keeps every layout facade signature byte-for-byte equivalent."""
+    for facade_symbol, owner_symbol in _LAYOUT_METHODS.items():
+        facade_signature = inspect.signature(getattr(ClioCoreQueue, facade_symbol))
+        owner_signature = inspect.signature(getattr(QueueLayout, owner_symbol))
+        assert facade_signature == owner_signature, facade_symbol

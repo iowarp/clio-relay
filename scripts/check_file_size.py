@@ -137,7 +137,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # exception details found by the complete RelayAuthoredError/
     # QueueConflictError constructor audit. The public conflict strings keep
     # only operation and owned-record identities.
-    "src/clio_relay/core_queue.py": 16074,
+    "src/clio_relay/core_queue.py": 15862,
     "src/clio_relay/deployment.py": 1243,
     # #231 R9 fix round 3: cohesive wire-adapter owner split out of
     # door_errors.py. Both sides are recorded exactly even below the default

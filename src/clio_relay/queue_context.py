@@ -36,6 +36,10 @@ class QueueStoreProtocol(Protocol):
         """Return the internal filesystem root for durable queue records."""
         ...
 
+    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
+        """Return the migration-pinned queue-root descriptor and identity."""
+        ...
+
     @property
     def lock(self) -> QueueLockProtocol:
         """Return the shared queue storage lock."""
