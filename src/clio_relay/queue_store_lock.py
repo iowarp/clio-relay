@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -10,6 +12,7 @@ from types import TracebackType
 
 from filelock import FileLock, Timeout
 
+from clio_relay import queue_layout
 from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.filesystem_paths import logical_filesystem_path
 from clio_relay.models import SchedulerPhase
@@ -50,6 +53,30 @@ class LegacyQueueStateError(QueueConflictError):
             ),
         }
         super().__init__(json.dumps(self.report, sort_keys=True))
+
+
+def require_legacy_family_directory(storage_root: Path, family: str) -> Path | None:
+    """Require a legacy family root to be an owner-private real directory."""
+    path = storage_root / family
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        reason = f"cannot inspect canonical family: {type(error).__name__}"
+        raise LegacyQueueStateError(family=family, path=path, reason=reason) from error
+    if not stat.S_ISDIR(details.st_mode) or queue_layout.record_is_reparse(details):
+        reason = "canonical family is not an owned directory"
+        raise LegacyQueueStateError(family=family, path=path, reason=reason)
+    if os.name != "nt":
+        getuid = getattr(os, "getuid", None)
+        foreign_owner = callable(getuid) and details.st_uid != getuid()
+        if foreign_owner or stat.S_IMODE(details.st_mode) & 0o077:
+            reason = "queue directory is not owned by the current user"
+            if not foreign_owner:
+                reason = "queue directory is readable or writable by another user"
+            raise LegacyQueueStateError(family=family, path=path, reason=reason)
+    return path
 
 
 class QueueSealRequiresExclusive(ConfigurationError):

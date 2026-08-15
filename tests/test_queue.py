@@ -14,7 +14,7 @@ import pytest
 from filelock import FileLock, Timeout
 
 import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_store_read, queue_store_write
+from clio_relay import queue_legacy_audit, queue_store_read, queue_store_write
 from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
@@ -107,7 +107,7 @@ def test_atomic_write_resolves_private_file_through_store_write_owner(
         return path.open("xb")
 
     monkeypatch.setattr(
-        core_queue_module,
+        queue_legacy_audit,
         "ensure_private_configuration_directory",
         create_test_directory,
     )

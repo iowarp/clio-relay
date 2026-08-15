@@ -10,6 +10,7 @@ from typing import NoReturn
 import pytest
 
 import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_legacy_audit, queue_legacy_output_audit
 from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
@@ -64,11 +65,11 @@ def test_indexed_era_fresh_process_startup_does_not_scan_record_history(
         _refuse_history_scan,
     )
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_iter_legacy_event_paths",
+        queue_legacy_output_audit.queue_legacy_output_codec,
+        "iter_legacy_event_paths",
         _refuse_history_scan,
     )
-    monkeypatch.setattr(core_queue_module, "MAX_BOUNDED_SCAN_RECORDS", 1)
+    monkeypatch.setattr(queue_legacy_audit.queue_layout, "MAX_BOUNDED_SCAN_RECORDS", 1)
 
     reopened = ClioCoreQueue(root)
     reopened.initialize()
@@ -122,8 +123,8 @@ def test_missing_seal_is_written_once_while_exclusive_writer_ownership_is_active
         sealed_phases.append(phase)
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(observe_seal),
     )
 
@@ -270,7 +271,7 @@ def test_missing_seal_repair_fails_closed_at_the_scan_bound(
         queue.submit_job(_job(f"job_repair_bound_{index}"))
     marker = _audit_marker(root)
     marker.unlink()
-    monkeypatch.setattr(core_queue_module, "MAX_BOUNDED_SCAN_RECORDS", 2)
+    monkeypatch.setattr(queue_legacy_audit.queue_layout, "MAX_BOUNDED_SCAN_RECORDS", 2)
 
     with pytest.raises(LegacyQueueStateError, match="bounded legacy audit limit"):
         ClioCoreQueue(root).initialize()
@@ -290,8 +291,8 @@ def test_crash_after_durable_seal_recovers_without_reauditing_history(
             raise RuntimeError("simulated post-seal crash")
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(crash_after_marker),
     )
     with pytest.raises(RuntimeError, match="post-seal crash"):
@@ -301,8 +302,8 @@ def test_crash_after_durable_seal_recovers_without_reauditing_history(
     assert json.loads(marker.read_bytes()) == ClioCoreQueue._legacy_record_audit_marker()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(_no_audit_fault),
     )
     monkeypatch.setattr(

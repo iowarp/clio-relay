@@ -13,7 +13,6 @@ from clio_relay import (
     queue_legacy_output_codec,
     queue_scheduler_cancel_records,
 )
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import (
     JobKind,
     RelayEvent,
@@ -140,7 +139,7 @@ def test_legacy_output_codec_is_byte_identical_to_parent_replacement(
         ordinary_limit=core_queue_module.RECORD_FAMILY_MAX_BYTES["events"],
         compatibility_schema="clio-relay.legacy-output-compatibility.v1",
     )
-    facade_record = ClioCoreQueue(tmp_path)._read_v09_legacy_output_record(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    stored_record = queue_legacy_output_codec.read_v09_legacy_output_record(
         path,
         job_id="job-cq4",
         seq=7,
@@ -148,11 +147,12 @@ def test_legacy_output_codec_is_byte_identical_to_parent_replacement(
 
     assert owner_record.original_bytes == original_bytes
     assert owner_record.replacement_bytes == expected_parent_bytes
-    assert facade_record.replacement_bytes == owner_record.replacement_bytes
+    assert stored_record.replacement_bytes == owner_record.replacement_bytes
     decoded_replacement = RelayEvent.model_validate_json(owner_record.replacement_bytes)
     assert decoded_replacement.model_dump_json(indent=2).encode("utf-8") == expected_parent_bytes
-    expected_receipt = core_queue_module.ClioCoreQueue._legacy_output_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        facade_record
+    expected_receipt = queue_legacy_output_codec.legacy_output_receipt(
+        stored_record,
+        receipt_schema="clio-relay.legacy-output-receipt.v1",
     )
     owner_receipt = queue_legacy_output_codec.legacy_output_receipt(
         owner_record,

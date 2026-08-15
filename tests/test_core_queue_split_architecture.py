@@ -17,6 +17,7 @@ from clio_relay import core_queue as core_queue_module
 from clio_relay import (
     queue_index_state,
     queue_lease_records,
+    queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_scheduler_cancel_records,
     queue_store_read,
@@ -40,6 +41,9 @@ _OWNER_RANK = {
     "queue_scheduler_cancel_records": 7,
     "queue_legacy_output_codec": 8,
     "queue_index_state": 9,
+    "queue_legacy_output_audit": 10,
+    "queue_legacy_output_migration": 11,
+    "queue_legacy_audit": 12,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -52,12 +56,14 @@ _OWNER_BUDGETS = {
     "queue_scheduler_cancel_records": 260,
     "queue_legacy_output_codec": 500,
     "queue_index_state": 270,
+    "queue_legacy_output_audit": 520,
+    "queue_legacy_output_migration": 210,
+    "queue_legacy_audit": 650,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
         "queue_lease_records",
         "queue_scheduler_cancel_records",
-        "queue_legacy_output_codec",
     }
 )
 _JARVIS_INPUT_SYMBOLS = (
@@ -85,6 +91,10 @@ class _CodecLookupSabotage(RuntimeError):
 
 class _IndexStateLookupSabotage(RuntimeError):
     """Raised only when the CQ5 owner store-read lookup is live."""
+
+
+class _LegacyOutputPathLookupSabotage(RuntimeError):
+    """Raised only when a CQ6 caller reaches the codec path lookup."""
 
 
 @dataclass(frozen=True)
@@ -225,7 +235,7 @@ def test_split_owner_dependencies_follow_the_migration_topology() -> None:
 
 
 def test_cq4_codecs_are_store_independent() -> None:
-    """CQ4 owners depend on codecs/layout only."""
+    """Record-only CQ4 owners depend on codecs/layout only."""
     store_owners = {"queue_store_lock", "queue_store_read", "queue_store_write"}
     violations = [
         f"{edge.caller} -> {edge.collaborator}"
@@ -236,12 +246,37 @@ def test_cq4_codecs_are_store_independent() -> None:
 
 
 def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
-    """Every CQ1-CQ5 owner is discovered and reads its cap from one table."""
+    """Every CQ1-CQ6 owner is discovered and reads its cap from one table."""
     assert set(_OWNER_MANIFEST) == set(_OWNER_BUDGETS)
     for owner in _OWNER_MANIFEST:
         budget = _OWNER_BUDGETS[owner]
         line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
+
+
+@pytest.mark.parametrize("caller", ["auxiliary", "event_audit"])
+def test_cq6_legacy_output_callers_use_the_codec_path_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+) -> None:
+    """Both historical callers resolve path scans through the CQ6 owner seam."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _LegacyOutputPathLookupSabotage(caller)
+
+    monkeypatch.setattr(
+        queue_legacy_output_audit.queue_legacy_output_codec,
+        "iter_legacy_event_paths",
+        sabotage,
+    )
+    queue = ClioCoreQueue(tmp_path / caller)
+
+    with pytest.raises(_LegacyOutputPathLookupSabotage, match=caller):
+        if caller == "auxiliary":
+            list(queue._iter_legacy_output_auxiliary_paths("legacy_output_archives"))  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        else:
+            queue._audit_legacy_output_state_before_initialization()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
@@ -441,7 +476,7 @@ def test_legacy_output_decoder_lookup_is_owned_by_the_cq4_module(
         _CodecLookupSabotage,
         match="queue_legacy_output_codec decoder lookup engaged",
     ):
-        ClioCoreQueue(tmp_path)._read_v09_legacy_output_record(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue_legacy_output_codec.read_v09_legacy_output_record(
             path,
             job_id="job-cq4",
             seq=1,

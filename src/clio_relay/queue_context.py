@@ -1,7 +1,3 @@
-"""Typed storage context shared by extracted core-queue owners."""
-
-from __future__ import annotations
-
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, TypeVar
@@ -14,8 +10,13 @@ Record = TypeVar("Record", bound=BaseModel)
 class QueueLockProtocol(Protocol):
     """Context-manager surface required from the queue's storage lock."""
 
-    def __enter__(self) -> QueueLockProtocol:
+    def __enter__(self) -> "QueueLockProtocol":
         """Acquire the queue storage lock."""
+        ...
+
+    @property
+    def is_locked(self) -> bool:
+        """Return whether this process currently holds the queue lock."""
         ...
 
     def __exit__(
