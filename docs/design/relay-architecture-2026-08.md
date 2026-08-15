@@ -22,7 +22,9 @@ Kept current as slices land.
 | **R5** | `frp_transport.py` (527 lines) — sibling `RelayTransport` implementations for modes (a)/(b) (`BrokeredTcpTransport`/`UdpRendezvousTransport`, one shared `_FrpChannelTransport` base), built on R4's `frp_link.py` substrate. `control_channel.py`'s `build_transport` dispatches to them behind a new typed `TransportIdentityAnchorRequired` refusal (§8.3); `ChannelLink`/`ChannelEvent` gain `identity_anchor`, stamped through `remote_connection.py` and surfaced in `event_report()`. `udp_rendezvous`'s hole-punch failure is a typed `TransportPunchFailed`, not yet the automatic in-mode stcp fallback §8.4's table describes — see §8.5's landed correction | **DONE** — opus review fix set (R1-R14) applied in the same slice, including a HIGH-severity security fix (R1) | `900f098` (frp_transport.py + wiring + tests), `053c928` (review fix set R1-R14: identity-first bring-up, R2/R7 `_establish` reorder, R6 primitive promotion, R9/R10/R13/R14 correctness fixes), `065431a`/plus the commit landing this revision (docs) | `feat/231-owner-modules` | `frp_transport.py` is new, 393 (initial) →527 (review fix set) lines (cap 800). `cluster_config.py` 1847→1863 and `remote_connection.py` 978→1006 (initial) →1058 (review fix set, §8.5) ratchet UP, justified in `scripts/check_file_size.py`'s baseline comments each time. `control_channel.py` 676→749→739 (not baselined, no ratchet entry needed). |
 | **R6** | `bounded_payload.py` (287 lines) — the T1/T2/T3 byte-budget enforcement + `clio-relay.truncation.v1`, applied at the three raw payload paths §6.4/§6.5 named: `runner.py`'s `_write_mcp_result` (T3, record-time head+tail stdout/stderr bounding), `frp_check.py`'s frpc failure detail (T1, byte- not line-count-bounded tail), and `relay_ops.py`'s `read_artifact_bytes` (T2, a typed delivery-refusal document instead of a raise) + its `mcp_server.py` call site (`_verified_local_mcp_result`). `door_errors.py`'s R3-landed truncation-record construction moved here (single owner, ground rule 1) — its own T1 char-count policy (`MAX_MESSAGE_CHARS`) is unchanged | **DONE** — opus review fix set (F1-F13) applied in the same slice, including a HIGH-severity `isError` correctness defect (F1) | `babef74` (bounded_payload.py + wiring + tests), `6972ebd` (docs landing R6), `eab1fc4` (review fix set F1-F13: shared `_delivery_refusal_failed` discriminator, the 413 `payload_too_large` door, five wrong-reason decode sites, `job read-artifact`'s exit code, the `_bounded_mcp_result` migration, `frp_check.py`'s discarded record + unbounded read, the degenerate-window refusal, wrong remediation advice, stale citations), plus the commit landing this revision (docs, §6.6) | `feat/231-owner-modules` | `jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py` 5758→5786 (T3 bound, unchanged by the review) and `src/clio_relay/mcp_server.py` 5920→5930→5943 (review fixes F1/F5/F7, +13 more), `src/clio_relay/cli.py` 19315→19333 (F5/F6, +18), `src/clio_relay/endpoint.py` 8710→8719 (F4, +9), `src/clio_relay/http_api.py` 3122→3151 (F2, +29), `src/clio_relay/jarvis_service_runtime.py` 1158→1169 (F5, +11), `src/clio_relay/live_acceptance.py` 5427→5447 (F5, +20), `src/clio_relay/remote_mcp.py` 5308→5319 (F5, +11) — all justified in `scripts/check_file_size.py`'s own baseline comments (§2 ground rule 5). `bounded_payload.py` is new, 287 lines (cap 800) in both `src/clio_relay/` and its vendored, byte-identical `jarvis-packages/clio_relay/clio_relay/` copy (the `process_containment.py` precedent, §7). `relay_ops.py` 530→571, `frp_check.py` 48→104, and `door_errors.py` 667→676 stay under `DEFAULT_MAX_LINES`, no baseline entries needed. |
 | **R7** | `release_pins.py` (773 lines) + `release_pin_sites.py` (799 lines, the `PINSITES` data table) + `release_pin_validation.py` (193 lines, B9's shape validator + the structural completeness sweep — a second split, §7.9) — the `PinSite` registry (80 sites: 43 line, 25 regex, 7 filename, 2 key, 2 derived-digest, 1 placeholder; 78 mutable + 2 frozen), `scripts/bump_release_version.py` (four independent axes incl. B6's bootstrap/acceptance split, `--dry-run`), `scripts/check_release_identity.py` (the fast preflight, wired into `local.release-identity`), and the `release preflight` CLI verb (#198) | **DONE** — opus review fixes B1-B10 applied in the same slice; the sibling R6-fix review pass's A6 finding then caught 2 more genuinely-new `v3.7` sites the completeness sweep named in `tests/test_endpoint.py` (78→80) | `7a22f9a` (registry + bump + preflight + wiring + tests), `8e93e90` (docs landing R7), `9f8449a` (R8(i), unrelated, landed between), `3700419` (review fix set B1-B10: dynamic-path resolution + atomic per-group bump (B1/B8), shape-aware sabotage test (B2), Markdown completeness sweep + 5 stale staging-gate sites (B3), frozen-site drift tracking + description correction (B5), the bootstrap/acceptance kit-axis split restored per 41b912c/eef50b5 (B6), the contract JSON's own embedded digests registered (B7), the `kind` shape validator (B9), ratchet-comment fix (B10)), plus the commit landing this revision (docs, §7.9), plus the R6-fix A1-A6 commit (A6 registers the 2 new sites) | `feat/231-owner-modules` | `release_pins.py`/`release_pin_sites.py`/`release_pin_validation.py` are new, 773/799/193 lines (cap 800 each — `release_pin_sites.py` is 1 line under cap after A6's 2 new rows). `ci_validation.py` 3775→3787 (+12, corrected from a "+13" miscount). `cli.py`'s R7 baseline entry was superseded by R8(i)'s own patch-seam rework, landed after R7 — no R7 entry remains to correct. |
-| **R8+** | `test_cli.py` monkeypatch-seam rework → `relay-host` command-module extraction → `session_lifecycle.py` wire-model extraction | PLANNED | — | — | — |
+| **R8(i)** | `test_cli.py` monkeypatch-seam rework (§4.6/§9) + the `tests/test_cli_patch_seam.py` guard meta-test: every audited collaborator symbol cli.py imported by bare name converts to a module-attribute call site (`import clio_relay.X as X`, `X.symbol(...)`), so tests patch the symbol where it is looked up and survive a future command-module extraction | **DONE** | `9f8449a` (61 collaborators across 32 owner modules, the guard test, 12 touched test files) | `feat/231-owner-modules` | `cli.py` 19353→19335 (net −18: the added `import ... as ...` lines are outweighed by the removed multi-line `from ... import (...)` blocks they replace). |
+| **R8(ii)** | `cli_relay_host.py` (637 lines) — the first real command-module extraction off `cli.py` (§5's `relay-host` row): the seven `relay_host_app` commands (frps/frpc config rendering, the live frpc login check, the three transport acceptance probes) move out, ground rule 2. `cli_support.py` (188 lines, new) absorbs the five §4.1 shared-plumbing helpers this group uses (`_run_or_exit`, `_require_cluster`, `_write_failed_acceptance_report`, `_resolve_env_secret`, `_acceptance_report_command`, plus `_local_secret`/`_echo_storage_admission_error`, the two private helpers they depend on) — §5's cli_support.py row, done now rather than deferred, since R8(i)'s guard meta-test made the extraction itself mechanical but the shared-plumbing question still had to be answered one way or the other. `_run_transport_validation`/`_run_frpc_connection_validation`/`_require_frp_server_addr` (§4.1's named "Transport validation" concern) stay in `cli.py` -- their real owner-module home (`frp_transport.py`) is still unsequenced, so moving their bodies into a parsing/rendering-only command module would just relocate ground rule 2's violation, not fix it. `test_cli_patch_seam.py`'s guard extended to a per-collaborator `caller` field (the three `transport_probe` entries' caller moved `cli` → `cli_relay_host`) | **DONE** — review found FIX-FIRST (F1-F7); fixes applied in the same slice: the reverse-first/`python -m` import-cycle regression hardened (`cli` imported function-locally only in `cli_relay_host.py`'s seven command bodies, never at module level -- a `TYPE_CHECKING` module-level import was tried and dropped, since neither ruff nor pyright found an annotation consumer to justify it; `cli_relay_host` moved into `cli.py`'s top import block), the marker decorator read straight from `cli_support` instead of through `cli.py`, and the five `cli_support.py` re-exports converted from bare object re-bindings to thin forwarders (F3/F4) so `monkeypatch.setattr(cli_support, "_X", ...)` bites again alongside the pre-existing `cli`-direction patch | `86918af` (`cli_relay_host.py`/`cli_support.py` + extraction), plus the commit landing this revision (review fix F1-F7) | `feat/231-r8-extraction` | `cli.py` 19338→18759 (R8(ii) initial, net −579, the largest single ratchet-down of the campaign): the extracted commands, the five-symbol cli_support.py split (kept as same-name re-exports so ~200 other bare-name call sites and ~10 existing `monkeypatch.setattr(cli, "_X", ...)` test patches outside this group stay unchanged), and the now-dead `transport_probe` import removed →18817 (review fix F3/F4, +58: the five re-exports become thin forwarders instead of bare object re-bindings, justified in `scripts/check_file_size.py`'s own baseline comment). `cli_relay_host.py`/`cli_support.py` are new, 637/188 lines (cap 800 each). 12 relay-host-exclusive tests moved `tests/test_cli.py` → `tests/test_cli_relay_host.py`; the shared acceptance-preflight/scheduler-preflight parametrized tests that merely include a `relay-host` case among several unrelated groups stayed; the review fix added 3 subprocess regression tests (`tests/test_cli_relay_host.py`) and 10 sabotage-guard tests (`tests/test_cli_patch_seam.py`, 124→134 parametrized cases). |
+| **R8(iii)+** | `session_lifecycle.py` wire-model extraction (§4.4) | PLANNED | — | — | — |
 
 **R4 scope correction (`frp_check.py`).** §3's exit-criteria table and §8.2's
 sizing both named `frp_check.py`'s 28-line `run_frpc_connection_check` as
@@ -148,15 +150,23 @@ parsing-only rule) are what R3+ execute against the map this document draws.
 
 ## 4. Concern inventory of the monoliths
 
-### 4.1 `cli.py` (19,315 lines; 16 Typer sub-apps, 125 commands)
+### 4.1 `cli.py` (18,817 lines; 15 Typer sub-apps, 119 commands)
 
-Sixteen `typer.Typer()` instances (`app.py:846-861`; the top-level `app` plus
-15 registered via `app.add_typer(...)` at `cli.py:863-877`): `endpoint`,
-`relay-host`, `job`, `cluster`, `agent`, `monitor`, `api`, `session`,
-`gateway`, `queue`, `worker`, `scheduler`, `remote-mcp`, `release`, `storage`.
-125 `@<app>.command(...)` decorators total, concentrated in `session_app`
+**Post-R8(ii) note:** the counts above are `cli.py`'s own, measured after
+the `relay-host` extraction (§0, §5) moved one sub-app and its 7 commands
+out. Fifteen `typer.Typer()` instances now live directly in `cli.py` (the
+top-level `app` plus 14 registered via `app.add_typer(...)` at
+`cli.py:803-817`): `endpoint`, `job`, `cluster`, `agent`, `monitor`, `api`,
+`session`, `gateway`, `queue`, `worker`, `scheduler`, `remote-mcp`,
+`release`, `storage`. A sixteenth, `relay-host`, moved out: `relay_host_app`'s
+own `typer.Typer()` instantiation now lives in `cli_relay_host.py`, still
+registered into the same `app` tree via
+`app.add_typer(cli_relay_host.relay_host_app, name="relay-host")` at
+`cli.py:804`. 119 `@<app>.command(...)` decorators now live in `cli.py`
+(`cli_relay_host.py` owns the 7 that moved), concentrated in `session_app`
 (20), `job_app` (17), `queue_app` (15), the top-level `app` (13),
-`gateway_app` (12), `scheduler_app` (11), `cluster_app` (9).
+`gateway_app` (12), `scheduler_app` (11), `cluster_app` (9) — none of those
+top counts changed, since `relay-host` was never among them.
 
 **Four domain concerns inlined rather than delegated:**
 
@@ -178,22 +188,35 @@ Sixteen `typer.Typer()` instances (`app.py:846-861`; the top-level `app` plus
   `checkpoint_finalized_cleanup_artifact` closure that verifies
   cleanup-evidence locks before authoritative closure.
 - **Transport validation** — `_run_transport_validation`
-  (`cli.py:18478-18630`, 153 body lines), called from `test-http-transport`,
+  (`cli.py:17995-18149`, 153 body lines), called from `test-http-transport`,
   `test-direct-transport`, and `test-ssh-transport`: builds a
   `ValidationResource`/`ValidationReport`, runs an injected probe, and on
   failure mutates connector state and appends structured cleanup actions —
   validation-report business logic, not parsing or rendering.
 
-**Shared-plumbing fan-out** (call-site counts, def excluded):
-`_run_or_exit` (`cli.py:19307`) — 74 call sites;
-`_require_cluster` (`cli.py:19132`) — 56;
-`_write_failed_acceptance_report` (`cli.py:18908`) — 19;
-`_resolve_env_secret` (`cli.py:19212`) — 19;
-`_acceptance_report_command` (`cli.py:838`, applied as a bare decorator) — 17
-applications; `default_report_path` (imported from
-`src/clio_relay/validation_report.py:2006`, not defined locally) — 18 call
-sites. These are exactly the kind of cross-cutting helper that an owner
-module (not `cli.py`) should host once `cli.py` is parsing/rendering only.
+**Shared-plumbing fan-out** (call-site counts, def excluded; pins as of the
+original, pre-R8(ii) inventory). **R8(ii)/review-fix update:** four of these
+moved to `cli_support.py` (§0's R8(ii) row, §5) — `cli.py` no longer
+defines their bodies at the pins below; it keeps each as a thin forwarder
+under the same name (`_run_or_exit` now `cli.py:18816`, `_require_cluster`
+now `cli.py:18647`, `_write_failed_acceptance_report` now `cli.py:18443`,
+`_resolve_env_secret` now `cli.py:18737`) that re-reads
+`cli_support.<symbol>` on every call, so both `monkeypatch.setattr(cli_support,
+...)` and the pre-existing `monkeypatch.setattr(cli, ...)` patch directions
+work:
+`_run_or_exit` (real body `cli_support.py:95`) — 74 call sites;
+`_require_cluster` (real body `cli_support.py:106`) — 56;
+`_write_failed_acceptance_report` (real body `cli_support.py:110`) — 19;
+`_resolve_env_secret` (real body `cli_support.py:181`) — 19;
+`_acceptance_report_command` (real body `cli_support.py:73`; `cli.py`'s own
+re-export, applied as a bare decorator to `cli.py`'s remaining command
+groups, at `cli.py:782` — `cli_relay_host.py`'s four commands apply
+`@cli_support._acceptance_report_command` straight from the owner instead,
+to avoid recreating the import cycle) — 17 applications; `default_report_path`
+(imported from `src/clio_relay/validation_report.py:2006`, not defined
+locally, never moved) — 18 call sites. These are exactly the kind of
+cross-cutting helper that an owner module (not `cli.py`) should host once
+`cli.py` is parsing/rendering only.
 
 **Other giants** (by line span): `_persist_local_cleanup_report_artifact`
 (`cli.py:4515-5324`, 810 lines) and, past the top five, `jarvis_mcp_validate`
@@ -423,9 +446,9 @@ slice for exactly this reason — the coupling has to be paid down before
 | `RelayTransport` implementations for modes (a)/(b) | `frp_transport.py` | `control_channel.py`'s `build_transport` refuses both (`TransportModeUnavailable`, §8.2); `transport_probe.py` has probe-only, non-production logic | R5 |
 | Byte-budget enforcement / truncation (T1/T2/T3, §6.4) | `bounded_payload.py` | constants scattered across `control_channel.py`, `remote_connection.py`, `mcp_server.py`, `runner.py` | R6 |
 | Release-identity + contract pins (§7) | `release_pins.py` + `release_pin_sites.py` (its `PINSITES` data table) | `pyproject.toml`, `__init__.py`, `models.py` (×3), `jarvis_mcp.py` (×3, incl. `CLIO_KIT_JARVIS_MCP_VERSION`), `cluster_config.py`, `installation.py`, `remote_mcp.py`, `runner.py`, `bootstrap.py`, `.github/workflows/ci.yml` (×2 jobs), `docs/release-gate-1.0.yaml`, `examples/release-gate/*.json`, 4+ test files, plus the stale `docs/remote-mcp-federation.md` mirror (§7) | **R7 DONE** |
-| `cli.py`↔test monkeypatch seam (§4.6) | rework the injection seam itself (no new module — a DI seam `cli.py` exposes so extractions don't break 236+28 patch sites) | `tests/test_cli.py`, `tests/test_acceptance_report_defaults.py` | R8+ |
-| `cli.py` shared plumbing (§4.1: `_run_or_exit` ×74, `_require_cluster` ×56, `_write_failed_acceptance_report` ×19, `_resolve_env_secret` ×19, `_acceptance_report_command` ×17, `default_report_path` ×18) | `cli_support.py` | `cli.py:19307`, `:19132`, `:18908`, `:19212`, `:838`; `default_report_path` imported from `validation_report.py:2006` | R8+ |
-| `relay-host` command-module extraction (parsing/rendering only, ground rule 2) | new `cli_commands/relay_host.py`-shaped module (exact name TBD at R8+; owns `relay_host_app`'s 7 commands) | `cli.py` (`relay_host_app`) | R8+, sequenced after R5 (§9 overlap) |
+| `cli.py`↔test monkeypatch seam (§4.6) | rework the injection seam itself (no new module — a DI seam `cli.py` exposes so extractions don't break 236+28 patch sites) | `tests/test_cli.py`, `tests/test_acceptance_report_defaults.py` | **R8(i) DONE** |
+| `cli.py` shared plumbing (§4.1: `_run_or_exit` ×74, `_require_cluster` ×56, `_write_failed_acceptance_report` ×19, `_resolve_env_secret` ×19, `_acceptance_report_command` ×17, `default_report_path` ×18) | `cli_support.py` | `cli_support.py:95`, `:106`, `:110`, `:181`, `:73` (real bodies); `default_report_path` imported from `validation_report.py:2006` (never moved) | **R8(ii) DONE** — `cli.py` keeps four of the five (`_run_or_exit`, `_require_cluster`, `_write_failed_acceptance_report`, `_resolve_env_secret`; `default_report_path` was never cli.py's to move) under their original name as thin forwarders (`cli.py:18816`/`:18647`/`:18443`/`:18737`) rather than rewriting the ~200 call sites outside the `relay-host` group; that rewrite is still open, unsequenced future work. Review fix F3/F4 corrected these from bare object re-exports (which silently broke `monkeypatch.setattr(cli_support, ...)`) to forwarders that re-read `cli_support.<symbol>` per call, so both patch directions work; `_acceptance_report_command` keeps a `cli.py:782` re-export for `cli.py`'s own remaining decorator applications, while `cli_relay_host.py`'s four commands apply it straight from `cli_support` (`cli_relay_host.py`'s own docstring) to avoid recreating the import cycle F2 hardened |
+| `relay-host` command-module extraction (parsing/rendering only, ground rule 2) | `cli_relay_host.py` (637 lines, owns `relay_host_app`'s 7 commands) | `cli.py` (`relay_host_app`) | **R8(ii) DONE** |
 | `session_lifecycle.py` wire models (§4.4) | a dedicated wire-model module (exact name TBD at R8+) | `session_lifecycle.py:890-1433` | R8+ |
 | `session_lifecycle.py`'s state machine (§4.4: `inspect_owned_session_recovery_status`, `execute_owned_session_start`, `execute_owned_session_teardown`) | `session_lifecycle.py` itself — already the correct home; this row exists because every §4 concern gets a §5 row, and the state machine's "extraction" is simply what remains once the wire-models row above moves out | `session_lifecycle.py:2417-3098`, `:5315-6218`, `:6749-7090` | completes alongside R8+'s wire-model split, not a separate extraction |
 | Sidecar/snapshot Windows file-handle cleanup (near-duplicated, not importable across the boundary) | no shared import is possible — `runner.py` is a separately wheel-packaged subprocess entry point (`pyproject.toml:44`/`:50`; no `src/clio_relay/mcp_call/`; launched via `sys.executable` at `endpoint.py:7157-7176`, own `__main__` at `runner.py:5757-5758`), so the honest resolution mirrors `process_containment.py`: keep two implementations, add a test policing byte-identity of the genuinely-shared substructure (the `_ByHandleFileInformation` ctypes layout + Windows constants), the same discipline as `tests/test_process_containment.py:50-55` (§7) | `endpoint.py:7728` (`_quarantine_windows_sidecar_by_handle` + 4 siblings `:7839-8000`), `runner.py:2691` (`_open_windows_snapshot_cleanup_handle` + 4 siblings `:2751-2959`) | unsequenced, R8+ or later — small and low-priority once named |
@@ -1757,7 +1780,10 @@ by ordering, not avoided by being independent:
   twice — once now, and again after its callees move. That is why the
   `relay-host` command-module extraction is sequenced inside R8+, strictly
   after R5, rather than bundled into the earlier `cli.py`-focused work
-  implied by ground rule 2.
+  implied by ground rule 2. **R8(ii) DONE**: landed after R5, exactly as
+  sequenced here — `cli_relay_host.py`'s seven commands still call
+  `transport_probe.py`/`frp_link.py`'s post-R5 substrate through the same
+  module-attribute calls they used inside `cli.py`, unchanged by the move.
 
 **Why R4 is cheap where `cli.py` is not — concrete evidence, not just
 assertion** (line numbers below are as measured pre-R4, when this argument

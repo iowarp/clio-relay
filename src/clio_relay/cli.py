@@ -40,6 +40,8 @@ import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_acceptance as bootstrap_acceptance
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
+import clio_relay.cli_relay_host as cli_relay_host
+import clio_relay.cli_support as cli_support
 import clio_relay.cluster_config as cluster_config
 import clio_relay.core_queue as core_queue
 import clio_relay.deployment as deployment
@@ -65,7 +67,6 @@ import clio_relay.service_runtime as service_runtime
 import clio_relay.session_api as session_api
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.storage_runtime as storage_runtime
-import clio_relay.transport_probe as transport_probe
 import clio_relay.validation_report as validation_report_module
 from clio_relay.bootstrap import install_local_frp
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
@@ -174,15 +175,7 @@ from clio_relay.queue_management import (
     list_queue_jobs,
     worker_status,
 )
-from clio_relay.relay_host import (
-    FrpcConfig,
-    FrpcVisitorConfig,
-    FrpsConfig,
-    FrpTransportProtocol,
-    render_frpc_config,
-    render_frpc_visitor_config,
-    render_frps_config,
-)
+from clio_relay.relay_host import FrpcConfig
 from clio_relay.relay_ops import cancel_job as request_cancel_job
 from clio_relay.relay_ops import (
     evaluate_monitor_rules,
@@ -772,20 +765,27 @@ SCHEDULER_SENTINEL_ACTIVE_PHASES = frozenset({"submitted", "pending", "allocated
 SCHEDULER_SENTINEL_PRESERVED_PHASES = SCHEDULER_SENTINEL_ACTIVE_PHASES | {"completed"}
 BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS = 24.0
 BOOTSTRAP_REPAIR_DEADLINE_SECONDS = 55.0
-_ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = "__clio_relay_acceptance_report_command__"
-
-
-def _acceptance_report_command[CommandCallback: Callable[..., Any]](
-    callback: CommandCallback,
-) -> CommandCallback:
-    """Mark a CLI callback as a canonical acceptance-report producer."""
-    setattr(callback, _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE, True)
-    return callback
+# R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
+# these two symbols' real bodies moved to cli_support.py -- see the longer
+# note beside `_write_failed_acceptance_report`'s re-export below. Bound
+# here, under this exact name, purely for cli.py's own ~15 other command
+# groups' `@_acceptance_report_command` decorator applications (a real
+# attribute lookup evaluated at each of *those* def sites' module-load time,
+# so this must be defined before the first one runs). `cli_relay_host.py`
+# does NOT reach this through `cli.py` -- its own four commands apply
+# `@cli_support._acceptance_report_command` straight from the owner (see
+# that module's docstring), specifically to avoid the import-cycle hazard
+# a `cli.<symbol>` module-level decorator read would create.
+_ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = (
+    cli_support._ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
+_acceptance_report_command = (
+    cli_support._acceptance_report_command  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
 
 
 app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
-relay_host_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 cluster_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
@@ -801,7 +801,7 @@ release_app = typer.Typer(no_args_is_help=True)
 storage_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
-app.add_typer(relay_host_app, name="relay-host")
+app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(agent_app, name="agent")
@@ -1040,512 +1040,6 @@ def release_preflight(
             raise typer.Exit(code=1)
 
     _run_or_exit(_run)
-
-
-@relay_host_app.command("render-frps-config")
-def render_frps(
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to CLIO_RELAY_FRP_TOKEN."),
-    ] = None,
-    bind_port: Annotated[int, typer.Option(help="frps bind port.")] = 7000,
-    transport_protocol: Annotated[
-        FrpTransportProtocol,
-        typer.Option(help="frpc-to-frps transport protocol."),
-    ] = FrpTransportProtocol.WSS,
-    dashboard_port: Annotated[
-        int | None,
-        typer.Option(help="Optional frps dashboard port."),
-    ] = None,
-) -> None:
-    """Render an frps config with no relay application state."""
-    _run_or_exit(
-        lambda: typer.echo(
-            render_frps_config(
-                FrpsConfig(
-                    bind_port=bind_port,
-                    token=_resolve_env_secret(token, "CLIO_RELAY_FRP_TOKEN", "frp token"),
-                    transport_protocol=transport_protocol,
-                    dashboard_port=dashboard_port,
-                )
-            )
-        )
-    )
-
-
-@relay_host_app.command("render-frpc-config")
-def render_frpc(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
-    ] = None,
-    secret_key: Annotated[
-        str | None,
-        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
-    ] = None,
-    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
-) -> None:
-    """Render an frpc config using the cluster's configured frp transport."""
-
-    def action() -> None:
-        definition = _require_cluster(cluster)
-        transport = definition.frp_transport
-        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
-        typer.echo(
-            render_frpc_config(
-                FrpcConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=_resolve_env_secret(token, transport.token_env, "frp token"),
-                    transport_protocol=FrpTransportProtocol(transport.protocol),
-                    proxy_name=proxy_name,
-                    local_port=local_port,
-                    secret_key=_resolve_env_secret(
-                        secret_key,
-                        transport.stcp_secret_env,
-                        "stcp secret",
-                    ),
-                )
-            )
-        )
-
-    _run_or_exit(action)
-
-
-@relay_host_app.command("test-frpc-connection")
-@_acceptance_report_command
-def test_frpc(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    local_port: Annotated[int, typer.Option(help="Local relay endpoint port.")],
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
-    ] = None,
-    secret_key: Annotated[
-        str | None,
-        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
-    ] = None,
-    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp-live-check",
-    timeout_seconds: Annotated[
-        float,
-        typer.Option(help="Seconds frpc must stay connected before success."),
-    ] = 10.0,
-    validation_report: Annotated[
-        Path | None,
-        typer.Option(
-            help="Canonical frpc connection validation JSON path. Defaults under .clio-relay."
-        ),
-    ] = None,
-    validation_launcher: Annotated[
-        str | None,
-        typer.Option(help="Launcher evidence, such as uv-tool."),
-    ] = None,
-    validation_install_source: Annotated[
-        str | None,
-        typer.Option(help="Explicit kind:reference install evidence."),
-    ] = None,
-    validation_artifact: Annotated[
-        Path | None,
-        typer.Option(
-            help="Optional wheel whose SHA-256 is recorded in transport evidence.",
-            exists=True,
-            dir_okay=False,
-        ),
-    ] = None,
-) -> None:
-    """Run a live frpc login check and persist canonical success or failure evidence."""
-
-    canonical_report_path = validation_report or default_report_path(cluster)
-
-    try:
-        settings = RelaySettings.from_env()
-        definition = _require_cluster(cluster)
-        transport = definition.frp_transport
-        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
-        config = FrpcConfig(
-            server_addr=server_addr,
-            server_port=transport.server_port,
-            token=_resolve_env_secret(token, transport.token_env, "frp token"),
-            transport_protocol=FrpTransportProtocol(transport.protocol),
-            proxy_name=proxy_name,
-            local_port=local_port,
-            secret_key=_resolve_env_secret(
-                secret_key,
-                transport.stcp_secret_env,
-                "stcp secret",
-            ),
-        )
-    except BaseException as exc:
-        _write_failed_acceptance_report(
-            path=canonical_report_path,
-            scenario="transport",
-            cluster=cluster,
-            check_id="transport.frpc-connection.preflight",
-            summary="validate frpc connection acceptance inputs",
-            error=exc,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact=validation_artifact,
-        )
-        raise
-
-    def action() -> None:
-        _echo_lines(
-            _run_frpc_connection_validation(
-                cluster=cluster,
-                proxy_name=proxy_name,
-                frpc_bin=settings.frpc_bin,
-                config=config,
-                timeout_seconds=timeout_seconds,
-                validation_report=canonical_report_path,
-                validation_launcher=validation_launcher,
-                validation_install_source=validation_install_source,
-                validation_artifact=validation_artifact,
-            )
-        )
-
-    _run_or_exit(action)
-
-
-@relay_host_app.command("render-frpc-visitor-config")
-def render_frpc_visitor(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
-    ] = None,
-    secret_key: Annotated[
-        str | None,
-        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
-    ] = None,
-    server_name: Annotated[str, typer.Option(help="Cluster-side stcp proxy name.")] = "relay-stcp",
-    visitor_name: Annotated[
-        str,
-        typer.Option(help="Desktop-side stcp visitor name."),
-    ] = "relay-stcp-visitor",
-    bind_addr: Annotated[
-        str,
-        typer.Option(help="Local desktop visitor bind address."),
-    ] = "127.0.0.1",
-) -> None:
-    """Render a desktop-side frpc STCP visitor config."""
-
-    def action() -> None:
-        definition = _require_cluster(cluster)
-        transport = definition.frp_transport
-        server_addr = _require_frp_server_addr(transport.server_addr, cluster)
-        typer.echo(
-            render_frpc_visitor_config(
-                FrpcVisitorConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=_resolve_env_secret(token, transport.token_env, "frp token"),
-                    transport_protocol=FrpTransportProtocol(transport.protocol),
-                    visitor_name=visitor_name,
-                    server_name=server_name,
-                    bind_addr=bind_addr,
-                    bind_port=bind_port,
-                    secret_key=_resolve_env_secret(
-                        secret_key,
-                        transport.stcp_secret_env,
-                        "stcp secret",
-                    ),
-                )
-            )
-        )
-
-    _run_or_exit(action)
-
-
-@relay_host_app.command("test-http-transport")
-@_acceptance_report_command
-def test_http_transport(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
-    ] = None,
-    secret_key: Annotated[
-        str | None,
-        typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
-    ] = None,
-    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
-    proxy_name: Annotated[str, typer.Option(help="stcp proxy/server name.")] = "relay-http",
-    timeout_seconds: Annotated[
-        float,
-        typer.Option(help="Seconds to wait for healthz through the transport."),
-    ] = 30.0,
-    validation_report: Annotated[
-        Path | None,
-        typer.Option(help="Canonical transport validation JSON path. Defaults under .clio-relay."),
-    ] = None,
-    validation_launcher: Annotated[
-        str | None,
-        typer.Option(help="Launcher evidence, such as uv-tool."),
-    ] = None,
-    validation_install_source: Annotated[
-        str | None,
-        typer.Option(help="Explicit kind:reference install evidence."),
-    ] = None,
-    validation_artifact: Annotated[
-        Path | None,
-        typer.Option(
-            help="Optional wheel whose SHA-256 is recorded in transport evidence.",
-            exists=True,
-            dir_okay=False,
-        ),
-    ] = None,
-) -> None:
-    """Run an end-to-end HTTP health check through frp STCP."""
-    canonical_report_path = validation_report or default_report_path(cluster)
-    try:
-        settings = RelaySettings.from_env()
-        definition = _require_cluster(cluster)
-    except BaseException as exc:
-        _write_failed_acceptance_report(
-            path=canonical_report_path,
-            scenario="transport",
-            cluster=cluster,
-            check_id="transport.preflight",
-            summary="validate HTTP transport acceptance inputs",
-            error=exc,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact=validation_artifact,
-        )
-        raise
-    _run_or_exit(
-        lambda: _echo_lines(
-            _run_transport_validation(
-                cluster=cluster,
-                transport_mode="frp-relay",
-                resource_id=proxy_name,
-                resource_role="frp_stcp_probe",
-                retain_remote_session=False,
-                validation_report=canonical_report_path,
-                validation_launcher=validation_launcher,
-                validation_install_source=validation_install_source,
-                validation_artifact=validation_artifact,
-                probe=lambda: transport_probe.run_frp_http_probe(
-                    cluster=cluster,
-                    definition=definition,
-                    frpc_bin=settings.frpc_bin,
-                    token=_resolve_env_secret(
-                        token,
-                        definition.frp_transport.token_env,
-                        "frp token",
-                    ),
-                    secret_key=_resolve_env_secret(
-                        secret_key,
-                        definition.frp_transport.stcp_secret_env,
-                        "stcp secret",
-                    ),
-                    local_bind_port=local_bind_port,
-                    remote_api_port=remote_api_port,
-                    proxy_name=proxy_name,
-                    api_token=settings.api_token,
-                    timeout_seconds=timeout_seconds,
-                ),
-            )
-        )
-    )
-
-
-@relay_host_app.command("test-direct-transport")
-@_acceptance_report_command
-def test_direct_transport(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    local_bind_port: Annotated[int, typer.Option(help="Local desktop visitor bind port.")],
-    token: Annotated[
-        str | None,
-        typer.Option(help="frp authentication token. Defaults to cluster token_env."),
-    ] = None,
-    secret_key: Annotated[
-        str | None,
-        typer.Option(help="stcp/xtcp shared secret. Defaults to cluster stcp_secret_env."),
-    ] = None,
-    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
-    proxy_name: Annotated[
-        str,
-        typer.Option(help="xtcp proxy/server name."),
-    ] = "relay-http-direct",
-    timeout_seconds: Annotated[
-        float,
-        typer.Option(help="Seconds to wait for healthz through direct transport."),
-    ] = 30.0,
-    allow_stcp_fallback: Annotated[
-        bool,
-        typer.Option(
-            "--allow-stcp-fallback/--no-allow-stcp-fallback",
-            help="Allow fallback to STCP if XTCP fails.",
-        ),
-    ] = False,
-    validation_report: Annotated[
-        Path | None,
-        typer.Option(help="Canonical transport validation JSON path. Defaults under .clio-relay."),
-    ] = None,
-    validation_launcher: Annotated[
-        str | None,
-        typer.Option(help="Launcher evidence, such as uv-tool."),
-    ] = None,
-    validation_install_source: Annotated[
-        str | None,
-        typer.Option(help="Explicit kind:reference install evidence."),
-    ] = None,
-    validation_artifact: Annotated[
-        Path | None,
-        typer.Option(
-            help="Optional wheel whose SHA-256 is recorded in transport evidence.",
-            exists=True,
-            dir_okay=False,
-        ),
-    ] = None,
-) -> None:
-    """Run an end-to-end HTTP health check through frp XTCP direct transport."""
-    canonical_report_path = validation_report or default_report_path(cluster)
-    try:
-        settings = RelaySettings.from_env()
-        definition = _require_cluster(cluster)
-    except BaseException as exc:
-        _write_failed_acceptance_report(
-            path=canonical_report_path,
-            scenario="transport",
-            cluster=cluster,
-            check_id="transport.preflight",
-            summary="validate direct transport acceptance inputs",
-            error=exc,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact=validation_artifact,
-        )
-        raise
-    _run_or_exit(
-        lambda: _echo_lines(
-            _run_transport_validation(
-                cluster=cluster,
-                transport_mode="frp-direct",
-                resource_id=proxy_name,
-                resource_role="frp_xtcp_probe",
-                retain_remote_session=False,
-                validation_report=canonical_report_path,
-                validation_launcher=validation_launcher,
-                validation_install_source=validation_install_source,
-                validation_artifact=validation_artifact,
-                probe=lambda: transport_probe.run_frp_direct_http_probe(
-                    cluster=cluster,
-                    definition=definition,
-                    frpc_bin=settings.frpc_bin,
-                    token=_resolve_env_secret(
-                        token,
-                        definition.frp_transport.token_env,
-                        "frp token",
-                    ),
-                    secret_key=_resolve_env_secret(
-                        secret_key,
-                        definition.frp_transport.stcp_secret_env,
-                        "stcp/xtcp secret",
-                    ),
-                    local_bind_port=local_bind_port,
-                    remote_api_port=remote_api_port,
-                    proxy_name=proxy_name,
-                    api_token=settings.api_token,
-                    timeout_seconds=timeout_seconds,
-                    allow_stcp_fallback=allow_stcp_fallback,
-                ),
-            )
-        )
-    )
-
-
-@relay_host_app.command("test-ssh-transport")
-@_acceptance_report_command
-def test_ssh_transport(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    local_bind_port: Annotated[int, typer.Option(help="Local desktop SSH-forward bind port.")],
-    remote_api_port: Annotated[int, typer.Option(help="Remote cluster API port.")] = 8765,
-    session_id: Annotated[
-        str,
-        typer.Option(help="Owned remote relay session id for this probe."),
-    ] = "relay-ssh-forward-test",
-    timeout_seconds: Annotated[
-        float,
-        typer.Option(help="Seconds to wait for healthz through the SSH forward."),
-    ] = 30.0,
-    detach_remote: Annotated[
-        bool,
-        typer.Option(
-            "--detach-remote/--teardown-remote",
-            help="Leave the remote API session running after the local SSH probe exits.",
-        ),
-    ] = False,
-    validation_report: Annotated[
-        Path | None,
-        typer.Option(help="Canonical transport validation JSON path. Defaults under .clio-relay."),
-    ] = None,
-    validation_launcher: Annotated[
-        str | None,
-        typer.Option(help="Launcher evidence, such as uv-tool."),
-    ] = None,
-    validation_install_source: Annotated[
-        str | None,
-        typer.Option(help="Explicit kind:reference install evidence."),
-    ] = None,
-    validation_artifact: Annotated[
-        Path | None,
-        typer.Option(
-            help="Optional wheel whose SHA-256 is recorded in transport evidence.",
-            exists=True,
-            dir_okay=False,
-        ),
-    ] = None,
-) -> None:
-    """Run an end-to-end HTTP health check through SSH local port forwarding."""
-    canonical_report_path = validation_report or default_report_path(cluster)
-    try:
-        settings = RelaySettings.from_env()
-        definition = _require_cluster(cluster)
-    except BaseException as exc:
-        _write_failed_acceptance_report(
-            path=canonical_report_path,
-            scenario="transport",
-            cluster=cluster,
-            check_id="transport.preflight",
-            summary="validate SSH transport acceptance inputs",
-            error=exc,
-            launcher=validation_launcher,
-            install_source=validation_install_source,
-            artifact=validation_artifact,
-        )
-        raise
-    _run_or_exit(
-        lambda: _echo_lines(
-            _run_transport_validation(
-                cluster=cluster,
-                transport_mode="ssh-forward",
-                resource_id=session_id,
-                resource_role="ssh_forward_probe",
-                retain_remote_session=detach_remote,
-                validation_report=canonical_report_path,
-                validation_launcher=validation_launcher,
-                validation_install_source=validation_install_source,
-                validation_artifact=validation_artifact,
-                probe=lambda: transport_probe.run_ssh_forward_http_probe(
-                    cluster=cluster,
-                    definition=definition,
-                    local_bind_port=local_bind_port,
-                    remote_api_port=remote_api_port,
-                    session_id=session_id,
-                    api_token=settings.api_token,
-                    timeout_seconds=timeout_seconds,
-                    detach_remote=detach_remote,
-                ),
-            )
-        )
-    )
 
 
 @endpoint_app.command("start")
@@ -12797,17 +12291,17 @@ def _submit_managed_job(job: RelayJob) -> RelayJob:
         raise typer.Exit(code=1) from exc
 
 
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): a bare object re-binding
+# (`_echo_storage_admission_error = cli_support._echo_storage_admission_error`)
+# captures the owner's function object at import time, so
+# `monkeypatch.setattr(cli_support, "_echo_storage_admission_error", ...)`
+# never reaches this module's own two call sites -- a silent no-op patch.
+# A thin forwarder re-reads `cli_support.<symbol>` on every call, so both
+# `monkeypatch.setattr(cli_support, ...)` and the pre-existing
+# `monkeypatch.setattr(cli, ...)` patch points bite.
 def _echo_storage_admission_error(error: StorageAdmissionError) -> None:
-    """Write the stable CLI storage refusal envelope to stderr."""
-    typer.echo(
-        json.dumps(
-            {
-                "error": "storage_admission_denied",
-                "storage_decision": error.decision.to_dict(),
-            },
-            sort_keys=True,
-        ),
-        err=True,
+    cli_support._echo_storage_admission_error(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        error
     )
 
 
@@ -18498,7 +17992,7 @@ def _last_nonempty_line(value: str) -> str:
     return lines[-1]
 
 
-def _run_transport_validation(
+def _run_transport_validation(  # pyright: ignore[reportUnusedFunction]
     *,
     cluster: str,
     transport_mode: str,
@@ -18653,7 +18147,7 @@ def _run_transport_validation(
     return lines
 
 
-def _run_frpc_connection_validation(
+def _run_frpc_connection_validation(  # pyright: ignore[reportUnusedFunction]
     *,
     cluster: str,
     proxy_name: str,
@@ -18928,6 +18422,24 @@ def _new_cleanup_acceptance_report(
     return report
 
 
+# R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
+# this symbol's real body moved to cli_support.py -- the doc's cli_support.py
+# row for cli.py's shared-plumbing fan-out. cli.py keeps it defined under its
+# original name at its original definition site so its own ~200 existing
+# bare-name call sites keep working unchanged; migrating cli.py's other 15
+# sub-apps onto `cli_support.X(...)` directly is separate, unsequenced future
+# work, not something this slice's `relay-host` extraction should absorb as
+# a side effect.
+#
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): this is a thin forwarder,
+# not a bare object re-binding (`_write_failed_acceptance_report =
+# cli_support._write_failed_acceptance_report`). The bare form captures the
+# owner's function object at import time, so
+# `monkeypatch.setattr(cli_support, "_write_failed_acceptance_report", ...)`
+# never reaches callers here -- a silent no-op patch that only
+# `monkeypatch.setattr(cli, "_write_failed_acceptance_report", ...)` could
+# see. Re-reading `cli_support.<symbol>` on every call restores both patch
+# directions.
 def _write_failed_acceptance_report(
     *,
     path: Path,
@@ -18941,44 +18453,18 @@ def _write_failed_acceptance_report(
     artifact: Path | None,
     partial_report: LiveValidationReport | None = None,
 ) -> None:
-    """Persist one canonical failed report without discarding partial evidence."""
-    report = partial_report
-    if partial_report is not None and path.exists():
-        with suppress(OSError, ValidationError, ValueError):
-            existing = load_validation_report(path)
-            if existing.report_id == partial_report.report_id:
-                expected_error = f"{type(error).__name__}: {error}"
-                already_recorded = (
-                    existing.status is ValidationStatus.FAILED
-                    and existing.error == expected_error
-                    and any(
-                        check.check_id == check_id
-                        and check.status is ValidationStatus.FAILED
-                        and check.error == expected_error
-                        for check in existing.checks
-                    )
-                )
-                if already_recorded:
-                    return
-                # The caller's in-memory report may contain the latest observation that
-                # failed before its next checkpoint write. The on-disk copy is used only
-                # for idempotency here; replacing the partial would discard that evidence.
-    artifact_sha256: str | None = None
-    if artifact is not None:
-        with suppress(OSError):
-            artifact_sha256 = sha256_file(artifact)
-    if report is None:
-        report = new_live_validation_report(
-            scenario=scenario,
-            cluster=cluster,
-            launcher=launcher,
-            install_source=install_source,
-            artifact_sha256=artifact_sha256,
-        )
-    recorder = ValidationRecorder(report)
-    recorder.record_failure(check_id, summary, error)
-    recorder.finish(error)
-    recorder.write(path)
+    cli_support._write_failed_acceptance_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path=path,
+        scenario=scenario,
+        cluster=cluster,
+        check_id=check_id,
+        summary=summary,
+        error=error,
+        launcher=launcher,
+        install_source=install_source,
+        artifact=artifact,
+        partial_report=partial_report,
+    )
 
 
 def _load_current_acceptance_report(
@@ -19152,8 +18638,16 @@ def _run_remote_or_exit(
     )
 
 
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._require_cluster` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_require_cluster", ...)` and
+# `monkeypatch.setattr(cli, "_require_cluster", ...)` effective.
 def _require_cluster(cluster: str) -> ClusterDefinition:
-    return ClusterRegistry.load(default_registry_path()).require(cluster)
+    return cli_support._require_cluster(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster
+    )
 
 
 def _session_transition_lock(*, cluster: str, session_id: str) -> FileLock:
@@ -19223,7 +18717,9 @@ def _resolved_worker_capacity_policy(
         ) from exc
 
 
-def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
+def _require_frp_server_addr(  # pyright: ignore[reportUnusedFunction]
+    server_addr: str, cluster: str
+) -> str:
     if server_addr.strip():
         return server_addr
     raise ConfigurationError(
@@ -19232,32 +18728,16 @@ def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
     )
 
 
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._resolve_env_secret` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_resolve_env_secret", ...)` and
+# `monkeypatch.setattr(cli, "_resolve_env_secret", ...)` effective.
 def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
-    resolved = value or os.getenv(env_name) or _local_secret(env_name)
-    if resolved:
-        return resolved
-    raise ConfigurationError(
-        f"{label} is required; pass it explicitly, set {env_name}, "
-        f"or add {env_name} to .clio-relay/secrets.json"
+    return cli_support._resolve_env_secret(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        value, env_name, label
     )
-
-
-def _local_secret(env_name: str) -> str | None:
-    path = Path(".clio-relay/secrets.json")
-    if not path.exists():
-        return None
-    loaded = cast(object, json.loads(path.read_text(encoding="utf-8-sig")))
-    if not isinstance(loaded, dict):
-        raise ConfigurationError(".clio-relay/secrets.json must contain a JSON object")
-    secrets = cast(dict[object, object], loaded)
-    value = secrets.get(env_name)
-    if value is None:
-        return None
-    if not isinstance(value, str) or value == "":
-        raise ConfigurationError(
-            f".clio-relay/secrets.json field must be a non-empty string: {env_name}"
-        )
-    return value
 
 
 def _environment_references(items: list[str] | None) -> dict[str, str]:
@@ -19327,12 +18807,11 @@ def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
     return f":uses-{hashlib.sha256(encoded).hexdigest()}"
 
 
+# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
+# object re-binding -- see the longer note beside
+# `_write_failed_acceptance_report`'s forwarder above. Re-reading
+# `cli_support._run_or_exit` on every call keeps both
+# `monkeypatch.setattr(cli_support, "_run_or_exit", ...)` and
+# `monkeypatch.setattr(cli, "_run_or_exit", ...)` effective.
 def _run_or_exit(action: Callable[[], None]) -> None:
-    try:
-        action()
-    except StorageAdmissionError as exc:
-        _echo_storage_admission_error(exc)
-        raise typer.Exit(code=1) from exc
-    except (ConfigurationError, RelayError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+    cli_support._run_or_exit(action)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
