@@ -56,30 +56,52 @@ from clio_relay.release_pin_sites import (
 from clio_relay.release_pin_sites import (
     SelectorKind as SelectorKind,
 )
+from clio_relay.release_pin_validation import (
+    PinSiteShapeError as PinSiteShapeError,
+)
+from clio_relay.release_pin_validation import (
+    UnregisteredHit as UnregisteredHit,
+)
+from clio_relay.release_pin_validation import (
+    sweep_structural_fixture_blocks,
+    validate_registry,
+)
+from clio_relay.release_pin_validation import (
+    validate_registry_sites as validate_registry_sites,
+)
+
+validate_registry()
 
 __all__ = [
     "PINSITES",
     "BumpTargets",
+    "CrossAxisNote",
     "FamilyAgreement",
     "PinChange",
     "PinFamily",
     "PinSite",
     "PinSiteDrifted",
     "PinSiteError",
+    "PinSiteShapeError",
     "PreflightResult",
     "SelectorKind",
     "SiteReading",
     "UnregisteredHit",
     "apply_bump",
     "check_all_agreement",
+    "frozen_sites",
     "plan_bump",
     "read_family_agreement",
+    "read_frozen_sites",
     "read_site_value",
     "render_preflight",
+    "resolve_site_path",
     "run_preflight",
     "sites_in_group",
     "sweep_incompleteness",
     "sweep_jarvis_contract_v37_completeness",
+    "validate_registry",
+    "validate_registry_sites",
     "value_groups",
     "write_site_value",
 ]
@@ -88,28 +110,78 @@ __all__ = [
 # --------------------------- Reading a site's current value ---------------
 
 
+def _is_rename_site(site: PinSite) -> bool:
+    """A ``FILENAME`` site whose own path (not a referencing line) embeds the value."""
+    return site.filename_template is not None and site.line is None
+
+
+def _anchor_value(root: Path, site: PinSite) -> str:
+    """Resolve ``site``'s dynamic path via a reliable, never-renamed sibling.
+
+    A ``dynamic_path`` site's own ``path`` is a ``{value}`` template, not a
+    literal -- "the version IS the path" (doc §7). The anchor is the first
+    non-``dynamic_path`` site in ``site.path_group`` (or ``site.value_group``
+    when ``path_group`` is unset -- the common case, where a site's own
+    value IS the path-determining one): by construction the anchor is a
+    stable source line (e.g. ``jc.jarvis_mcp_contract_id``), never itself
+    renamed, so it is always safe to read regardless of where the
+    dynamic-path site's own file currently sits. A digest embedded in the
+    same file needs the *id* group's anchor, not its own digest group's --
+    that is exactly what ``path_group`` overrides.
+    """
+    group = site.path_group or site.value_group
+    assert group is not None
+    anchor = next(candidate for candidate in sites_in_group(group) if not candidate.dynamic_path)
+    return read_site_value(root, anchor)
+
+
+def resolve_site_path(root: Path, site: PinSite, *, at_value: str | None = None) -> Path:
+    """Resolve the real file ``site`` targets.
+
+    ``at_value`` pins the dynamic-path resolution to a specific value (the
+    value already captured during a bump's read phase) rather than
+    re-reading the anchor -- required at write time, since sibling sites in
+    the same group may already have been rewritten by the time a
+    dynamic-path site is written (:func:`_group_changes`'s ordering).
+    """
+    if not site.dynamic_path:
+        return root / site.path
+    resolved = at_value if at_value is not None else _anchor_value(root, site)
+    return root / site.path.format(value=resolved)
+
+
 def _read_line_like(root: Path, site: PinSite) -> str:
-    assert site.line is not None and site.pattern is not None
-    file_path = root / site.path
+    assert site.pattern is not None
+    file_path = resolve_site_path(root, site)
     try:
         lines = file_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise PinSiteDrifted(site, f"could not read file: {exc}") from exc
-    if not (1 <= site.line <= len(lines)):
-        raise PinSiteDrifted(site, f"file has {len(lines)} lines, no line {site.line}")
-    text = lines[site.line - 1]
-    matches = list(site.pattern.finditer(text))
-    if not matches:
-        raise PinSiteDrifted(site, f"pattern not found on line {site.line}: {text!r}")
-    values = {match.group(1) for match in matches}
+    if site.line is not None:
+        if not (1 <= site.line <= len(lines)):
+            raise PinSiteDrifted(site, f"file has {len(lines)} lines, no line {site.line}")
+        candidates = [lines[site.line - 1]]
+        locator = f"line {site.line}"
+    else:
+        # No fixed line: the file is wholesale-regenerated on a real bump
+        # (the vendored contract JSON's own embedded digests), so search
+        # the whole file for the pattern instead of trusting a line number
+        # that shifts with the file's content.
+        candidates = lines
+        locator = "the file"
+    values: set[str] = set()
+    for text in candidates:
+        values.update(match.group(1) for match in site.pattern.finditer(text))
+    if not values:
+        raise PinSiteDrifted(site, f"pattern not found in {locator}")
     if len(values) != 1:
-        raise PinSiteDrifted(site, f"line {site.line} holds inconsistent values: {sorted(values)}")
+        raise PinSiteDrifted(site, f"{locator} holds inconsistent values: {sorted(values)}")
     return values.pop()
 
 
 def _read_json_key(root: Path, site: PinSite) -> str:
     assert site.key_path is not None
-    file_path = root / site.path
+    file_path = resolve_site_path(root, site)
     try:
         document = json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -127,7 +199,8 @@ def _read_json_key(root: Path, site: PinSite) -> str:
 
 def _read_filename(root: Path, site: PinSite) -> str:
     assert site.filename_template is not None
-    file_path = root / site.path
+    anchor_value = _anchor_value(root, site) if site.dynamic_path else None
+    file_path = resolve_site_path(root, site, at_value=anchor_value)
     prefix, _, suffix = site.filename_template.partition("{value}")
     name = file_path.name
     if not (name.startswith(prefix) and name.endswith(suffix)) or not file_path.is_file():
@@ -149,7 +222,7 @@ def read_site_value(root: Path, site: PinSite) -> str:
         if not (1 <= site.line <= len(lines)) or site.placeholder not in lines[site.line - 1]:
             raise PinSiteDrifted(site, f"placeholder {site.placeholder!r} not found")
         return f"<placeholder:{site.placeholder}>"
-    if site.filename_template is not None and site.line is None:
+    if _is_rename_site(site):
         return _read_filename(root, site)
     if site.key_path is not None and site.path.endswith(".json"):
         return _read_json_key(root, site)
@@ -159,25 +232,47 @@ def read_site_value(root: Path, site: PinSite) -> str:
 # --------------------------- Writing a new value (bump's rewrite primitive)
 
 
-def _write_line_like(root: Path, site: PinSite, new_value: str) -> None:
-    assert site.line is not None and site.pattern is not None
-    file_path = root / site.path
+def _own_value_is_path_value(site: PinSite) -> bool:
+    """Does this site's own value (not another site's) determine its path?
+
+    True for the rename/id-content sites (``path_group`` unset -- their own
+    value literally IS the contract revision the path embeds). False for a
+    digest embedded in the same file (``path_group="jarvis_contract_id"``,
+    ``value_group="jarvis_contract_sha256"``/etc.): its own ``old_value`` is
+    a digest, useless for path resolution, so path resolution must always
+    re-read the id group's anchor fresh rather than trust a passed-in value.
+    """
+    return site.dynamic_path and site.path_group is None
+
+
+def _write_line_like(root: Path, site: PinSite, new_value: str, *, old_value: str) -> None:
+    assert site.pattern is not None
+    at_value = old_value if _own_value_is_path_value(site) else None
+    file_path = resolve_site_path(root, site, at_value=at_value)
     lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    text = lines[site.line - 1]
-    pieces: list[str] = []
-    cursor = 0
-    for match in site.pattern.finditer(text):
-        pieces.append(text[cursor : match.start(1)])
-        pieces.append(new_value)
-        cursor = match.end(1)
-    pieces.append(text[cursor:])
-    lines[site.line - 1] = "".join(pieces)
+    line_numbers = (
+        [site.line] if site.line is not None else [index + 1 for index in range(len(lines))]
+    )
+    for line_number in line_numbers:
+        text = lines[line_number - 1]
+        pieces: list[str] = []
+        cursor = 0
+        changed = False
+        for match in site.pattern.finditer(text):
+            pieces.append(text[cursor : match.start(1)])
+            pieces.append(new_value)
+            cursor = match.end(1)
+            changed = True
+        if not changed:
+            continue
+        pieces.append(text[cursor:])
+        lines[line_number - 1] = "".join(pieces)
     file_path.write_text("".join(lines), encoding="utf-8")
 
 
 def _write_json_key(root: Path, site: PinSite, new_value: str) -> None:
     assert site.key_path is not None
-    file_path = root / site.path
+    file_path = resolve_site_path(root, site)
     document = json.loads(file_path.read_text(encoding="utf-8"))
     cursor = document
     for part in site.key_path[:-1]:
@@ -186,14 +281,21 @@ def _write_json_key(root: Path, site: PinSite, new_value: str) -> None:
     file_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
-def _write_filename(root: Path, site: PinSite, new_value: str) -> None:
+def _write_filename(root: Path, site: PinSite, new_value: str, *, old_value: str) -> None:
     assert site.filename_template is not None
-    file_path = root / site.path
+    at_value = old_value if _own_value_is_path_value(site) else None
+    file_path = resolve_site_path(root, site, at_value=at_value)
     file_path.rename(file_path.with_name(site.filename_template.format(value=new_value)))
 
 
-def write_site_value(root: Path, site: PinSite, new_value: str) -> None:
+def write_site_value(root: Path, site: PinSite, new_value: str, *, old_value: str) -> None:
     """Rewrite a mutable :class:`PinSite` to ``new_value``.
+
+    ``old_value`` is the value already read for this site during the bump's
+    read-all-first phase (:func:`_group_changes`) -- required (not
+    re-derived) for a ``dynamic_path`` site, since a sibling anchor in the
+    same group may already have been rewritten by the time this call
+    happens, which would resolve the wrong (already-new) path.
 
     Raises:
         PinSiteError: ``site.mutable`` is ``False`` -- a frozen/placeholder
@@ -201,13 +303,13 @@ def write_site_value(root: Path, site: PinSite, new_value: str) -> None:
     """
     if not site.mutable:
         raise PinSiteError(f"{site.id} is not mutable -- refusing to rewrite it")
-    if site.filename_template is not None and site.line is None:
-        _write_filename(root, site, new_value)
+    if _is_rename_site(site):
+        _write_filename(root, site, new_value, old_value=old_value)
         return
     if site.key_path is not None and site.path.endswith(".json"):
         _write_json_key(root, site, new_value)
         return
-    _write_line_like(root, site, new_value)
+    _write_line_like(root, site, new_value, old_value=old_value)
 
 
 # --------------------------- Agreement: does one value_group agree? -------
@@ -267,70 +369,43 @@ def check_all_agreement(root: Path) -> tuple[FamilyAgreement, ...]:
     return tuple(read_family_agreement(root, group) for group in value_groups())
 
 
+def frozen_sites() -> tuple[PinSite, ...]:
+    """Every registered site that is tracked but never rewritten or agreement-checked."""
+    return tuple(site for site in PINSITES if not site.mutable)
+
+
+def read_frozen_sites(root: Path) -> tuple[SiteReading, ...]:
+    """Read every frozen site's current value now -- reported, never failing.
+
+    "Registered" must never be decorative (doc §7.9, B5): a frozen site is
+    excluded from agreement-checking on purpose (a stable historical label
+    or a placeholder, never rewritten), but it is still read every
+    preflight run, so a site whose own pattern stops matching at all (a
+    genuinely broken reference, not merely "says an old version on
+    purpose") is at least visible instead of silently unverified forever.
+    """
+    readings: list[SiteReading] = []
+    for site in frozen_sites():
+        try:
+            readings.append(SiteReading(site, read_site_value(root, site)))
+        except PinSiteDrifted as exc:
+            readings.append(SiteReading(site, None, str(exc)))
+    return tuple(readings)
+
+
 # --------------------------- Completeness: any unregistered pin site? -----
-
-#: Sweep name -> (path, whole-file regex). Every registered ``REGEX``-kind
-#: site names the sweep it participates in; :func:`sweep_incompleteness`
-#: scans the whole file for the same shape and diffs the two line sets, so
-#: a newly added block can never be silently missed (doc §7's
-#: "repeated-structural-block coverage" requirement).
-_SWEEPS: dict[str, tuple[str, re.Pattern[str]]] = {
-    "release_gate_kit_text": (
-        "docs/release-gate-1.0.yaml",
-        re.compile(r'\bclio-kit: "[0-9][0-9.]*"|clio_kit-[0-9][0-9.]*-py3-none-any\.whl'),
-    ),
-    "release_gate_kit_digest": (
-        "docs/release-gate-1.0.yaml",
-        re.compile(r"\b\w*artifact_sha256: [0-9a-f]{64}"),
-    ),
-    "release_gate_contract_id": (
-        "docs/release-gate-1.0.yaml",
-        re.compile(r"contract_id: clio-kit-jarvis-user-v[0-9.]+"),
-    ),
-    "release_gate_contract_sha256": (
-        "docs/release-gate-1.0.yaml",
-        re.compile(r"^\s{16}contract_sha256: [0-9a-f]{64}", re.MULTILINE),
-    ),
-}
-#: A digest that structurally matches ``release_gate_kit_digest``'s pattern
-#: but pins the *unrelated* jarvis-cd artifact, not clio-kit -- named and
-#: excluded rather than silently miscounted (jarvis-cd is not a #198 axis).
-_JARVIS_CD_ARTIFACT_SHA256 = "2c2e2042d0256bd3d9c117d75aaf00d26d9e814fcbcca9a904abf06399fc1067"
-
-
-@dataclass(frozen=True)
-class UnregisteredHit:
-    """A sweep found a pin-shaped value at a line not in the registry."""
-
-    sweep: str
-    path: str
-    line: int
-    text: str
 
 
 def sweep_incompleteness(root: Path) -> tuple[UnregisteredHit, ...]:
-    """Find every pin-shaped value in a swept file that is NOT registered.
+    """Every pin-shaped value in the tree that is NOT a registered site.
 
-    The opposite direction -- a registered site whose exact line no longer
-    matches -- surfaces as a :class:`PinSiteDrifted` from
-    :func:`read_family_agreement` instead, so both directions of drift are
-    covered.
+    Combines the two completeness sweeps: the structural release-gate
+    fixture blocks (``release_pin_validation.sweep_structural_fixture_
+    blocks``, no dynamic-path dependency) and the v3.7 contract-literal
+    sweep below (needs :func:`resolve_site_path`, which is why it lives
+    here rather than alongside the other one -- a circular import).
     """
-    hits: list[UnregisteredHit] = []
-    for sweep_name, (path, pattern) in _SWEEPS.items():
-        registered = {
-            site.line for site in PINSITES if site.sweep == sweep_name and site.line is not None
-        }
-        text = (root / path).read_text(encoding="utf-8")
-        for line_number, line_text in enumerate(text.splitlines(), start=1):
-            if pattern.search(line_text) is None:
-                continue
-            if sweep_name == "release_gate_kit_digest" and _JARVIS_CD_ARTIFACT_SHA256 in line_text:
-                continue
-            if line_number not in registered:
-                hits.append(UnregisteredHit(sweep_name, path, line_number, line_text.strip()))
-    hits.extend(sweep_jarvis_contract_v37_completeness(root))
-    return tuple(hits)
+    return sweep_structural_fixture_blocks(root) + sweep_jarvis_contract_v37_completeness(root)
 
 
 #: The CURRENT canonical contract revision only. Sites pinning an OLDER
@@ -350,27 +425,64 @@ _SWEEP_EXCLUDED_FILES = frozenset(
 )
 
 
+#: (directory, recursive) pairs scanned for the v3.7-literal sweep.
+#: ``docs``/``docs/ai`` are shallow (not recursive): that deliberately
+#: excludes docs/design/relay-architecture-2026-08.md, which discusses the
+#: v3.7 pin extensively as prose *about* the registry (this section's own
+#: audit language, quoted example values) -- not a duplicate pin, and
+#: sweeping it recursively would manufacture false positives against the
+#: document that specifies this very sweep (doc §7.9, B3).
+_SWEEP_BASES: tuple[tuple[str, bool], ...] = (
+    ("src/clio_relay", True),
+    ("jarvis-packages/clio_relay", True),
+    ("tests", True),
+    ("docs", False),
+    ("docs/ai", False),
+)
+_SWEEP_SUFFIXES = frozenset({".py", ".json", ".md"})
+
+
 def sweep_jarvis_contract_v37_completeness(root: Path) -> tuple[UnregisteredHit, ...]:
     """Every ``v3.7`` JARVIS contract literal must be a registered site.
 
     Scans ``src/clio_relay``, the vendored ``jarvis-packages/clio_relay``
-    mirror, and ``tests/`` -- the same three trees #198's "13-copy" story
-    was scattered across -- and names any file:line the registry misses.
-    Restricted to the current revision (v3.7): legacy v3.1-v3.6 references
-    are deliberate backward-compatibility surface, not a #198 pin.
+    mirror, ``tests/`` -- the same three trees #198's "13-copy" story was
+    scattered across -- and the top-level Markdown under ``docs/`` and
+    ``docs/ai/`` (doc §7.9, B3: prose describing the staging gate drifted
+    stale independently of the code sites), naming any file:line the
+    registry misses. Restricted to the current revision (v3.7): legacy
+    v3.1-v3.6 references are deliberate backward-compatibility surface,
+    not a #198 pin.
     """
-    registered = {
-        (site.path, site.line)
-        for site in PINSITES
-        if site.family is PinFamily.JARVIS_CONTRACT and site.line is not None
-    }
+    # A dynamic_path site's own `.path` is a `{value}` template, not the
+    # real relative path any file scan will ever report -- resolve it
+    # against the real tree first, or every dynamic_path site's line
+    # permanently misses (never matches a real scanned `rel`). Resolution
+    # itself reads an anchor site elsewhere in the tree (e.g.
+    # cluster_config.py); on a partial/synthetic tree (a test fixture that
+    # only sets up the one file it cares about) that anchor may not exist --
+    # skip the entry rather than crashing the whole sweep for every other,
+    # perfectly resolvable site.
+    registered: set[tuple[str, int]] = set()
+    for site in PINSITES:
+        if site.family is not PinFamily.JARVIS_CONTRACT or site.line is None:
+            continue
+        if not site.dynamic_path:
+            registered.add((site.path, site.line))
+            continue
+        try:
+            resolved = resolve_site_path(root, site).relative_to(root).as_posix()
+        except PinSiteDrifted:
+            continue
+        registered.add((resolved, site.line))
     hits: list[UnregisteredHit] = []
-    for base in ("src/clio_relay", "jarvis-packages/clio_relay", "tests"):
+    for base, recursive in _SWEEP_BASES:
         base_dir = root / base
         if not base_dir.is_dir():
             continue
-        for file_path in sorted(base_dir.rglob("*")):
-            if not file_path.is_file() or file_path.suffix not in {".py", ".json"}:
+        candidates = base_dir.rglob("*") if recursive else base_dir.glob("*")
+        for file_path in sorted(candidates):
+            if not file_path.is_file() or file_path.suffix not in _SWEEP_SUFFIXES:
                 continue
             rel = file_path.relative_to(root).as_posix()
             if rel in _SWEEP_EXCLUDED_FILES:
@@ -388,6 +500,50 @@ def sweep_jarvis_contract_v37_completeness(root: Path) -> tuple[UnregisteredHit,
 
 # --------------------------- Preflight: the release-gate local check ------
 
+#: Prefixes marking two value_groups as the SAME underlying concern
+#: pinned on two deliberately independent axes (clio-relay #190/#199,
+#: 41b912c/eef50b5): a bootstrap default and an ares acceptance-policy
+#: fixture that records what a past live run actually had installed.
+#: Diverging is allowed by design -- reported as :class:`CrossAxisNote`,
+#: never a preflight failure.
+_CROSS_AXIS_PREFIXES: tuple[str, ...] = ("bootstrap_", "acceptance_")
+
+
+@dataclass(frozen=True)
+class CrossAxisNote:
+    """Two independent value_groups for the same concern currently differ.
+
+    Informational only -- see :data:`_CROSS_AXIS_PREFIXES`.
+    """
+
+    group_a: str
+    value_a: str | None
+    group_b: str
+    value_b: str | None
+
+
+def _cross_axis_notes(agreements: tuple[FamilyAgreement, ...]) -> tuple[CrossAxisNote, ...]:
+    consensus = {agreement.value_group: agreement.consensus_value for agreement in agreements}
+    notes: list[CrossAxisNote] = []
+    seen: set[frozenset[str]] = set()
+    for prefix in _CROSS_AXIS_PREFIXES:
+        for group in consensus:
+            if not group.startswith(prefix):
+                continue
+            suffix = group[len(prefix) :]
+            for other_prefix in _CROSS_AXIS_PREFIXES:
+                other_group = f"{other_prefix}{suffix}"
+                if other_prefix == prefix or other_group not in consensus:
+                    continue
+                pair = frozenset({group, other_group})
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                value, other_value = consensus[group], consensus[other_group]
+                if value is not None and other_value is not None and value != other_value:
+                    notes.append(CrossAxisNote(group, value, other_group, other_value))
+    return tuple(notes)
+
 
 @dataclass(frozen=True)
 class PreflightResult:
@@ -395,6 +551,8 @@ class PreflightResult:
 
     agreements: tuple[FamilyAgreement, ...]
     unregistered: tuple[UnregisteredHit, ...]
+    cross_axis: tuple[CrossAxisNote, ...] = ()
+    frozen: tuple[SiteReading, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -403,7 +561,13 @@ class PreflightResult:
 
 def run_preflight(root: Path) -> PreflightResult:
     """Run the full release-identity preflight against the tree at ``root``."""
-    return PreflightResult(check_all_agreement(root), sweep_incompleteness(root))
+    agreements = check_all_agreement(root)
+    return PreflightResult(
+        agreements,
+        sweep_incompleteness(root),
+        _cross_axis_notes(agreements),
+        read_frozen_sites(root),
+    )
 
 
 def render_preflight(result: PreflightResult) -> list[str]:
@@ -424,6 +588,18 @@ def render_preflight(result: PreflightResult) -> list[str]:
                 )
     for hit in result.unregistered:
         lines.append(f"FAIL: unregistered {hit.sweep} pin at {hit.path}:{hit.line}: {hit.text}")
+    for note in result.cross_axis:
+        lines.append(
+            f"INFO: {note.group_a}={note.value_a!r} differs from "
+            f"{note.group_b}={note.value_b!r} (independent axes by design, not a failure)"
+        )
+    for reading in result.frozen:
+        if reading.error is not None:
+            lines.append(
+                f"INFO: frozen site {reading.site.id} did not read cleanly: {reading.error}"
+            )
+        else:
+            lines.append(f"INFO: frozen site {reading.site.id} currently reads {reading.value!r}")
     if result.passed:
         checked = sum(len(agreement.readings) for agreement in result.agreements)
         lines.append(
@@ -440,16 +616,26 @@ class BumpTargets:
     """New values for one or more release-identity axes.
 
     Each axis is independent -- pass only the ones you are bumping. A
-    ``kit_version``/``contract_version`` bump that also needs to move a
+    ``*_kit_version``/``contract_version`` bump that also needs to move a
     digest mirror requires the matching ``*_sha256`` argument; when it is
     omitted, that value_group is left unchanged (never silently dropped --
     ground rule 2, no silent fallback: :func:`plan_bump` still reports it,
     unset).
+
+    ``bootstrap_kit_version``/``bootstrap_kit_wheel_sha256`` and
+    ``acceptance_kit_version``/``acceptance_kit_wheel_sha256`` are
+    deliberately separate axes, not two names for one value (clio-relay
+    #190/#199, 41b912c/eef50b5): the acceptance-policy pin
+    (``docs/release-gate-1.0.yaml``) records what a past live ares run
+    actually had installed, independent of whatever the current bootstrap
+    default is. Bumping one must never silently move the other.
     """
 
     relay_version: str | None = None
-    kit_version: str | None = None
-    kit_wheel_sha256: str | None = None
+    bootstrap_kit_version: str | None = None
+    bootstrap_kit_wheel_sha256: str | None = None
+    acceptance_kit_version: str | None = None
+    acceptance_kit_wheel_sha256: str | None = None
     contract_version: str | None = None
     contract_sha256: str | None = None
     contract_wire_sha256: str | None = None
@@ -470,8 +656,10 @@ class PinChange:
 def _target_for_group(value_group: str, targets: BumpTargets) -> str | None:
     return {
         "relay_version": targets.relay_version,
-        "kit_version_text": targets.kit_version,
-        "kit_wheel_sha256": targets.kit_wheel_sha256,
+        "bootstrap_kit_version_text": targets.bootstrap_kit_version,
+        "bootstrap_kit_wheel_sha256": targets.bootstrap_kit_wheel_sha256,
+        "acceptance_kit_version_text": targets.acceptance_kit_version,
+        "acceptance_kit_wheel_sha256": targets.acceptance_kit_wheel_sha256,
         "jarvis_contract_id": targets.contract_version,
         "jarvis_contract_sha256": targets.contract_sha256,
         "jarvis_contract_wire_sha256": targets.contract_wire_sha256,
@@ -479,19 +667,55 @@ def _target_for_group(value_group: str, targets: BumpTargets) -> str | None:
     }.get(value_group)
 
 
+def _group_changes(root: Path, group: str, new_value: str, *, write: bool) -> list[PinChange]:
+    """Compute (and optionally apply) one value_group's changes, atomically.
+
+    Every site in ``group`` is read *before* any of them is written, both so
+    a rename earlier in registry order can never make a later sibling's read
+    of the pre-rename path fail (the exact bug this ordering prevented
+    B1 from reproducing), and so one drifted site blocks the *whole* group
+    rather than leaving it partially rewritten -- ``write=True`` only ever
+    touches disk once every site in the group has read cleanly.
+    """
+    sites = sites_in_group(group)
+    readings: list[tuple[PinSite, str | None, str | None]] = []
+    for site in sites:
+        try:
+            readings.append((site, read_site_value(root, site), None))
+        except PinSiteDrifted as exc:
+            readings.append((site, None, str(exc)))
+    drifted = [reading for reading in readings if reading[2] is not None]
+    if drifted:
+        drifted_ids = sorted(reading[0].id for reading in drifted)
+        blocked_reason = f"blocked: sibling site(s) drifted in the same value_group: {drifted_ids}"
+        return [
+            PinChange(
+                site, old_value, new_value, False, error if error is not None else blocked_reason
+            )
+            for site, old_value, error in readings
+        ]
+    # Every site in the group read cleanly. Renames are applied last so a
+    # sibling KEY/LINE site targeting the same (pre-rename) path always
+    # finds it, even though every read already happened above.
+    ordered = sorted(readings, key=lambda reading: _is_rename_site(reading[0]))
+    changes: list[PinChange] = []
+    for site, old_value, _ in ordered:
+        assert old_value is not None, "no drift was detected above, so every read succeeded"
+        if old_value == new_value:
+            continue
+        if write:
+            write_site_value(root, site, new_value, old_value=old_value)
+        changes.append(PinChange(site, old_value, new_value, write))
+    return changes
+
+
 def plan_bump(root: Path, targets: BumpTargets) -> tuple[PinChange, ...]:
     """Compute the per-site diff a bump would apply, without writing anything."""
     changes: list[PinChange] = []
     for group in value_groups():
         new_value = _target_for_group(group, targets)
-        for site in sites_in_group(group):
-            try:
-                old_value = read_site_value(root, site)
-            except PinSiteDrifted as exc:
-                changes.append(PinChange(site, None, new_value, False, str(exc)))
-                continue
-            if new_value is not None and old_value != new_value:
-                changes.append(PinChange(site, old_value, new_value, False))
+        if new_value is not None:
+            changes.extend(_group_changes(root, group, new_value, write=False))
     if targets.relay_version is not None:
         digest_change = _matrix_digest_change(root, targets.relay_version)
         if digest_change is not None:
@@ -514,6 +738,9 @@ def _matrix_digest_change(root: Path, new_relay_version: str) -> PinChange | Non
 def apply_bump(root: Path, targets: BumpTargets) -> tuple[PinChange, ...]:
     """Rewrite every registered mutable site named by ``targets``.
 
+    Each value_group is all-or-nothing: every site in it is read before any
+    of them is written, so one drifted sibling blocks writes to the whole
+    group instead of leaving it partially rewritten (:func:`_group_changes`).
     The two ``matrix_digest`` sites are recomputed and written strictly
     after every other site is rewritten (doc §7's ordering rule for derived
     digests) via
@@ -523,17 +750,8 @@ def apply_bump(root: Path, targets: BumpTargets) -> tuple[PinChange, ...]:
     applied: list[PinChange] = []
     for group in value_groups():
         new_value = _target_for_group(group, targets)
-        if new_value is None:
-            continue
-        for site in sites_in_group(group):
-            try:
-                old_value = read_site_value(root, site)
-            except PinSiteDrifted as exc:
-                applied.append(PinChange(site, None, new_value, False, str(exc)))
-                continue
-            if old_value != new_value:
-                write_site_value(root, site, new_value)
-                applied.append(PinChange(site, old_value, new_value, True))
+        if new_value is not None:
+            applied.extend(_group_changes(root, group, new_value, write=True))
     if targets.relay_version is not None:
         digest_change = _apply_matrix_digest(root)
         if digest_change is not None:
@@ -551,5 +769,5 @@ def _apply_matrix_digest(root: Path) -> PinChange | None:
     if old_digest == new_digest:
         return None
     _write_json_key(root, matrix_site, new_digest)
-    _write_line_like(root, mirror_site, new_digest)
+    _write_line_like(root, mirror_site, new_digest, old_value=old_digest)
     return PinChange(matrix_site, old_digest, new_digest, True)

@@ -287,7 +287,7 @@ workspace. Absolute paths are accepted only when the verified file remains
 inside it.
 
 Both JARVIS doors stage through the same plane. A registered route reaches it
-through its `clio-kit-jarvis-user-v3.6` registration; the built-in `jarvis_*`
+through its `clio-kit-jarvis-user-v3.7` registration; the built-in `jarvis_*`
 tools reach it through the relay's own pinned clio-kit release, whose contract
 digest and JARVIS-CD lock take the place of a registration revision in the
 staged route identity. The built-in door engages staging only when the JARVIS
@@ -298,7 +298,7 @@ Staging is schema-driven, not filename-driven. It is enabled only when all of
 these statements are true:
 
 - the door is the built-in JARVIS route, or a registration declares exactly
-  `contract: clio-kit-jarvis-user-v3.6` and its immutable server artifact and
+  `contract: clio-kit-jarvis-user-v3.7` and its immutable server artifact and
   discovered schemas match that contract;
 - the same route first completes
   `jarvis_describe(target="package", package_name=...,
@@ -434,7 +434,7 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.7.2 artifact carries the pinned six-tool JARVIS v3.6
+The released clio-kit 2.7.2 artifact carries the pinned six-tool JARVIS v3.7
 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
@@ -464,7 +464,7 @@ clio-kit server and is not part of an individual MCP call's bounded startup.
 The locked sync and safe superseded-environment eviction still run; operators
 can perform explicit clio-kit cache GC outside a served MCP session.
 
-The release gate requires that exact 2.7.2 artifact to be rerun on every target
+The release gate requires that exact 2.6.6 artifact to be rerun on every target
 selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 

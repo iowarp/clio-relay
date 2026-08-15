@@ -69,7 +69,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # its own payload_too_large reason instead of blanket configuration_error.
     # A justified, minimal ratchet-up both times.
     "src/clio_relay/browser_gateway.py": 885,
-    # #231 R7: +13 net lines -- compute_release_acceptance_matrix_sha256 is
+    # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest
     # computation (doc's §7 "derived-digest-with-ordering" rule: never

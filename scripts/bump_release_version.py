@@ -10,18 +10,30 @@ real logic -- reading, writing, and the digest recompute -- lives in
 per-site diff (the same thin-script pattern `check_release_identity.py`
 follows).
 
-Three independent axes, each optional:
+Four independent axes, each optional:
 
 * ``--relay-version X.Y.Z`` -- clio-relay's own release version.
-* ``--kit-version X.Y.Z --kit-wheel-sha256 HEX`` -- the pinned clio-kit
-  distribution. Both are required together: the wheel's SHA-256 for a new
-  version cannot be derived, only supplied (the same reason the CI workflow
-  itself pins it as a literal, not a computed value).
+* ``--kit-version X.Y.Z --kit-wheel-sha256 HEX`` -- the default *bootstrap*
+  install pin (``jarvis_mcp.py``, CI, docs). Both are required together:
+  the wheel's SHA-256 for a new version cannot be derived, only supplied
+  (the same reason the CI workflow itself pins it as a literal).
+* ``--acceptance-kit-version X.Y.Z --acceptance-kit-wheel-sha256 HEX`` --
+  the ares *acceptance-policy* pin (``docs/release-gate-1.0.yaml``), a
+  DIFFERENT axis from ``--kit-version`` on purpose (clio-relay #190/#199,
+  commits 41b912c/eef50b5): it records what a past live ares run actually
+  had installed, not "whatever the bootstrap default currently is". Move
+  it only after re-running the ares acceptance suite against the new kit
+  version and collecting real evidence -- never to just mirror
+  ``--kit-version``'s text.
 * ``--contract-version vX.Y [--contract-sha256 HEX --contract-wire-sha256
   HEX --contract-artifact-sha256 HEX]`` -- the JARVIS MCP user contract
   revision. The digest arguments are optional: omitting them leaves the
   content-identity value_groups unchanged (reported, never silently
   dropped) while the id-literal sites still move.
+
+The preflight (``check_release_identity.py``) never fails just because the
+bootstrap and acceptance-policy kit axes currently differ -- that is
+allowed, by design; it reports the difference as an INFO note.
 
 Examples::
 
@@ -51,8 +63,22 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--relay-version", help="New clio-relay release version (e.g. 1.6.7).")
-    parser.add_argument("--kit-version", help="New pinned clio-kit distribution version.")
-    parser.add_argument("--kit-wheel-sha256", help="SHA-256 of the new clio-kit release wheel.")
+    parser.add_argument(
+        "--kit-version", help="New pinned clio-kit distribution version (bootstrap default axis)."
+    )
+    parser.add_argument(
+        "--kit-wheel-sha256", help="SHA-256 of the new clio-kit release wheel (bootstrap axis)."
+    )
+    parser.add_argument(
+        "--acceptance-kit-version",
+        help="New clio-kit distribution version for the ares acceptance-policy fixture "
+        "(docs/release-gate-1.0.yaml) -- a DIFFERENT axis from --kit-version; move it only "
+        "with real re-certification evidence, never to mirror --kit-version.",
+    )
+    parser.add_argument(
+        "--acceptance-kit-wheel-sha256",
+        help="SHA-256 of the clio-kit wheel for the ares acceptance-policy fixture.",
+    )
     parser.add_argument(
         "--contract-version", help="New JARVIS MCP user contract revision (e.g. v3.8)."
     )
@@ -67,22 +93,32 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if bool(args.kit_version) != bool(args.kit_wheel_sha256):
         parser.error("--kit-version and --kit-wheel-sha256 must be given together")
+    if bool(args.acceptance_kit_version) != bool(args.acceptance_kit_wheel_sha256):
+        parser.error(
+            "--acceptance-kit-version and --acceptance-kit-wheel-sha256 must be given together"
+        )
     if not any(
         (
             args.relay_version,
             args.kit_version,
+            args.acceptance_kit_version,
             args.contract_version,
         )
     ):
-        parser.error("at least one of --relay-version/--kit-version/--contract-version is required")
+        parser.error(
+            "at least one of --relay-version/--kit-version/--acceptance-kit-version/"
+            "--contract-version is required"
+        )
     return args
 
 
 def _targets(args: argparse.Namespace) -> BumpTargets:
     return BumpTargets(
         relay_version=args.relay_version,
-        kit_version=args.kit_version,
-        kit_wheel_sha256=args.kit_wheel_sha256,
+        bootstrap_kit_version=args.kit_version,
+        bootstrap_kit_wheel_sha256=args.kit_wheel_sha256,
+        acceptance_kit_version=args.acceptance_kit_version,
+        acceptance_kit_wheel_sha256=args.acceptance_kit_wheel_sha256,
         contract_version=args.contract_version,
         contract_sha256=args.contract_sha256,
         contract_wire_sha256=args.contract_wire_sha256,

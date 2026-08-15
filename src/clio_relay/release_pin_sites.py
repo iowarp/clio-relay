@@ -93,6 +93,20 @@ class PinSite:
         sweep: Name of the completeness sweep this site participates in
             (``None`` if its own line is the only source of truth for its
             existence -- see ``release_pins.sweep_incompleteness``).
+        dynamic_path: ``True`` when ``path`` is a ``{value}`` template, not
+            a literal -- the vendored contract file's own path (and its
+            internal content, once renamed) can only be found by first
+            reading a reliable, never-renamed sibling site ("the version IS
+            the path", doc §7): a static path baked in at import time goes
+            permanently stale the moment a real bump renames the file.
+        path_group: Which ``value_group`` to resolve a ``dynamic_path``
+            site's anchor from. Defaults to this site's own ``value_group``
+            when ``None`` -- correct for the rename/id-content sites, whose
+            own value IS the path-determining contract revision. A digest
+            site embedded in the same file (its own ``value_group`` is a
+            *digest* family, e.g. ``jarvis_contract_sha256``) still needs
+            the *id* group's anchor to find the file, so it sets this
+            explicitly rather than resolving against its own digest value.
     """
 
     id: str
@@ -108,6 +122,8 @@ class PinSite:
     mutable: bool = True
     value_group: str | None = None
     sweep: str | None = None
+    dynamic_path: bool = False
+    path_group: str | None = None
 
 
 def _row(
@@ -148,7 +164,8 @@ _LN, _KY, _FN, _PH, _RX, _DD = (
     SelectorKind.REGEX,
     SelectorKind.DERIVED_DIGEST,
 )
-_CONTRACT_JSON = "src/clio_relay/_contracts/jarvis-user-v3.7.json"
+#: A ``{value}`` template, not a literal path -- see ``PinSite.dynamic_path``.
+_CONTRACT_JSON = "src/clio_relay/_contracts/jarvis-user-{value}.json"
 
 PINSITES: tuple[PinSite, ...] = (
     # -- relay_version: clio-relay's own release version (4 sites) --------
@@ -312,16 +329,40 @@ PINSITES: tuple[PinSite, ...] = (
         "vendored contract file -- the version IS the path",
         filename_template="jarvis-user-{value}.json",
         value_group="jarvis_contract_id",
+        dynamic_path=True,
     ),
     _row(
         "jc.contract_file_content",
         _CONTRACT_JSON,
         _JC,
-        _KY,
+        _LN,
         "vendored contract file's own contract_id field",
         line=3,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
+        dynamic_path=True,
+    ),
+    _row(
+        "jc.contract_file_content_sha256",
+        _CONTRACT_JSON,
+        _JC,
+        _LN,
+        "vendored contract file's own import-validated content SHA-256",
+        pattern=re.compile(r'"contract_sha256": "([0-9a-f]{64})"'),
+        value_group="jarvis_contract_sha256",
+        dynamic_path=True,
+        path_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.contract_file_wire_sha256",
+        _CONTRACT_JSON,
+        _JC,
+        _LN,
+        "vendored contract file's own import-validated wire SHA-256",
+        pattern=re.compile(r'"wire_sha256": "([0-9a-f]{64})"'),
+        value_group="jarvis_contract_wire_sha256",
+        dynamic_path=True,
+        path_group="jarvis_contract_id",
     ),
     _row(
         "jc.runner_registered_contract",
@@ -416,6 +457,56 @@ PINSITES: tuple[PinSite, ...] = (
         value_group="jarvis_contract_id",
     ),
     _row(
+        "jc.remote_mcp_federation_wheel_carries_contract",
+        "docs/remote-mcp-federation.md",
+        _JC,
+        _LN,
+        "'the released clio-kit artifact carries the pinned ... contract' prose",
+        line=437,
+        pattern=_BARE_V,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.remote_mcp_federation_staging_registered_route",
+        "docs/remote-mcp-federation.md",
+        _JC,
+        _LN,
+        "staging-plane prose: 'A registered route reaches it through its ... registration'",
+        line=290,
+        pattern=_CONTRACT,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.remote_mcp_federation_staging_gate_condition",
+        "docs/remote-mcp-federation.md",
+        _JC,
+        _LN,
+        "staging-plane prose: 'a registration declares exactly contract: ...'",
+        line=301,
+        pattern=_CONTRACT,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.interface_context_staging_route",
+        "docs/ai/interface-context.md",
+        _JC,
+        _LN,
+        "'Exact ... routes additionally support package-described local-file staging'",
+        line=286,
+        pattern=_CONTRACT,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.system_context_staging_route",
+        "docs/ai/system-context.md",
+        _JC,
+        _LN,
+        "'Transparent local-file staging is enabled only for an immutable registered ... route'",
+        line=111,
+        pattern=_CONTRACT,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
         "jc.remote_mcp_federation_contract_filename",
         "docs/remote-mcp-federation.md",
         _JC,
@@ -425,23 +516,28 @@ PINSITES: tuple[PinSite, ...] = (
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
-    # -- jarvis_contract: frozen historical labels (tracked, never rewritten)
+    # -- jarvis_contract: description prose moves with the contract; the --
+    # -- check-id stays a frozen historical label (B5: a description is --
+    # -- prose, not an identifier -- it must say what the requirement --
+    # -- ACTUALLY exercises, so it moves like every other id-literal site; --
+    # -- the check-id is a stable name other tooling/evidence references --
+    # -- by string, so it is never rewritten). --
     _row(
         "jc.release_gate_secure_runtime_description",
         "docs/release-gate-1.0.yaml",
         _JC,
         _LN,
-        "ares-secure-jarvis-runtime requirement description (stable label)",
+        "ares-secure-jarvis-runtime requirement description",
         line=1109,
         pattern=_BARE_V,
-        mutable=False,
+        value_group="jarvis_contract_id",
     ),
     _row(
         "jc.release_gate_secure_runtime_check_id",
         "docs/release-gate-1.0.yaml",
         _JC,
         _LN,
-        "secure-runtime.jarvis-v3.6-query check id (stable label)",
+        "secure-runtime.jarvis-v3.6-query check id (stable label, tracked not rewritten)",
         line=1115,
         pattern=_BARE_V,
         mutable=False,
@@ -529,26 +625,35 @@ PINSITES: tuple[PinSite, ...] = (
         pattern=_HEX,
         value_group="jarvis_contract_artifact_sha256",
     ),
-    # -- kit_version: the clio-kit distribution pin (canonical + mirrors) -
+    # -- kit_version: the clio-kit distribution pin -- TWO axes, not one. --
+    # -- clio-relay#190/#199 (41b912c/eef50b5) deliberately decoupled the --
+    # -- default *bootstrap* install pin from the *ares acceptance-policy* --
+    # -- pin ("a separate, self-consistent live-cluster acceptance policy --
+    # -- pin... not part of this issue" -- eef50b5's own message): the --
+    # -- acceptance fixture records what a PAST live run actually had --
+    # -- installed, not "whatever the current default is". They are --
+    # -- independent value_groups on purpose; a bump moving one must never --
+    # -- silently move the other, and the preflight must never fail just --
+    # -- because they currently differ (doc §7.9's cross-axis INFO note). --
     _row(
         "kv.jarvis_mcp_version",
         "src/clio_relay/jarvis_mcp.py",
         _KV_FAM,
         _LN,
-        "CLIO_KIT_JARVIS_MCP_VERSION (sole canonical definition)",
+        "CLIO_KIT_JARVIS_MCP_VERSION (sole canonical bootstrap definition)",
         line=32,
         pattern=_KV,
-        value_group="kit_version_text",
+        value_group="bootstrap_kit_version_text",
     ),
     _row(
         "kv.jarvis_mcp_wheel_sha256",
         "src/clio_relay/jarvis_mcp.py",
         _KV_FAM,
         _LN,
-        "CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 (sole canonical definition)",
+        "CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 (sole canonical bootstrap definition)",
         line=39,
         pattern=_HEX,
-        value_group="kit_wheel_sha256",
+        value_group="bootstrap_kit_wheel_sha256",
     ),
     _row(
         "kv.bootstrap_placeholder",
@@ -570,7 +675,7 @@ PINSITES: tuple[PinSite, ...] = (
             f"stage exact clio-kit release wheel ({job} build job): filename",
             line=fline,
             pattern=_KV,
-            value_group="kit_version_text",
+            value_group="bootstrap_kit_version_text",
         )
         for job, fline in (("job1", 62), ("job2", 166))
     ),
@@ -583,7 +688,7 @@ PINSITES: tuple[PinSite, ...] = (
             f"stage exact clio-kit release wheel ({job} build job): SHA-256",
             line=sline,
             pattern=_HEX,
-            value_group="kit_wheel_sha256",
+            value_group="bootstrap_kit_wheel_sha256",
         )
         for job, sline in (("job1", 63), ("job2", 167))
     ),
@@ -596,7 +701,7 @@ PINSITES: tuple[PinSite, ...] = (
             f"stage exact clio-kit release wheel ({job} build job): URL",
             line=uline,
             pattern=_KV,
-            value_group="kit_version_text",
+            value_group="bootstrap_kit_version_text",
         )
         for job, uline in (("job1", 64), ("job2", 168))
     ),
@@ -608,7 +713,7 @@ PINSITES: tuple[PinSite, ...] = (
         "Use Remote JARVIS MCP: uv tool install wheel URL",
         line=719,
         pattern=_KV,
-        value_group="kit_version_text",
+        value_group="bootstrap_kit_version_text",
     ),
     _row(
         "kv.remote_mcp_federation_filename",
@@ -618,7 +723,7 @@ PINSITES: tuple[PinSite, ...] = (
         "kit-pin digests paragraph: exact release wheel filename",
         line=472,
         pattern=_KV,
-        value_group="kit_version_text",
+        value_group="bootstrap_kit_version_text",
     ),
     _row(
         "kv.remote_mcp_federation_sha256",
@@ -628,17 +733,18 @@ PINSITES: tuple[PinSite, ...] = (
         "kit-pin digests paragraph: exact release wheel SHA-256",
         line=473,
         pattern=_HEX,
-        value_group="kit_wheel_sha256",
+        value_group="bootstrap_kit_wheel_sha256",
     ),
     _row(
         "kv.remote_mcp_federation_release_gate_prose",
         "docs/remote-mcp-federation.md",
         _KV_FAM,
         _LN,
-        "'the release gate requires that exact ... artifact' prose",
+        "'the release gate requires that exact ... artifact' prose -- "
+        "describes the ACCEPTANCE-policy pin, not the bootstrap default",
         line=467,
         pattern=_KV,
-        value_group="kit_version_text",
+        value_group="acceptance_kit_version_text",
     ),
     *(
         _row(
@@ -646,10 +752,11 @@ PINSITES: tuple[PinSite, ...] = (
             "docs/release-gate-1.0.yaml",
             _KV_FAM,
             _RX,
-            "worker component-identity block: clio-kit version literal",
+            "worker component-identity block: clio-kit version literal "
+            "(ares acceptance-policy pin, independent of the bootstrap default)",
             line=gline,
             pattern=_KV,
-            value_group="kit_version_text",
+            value_group="acceptance_kit_version_text",
             sweep="release_gate_kit_text",
         )
         for gline in (115, 121, 122, 226, 230, 231, 294, 299, 300, 302, 309, 374, 1187)
@@ -660,10 +767,11 @@ PINSITES: tuple[PinSite, ...] = (
             "docs/release-gate-1.0.yaml",
             _KV_FAM,
             _RX,
-            "worker component-identity block: clio-kit wheel SHA-256",
+            "worker component-identity block: clio-kit wheel SHA-256 "
+            "(ares acceptance-policy pin, independent of the bootstrap default)",
             line=dline,
             pattern=_HEX,
-            value_group="kit_wheel_sha256",
+            value_group="acceptance_kit_wheel_sha256",
             sweep="release_gate_kit_digest",
         )
         for dline in (124, 233, 303, 311, 371, 680, 782, 887)
