@@ -10,6 +10,7 @@ import pytest
 
 import clio_relay.relay_ops as relay_ops_module
 import clio_relay.spool as spool_module
+from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, JobState, RelayJob
@@ -158,7 +159,16 @@ def test_read_artifact_verifies_and_returns_original_bytes(
     assert payload["artifact"] == artifact.model_dump(mode="json")
 
 
-def test_read_artifact_rejects_unbounded_json_transfer(tmp_path: Path) -> None:
+def test_artifact_read_over_the_inline_budget_refuses_with_the_delivery_document_not_a_partial_body(
+    tmp_path: Path,
+) -> None:
+    """T2 (doc §6.4): over :data:`MAX_ARTIFACT_CONTENT_BYTES`, ``read_artifact_bytes``
+    must never hand back a raise -- much less a silently truncated body.
+    It returns a typed delivery-refusal document instead, keeping the
+    durable artifact reference as evidence while withholding ``data``. The
+    byte threshold itself (``MAX_ARTIFACT_CONTENT_BYTES``, 16 MiB) is
+    unchanged by R6 (#231) -- only the over-budget shape is typed now.
+    """
     queue = ClioCoreQueue(tmp_path / "core")
     job = queue.submit_job(
         RelayJob(
@@ -183,8 +193,98 @@ def test_read_artifact_rejects_unbounded_json_transfer(tmp_path: Path) -> None:
         )
     )
 
-    with pytest.raises(RelayError, match="transfer limit"):
-        read_artifact_bytes(queue, artifact.artifact_id)
+    document = read_artifact_bytes(queue, artifact.artifact_id)
+
+    assert is_delivery_refusal(document)
+    assert document["artifact"] == artifact.model_dump(mode="json")
+    assert "data" not in document
+    delivery = document["delivery"]
+    assert isinstance(delivery, dict)
+    assert delivery["code"] == "artifact_content_too_large"
+    assert delivery["max_inline_bytes"] == MAX_ARTIFACT_CONTENT_BYTES
+    assert delivery["private_evidence_preserved"] is True
+    assert delivery["remote_side_effects_may_have_occurred"] is False
+    assert "transfer limit" in delivery["message"]
+    assert "cursor-based log endpoint" in delivery["message"]
+
+
+def test_oversized_non_log_artifact_refusal_does_not_recommend_the_log_endpoint(
+    tmp_path: Path,
+) -> None:
+    """F10 (#231 R6 review): the cursor-based log endpoint only serves
+    ``stdout``/``stderr`` streams (``relay_ops.read_job_log``) -- an
+    oversized ``mcp_result`` artifact (or any other non-log kind) must not
+    be told to use it, since that endpoint has no path to serve it at all.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.MCP_CALL,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="mcp-result-transfer-bound",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "mcp-result.json"
+    with artifact_path.open("wb") as stream:
+        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
+            metadata=_owned_artifact_metadata(owned_root),
+        )
+    )
+
+    document = read_artifact_bytes(queue, artifact.artifact_id)
+
+    delivery = document["delivery"]
+    assert isinstance(delivery, dict)
+    assert "transfer limit" in delivery["message"]
+    assert "cursor-based log endpoint" not in delivery["message"]
+
+
+def test_artifact_read_delivery_refusal_is_not_reported_for_an_ordinary_envelope(
+    tmp_path: Path,
+) -> None:
+    """Sabotage twin: an ordinary, in-budget envelope must never be
+    misidentified as a T2 refusal -- ``is_delivery_refusal`` keys off the
+    ``delivery`` schema tag, not just the absence of a ``data`` field a
+    caller could accidentally omit.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="artifact-transfer-ok",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "small.log"
+    data = b"ok\n"
+    artifact_path.write_bytes(data)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="stdout",
+            size_bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            metadata=_owned_artifact_metadata(owned_root),
+        )
+    )
+
+    document = read_artifact_bytes(queue, artifact.artifact_id)
+
+    assert not is_delivery_refusal(document)
+    assert document["data"] is not None
 
 
 def test_read_artifact_rejects_paths_outside_root_hardlinks_and_symlinks(
@@ -348,8 +448,12 @@ def test_read_artifact_growth_is_bounded_to_limit_plus_one(
     monkeypatch.setattr(relay_ops_module, "MAX_ARTIFACT_CONTENT_BYTES", 4)
     monkeypatch.setattr(spool_module, "_read_owned_file_chunk", grow_after_read)
 
-    with pytest.raises(RelayError, match="4-byte transfer limit"):
-        read_artifact_bytes(queue, artifact.artifact_id)
+    document = read_artifact_bytes(queue, artifact.artifact_id)
+
+    assert is_delivery_refusal(document)
+    delivery = document["delivery"]
+    assert isinstance(delivery, dict)
+    assert "4-byte transfer limit" in delivery["message"]
     assert requested_sizes == [5, 1]
 
 

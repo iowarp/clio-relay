@@ -30,6 +30,7 @@ from clio_relay.live_acceptance import (
     _browser_json_observation,  # pyright: ignore[reportPrivateUsage]
     _browser_sse_observation,  # pyright: ignore[reportPrivateUsage]
     _BrowserHttpRequestError,  # pyright: ignore[reportPrivateUsage]
+    _decode_artifact_text,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
@@ -37,6 +38,7 @@ from clio_relay.live_acceptance import (
     _native_progress_attestation,  # pyright: ignore[reportPrivateUsage]
     _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
     _progress_attestation_identity,  # pyright: ignore[reportPrivateUsage]
+    _remote_shell,  # pyright: ignore[reportPrivateUsage]
     _require_secure_runtime_control_capacity,  # pyright: ignore[reportPrivateUsage]
     _runtime_metadata_from_job_status,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
@@ -302,6 +304,89 @@ def test_transport_http_client_sends_exact_owned_session_binding(
             owner_session_id="desktop-session-1",
             timeout_seconds=5,
         )
+
+
+def test_decode_artifact_text_reports_a_delivery_refusal_by_its_own_message(
+    tmp_path: Path,
+) -> None:
+    """F5 (#231 R6 review): a T2 refusal (doc §6.4) is not a "not base64
+    encoded" envelope -- ``_decode_artifact_text`` must report the
+    refusal's own ``delivery.message``/``code`` instead of the generic,
+    misleading base64 complaint.
+    """
+    del tmp_path
+    payload = {
+        "artifact": {"artifact_id": "a"},
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": "clio-relay.mcp-result-delivery.v1",
+            "status": "failed",
+            "code": "artifact_content_too_large",
+            "max_inline_bytes": 16 * 1_048_576,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": False,
+            "message": "artifact content exceeds the 16777216-byte transfer limit",
+        },
+    }
+
+    with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
+        _decode_artifact_text(payload)
+
+
+def test_decode_artifact_text_still_rejects_a_genuinely_malformed_envelope() -> None:
+    """Sabotage twin: a payload that is merely missing base64 fields (not a
+    typed refusal) must still raise the original, distinct complaint --
+    the F5 fix must not swallow every non-base64 payload as a refusal.
+    """
+    with pytest.raises(RelayError, match="not base64 encoded"):
+        _decode_artifact_text({"encoding": "raw"})
+
+
+def test_remote_shell_surfaces_a_delivery_refusal_by_its_own_message() -> None:
+    """A1 (#231 R6-fix review): a remote CLI guard exits non-zero *after*
+
+    printing a T2 delivery-refusal document (doc §6.4) to stdout --
+    ``_remote_shell`` must recognize it and surface its own typed code/
+    message, not the generic "remote command failed: <raw blob>" a
+    blanket non-zero-exit check would otherwise report. Exercised through
+    the real ``_remote_shell`` entry point with a fake failing runner, not
+    by calling the message-extraction helper in isolation.
+    """
+    refusal = (
+        b'{"content_truncated": true, "result_available": false, "delivery": '
+        b'{"schema_version": "clio-relay.mcp-result-delivery.v1", "status": "failed", '
+        b'"code": "artifact_content_too_large", "max_inline_bytes": 16777216, '
+        b'"private_evidence_preserved": true, '
+        b'"remote_side_effects_may_have_occurred": false, '
+        b'"message": "artifact content exceeds the 16777216-byte transfer limit"}}'
+    )
+
+    def fake_runner(
+        command: list[str], *, input: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return subprocess.CompletedProcess(command, 1, stdout=refusal, stderr=b"")
+
+    with pytest.raises(
+        RelayError,
+        match=r"remote command refused delivery \(artifact_content_too_large\): "
+        r"artifact content exceeds the 16777216-byte transfer limit",
+    ):
+        _remote_shell("ares-login", "clio-relay job read-artifact a1", runner=fake_runner)
+
+
+def test_remote_shell_falls_back_to_the_generic_error_for_a_non_refusal_failure() -> None:
+    """A real command failure (not a delivery refusal) still reports the raw blob."""
+
+    def fake_runner(
+        command: list[str], *, input: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return subprocess.CompletedProcess(command, 127, stdout=b"", stderr=b"command not found")
+
+    with pytest.raises(RelayError, match="remote command failed: command not found"):
+        _remote_shell("ares-login", "not-a-real-command", runner=fake_runner)
 
 
 def test_live_acceptance_requires_configured_workload() -> None:

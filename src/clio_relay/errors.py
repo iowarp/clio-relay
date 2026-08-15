@@ -20,7 +20,7 @@ class QueueConflictError(RelayError):
 class TaskInputParkConflictError(QueueConflictError):
     """A durable MCP task's post-admission input round exhausted CAS retries.
 
-    Raised only by ``RelayTasksExtension._park_agent_input`` when
+    Raised only by ``RelayMcpRuntime._park_agent_input`` when
     ``update_mcp_task_projection``'s optimistic-concurrency check keeps
     losing a race after every retry attempt. This is a transient
     concurrency conflict, never a client parameter problem -- unlike

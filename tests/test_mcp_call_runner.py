@@ -2386,6 +2386,80 @@ def test_mcp_call_runner_writes_result_on_timeout(
     assert result["stderr"] == "late"
 
 
+def test_a_38mib_stdout_capture_is_recorded_head_tail_with_a_typed_elision_marker(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Drives the runner's actual ``_write_mcp_result`` build path (doc §6.4,
+    T3) with a synthetic ~38 MiB stdout capture. The JSON-RPC response line
+    is buried deep in the elided middle (well past the 1 MiB head window,
+    well before the 1 MiB tail window) -- protocol parsing must still find
+    it, because parsing runs against the full, unbounded capture BEFORE the
+    record-time bound is applied; only the ``mcp-result.json`` ``stdout``
+    field itself is bounded.
+    """
+    from clio_relay.bounded_payload import STDOUT_HEAD_MAX_BYTES, STDOUT_TAIL_MAX_BYTES
+
+    runner = _load_runner()
+    monkeypatch.chdir(tmp_path)
+
+    head_filler = "H" * (STDOUT_HEAD_MAX_BYTES + (2 * 1024 * 1024))
+    tail_filler = "T" * (STDOUT_TAIL_MAX_BYTES + (33 * 1024 * 1024))
+    response_line = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "clio-relay-mcp-call",
+            "result": {"content": [], "isError": False},
+        }
+    )
+    stdout = f"{head_filler}\n{response_line}\n{tail_filler}"
+    original_bytes = len(stdout.encode("utf-8"))
+
+    def fake_run(
+        command: list[str],
+        *,
+        tool: str,
+        arguments: dict[str, object],
+        timeout: int | None,
+        env_from: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del tool, arguments, timeout, env_from
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cast(Any, runner), "_run_mcp_session", fake_run)
+
+    return_code = cast(McpCallRunnerModule, runner).run_mcp_call_from_params(
+        {"server": "science-mcp", "tool": "inspect"}
+    )
+    result = json.loads((tmp_path / "mcp-result.json").read_text(encoding="utf-8"))
+
+    assert return_code == 0
+    # Parsing ran against the full, unbounded capture -- the response is
+    # found even though its exact text is elided from the written "stdout".
+    assert result["protocol_result"] == {"content": [], "isError": False}
+
+    truncation = result["stdout_truncation"]
+    assert truncation is not None
+    assert truncation["schema_version"] == "clio-relay.truncation.v1"
+    assert truncation["retention"] == "head_tail"
+    assert truncation["original_bytes"] == original_bytes
+    assert truncation["retained_head_bytes"] == STDOUT_HEAD_MAX_BYTES
+    assert truncation["retained_tail_bytes"] == STDOUT_TAIL_MAX_BYTES
+    assert truncation["elided_bytes"] == (
+        original_bytes - STDOUT_HEAD_MAX_BYTES - STDOUT_TAIL_MAX_BYTES
+    )
+
+    bounded_stdout = result["stdout"]
+    assert "[clio-relay: elided" in bounded_stdout
+    assert "H" * 100 in bounded_stdout
+    assert "T" * 100 in bounded_stdout
+    assert response_line not in bounded_stdout
+    assert len(bounded_stdout.encode("utf-8")) < (
+        STDOUT_HEAD_MAX_BYTES + STDOUT_TAIL_MAX_BYTES + 300
+    )
+    assert result["stderr_truncation"] is None
+
+
 def test_mcp_call_runner_classifies_early_server_exit_as_protocol_failure(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

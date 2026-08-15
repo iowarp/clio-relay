@@ -25,7 +25,10 @@ from typer.testing import CliRunner
 
 import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
+import clio_relay.core_queue as core_queue
+import clio_relay.installation as installation
 from clio_relay import __version__
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
@@ -2053,7 +2056,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     monkeypatch.setattr(bootstrap, "_validate_relay_bootstrap_wheel", poison)
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "cli_test"})())
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "missing-source")
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "missing-source")
 
     def remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
         return {"verified": True}
@@ -2123,7 +2126,7 @@ def test_public_release_bootstrap_requires_artifact_digest(
             )
         }
     ).save(tmp_path / ".clio-relay/clusters.json")
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "installed-package")
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "installed-package")
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     result = CliRunner().invoke(
@@ -2228,12 +2231,12 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
     def invocation_lock(**_kwargs: object) -> nullcontext[Path]:
         return nullcontext(tmp_path / "bootstrap.lock")
 
-    monkeypatch.setattr(cli, "installation_info", installation_info)
-    monkeypatch.setattr(cli, "ClioCoreQueue", ReadyQueue)
-    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", inspect)
-    monkeypatch.setattr(cli, "run_bounded_process", systemctl)
-    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(installation, "installation_info", installation_info)
+    monkeypatch.setattr(core_queue, "ClioCoreQueue", ReadyQueue)
+    monkeypatch.setattr(bootstrap_reconcile, "inspect_exact_bootstrap_noop", inspect)
+    monkeypatch.setattr(bounded_process, "run_bounded_process", systemctl)
+    monkeypatch.setattr(installation, "worker_runtime_info", worker_info)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2397,18 +2400,18 @@ def test_payload_free_inspector_short_circuits_proven_generation_mismatch(
     def mismatched_generation(_desired: BootstrapDesiredState) -> str:
         return "b" * 64
 
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
     monkeypatch.setattr(
-        cli,
+        bootstrap_reconcile,
         "proven_active_generation_mismatch",
         mismatched_generation,
     )
-    monkeypatch.setattr(cli, "installation_info", unexpected)
-    monkeypatch.setattr(cli, "ClioCoreQueue", unexpected)
-    monkeypatch.setattr(cli, "run_bounded_process", unexpected)
-    monkeypatch.setattr(cli, "worker_runtime_info", unexpected)
-    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", unexpected)
-    monkeypatch.setattr(cli, "write_bootstrap_receipt", unexpected)
+    monkeypatch.setattr(installation, "installation_info", unexpected)
+    monkeypatch.setattr(core_queue, "ClioCoreQueue", unexpected)
+    monkeypatch.setattr(bounded_process, "run_bounded_process", unexpected)
+    monkeypatch.setattr(installation, "worker_runtime_info", unexpected)
+    monkeypatch.setattr(bootstrap_reconcile, "inspect_exact_bootstrap_noop", unexpected)
+    monkeypatch.setattr(bootstrap_reconcile, "write_bootstrap_receipt", unexpected)
     arguments = [
         "bootstrap-inspect",
         "--invocation-id",
@@ -2471,9 +2474,11 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
     def matching_generation(_desired: BootstrapDesiredState) -> None:
         return None
 
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
-    monkeypatch.setattr(cli, "proven_active_generation_mismatch", matching_generation)
-    monkeypatch.setattr(cli, "installation_info", deep_inspection)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(
+        bootstrap_reconcile, "proven_active_generation_mismatch", matching_generation
+    )
+    monkeypatch.setattr(installation, "installation_info", deep_inspection)
 
     result = CliRunner().invoke(
         cli.app,

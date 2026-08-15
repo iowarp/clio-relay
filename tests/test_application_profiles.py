@@ -47,10 +47,8 @@ def _install_site_profile(monkeypatch: MonkeyPatch) -> None:
 
 def test_relay_distribution_contains_no_built_in_application_plugins() -> None:
     source_root = Path(__file__).parents[1] / "src" / "clio_relay"
-    assert [path.name for path in (source_root / "app_profiles").glob("*.py")] == ["__init__.py"]
-    assert [path.name for path in (source_root / "package_adapters").glob("*.py")] == [
-        "__init__.py"
-    ]
+    assert not (source_root / "app_profiles").exists()
+    assert not (source_root / "package_adapters").exists()
     for relative_path in (
         "bootstrap.py",
         "endpoint.py",

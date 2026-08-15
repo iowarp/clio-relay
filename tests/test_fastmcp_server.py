@@ -27,6 +27,7 @@ from fastmcp_tasks.models import MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp.shared.exceptions import MCPError
 
 import clio_relay.fastmcp_server as fastmcp_server_module
+from clio_relay import door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
@@ -1163,6 +1164,11 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
     -32603 internal error (the exact live symptom). A real conflict (as
     opposed to the control-only-argument false positive covered above) must
     still be refused, but as a typed, queryable MCPError.
+
+    #231 R3: re-pointed at ``door_errors.classify(..., reason="mcp_task_conflict")``
+    -- the wire ``reason`` string now comes from the frozen ``REASONS`` table
+    (``door_errors.REASONS["mcp_task_conflict"]``) instead of the ad hoc
+    ``"mcp_task_identity_conflict"`` this site invented locally.
     """
     settings = RelaySettings(
         core_dir=tmp_path / "core",
@@ -1188,13 +1194,11 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
                 await call_tool_task(client, "relay_submit_agent", arguments)
             assert failure.value.code == mcp_types.INVALID_PARAMS
             assert "different semantics" in str(failure.value)
-            # clio-relay#218 rework: the sibling MCPError raise ~80 lines
-            # above (mcp_task_status_reconciliation_failed) carries
-            # data={"reason": ..., "task_id": ...} so the caller can query
-            # the failure -- this raise must match that pattern too.
+            # door_errors.as_mcp_error always carries data={"reason": ..., ...}
+            # so the caller can query the failure by its frozen reason.
             assert conflicting_task_ids
             assert failure.value.data == {
-                "reason": "mcp_task_identity_conflict",
+                "reason": "mcp_task_conflict",
                 "task_id": conflicting_task_ids[-1],
             }
 
@@ -1214,8 +1218,13 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
     genuine task-identity-reuse conflict correctly is (test above). Forcing
     every update_mcp_task_projection call to conflict exhausts
     _park_agent_input's 8 retry attempts and raises
-    TaskInputParkConflictError, which intercept_tool_call deliberately
-    leaves unwrapped.
+    TaskInputParkConflictError.
+
+    #231 R3: this closes the live hole the #218 comment named but left open
+    -- ``intercept_tool_call`` no longer leaves ``TaskInputParkConflictError``
+    unwrapped. ``door_errors.classify`` now types it into the dedicated,
+    retryable ``mcp_task_input_park_conflict`` reason (its own MCP code,
+    never ``INTERNAL_ERROR`` and never ``INVALID_PARAMS``).
     """
 
     def create_test_directory(path: Path) -> None:
@@ -1268,14 +1277,16 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
             }
             with pytest.raises(MCPError) as failure:
                 await call_tool_task(client, "relay_submit_agent", arguments)
-            # FastMCP's generic handler surfaces this exactly as it did for
-            # ANY unhandled QueueConflictError before #218 -- a bare,
-            # typeless INTERNAL_ERROR. What #218 rework must guarantee is
-            # narrower: this is never MCPError(INVALID_PARAMS), the code
-            # that tells a client "your parameters are wrong" when the real
-            # cause is transient server-side CAS contention.
-            assert failure.value.code == mcp_types.INTERNAL_ERROR
+            # #231 R3: typed via door_errors into its own dedicated,
+            # retryable reason -- never the generic INTERNAL_ERROR bucket
+            # (the old bare-re-raise behavior) and never INVALID_PARAMS (the
+            # code that tells a client "your parameters are wrong" when the
+            # real cause is transient server-side CAS contention).
+            spec = door_errors.REASONS["mcp_task_input_park_conflict"]
+            assert failure.value.code == spec.mcp_code
+            assert failure.value.code != mcp_types.INTERNAL_ERROR
             assert failure.value.code != mcp_types.INVALID_PARAMS
+            assert failure.value.data == {"reason": "mcp_task_input_park_conflict"}
 
     asyncio.run(scenario())
 

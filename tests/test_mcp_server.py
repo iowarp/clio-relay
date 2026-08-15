@@ -15,6 +15,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from clio_relay import mcp_server as mcp_server_module
+from clio_relay import relay_ops as relay_ops_module
+from clio_relay.bounded_payload import build_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -441,8 +443,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "artifact_id",
         "page_size",
         "cursor",
+        "content_max_bytes",
     }
     assert artifact_query["properties"]["page_size"]["maximum"] == 100
+    content_max_bytes = artifact_query["properties"]["content_max_bytes"]["anyOf"][0]
+    assert content_max_bytes == {"type": "integer", "minimum": 1, "maximum": 65536}
     assert query_tool["outputSchema"]["properties"]["kind"] == {
         "type": "string",
         "const": "mcp_call",
@@ -3784,6 +3789,173 @@ def test_oversized_terminal_mcp_result_sets_tool_error_and_preserves_job_evidenc
     assert parsed.document["structured_result"] == {"application_payload": secret}
 
 
+def test_verified_local_mcp_result_surfaces_an_oversized_artifact_as_a_typed_refusal(
+    tmp_path: Path,
+) -> None:
+    """T2 (doc §6.4): when the durable ``mcp_result`` artifact itself exceeds
+    ``relay_ops.MAX_ARTIFACT_CONTENT_BYTES`` (16 MiB), ``read_artifact_bytes``
+    now returns a typed delivery-refusal document instead of raising (R6,
+    #231). ``_verified_local_mcp_result`` must surface that refusal as-is --
+    not fall into ``_decode_verified_mcp_result``, which expects a base64
+    envelope and would otherwise misreport this as a generic malformed-
+    artifact ``ValueError`` (an internal_error on the wire, losing the typed
+    signal entirely).
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(server="science-mcp", tool="inspect"),
+            idempotency_key="oversized-local-mcp-result",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "mcp-result.json"
+    with artifact_path.open("wb") as stream:
+        stream.truncate(relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+
+    verified = mcp_server_module._verified_local_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue, job.job_id
+    )
+
+    assert verified is not None
+    assert verified.document == verified.public
+    assert is_delivery_refusal(verified.document)
+    assert verified.document["artifact"]["artifact_id"] == artifact.artifact_id
+    delivery = verified.document["delivery"]
+    assert delivery["code"] == "artifact_content_too_large"
+    assert delivery["private_evidence_preserved"] is True
+    assert delivery["remote_side_effects_may_have_occurred"] is False
+
+
+def test_mcp_tool_result_failed_recognizes_any_typed_delivery_refusal_not_one_named_code(
+    tmp_path: Path,
+) -> None:
+    """F1 (#231 R6 review, HIGH): ``_mcp_tool_result_failed`` used to key its
+    delivery-refusal branch on ``code == MCP_RESULT_INLINE_LIMIT_CODE``
+    only. An ``artifact_content_too_large`` refusal (``relay_ops.py``'s
+    ``read_artifact_bytes``, doc §6.4/§6.5) carries a DIFFERENT code and
+    fell through to ``False`` -- a SUCCESS ``CallToolResult`` whose body
+    says ``result_available: false``. The fix discriminates on
+    ``is_delivery_refusal`` plus ``delivery.status``, not a single code.
+    """
+    del tmp_path
+    refusal = build_delivery_refusal(
+        code="artifact_content_too_large",
+        message="artifact content exceeds the transfer limit",
+        max_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES,
+        remote_side_effects_may_have_occurred=False,
+    )
+    mcp_result: dict[str, Any] = {"artifact": {"artifact_id": "a"}, **refusal}
+
+    assert mcp_server_module._mcp_tool_result_failed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {"mcp_result": mcp_result}
+    )
+
+
+def test_oversized_artifact_read_refusal_sets_tool_error_not_a_silent_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 (#231 R6 review, HIGH): the integration-level twin of the unit test
+    above, mirroring ``test_oversized_terminal_mcp_result_sets_tool_error_
+    and_preserves_job_evidence``'s shape for the OTHER T2 refusal code --
+    the durable ``mcp_result`` artifact itself (not its inline JSON body)
+    exceeded the transfer limit. Before the F1 fix, ``relay_wait`` reported
+    ``isError: False`` here even though ``result_available`` was ``false``.
+    """
+    refusal = build_delivery_refusal(
+        code="artifact_content_too_large",
+        message="artifact content exceeds the transfer limit",
+        max_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES,
+        remote_side_effects_may_have_occurred=False,
+    )
+    document: dict[str, Any] = {
+        "artifact": {"artifact_id": "artifact_oversized_mcp_result_source"},
+        **refusal,
+    }
+    source_job = RelayJob(
+        job_id="job_oversized_artifact_source",
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        state=JobState.SUCCEEDED,
+        spec=McpCallSpec(server="science-mcp", tool="science_inspect"),
+        idempotency_key="oversized-artifact-fixture",
+    )
+    dummy_payload = b"placeholder"
+    artifact = ArtifactRef(
+        artifact_id="artifact_oversized_mcp_result_source",
+        job_id=source_job.job_id,
+        uri=(tmp_path / "private-mcp-result.json").as_uri(),
+        kind="mcp_result",
+        size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        sha256=hashlib.sha256(dummy_payload).hexdigest(),
+    )
+    receipt: dict[str, Any] = {
+        "cluster": "ares",
+        "job_id": source_job.job_id,
+        "state": "succeeded",
+        "kind": "mcp_call",
+        "terminal": True,
+        "remote": True,
+        "route_revision": "a" * 64,
+    }
+    parsed = mcp_server_module._VerifiedMcpResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        document=document,
+        public=document,
+    )
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=source_job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+
+    def waited_result(
+        _arguments: dict[str, Any],
+        *,
+        queue: ClioCoreQueue,
+        settings: RelaySettings,
+    ) -> dict[str, Any]:
+        del queue, settings
+        return receipt
+
+    monkeypatch.setattr(mcp_server_module, "_wait_job", waited_result)
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": source_job.job_id},
+            },
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    public_receipt = cast(dict[str, Any], tool_result["structuredContent"])
+    delivery = cast(dict[str, Any], public_receipt["mcp_result"])["delivery"]
+    assert delivery["status"] == "failed"
+    assert delivery["code"] == "artifact_content_too_large"
+
+
 def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5717,6 +5889,61 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     serialized_error = json.dumps(internal_content_response, sort_keys=True)
     assert "not model-readable" in serialized_error
     assert bearer not in serialized_error
+
+
+def test_relay_read_artifact_over_budget_sets_is_error_not_a_silent_success(
+    tmp_path: Path,
+) -> None:
+    """F5 (#231 R6 review): ``relay_read_artifact``'s OWN result document can
+    be a T2 refusal directly (doc §6.4) -- not only nested under a job
+    status's ``mcp_result`` (the F1 scenario). ``_mcp_tool_result_failed``
+    must recognize this top-level shape too, or the tool answers
+    ``isError: false`` while its body says ``result_available: false``.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="oversized-relay-read-artifact",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    oversized_path = owned_root / "large.bin"
+    with oversized_path.open("wb") as stream:
+        stream.truncate(relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=oversized_path.as_uri(),
+            kind="stdout",
+            size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_read_artifact",
+                "arguments": {"artifact_id": artifact.artifact_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    structured = cast(dict[str, Any], tool_result["structuredContent"])
+    assert structured["result_available"] is False
+    assert structured["delivery"]["code"] == "artifact_content_too_large"
 
 
 def test_mcp_cancels_job(tmp_path: Path) -> None:

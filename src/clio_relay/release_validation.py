@@ -167,6 +167,31 @@ def run_local_release_validation(
         )
         _run_check(
             recorder,
+            "local.file-size-ratchet",
+            "per-file source line-count ratchet against god-file re-accretion",
+            ["uv", "run", "--no-sync", "python", "scripts/check_file_size.py"],
+            root=root,
+            runner=command_runner,
+        )
+        _run_check(
+            recorder,
+            "local.no-class-in-function",
+            "class-in-function ratchet against hidden classes buried in closures",
+            ["uv", "run", "--no-sync", "python", "scripts/check_no_class_in_function.py"],
+            root=root,
+            runner=command_runner,
+        )
+        _run_check(
+            recorder,
+            "local.release-identity",
+            "release-identity pin registry: every value_group agrees and no "
+            "unregistered site pins the same family (clio-relay#198)",
+            ["uv", "run", "--no-sync", "python", "scripts/check_release_identity.py"],
+            root=root,
+            runner=command_runner,
+        )
+        _run_check(
+            recorder,
             "local.pytest",
             (
                 "native-platform pytest partition with no failed, skipped, xfailed, "

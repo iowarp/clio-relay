@@ -2233,6 +2233,22 @@ def build_staged_release_asset_plan(
     }
 
 
+def compute_release_acceptance_matrix_sha256(canonical: Mapping[str, object]) -> str:
+    """Compute the release-acceptance-matrix self-digest over its canonical fields.
+
+    ``canonical`` is the matrix mapping with its own ``matrix_sha256``/
+    ``acceptance_matrix_sha256`` key already removed. This is the sole digest
+    computation for the release-acceptance-matrix family -- both
+    :func:`validate_release_acceptance_matrix` (below) and
+    ``clio_relay.release_pins``'s bump command (clio-relay#198) call this
+    rather than each recomputing the hash independently.
+    """
+    encoded = json.dumps(
+        dict(canonical), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def validate_release_acceptance_matrix(
     document: object,
     *,
@@ -2398,11 +2414,7 @@ def validate_release_acceptance_matrix(
         raise ProvenanceError("release acceptance matrix SHA-256 is invalid")
     canonical = dict(matrix)
     del canonical["matrix_sha256"]
-    actual_sha256 = hashlib.sha256(
-        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    actual_sha256 = compute_release_acceptance_matrix_sha256(canonical)
     if claimed_sha256 != actual_sha256:
         raise ProvenanceError("release acceptance matrix self-digest does not match")
     if expected_sha256 is not None and expected_sha256 != actual_sha256:

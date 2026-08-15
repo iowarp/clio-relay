@@ -38,6 +38,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -2040,12 +2041,11 @@ def resolve_registered_remote_mcp_admission(
         if not dev_mode_enabled():
             raise ValueError("MCP discovery did not verify an immutable server artifact")
     else:
-        observed_server_digest = remote_mcp_server_artifact_digest(
-            entry.provenance.server_artifact
-        )
-        if not hmac.compare_digest(
-            observed_server_digest, expected_server_artifact_digest
-        ) and not dev_mode_enabled():
+        observed_server_digest = remote_mcp_server_artifact_digest(entry.provenance.server_artifact)
+        if (
+            not hmac.compare_digest(observed_server_digest, expected_server_artifact_digest)
+            and not dev_mode_enabled()
+        ):
             raise ValueError("MCP server artifact does not match the discovered route binding")
     return (
         McpAdmissionClass.CONTROL_QUERY,
@@ -2112,6 +2112,16 @@ def _control_query_discovery_artifact_bytes(
     from clio_relay.relay_ops import read_artifact_bytes
 
     envelope = read_artifact_bytes(queue, artifact_id)
+    if is_delivery_refusal(envelope):
+        # F5 (#231 R6 review): a T2 refusal (doc §6.4) is not an unsupported
+        # encoding -- report the refusal's own message/code rather than the
+        # generic "encoding is unsupported", which misdescribes why the
+        # artifact is unavailable.
+        # A2 (#231 R6 review): the message extraction itself now delegates
+        # to bounded_payload.describe_delivery_refusal, the single owner.
+        code = cast(dict[str, object], envelope.get("delivery", {})).get("code")
+        message = describe_delivery_refusal(envelope)
+        raise ValueError(f"MCP discovery artifact delivery refused ({code}): {message}")
     if envelope.get("encoding") != "base64":
         raise ValueError("MCP discovery artifact encoding is unsupported")
     encoded = envelope.get("data")

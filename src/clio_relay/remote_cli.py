@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import yaml
 
+from clio_relay.bounded_payload import describe_delivery_refusal, parse_delivery_refusal
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -243,8 +244,27 @@ def run_remote_shell(definition: ClusterDefinition, script: str) -> str:
     except OSError as exc:
         raise RelayError(f"remote command could not start: {definition.ssh_host}: {exc}") from exc
     if result.returncode != 0:
-        raise RelayError(_command_error("remote command failed", result))
+        raise _remote_command_failure(result)
     return result.stdout.decode("utf-8", errors="replace")
+
+
+def _remote_command_failure(result: subprocess.CompletedProcess[bytes]) -> RelayError:
+    """Build the typed error for a failed remote command.
+
+    A2/A1 (#231 R6 review): a remote CLI guard (e.g. ``job read-artifact``)
+    already exits non-zero *after* printing a T2 delivery-refusal document
+    (doc §6.4) to stdout -- recognized first, via
+    ``bounded_payload.parse_delivery_refusal``, so its own typed code/
+    message surfaces instead of the generic "remote command failed: <raw
+    stdout+stderr blob>" that discards the structure.
+    """
+    refusal = parse_delivery_refusal(result.stdout)
+    if refusal is not None:
+        code = cast(dict[str, object], refusal.get("delivery", {})).get("code")
+        return RelayError(
+            f"remote command refused delivery ({code}): {describe_delivery_refusal(refusal)}"
+        )
+    return RelayError(_command_error("remote command failed", result))
 
 
 def write_remote_file(definition: ClusterDefinition, remote_path: str, data: bytes) -> None:

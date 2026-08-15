@@ -44,7 +44,7 @@ from mcp_types.jsonrpc import HEADER_MISMATCH
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import PrivateAttr
 
-from clio_relay import __version__
+from clio_relay import __version__, door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError, TaskInputParkConflictError
@@ -995,10 +995,7 @@ class RelayTasksExtension(ServerExtension):
         try:
             return await asyncio.to_thread(self._runtime.queue.get_mcp_task, task_id)
         except NotFoundError as exc:
-            raise MCPError(
-                code=mcp_types.INVALID_PARAMS,
-                message=f"Task not found: {task_id}",
-            ) from exc
+            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
 
     async def _handle_get(
         self,
@@ -1012,28 +1009,21 @@ class RelayTasksExtension(ServerExtension):
         except MCPError:
             raise
         except Exception as exc:
-            # relay#215: this projection can re-derive a task's status over
-            # network round trips (``task_status``'s ``status``/``wait``
-            # re-fetch); an unwrapped failure there escaped as a bare, typeless
-            # "Internal server error" (no try/except -> the SDK's generic
-            # handler catch-all). Surface a typed, queryable reason instead.
-            # Raising ``MCPError`` here short-circuits the SDK's own
-            # ``logger.exception(...)`` (``mcp/server/runner.py``'s
-            # ``modern_error_data`` only logs when the handler exception is
-            # left for its generic catch-all), so the traceback would
-            # otherwise be lost entirely -- log it ourselves. And keep
-            # handler internals off the wire (the SDK's own stated posture
-            # for INTERNAL_ERROR: a generic message, never ``str(exc)``);
-            # the typed reason plus task_id in ``data`` is the queryable
-            # signal instead.
+            # relay#215, grounding + rationale now owned by
+            # door_errors.REASONS["mcp_task_status_reconciliation_failed"]'s
+            # docstring. Raising via door_errors short-circuits the SDK's own
+            # logger.exception(...) (mcp/server/runner.py's modern_error_data
+            # only logs when the handler exception is left for its generic
+            # catch-all), so the traceback is logged here or it is lost
+            # entirely.
             logger.exception("relay could not reconcile task %r's status", params.task_id)
-            raise MCPError(
-                code=mcp_types.INTERNAL_ERROR,
-                message="relay could not reconcile this task's status.",
-                data={
-                    "reason": "mcp_task_status_reconciliation_failed",
-                    "task_id": params.task_id,
-                },
+            raise door_errors.as_mcp_error(
+                door_errors.classify(
+                    exc,
+                    reason="mcp_task_status_reconciliation_failed",
+                    message="relay could not reconcile this task's status.",
+                    data={"task_id": params.task_id},
+                )
             ) from exc
 
     async def _handle_update(
@@ -1103,33 +1093,32 @@ class RelayTasksExtension(ServerExtension):
                 result=outcome,
                 context=context,
             )
-        except TaskInputParkConflictError:
-            # relay#218 rework: _park_agent_input's own CAS-exhaustion
-            # conflict is an unrelated transient concurrency conflict, not a
-            # client parameter problem -- it must never be mistyped as
-            # INVALID_PARAMS. A distinct exception TYPE (checked first, so
-            # it never reaches the broader except below) is what makes this
-            # a non-heuristic discrimination rather than a message/keyword
-            # match. Left unwrapped: it escapes through FastMCP's generic
-            # handler exactly as it did before #218, a bare internal error.
-            raise
+        except TaskInputParkConflictError as exc:
+            # relay#218 rework, grounding now owned by
+            # door_errors.REASONS["mcp_task_input_park_conflict"]'s
+            # docstring. A distinct exception TYPE (checked first, so it
+            # never reaches the broader except below) is what makes this a
+            # non-heuristic discrimination rather than a message/keyword
+            # match against the genuine task-identity conflict below.
+            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
         except QueueConflictError as exc:
-            # relay#218: a genuine task-identity reuse conflict (put_mcp_task,
-            # as opposed to the transport-control-only false positive
-            # normalized away by _canonical_mcp_task_arguments, and as
-            # opposed to the CAS-exhaustion conflict above) must still be
-            # refused, but as a typed, queryable MCPError -- not escape
-            # through FastMCP's generic handler as a bare, typeless -32603
-            # internal error (the live symptom).
+            # relay#218, grounding now owned by
+            # door_errors.REASONS["mcp_task_conflict"]'s docstring.
+            # Call-path-scoped: a bare QueueConflictError means this only on
+            # this MCP-task-creation path (it is raised 651 other times
+            # elsewhere in core_queue.py for unrelated invariants), so the
+            # reason is supplied here rather than derived from the type alone.
             conflicting_task_id = (
                 outcome.structured_content.get("job_id")
                 if isinstance(outcome.structured_content, dict)
                 else None
             )
-            raise MCPError(
-                code=mcp_types.INVALID_PARAMS,
-                message=str(exc),
-                data={"reason": "mcp_task_identity_conflict", "task_id": conflicting_task_id},
+            raise door_errors.as_mcp_error(
+                door_errors.classify(
+                    exc,
+                    reason="mcp_task_conflict",
+                    data={"task_id": conflicting_task_id},
+                )
             ) from exc
         if task is None:
             return outcome

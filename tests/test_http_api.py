@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from clio_relay import door_errors as door_errors_module
 from clio_relay import http_api as http_api_module
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -63,7 +64,7 @@ from clio_relay.models import (
     TaskTimelineEvent,
     utc_now,
 )
-from clio_relay.relay_ops import job_wait_result
+from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES, job_wait_result
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     cache_entry_from_discovery_artifact,
@@ -137,6 +138,54 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert artifact_response.status_code == 200
     assert artifact_response.json()["artifact"]["artifact_id"] == artifact.artifact_id
     assert [response.status_code for response in invalid_log_responses] == [422, 422, 422]
+
+
+def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
+    tmp_path: Path,
+) -> None:
+    """F2 (#231 R6 review): GET /artifacts/{id}/content used to answer 200
+    for an over-budget read, its body merely SAYING ``result_available:
+    false`` -- a client checking only the status code would treat that as
+    success. Routes through door_errors' existing ``payload_too_large``
+    door (413) instead, the refusal document riding along as the envelope's
+    extension data.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-oversized-artifact",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    oversized_path = spool / "large.bin"
+    with oversized_path.open("wb") as stream:
+        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=oversized_path.as_uri(),
+            kind="stdout",
+            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/artifacts/{artifact.artifact_id}/content")
+
+    assert response.status_code == 413
+    document = response.json()
+    assert document["schema_version"] == door_errors_module.SCHEMA_VERSION
+    assert document["reason"] == "payload_too_large"
+    assert document["status"] == 413
+    assert document["result_available"] is False
+    assert document["delivery"]["code"] == "artifact_content_too_large"
+    assert document["artifact"]["artifact_id"] == artifact.artifact_id
+    assert "data" not in document
 
 
 def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
@@ -1972,6 +2021,7 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         cluster: str | None = None,
         dev_mode: bool | None = None,
         findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
     ) -> str:
         observed.append(
             {"fn": "server", "receipt_path": receipt_path, "cluster": cluster, "dev_mode": dev_mode}
@@ -1983,6 +2033,7 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         receipt_path: Path | None = None,
         cluster: str | None = None,
         dev_mode: bool | None = None,
+        registered_command: list[str] | None = None,
     ) -> list[str]:
         observed.append(
             {
@@ -2057,6 +2108,7 @@ def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict
         cluster: str | None = None,
         dev_mode: bool | None = None,
         findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
     ) -> str:
         raise ValueError("receipt-bound clio-kit runtime identity did not verify")
 

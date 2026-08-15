@@ -594,7 +594,7 @@ def test_cli_submits_and_queries_content_pinned_lineage(
 
     monkeypatch.setattr("clio_relay.cli._require_cluster", require_local_cluster)
     monkeypatch.setattr(
-        "clio_relay.cli.should_execute_on_cluster",
+        "clio_relay.remote_cli.should_execute_on_cluster",
         execute_locally,
     )
 

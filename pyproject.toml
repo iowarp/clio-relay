@@ -90,7 +90,7 @@ ignore = ["ANN401"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-include = ["src", "jarvis-packages", "tests"]
+include = ["src", "jarvis-packages", "tests", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

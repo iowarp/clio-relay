@@ -4566,7 +4566,7 @@ def test_internal_scheduler_step_start_cli_preserves_connector_argv(
         return provider
 
     monkeypatch.setattr(
-        "clio_relay.cli.allocation_connector_provider_for_scheduler",
+        "clio_relay.scheduler_providers.allocation_connector_provider_for_scheduler",
         allocation_provider,
     )
 

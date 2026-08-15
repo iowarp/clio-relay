@@ -458,6 +458,17 @@ class CapabilityProxyServer(ThreadingHTTPServer):
                 self._overload_slots.release()
 
 
+class _RequestBodyTooLargeError(ValueError):
+    """A declared/actual request body exceeded ``MAX_REQUEST_BODY_BYTES``.
+
+    A distinct type (not a message match) so ``_error_from_exception`` can
+    route this one condition to ``door_errors.REASONS["payload_too_large"]``
+    while ``_request_body``'s other three failures (chunked encoding, a
+    malformed ``Content-Length``, a body that ended early) stay the
+    catch-all ``configuration_error`` (#231 R3 re-review, F7+F14).
+    """
+
+
 class CapabilityProxyHandler(BaseHTTPRequestHandler):
     """Authorize and proxy one narrowly scoped browser request."""
 
@@ -507,7 +518,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         try:
             self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         requested_method = self.headers.get("Access-Control-Request-Method")
@@ -578,7 +589,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         config = self.capability_server.config
@@ -669,7 +680,14 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ValueError("request Content-Length is invalid") from exc
         if length < 0 or length > MAX_REQUEST_BODY_BYTES:
-            raise ValueError("request body exceeds the browser gateway limit")
+            # A distinct exception TYPE (F7+F14, opus review), not a message
+            # match: this is the one _request_body failure that is a
+            # well-known HTTP concept (413) in its own right, not a generic
+            # protocol-validation mistake -- _error_from_exception routes it
+            # to door_errors.REASONS["payload_too_large"] instead of the
+            # blanket configuration_error the other three conditions here
+            # still use.
+            raise _RequestBodyTooLargeError("request body exceeds the browser gateway limit")
         body = self.rfile.read(length)
         if len(body) != length:
             deadline = self._request_input_deadline
@@ -689,16 +707,57 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
 
-    def _error(self, status: int, message: str) -> None:
-        payload = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+    def _write_response(self, status: int, content_type: str, payload: bytes) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             with suppress(BrokenPipeError, ConnectionResetError, OSError):
                 self.wfile.write(payload)
+
+    def _error(self, status: int, message: str) -> None:
+        payload = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+        self._write_response(status, "application/json", payload)
+
+    def _error_document(self, status: int, document: dict[str, object]) -> None:
+        """Write a door_errors-owned RFC 7807 document (doc §6.2's fourth adapter).
+
+        Unlike ``_error``'s bare ``{"error": message}`` (still used by this
+        handler's other 11 call sites), the document's fields sit at the top
+        level, not nested under an ``"error"`` key.
+        """
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self._write_response(status, "application/problem+json", payload)
+
+    def _error_from_exception(self, exc: ValueError) -> None:
+        """Route a caught request-body-validation ``ValueError`` through door_errors (#231 R3).
+
+        Local import: a module-level ``from clio_relay import door_errors``
+        here creates a real import cycle (browser_gateway -> door_errors ->
+        storage_runtime -> core_queue -> browser_gateway, since core_queue
+        already imports ``BrowserAttachmentRecord`` from this module) --
+        confirmed by triggering it, not merely suspected.
+
+        A ``_RequestBodyTooLargeError`` (the oversize branch specifically,
+        F7+F14 opus review) is a well-known HTTP concept in its own right
+        and routes to the dedicated ``payload_too_large`` reason (413).
+        ``_request_body``'s other three failures (chunked encoding, a
+        malformed ``Content-Length``, a body that ended early) are generic
+        protocol-level mistakes, not a distinct domain reason this module's
+        frozen ``REASONS`` table names on their own -- ``configuration_error``
+        (400, "client-schema mismatches") is the closest table-sanctioned
+        fit for those, chosen over inventing three more unregistered reasons
+        for this one file.
+        """
+        from clio_relay import door_errors
+
+        is_oversized = isinstance(exc, _RequestBodyTooLargeError)
+        reason = "payload_too_large" if is_oversized else "configuration_error"
+        fault = door_errors.classify(exc, reason=reason)
+        status, document = door_errors.as_browser_gateway_error(fault)
+        self._error_document(status, document)
 
     def log_message(self, format: str, *args: object) -> None:
         """Emit bounded process-log entries without logging capability-bearing URLs."""

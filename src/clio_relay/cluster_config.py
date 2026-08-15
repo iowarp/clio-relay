@@ -206,6 +206,15 @@ class DirectTransportConfig(BaseModel):
         return value
 
 
+# The identity anchor `frp_transport.py` (#231 R5) requires a cluster to opt into
+# before `brokered_tcp`/`udp_rendezvous` may be used -- see
+# `relay-architecture-2026-08.md` §8.3. `None` means "not opted in": modes (a)/(b)
+# have no ssh-authenticated act to carry the bring-up identity document over, so a
+# cluster that has not explicitly accepted the weaker preshared-link anchor does not
+# get to use those modes by falling through to it unannounced.
+IdentityAnchor = Literal["preshared_link_secret"]
+
+
 class FrpTransportConfig(BaseModel):
     """Transport settings for frpc-to-frps connections."""
 
@@ -216,6 +225,13 @@ class FrpTransportConfig(BaseModel):
     server_port: int = 443
     token_env: str = "CLIO_RELAY_FRP_TOKEN"
     stcp_secret_env: str = "CLIO_RELAY_STCP_SECRET"
+    # The stcp/xtcp proxy+visitor name pair this cluster's remote relay already
+    # registered at the relay point for the owned-session control channel (modes
+    # (a)/(b)). `None` resolves to a per-cluster default at transport build time
+    # (`frp_transport.py`); set this explicitly when the remote registration uses a
+    # different name.
+    proxy_name: str | None = None
+    identity_anchor: IdentityAnchor | None = None
     direct: DirectTransportConfig = Field(default_factory=DirectTransportConfig)
 
 

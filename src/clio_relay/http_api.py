@@ -9,6 +9,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -24,15 +25,18 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     WebSocketException,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from clio_relay import door_errors
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -151,6 +155,8 @@ from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
+
+logger = logging.getLogger(__name__)
 
 ModelRecord = TypeVar("ModelRecord", bound=BaseModel)
 OWNED_SESSION_STATUS_SCHEMA = "clio-relay.owned-session-status.v1"
@@ -1007,6 +1013,59 @@ def _bound_owner_session_cluster_definition(
     return definition
 
 
+_FALLBACK_PROBLEM_DOCUMENT: dict[str, object] = {
+    "type": "urn:clio-relay:error:internal_error",
+    "title": "Internal error",
+    "status": 500,
+    "detail": "relay encountered an internal error.",
+    "schema_version": door_errors.SCHEMA_VERSION,
+    "reason": "internal_error",
+    "retryable": False,
+    "truncation": None,
+}
+
+
+async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """The ONE global exception handler (#231 R3, doc §6.2/§6.3).
+
+    FastAPI's ``build_middleware_stack`` pulls any handler registered under
+    the bare ``Exception`` key OUT of ``ExceptionMiddleware`` and installs it
+    as ``ServerErrorMiddleware``'s own ``handler`` -- a separate middleware
+    layer, positioned OUTSIDE ``ExceptionMiddleware`` in the stack, not "the
+    most specific match" within one dispatch table. ``HTTPException`` stays
+    handled by ``ExceptionMiddleware`` (FastAPI's own default handler for
+    it), which is why the 107 hand-rolled ``raise HTTPException(...)`` sites
+    here keep their exact shape and status codes untouched (doc §6.2:
+    rewriting them is a later, deferred slice) -- they never reach this
+    function at all, by construction of where each handler lives, not by a
+    priority contest between them.
+
+    This closes the rest of §3's "0 unclassified exceptions reach the wire"
+    criterion: anything that escapes every hand-rolled site now routes
+    through the same owner every other surface uses, instead of falling
+    through to FastAPI's bare default "Internal Server Error". Guarded
+    end-to-end (F5): even if ``door_errors`` itself somehow fails to
+    classify or render ``exc`` -- a non-JSON-serializable value smuggled
+    into ``fault.data``, or a defect in door_errors.py itself -- this
+    handler still returns the fixed, hardcoded internal_error document
+    rather than let a second exception replace the first and collapse into
+    Starlette's own bodyless default.
+    """
+    try:
+        fault = door_errors.classify(exc)
+        document = door_errors.as_http_problem(fault)
+        status_code = fault.http_status
+    except Exception:
+        logger.exception(
+            "clio-relay: door_errors could not classify/render %s; "
+            "falling back to the hardcoded internal_error document",
+            type(exc).__name__,
+        )
+        document = _FALLBACK_PROBLEM_DOCUMENT
+        status_code = 500
+    return JSONResponse(document, status_code=status_code, media_type="application/problem+json")
+
+
 def create_app(settings: RelaySettings | None = None) -> FastAPI:
     """Create the FastAPI relay surface."""
     resolved = settings or RelaySettings.from_env()
@@ -1044,6 +1103,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
             queue.close()
 
     app = FastAPI(title="clio-relay", lifespan=lifespan)
+    app.add_exception_handler(Exception, _relay_unhandled_exception_handler)
     app.add_middleware(
         InputArtifactBodyLimitMiddleware,
         max_body_bytes=(
@@ -2438,13 +2498,39 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/artifacts/{artifact_id}/content", dependencies=[auth_dependency])
-    def get_artifact_content(artifact_id: DurableRecordId) -> dict[str, object]:
+    @app.get(
+        "/artifacts/{artifact_id}/content",
+        dependencies=[auth_dependency],
+        response_model=None,
+    )
+    def get_artifact_content(artifact_id: DurableRecordId) -> dict[str, object] | JSONResponse:
         try:
             require_owned_artifact(artifact_id)
-            return _public_payload(read_artifact_bytes(queue, artifact_id))
+            document = read_artifact_bytes(queue, artifact_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if is_delivery_refusal(document):
+            # F2 (#231 R6 review): an over-budget artifact read must not
+            # answer 200 with a body that merely SAYS result_available:
+            # false -- route it through door_errors' existing
+            # payload_too_large door (413, door_errors.py:336-341) instead
+            # of a silent success. The refusal document itself rides along
+            # as the envelope's extension data (F4: the contract's type/
+            # title/status/detail/schema_version/reason/retryable always
+            # win over a colliding key in it).
+            # A2 (#231 R6 review): the message extraction itself now
+            # delegates to bounded_payload.describe_delivery_refusal.
+            message = describe_delivery_refusal(document)
+            fault = door_errors.classify(
+                RelayError(message),
+                reason="payload_too_large",
+                data=document,
+            )
+            problem = door_errors.as_http_problem(fault)
+            return JSONResponse(
+                problem, status_code=fault.http_status, media_type="application/problem+json"
+            )
+        return _public_payload(document)
 
     @app.post("/jobs/{job_id}/cancel", response_model=RelayJob, dependencies=[auth_dependency])
     def cancel_job(

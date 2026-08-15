@@ -3340,6 +3340,15 @@ class EndpointWorker:
             "protocol_error": None,
             "stdout": "",
             "stderr": "",
+            # F4 (#231 R6 review): stdout/stderr are blanked above, but a
+            # spread `**query_document` (doc §6.4's T3 record-time bound,
+            # runner.py's _write_mcp_result) can carry a POPULATED
+            # stdout_truncation/stderr_truncation from the source execution
+            # query -- a record that would otherwise claim a truncation
+            # happened on content that no longer exists. Null them out
+            # explicitly rather than let the spread's stale value survive.
+            "stdout_truncation": None,
+            "stderr_truncation": None,
             "result_validation": None,
             "package_progress_bridge": None,
             "relay_recovery": {

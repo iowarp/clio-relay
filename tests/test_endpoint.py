@@ -147,6 +147,86 @@ def test_worker_failure_persists_only_logical_windows_paths(tmp_path: Path) -> N
     assert str(logical_failure_path) in failed.last_error
 
 
+def test_recovered_jarvis_run_result_nulls_stale_stream_truncation_records(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """F4 (#231 R6 review): ``recovered_document`` blanks ``stdout``/``stderr``
+    to ``""`` but used to INHERIT a populated ``stdout_truncation``/
+    ``stderr_truncation`` from the spread ``query_document`` (doc §6.4's T3
+    record-time bound) -- a record that would falsely claim a truncation
+    happened on content that no longer exists. Both fields must be nulled
+    alongside ``stdout``/``stderr``.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster="ares",
+        queue=queue,
+    )
+    try:
+        job = queue.submit_job(
+            RelayJob(
+                cluster="ares",
+                kind=JobKind.MCP_CALL,
+                spec=McpCallSpec(server="jarvis-mcp", tool="jarvis_run", arguments={}),
+                idempotency_key="recovered-run-truncation",
+            )
+        )
+        spool = JobSpool(settings.spool_dir, job)
+        spool.path.mkdir(parents=True, exist_ok=True)
+        query_document: dict[str, object] = {
+            "stdout": "H" * 2000,
+            "stderr": "E" * 2000,
+            "stdout_truncation": {
+                "schema_version": "clio-relay.truncation.v1",
+                "truncated": True,
+                "retention": "head_tail",
+                "original_bytes": 5_000_000,
+                "retained_head_bytes": 1_048_576,
+                "retained_tail_bytes": 1_048_576,
+                "elided_bytes": 5_000_000 - 2 * 1_048_576,
+                "marker": "[clio-relay: elided 2902848 bytes of stdout]",
+                "evidence_ref": None,
+            },
+            "stderr_truncation": None,
+            "structured_result": {
+                "execution_handle": {"mode": "local"},
+                "execution_record": {"state": "completed"},
+                "progress": {},
+                "runtime_metadata": {"script_path": None},
+                "pipeline_id": "pipeline-a",
+                "execution_id": "execution-a",
+            },
+        }
+
+        # The trust check (_jarvis_mcp_result_identity_matches) verifies
+        # server/args/artifact identity -- an orthogonal concern to F4's
+        # stale-truncation-field bug. Bypassed here so this test isolates
+        # the dict-construction fix instead of duplicating that machinery.
+        def _always_trusted(_job: RelayJob, _document: object) -> tuple[bool, str]:
+            return True, "test"
+
+        monkeypatch.setattr(endpoint_module, "_trusted_jarvis_mcp_result", _always_trusted)
+
+        cast(Any, worker)._write_recovered_jarvis_run_result(
+            job,
+            query_document=query_document,
+            spool=spool,
+            recovery_result_sha256="a" * 64,
+        )
+
+        recovered = json.loads((spool.path / "mcp-result.json").read_text(encoding="utf-8"))
+        assert recovered["stdout"] == ""
+        assert recovered["stderr"] == ""
+        assert recovered["stdout_truncation"] is None
+        assert recovered["stderr_truncation"] is None
+    finally:
+        worker.close()
+
+
 def test_worker_provider_uses_receipt_bound_jarvis_interpreter(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3034,7 +3114,7 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
     assert "relay_progress_token" not in progress[0].metadata
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.7"])
 def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3057,7 +3137,7 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
@@ -5853,7 +5933,7 @@ def test_worker_indexes_agent_result_artifacts(
     assert "agent_last_message.available" in event_types
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.7"])
 def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -5880,7 +5960,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),

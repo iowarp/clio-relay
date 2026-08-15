@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
+import clio_relay.remote_cli as remote_cli
 from clio_relay import cli as relay_cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition
@@ -187,8 +188,8 @@ def test_cli_remote_gateway_get_redacts_untrusted_remote_payload(
         return session.model_dump_json()
 
     monkeypatch.setattr(relay_cli, "_require_cluster", require_cluster)
-    monkeypatch.setattr(relay_cli, "should_execute_on_cluster", execute_remotely)
-    monkeypatch.setattr(relay_cli, "run_remote_clio", remote_gateway)
+    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_remotely)
+    monkeypatch.setattr(remote_cli, "run_remote_clio", remote_gateway)
 
     read = CliRunner().invoke(
         app,

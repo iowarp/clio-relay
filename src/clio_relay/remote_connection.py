@@ -32,7 +32,8 @@ import urllib.parse
 from contextlib import suppress
 from typing import Final, Literal, cast
 
-from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
+from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
     ChannelDropped,
@@ -202,6 +203,28 @@ class RemoteConnection:
         return self._transport_mode
 
     @property
+    def identity_anchor(self) -> IdentityAnchor | None:
+        """Return this connection's identity anchor (§8.3).
+
+        Prefers the HELD link's own snapshot (``ChannelLink.identity_anchor``,
+        captured when ``establish`` last succeeded) over live cluster config:
+        the audit trail must describe the link that is actually held, not
+        whatever the on-disk cluster definition says right now, which could
+        have drifted since bring-up (#231 R5 opus review item R9). Before the
+        first ``establish`` succeeds -- no link yet to describe -- falls back
+        to what config currently declares for this mode.
+        ``brokered_tcp``/``udp_rendezvous`` declare ``"preshared_link_secret"``;
+        ``ssh_forward`` has none: its identity document is carried by the
+        ssh-authenticated bootstrap act itself.
+        """
+        link = self._link
+        if link is not None:
+            return link.identity_anchor
+        if self._transport_mode in ("brokered_tcp", "udp_rendezvous"):
+            return self._definition.frp_transport.identity_anchor
+        return None
+
+    @property
     def connected(self) -> bool:
         """Return whether the channel is currently held."""
         transport = self._transport
@@ -247,7 +270,7 @@ class RemoteConnection:
                 # Dev channel: auto-replace the dropped channel (recorded, one
                 # attempt) instead of requiring the explicit reconnect().
                 previous = self._transport
-                detail = None if previous is None else previous.failure_detail()
+                detail = previous.failure_detail()
                 self._release_locked(reason="dev_mode_auto_reconnect")
                 self._record(
                     channel_event(
@@ -258,6 +281,7 @@ class RemoteConnection:
                         reason="channel_dropped_dev_mode_auto",
                         detail=detail,
                         user_authorization_required=self._allow_interactive_authorization,
+                        identity_anchor=self.identity_anchor,
                     )
                 )
                 self._establish(event="reestablished")
@@ -279,6 +303,7 @@ class RemoteConnection:
                     reason="channel_dropped",
                     detail=detail,
                     user_authorization_required=self._allow_interactive_authorization,
+                    identity_anchor=self.identity_anchor,
                 )
             )
             self._establish(event="reestablished")
@@ -364,17 +389,31 @@ class RemoteConnection:
         return status
 
     def close(self) -> None:
-        """Release the held channel and record the closure."""
+        """Release the held channel and record the closure.
+
+        ``transport.failure_detail()`` is read AFTER ``_release_locked``
+        (which calls ``transport.close()``), not before: for the frp-based
+        transports that is when a residual, secret-bearing config-cleanup
+        failure would be folded in (``HeldFrpVisitor.config_cleanup_error``,
+        #231 R5 opus review item R3) -- a normal close leaves it ``None`` and
+        the event is unchanged, but a residual is never silently dropped from
+        the ledger.
+        """
         with self._lock:
             if self._transport is None:
                 return
+            transport = self._transport
             self._release_locked(reason="closed")
+            residual_detail = transport.failure_detail()
             self._record(
                 channel_event(
                     cluster=self.cluster,
                     mode=self._transport_mode,
                     event="closed",
                     attempt=self._attempt,
+                    reason="config_cleanup_error" if residual_detail else None,
+                    detail=residual_detail,
+                    identity_anchor=self.identity_anchor,
                 )
             )
 
@@ -404,40 +443,64 @@ class RemoteConnection:
         )
 
     def _establish(self, *, event: Literal["established", "reestablished"]) -> None:
-        """Bring one transport up and prove the remote relay behind it."""
+        """Bring one transport up and prove the remote relay behind it.
+
+        ``build_transport`` runs INSIDE the try (#231 R5 opus review item R2):
+        a typed refusal it raises (``TransportIdentityAnchorRequired``, a
+        missing ``CLIO_RELAY_API_TOKEN``, ...) must still reach the ledger as
+        a terminal ``establish_failed`` event, not propagate with a dangling
+        ``establishing`` and no terminal event at all. It also means the
+        transport object exists before ``authorization_required`` is decided,
+        which is what item R7 needs (see below).
+        """
         self._attempt += 1
         nonce = secrets.token_hex(32)
-        if self._allow_interactive_authorization:
+        transport: RelayTransport | None = None
+        try:
+            transport = build_transport(
+                mode=self._transport_mode,
+                definition=self._definition,
+                session_id=self._session_id,
+                session_generation_id=self._generation_id,
+                remote_api_port=self._remote_api_port,
+                nonce=nonce,
+                api_token=self._api_token,
+                frpc_bin=self._settings.frpc_bin,
+                process_factory=self._process_factory,
+                ready_timeout_seconds=self._timeout_seconds,
+                allow_interactive_authorization=self._allow_interactive_authorization,
+            )
+            # Gated on the TRANSPORT's own declared property, not on
+            # ``self._allow_interactive_authorization`` (#231 R5 opus review
+            # item R7): that connection-level setting only controls whether an
+            # ssh_forward dial may prompt (it becomes
+            # ``SshForwardTransport.requires_user_authorization`` verbatim, so
+            # ssh_forward's event is unchanged), but a default-configured
+            # brokered_tcp/udp_rendezvous connection has no prompt to announce
+            # at all -- gating on the transport's own answer is what makes
+            # "no authorization event" a structural property of the mode
+            # rather than a fixture/settings choice.
+            if transport.requires_user_authorization:
+                self._record(
+                    channel_event(
+                        cluster=self.cluster,
+                        mode=self._transport_mode,
+                        event="authorization_required",
+                        attempt=self._attempt,
+                        reason="transport_requires_user_authorization",
+                        user_authorization_required=True,
+                        identity_anchor=self.identity_anchor,
+                    )
+                )
             self._record(
                 channel_event(
                     cluster=self.cluster,
                     mode=self._transport_mode,
-                    event="authorization_required",
+                    event="establishing",
                     attempt=self._attempt,
-                    reason="transport_requires_user_authorization",
-                    user_authorization_required=True,
+                    identity_anchor=self.identity_anchor,
                 )
             )
-        self._record(
-            channel_event(
-                cluster=self.cluster,
-                mode=self._transport_mode,
-                event="establishing",
-                attempt=self._attempt,
-            )
-        )
-        transport = build_transport(
-            mode=self._transport_mode,
-            definition=self._definition,
-            session_id=self._session_id,
-            session_generation_id=self._generation_id,
-            remote_api_port=self._remote_api_port,
-            nonce=nonce,
-            process_factory=self._process_factory,
-            ready_timeout_seconds=self._timeout_seconds,
-            allow_interactive_authorization=self._allow_interactive_authorization,
-        )
-        try:
             link = transport.establish(nonce=nonce)
             endpoint = link.control_endpoint
             bootstrap = link.bootstrap
@@ -449,7 +512,8 @@ class RemoteConnection:
                 timeout_seconds=self._timeout_seconds,
             )
         except BaseException as exc:
-            transport.close()
+            if transport is not None:
+                transport.close()
             self._record(
                 channel_event(
                     cluster=self.cluster,
@@ -458,6 +522,7 @@ class RemoteConnection:
                     attempt=self._attempt,
                     reason=type(exc).__name__,
                     detail=str(exc),
+                    identity_anchor=self.identity_anchor,
                 )
             )
             raise
@@ -475,6 +540,7 @@ class RemoteConnection:
                 mode=self._transport_mode,
                 event=event,
                 attempt=self._attempt,
+                identity_anchor=self.identity_anchor,
             )
         )
 
@@ -515,7 +581,10 @@ class RemoteConnection:
         block every other operation on the same cluster.  Opening another stream
         is another TCP connection *through the forward that is already held*, so
         it costs no new transport -- the dial count is unchanged.  Every stream
-        is proven against the same out-of-band bring-up identity document before
+        is proven against the same bring-up identity document -- carried
+        out-of-band in ``ssh_forward`` mode, fetched identity-first over the
+        held link itself under the weaker ``preshared_link_secret`` anchor in
+        modes (a)/(b) (§8.3; ``RemoteConnection.identity_anchor``) -- before
         any credential is sent, so none of them talks to an unproven listener.
 
         ``reason`` labels *why* a freshly proven stream's ``stream_reproven``
@@ -537,6 +606,7 @@ class RemoteConnection:
                         attempt=self._attempt,
                         reason="transport_exited",
                         detail=transport.failure_detail(),
+                        identity_anchor=self.identity_anchor,
                     )
                 )
                 raise ChannelDropped(
@@ -582,6 +652,7 @@ class RemoteConnection:
                         event="stream_reproven",
                         attempt=self._attempt,
                         reason=reason,
+                        identity_anchor=self.identity_anchor,
                     )
                 )
         return proven
@@ -765,6 +836,7 @@ class RemoteConnectionRegistry:
             events = connection.events
             clusters[cluster] = {
                 "transport_mode": connection.transport_mode,
+                "identity_anchor": connection.identity_anchor,
                 "session_id": connection.session_id,
                 "session_generation_id": connection.session_generation_id,
                 "remote_api_port": connection.remote_api_port,
@@ -795,6 +867,7 @@ def _retired_report(connection: RemoteConnection) -> dict[str, object]:
         "session_id": connection.session_id,
         "session_generation_id": connection.session_generation_id,
         "transport_mode": connection.transport_mode,
+        "identity_anchor": connection.identity_anchor,
         "transport_connections_opened": sum(
             1 for event in events if event.event in {"established", "reestablished"}
         ),
@@ -917,6 +990,20 @@ def _request_json_on_stream(
         response = stream.getresponse()
         document = read_json_response(response, label=f"{method} {path}")
         if not 200 <= response.status < 300:
+            # A1 (#231 R6 review): door_errors.as_http_problem spreads the
+            # original T2 refusal document's fields (doc §6.4) into the 413
+            # problem body (fault.data, F4) -- recognized here so its own
+            # typed code/message surfaces instead of the generic "HTTP
+            # {status}: {raw json blob}" that discards the structure.
+            typed_document = (
+                cast(dict[str, object], document) if isinstance(document, dict) else None
+            )
+            if typed_document is not None and is_delivery_refusal(typed_document):
+                code = cast(dict[str, object], typed_document.get("delivery", {})).get("code")
+                raise RelayError(
+                    f"owned session API request refused delivery ({code}): "
+                    f"{describe_delivery_refusal(typed_document)}"
+                )
             detail = json.dumps(document, ensure_ascii=False)[:2_000]
             raise RelayError(
                 f"owned session API request failed: {method} {path}: "
@@ -963,9 +1050,17 @@ def verify_session_identity(
     *,
     expected: dict[str, object],
 ) -> None:
-    """Require the reached listener to be the out-of-band proven session."""
+    """Require the reached listener to be the bring-up-proven session.
+
+    ``expected`` is proven under whatever identity anchor this connection's
+    mode declares (§8.3) -- the ssh-authenticated bootstrap act in
+    ``ssh_forward`` mode, the weaker ``preshared_link_secret`` anchor in
+    modes (a)/(b) -- never assumed to be ssh-specific here.
+    """
     if any(observed.get(field) != expected.get(field) for field in _IDENTITY_FIELDS):
-        raise RelayError("owned session API server identity did not match the SSH-proven session")
+        raise RelayError(
+            "owned session API server identity did not match the bring-up-proven session"
+        )
     observed_signature = observed.get("hmac_sha256")
     expected_signature = expected.get("hmac_sha256")
     if (

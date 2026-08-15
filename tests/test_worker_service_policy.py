@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
-from clio_relay import cli, deployment
+from clio_relay import deployment
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -195,7 +195,7 @@ def test_install_service_persists_explicit_capacity_overrides(
         rendered_units.append(service_text)
         return ["endpoint_service.active=active"]
 
-    monkeypatch.setattr(cli, "install_endpoint_user_service_over_ssh", install)
+    monkeypatch.setattr(deployment, "install_endpoint_user_service_over_ssh", install)
     runner = CliRunner()
 
     changed = runner.invoke(
@@ -272,8 +272,8 @@ def test_restart_service_cli_preserves_registry_and_never_installs(
     def fail_install(**_kwargs: object) -> list[str]:
         raise AssertionError("restart-only must not call the installer")
 
-    monkeypatch.setattr(cli, "restart_endpoint_user_service_over_ssh", restart)
-    monkeypatch.setattr(cli, "install_endpoint_user_service_over_ssh", fail_install)
+    monkeypatch.setattr(deployment, "restart_endpoint_user_service_over_ssh", restart)
+    monkeypatch.setattr(deployment, "install_endpoint_user_service_over_ssh", fail_install)
 
     result = CliRunner().invoke(
         app,

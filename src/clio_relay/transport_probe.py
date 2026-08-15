@@ -5,27 +5,25 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import socket
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.relay_host import (
-    FrpcConfig,
-    FrpcVisitorConfig,
-    FrpTransportProtocol,
-    render_frpc_config,
-    render_frpc_visitor_config,
+from clio_relay.frp_link import (
+    FrpLinkConfig,
+    FrpVisitorType,
+    HeldFrpVisitor,
+    require_frp_server_addr,
 )
+from clio_relay.frp_link import assert_loopback_port_available as _assert_local_bind_port_available
+from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 from clio_relay.session_lifecycle import (
     CleanupResource,
@@ -103,9 +101,17 @@ class _RemoteCleanupPayload(BaseModel):
 
 
 class ManagedProcess(Protocol):
-    """Subset of subprocess.Popen used by the transport probe."""
+    """Subset of subprocess.Popen used by the transport probe.
+
+    ``stdin``/``stdout``/``stderr`` stay ``Any``: Protocol attributes are
+    checked invariantly, and the test double in
+    ``tests/test_transport_probe.py`` declares them with a narrower concrete
+    type that only ``Any`` accepts both ways without editing that file.
+    """
 
     stdin: Any | None
+    stdout: Any | None
+    stderr: Any | None
 
     def poll(self) -> int | None:
         """Return process status."""
@@ -224,115 +230,21 @@ def run_frp_http_probe(
     http_check: HttpCheck | None = None,
 ) -> list[str]:
     """Probe desktop-to-cluster HTTP reachability through frp STCP."""
-    if local_bind_port <= 0:
-        raise ConfigurationError("local_bind_port must be positive")
-    if remote_api_port <= 0:
-        raise ConfigurationError("remote_api_port must be positive")
-    if timeout_seconds <= 0:
-        raise ConfigurationError("timeout_seconds must be positive")
-    _assert_local_bind_port_available(local_bind_port)
-    factory = process_factory or _popen
-    transport = definition.frp_transport
-    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
-    _require_api_token(api_token)
-    protocol = FrpTransportProtocol(transport.protocol)
-    with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
-        temp_path = Path(temp_dir)
-        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
-        remote_frpc_config = render_frpc_config(
-            FrpcConfig(
-                server_addr=server_addr,
-                server_port=transport.server_port,
-                token=token,
-                transport_protocol=protocol,
-                proxy_name=proxy_name,
-                local_port=remote_api_port,
-                secret_key=secret_key,
-            )
-        )
-        visitor_config_path = temp_path / "frpc-visitor.toml"
-        visitor_config_path.write_text(
-            render_frpc_visitor_config(
-                FrpcVisitorConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=token,
-                    transport_protocol=protocol,
-                    visitor_name=f"{proxy_name}-visitor",
-                    server_name=proxy_name,
-                    bind_port=local_bind_port,
-                    secret_key=secret_key,
-                )
-            ),
-            encoding="utf-8",
-        )
-        remote = factory(
-            ["ssh", definition.ssh_host, "bash", "-s"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert remote.stdin is not None
-        remote.stdin.write(
-            _remote_probe_script(
-                cluster=cluster,
-                definition=definition,
-                probe_id=probe_id,
-                api_token=api_token,
-                api_port=remote_api_port,
-                frpc_config=remote_frpc_config,
-            ).encode("utf-8")
-        )
-        remote.stdin.close()
-        visitor = factory(
-            [frpc_bin, "-c", str(visitor_config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        lines: list[str] = []
-        primary_error: BaseException | None = None
-        try:
-            time.sleep(1)
-            if remote.poll() is not None:
-                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            try:
-                _wait_for_healthz(
-                    f"http://127.0.0.1:{local_bind_port}/healthz",
-                    timeout_seconds=timeout_seconds,
-                )
-            except RelayError as exc:
-                _terminate(visitor)
-                _terminate(remote)
-                details = [
-                    str(exc),
-                    _process_output_message(remote, "remote transport probe still running"),
-                    _process_output_message(visitor, "local frpc visitor still running"),
-                ]
-                raise RelayError("\n".join(details)) from exc
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            lines = [
-                f"transport.cluster={cluster}",
-                f"transport.server={server_addr}:{transport.server_port}",
-                f"transport.protocol={transport.protocol}",
-                f"transport.local_url=http://127.0.0.1:{local_bind_port}",
-                "transport.healthz=ok",
-            ]
-            if http_check is not None:
-                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
-        except BaseException as exc:
-            primary_error = exc
-        cleanup_lines = _finish_frp_probe_cleanup(
-            cluster=cluster,
-            definition=definition,
-            probe_id=probe_id,
-            visitor=visitor,
-            remote=remote,
-            primary_error=primary_error,
-        )
-        return [*lines, *cleanup_lines]
+    return _run_frp_http_probe_with_proxy_type(
+        cluster=cluster,
+        definition=definition,
+        frpc_bin=frpc_bin,
+        token=token,
+        secret_key=secret_key,
+        local_bind_port=local_bind_port,
+        remote_api_port=remote_api_port,
+        proxy_name=proxy_name,
+        api_token=api_token,
+        timeout_seconds=timeout_seconds,
+        process_factory=process_factory,
+        http_check=http_check,
+        proxy_type="stcp",
+    )
 
 
 def run_frp_direct_http_probe(
@@ -1009,110 +921,111 @@ def _run_frp_http_probe_with_proxy_type(
     _assert_local_bind_port_available(local_bind_port)
     factory = process_factory or _popen
     transport = definition.frp_transport
-    server_addr = _require_frp_server_addr(transport.server_addr, cluster)
+    server_addr = require_frp_server_addr(transport.server_addr, cluster)
     _require_api_token(api_token)
     protocol = FrpTransportProtocol(transport.protocol)
-    with tempfile.TemporaryDirectory(prefix="clio-relay-transport-") as temp_dir:
-        temp_path = Path(temp_dir)
-        probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
-        remote_frpc_config = render_frpc_config(
-            FrpcConfig(
-                server_addr=server_addr,
-                server_port=transport.server_port,
-                token=token,
-                transport_protocol=protocol,
-                proxy_name=proxy_name,
-                proxy_type=proxy_type,
-                local_port=remote_api_port,
-                secret_key=secret_key,
-            )
+    probe_id = _probe_id(cluster=cluster, proxy_name=proxy_name)
+    remote_frpc_config = render_frpc_config(
+        FrpcConfig(
+            server_addr=server_addr,
+            server_port=transport.server_port,
+            token=token,
+            transport_protocol=protocol,
+            proxy_name=proxy_name,
+            proxy_type=proxy_type,
+            local_port=remote_api_port,
+            secret_key=secret_key,
         )
-        visitor_config_path = temp_path / "frpc-visitor.toml"
-        visitor_config_path.write_text(
-            render_frpc_visitor_config(
-                FrpcVisitorConfig(
-                    server_addr=server_addr,
-                    server_port=transport.server_port,
-                    token=token,
-                    transport_protocol=protocol,
-                    visitor_name=f"{proxy_name}-visitor",
-                    visitor_type=proxy_type,
-                    server_name=proxy_name,
-                    bind_port=local_bind_port,
-                    secret_key=secret_key,
-                    keep_tunnel_open=proxy_type == "xtcp",
-                )
-            ),
-            encoding="utf-8",
-        )
-        remote = factory(
-            ["ssh", definition.ssh_host, "bash", "-s"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert remote.stdin is not None
-        remote.stdin.write(
-            _remote_probe_script(
-                cluster=cluster,
-                definition=definition,
-                probe_id=probe_id,
-                api_token=api_token,
-                api_port=remote_api_port,
-                frpc_config=remote_frpc_config,
-            ).encode("utf-8")
-        )
-        remote.stdin.close()
-        visitor = factory(
-            [frpc_bin, "-c", str(visitor_config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        lines: list[str] = []
-        primary_error: BaseException | None = None
-        try:
-            time.sleep(1)
-            if remote.poll() is not None:
-                raise RelayError(_process_output_message(remote, "remote transport probe failed"))
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            try:
-                _wait_for_healthz(
-                    f"http://127.0.0.1:{local_bind_port}/healthz",
-                    timeout_seconds=timeout_seconds,
-                )
-            except RelayError as exc:
-                _terminate(visitor)
-                _terminate(remote)
-                details = [
-                    str(exc),
-                    _process_output_message(remote, "remote transport probe still running"),
-                    _process_output_message(visitor, "local frpc visitor still running"),
-                ]
-                raise RelayError("\n".join(details)) from exc
-            if visitor.poll() is not None:
-                raise RelayError(_process_output_message(visitor, "local frpc visitor failed"))
-            lines = [
-                f"transport.cluster={cluster}",
-                f"transport.server={server_addr}:{transport.server_port}",
-                f"transport.protocol={transport.protocol}",
-                f"transport.proxy_type={proxy_type}",
-                f"transport.local_url=http://127.0.0.1:{local_bind_port}",
-                "transport.healthz=ok",
-            ]
-            if http_check is not None:
-                lines.extend(http_check(f"http://127.0.0.1:{local_bind_port}"))
-        except BaseException as exc:
-            primary_error = exc
-        cleanup_lines = _finish_frp_probe_cleanup(
+    )
+    remote = factory(
+        ["ssh", definition.ssh_host, "bash", "-s"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert remote.stdin is not None
+    remote.stdin.write(
+        _remote_probe_script(
             cluster=cluster,
             definition=definition,
             probe_id=probe_id,
-            visitor=visitor,
-            remote=remote,
-            primary_error=primary_error,
+            api_token=api_token,
+            api_port=remote_api_port,
+            frpc_config=remote_frpc_config,
+        ).encode("utf-8")
+    )
+    remote.stdin.close()
+
+    lines: list[str] = []
+    primary_error: BaseException | None = None
+    visitor: HeldFrpVisitor | None = None
+    try:
+        # The local-visitor half (write the 0600 config, spawn `frpc -c <toml>`,
+        # track/terminate it) delegates to the shared substrate (#231 R4) rather
+        # than reimplementing it here -- the remote-side script above is the only
+        # part of this probe that stays local to transport_probe.py. establish()
+        # is inside this try (not before it) so a spawn failure still reaches
+        # _finish_frp_probe_cleanup below instead of leaking the remote process
+        # (#231 R4 opus review F9).
+        visitor = HeldFrpVisitor(
+            frpc_bin=frpc_bin,
+            config=FrpLinkConfig(
+                server_addr=server_addr,
+                server_port=transport.server_port,
+                protocol=protocol,
+                token=token,
+                secret_key=secret_key,
+                proxy_name=proxy_name,
+            ),
+            local_bind_port=local_bind_port,
+            visitor_type=cast(FrpVisitorType, proxy_type),
+            keep_tunnel_open=proxy_type == "xtcp",
+            process_factory=process_factory,
         )
-        return [*lines, *cleanup_lines]
+        visitor.establish()
+
+        time.sleep(1)
+        if remote.poll() is not None:
+            raise RelayError(_process_output_message(remote, "remote transport probe failed"))
+        if not visitor.is_alive():
+            raise RelayError(_visitor_failure_message(visitor, "local frpc visitor failed"))
+        try:
+            _wait_for_healthz(
+                f"{visitor.base_url}/healthz",
+                timeout_seconds=timeout_seconds,
+            )
+        except RelayError as exc:
+            visitor.close()
+            _terminate(remote)
+            details = [
+                str(exc),
+                _process_output_message(remote, "remote transport probe still running"),
+                _visitor_failure_message(visitor, "local frpc visitor still running"),
+            ]
+            raise RelayError("\n".join(details)) from exc
+        if not visitor.is_alive():
+            raise RelayError(_visitor_failure_message(visitor, "local frpc visitor failed"))
+        lines = [
+            f"transport.cluster={cluster}",
+            f"transport.server={server_addr}:{transport.server_port}",
+            f"transport.protocol={transport.protocol}",
+            f"transport.proxy_type={proxy_type}",
+            f"transport.local_url={visitor.base_url}",
+            "transport.healthz=ok",
+        ]
+        if http_check is not None:
+            lines.extend(http_check(visitor.base_url))
+    except BaseException as exc:
+        primary_error = exc
+    cleanup_lines = _finish_frp_probe_cleanup(
+        cluster=cluster,
+        definition=definition,
+        probe_id=probe_id,
+        visitor=visitor,
+        remote=remote,
+        primary_error=primary_error,
+    )
+    return [*lines, *cleanup_lines]
 
 
 def _finish_frp_probe_cleanup(
@@ -1120,24 +1033,33 @@ def _finish_frp_probe_cleanup(
     cluster: str,
     definition: ClusterDefinition,
     probe_id: str,
-    visitor: ManagedProcess,
+    visitor: HeldFrpVisitor | None,
     remote: ManagedProcess,
     primary_error: BaseException | None,
 ) -> list[str]:
     """Verify local and remote probe teardown before reporting cleanup success."""
     cleanup_errors: list[str] = []
     cleanup_lines: list[str] = []
-    local_stopped = False
+    local_stopped = True
     local_detail: str | None = None
-    try:
-        _terminate(visitor)
-        local_stopped = visitor.poll() is not None
-        if not local_stopped:
-            local_detail = "local frpc visitor remains running"
+    config_cleanup_error: str | None = None
+    if visitor is not None:
+        local_stopped = False
+        try:
+            visitor.close()
+            local_stopped = not visitor.is_alive()
+            if not local_stopped:
+                local_detail = "local frpc visitor remains running"
+                cleanup_errors.append(local_detail)
+            config_cleanup_error = visitor.config_cleanup_error
+            if config_cleanup_error is not None:
+                # Never folded into local_detail: this is a distinct resource
+                # (a leaked plaintext-secret file, not the process) and gets
+                # its own ledger entry below (#231 R4 opus review F3).
+                cleanup_errors.append(config_cleanup_error)
+        except BaseException as exc:
+            local_detail = f"local frpc cleanup failed: {type(exc).__name__}: {exc}"
             cleanup_errors.append(local_detail)
-    except BaseException as exc:
-        local_detail = f"local frpc cleanup failed: {type(exc).__name__}: {exc}"
-        cleanup_errors.append(local_detail)
     try:
         cleanup_lines.extend(
             _cleanup_remote_probe(
@@ -1161,37 +1083,65 @@ def _finish_frp_probe_cleanup(
     except BaseException as exc:
         remote_control_detail = f"remote SSH cleanup failed: {type(exc).__name__}: {exc}"
         cleanup_errors.append(remote_control_detail)
+    resources: list[TransportCleanupResourceEvidence] = []
+    if visitor is not None:
+        # Omitted entirely when no visitor was ever constructed (#231 R5 opus
+        # review item R14): with no visitor object, nothing was verified
+        # stopped -- reporting "outcome=stopped, verified_after_operation=True"
+        # for a resource that never existed would be a fabricated claim, not a
+        # residual-secret gap like the config-file entry below.
+        resources.append(
+            _process_cleanup_resource(
+                kind="connector",
+                resource_id=f"frpc-visitor:{probe_id}",
+                role="desktop_frpc_visitor",
+                location="desktop",
+                ownership_verified=True,
+                outcome="stopped" if local_stopped else "failed",
+                verified_after_operation=local_stopped,
+                observed_state="stopped" if local_stopped else "running_or_unknown",
+                residual=not local_stopped,
+                detail=local_detail,
+            )
+        )
+    resources.append(
+        _process_cleanup_resource(
+            kind="connector",
+            resource_id=f"ssh-probe-control:{probe_id}",
+            role="desktop_ssh_probe_control",
+            location="desktop",
+            ownership_verified=True,
+            outcome="stopped" if remote_control_stopped else "failed",
+            verified_after_operation=remote_control_stopped,
+            observed_state=("stopped" if remote_control_stopped else "running_or_unknown"),
+            residual=not remote_control_stopped,
+            detail=remote_control_detail,
+        )
+    )
+    if config_cleanup_error is not None:
+        # A residual, secret-bearing config file is a distinct resource from
+        # the process above: the process can be confirmed stopped while its
+        # config directory still failed to delete (#231 R4 opus review F3).
+        resources.append(
+            _process_cleanup_resource(
+                kind="secret_config_file",
+                resource_id=f"frpc-visitor-config:{probe_id}",
+                role="desktop_frpc_visitor_config",
+                location="desktop",
+                ownership_verified=True,
+                outcome="residual",
+                verified_after_operation=False,
+                observed_state="residual",
+                residual=True,
+                detail=config_cleanup_error,
+            )
+        )
     cleanup_lines.append(
         _transport_resource_line(
             probe_id=probe_id,
             cluster=cluster,
             cleanup_mode="transport_probe_teardown",
-            resources=[
-                _process_cleanup_resource(
-                    kind="connector",
-                    resource_id=f"frpc-visitor:{probe_id}",
-                    role="desktop_frpc_visitor",
-                    location="desktop",
-                    ownership_verified=True,
-                    outcome="stopped" if local_stopped else "failed",
-                    verified_after_operation=local_stopped,
-                    observed_state="stopped" if local_stopped else "running_or_unknown",
-                    residual=not local_stopped,
-                    detail=local_detail,
-                ),
-                _process_cleanup_resource(
-                    kind="connector",
-                    resource_id=f"ssh-probe-control:{probe_id}",
-                    role="desktop_ssh_probe_control",
-                    location="desktop",
-                    ownership_verified=True,
-                    outcome="stopped" if remote_control_stopped else "failed",
-                    verified_after_operation=remote_control_stopped,
-                    observed_state=("stopped" if remote_control_stopped else "running_or_unknown"),
-                    residual=not remote_control_stopped,
-                    detail=remote_control_detail,
-                ),
-            ],
+            resources=resources,
         )
     )
     if cleanup_errors:
@@ -1771,24 +1721,6 @@ def _last_json_line(output: str) -> dict[str, object]:
     raise RelayError("remote cleanup did not emit a bounded JSON object")
 
 
-def _assert_local_bind_port_available(port: int) -> None:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            probe.bind(("127.0.0.1", port))
-    except OSError as exc:
-        raise ConfigurationError(f"local visitor port is already occupied: {port}") from exc
-
-
-def _require_frp_server_addr(server_addr: str, cluster: str) -> str:
-    if server_addr.strip():
-        return server_addr
-    raise ConfigurationError(
-        f"frp server address is not configured for cluster {cluster}; "
-        "set it with `clio-relay cluster add --frp-server-addr ...`"
-    )
-
-
 def _require_api_token(api_token: str | None) -> str:
     if api_token is None or api_token == "":
         raise ConfigurationError(
@@ -1809,6 +1741,20 @@ def _terminate(process: ManagedProcess) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _visitor_failure_message(visitor: HeldFrpVisitor, label: str) -> str:
+    """Return ``label``, plus the visitor's bounded stdout/stderr as detail.
+
+    ``label`` is always a PREFIX, never a replacement (#231 R4 opus review
+    F2): the pre-R4 code read both of the visitor's streams via
+    ``_process_output_message`` and included them alongside a fixed label
+    like "local frpc visitor failed"; delegating to
+    ``HeldFrpVisitor.failure_detail()`` must not regress that to a bare label
+    with no diagnostic content.
+    """
+    detail = visitor.failure_detail()
+    return f"{label}: {detail}" if detail else label
 
 
 def _process_output_message(process: ManagedProcess, fallback: str) -> str:
