@@ -8,16 +8,19 @@ import json
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+import types
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from typing import cast
+from typing import BinaryIO, Literal, cast
 
 import httpx
 import pytest
@@ -566,6 +569,57 @@ class FakeRunner(CommandRunner):
             process_start_marker=f"start-{pid}",
             owner_token=owner_token,
         )
+
+
+class LifecycleFrpProcess(FakeProcess):
+    """Fake detached frpc wrapper whose liveness can change after bring-up."""
+
+    def __init__(self, pid: int, argv: Sequence[str]) -> None:
+        super().__init__(pid)
+        self.argv = list(argv)
+        self.returncode: int | None = None
+
+    def drop(self) -> None:
+        """Simulate an unexpected connector exit without triggering a replacement."""
+        self.returncode = 255
+
+
+class LifecycleFrpRunner(FakeRunner):
+    """Fake runner with a process factory keyed on the spawned argv."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frp_processes: list[LifecycleFrpProcess] = []
+
+    def popen(
+        self,
+        command: Sequence[str],
+        *,
+        stdout_path: Path,
+        stderr_path: Path,
+        env: dict[str, str] | None = None,
+        isolate_process_group: bool = False,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.Popen[bytes]:
+        argv = list(command)
+        if "frpc-test" not in argv:
+            return super().popen(
+                command,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                env=env,
+                isolate_process_group=isolate_process_group,
+                input_bytes=input_bytes,
+            )
+        self.popen_commands.append(argv)
+        self.popen_environments.append(env)
+        self.popen_inputs.append(input_bytes)
+        self.isolated_processes.append(isolate_process_group)
+        stdout_path.write_bytes(b"")
+        stderr_path.write_bytes(b"")
+        process = LifecycleFrpProcess(555 + len(self.frp_processes), argv)
+        self.frp_processes.append(process)
+        return cast(subprocess.Popen[bytes], process)
 
 
 class TransientConnectorDiscoveryRunner(FakeRunner):
@@ -1252,12 +1306,16 @@ def test_service_runtime_supervisor_starts_generic_streaming_service(tmp_path: P
     assert session.gateway["connect_url"] == "http://127.0.0.1:28777"
     assert result.health_url == "http://127.0.0.1:28777/healthz"
     assert result.events_url == "http://127.0.0.1:28777/events"
+    assert len(runner.popen_commands) == 1
     assert runner.popen_commands[0][-3:] == [
         "frpc-test",
         "-c",
         str(_visitor_config_path(settings, session.session_id)),
     ]
     assert runner.isolated_processes == [True]
+    config_path = _visitor_config_path(settings, session.session_id)
+    if service_runtime.os.name != "nt":
+        assert config_path.stat().st_mode & 0o777 == 0o600
     connector = session.gateway["transport"]["desktop_connector"]
     assert connector["process_group_id"] == 555
     assert connector["process_start_marker"] == "start-555"
@@ -1266,7 +1324,7 @@ def test_service_runtime_supervisor_starts_generic_streaming_service(tmp_path: P
     assert (
         runner.popen_environments[0]["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] == connector["owner_token"]
     )
-    visitor_config = _visitor_config_path(settings, session.session_id).read_text(encoding="utf-8")
+    visitor_config = config_path.read_text(encoding="utf-8")
     assert 'serverAddr = "frps.example.org"' in visitor_config
     assert 'serverName = "generic-service-proxy"' in visitor_config
     assert "bindPort = 28777" in visitor_config
@@ -1278,6 +1336,157 @@ def test_service_runtime_supervisor_starts_generic_streaming_service(tmp_path: P
     )
     assert 'kill -0 -- "-$pid"' in remote_scripts
     assert "incomplete remote connector process group cleanup" in remote_scripts
+
+    # A ready-session observation, including after an out-of-band visitor drop,
+    # never spends a second frpc spawn. Explicit detach/attach owns replacement.
+    resumed = supervisor.resume_start(session_id=session.session_id)
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert len(runner.popen_commands) == 1
+
+
+def _start_lifecycle_frp_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ServiceRuntimeSupervisor, LifecycleFrpRunner, ServiceRuntimeStartResult]:
+    def allow_private_path(_path: Path, *, directory: bool = True) -> None:
+        del directory
+
+    for module_name in (
+        "clio_relay.cluster_config",
+        "clio_relay.core_queue",
+        "clio_relay.worker_lifetime_lock",
+        "clio_relay.service_runtime",
+    ):
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_directory",
+            allow_private_path,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_path",
+            allow_private_path,
+            raising=False,
+        )
+
+    @contextmanager
+    def open_test_atomic_file(path: Path) -> Iterator[BinaryIO]:
+        with path.open("xb") as handle:
+            yield handle
+
+    monkeypatch.setattr(
+        "clio_relay.core_queue.open_private_atomic_file",
+        open_test_atomic_file,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        frpc_bin="frpc-test",
+    )
+    runner = LifecycleFrpRunner()
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=ClioCoreQueue(settings.core_dir),
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+        runner=runner,
+        sleep=lambda _seconds: None,
+    )
+    supervisor._wait_for_local_health = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    result = supervisor.start(name="frp-lifecycle", spec=_runtime_spec())
+    assert isinstance(result, ServiceRuntimeStartResult)
+    return supervisor, runner, result
+
+
+def test_service_runtime_frp_bring_up_spawns_once_and_does_not_respawn_after_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, runner, started = _start_lifecycle_frp_runtime(tmp_path, monkeypatch)
+
+    assert len(runner.frp_processes) == 1
+    process = runner.frp_processes[0]
+    transport = cast(dict[str, object], started.session.gateway["transport"])
+    connector = cast(dict[str, object], transport["desktop_connector"])
+    config_path = Path(cast(str, connector["config_path"]))
+    assert process.argv[-3:] == ["frpc-test", "-c", str(config_path)]
+    assert Path(cast(str, connector["stdout_path"])).is_file()
+    assert Path(cast(str, connector["stderr_path"])).is_file()
+    if service_runtime.os.name != "nt":
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    process.drop()
+
+    resumed = supervisor.resume_start(session_id=started.session.session_id)
+
+    assert isinstance(resumed, ServiceRuntimeStartResult)
+    assert len(runner.frp_processes) == 1
+
+
+def test_service_runtime_frp_teardown_escalates_and_verifies_process_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, runner, started = _start_lifecycle_frp_runtime(tmp_path, monkeypatch)
+    process = runner.frp_processes[0]
+    signals: list[int] = []
+    sigkill = getattr(signal, "SIGKILL", 9)
+
+    def identity_status(
+        _connector: dict[str, object],
+    ) -> tuple[Literal["owned"], None]:
+        return "owned", None
+
+    def group_members(_connector: dict[str, object]) -> list[int]:
+        return [process.pid] if process.returncode is None else []
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(service_runtime, "os", types.SimpleNamespace(name="posix"))
+    monkeypatch.setattr(service_runtime.signal, "SIGKILL", sigkill, raising=False)
+    monkeypatch.setattr(
+        service_runtime,
+        "_local_connector_identity_status",
+        identity_status,
+    )
+    monkeypatch.setattr(
+        service_runtime,
+        "_local_connector_group_members",
+        group_members,
+    )
+
+    def signal_processes(_connector: dict[str, object], sent_signal: int) -> None:
+        signals.append(sent_signal)
+        if sent_signal == sigkill:
+            process.returncode = -sigkill
+
+    clock = iter((0.0, 6.0, 7.0, 8.0))
+    monkeypatch.setattr(
+        service_runtime,
+        "_signal_owned_posix_connector_processes",
+        signal_processes,
+    )
+    monkeypatch.setattr(service_runtime.time, "time", lambda: next(clock))
+    monkeypatch.setattr(service_runtime.time, "sleep", no_sleep)
+
+    stopped = supervisor.stop(session_id=started.session.session_id)
+
+    assert signals == [signal.SIGTERM, sigkill]
+    transport = cast(dict[str, object], started.session.gateway["transport"])
+    connector = cast(dict[str, object], transport["desktop_connector"])
+    # Durable config/log evidence is intentionally retained by this profile;
+    # teardown proves process-group absence rather than deleting the session record.
+    assert Path(cast(str, connector["config_path"])).is_file()
+    assert Path(cast(str, connector["stdout_path"])).is_file()
+    assert Path(cast(str, connector["stderr_path"])).is_file()
+    local_cleanup = next(
+        resource for resource in stopped.resources if resource.kind == "desktop_connector"
+    )
+    assert local_cleanup.outcome == "stopped"
+    assert local_cleanup.verified_after_operation is True
+    assert local_cleanup.residual is False
+    assert stopped.errors == []
 
 
 @pytest.mark.parametrize("mode", ["scheduler", "scheduler_output", "remote", "local"])

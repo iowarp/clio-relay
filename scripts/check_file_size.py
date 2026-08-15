@@ -264,7 +264,10 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/retention.py": 944,
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,
-    "src/clio_relay/service_runtime.py": 10163,
+    # #231 R10: the local owned-visitor render/write/spawn path now delegates
+    # to frp_link.py, while the three remote frpc start/stop script generators
+    # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
+    "src/clio_relay/service_runtime.py": 9391,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
