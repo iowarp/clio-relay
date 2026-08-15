@@ -81,7 +81,7 @@ from clio_relay.scheduler_providers import (
     SchedulerAllocationConnectorProvider,
     provider_for_scheduler,
 )
-from clio_relay.session_lifecycle import CleanupResource
+from clio_relay.session_wire_models import CleanupResource
 
 if TYPE_CHECKING:
     from clio_relay.validation_report import (

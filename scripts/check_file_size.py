@@ -232,7 +232,13 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,
     "src/clio_relay/service_runtime.py": 10163,
-    "src/clio_relay/session_lifecycle.py": 8326,
+    # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
+    # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
+    # lines) plus its 2 bound constants moved to the new
+    # session_wire_models.py, re-exported here under their original names
+    # (RemoteSession is not re-exported -- nothing outside the wire-model
+    # module ever referenced it, confirmed by ruff F401). 8326 -> 7801.
+    "src/clio_relay/session_lifecycle.py": 7801,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     "src/clio_relay/storage_runtime.py": 1111,
@@ -247,7 +253,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # spawn failure still reaches cleanup (F9). Evaluated ground rule 5
     # (remove/redesign first) and rejected -- this is the review's required
     # safety/diagnostic behavior, not accreted duplication. 1749 -> 1795.
-    "src/clio_relay/transport_probe.py": 1795,
+    # #231 R8(iii): wire-model import collapses from a 7-line multi-import
+    # block to a single-line `from clio_relay.session_wire_models import
+    # CleanupResource, OwnedSessionStartResult` -- ratchet down. 1795 -> 1794.
+    "src/clio_relay/transport_probe.py": 1794,
     "src/clio_relay/validation_report.py": 5458,
 }
 
