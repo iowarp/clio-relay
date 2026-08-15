@@ -29,6 +29,7 @@ from uuid import uuid4
 from filelock import FileLock, Timeout
 from pydantic import BaseModel
 
+from clio_relay import queue_context, queue_jarvis_inputs
 from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.cluster_config import (
     ensure_private_configuration_directory,
@@ -473,6 +474,48 @@ class _FairBoundedFileLock:
             self._serving_ticket += 1
 
 
+class _CoreQueueStoreAdapter:
+    """Temporarily adapt the facade's private store to extracted queue owners."""
+
+    def __init__(self, queue: ClioCoreQueue) -> None:
+        self._queue = queue
+
+    @property
+    def storage_root(self) -> Path:
+        """Return the facade's internal durable storage root."""
+        return self._queue._storage_root  # pyright: ignore[reportPrivateUsage]
+
+    @property
+    def lock(self) -> queue_context.QueueLockProtocol:
+        """Return the facade's shared storage lock."""
+        return self._queue._lock  # pyright: ignore[reportPrivateUsage]
+
+    def initialize(self) -> None:
+        """Initialize the facade's current private store."""
+        self._queue.initialize()
+
+    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
+        """Read one optional record through the facade's private store."""
+        return self._queue._read_optional(  # pyright: ignore[reportPrivateUsage]
+            path,
+            model,
+        )
+
+    def write(self, path: Path, record: BaseModel) -> None:
+        """Write one record through the facade's private store."""
+        self._queue._write(path, record)  # pyright: ignore[reportPrivateUsage]
+
+    def bounded_regular_json_count(
+        self,
+        directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[int, bool]:
+        """Count bounded regular JSON records with the existing store helper."""
+        return _bounded_regular_json_count(directory, limit=limit, label=label)
+
+
 @dataclass(frozen=True, slots=True)
 class IdempotentSubmissionResolution:
     """Read-only canonical identity resolution for storage admission."""
@@ -626,6 +669,8 @@ class ClioCoreQueue:
         self._migration_lifetime_guarded = False
         self._locked_storage_root_descriptor: int | None = None
         self._locked_storage_root_identity: tuple[int, int] | None = None
+        self._jarvis_input_store: queue_context.QueueStoreProtocol = _CoreQueueStoreAdapter(self)
+        self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._jarvis_input_store)
 
     def _storage_root_stat(self) -> os.stat_result:
         """Inspect the queue root through its held descriptor when migration-pinned."""
@@ -4234,7 +4279,7 @@ class ClioCoreQueue:
         cursor = 1
         remaining_source_positions = limit
         jobs: list[RelayJob] = []
-        next_cursor: int | None = cursor
+        next_cursor = cast(int | None, cursor)
         while remaining_source_positions > 0 and next_cursor is not None:
             page_limit = min(MAX_RESPONSE_PAGE_RECORDS, remaining_source_positions)
             page, next_cursor, _total = self.list_jobs_page(
@@ -4379,90 +4424,28 @@ class ClioCoreQueue:
         route: JarvisPackageInputRoute,
     ) -> JarvisPackageInputContractRecord | None:
         """Load one exact checksum-bound package input contract record."""
-        self.initialize()
-        route_sha256 = route.identity_sha256()
-        path = self._storage_root / "jarvis_package_input_contracts" / f"{route_sha256}.json"
-        with self._lock:
-            record = self._read_optional(path, JarvisPackageInputContractRecord)
-            if record is None:
-                return None
-            if record.route != route or record.route_sha256 != route_sha256:
-                raise QueueConflictError(
-                    "durable JARVIS package input contract route identity changed"
-                )
-            return record
+        return self._jarvis_inputs.get_jarvis_package_input_contract(route)
 
     def put_jarvis_package_input_contract(
         self,
         record: JarvisPackageInputContractRecord,
     ) -> JarvisPackageInputContractRecord:
         """Persist immutable package semantics for one exact registered route."""
-        self.initialize()
-        route_sha256 = record.route.identity_sha256()
-        if record.route_sha256 != route_sha256:
-            raise ValueError("package input contract route checksum changed before persistence")
-        directory = self._storage_root / "jarvis_package_input_contracts"
-        path = directory / f"{route_sha256}.json"
-        with self._lock:
-            existing = self._read_optional(path, JarvisPackageInputContractRecord)
-            if existing is not None:
-                if (
-                    existing.route != record.route
-                    or existing.package_names != record.package_names
-                    or existing.local_file_settings != record.local_file_settings
-                    or existing.settings_sha256 != record.settings_sha256
-                ):
-                    raise QueueConflictError(
-                        "immutable JARVIS package input contract changed on the same route"
-                    )
-                return existing
-            count, over_capacity = _bounded_regular_json_count(
-                directory,
-                limit=MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS,
-                label="JARVIS package input contract",
-            )
-            if over_capacity or count >= MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS:
-                raise QueueConflictError(
-                    "JARVIS package input contracts reached their bounded record capacity"
-                )
-            self._write(path, record)
-            return record
+        return self._jarvis_inputs.put_jarvis_package_input_contract(record)
 
     def get_jarvis_pipeline_input_lineage(
         self,
         route: JarvisPipelineInputRoute,
     ) -> JarvisPipelineInputLineage | None:
         """Load one exact checksum-bound pipeline input lineage record."""
-        self.initialize()
-        route_sha256 = route.identity_sha256()
-        path = self._storage_root / "jarvis_pipeline_input_lineage" / f"{route_sha256}.json"
-        with self._lock:
-            record = self._read_optional(path, JarvisPipelineInputLineage)
-            if record is None:
-                return None
-            if record.route != route or record.route_sha256 != route_sha256:
-                raise QueueConflictError(
-                    "durable JARVIS pipeline input lineage route identity changed"
-                )
-            return record
+        return self._jarvis_inputs.get_jarvis_pipeline_input_lineage(route)
 
     def get_jarvis_pipeline_input_bindings(
         self,
         route: JarvisPipelineInputRoute,
     ) -> JarvisPipelineInputBindings | None:
         """Load current local-file bindings for one exact registered pipeline route."""
-        self.initialize()
-        route_sha256 = route.identity_sha256()
-        path = self._storage_root / "jarvis_pipeline_input_bindings" / f"{route_sha256}.json"
-        with self._lock:
-            record = self._read_optional(path, JarvisPipelineInputBindings)
-            if record is None:
-                return None
-            if record.route != route or record.route_sha256 != route_sha256:
-                raise QueueConflictError(
-                    "durable JARVIS pipeline input bindings route identity changed"
-                )
-            return record
+        return self._jarvis_inputs.get_jarvis_pipeline_input_bindings(route)
 
     def update_jarvis_pipeline_input_bindings(
         self,
@@ -4472,52 +4455,11 @@ class ClioCoreQueue:
         remove: tuple[tuple[str, str], ...] = (),
     ) -> JarvisPipelineInputBindings:
         """Atomically update exact step/setting bindings for one pipeline route."""
-        self.initialize()
-        route_sha256 = route.identity_sha256()
-        directory = self._storage_root / "jarvis_pipeline_input_bindings"
-        path = directory / f"{route_sha256}.json"
-        remove_set = set(remove)
-        if len(remove_set) != len(remove):
-            raise ValueError("pipeline input binding removals must be unique")
-        upsert_identities = [item.identity() for item in upserts]
-        if len(upsert_identities) != len(set(upsert_identities)):
-            raise ValueError("pipeline input binding upserts must be unique")
-        if remove_set.intersection(upsert_identities):
-            raise ValueError("pipeline input binding cannot be removed and upserted together")
-        with self._lock:
-            existing = self._read_optional(path, JarvisPipelineInputBindings)
-            mutation_at = utc_now()
-            if existing is None:
-                count, over_capacity = _bounded_regular_json_count(
-                    directory,
-                    limit=MAX_JARVIS_PIPELINE_INPUT_BINDING_RECORDS,
-                    label="JARVIS pipeline input bindings",
-                )
-                if over_capacity or count >= MAX_JARVIS_PIPELINE_INPUT_BINDING_RECORDS:
-                    raise QueueConflictError(
-                        "JARVIS pipeline input bindings reached their bounded record capacity"
-                    )
-                by_identity: dict[tuple[str, str], JarvisPipelineInputBinding] = {}
-                created_at = mutation_at
-            else:
-                if existing.route != route or existing.route_sha256 != route_sha256:
-                    raise QueueConflictError(
-                        "durable JARVIS pipeline input bindings route identity changed"
-                    )
-                by_identity = {item.identity(): item for item in existing.bindings}
-                created_at = existing.created_at
-            for identity in remove_set:
-                by_identity.pop(identity, None)
-            for item in upserts:
-                by_identity[item.identity()] = item
-            record = JarvisPipelineInputBindings.create(
-                route=route,
-                bindings=tuple(by_identity.values()),
-                created_at=created_at,
-                updated_at=mutation_at,
-            )
-            self._write(path, record)
-            return record
+        return self._jarvis_inputs.update_jarvis_pipeline_input_bindings(
+            route,
+            upserts=upserts,
+            remove=remove,
+        )
 
     def get_jarvis_run_input_manifest(
         self,
@@ -4526,54 +4468,17 @@ class ClioCoreQueue:
         idempotency_key: str,
     ) -> JarvisRunInputManifest | None:
         """Load an immutable input manifest for one exact jarvis_run admission."""
-        self.initialize()
-        identity_sha256 = JarvisRunInputManifest.storage_identity_sha256(
-            route=route,
+        return self._jarvis_inputs.get_jarvis_run_input_manifest(
+            route,
             idempotency_key=idempotency_key,
         )
-        path = self._storage_root / "jarvis_run_input_manifests" / f"{identity_sha256}.json"
-        with self._lock:
-            record = self._read_optional(path, JarvisRunInputManifest)
-            if record is None:
-                return None
-            if (
-                record.route != route
-                or record.idempotency_key != idempotency_key
-                or record.identity_sha256() != identity_sha256
-            ):
-                raise QueueConflictError("durable JARVIS run input manifest identity changed")
-            return record
 
     def put_jarvis_run_input_manifest(
         self,
         record: JarvisRunInputManifest,
     ) -> JarvisRunInputManifest:
         """Persist the first exact input manifest admitted for one run key."""
-        self.initialize()
-        identity_sha256 = record.identity_sha256()
-        directory = self._storage_root / "jarvis_run_input_manifests"
-        path = directory / f"{identity_sha256}.json"
-        with self._lock:
-            existing = self._read_optional(path, JarvisRunInputManifest)
-            if existing is not None:
-                if (
-                    existing.route != record.route
-                    or existing.idempotency_key != record.idempotency_key
-                    or existing.identity_sha256() != identity_sha256
-                ):
-                    raise QueueConflictError("durable JARVIS run input manifest identity changed")
-                return existing
-            count, over_capacity = _bounded_regular_json_count(
-                directory,
-                limit=MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS,
-                label="JARVIS run input manifest",
-            )
-            if over_capacity or count >= MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS:
-                raise QueueConflictError(
-                    "JARVIS run input manifests reached their bounded record capacity"
-                )
-            self._write(path, record)
-            return record
+        return self._jarvis_inputs.put_jarvis_run_input_manifest(record)
 
     def merge_jarvis_pipeline_input_lineage(
         self,
@@ -4583,59 +4488,11 @@ class ClioCoreQueue:
         manifest_sha256: str,
     ) -> JarvisPipelineInputLineage:
         """Atomically merge staged inputs for one exact registered pipeline route."""
-        if not artifact_uses:
-            raise ValueError("pipeline input lineage requires at least one artifact use")
-        if len(manifest_sha256) != 64 or any(
-            character not in "0123456789abcdef" for character in manifest_sha256
-        ):
-            raise ValueError("pipeline input lineage manifest must be a canonical SHA-256")
-        self.initialize()
-        route_sha256 = route.identity_sha256()
-        directory = self._storage_root / "jarvis_pipeline_input_lineage"
-        path = directory / f"{route_sha256}.json"
-        with self._lock:
-            existing = self._read_optional(path, JarvisPipelineInputLineage)
-            mutation_at = utc_now()
-            if existing is None:
-                count, over_capacity = _bounded_regular_json_count(
-                    directory,
-                    limit=MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS,
-                    label="JARVIS pipeline input lineage",
-                )
-                if over_capacity or count >= MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS:
-                    raise QueueConflictError(
-                        "JARVIS pipeline input lineage reached its bounded record capacity"
-                    )
-                merged_uses = artifact_uses
-                manifests = (manifest_sha256,)
-                created_at = mutation_at
-            else:
-                if existing.route != route or existing.route_sha256 != route_sha256:
-                    raise QueueConflictError(
-                        "durable JARVIS pipeline input lineage route identity changed"
-                    )
-                by_artifact = {item.artifact_id: item for item in existing.artifact_uses}
-                for item in artifact_uses:
-                    previous = by_artifact.get(item.artifact_id)
-                    if previous is not None and previous != item:
-                        raise QueueConflictError(
-                            f"pipeline input artifact identity changed: {item.artifact_id}"
-                        )
-                    by_artifact[item.artifact_id] = item
-                merged_uses = tuple(
-                    sorted(by_artifact.values(), key=lambda item: (item.artifact_id, item.sha256))
-                )
-                manifests = (*existing.manifest_sha256s, manifest_sha256)
-                created_at = existing.created_at
-            record = JarvisPipelineInputLineage.create(
-                route=route,
-                artifact_uses=merged_uses,
-                manifest_sha256s=manifests,
-                created_at=created_at,
-                updated_at=mutation_at,
-            )
-            self._write(path, record)
-            return record
+        return self._jarvis_inputs.merge_jarvis_pipeline_input_lineage(
+            route,
+            artifact_uses,
+            manifest_sha256=manifest_sha256,
+        )
 
     def list_endpoints(self, cluster: str | None = None) -> list[EndpointRegistration]:
         """Return registered endpoints, optionally filtered by cluster."""
