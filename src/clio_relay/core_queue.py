@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from clio_relay import (
     queue_context,
+    queue_events,
     queue_index_state,
     queue_jarvis_inputs,
     queue_layout,
@@ -35,6 +36,7 @@ from clio_relay import (
     queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_legacy_output_migration,
+    queue_order_index,
     queue_scheduler_cancel_records,
     queue_store_lock,
     queue_store_read,
@@ -61,7 +63,6 @@ from clio_relay.models import (
     ArtifactUse,
     ArtifactUseProvenance,
     ArtifactUserOrderHead,
-    Cursor,
     EndpointRegistration,
     GatewaySession,
     GatewaySessionState,
@@ -94,7 +95,6 @@ from clio_relay.models import (
     SchedulerCancelDispositionState,
     SchedulerCancelPending,
     SchedulerPhase,
-    TaskTimelineEvent,
     TerminalJobGcPlan,
     TerminalJobGcResult,
     TransformRef,
@@ -108,7 +108,6 @@ from clio_relay.models import (
 from clio_relay.pagination import (
     MAX_RESPONSE_PAGE_RECORDS,
     validate_gc_batch_size,
-    validate_record_cursor,
     validate_response_page_limit,
 )
 from clio_relay.remote_mcp import VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
@@ -279,9 +278,17 @@ class _QueueStoreAdapter:
         """Read one optional typed record through the store-read owner."""
         return self._queue._read_optional(path, model)  # pyright: ignore[reportPrivateUsage]
 
+    def read_json_document(self, path: Path) -> object:
+        """Read one strict JSON document through the store-read owner."""
+        return queue_store_read.read_json_document(path)
+
     def write(self, path: Path, record: BaseModel) -> None:
         """Persist one typed record through the store-write owner."""
         self._queue._write(path, record)  # pyright: ignore[reportPrivateUsage]
+
+    def write_json(self, path: Path, record: dict[str, object]) -> None:
+        """Persist one JSON object through the store-write owner."""
+        queue_store_write.write_json(self.storage_root, path, record)
 
     def bounded_regular_json_count(
         self,
@@ -295,6 +302,7 @@ class _QueueStoreAdapter:
 
 
 class ClioCoreQueue(
+    queue_events.QueueEventsMixin,
     queue_legacy_audit.QueueLegacyAuditMixin,
     queue_legacy_output_audit.QueueLegacyOutputAuditMixin,
     queue_legacy_output_migration.QueueLegacyOutputMigrationMixin,
@@ -5425,88 +5433,6 @@ class ClioCoreQueue(
                 tasks = [task for task in tasks if task.job_id == job_id]
             return sorted(tasks, key=lambda task: task.created_at), truncated
 
-    def append_task_event(self, event: TaskTimelineEvent) -> TaskTimelineEvent:
-        """Append a structured task timeline event with a per-task sequence."""
-        self._require_durable_record_id(event.task_id, field="task_id")
-        for artifact_id in event.artifact_refs:
-            self._require_durable_record_id(artifact_id, field="artifact_id")
-        self.initialize()
-        with self._lock:
-            task = self.get_task(event.task_id)
-            event_dir = self._storage_root / "task_events" / event.task_id
-            event_dir.mkdir(parents=True, exist_ok=True)
-            seq = self._next_task_event_seq(event.task_id, event_dir)
-            saved = event.model_copy(update={"seq": seq})
-            self._write(event_dir / f"{seq:020d}.json", saved)
-            self._write_json(
-                self._storage_root / "task_event_heads" / f"{event.task_id}.json",
-                {"task_id": event.task_id, "latest_seq": seq},
-            )
-            self.append_event(
-                task.job_id,
-                f"task.timeline.{event.event_type}",
-                event.summary,
-                locked=True,
-                payload={
-                    "task_id": event.task_id,
-                    "task_event_seq": seq,
-                    "event_type": event.event_type,
-                    "label": event.label,
-                    "status": event.status.value,
-                },
-            )
-            return saved
-
-    def drain_task_events(
-        self,
-        task_id: str,
-        *,
-        cursor: int = 1,
-        limit: int = 100,
-    ) -> tuple[list[TaskTimelineEvent], int]:
-        """Drain structured task timeline events from a task cursor."""
-        task_id = self._require_durable_record_id(task_id, field="task_id")
-        cursor = validate_record_cursor(cursor, field_name="task event cursor")
-        limit = validate_response_page_limit(limit, field_name="task event limit")
-        self.initialize()
-        self.get_task(task_id)
-        event_directory = self._storage_root / "task_events" / task_id
-        durable_latest_seq = _last_contiguous_sequence(event_directory)
-        head_path = self._storage_root / "task_event_heads" / f"{task_id}.json"
-        try:
-            raw_head = self._read_json_document(head_path)
-        except FileNotFoundError:
-            latest_seq = durable_latest_seq
-        else:
-            if not isinstance(raw_head, dict):
-                raise QueueConflictError(f"task event head is not an object: {head_path}")
-            head = cast(dict[str, object], raw_head)
-            recorded_latest_seq = head.get("latest_seq")
-            if (
-                head.get("task_id") != task_id
-                or isinstance(recorded_latest_seq, bool)
-                or not isinstance(recorded_latest_seq, int)
-                or recorded_latest_seq < 0
-            ):
-                raise QueueConflictError(f"invalid task event head identity: {head_path}")
-            if recorded_latest_seq > durable_latest_seq:
-                raise QueueConflictError(f"task event head exceeds durable records: {task_id}")
-            latest_seq = durable_latest_seq
-        stop = min(latest_seq + 1, cursor + limit)
-        drained: list[TaskTimelineEvent] = []
-        for sequence in range(cursor, stop):
-            event = self._read_optional(
-                self._storage_root / "task_events" / task_id / f"{sequence:020d}.json",
-                TaskTimelineEvent,
-            )
-            if event is None or event.seq != sequence or event.task_id != task_id:
-                raise QueueConflictError(
-                    f"task event index is missing sequence {sequence}: {task_id}"
-                )
-            drained.append(event)
-        next_cursor = cursor if not drained else drained[-1].seq + 1
-        return drained, next_cursor
-
     def get_task(self, task_id: str) -> RelayTask:
         """Return a task by id."""
         task_id = self._require_durable_record_id(task_id, field="task_id")
@@ -6069,63 +5995,6 @@ class ClioCoreQueue(
     @staticmethod
     def _execution_cleanup_shard(job_id: str) -> int:
         return hashlib.sha256(job_id.encode("utf-8")).digest()[0]
-
-    def append_event(
-        self,
-        job_id: str,
-        event_type: str,
-        message: str,
-        *,
-        locked: bool = False,
-        payload: dict[str, object] | None = None,
-    ) -> RelayEvent:
-        """Append an event with a per-job monotonic sequence number."""
-        job_id = self._require_durable_record_id(job_id, field="job_id")
-        if locked:
-            return self._append_event_unlocked(job_id, event_type, message, payload or {})
-        with self._lock:
-            return self._append_event_unlocked(job_id, event_type, message, payload or {})
-
-    def drain_events(self, cursor: Cursor, *, limit: int = 100) -> tuple[list[RelayEvent], Cursor]:
-        """Drain events from a cursor and return the advanced cursor."""
-        self._require_durable_record_id(cursor.job_id, field="job_id")
-        drained, next_seq = self.read_event_page(
-            cursor.job_id,
-            next_seq=cursor.next_seq,
-            limit=limit,
-        )
-        advanced = Cursor(job_id=cursor.job_id, next_seq=next_seq)
-        return drained, advanced
-
-    def read_event_page(
-        self,
-        job_id: str,
-        *,
-        next_seq: int = 1,
-        limit: int = 100,
-    ) -> tuple[list[RelayEvent], int]:
-        """Read one bounded contiguous event page without updating a consumer cursor."""
-        job_id = self._require_durable_record_id(job_id, field="job_id")
-        if next_seq < 1:
-            raise ValueError("event sequence must be greater than or equal to 1")
-        if limit < 1:
-            raise ValueError("event page limit must be greater than or equal to 1")
-        self.initialize()
-        event_dir = self._storage_root / "events" / job_id
-        events: list[RelayEvent] = []
-        candidate_seq = next_seq
-        while len(events) < limit:
-            event = self._read_optional(
-                event_dir / f"{candidate_seq:020d}.json",
-                RelayEvent,
-            )
-            if event is None:
-                break
-            if event.job_id != job_id or event.seq != candidate_seq:
-                raise QueueConflictError(f"event filename/content identity mismatch: {event_dir}")
-            events.append(event)
-            candidate_seq += 1
-        return events, candidate_seq
 
     def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
         """Index an artifact reference."""
@@ -9204,102 +9073,6 @@ class ClioCoreQueue(
             / f"{_stable_ref_token(job_id, source_id)}.json"
         )
 
-    def _append_event_unlocked(
-        self,
-        job_id: str,
-        event_type: str,
-        message: str,
-        payload: dict[str, object],
-    ) -> RelayEvent:
-        event_dir = self._storage_root / "events" / job_id
-        event_dir.mkdir(parents=True, exist_ok=True)
-        seq = self._next_event_seq(job_id, event_dir)
-        event = RelayEvent(
-            job_id=job_id,
-            seq=seq,
-            event_type=event_type,
-            message=message,
-            payload=payload,
-        )
-        self._write(event_dir / f"{seq:020d}.json", event)
-        self._update_job_index_unlocked(job_id, latest_event_seq=seq)
-        return event
-
-    def latest_job_event(self, job_id: str) -> tuple[RelayEvent | None, bool]:
-        """Read the exact indexed event head without enumerating the event directory."""
-        job_id = self._require_durable_record_id(job_id, field="job_id")
-        index = self._read_job_index(job_id)
-        if index is not None:
-            latest_seq = _index_integer(index, "latest_event_seq")
-            if latest_seq == 0:
-                return None, False
-            event = self._read_optional(
-                self._storage_root / "events" / job_id / f"{latest_seq:020d}.json",
-                RelayEvent,
-            )
-            if event is None:
-                raise QueueConflictError(f"event index points to a missing record: {job_id}")
-            if event.job_id != job_id or event.seq != latest_seq:
-                raise QueueConflictError(f"event index identity mismatch: {job_id}")
-            return event, False
-        event_dir = self._storage_root / "events" / job_id
-        latest: RelayEvent | None = None
-        for seq in range(1, DEFAULT_EXACT_RECORD_LIMIT + 1):
-            event = self._read_optional(event_dir / f"{seq:020d}.json", RelayEvent)
-            if event is None:
-                return latest, False
-            if event.job_id != job_id or event.seq != seq:
-                raise QueueConflictError(f"event filename/content identity mismatch: {job_id}")
-            latest = event
-        truncated = (event_dir / f"{DEFAULT_EXACT_RECORD_LIMIT + 1:020d}.json").exists()
-        return latest, truncated
-
-    def _next_event_seq(self, job_id: str, event_dir: Path) -> int:
-        index = self._read_job_index(job_id)
-        if index is not None:
-            candidate = _index_integer(index, "latest_event_seq") + 1
-            while (event_dir / f"{candidate:020d}.json").exists():
-                candidate += 1
-                if candidate > DEFAULT_EXACT_RECORD_LIMIT + _index_integer(
-                    index, "latest_event_seq"
-                ):
-                    raise QueueConflictError(f"event head recovery exceeded bound: {job_id}")
-            return candidate
-        for candidate in range(1, DEFAULT_EXACT_RECORD_LIMIT + 1):
-            if not (event_dir / f"{candidate:020d}.json").exists():
-                return candidate
-        raise QueueConflictError(f"legacy event sequence requires index migration: {job_id}")
-
-    def _next_task_event_seq(self, task_id: str, directory: Path) -> int:
-        head_path = self._storage_root / "task_event_heads" / f"{task_id}.json"
-        try:
-            raw = self._read_json_document(head_path)
-        except FileNotFoundError:
-            return _last_contiguous_sequence(directory) + 1
-        except (OSError, QueueConflictError) as exc:
-            raise queue_conflict_from_cause(
-                f"invalid task event head {head_path}",
-                cause=exc,
-                logger=logger,
-            ) from exc
-        if not isinstance(raw, dict):
-            raise QueueConflictError(f"task event head is not an object: {head_path}")
-        head = cast(dict[str, object], raw)
-        latest_seq = head.get("latest_seq")
-        if (
-            head.get("task_id") != task_id
-            or not isinstance(latest_seq, int)
-            or isinstance(latest_seq, bool)
-            or latest_seq < 0
-        ):
-            raise QueueConflictError(f"invalid task event head identity: {head_path}")
-        candidate = latest_seq + 1
-        for _ in range(DEFAULT_EXACT_RECORD_LIMIT):
-            if not (directory / f"{candidate:020d}.json").exists():
-                return candidate
-            candidate += 1
-        raise QueueConflictError(f"task event head recovery exceeded bound: {task_id}")
-
     def _active_lease_for_endpoint(
         self,
         endpoint_id: str,
@@ -10785,224 +10558,6 @@ class ClioCoreQueue(
             tombstone=tombstone,
         )
 
-    def _ensure_global_order_entry_unlocked(self, family: str, record_id: str) -> int:
-        """Return one durable global sequence, repairing an interrupted entry write."""
-        if family not in _GLOBAL_ORDER_FAMILIES:
-            raise QueueConflictError(f"unsupported global-order family: {family}")
-        if not _safe_global_record_id(record_id):
-            raise QueueConflictError(f"unsafe global-order record id: {record_id!r}")
-        root = self._storage_root / "global_order" / family
-        mapping_path = root / "by_id" / f"{_stable_ref_token(record_id)}.json"
-        mapping = self._read_global_order_record_optional(
-            mapping_path,
-            family=family,
-        )
-        latest_sequence = self._read_global_order_head(family)
-        if mapping is not None:
-            mapped_id, sequence = mapping
-            if mapped_id != record_id or sequence > latest_sequence:
-                raise QueueConflictError(
-                    f"global-order mapping identity mismatch: {family}/{record_id}"
-                )
-            self._ensure_global_order_sequence_record_unlocked(
-                family,
-                record_id,
-                sequence,
-            )
-            return sequence
-        if latest_sequence >= 2**63 - 1:
-            raise QueueConflictError(f"global-order sequence exhausted: {family}")
-        sequence = latest_sequence + 1
-        self._write_json(
-            root / "head.json",
-            {
-                "schema_version": GLOBAL_ORDER_INDEX_SCHEMA,
-                "family": family,
-                "latest_sequence": sequence,
-            },
-        )
-        document: dict[str, object] = {
-            "schema_version": GLOBAL_ORDER_INDEX_SCHEMA,
-            "family": family,
-            "record_id": record_id,
-            "sequence": sequence,
-        }
-        self._write_json(mapping_path, document)
-        self._ensure_global_order_sequence_record_unlocked(
-            family,
-            record_id,
-            sequence,
-        )
-        return sequence
-
-    def _job_submission_order_key_unlocked(
-        self,
-        job: RelayJob,
-    ) -> tuple[int, datetime, str]:
-        """Return the durable total-order key for one submitted job."""
-        sequence = self._ensure_global_order_entry_unlocked("jobs", job.job_id)
-        return sequence, job.created_at, job.job_id
-
-    def _ensure_global_order_sequence_record_unlocked(
-        self,
-        family: str,
-        record_id: str,
-        sequence: int,
-    ) -> None:
-        entry_path = (
-            self._storage_root / "global_order" / family / "entries" / f"{sequence:020d}.json"
-        )
-        existing = self._read_global_order_record_optional(entry_path, family=family)
-        if existing is not None:
-            if existing != (record_id, sequence):
-                raise QueueConflictError(f"global-order sequence collision: {family}/{sequence}")
-            return
-        self._write_json(
-            entry_path,
-            {
-                "schema_version": GLOBAL_ORDER_INDEX_SCHEMA,
-                "family": family,
-                "record_id": record_id,
-                "sequence": sequence,
-            },
-        )
-
-    def _read_global_order_head(self, family: str) -> int:
-        path = self._storage_root / "global_order" / family / "head.json"
-        try:
-            raw = self._read_json_document(path)
-        except FileNotFoundError:
-            return 0
-        if not isinstance(raw, dict):
-            raise QueueConflictError(f"global-order head is not an object: {path}")
-        document = cast(dict[str, object], raw)
-        latest_sequence = document.get("latest_sequence")
-        if (
-            document.get("schema_version") != GLOBAL_ORDER_INDEX_SCHEMA
-            or document.get("family") != family
-            or isinstance(latest_sequence, bool)
-            or not isinstance(latest_sequence, int)
-            or latest_sequence < 1
-            or latest_sequence >= 2**63
-        ):
-            raise QueueConflictError(f"invalid global-order head: {path}")
-        return latest_sequence
-
-    def _read_global_order_record_optional(
-        self,
-        path: Path,
-        *,
-        family: str,
-    ) -> tuple[str, int] | None:
-        try:
-            raw = self._read_json_document(path)
-        except FileNotFoundError:
-            return None
-        if not isinstance(raw, dict):
-            raise QueueConflictError(f"global-order record is not an object: {path}")
-        document = cast(dict[str, object], raw)
-        record_id = document.get("record_id")
-        sequence = document.get("sequence")
-        if (
-            document.get("schema_version") != GLOBAL_ORDER_INDEX_SCHEMA
-            or document.get("family") != family
-            or not _safe_global_record_id(record_id)
-            or isinstance(sequence, bool)
-            or not isinstance(sequence, int)
-            or sequence < 1
-            or sequence >= 2**63
-        ):
-            raise QueueConflictError(f"invalid global-order record: {path}")
-        return cast(str, record_id), sequence
-
-    def _read_global_order_page(
-        self,
-        *,
-        family: str,
-        model: type[Record],
-        identity_field: str,
-        cursor: int,
-        limit: int,
-        predicate: Callable[[Record], bool] | None = None,
-    ) -> tuple[list[Record], int | None, int]:
-        """Read one bounded global source window in durable sequence order."""
-        cursor = validate_record_cursor(cursor)
-        limit = validate_response_page_limit(limit)
-        self.initialize()
-        self._require_index_migration_complete()
-        latest_sequence = self._read_global_order_head(family)
-        if cursor > latest_sequence:
-            return [], None, latest_sequence
-        stop = min(latest_sequence + 1, cursor + limit)
-        records: list[Record] = []
-        root = self._storage_root / "global_order" / family
-        for sequence in range(cursor, stop):
-            entry = self._read_global_order_record_optional(
-                root / "entries" / f"{sequence:020d}.json",
-                family=family,
-            )
-            if entry is None:
-                continue
-            record_id, recorded_sequence = entry
-            if recorded_sequence != sequence:
-                raise QueueConflictError(
-                    f"global-order sequence identity mismatch: {family}/{sequence}"
-                )
-            mapping = self._read_global_order_record_optional(
-                root / "by_id" / f"{_stable_ref_token(record_id)}.json",
-                family=family,
-            )
-            if mapping != entry:
-                raise QueueConflictError(
-                    f"global-order reverse mapping mismatch: {family}/{record_id}"
-                )
-            record = self._read_optional(self._storage_root / family / f"{record_id}.json", model)
-            if record is None:
-                continue
-            if getattr(record, identity_field, None) != record_id:
-                raise QueueConflictError(
-                    f"global-order target identity mismatch: {family}/{record_id}"
-                )
-            if predicate is None or predicate(record):
-                records.append(record)
-        next_cursor = stop if stop <= latest_sequence else None
-        return records, next_cursor, latest_sequence
-
-    def _scan_global_order(
-        self,
-        *,
-        family: str,
-        model: type[Record],
-        identity_field: str,
-        limit: int,
-        predicate: Callable[[Record], bool] | None = None,
-    ) -> tuple[list[Record], bool]:
-        """Read at most one bounded number of durable global source positions."""
-        if isinstance(limit, bool):
-            raise ValueError("scan limit must be an integer")
-        if limit < 1 or limit > MAX_BOUNDED_SCAN_RECORDS:
-            raise ValueError(f"scan limit must be between 1 and {MAX_BOUNDED_SCAN_RECORDS}")
-        records: list[Record] = []
-        cursor = 1
-        remaining = limit
-        while remaining > 0:
-            page_limit = min(remaining, MAX_RESPONSE_PAGE_RECORDS)
-            page, next_cursor, total = self._read_global_order_page(
-                family=family,
-                model=model,
-                identity_field=identity_field,
-                cursor=cursor,
-                limit=page_limit,
-                predicate=predicate,
-            )
-            records.extend(page)
-            consumed = min(page_limit, max(0, total - cursor + 1))
-            remaining -= consumed
-            if next_cursor is None:
-                return records, False
-            cursor = next_cursor
-        return records, cursor <= self._read_global_order_head(family)
-
     def _ensure_extended_migration_state(self) -> None:
         state = self._read_index_migration_state()
         changed = False
@@ -11394,183 +10949,10 @@ class ClioCoreQueue(
             return
         raise QueueConflictError(f"operational-index migration record mismatch: {family}")
 
-    def _finalize_job_index_unlocked(self, job_id: str) -> None:
-        self._initialize_job_index_unlocked(job_id)
-        safe_job_id = self._durable_key(job_id)
-        task_count = _last_contiguous_sequence(
-            self._storage_root / "task_order_by_job" / safe_job_id
-        )
-        artifact_count = _last_contiguous_sequence(
-            self._storage_root / "artifact_order_by_job" / safe_job_id
-        )
-        progress_count = _last_contiguous_sequence(
-            self._storage_root / "progress_order_by_job" / safe_job_id
-        )
-        latest_progress = (
-            self._read_optional(
-                self._storage_root
-                / "progress_order_by_job"
-                / safe_job_id
-                / f"{progress_count:020d}.json",
-                ProgressRecord,
-            )
-            if progress_count > 0
-            else None
-        )
-        latest_event_seq = _last_contiguous_sequence(self._storage_root / "events" / job_id)
-        self._update_job_index_unlocked(
-            job_id,
-            task_count=task_count,
-            artifact_count=artifact_count,
-            progress_count=progress_count,
-            latest_progress_id=(None if latest_progress is None else latest_progress.progress_id),
-            latest_event_seq=latest_event_seq,
-        )
-
-    def _initialize_job_index_unlocked(self, job_id: str) -> None:
-        index_path = self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json"
-        for family in (
-            "tasks_by_job",
-            "leases_by_job",
-            "artifacts_by_job",
-            "used_artifacts_by_job",
-            "progress_by_job",
-            "task_order_by_job",
-            "artifact_order_by_job",
-            "progress_order_by_job",
-            "active_tasks_by_job",
-            "scheduler_refs_by_job",
-            "scheduler_protections_by_job",
-            "monitor_rules_by_job",
-            "active_monitor_rules_by_job",
-            "active_gateway_refs_by_job",
-        ):
-            (self._storage_root / family / self._durable_key(job_id)).mkdir(
-                parents=True, exist_ok=True
-            )
-        if index_path.exists():
-            return
-        self._write_json(
-            index_path,
-            {
-                "schema_version": JOB_INDEX_SCHEMA,
-                "order_schema_version": ORDER_INDEX_SCHEMA,
-                "retention_schema_version": RETENTION_INDEX_SCHEMA,
-                "job_id": job_id,
-                "task_count": 0,
-                "artifact_count": 0,
-                "progress_count": 0,
-                "latest_progress_id": None,
-                "latest_event_seq": 0,
-            },
-        )
-
-    def _job_index_exists(self, job_id: str) -> bool:
-        return (self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json").is_file()
-
-    def _read_job_index(self, job_id: str) -> dict[str, object] | None:
-        path = self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json"
-        try:
-            raw = self._read_json_document(path)
-        except FileNotFoundError:
-            return None
-        except (OSError, QueueConflictError) as exc:
-            raise queue_conflict_from_cause(
-                f"invalid job index {path}",
-                cause=exc,
-                logger=logger,
-            ) from exc
-        if not isinstance(raw, dict):
-            raise QueueConflictError(f"job index is not an object: {path}")
-        index = cast(dict[str, object], raw)
-        if index.get("schema_version") != JOB_INDEX_SCHEMA or index.get("job_id") != job_id:
-            raise QueueConflictError(f"job index identity mismatch: {path}")
-        for field in ("task_count", "artifact_count", "progress_count", "latest_event_seq"):
-            _index_integer(index, field)
-        latest_progress_id = index.get("latest_progress_id")
-        if latest_progress_id is not None and not isinstance(latest_progress_id, str):
-            raise QueueConflictError(f"invalid latest_progress_id in {path}")
-        return index
-
-    def _update_job_index_unlocked(self, job_id: str, **updates: object) -> None:
-        index = self._read_job_index(job_id)
-        if index is None:
-            return
-        index.update(updates)
-        self._write_json(
-            self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json",
-            index,
-        )
-
-    def _increment_job_index_unlocked(
-        self,
-        job_id: str,
-        field: str,
-        **updates: object,
-    ) -> None:
-        index = self._read_job_index(job_id)
-        if index is None:
-            return
-        index[field] = _index_integer(index, field) + 1
-        index.update(updates)
-        self._write_json(
-            self._storage_root / "job_indexes" / f"{self._durable_key(job_id)}.json",
-            index,
-        )
-
-    def _next_job_record_sequence_unlocked(self, job_id: str, count_field: str) -> int:
-        index = self._read_job_index(job_id)
-        if index is None:
-            raise QueueConflictError(f"job order index is missing: {job_id}")
-        return _index_integer(index, count_field) + 1
-
-    def _write_ordered_job_record(
-        self,
-        family: str,
-        job_id: str,
-        sequence: int,
-        record: BaseModel,
-    ) -> None:
-        directory = self._storage_root / f"{family}_order_by_job" / self._durable_key(job_id)
-        self._write(directory / f"{sequence:020d}.json", record)
-
-    def _read_ordered_job_page(
-        self,
-        job_id: str,
-        *,
-        family: str,
-        model: type[Record],
-        cursor: int,
-        limit: int,
-        count_field: str,
-    ) -> tuple[list[Record], int | None, int]:
-        cursor = validate_record_cursor(cursor)
-        limit = validate_response_page_limit(limit)
-        self.initialize()
-        self._require_index_migration_complete()
-        index = self._read_job_index(job_id)
-        if index is None:
-            raise NotFoundError(f"job not found: {job_id}")
-        total = _index_integer(index, count_field)
-        if cursor > total:
-            return [], None, total
-        stop = min(total + 1, cursor + limit)
-        records: list[Record] = []
-        directory = self._storage_root / f"{family}_order_by_job" / self._durable_key(job_id)
-        for sequence in range(cursor, stop):
-            record = self._read_optional(directory / f"{sequence:020d}.json", model)
-            if record is None:
-                raise QueueConflictError(
-                    f"{family} order index is missing sequence {sequence}: {job_id}"
-                )
-            records.append(record)
-        next_cursor = stop if stop <= total else None
-        return records, next_cursor, total
-
     def _migrate_order_record_unlocked(self, family: str, record: BaseModel) -> None:
         if family == "tasks" and isinstance(record, RelayTask):
             sequence = record.sequence or (
-                _last_contiguous_sequence(
+                queue_order_index.last_contiguous_sequence(
                     self._storage_root / "task_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
@@ -11582,7 +10964,7 @@ class ClioCoreQueue(
             return
         if family == "artifacts" and isinstance(record, ArtifactRef):
             sequence = record.sequence or (
-                _last_contiguous_sequence(
+                queue_order_index.last_contiguous_sequence(
                     self._storage_root / "artifact_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
@@ -11602,7 +10984,7 @@ class ClioCoreQueue(
             return
         if family == "progress" and isinstance(record, ProgressRecord):
             sequence = record.sequence or (
-                _last_contiguous_sequence(
+                queue_order_index.last_contiguous_sequence(
                     self._storage_root / "progress_order_by_job" / self._durable_key(record.job_id)
                 )
                 + 1
@@ -12735,25 +12117,6 @@ def _migration_batch_paths(
         key=lambda path: path.name,
     )
     return candidates[:limit], len(candidates) > limit
-
-
-def _last_contiguous_sequence(directory: Path) -> int:
-    if not (directory / f"{1:020d}.json").is_file():
-        return 0
-    low = 1
-    high = 2
-    while (directory / f"{high:020d}.json").is_file():
-        low = high
-        high *= 2
-        if high > 2**63:
-            raise QueueConflictError(f"record sequence exceeds supported range: {directory}")
-    while low + 1 < high:
-        middle = (low + high) // 2
-        if (directory / f"{middle:020d}.json").is_file():
-            low = middle
-        else:
-            high = middle
-    return low
 
 
 def _idempotency_key_filename(key: str) -> str:

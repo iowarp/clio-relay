@@ -1,10 +1,8 @@
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol, TypeVar
+from typing import Callable, Protocol  # noqa: UP035
 
 from pydantic import BaseModel
-
-Record = TypeVar("Record", bound=BaseModel)
 
 
 class QueueLockProtocol(Protocol):
@@ -37,9 +35,7 @@ class QueueStoreProtocol(Protocol):
         """Return the internal filesystem root for durable queue records."""
         ...
 
-    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
-        """Return the migration-pinned queue-root descriptor and identity."""
-        ...
+    locked_storage_root: Callable[[], tuple[int | None, tuple[int, int] | None]]
 
     @property
     def lock(self) -> QueueLockProtocol:
@@ -50,13 +46,17 @@ class QueueStoreProtocol(Protocol):
         """Initialize and validate the durable store."""
         ...
 
-    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
+    def read_optional[Record: BaseModel](self, path: Path, model: type[Record]) -> Record | None:
         """Read one optional typed record."""
         ...
+
+    read_json_document: Callable[[Path], object]
 
     def write(self, path: Path, record: BaseModel) -> None:
         """Persist one typed record atomically."""
         ...
+
+    write_json: Callable[[Path, dict[str, object]], None]
 
     def bounded_regular_json_count(
         self,

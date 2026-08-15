@@ -15,12 +15,14 @@ from pytest import MonkeyPatch
 
 from clio_relay import core_queue as core_queue_module
 from clio_relay import (
+    queue_events,
     queue_index_state,
     queue_lease_records,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_scheduler_cancel_records,
     queue_store_read,
+    queue_store_write,
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -44,6 +46,8 @@ _OWNER_RANK = {
     "queue_legacy_output_audit": 10,
     "queue_legacy_output_migration": 11,
     "queue_legacy_audit": 12,
+    "queue_order_index": 13,
+    "queue_events": 14,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -59,6 +63,8 @@ _OWNER_BUDGETS = {
     "queue_legacy_output_audit": 520,
     "queue_legacy_output_migration": 210,
     "queue_legacy_audit": 650,
+    "queue_order_index": 450,
+    "queue_events": 270,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -95,6 +101,10 @@ class _IndexStateLookupSabotage(RuntimeError):
 
 class _LegacyOutputPathLookupSabotage(RuntimeError):
     """Raised only when a CQ6 caller reaches the codec path lookup."""
+
+
+class _EventIndexLookupSabotage(RuntimeError):
+    """Raised only when CQ7 event append reaches the order-index owner."""
 
 
 @dataclass(frozen=True)
@@ -224,7 +234,7 @@ def test_split_owners_never_bare_import_cross_owner_functions() -> None:
 
 
 def test_split_owner_dependencies_follow_the_migration_topology() -> None:
-    """Every recorded owner dependency points to an earlier CQ1 owner."""
+    """Every recorded owner dependency points to an earlier landed owner."""
     violations = [
         f"{edge.caller} -> {edge.collaborator}"
         for edge in _owner_dependencies()
@@ -246,7 +256,7 @@ def test_cq4_codecs_are_store_independent() -> None:
 
 
 def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
-    """Every CQ1-CQ6 owner is discovered and reads its cap from one table."""
+    """Every landed owner is discovered and reads its cap from one table."""
     assert set(_OWNER_MANIFEST) == set(_OWNER_BUDGETS)
     for owner in _OWNER_MANIFEST:
         budget = _OWNER_BUDGETS[owner]
@@ -277,6 +287,29 @@ def test_cq6_legacy_output_callers_use_the_codec_path_lookup(
             list(queue._iter_legacy_output_auxiliary_paths("legacy_output_archives"))  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         else:
             queue._audit_legacy_output_state_before_initialization()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_cq7_event_append_uses_the_order_index_increment_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Job-event append must resolve index advancement through the CQ7 owner seam."""
+    queue = ClioCoreQueue(tmp_path)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _EventIndexLookupSabotage("queue_events order-index increment lookup engaged")
+
+    def discard_event_write(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(queue_store_write, "write_model", discard_event_write)
+    monkeypatch.setattr(queue_events.queue_order_index, "increment_job_index", sabotage)
+
+    with pytest.raises(
+        _EventIndexLookupSabotage,
+        match="queue_events order-index increment lookup engaged",
+    ):
+        queue.append_event("job-cq7", "cq7.sabotage", "CQ7 sabotage", locked=True)
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
