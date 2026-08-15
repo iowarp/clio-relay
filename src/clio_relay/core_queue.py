@@ -17,8 +17,7 @@ import os
 import stat
 from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
@@ -27,7 +26,9 @@ from pydantic import BaseModel
 
 from clio_relay import (
     queue_context,
+    queue_endpoints,
     queue_events,
+    queue_idempotency,
     queue_index_state,
     queue_jarvis_inputs,
     queue_layout,
@@ -99,9 +100,7 @@ from clio_relay.models import (
     TerminalJobGcResult,
     TransformRef,
     UsedArtifactRef,
-    artifact_use_payload,
     deterministic_input_artifact_id,
-    is_owned_jarvis_run_spec,
     prepare_owned_jarvis_run_submission,
     utc_now,
 )
@@ -202,13 +201,10 @@ _GC_TERMINAL_SCHEDULER_PHASES = queue_store_lock.GC_TERMINAL_SCHEDULER_PHASES
 _FairBoundedFileLock = queue_store_lock.FairBoundedFileLock
 
 
-@dataclass(frozen=True, slots=True)
-class IdempotentSubmissionResolution:
-    """Read-only canonical identity resolution for storage admission."""
-
-    state: Literal["new", "reserved", "existing", "retired"]
-    canonical_job_id: str
-    existing_job: RelayJob | None = None
+IdempotentSubmissionResolution = queue_idempotency.IdempotentSubmissionResolution
+_job_idempotency_digest = queue_idempotency._job_idempotency_digest  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+_idempotency_key_filename = queue_idempotency._idempotency_key_filename  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+_committed_idempotency_record = queue_idempotency._committed_idempotency_record  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 SchedulerCancelIdentityRegistration = (
@@ -302,6 +298,8 @@ class _QueueStoreAdapter:
 
 
 class ClioCoreQueue(
+    queue_endpoints.QueueEndpointsMixin,
+    queue_idempotency.QueueIdempotencyMixin,
     queue_events.QueueEventsMixin,
     queue_legacy_audit.QueueLegacyAuditMixin,
     queue_legacy_output_audit.QueueLegacyOutputAuditMixin,
@@ -331,6 +329,7 @@ class ClioCoreQueue(
         self._store_adapter: queue_context.QueueStoreProtocol = _QueueStoreAdapter(self)
         self._layout = queue_layout.QueueLayout(self._store_adapter)
         self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._store_adapter)
+        self._validate_new_owner_session_metadata = _validate_new_owner_session_metadata
 
     def _storage_root_stat(self) -> os.stat_result:
         """Inspect the queue root through its held descriptor when migration-pinned."""
@@ -1551,137 +1550,6 @@ class ClioCoreQueue(
         for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
             path.rmdir()
 
-    def register_endpoint(self, endpoint: EndpointRegistration) -> EndpointRegistration:
-        """Create or refresh an endpoint registration with exact identity continuity."""
-        self._require_durable_record_id(endpoint.endpoint_id, field="endpoint_id")
-        self.initialize()
-        self._require_index_migration_complete()
-        with self._lock:
-            existing = self._read_optional(
-                self._storage_root / "endpoints" / f"{endpoint.endpoint_id}.json",
-                EndpointRegistration,
-            )
-            if existing is not None:
-                existing_identity = (
-                    existing.role,
-                    existing.cluster,
-                    existing.hostname,
-                    existing.pid,
-                    existing.registered_at,
-                )
-                requested_identity = (
-                    endpoint.role,
-                    endpoint.cluster,
-                    endpoint.hostname,
-                    endpoint.pid,
-                    endpoint.registered_at,
-                )
-                if existing_identity != requested_identity:
-                    raise QueueConflictError(
-                        "endpoint identity or registration generation changed before heartbeat: "
-                        f"{endpoint.endpoint_id}"
-                    )
-                endpoint = existing.model_copy(
-                    update={"last_seen_at": utc_now(), "metadata": endpoint.metadata}
-                )
-            self._ensure_global_order_entry_unlocked("endpoints", endpoint.endpoint_id)
-            self._write(self._storage_root / "endpoints" / f"{endpoint.endpoint_id}.json", endpoint)
-            self._index_fresh_endpoint_unlocked(endpoint)
-        return endpoint
-
-    def resolve_idempotent_submission(
-        self,
-        job: RelayJob,
-    ) -> IdempotentSubmissionResolution:
-        """Resolve canonical idempotency identity without repairing or writing records."""
-        self._require_durable_record_id(job.job_id, field="job_id")
-        _validate_new_owner_session_metadata(job.metadata)
-        self.initialize()
-        self._require_index_migration_complete()
-        key_path = (
-            self._storage_root
-            / "idempotency"
-            / f"{_idempotency_key_filename(job.idempotency_key)}.json"
-        )
-        with self._lock:
-            try:
-                raw = self._read_json_document(key_path)
-            except FileNotFoundError:
-                job = prepare_owned_jarvis_run_submission(job)
-                job_digest = _job_idempotency_digest(job)
-                if job.submission_digest not in {None, job_digest}:
-                    raise QueueConflictError(
-                        "submitted job carries a mismatched submission_digest"
-                    ) from None
-                return IdempotentSubmissionResolution(
-                    state="new",
-                    canonical_job_id=job.job_id,
-                )
-            if not isinstance(raw, dict):
-                raise QueueConflictError(f"idempotency record is not an object: {key_path}")
-            record = cast(dict[str, object], raw)
-            canonical_job_id = record.get("job_id")
-            recorded_digest = record.get("job_digest")
-            state = record.get("state")
-            if (
-                not _safe_global_record_id(canonical_job_id)
-                or record.get("idempotency_key") != job.idempotency_key
-                or state not in {"reserved", "committed", "retired"}
-            ):
-                raise QueueConflictError(
-                    f"idempotency key was reused with a different or invalid job payload: "
-                    f"{job.idempotency_key}"
-                )
-            canonical_job_id = cast(str, canonical_job_id)
-            job = prepare_owned_jarvis_run_submission(
-                job.model_copy(update={"job_id": canonical_job_id})
-            )
-            job_digest = _job_idempotency_digest(job)
-            if job.submission_digest not in {None, job_digest}:
-                raise QueueConflictError("submitted job carries a mismatched submission_digest")
-            if not _is_sha256_digest(recorded_digest) or recorded_digest != job_digest:
-                raise QueueConflictError(
-                    f"idempotency key was reused with a different or invalid job payload: "
-                    f"{job.idempotency_key}"
-                )
-            submitted = job.model_copy(update={"submission_digest": job_digest})
-            if state == "retired":
-                retired = self._replay_retired_job(
-                    submitted,
-                    record,
-                    job_digest=job_digest,
-                )
-                return IdempotentSubmissionResolution(
-                    state="retired",
-                    canonical_job_id=canonical_job_id,
-                    existing_job=retired,
-                )
-            existing = self._read_optional(
-                self._storage_root / "jobs" / f"{canonical_job_id}.json",
-                RelayJob,
-            )
-            if existing is not None:
-                if existing.idempotency_key != job.idempotency_key or (
-                    existing.submission_digest is not None
-                    and existing.submission_digest != job_digest
-                ):
-                    raise QueueConflictError(
-                        f"idempotency target identity mismatch: {canonical_job_id}"
-                    )
-                return IdempotentSubmissionResolution(
-                    state="existing",
-                    canonical_job_id=canonical_job_id,
-                    existing_job=existing,
-                )
-            if state == "committed":
-                raise QueueConflictError(
-                    f"idempotency key points to missing job: {job.idempotency_key}"
-                )
-            return IdempotentSubmissionResolution(
-                state="reserved",
-                canonical_job_id=canonical_job_id,
-            )
-
     def submit_job(self, job: RelayJob) -> RelayJob:
         """Submit a job, returning the existing record for a repeated idempotency key."""
         self._require_durable_record_id(job.job_id, field="job_id")
@@ -1814,49 +1682,6 @@ class ClioCoreQueue(
             )
             self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
         return job
-
-    def _replay_retired_job(
-        self,
-        submitted: RelayJob,
-        idempotency_record: dict[str, object],
-        *,
-        job_digest: str,
-    ) -> RelayJob:
-        job_id = idempotency_record.get("job_id")
-        if not isinstance(job_id, str) or not job_id:
-            raise QueueConflictError("retired idempotency record has no job_id")
-        tombstone = self._read_optional(
-            self._storage_root / "job_tombstones" / f"{self._durable_key(job_id)}.json",
-            JobTombstone,
-        )
-        if tombstone is None:
-            raise QueueConflictError(
-                f"retired idempotency record points to a missing tombstone: {job_id}"
-            )
-        if tombstone.job_digest != job_digest or tombstone.idempotency_key != (
-            submitted.idempotency_key
-        ):
-            raise QueueConflictError(f"retired idempotency identity mismatch: {job_id}")
-        metadata = dict(submitted.metadata)
-        metadata["retired_job"] = {
-            "schema_version": tombstone.schema_version,
-            "phase": tombstone.phase.value,
-            "gc_started_at": tombstone.gc_started_at.isoformat(),
-        }
-        return submitted.model_copy(
-            update={
-                "job_id": tombstone.job_id,
-                "cluster": tombstone.cluster,
-                "kind": tombstone.kind,
-                "state": tombstone.final_state,
-                "created_at": tombstone.created_at,
-                "updated_at": tombstone.updated_at,
-                "attempts": tombstone.attempts,
-                "last_error": tombstone.last_error,
-                "leased_by": None,
-                "metadata": metadata,
-            }
-        )
 
     def get_job(self, job_id: str) -> RelayJob:
         """Return a job by id."""
@@ -2346,187 +2171,6 @@ class ClioCoreQueue(
             artifact_uses,
             manifest_sha256=manifest_sha256,
         )
-
-    def list_endpoints(self, cluster: str | None = None) -> list[EndpointRegistration]:
-        """Return registered endpoints, optionally filtered by cluster."""
-        self.initialize()
-        endpoints = list(
-            self._read_many(
-                self._storage_root / "endpoints",
-                EndpointRegistration,
-                identity_field="endpoint_id",
-            )
-        )
-        if cluster is not None:
-            endpoints = [endpoint for endpoint in endpoints if endpoint.cluster == cluster]
-        return sorted(endpoints, key=lambda endpoint: endpoint.registered_at)
-
-    def list_endpoints_page(
-        self,
-        *,
-        cursor: int = 1,
-        limit: int = 100,
-        cluster: str | None = None,
-    ) -> tuple[list[EndpointRegistration], int | None, int]:
-        """Read one global endpoint source window with an in-window cluster filter."""
-
-        def matches(endpoint: EndpointRegistration) -> bool:
-            return cluster is None or endpoint.cluster == cluster
-
-        return self._read_global_order_page(
-            family="endpoints",
-            model=EndpointRegistration,
-            identity_field="endpoint_id",
-            cursor=cursor,
-            limit=limit,
-            predicate=matches,
-        )
-
-    def scan_endpoints(
-        self,
-        *,
-        limit: int,
-        cluster: str | None = None,
-    ) -> tuple[list[EndpointRegistration], bool]:
-        """Read a bounded endpoint snapshot."""
-        endpoints, truncated = self._scan_many(
-            self._storage_root / "endpoints",
-            EndpointRegistration,
-            limit=limit,
-            identity_field="endpoint_id",
-        )
-        if cluster is not None:
-            endpoints = [endpoint for endpoint in endpoints if endpoint.cluster == cluster]
-        return sorted(endpoints, key=lambda endpoint: endpoint.registered_at), truncated
-
-    def scan_fresh_endpoints(
-        self,
-        *,
-        limit: int,
-        fresh_seconds: int,
-        cluster: str | None = None,
-        now: datetime | None = None,
-    ) -> tuple[list[EndpointRegistration], bool]:
-        """Read only recent endpoint buckets, independent of endpoint history size."""
-        self.initialize()
-        self._require_index_migration_complete()
-        return self._scan_fresh_endpoint_index(
-            limit=limit,
-            fresh_seconds=fresh_seconds,
-            cluster=cluster,
-            now=now,
-        )
-
-    def scan_fresh_endpoints_read_only(
-        self,
-        *,
-        limit: int,
-        fresh_seconds: int,
-        cluster: str,
-        now: datetime | None = None,
-    ) -> tuple[list[EndpointRegistration], bool]:
-        """Read one cluster's sealed fresh-endpoint index without initialization.
-
-        This path is for bootstrap/readiness probes. It proves the fixed queue
-        layout and audit seal first, then reads only the requested cluster's
-        bounded recent time buckets. It never creates, repairs, or migrates
-        queue state and never scans the historical endpoint family.
-        """
-        readiness = self.readiness_info()
-        if readiness.get("complete") is not True or readiness.get("sealed") is not True:
-            raise QueueConflictError("fresh endpoint readiness requires a sealed indexed queue")
-        return self._scan_fresh_endpoint_index(
-            limit=limit,
-            fresh_seconds=fresh_seconds,
-            cluster=cluster,
-            now=now,
-        )
-
-    def _scan_fresh_endpoint_index(
-        self,
-        *,
-        limit: int,
-        fresh_seconds: int,
-        cluster: str | None,
-        now: datetime | None,
-    ) -> tuple[list[EndpointRegistration], bool]:
-        """Read bounded fresh endpoint buckets after the caller proves readiness."""
-        if limit < 1 or limit > MAX_BOUNDED_SCAN_RECORDS:
-            raise ValueError(
-                f"endpoint scan limit must be between 1 and {MAX_BOUNDED_SCAN_RECORDS}"
-            )
-        if fresh_seconds < 1 or fresh_seconds > MAX_ENDPOINT_FRESH_SECONDS:
-            raise ValueError(f"fresh_seconds must be between 1 and {MAX_ENDPOINT_FRESH_SECONDS}")
-        observed_at = now or utc_now()
-        cutoff = observed_at - timedelta(seconds=fresh_seconds)
-        first_bucket = _endpoint_fresh_bucket(cutoff)
-        last_bucket = _endpoint_fresh_bucket(observed_at)
-        roots: list[Path]
-        overflow = False
-        if cluster is not None:
-            roots = [self._storage_root / "endpoints_fresh" / _stable_ref_token(cluster)]
-        else:
-            roots = []
-            with os.scandir(self._storage_root / "endpoints_fresh") as entries:
-                for entry in entries:
-                    if not entry.is_dir(follow_symlinks=False):
-                        raise QueueConflictError(
-                            f"fresh endpoint index contains an unsafe root: {entry.path}"
-                        )
-                    if len(roots) >= MAX_ENDPOINT_FRESH_CLUSTER_ROOTS:
-                        overflow = True
-                        break
-                    roots.append(Path(entry.path))
-            roots.sort(key=lambda path: path.name)
-        by_id: dict[str, EndpointRegistration] = {}
-        for cluster_root in roots:
-            for bucket in range(last_bucket, first_bucket - 1, -1):
-                remaining = limit - len(by_id)
-                if remaining <= 0:
-                    overflow = True
-                    break
-                bucket_root = cluster_root / f"{bucket:020d}"
-                if not bucket_root.is_dir():
-                    continue
-                bucket_endpoints, truncated = self._scan_many(
-                    bucket_root,
-                    EndpointRegistration,
-                    limit=remaining,
-                )
-                overflow = overflow or truncated
-                for indexed_endpoint in bucket_endpoints:
-                    endpoint = self.get_endpoint(indexed_endpoint.endpoint_id)
-                    if endpoint is None:
-                        continue
-                    if endpoint.last_seen_at < cutoff:
-                        continue
-                    if (
-                        endpoint.last_seen_at > observed_at
-                        and indexed_endpoint.last_seen_at > observed_at
-                    ):
-                        continue
-                    if cluster is not None and endpoint.cluster != cluster:
-                        raise QueueConflictError(
-                            f"fresh endpoint cluster index mismatch: {endpoint.endpoint_id}"
-                        )
-                    previous = by_id.get(endpoint.endpoint_id)
-                    if previous is None or previous.last_seen_at < endpoint.last_seen_at:
-                        by_id[endpoint.endpoint_id] = endpoint
-            if len(by_id) >= limit:
-                break
-        endpoints = sorted(by_id.values(), key=lambda endpoint: endpoint.registered_at)
-        return endpoints, overflow
-
-    def get_endpoint(self, endpoint_id: str) -> EndpointRegistration | None:
-        """Return one exact endpoint registration when present."""
-        endpoint_id = self._require_durable_record_id(endpoint_id, field="endpoint_id")
-        endpoint = self._read_optional(
-            self._storage_root / "endpoints" / f"{endpoint_id}.json",
-            EndpointRegistration,
-        )
-        if endpoint is not None and endpoint.endpoint_id != endpoint_id:
-            raise QueueConflictError(f"canonical endpoint identity mismatch: {endpoint_id}")
-        return endpoint
 
     def list_leases(self, cluster: str | None = None) -> list[Lease]:
         """Return active and expired leases, optionally filtered by job cluster."""
@@ -9297,14 +8941,6 @@ class ClioCoreQueue(
         self._update_job_index_unlocked(job.job_id, latest_event_seq=0)
         self.append_event(job.job_id, "job.queued", "Job queued", locked=True)
 
-    def _write_committed_idempotency_record(
-        self,
-        key_path: Path,
-        job: RelayJob,
-        job_digest: str,
-    ) -> None:
-        self._write_json(key_path, _committed_idempotency_record(job, job_digest))
-
     def _scheduler_cancel_record_path(
         self,
         family: Literal["scheduler_cancel_pending", "scheduler_cancel_dispositions"],
@@ -9589,64 +9225,6 @@ class ClioCoreQueue(
                 f"terminal input ingest artifact identity changed: {job.job_id}"
             )
         return True
-
-    def _index_fresh_endpoint_unlocked(self, endpoint: EndpointRegistration) -> None:
-        """Move one endpoint's mutable presence record into its current time bucket."""
-        cluster_identity = endpoint.cluster or "__desktop__"
-        cluster_token = _stable_ref_token(cluster_identity)
-        bucket = _endpoint_fresh_bucket(endpoint.last_seen_at)
-        mapping_path = (
-            self._storage_root
-            / "endpoints_fresh_by_id"
-            / f"{_stable_ref_token(endpoint.endpoint_id)}.json"
-        )
-        previous: dict[str, object] | None = None
-        try:
-            raw_previous = self._read_json_document(mapping_path)
-        except FileNotFoundError:
-            raw_previous = None
-        if raw_previous is not None:
-            if not isinstance(raw_previous, dict):
-                raise QueueConflictError(f"fresh endpoint mapping is invalid: {mapping_path}")
-            previous = cast(dict[str, object], raw_previous)
-            if (
-                previous.get("schema_version") != "clio-relay.endpoint-fresh-index.v1"
-                or previous.get("endpoint_id") != endpoint.endpoint_id
-                or not isinstance(previous.get("cluster_token"), str)
-                or isinstance(previous.get("bucket"), bool)
-                or not isinstance(previous.get("bucket"), int)
-            ):
-                raise QueueConflictError(
-                    f"fresh endpoint mapping identity mismatch: {mapping_path}"
-                )
-        target = (
-            self._storage_root
-            / "endpoints_fresh"
-            / cluster_token
-            / f"{bucket:020d}"
-            / f"{endpoint.endpoint_id}.json"
-        )
-        if previous is not None:
-            previous_target = (
-                self._storage_root
-                / "endpoints_fresh"
-                / cast(str, previous["cluster_token"])
-                / f"{cast(int, previous['bucket']):020d}"
-                / f"{endpoint.endpoint_id}.json"
-            )
-            if previous_target != target:
-                _unlink_durable_path(previous_target, missing_ok=True)
-        self._write(target, endpoint)
-        self._write_json(
-            mapping_path,
-            {
-                "schema_version": "clio-relay.endpoint-fresh-index.v1",
-                "endpoint_id": endpoint.endpoint_id,
-                "cluster_token": cluster_token,
-                "bucket": bucket,
-                "last_seen_at": endpoint.last_seen_at.isoformat(),
-            },
-        )
 
     def _write_job_unlocked(self, job: RelayJob) -> None:
         """Write a canonical job and replayable derived-index transition."""
@@ -11395,12 +10973,6 @@ def _safe_global_record_id(record_id: object) -> bool:
     return queue_layout.safe_global_record_id(record_id)
 
 
-def _endpoint_fresh_bucket(value: datetime) -> int:
-    """Return the UTC minute bucket used by the live endpoint index."""
-    observed = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    return int(observed.timestamp()) // ENDPOINT_FRESH_BUCKET_SECONDS
-
-
 def _job_matches_mcp_admission_class(
     job: RelayJob,
     admission_class: McpAdmissionClass,
@@ -11946,66 +11518,6 @@ def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _job_idempotency_digest(job: RelayJob) -> str:
-    payload = job.model_dump(mode="json")
-    for generated_field in {
-        "job_id",
-        "state",
-        "created_at",
-        "updated_at",
-        "leased_by",
-        "attempts",
-        "last_error",
-        "submission_digest",
-    }:
-        payload.pop(generated_field, None)
-    # Preserve the pre-lineage digest for submissions without dependencies so
-    # existing idempotency records remain replayable after this additive schema
-    # upgrade. Non-empty dependency pins remain part of the canonical identity.
-    if not payload.get("used_artifact_refs"):
-        payload.pop("used_artifact_refs", None)
-    else:
-        # A missing provenance field is the legacy two-field ArtifactUse wire
-        # shape. Keep its digest byte-for-byte stable after the additive model
-        # field is introduced; non-null provenance remains canonical identity.
-        payload["used_artifact_refs"] = [
-            artifact_use_payload(item) for item in job.used_artifact_refs
-        ]
-    raw_metadata = payload.get("metadata")
-    if job.kind is JobKind.INPUT_INGEST and isinstance(raw_metadata, dict):
-        typed_metadata = cast(dict[str, object], raw_metadata)
-        for key in (
-            INPUT_INGEST_POLICY_METADATA_KEY,
-            INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
-            INPUT_INGEST_ATTEMPT_METADATA_KEY,
-        ):
-            typed_metadata.pop(key, None)
-    # Preserve the pre-JARVIS-lock digest for generic MCP calls. The marker is
-    # release authority only when explicitly present on the built-in route.
-    raw_spec = payload.get("spec")
-    if isinstance(raw_spec, dict):
-        spec_payload = cast(dict[str, object], raw_spec)
-        if spec_payload.get("expected_jarvis_cd_lock_binding") is None:
-            spec_payload.pop("expected_jarvis_cd_lock_binding", None)
-        # Preserve the pre-admission-lane digest for ordinary MCP work. Only an
-        # explicit control-query promotion is new caller-visible identity.
-        if (
-            job.kind is JobKind.MCP_CALL
-            and isinstance(job.spec, McpCallSpec)
-            and job.spec.admission_class is McpAdmissionClass.WORKLOAD
-        ):
-            spec_payload.pop("admission_class", None)
-        if is_owned_jarvis_run_spec(job.kind, job.spec):
-            raw_arguments = spec_payload.get("arguments")
-            if isinstance(raw_arguments, dict):
-                # The relay injects this identity at admission. Like job_id and
-                # timestamps, it is durable output rather than caller payload,
-                # so excluding it keeps pre-handle idempotency records replayable.
-                cast(dict[str, object], raw_arguments).pop("execution_id", None)
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _is_sha256_digest(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -12117,19 +11629,3 @@ def _migration_batch_paths(
         key=lambda path: path.name,
     )
     return candidates[:limit], len(candidates) > limit
-
-
-def _idempotency_key_filename(key: str) -> str:
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return f"key_{digest}"
-
-
-def _committed_idempotency_record(job: RelayJob, job_digest: str) -> dict[str, object]:
-    return {
-        "state": "committed",
-        "job_id": job.job_id,
-        "idempotency_key": job.idempotency_key,
-        "job_digest": job_digest,
-        "created_at": job.created_at.isoformat(),
-        "committed_at": utc_now().isoformat(),
-    }

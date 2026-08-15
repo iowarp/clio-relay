@@ -133,9 +133,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # deletion offsets it: these are two new, real config fields, not a fixable
     # regression.
     "src/clio_relay/cluster_config.py": 1863,
-    # #231 CQ7: durable event and global/per-job order-index ownership moves
-    # behind typed owner/store seams, lowering the facade ratchet by 637 lines.
-    "src/clio_relay/core_queue.py": 12135,
+    # #231 CQ8: idempotency admission and endpoint registration/heartbeat
+    # ownership move behind typed owner/store seams, lowering the facade
+    # ratchet by 504 lines.
+    "src/clio_relay/core_queue.py": 11631,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_

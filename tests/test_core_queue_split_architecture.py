@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +16,9 @@ from pytest import MonkeyPatch
 
 from clio_relay import core_queue as core_queue_module
 from clio_relay import (
+    queue_endpoints,
     queue_events,
+    queue_idempotency,
     queue_index_state,
     queue_lease_records,
     queue_legacy_output_audit,
@@ -26,7 +29,13 @@ from clio_relay import (
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
-from clio_relay.models import JobKind
+from clio_relay.models import (
+    EndpointRegistration,
+    EndpointRole,
+    JarvisRunSpec,
+    JobKind,
+    RelayJob,
+)
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
 
@@ -48,6 +57,8 @@ _OWNER_RANK = {
     "queue_legacy_audit": 12,
     "queue_order_index": 13,
     "queue_events": 14,
+    "queue_idempotency": 15,
+    "queue_endpoints": 16,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -65,6 +76,8 @@ _OWNER_BUDGETS = {
     "queue_legacy_audit": 650,
     "queue_order_index": 450,
     "queue_events": 270,
+    "queue_idempotency": 270,
+    "queue_endpoints": 340,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -105,6 +118,14 @@ class _LegacyOutputPathLookupSabotage(RuntimeError):
 
 class _EventIndexLookupSabotage(RuntimeError):
     """Raised only when CQ7 event append reaches the order-index owner."""
+
+
+class _IdempotencyStoreLookupSabotage(RuntimeError):
+    """Raised only when CQ8 idempotency reaches its store-read owner."""
+
+
+class _EndpointStoreLookupSabotage(RuntimeError):
+    """Raised only when CQ8 endpoint registration reaches its store-write owner."""
 
 
 @dataclass(frozen=True)
@@ -310,6 +331,117 @@ def test_cq7_event_append_uses_the_order_index_increment_lookup(
         match="queue_events order-index increment lookup engaged",
     ):
         queue.append_event("job-cq7", "cq7.sabotage", "CQ7 sabotage", locked=True)
+
+
+def test_cq8_idempotency_uses_its_store_read_lookup_and_typed_mixin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Idempotency resolution must execute the typed CQ8 owner and its read seam."""
+
+    def sabotage(_path: Path) -> object:
+        raise _IdempotencyStoreLookupSabotage("queue_idempotency store-read lookup engaged")
+
+    def accept_complete_index(_root: Path) -> None:
+        return None
+
+    isolated_store_read = SimpleNamespace(
+        **{
+            **vars(queue_store_read),
+            "read_json_document": sabotage,
+        }
+    )
+    monkeypatch.setattr(queue_idempotency, "queue_store_read", isolated_store_read)
+    isolated_index_state = SimpleNamespace(
+        **{
+            **vars(queue_index_state),
+            "require_index_migration_complete": accept_complete_index,
+        }
+    )
+    monkeypatch.setattr(queue_idempotency, "queue_index_state", isolated_index_state)
+    queue = ClioCoreQueue(tmp_path)
+    monkeypatch.setattr(queue, "initialize", lambda: None)
+    monkeypatch.setattr(queue, "_require_index_migration_complete", lambda: None)
+    monkeypatch.setattr(queue, "_lock", nullcontext())
+    job = RelayJob(
+        cluster="cluster-cq8",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq8-owner-read",
+    )
+
+    with pytest.raises(
+        _IdempotencyStoreLookupSabotage,
+        match="queue_idempotency store-read lookup engaged",
+    ):
+        queue.resolve_idempotent_submission(job)
+
+    assert (
+        ClioCoreQueue.resolve_idempotent_submission
+        is queue_idempotency.QueueIdempotencyMixin.resolve_idempotent_submission
+    )
+
+
+def test_cq8_endpoint_registration_uses_its_store_write_lookup_and_typed_mixin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Endpoint registration must execute the typed CQ8 owner and its write seam."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _EndpointStoreLookupSabotage("queue_endpoints store-write lookup engaged")
+
+    def accept_complete_index(_root: Path) -> None:
+        return None
+
+    def ignore_global_order(_family: str, _record_id: str) -> int:
+        return 1
+
+    def ignore_write(_path: Path, _record: object) -> None:
+        return None
+
+    def ignore_fresh_index(_endpoint: EndpointRegistration) -> None:
+        return None
+
+    isolated_store_write = SimpleNamespace(
+        **{
+            **vars(queue_store_write),
+            "write_model": sabotage,
+        }
+    )
+    monkeypatch.setattr(queue_endpoints, "queue_store_write", isolated_store_write)
+    queue = ClioCoreQueue(tmp_path)
+    isolated_index_state = SimpleNamespace(
+        **{
+            **vars(queue_index_state),
+            "require_index_migration_complete": accept_complete_index,
+        }
+    )
+    monkeypatch.setattr(queue_endpoints, "queue_index_state", isolated_index_state)
+    monkeypatch.setattr(queue, "initialize", lambda: None)
+    monkeypatch.setattr(queue, "_require_index_migration_complete", lambda: None)
+    monkeypatch.setattr(queue, "_lock", nullcontext())
+    monkeypatch.setattr(queue, "_ensure_global_order_entry_unlocked", ignore_global_order)
+    monkeypatch.setattr(queue, "_write", ignore_write)
+    monkeypatch.setattr(queue, "_index_fresh_endpoint_unlocked", ignore_fresh_index)
+    observed_at = datetime(2026, 8, 15, 12, tzinfo=UTC)
+    endpoint = EndpointRegistration(
+        endpoint_id="endpoint-cq8",
+        role=EndpointRole.WORKER,
+        cluster="cluster-cq8",
+        hostname="worker-cq8",
+        pid=238,
+        registered_at=observed_at,
+        last_seen_at=observed_at,
+    )
+
+    with pytest.raises(
+        _EndpointStoreLookupSabotage,
+        match="queue_endpoints store-write lookup engaged",
+    ):
+        queue.register_endpoint(endpoint)
+
+    assert ClioCoreQueue.register_endpoint is queue_endpoints.QueueEndpointsMixin.register_endpoint
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
