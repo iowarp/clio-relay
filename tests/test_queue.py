@@ -512,6 +512,7 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
     indexed_path = queue.root / "leases_by_job" / job.job_id / f"{lease.lease_id}.json"
     original_unlink = Path.unlink
     attempts = 0
+    retry_delays: list[float] = []
 
     def blocked_unlink(path: Path, missing_ok: bool = False) -> None:
         nonlocal attempts
@@ -526,11 +527,13 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "unlink", blocked_unlink)
-        patch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+        patch.setattr(queue_store_write.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+        patch.setattr(queue_store_write.time, "sleep", retry_delays.append)
         with pytest.raises(PermissionError, match="persistent sharing violation"):
             queue.release_lease(lease.lease_id)
 
     assert attempts == core_queue_module.ATOMIC_REPLACE_ATTEMPTS
+    assert retry_delays == [0.0] * (core_queue_module.ATOMIC_REPLACE_ATTEMPTS - 1)
     assert indexed_path.is_file()
     assert len(list((queue.root / "transition_intents").glob("*.json"))) == 1
 
@@ -543,6 +546,37 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
         lease.lease_id
     ).exists()
     assert list((reopened.root / "transition_intents").glob("*.json")) == []
+
+
+def test_unlink_retry_resolves_delay_through_the_layout_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CQ3 write retry seam reads the live ``queue_layout`` setting."""
+    path = tmp_path / "retry.json"
+    path.write_text("{}", encoding="utf-8")
+    attempts = 0
+    retry_delays: list[float] = []
+
+    def blocked_unlink(_path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        del missing_ok
+        attempts += 1
+        raise _SimulatedWindowsSharingViolation(
+            13,
+            "simulated persistent sharing violation",
+            str(path),
+        )
+
+    monkeypatch.setattr(Path, "unlink", blocked_unlink)
+    monkeypatch.setattr(queue_store_write.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(queue_store_write.time, "sleep", retry_delays.append)
+
+    with pytest.raises(PermissionError, match="persistent sharing violation"):
+        queue_store_write.unlink_durable_path(path)
+
+    assert attempts == queue_store_write.queue_layout.ATOMIC_REPLACE_ATTEMPTS
+    assert retry_delays == [0.0] * (attempts - 1)
 
 
 def test_durable_record_read_retries_identity_replacement_before_open(
@@ -854,8 +888,8 @@ def test_concurrent_endpoint_heartbeat_replacement_is_not_a_false_hardlink(
             heartbeat_done.set()
 
     monkeypatch.setattr(
-        core_queue_module,
-        "_read_bounded_record_bytes_once",
+        queue_store_read,
+        "read_bounded_record_bytes_once",
         coordinate_replacement,
     )
     worker = threading.Thread(target=heartbeat, name="concurrent-endpoint-heartbeat")

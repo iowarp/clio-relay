@@ -48,6 +48,10 @@ class QueueConflictError(RelayError):
     """Raised when a queue operation violates an invariant."""
 
 
+class McpTaskIdentityConflictError(QueueConflictError):
+    """A caller reused one durable MCP task identity for different semantics."""
+
+
 def queue_conflict_from_cause(
     message: str,
     *,
@@ -72,7 +76,7 @@ class TaskInputParkConflictError(QueueConflictError):
     ``update_mcp_task_projection``'s optimistic-concurrency check keeps
     losing a race after every retry attempt. This is a transient
     concurrency conflict, never a client parameter problem -- unlike
-    ``put_mcp_task``'s genuine task-identity-reuse ``QueueConflictError``,
+    ``put_mcp_task``'s genuine task-identity-reuse conflict,
     it must never be surfaced as ``INVALID_PARAMS`` (clio-relay#218 rework).
     A distinct subtype, rather than a message/keyword match, is what lets
     ``intercept_tool_call`` discriminate the two conflict sources by type.

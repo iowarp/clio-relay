@@ -8,9 +8,8 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
-from typing import cast
 
 from pydantic import BaseModel
 
@@ -18,17 +17,6 @@ from clio_relay import queue_layout
 from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 
 logger = logging.getLogger(__name__)
-
-_facade_symbol: Callable[[str], object] | None = None
-
-
-def bind_facade_symbol(
-    resolver: Callable[[str], object],
-) -> Callable[[str], object]:
-    """Preserve the facade's live bounded-read patch seam after extraction."""
-    global _facade_symbol
-    _facade_symbol = resolver
-    return resolver
 
 
 def read_canonical_record[Record: BaseModel](
@@ -322,15 +310,9 @@ def read_bounded_record_bytes(path: Path) -> bytes:
     """Read one stable bounded record, retrying only atomic replacement races."""
     limit = queue_layout.record_max_bytes(path)
     last_replacement: queue_layout.TransientRecordReplacement | None = None
-    read_attempt = read_bounded_record_bytes_once
-    if _facade_symbol is not None:
-        read_attempt = cast(
-            Callable[..., bytes],
-            _facade_symbol("_read_bounded_record_bytes_once"),
-        )
     for attempt in range(queue_layout.ATOMIC_REPLACE_ATTEMPTS):
         try:
-            return read_attempt(path, limit=limit)
+            return read_bounded_record_bytes_once(path, limit=limit)
         except FileNotFoundError as error:
             if last_replacement is None:
                 raise

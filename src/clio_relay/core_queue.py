@@ -45,6 +45,7 @@ from clio_relay.cluster_config import (
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import (
     ConfigurationError,
+    McpTaskIdentityConflictError,
     NotFoundError,
     QueueConflictError,
     queue_conflict_from_cause,
@@ -117,7 +118,6 @@ from clio_relay.worker_lifetime_lock import (
 )
 
 logger = logging.getLogger(__name__)
-_STORE_READ_FACADE_SYMBOL = queue_store_read.bind_facade_symbol(globals().__getitem__)
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = queue_layout.LeaseExpiryReference
 _UNSET = queue_layout.UNSET
@@ -257,6 +257,52 @@ def _artifact_with_sequence(artifact: ArtifactRef, sequence: int) -> ArtifactRef
     return ArtifactRef.model_validate(payload)
 
 
+class _QueueStoreAdapter:
+    """Expose private facade store state to the extracted queue owners."""
+
+    def __init__(self, queue: ClioCoreQueue) -> None:
+        self._queue = queue
+
+    @property
+    def storage_root(self) -> Path:
+        """Return the internal filesystem root for durable queue records."""
+        return self._queue._storage_root  # pyright: ignore[reportPrivateUsage]
+
+    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
+        """Return the migration-pinned queue-root descriptor and identity."""
+        return (
+            self._queue._locked_storage_root_descriptor,  # pyright: ignore[reportPrivateUsage]
+            self._queue._locked_storage_root_identity,  # pyright: ignore[reportPrivateUsage]
+        )
+
+    @property
+    def lock(self) -> queue_context.QueueLockProtocol:
+        """Return the shared queue storage lock."""
+        return self._queue._lock  # pyright: ignore[reportPrivateUsage]
+
+    def initialize(self) -> None:
+        """Initialize and validate the durable store."""
+        self._queue.initialize()
+
+    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
+        """Read one optional typed record through the store-read owner."""
+        return self._queue._read_optional(path, model)  # pyright: ignore[reportPrivateUsage]
+
+    def write(self, path: Path, record: BaseModel) -> None:
+        """Persist one typed record through the store-write owner."""
+        self._queue._write(path, record)  # pyright: ignore[reportPrivateUsage]
+
+    def bounded_regular_json_count(
+        self,
+        directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[int, bool]:
+        """Count bounded regular JSON records without following unsafe entries."""
+        return _bounded_regular_json_count(directory, limit=limit, label=label)
+
+
 class ClioCoreQueue:
     """Durable queue facade for endpoint, job, task, lease, event, cursor, and artifact records."""
 
@@ -279,41 +325,9 @@ class ClioCoreQueue:
         self._migration_lifetime_guarded = False
         self._locked_storage_root_descriptor: int | None = None
         self._locked_storage_root_identity: tuple[int, int] | None = None
-        self._jarvis_input_store: queue_context.QueueStoreProtocol = self
-        self._layout = queue_layout.QueueLayout(self._jarvis_input_store)
-        self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._jarvis_input_store)
-
-    @property
-    def storage_root(self) -> Path:
-        """Return the internal filesystem root for durable queue records."""
-        return self._storage_root
-
-    def locked_storage_root(self) -> tuple[int | None, tuple[int, int] | None]:
-        """Return the migration-pinned queue-root descriptor and identity."""
-        return self._locked_storage_root_descriptor, self._locked_storage_root_identity
-
-    @property
-    def lock(self) -> queue_context.QueueLockProtocol:
-        """Return the shared queue storage lock."""
-        return self._lock
-
-    def read_optional(self, path: Path, model: type[Record]) -> Record | None:
-        """Read one optional typed record through the store-read owner."""
-        return self._read_optional(path, model)
-
-    def write(self, path: Path, record: BaseModel) -> None:
-        """Persist one typed record through the store-write owner."""
-        self._write(path, record)
-
-    def bounded_regular_json_count(
-        self,
-        directory: Path,
-        *,
-        limit: int,
-        label: str,
-    ) -> tuple[int, bool]:
-        """Count bounded regular JSON records without following unsafe entries."""
-        return _bounded_regular_json_count(directory, limit=limit, label=label)
+        self._store_adapter: queue_context.QueueStoreProtocol = _QueueStoreAdapter(self)
+        self._layout = queue_layout.QueueLayout(self._store_adapter)
+        self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._store_adapter)
 
     def _storage_root_stat(self) -> os.stat_result:
         """Inspect the queue root through its held descriptor when migration-pinned."""
@@ -601,36 +615,6 @@ class ClioCoreQueue:
         if schema_version is not None and checkpoint.get("schema_version") != schema_version:
             raise QueueConflictError(f"sealed {label} checkpoint schema is invalid")
         return checkpoint
-
-    @classmethod
-    def _require_sealed_checkpoint_group(
-        cls,
-        raw: object,
-        *,
-        label: str,
-        families: tuple[str, ...],
-        schema_by_family: dict[str, str] | None = None,
-    ) -> dict[str, object]:
-        """Validate one exact fixed-family checkpoint group."""
-        return queue_index_state.require_sealed_checkpoint_group(
-            raw,
-            label=label,
-            families=families,
-            schema_by_family=schema_by_family,
-            checkpoint_validator=cls._require_sealed_checkpoint,
-        )
-
-    @staticmethod
-    def _require_optional_bounded_record_count(
-        checkpoint: dict[str, object],
-        *,
-        label: str,
-    ) -> None:
-        """Validate an optional bounded migration record count."""
-        queue_index_state.require_optional_bounded_record_count(
-            checkpoint,
-            label=label,
-        )
 
     def _read_sealed_index_migration_state(
         self,
@@ -6801,7 +6785,7 @@ class ClioCoreQueue:
                     or {field: persisted.initial_result.get(field) for field in route_fields}
                     != {field: requested.initial_result.get(field) for field in route_fields}
                 ):
-                    raise QueueConflictError(
+                    raise McpTaskIdentityConflictError(
                         f"MCP task identity was reused with different semantics: {task.task_id}"
                     )
                 return existing
@@ -13245,9 +13229,6 @@ class ClioCoreQueue:
     def _require_safe_write_directory(self, directory: Path) -> os.stat_result:
         return queue_store_write.require_safe_write_directory(self._storage_root, directory)
 
-    def _require_private_write_staging(self) -> tuple[Path, os.stat_result]:
-        return queue_store_write.require_private_write_staging(self._storage_root)
-
     def _purge_write_staging_unlocked(self) -> None:
         queue_store_write.purge_write_staging(self._storage_root)
 
@@ -13309,19 +13290,6 @@ class ClioCoreQueue:
             model,
             limit=limit,
             identity_field=identity_field,
-        )
-
-    @staticmethod
-    def _scan_json_record_paths(
-        directory: Path,
-        *,
-        limit: int,
-        label: str,
-    ) -> tuple[list[Path], bool]:
-        return queue_store_read.scan_json_record_paths(
-            directory,
-            limit=limit,
-            label=label,
         )
 
     @staticmethod

@@ -24,12 +24,8 @@ status code: every ``reason``, and everything that follows from it
 1. A :class:`JarvisDispatchRefusal` is a frozen dataclass a durable
    ``jarvis_run`` result *carries* -- never raised and caught -- so it gets
    its own object-typed entry point ahead of exception dispatch.
-2. An explicit ``reason=`` keyword is the call-path-scope override: a small
-   number of raise sites cannot be told apart by exception type alone (a
-   bare ``QueueConflictError`` means a genuine MCP task-identity conflict
-   only on the ``intercept_tool_call`` path -- the same type is raised 651
-   other times in ``core_queue.py`` for unrelated invariants) or already
-   have a shipped, call-path-fixed reason (``fastmcp_server.py``'s
+2. An explicit ``reason=`` keyword is the call-path-scope override for sites
+   that already have a shipped, call-path-fixed reason (``fastmcp_server.py``'s
    ``_handle_get`` catch-all always means
    ``mcp_task_status_reconciliation_failed``, regardless of the underlying
    exception's type). These call sites already know their own reason; this
@@ -72,12 +68,11 @@ this slice deletes at their old call sites, per doc §10):
     handler as a bare internal error. Routing it through :func:`classify`
     closes that hole with a correctly-typed, retryable conversion instead.
 ``mcp_task_conflict``
-    ``put_mcp_task``'s genuine task-identity-reuse ``QueueConflictError``
+    ``put_mcp_task``'s dedicated genuine task-identity-reuse conflict
     (clio-relay#218), refused as a typed, queryable ``MCPError`` rather than
     escaping through FastMCP's generic handler as a bare, typeless
-    ``INTERNAL_ERROR`` (the original #218 symptom). Call-path-scoped (see
-    dispatch rule 2 above): a bare ``QueueConflictError`` means this only on
-    the MCP-task-creation path.
+    ``INTERNAL_ERROR`` (the original #218 symptom). The dedicated subtype is
+    the only queue conflict whose authored message is marked public there.
 ``mcp_task_status_reconciliation_failed``
     ``_handle_get``'s catch-all (clio-relay#215): ``task_status`` can
     re-derive a task's status over network round trips, and an unwrapped

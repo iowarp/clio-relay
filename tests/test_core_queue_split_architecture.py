@@ -28,24 +28,38 @@ from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
-_OWNER_ORDER = (
-    "queue_context",
-    "queue_jarvis_inputs",
-    "queue_layout",
-    "queue_store_lock",
-    "queue_store_read",
-    "queue_store_write",
-    "queue_lease_records",
-    "queue_scheduler_cancel_records",
-    "queue_legacy_output_codec",
-    "queue_index_state",
-)
-_CQ4_CODEC_OWNERS = {
+_NON_OWNER_QUEUE_MODULES = frozenset({"queue_management", "queue_validation"})
+_OWNER_RANK = {
+    "queue_context": 0,
+    "queue_jarvis_inputs": 1,
+    "queue_layout": 2,
+    "queue_store_lock": 3,
+    "queue_store_read": 4,
+    "queue_store_write": 5,
+    "queue_lease_records": 6,
+    "queue_scheduler_cancel_records": 7,
+    "queue_legacy_output_codec": 8,
+    "queue_index_state": 9,
+}
+_OWNER_BUDGETS = {
+    "queue_context": 70,
+    "queue_jarvis_inputs": 300,
+    "queue_layout": 410,
+    "queue_store_lock": 270,
+    "queue_store_read": 350,
+    "queue_store_write": 230,
     "queue_lease_records": 680,
     "queue_scheduler_cancel_records": 260,
     "queue_legacy_output_codec": 500,
+    "queue_index_state": 270,
 }
-_CQ5_INDEX_OWNER = {"queue_index_state": 270}
+_CQ4_CODEC_OWNERS = frozenset(
+    {
+        "queue_lease_records",
+        "queue_scheduler_cancel_records",
+        "queue_legacy_output_codec",
+    }
+)
 _JARVIS_INPUT_SYMBOLS = (
     "get_jarvis_package_input_contract",
     "put_jarvis_package_input_contract",
@@ -79,6 +93,19 @@ class _OwnerDependency:
     collaborator: str
 
 
+def _discover_owner_manifest(source_root: Path) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            path.stem
+            for path in source_root.glob("queue_*.py")
+            if path.stem not in _NON_OWNER_QUEUE_MODULES
+        )
+    )
+
+
+_OWNER_MANIFEST = _discover_owner_manifest(_SOURCE_ROOT)
+
+
 def _owner_tree(owner: str) -> ast.Module:
     return ast.parse(
         (_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8"),
@@ -86,42 +113,80 @@ def _owner_tree(owner: str) -> ast.Module:
     )
 
 
-def _imported_owner(module: str | None) -> str | None:
-    if module is None or not module.startswith("clio_relay.queue_"):
+def _imported_owner(
+    module: str | None,
+    *,
+    owners: tuple[str, ...] = _OWNER_MANIFEST,
+) -> str | None:
+    if module is None:
         return None
-    return module.removeprefix("clio_relay.")
+    normalized = module.removeprefix("clio_relay.")
+    return normalized if normalized in owners else None
+
+
+def _core_import_lines(tree: ast.Module) -> list[int]:
+    violations: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name in {"core_queue", "clio_relay.core_queue"} for alias in node.names):
+                violations.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom) and (
+            node.module in {"core_queue", "clio_relay.core_queue"}
+            or (
+                node.module in {None, "clio_relay"}
+                and any(alias.name == "core_queue" for alias in node.names)
+            )
+        ):
+            violations.append(node.lineno)
+    return violations
+
+
+def _bare_owner_import_lines(
+    tree: ast.Module,
+    *,
+    caller: str,
+    functions_by_owner: dict[str, set[str]],
+    owners: tuple[str, ...] = _OWNER_MANIFEST,
+) -> list[int]:
+    violations: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        collaborator = _imported_owner(node.module, owners=owners)
+        if collaborator is None or collaborator == caller:
+            continue
+        if any(alias.name in functions_by_owner.get(collaborator, set()) for alias in node.names):
+            violations.append(node.lineno)
+    return violations
 
 
 def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
     dependencies: set[_OwnerDependency] = set()
-    for caller in _OWNER_ORDER:
+    for caller in _OWNER_MANIFEST:
         for node in ast.walk(_owner_tree(caller)):
             if isinstance(node, ast.ImportFrom):
                 collaborator = _imported_owner(node.module)
-                if collaborator in _OWNER_ORDER and collaborator != caller:
+                if collaborator is not None and collaborator != caller:
                     dependencies.add(_OwnerDependency(caller, collaborator))
-                if node.module == "clio_relay":
+                if node.module in {None, "clio_relay"}:
                     for alias in node.names:
-                        if alias.name in _OWNER_ORDER and alias.name != caller:
+                        if alias.name in _OWNER_MANIFEST and alias.name != caller:
                             dependencies.add(_OwnerDependency(caller, alias.name))
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     collaborator = _imported_owner(alias.name)
-                    if collaborator in _OWNER_ORDER and collaborator != caller:
+                    if collaborator is not None and collaborator != caller:
                         dependencies.add(_OwnerDependency(caller, collaborator))
     return tuple(sorted(dependencies, key=lambda edge: (edge.caller, edge.collaborator)))
 
 
 def test_split_owners_never_import_the_core_queue_facade() -> None:
     """An extracted owner must never create a callback edge to ``core_queue``."""
-    violations: list[str] = []
-    for owner in _OWNER_ORDER:
-        for node in ast.walk(_owner_tree(owner)):
-            if isinstance(node, ast.Import):
-                if any(alias.name == "clio_relay.core_queue" for alias in node.names):
-                    violations.append(f"{owner}:{node.lineno}")
-            elif isinstance(node, ast.ImportFrom) and node.module == "clio_relay.core_queue":
-                violations.append(f"{owner}:{node.lineno}")
+    violations = [
+        f"{owner}:{line}"
+        for owner in _OWNER_MANIFEST
+        for line in _core_import_lines(_owner_tree(owner))
+    ]
     assert violations == []
 
 
@@ -133,37 +198,34 @@ def test_split_owners_never_bare_import_cross_owner_functions() -> None:
             for node in _owner_tree(owner).body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        for owner in _OWNER_ORDER
+        for owner in _OWNER_MANIFEST
     }
     violations: list[str] = []
-    for caller in _OWNER_ORDER:
-        for node in ast.walk(_owner_tree(caller)):
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            collaborator = _imported_owner(node.module)
-            if collaborator is None or collaborator == caller:
-                continue
-            for alias in node.names:
-                if alias.name in functions_by_owner.get(collaborator, set()):
-                    violations.append(
-                        f"{caller}:{node.lineno} imports {collaborator}.{alias.name} bare"
-                    )
+    for caller in _OWNER_MANIFEST:
+        violations.extend(
+            f"{caller}:{line} imports a cross-owner function bare"
+            for line in _bare_owner_import_lines(
+                _owner_tree(caller),
+                caller=caller,
+                functions_by_owner=functions_by_owner,
+            )
+        )
     assert violations == []
 
 
 def test_split_owner_dependencies_follow_the_migration_topology() -> None:
     """Every recorded owner dependency points to an earlier CQ1 owner."""
-    order = {owner: index for index, owner in enumerate(_OWNER_ORDER)}
     violations = [
         f"{edge.caller} -> {edge.collaborator}"
         for edge in _owner_dependencies()
-        if order[edge.collaborator] >= order[edge.caller]
+        if _OWNER_RANK.get(edge.collaborator, len(_OWNER_RANK))
+        >= _OWNER_RANK.get(edge.caller, len(_OWNER_RANK))
     ]
     assert violations == []
 
 
-def test_cq4_codecs_are_store_independent_and_within_design_budgets() -> None:
-    """CQ4 owners depend on codecs/layout only and honor their planned caps."""
+def test_cq4_codecs_are_store_independent() -> None:
+    """CQ4 owners depend on codecs/layout only."""
     store_owners = {"queue_store_lock", "queue_store_read", "queue_store_write"}
     violations = [
         f"{edge.caller} -> {edge.collaborator}"
@@ -171,25 +233,67 @@ def test_cq4_codecs_are_store_independent_and_within_design_budgets() -> None:
         if edge.caller in _CQ4_CODEC_OWNERS and edge.collaborator in store_owners
     ]
     assert violations == []
-    for owner, budget in _CQ4_CODEC_OWNERS.items():
+
+
+def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
+    """Every CQ1-CQ5 owner is discovered and reads its cap from one table."""
+    assert set(_OWNER_MANIFEST) == set(_OWNER_BUDGETS)
+    for owner in _OWNER_MANIFEST:
+        budget = _OWNER_BUDGETS[owner]
         line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
 
 
-def test_cq5_index_state_follows_predecessors_and_stays_within_budget() -> None:
-    """CQ5 depends only on landed owners and honors its planned cap."""
-    for owner, budget in _CQ5_INDEX_OWNER.items():
-        line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
-        assert line_count <= budget, f"{owner}: {line_count} > {budget}"
+def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
+    """A top-level absolute owner import cannot bypass bare-function checks."""
+    tree = ast.parse("from queue_layout import validate_canonical_access\n")
+    violations = _bare_owner_import_lines(
+        tree,
+        caller="queue_store_read",
+        functions_by_owner={"queue_layout": {"validate_canonical_access"}},
+    )
+
+    assert violations == [1]
 
 
-def test_queue_store_protocol_is_implemented_by_the_concrete_queue(
+def test_guard_rejects_package_from_core_import_fixture() -> None:
+    """Package-from syntax cannot bypass the facade callback guard."""
+    tree = ast.parse("from clio_relay import core_queue\n")
+
+    assert _core_import_lines(tree) == [1]
+
+
+def test_guard_discovers_and_rejects_unregistered_owner_fixture(tmp_path: Path) -> None:
+    """A newly landed owner is scanned without manual manifest registration."""
+    fixture = tmp_path / "queue_future_owner.py"
+    fixture.write_text("from . import core_queue\n", encoding="utf-8")
+    manifest = _discover_owner_manifest(tmp_path)
+
+    assert manifest == ("queue_future_owner",)
+    assert _core_import_lines(ast.parse(fixture.read_text(encoding="utf-8"))) == [1]
+
+
+def test_queue_store_protocol_is_implemented_by_one_private_adapter(
     tmp_path: Path,
 ) -> None:
-    """CQ3 removes the temporary facade adapter from the JARVIS owner binding."""
+    """CQ3 owners share one private adapter, never the public facade surface."""
     queue = ClioCoreQueue(tmp_path)
 
-    assert queue._jarvis_input_store is queue  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    adapter = queue._store_adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert adapter is not queue
+    assert queue._layout._store is adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert queue._jarvis_inputs._store is adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
+    """Private owner wiring must not grow the public queue facade."""
+    public_methods = {
+        name
+        for name, member in inspect.getmembers(ClioCoreQueue)
+        if not name.startswith("_") and (inspect.isfunction(member) or isinstance(member, property))
+    }
+
+    assert len(public_methods) == 128
 
 
 def test_index_completeness_gate_reads_through_the_cq5_owner(

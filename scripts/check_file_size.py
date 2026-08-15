@@ -133,17 +133,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # deletion offsets it: these are two new, real config fields, not a fixable
     # regression.
     "src/clio_relay/cluster_config.py": 1863,
-    # #231 R9 fix round 3: +80 lines curate and server-log 21 foreign caught
-    # exception details found by the complete RelayAuthoredError/
-    # QueueConflictError constructor audit. The public conflict strings keep
-    # only operation and owned-record identities.
-    "src/clio_relay/core_queue.py": 14392,
+    # #231 CQ checkpoint fixes: the private owner adapter, four dead-wrapper
+    # deletions, and owner-only bounded-read seam lower the facade ratchet.
+    "src/clio_relay/core_queue.py": 14360,
     "src/clio_relay/deployment.py": 1243,
-    # #231 R9 fix round 3: cohesive wire-adapter owner split out of
-    # door_errors.py. Both sides are recorded exactly even below the default
-    # cap so this decomposition cannot silently re-accrete.
     "src/clio_relay/door_error_adapters.py": 168,
-    "src/clio_relay/door_errors.py": 739,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
