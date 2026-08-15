@@ -8,17 +8,21 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import core_queue as core_queue_module
 from clio_relay import (
+    queue_index_state,
     queue_lease_records,
     queue_legacy_output_codec,
     queue_scheduler_cancel_records,
+    queue_store_read,
 )
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import QueueConflictError
 from clio_relay.models import JobKind
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
@@ -34,12 +38,14 @@ _OWNER_ORDER = (
     "queue_lease_records",
     "queue_scheduler_cancel_records",
     "queue_legacy_output_codec",
+    "queue_index_state",
 )
 _CQ4_CODEC_OWNERS = {
     "queue_lease_records": 680,
     "queue_scheduler_cancel_records": 260,
     "queue_legacy_output_codec": 500,
 }
+_CQ5_INDEX_OWNER = {"queue_index_state": 270}
 _JARVIS_INPUT_SYMBOLS = (
     "get_jarvis_package_input_contract",
     "put_jarvis_package_input_contract",
@@ -61,6 +67,10 @@ _LAYOUT_METHODS = {
 
 class _CodecLookupSabotage(RuntimeError):
     """Raised only when a CQ4 owner decoder lookup is live."""
+
+
+class _IndexStateLookupSabotage(RuntimeError):
+    """Raised only when the CQ5 owner store-read lookup is live."""
 
 
 @dataclass(frozen=True)
@@ -166,6 +176,13 @@ def test_cq4_codecs_are_store_independent_and_within_design_budgets() -> None:
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
 
 
+def test_cq5_index_state_follows_predecessors_and_stays_within_budget() -> None:
+    """CQ5 depends only on landed owners and honors its planned cap."""
+    for owner, budget in _CQ5_INDEX_OWNER.items():
+        line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
+        assert line_count <= budget, f"{owner}: {line_count} > {budget}"
+
+
 def test_queue_store_protocol_is_implemented_by_the_concrete_queue(
     tmp_path: Path,
 ) -> None:
@@ -173,6 +190,57 @@ def test_queue_store_protocol_is_implemented_by_the_concrete_queue(
     queue = ClioCoreQueue(tmp_path)
 
     assert queue._jarvis_input_store is queue  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_index_completeness_gate_reads_through_the_cq5_owner(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The facade completeness gate must re-resolve the CQ5 store-read lookup."""
+
+    def sabotage(_path: Path) -> object:
+        raise _IndexStateLookupSabotage("queue_index_state store-read lookup engaged")
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "index-v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": core_queue_module.INDEX_MIGRATION_SCHEMA,
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    isolated_store_read = SimpleNamespace(
+        **{
+            **vars(queue_store_read),
+            "read_json_document": sabotage,
+        }
+    )
+    monkeypatch.setattr(queue_index_state, "queue_store_read", isolated_store_read)
+
+    with pytest.raises(
+        _IndexStateLookupSabotage,
+        match="queue_index_state store-read lookup engaged",
+    ):
+        ClioCoreQueue(tmp_path)._require_index_migration_complete()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_cq5_sealed_state_preserves_duplicate_key_rejection(tmp_path: Path) -> None:
+    """CQ5 keeps the sealed-state reader's strict duplicate-key contract."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "index-v1.json").write_text(
+        '{"complete":true,"complete":false}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(core_queue_module.LegacyQueueStateError) as raised:
+        ClioCoreQueue(tmp_path)._read_sealed_index_migration_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert isinstance(raised.value.__cause__, QueueConflictError)
+    assert "duplicate JSON key 'complete'" in str(raised.value.__cause__)
 
 
 def test_jarvis_input_facade_signatures_match_the_owner() -> None:
