@@ -3114,7 +3114,7 @@ def test_worker_ingests_package_progress_side_channel(tmp_path: Path) -> None:
     assert "relay_progress_token" not in progress[0].metadata
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.7"])
 def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3137,7 +3137,7 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
@@ -5933,7 +5933,7 @@ def test_worker_indexes_agent_result_artifacts(
     assert "agent_last_message.available" in event_types
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.6"])
+@pytest.mark.parametrize("registered", [False, True], ids=["built-in", "registered-v3.7"])
 def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -5960,7 +5960,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),

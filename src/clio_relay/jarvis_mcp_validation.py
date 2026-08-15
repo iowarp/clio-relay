@@ -2357,6 +2357,7 @@ def _execution_query_contract_evidence(tool: JSON | None) -> tuple[JSON, bool]:
         "artifact_id",
         "page_size",
         "cursor",
+        "content_max_bytes",
     }
     expected_outputs = {
         "schema_version",

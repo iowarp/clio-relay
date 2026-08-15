@@ -443,8 +443,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "artifact_id",
         "page_size",
         "cursor",
+        "content_max_bytes",
     }
     assert artifact_query["properties"]["page_size"]["maximum"] == 100
+    content_max_bytes = artifact_query["properties"]["content_max_bytes"]["anyOf"][0]
+    assert content_max_bytes == {"type": "integer", "minimum": 1, "maximum": 65536}
     assert query_tool["outputSchema"]["properties"]["kind"] == {
         "type": "string",
         "const": "mcp_call",

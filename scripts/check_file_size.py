@@ -128,7 +128,14 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
-    "src/clio_relay/jarvis_mcp_validation.py": 2671,
+    # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s
+    # own `expected_filters` set was a stale v3.6-shaped copy that never
+    # gained `content_max_bytes` when the v3.7 contract added it (7ea003a
+    # touched `installation.py`'s equivalent guard but missed this one) --
+    # the acceptance validator was reporting a fully compliant remote
+    # contract as FAILED. A ratchet-up for a one-line real bug fix, not
+    # accretion.
+    "src/clio_relay/jarvis_mcp_validation.py": 2672,
     # #231 R6 review fixes: +11 net lines -- F5, `_load_source` checks
     # is_delivery_refusal on the source envelope FIRST and raises the
     # refusal's own message/code, instead of the generic "is not a base64
