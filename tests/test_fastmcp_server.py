@@ -1396,6 +1396,54 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
         queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
 
 
+def test_task_persistence_untyped_failure_surfaces_as_typed_error_v1(
+    tmp_path: Path,
+) -> None:
+    """relay#234 adversarial review finding 1: ``put_mcp_task`` can raise a
+    non-conflict error too (disk-full, permission) -- ``intercept_tool_call``
+    previously caught only ``TaskInputParkConflictError``/``QueueConflictError``,
+    so anything else (an ``OSError`` here, standing in for a real storage
+    failure) escaped through FastMCP's own generic handler with no relay
+    ``reason`` at all, violating the error.v1/no-silent-fallback doctrine.
+
+    Asserts the SERVED wire shape (typed ``reason``/``code``/bounded
+    ``message``), not merely that some exception was raised -- and that the
+    raw ``OSError`` text never reaches the client (dispatch rule 4: an
+    unmatched exception type classifies as ``internal_error`` with a fixed,
+    handler-internals-free message).
+    """
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+    real_put_mcp_task = queue.put_mcp_task
+
+    def disk_full(_task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        raise OSError("No space left on device")
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            arguments = _submit_arguments(tmp_path, "untyped-persistence-failure")
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(client, "relay_submit_agent", arguments)
+            spec = door_errors.REASONS["internal_error"]
+            assert failure.value.code == spec.mcp_code
+            assert failure.value.data == {"reason": "internal_error"}
+            assert "No space left on device" not in str(failure.value)
+            assert "No space left on device" not in json.dumps(
+                failure.value.data,
+                default=str,
+            )
+
+    queue.put_mcp_task = disk_full  # type: ignore[method-assign]
+    try:
+        asyncio.run(scenario())
+    finally:
+        queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
+
+
 def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

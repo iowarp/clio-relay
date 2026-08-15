@@ -119,11 +119,24 @@ Cancellation is cooperative and eventually consistent: `tasks/cancel`
 acknowledges the relay cancellation request, while subsequent `tasks/get`
 observes canonical relay state.
 
-Low-level submission, status, read, and cancellation tools remain immediate.
-Task augmentation is enabled for the virtual remote-operation catalog and the
-JARVIS operation surface, where a durable job receipt already exists. The
-adapter creates a task only after relay admission succeeds; validation errors
-or calls that return no relay job remain ordinary synchronous results.
+Low-level status, read, and cancellation tools, and every low-level
+submission tool except the two below, are never task-negotiated
+(`forbidden`): they always answer inline, whether or not the calling client
+declares the tasks extension. Task augmentation is enabled for the virtual
+remote-operation catalog, the JARVIS operation surface, and the two
+remote-agent submission tools (`relay_submit_agent`,
+`relay_submit_remote_agent`), all of which carry a durable job receipt to
+project. The adapter creates a task only after relay admission succeeds;
+validation errors or calls that return no relay job remain ordinary
+synchronous results. Task-capable tools are `optional`, not `required`: a
+client that does not declare the tasks extension keeps receiving the
+ordinary inline result, exactly like the never-task-negotiated tools above;
+only a client that declares it receives a task envelope. Admission gates
+that envelope, not the job's speed -- an instant-settling call (the job is
+already terminal by the time admission completes) still becomes a task,
+terminal-at-birth: the create response reports a completed/failed status
+immediately, with `completed_result` already resolved rather than left for
+the first `tasks/get` (see the create-response bullet above).
 
 ## input and elicitation
 

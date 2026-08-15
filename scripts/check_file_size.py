@@ -114,7 +114,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # of inheriting a stale populated record from the spread source
     # document. A justified, minimal ratchet-up.
     "src/clio_relay/endpoint.py": 8719,
-    "src/clio_relay/fastmcp_server.py": 1210,
+    # relay#234 adversarial review, finding 1: +24 net lines --
+    # `intercept_tool_call`'s conflict handling caught only
+    # `TaskInputParkConflictError`/`QueueConflictError`; anything else
+    # `create_task` raised (disk-full, permission) escaped through
+    # FastMCP's own generic handler untyped, violating the error.v1/
+    # no-silent-fallback doctrine. Added an `except MCPError: raise` (never
+    # re-classify an already-typed error) followed by a catch-all that
+    # routes every other exception through `door_errors.classify`/
+    # `as_mcp_error`. A justified, minimal ratchet-up.
+    "src/clio_relay/fastmcp_server.py": 1234,
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which

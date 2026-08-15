@@ -367,9 +367,9 @@ class RelayMcpRuntime:
         except ValueError:
             return None
         # relay#234: task creation itself is gated ONLY on relay admission
-        # succeeding (docs/mcp-tasks.md:122-126) -- ``request_followup_message``
+        # succeeding (docs/mcp-tasks.md:122-139) -- ``request_followup_message``
         # is a per-call opt-in for ONE extra post-admission input round on the
-        # agent lane (docs/mcp-tasks.md:134-140), never a precondition for
+        # agent lane (docs/mcp-tasks.md:147-153), never a precondition for
         # minting a task at all. A prior gate here
         # (``if tool.task_requires_post_admission_input and not
         # _agent_input_enabled(...): return None``) conflated the two: every
@@ -1118,6 +1118,30 @@ class RelayTasksExtension(ServerExtension):
                     data={"task_id": conflicting_task_id},
                 )
             ) from exc
+        except MCPError:
+            # relay#234 adversarial review: create_task -- or anything it
+            # calls -- can itself raise an MCPError that already carries
+            # its own typed wire shape (e.g. a nested dispatch failure).
+            # Re-classifying an already-typed error here would erase its
+            # real reason behind a generic internal_error, so it passes
+            # through untouched.
+            raise
+        except Exception as exc:
+            # relay#234 adversarial review: put_mcp_task (and everything
+            # else create_task calls -- _terminal_completed_result's
+            # wait_mcp_job round trip, _park_agent_input's projection
+            # update) can raise something other than the two conflict
+            # types above -- disk-full, permission, or any other untyped
+            # domain/OS failure. Left uncaught here, that exception
+            # previously escaped through FastMCP's own generic handler
+            # with no relay reason at all -- a silent, untyped fallback
+            # the no-silent-fallback doctrine forbids. door_errors.classify
+            # maps it to whatever typed reason its exception type carries
+            # (dispatch rule 3), or to "internal_error" (rule 4) -- either
+            # way logging the traceback exactly once, here, via classify's
+            # own logger.exception call, and never letting the exception's
+            # internals reach the wire.
+            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
         if task is None:
             return outcome
         return CreateTaskResult(
