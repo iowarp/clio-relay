@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from clio_relay import door_errors
+from clio_relay import door_error_adapters, door_errors
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -342,7 +342,9 @@ class InputArtifactBodyLimitMiddleware:
     async def _send_error(send: Send, reason: str, detail: str) -> None:
         fault = door_errors.fault_for_reason(reason, detail)
         payload = json.dumps(
-            door_errors.as_http_problem(fault), separators=(",", ":"), ensure_ascii=False
+            door_error_adapters.as_http_problem(fault),
+            separators=(",", ":"),
+            ensure_ascii=False,
         ).encode("utf-8")
         await send(
             {
@@ -1049,7 +1051,7 @@ async def _relay_unhandled_exception_handler(_request: Request, exc: Exception) 
     """
     try:
         fault = door_errors.classify(exc)
-        document = door_errors.as_http_problem(fault)
+        document = door_error_adapters.as_http_problem(fault)
         status_code = fault.http_status
     except Exception:
         logger.exception(
@@ -1074,7 +1076,7 @@ async def _relay_http_problem_handler(
     """
     if not isinstance(exc, door_errors.HTTPProblemError):
         raise exc
-    document = door_errors.as_http_problem(exc.fault)
+    document = door_error_adapters.as_http_problem(exc.fault)
     return JSONResponse(
         document,
         status_code=exc.fault.http_status,
@@ -1094,7 +1096,7 @@ async def _relay_request_validation_handler(
         "Request validation failed.",
     )
     return JSONResponse(
-        door_errors.as_http_problem(fault),
+        door_error_adapters.as_http_problem(fault),
         status_code=fault.http_status,
         media_type="application/problem+json",
     )
@@ -1113,7 +1115,7 @@ async def _relay_framework_http_handler(
     }.get(exc.status_code, "framework_http_error")
     fault = door_errors.fault_for_http_status(reason, exc.status_code)
     return JSONResponse(
-        door_errors.as_http_problem(fault),
+        door_error_adapters.as_http_problem(fault),
         status_code=exc.status_code,
         headers=exc.headers,
         media_type="application/problem+json",
@@ -2116,16 +2118,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         """Stream task timeline events over a WebSocket."""
         _require_websocket_token(resolved, websocket)
         if poll_seconds <= 0:
-            raise door_errors.websocket_refusal("websocket_poll_interval_invalid")
+            raise door_error_adapters.websocket_refusal("websocket_poll_interval_invalid")
         if cursor < 1:
-            raise door_errors.websocket_refusal("websocket_cursor_invalid")
+            raise door_error_adapters.websocket_refusal("websocket_cursor_invalid")
         _require_websocket_page_limit(limit)
         try:
             require_owned_task(task_id)
         except NotFoundError as exc:
-            raise door_errors.websocket_refusal("websocket_resource_not_found") from exc
+            raise door_error_adapters.websocket_refusal("websocket_resource_not_found") from exc
         except door_errors.HTTPProblemError as exc:
-            raise door_errors.websocket_refusal("websocket_resource_ownership_refused") from exc
+            raise door_error_adapters.websocket_refusal(
+                "websocket_resource_ownership_refused"
+            ) from exc
         await websocket.accept()
         try:
             async for payload in _task_stream_payloads(
@@ -2194,16 +2198,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         """Stream job monitor updates over a WebSocket."""
         _require_websocket_token(resolved, websocket)
         if poll_seconds <= 0:
-            raise door_errors.websocket_refusal("websocket_poll_interval_invalid")
+            raise door_error_adapters.websocket_refusal("websocket_poll_interval_invalid")
         if cursor < 1:
-            raise door_errors.websocket_refusal("websocket_cursor_invalid")
+            raise door_error_adapters.websocket_refusal("websocket_cursor_invalid")
         _require_websocket_page_limit(limit)
         try:
             require_owned_job(job_id)
         except NotFoundError as exc:
-            raise door_errors.websocket_refusal("websocket_resource_not_found") from exc
+            raise door_error_adapters.websocket_refusal("websocket_resource_not_found") from exc
         except door_errors.HTTPProblemError as exc:
-            raise door_errors.websocket_refusal("websocket_resource_ownership_refused") from exc
+            raise door_error_adapters.websocket_refusal(
+                "websocket_resource_ownership_refused"
+            ) from exc
         await websocket.accept()
         try:
             async for payload in _monitor_stream_payloads(
@@ -2604,7 +2610,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 reason="payload_too_large",
                 data=document,
             )
-            problem = door_errors.as_http_problem(fault)
+            problem = door_error_adapters.as_http_problem(fault)
             return JSONResponse(
                 problem, status_code=fault.http_status, media_type="application/problem+json"
             )
@@ -3215,7 +3221,7 @@ def _require_websocket_page_limit(limit: object) -> None:
     try:
         validate_response_page_limit(limit)
     except ValueError as exc:
-        raise door_errors.websocket_refusal("websocket_page_limit_invalid") from exc
+        raise door_error_adapters.websocket_refusal("websocket_page_limit_invalid") from exc
 
 
 def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> None:
@@ -3225,7 +3231,7 @@ def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> N
     if supplied is None:
         supplied = _extract_token(websocket.headers.get("authorization"), None)
     if supplied is None or not secrets.compare_digest(supplied, settings.api_token):
-        raise door_errors.websocket_refusal("websocket_authentication_failed")
+        raise door_error_adapters.websocket_refusal("websocket_authentication_failed")
     if settings.owner_session_id is None:
         return
     session_id = websocket.headers.get(OWNER_SESSION_ID_HEADER)
@@ -3237,7 +3243,7 @@ def _require_websocket_token(settings: RelaySettings, websocket: WebSocket) -> N
         or not secrets.compare_digest(session_id, settings.owner_session_id)
         or not secrets.compare_digest(generation_id, settings.owner_session_generation_id)
     ):
-        raise door_errors.websocket_refusal("websocket_session_binding_failed")
+        raise door_error_adapters.websocket_refusal("websocket_session_binding_failed")
 
 
 def _extract_token(authorization: str | None, header_token: str | None) -> str | None:

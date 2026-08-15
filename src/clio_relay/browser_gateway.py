@@ -715,7 +715,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         fit for those, chosen over inventing three more unregistered reasons
         for this one file.
         """
-        from clio_relay import door_errors
+        from clio_relay import door_error_adapters, door_errors
 
         is_oversized = isinstance(exc, _RequestBodyTooLargeError)
         reason = "payload_too_large" if is_oversized else "configuration_error"
@@ -724,7 +724,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             reason=reason,
             message=("request body exceeds the browser gateway limit" if is_oversized else None),
         )
-        status, document = door_errors.as_browser_gateway_error(fault)
+        status, document = door_error_adapters.as_browser_gateway_error(fault)
         self._error_document(status, document)
 
     def log_message(self, format: str, *args: object) -> None:

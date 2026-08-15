@@ -12,6 +12,7 @@ import errno
 import hashlib
 import heapq
 import json
+import logging
 import os
 import stat
 import threading
@@ -35,7 +36,12 @@ from clio_relay.cluster_config import (
     open_private_atomic_file,
 )
 from clio_relay.command_evidence import bounded_error_detail
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
+from clio_relay.errors import (
+    ConfigurationError,
+    NotFoundError,
+    QueueConflictError,
+    queue_conflict_from_cause,
+)
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.identifiers import filesystem_key, validate_durable_record_id
 from clio_relay.models import (
@@ -102,6 +108,8 @@ from clio_relay.worker_lifetime_lock import (
     exclusive_migration_lifetime,
     require_active_locked_core,
 )
+
+logger = logging.getLogger(__name__)
 
 Record = TypeVar("Record", bound=BaseModel)
 _LeaseExpiryReference = tuple[int, str, JobKind, str, str, str, str]
@@ -3632,8 +3640,10 @@ class ClioCoreQueue:
                             )
                         files.append(entry_path)
             except OSError as exc:
-                raise QueueConflictError(
-                    f"cannot inspect lease operational index {directory}: {exc}"
+                raise queue_conflict_from_cause(
+                    f"cannot inspect lease operational index {directory}",
+                    cause=exc,
+                    logger=logger,
                 ) from exc
 
         for root in roots:
@@ -4941,7 +4951,11 @@ class ClioCoreQueue:
         except QueueConflictError:
             raise
         except OSError as exc:
-            raise QueueConflictError(f"cannot inspect lease capacity directory: {exc}") from exc
+            raise queue_conflict_from_cause(
+                "cannot inspect lease capacity directory",
+                cause=exc,
+                logger=logger,
+            ) from exc
         if not allow_missing and set(paths) != allowed:
             missing = ", ".join(sorted(allowed - set(paths)))
             raise QueueConflictError(f"lease capacity pair is incomplete; missing {missing}")
@@ -5461,7 +5475,11 @@ class ClioCoreQueue:
                         )
                     lease_refs.append(lease_ref)
         except OSError as exc:
-            raise QueueConflictError(f"cannot scan {label}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"cannot scan {label}",
+                cause=exc,
+                logger=logger,
+            ) from exc
         return sorted(lease_refs), False
 
     def _scan_expiry_refs(
@@ -5498,7 +5516,11 @@ class ClioCoreQueue:
                         )
                     refs.append(parsed)
         except OSError as exc:
-            raise QueueConflictError(f"cannot scan lease expiry index: {exc}") from exc
+            raise queue_conflict_from_cause(
+                "cannot scan lease expiry index",
+                cause=exc,
+                logger=logger,
+            ) from exc
         return sorted(refs), False
 
     def _scan_lease_identity_refs(
@@ -5540,7 +5562,11 @@ class ClioCoreQueue:
                         )
                     refs.append(parsed)
         except OSError as exc:
-            raise QueueConflictError(f"cannot scan lease identity reference index: {exc}") from exc
+            raise queue_conflict_from_cause(
+                "cannot scan lease identity reference index",
+                cause=exc,
+                logger=logger,
+            ) from exc
         return sorted(refs), False
 
     def _scan_lease_endpoint_refs(
@@ -5598,7 +5624,11 @@ class ClioCoreQueue:
                         )
                     target.add(parsed)
         except OSError as exc:
-            raise QueueConflictError(f"cannot scan lease endpoint index: {exc}") from exc
+            raise queue_conflict_from_cause(
+                "cannot scan lease endpoint index",
+                cause=exc,
+                logger=logger,
+            ) from exc
         if references != guards:
             raise QueueConflictError(
                 f"lease endpoint references and guards disagree: {endpoint_id}"
@@ -8185,8 +8215,10 @@ class ClioCoreQueue:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
-                    raise QueueConflictError(
-                        f"could not repair empty execution cleanup index {pending_job_path}: {exc}"
+                    raise queue_conflict_from_cause(
+                        f"could not repair empty execution cleanup index {pending_job_path}",
+                        cause=exc,
+                        logger=logger,
                     ) from exc
                 self._fsync_execution_cleanup_directory(shard_path)
         return markers, not migration_complete
@@ -11543,7 +11575,11 @@ class ClioCoreQueue:
         except FileNotFoundError:
             return _last_contiguous_sequence(directory) + 1
         except (OSError, QueueConflictError) as exc:
-            raise QueueConflictError(f"invalid task event head {head_path}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"invalid task event head {head_path}",
+                cause=exc,
+                logger=logger,
+            ) from exc
         if not isinstance(raw, dict):
             raise QueueConflictError(f"task event head is not an object: {head_path}")
         head = cast(dict[str, object], raw)
@@ -11858,8 +11894,10 @@ class ClioCoreQueue:
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise QueueConflictError(
-                f"cannot inspect scheduler cancellation capacity: {exc}"
+            raise queue_conflict_from_cause(
+                "cannot inspect scheduler cancellation capacity",
+                cause=exc,
+                logger=logger,
             ) from exc
         record = SchedulerCancelPending(
             job_id=job.job_id,
@@ -11950,7 +11988,11 @@ class ClioCoreQueue:
                             "before submitting another job"
                         )
         except OSError as exc:
-            raise QueueConflictError(f"cannot inspect active job capacity: {exc}") from exc
+            raise queue_conflict_from_cause(
+                "cannot inspect active job capacity",
+                cause=exc,
+                logger=logger,
+            ) from exc
 
     def _assert_input_ingest_quota_unlocked(
         self,
@@ -13501,7 +13543,11 @@ class ClioCoreQueue:
         try:
             raw = self._read_json_document(path)
         except (OSError, QueueConflictError) as exc:
-            raise QueueConflictError(f"invalid index migration state {path}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"invalid index migration state {path}",
+                cause=exc,
+                logger=logger,
+            ) from exc
         if not isinstance(raw, dict):
             raise QueueConflictError(f"index migration state is not an object: {path}")
         state = cast(dict[str, object], raw)
@@ -13779,7 +13825,11 @@ class ClioCoreQueue:
         except FileNotFoundError:
             return None
         except (OSError, QueueConflictError) as exc:
-            raise QueueConflictError(f"invalid job index {path}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"invalid job index {path}",
+                cause=exc,
+                logger=logger,
+            ) from exc
         if not isinstance(raw, dict):
             raise QueueConflictError(f"job index is not an object: {path}")
         index = cast(dict[str, object], raw)
@@ -14279,7 +14329,11 @@ class ClioCoreQueue:
                         raise QueueConflictError(f"{label} contains an unsafe record: {path}")
                     paths.append(path)
         except OSError as exc:
-            raise QueueConflictError(f"cannot scan {label}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"cannot scan {label}",
+                cause=exc,
+                logger=logger,
+            ) from exc
         return paths
 
     @staticmethod
@@ -14305,7 +14359,11 @@ class ClioCoreQueue:
         try:
             return json.loads(_read_bounded_record_bytes(path))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise QueueConflictError(f"invalid JSON record {path}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"invalid JSON record {path}",
+                cause=exc,
+                logger=logger,
+            ) from exc
 
 
 def _read_unique_json_document(path: Path) -> object:
@@ -14325,7 +14383,11 @@ def _read_unique_json_document(path: Path) -> object:
             object_pairs_hook=unique_object,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise QueueConflictError(f"invalid JSON record {path}: {exc}") from exc
+        raise queue_conflict_from_cause(
+            f"invalid JSON record {path}",
+            cause=exc,
+            logger=logger,
+        ) from exc
 
 
 def _record_identity_field(model: type[BaseModel]) -> str:
@@ -14820,7 +14882,11 @@ def _bounded_regular_json_count(
     except FileNotFoundError:
         return 0, False
     except OSError as exc:
-        raise QueueConflictError(f"cannot inspect {label}: {exc}") from exc
+        raise queue_conflict_from_cause(
+            f"cannot inspect {label}",
+            cause=exc,
+            logger=logger,
+        ) from exc
     return count, False
 
 
@@ -15531,7 +15597,11 @@ def _move_gc_path(source: Path, destination: Path) -> bool:
     try:
         source.replace(destination)
     except OSError as exc:
-        raise QueueConflictError(f"GC could not quarantine {source}: {exc}") from exc
+        raise queue_conflict_from_cause(
+            f"GC could not quarantine {source}",
+            cause=exc,
+            logger=logger,
+        ) from exc
     return True
 
 
@@ -15589,8 +15659,10 @@ def _purge_one_gc_entry(path: Path, *, root: Path) -> bool:
             with os.scandir(candidate) as entries:
                 entry = next(entries, None)
         except OSError as exc:
-            raise QueueConflictError(
-                f"GC could not scan quarantined directory {candidate}: {exc}"
+            raise queue_conflict_from_cause(
+                f"GC could not scan quarantined directory {candidate}",
+                cause=exc,
+                logger=logger,
             ) from exc
         after_scan = _path_lstat(candidate)
         if after_scan is None or not os.path.samestat(candidate_stat, after_scan):
@@ -15635,8 +15707,10 @@ def _remove_gc_candidate(
         else:
             candidate.unlink()
     except OSError as exc:
-        raise QueueConflictError(
-            f"GC could not remove quarantined path {candidate}: {exc}"
+        raise queue_conflict_from_cause(
+            f"GC could not remove quarantined path {candidate}",
+            cause=exc,
+            logger=logger,
         ) from exc
 
 
@@ -15675,8 +15749,10 @@ def _remove_gc_candidate_posix(
     except QueueConflictError:
         raise
     except OSError as exc:
-        raise QueueConflictError(
-            f"GC could not remove quarantined path {candidate}: {exc}"
+        raise queue_conflict_from_cause(
+            f"GC could not remove quarantined path {candidate}",
+            cause=exc,
+            logger=logger,
         ) from exc
     finally:
         for descriptor in reversed(descriptors):
@@ -15825,7 +15901,11 @@ def _read_bounded_record_bytes_once(path: Path, *, limit: int) -> bytes:
     except (_TransientRecordReplacement, QueueConflictError):
         raise
     except OSError as exc:
-        raise QueueConflictError(f"cannot read durable record {path}: {exc}") from exc
+        raise queue_conflict_from_cause(
+            f"cannot read durable record {path}",
+            cause=exc,
+            logger=logger,
+        ) from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)

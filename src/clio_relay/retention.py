@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 import stat
 from collections.abc import Generator
@@ -19,7 +20,7 @@ from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.core_queue import ClioCoreQueue, purge_quarantined_tree_batch
-from clio_relay.errors import QueueConflictError
+from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.models import (
     TerminalJobGcPlan,
@@ -34,6 +35,8 @@ RETENTION_PLAN_SCHEMA = "clio-relay.terminal-retention-plan.v1"
 RETENTION_RESULT_SCHEMA = "clio-relay.terminal-retention-result.v1"
 MAX_RETENTION_RECEIPT_BYTES = 65_536
 DEFAULT_RETENTION_LOCK_TIMEOUT_SECONDS = 10.0
+
+logger = logging.getLogger(__name__)
 
 
 class SpoolRetentionPhase(StrEnum):
@@ -411,7 +414,11 @@ class TerminalRetentionCoordinator:
         try:
             return SpoolQuarantineReceipt.model_validate_json(snapshot.data)
         except ValueError as exc:
-            raise QueueConflictError(f"invalid retention receipt {path}: {exc}") from exc
+            raise queue_conflict_from_cause(
+                f"retention receipt failed validation: {path}",
+                cause=exc,
+                logger=logger,
+            ) from exc
 
     def _write_receipt(self, receipt: SpoolQuarantineReceipt) -> None:
         self._ensure_retention_layout()

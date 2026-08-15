@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 
 class PublicMessageError:
     """Mark an exception whose message is relay-authored public guidance."""
@@ -44,6 +46,23 @@ class ConfigurationError(RelayError):
 
 class QueueConflictError(RelayError):
     """Raised when a queue operation violates an invariant."""
+
+
+def queue_conflict_from_cause(
+    message: str,
+    *,
+    cause: BaseException,
+    logger: logging.Logger,
+) -> QueueConflictError:
+    """Log foreign cause detail once and return a curated queue conflict."""
+    if not isinstance(cause, QueueConflictError):
+        logger.warning(
+            "clio-relay: %s; cause_type=%s",
+            message,
+            type(cause).__name__,
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+    return QueueConflictError(message)
 
 
 class TaskInputParkConflictError(QueueConflictError):

@@ -133,8 +133,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # deletion offsets it: these are two new, real config fields, not a fixable
     # regression.
     "src/clio_relay/cluster_config.py": 1863,
-    "src/clio_relay/core_queue.py": 16137,
+    # #231 R9 fix round 3: +80 lines curate and server-log 21 foreign caught
+    # exception details found by the complete RelayAuthoredError/
+    # QueueConflictError constructor audit. The public conflict strings keep
+    # only operation and owned-record identities.
+    "src/clio_relay/core_queue.py": 16217,
     "src/clio_relay/deployment.py": 1243,
+    # #231 R9 fix round 3: cohesive wire-adapter owner split out of
+    # door_errors.py. Both sides are recorded exactly even below the default
+    # cap so this decomposition cannot silently re-accrete.
+    "src/clio_relay/door_error_adapters.py": 168,
+    "src/clio_relay/door_errors.py": 739,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
@@ -168,7 +177,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # public-message disposition explicit. Relay-authored validation and
     # conflict catches opt into the typed marker; the mixed ingest catch
     # marks QueueConflictError only and keeps OS/runtime text private.
-    "src/clio_relay/http_api.py": 3254,
+    # #231 R9 fix round 3: +6 lines repoint every HTTP/WebSocket surface
+    # adapter call to the cohesive door_error_adapters owner.
+    "src/clio_relay/http_api.py": 3260,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
@@ -230,7 +241,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # doubled blank line `ruff format` collapsed at the deletion site
     # (-2). A ratchet-down.
     "src/clio_relay/mcp_server.py": 5929,
-    "src/clio_relay/mcp_stdio_validation.py": 1269,
+    # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
+    # timeout message and log its bounded diagnostic once server-side.
+    "src/clio_relay/mcp_stdio_validation.py": 1285,
     # #231 R9 fix round 2: +3 lines retain v3.6 as a handle-first execution
     # contract while v3.7 remains the current input-staging contract.
     "src/clio_relay/models.py": 2299,
@@ -266,7 +279,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # instead of the generic "encoding is unsupported" that misdescribes
     # why the artifact is unavailable. A justified, minimal ratchet-up.
     "src/clio_relay/remote_mcp.py": 5319,
-    "src/clio_relay/retention.py": 944,
+    # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
+    # out of the public conflict while logging it once server-side.
+    "src/clio_relay/retention.py": 951,
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,
     "src/clio_relay/service_runtime.py": 10163,

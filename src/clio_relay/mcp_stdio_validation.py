@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -41,6 +42,7 @@ from clio_relay.process_containment import (
 )
 
 JSON = dict[str, Any]
+logger = logging.getLogger(__name__)
 _INITIALIZE_ID = "clio-relay-validation-initialize"
 _TOOLS_LIST_ID = "clio-relay-validation-tools-list"
 _TOOLS_CALL_ID = "clio-relay-validation-tools-call"
@@ -597,8 +599,22 @@ def _run_bounded_process(
     if failure is not None:
         detail = _sanitized_diagnostic(stderr, forbidden_values=private_values)
         cause = "" if containment_error is None else f" cause={type(containment_error).__name__}"
-        error_type = ObservationTimeoutError if deadline_expired else RelayError
-        raise error_type(
+        if deadline_expired:
+            logger.warning(
+                "packaged MCP timeout: command=clio-relay-mcp-server "
+                "phase=stdio_validation timeout_seconds=%s stdout_bytes=%s "
+                "stderr_bytes=%s stderr=%r%s",
+                timeout_seconds,
+                len(stdout),
+                len(stderr),
+                detail,
+                cause,
+            )
+            raise ObservationTimeoutError(
+                "packaged clio-relay mcp-server timed out during stdio validation "
+                f"after {timeout_seconds:g} seconds"
+            ) from None
+        raise RelayError(
             f"{failure}; stdout_bytes={len(stdout)} stderr_bytes={len(stderr)} "
             f"stderr={detail!r}{cause}"
         ) from None

@@ -918,6 +918,36 @@ def test_mcp_error_pass_through_is_never_reclassified_by_the_owner(
     asyncio.run(scenario())
 
 
+def test_public_error_constructors_never_interpolate_a_caught_exception() -> None:
+    """Foreign caught text must be logged, never embedded in a marked source message."""
+    source_root = Path(__file__).parents[1] / "src" / "clio_relay"
+    offenders: list[str] = []
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for handler in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ExceptHandler) and node.name is not None
+        ):
+            scope = ast.Module(body=handler.body, type_ignores=[])
+            for call in (node for node in ast.walk(scope) if isinstance(node, ast.Call)):
+                constructor = call.func.id if isinstance(call.func, ast.Name) else ""
+                if constructor not in {"QueueConflictError", "RelayAuthoredError"}:
+                    continue
+                if any(
+                    isinstance(argument, ast.JoinedStr)
+                    and any(
+                        isinstance(part, ast.FormattedValue)
+                        and isinstance(part.value, ast.Name)
+                        and part.value.id == handler.name
+                        for part in argument.values
+                    )
+                    for argument in call.args
+                ):
+                    offenders.append(f"{path.relative_to(source_root)}:{call.lineno}")
+    assert offenders == []
+
+
 # --------------------------------------------------------------------------- #
 # http_api.py wiring: the global exception handler
 # --------------------------------------------------------------------------- #

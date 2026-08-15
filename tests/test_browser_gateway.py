@@ -625,7 +625,7 @@ def test_browser_gateway_reclaims_idle_pre_auth_connection_slot(
 ) -> None:
     """An unauthenticated socket cannot retain the sole handler slot indefinitely."""
     monkeypatch.setattr(browser_gateway_module, "MAX_ACTIVE_BROWSER_REQUESTS", 1)
-    monkeypatch.setattr(browser_gateway_module, "BROWSER_CLIENT_IO_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(browser_gateway_module, "BROWSER_CLIENT_IO_TIMEOUT_SECONDS", 3.0)
     with _backend_server() as (backend_port, _requests):
         capability = "i" * 43
         with _capability_proxy_server(
@@ -642,11 +642,19 @@ def test_browser_gateway_reclaims_idle_pre_auth_connection_slot(
                 )
                 overloaded = httpx.get(url, headers={"Origin": "null"}, timeout=2.0)
                 assert overloaded.status_code == 503
-                assert overloaded.json()["reason"] == "browser_gateway_overloaded"
-                assert overloaded.json()["status"] == 503
+                assert overloaded.json() == {
+                    "type": "urn:clio-relay:error:browser_gateway_overloaded",
+                    "title": "Browser gateway overloaded",
+                    "status": 503,
+                    "detail": "browser attachment request capacity exhausted",
+                    "schema_version": "clio-relay.error.v1",
+                    "reason": "browser_gateway_overloaded",
+                    "retryable": True,
+                    "truncation": None,
+                }
                 assert overloaded.headers["access-control-allow-origin"] == "null"
                 assert overloaded.headers["retry-after"] == "1"
-                assert server.wait_for_active_request_count(0, timeout=2.0)
+                assert server.wait_for_active_request_count(0, timeout=5.0)
                 recovered = httpx.get(url, headers={"Origin": "null"}, timeout=2.0)
                 assert recovered.status_code == 200
             finally:
