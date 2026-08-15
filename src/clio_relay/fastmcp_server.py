@@ -366,11 +366,21 @@ class RelayMcpRuntime:
             state = JobState(state_value)
         except ValueError:
             return None
-        if tool.task_requires_post_admission_input and not _agent_input_enabled(
-            tool.name,
-            arguments,
-        ):
-            return None
+        # relay#234: task creation itself is gated ONLY on relay admission
+        # succeeding (docs/mcp-tasks.md:122-139) -- ``request_followup_message``
+        # is a per-call opt-in for ONE extra post-admission input round on the
+        # agent lane (docs/mcp-tasks.md:147-153), never a precondition for
+        # minting a task at all. A prior gate here
+        # (``if tool.task_requires_post_admission_input and not
+        # _agent_input_enabled(...): return None``) conflated the two: every
+        # ``relay_submit_agent``/``relay_submit_remote_agent`` call that did
+        # not set ``request_followup_message=True`` silently fell back to a
+        # plain ``CallToolResult`` for a client that explicitly declared task
+        # semantics, regardless of whether the underlying job was already
+        # terminal or still queued/running -- the admission gate never
+        # engaged for the agent lane's default (no-follow-up) case. Whether
+        # this call actually parks an input round remains solely
+        # ``_agent_input_enabled``'s decision, a few lines below.
         encoded_arguments = json.dumps(
             arguments,
             sort_keys=True,
@@ -782,7 +792,6 @@ class RelayTool(Tool):
 
     _runtime: RelayMcpRuntime = PrivateAttr()
     _catalog_revision: str | None = PrivateAttr(default=None)
-    _task_requires_post_admission_input: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -791,7 +800,6 @@ class RelayTool(Tool):
         runtime: RelayMcpRuntime,
         catalog_revision: str | None,
         task_capable: bool,
-        task_requires_post_admission_input: bool = False,
     ) -> None:
         meta = dict(cast(dict[str, Any], definition.get("_meta") or {}))
         if catalog_revision is not None:
@@ -817,17 +825,11 @@ class RelayTool(Tool):
         )
         self._runtime = runtime
         self._catalog_revision = catalog_revision
-        self._task_requires_post_admission_input = task_requires_post_admission_input
 
     @property
     def catalog_revision(self) -> str | None:
         """Return the exact dynamic catalog revision bound at dispatch."""
         return self._catalog_revision
-
-    @property
-    def task_requires_post_admission_input(self) -> bool:
-        """Return whether task admission requires the explicit agent-input opt-in."""
-        return self._task_requires_post_admission_input
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the established relay dispatcher without a second tool runtime."""
@@ -868,9 +870,6 @@ class RelayToolProvider(Provider):
                     cast(str, definition["name"]),
                     static_names,
                 ),
-                task_requires_post_admission_input=(
-                    cast(str, definition["name"]) in _AGENT_TASK_TOOL_NAMES
-                ),
             )
             for definition in definitions
         ]
@@ -892,7 +891,6 @@ class RelayToolProvider(Provider):
                 runtime=self._runtime,
                 catalog_revision=None if name in static_names else revision,
                 task_capable=_task_capable_tool_name(name, static_names),
-                task_requires_post_admission_input=name in _AGENT_TASK_TOOL_NAMES,
             )
         return None
 
@@ -1120,6 +1118,30 @@ class RelayTasksExtension(ServerExtension):
                     data={"task_id": conflicting_task_id},
                 )
             ) from exc
+        except MCPError:
+            # relay#234 adversarial review: create_task -- or anything it
+            # calls -- can itself raise an MCPError that already carries
+            # its own typed wire shape (e.g. a nested dispatch failure).
+            # Re-classifying an already-typed error here would erase its
+            # real reason behind a generic internal_error, so it passes
+            # through untouched.
+            raise
+        except Exception as exc:
+            # relay#234 adversarial review: put_mcp_task (and everything
+            # else create_task calls -- _terminal_completed_result's
+            # wait_mcp_job round trip, _park_agent_input's projection
+            # update) can raise something other than the two conflict
+            # types above -- disk-full, permission, or any other untyped
+            # domain/OS failure. Left uncaught here, that exception
+            # previously escaped through FastMCP's own generic handler
+            # with no relay reason at all -- a silent, untyped fallback
+            # the no-silent-fallback doctrine forbids. door_errors.classify
+            # maps it to whatever typed reason its exception type carries
+            # (dispatch rule 3), or to "internal_error" (rule 4) -- either
+            # way logging the traceback exactly once, here, via classify's
+            # own logger.exception call, and never letting the exception's
+            # internals reach the wire.
+            raise door_errors.as_mcp_error(door_errors.classify(exc)) from exc
         if task is None:
             return outcome
         return CreateTaskResult(

@@ -508,16 +508,204 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
             result = await task.result()
             assert result.is_error is False
 
-            ordinary = await client.call_tool(
-                "relay_submit_agent",
-                _submit_arguments(tmp_path, "ordinary-agent"),
+            # relay#234: an "ordinary" relay_submit_agent call (no
+            # request_followup_message opt-in) from this SAME task-declaring
+            # client is now ALSO durably projected as an mcp task -- task
+            # admission depends only on this client having declared task
+            # semantics (mode="optional"), never on whether the call happens
+            # to be part of a post-admission-input round. Before the fix this
+            # assertion inverted that on purpose (`pytest.raises(NotFoundError)`)
+            # to pin the defect: the client's own transparent `call_tool`
+            # polling now genuinely drives a real task to completion here,
+            # exactly like `test_transparent_fastmcp_call_tool_polls_relay_
+            # task_to_completion` -- so the job is admitted, observed via
+            # `list_jobs`, and settled to SUCCEEDED from the test while the
+            # client's poll loop is in flight.
+            pending_ordinary = asyncio.create_task(
+                client.call_tool(
+                    "relay_submit_agent",
+                    _submit_arguments(tmp_path, "ordinary-agent"),
+                )
             )
+            for _attempt in range(1_000):
+                candidates = [
+                    job
+                    for job in await asyncio.to_thread(queue.list_jobs)
+                    if job.job_id not in {task.task_id}
+                ]
+                if candidates:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("ordinary relay job was not admitted")
+            ordinary_job_id = candidates[0].job_id
+            queue.update_job_state(ordinary_job_id, JobState.SUCCEEDED)
+            ordinary = await asyncio.wait_for(pending_ordinary, timeout=5)
             assert ordinary.is_error is False
             assert ordinary.structured_content is not None
-            ordinary_job_id = ordinary.structured_content["job_id"]
+            assert ordinary.structured_content["job"]["job_id"] == ordinary_job_id
             assert queue.get_job(ordinary_job_id).job_id == ordinary_job_id
-            with pytest.raises(NotFoundError):
-                queue.get_mcp_task(ordinary_job_id)
+            assert queue.get_mcp_task(ordinary_job_id).job_id == ordinary_job_id
+
+    asyncio.run(scenario())
+
+
+def _mock_local_job_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force relay_submit_agent's local (non-owned-session) admission path.
+
+    Shared by relay#234's admission-gate tests below: monkeypatches the
+    private-configuration helpers so a tmp_path-rooted RelaySettings works
+    without touching the real user config directory, and forces
+    ``_optional_cluster_definition`` to report no matching cluster so
+    submission always takes the deterministic local-job path rather than
+    depending on whatever cluster config happens to exist on the test
+    runner.
+    """
+
+    def create_test_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+
+    def accept_test_path(path: Path, *, directory: bool) -> None:
+        if directory:
+            create_test_directory(path)
+
+    for module_name in (
+        "clio_relay.cluster_config",
+        "clio_relay.core_queue",
+        "clio_relay.worker_lifetime_lock",
+    ):
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_directory",
+            create_test_directory,
+        )
+        monkeypatch.setattr(
+            f"{module_name}.ensure_private_configuration_path",
+            accept_test_path,
+        )
+
+    def _open_atomic(path: Path) -> BinaryIO:
+        return path.open("xb")
+
+    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+
+    def _no_cluster(_cluster: str) -> None:
+        return None
+
+    monkeypatch.setattr("clio_relay.mcp_server._optional_cluster_definition", _no_cluster)
+
+
+def test_agent_task_admission_engages_without_the_followup_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """relay#234: a task-requesting client must receive a task for
+    ``relay_submit_agent`` even when the call does NOT opt into
+    ``request_followup_message`` -- the two-client repro on the issue
+    (fastmcp_tasks' own ``call_tool_task`` client helper AND hand-rolled
+    JSON-RPC with the tasks extension declared) both observed a plain
+    ``CallToolResult`` instead of a minted task.
+
+    Root cause: ``create_task``'s early-return gate conflated "this tool
+    REQUIRES post-admission input" (the agent lane's per-call opt-in for one
+    extra elicitation round, ``request_followup_message``) with "this tool
+    is ELIGIBLE for task creation at all". Every
+    ``relay_submit_agent``/``relay_submit_remote_agent`` call omitting
+    ``request_followup_message=True`` fell back to inline, unconditionally --
+    a probe against production wiring proved this fires identically for a
+    job still sitting in ``queued`` state, so this was never a fast-settle
+    race: the admission gate simply never engaged for the agent lane's
+    default (no-follow-up) case.
+
+    Exercises the REAL production wiring (``create_fastmcp_server`` ->
+    ``RelayToolProvider``), not this module's ``_task_server`` helper --
+    ``_task_server`` constructs ``RelayTool`` directly and never reproduced
+    ``task_requires_post_admission_input=True`` (the flag only
+    ``RelayToolProvider`` ever set before this fix), which is exactly why
+    the existing suite never caught this defect.
+    """
+    _mock_local_job_admission(monkeypatch)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue),
+            mode="auto",
+        ) as client:
+            arguments = _submit_arguments(tmp_path, "no-followup-opt-in")
+            assert "request_followup_message" not in arguments
+            # Before the fix this raised ToolError("... did not run as a
+            # task: the server returned a CallToolResult instead of a
+            # task ...") -- the exact official-helper failure from the
+            # issue's two-client repro.
+            task = await call_tool_task(client, "relay_submit_agent", arguments)
+            job = queue.get_job(task.task_id)
+            assert task.task_id == job.job_id
+            assert queue.get_mcp_task(task.task_id).projection.tool_name == "relay_submit_agent"
+            status = await task.status()
+            assert status.status == "working"
+
+    asyncio.run(scenario())
+
+
+def test_agent_task_admission_is_terminal_at_birth_for_instant_settling_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """relay#234 acceptance: an instant-settling ``relay_submit_agent`` call
+    must yield a terminal-at-birth task (the #215 family shape) for a client
+    that requested task semantics without ``request_followup_message`` --
+    never a bare ``CallToolResult``. ``wait_for_terminal`` makes the
+    server-side admission call itself observe the job's terminal state
+    before ``tools/call`` returns (the underlying job is flipped to
+    ``succeeded`` from this test, concurrently, once it is visible in the
+    queue), reproducing the "instant-settling call" shape without a wall-
+    clock race.
+    """
+    _mock_local_job_admission(monkeypatch)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue),
+            mode="auto",
+        ) as client:
+            arguments = {
+                **_submit_arguments(tmp_path, "instant-settle"),
+                "wait_for_terminal": True,
+                "wait_timeout_seconds": 5,
+                "poll_seconds": 0.01,
+            }
+            pending = asyncio.create_task(call_tool_task(client, "relay_submit_agent", arguments))
+            for _attempt in range(1_000):
+                jobs = await asyncio.to_thread(queue.list_jobs)
+                if jobs:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("relay job was not admitted")
+            queue.update_job_state(jobs[0].job_id, JobState.SUCCEEDED)
+            task = await asyncio.wait_for(pending, timeout=5)
+            assert task.task_id == jobs[0].job_id
+            # Terminal-at-birth: the CreateTaskResult itself already reports
+            # "completed" -- the #215 family shape -- never "working", and a
+            # client never has to poll tasks/get to observe a state
+            # transition that already happened before the task was minted.
+            assert task.create_result.status == "completed"
+            persisted = queue.get_mcp_task(task.task_id)
+            assert persisted.projection.completed_result is not None
+            status = await task.status()
+            assert status.status == "completed"
+            assert status.result is not None
+            result = await task.result()
+            assert result.is_error is False
 
     asyncio.run(scenario())
 
@@ -1202,6 +1390,54 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
                 "task_id": conflicting_task_ids[-1],
             }
 
+    try:
+        asyncio.run(scenario())
+    finally:
+        queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
+
+
+def test_task_persistence_untyped_failure_surfaces_as_typed_error_v1(
+    tmp_path: Path,
+) -> None:
+    """relay#234 adversarial review finding 1: ``put_mcp_task`` can raise a
+    non-conflict error too (disk-full, permission) -- ``intercept_tool_call``
+    previously caught only ``TaskInputParkConflictError``/``QueueConflictError``,
+    so anything else (an ``OSError`` here, standing in for a real storage
+    failure) escaped through FastMCP's own generic handler with no relay
+    ``reason`` at all, violating the error.v1/no-silent-fallback doctrine.
+
+    Asserts the SERVED wire shape (typed ``reason``/``code``/bounded
+    ``message``), not merely that some exception was raised -- and that the
+    raw ``OSError`` text never reaches the client (dispatch rule 4: an
+    unmatched exception type classifies as ``internal_error`` with a fixed,
+    handler-internals-free message).
+    """
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+    real_put_mcp_task = queue.put_mcp_task
+
+    def disk_full(_task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        raise OSError("No space left on device")
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            arguments = _submit_arguments(tmp_path, "untyped-persistence-failure")
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(client, "relay_submit_agent", arguments)
+            spec = door_errors.REASONS["internal_error"]
+            assert failure.value.code == spec.mcp_code
+            assert failure.value.data == {"reason": "internal_error"}
+            assert "No space left on device" not in str(failure.value)
+            assert "No space left on device" not in json.dumps(
+                failure.value.data,
+                default=str,
+            )
+
+    queue.put_mcp_task = disk_full  # type: ignore[method-assign]
     try:
         asyncio.run(scenario())
     finally:
