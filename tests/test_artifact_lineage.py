@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_artifact_lineage
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -385,7 +386,7 @@ def test_submission_refuses_to_overfill_bounded_reverse_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(core_queue_module, "MAX_ARTIFACT_CONSUMERS", 2)
+    monkeypatch.setattr(queue_artifact_lineage, "MAX_ARTIFACT_CONSUMERS", 2)
     queue = ClioCoreQueue(tmp_path)
     _producer, artifact = _producer_artifact(queue)
     assert artifact.sha256 is not None
@@ -456,17 +457,21 @@ def test_reserved_submission_recovers_after_monotonic_counter_crash_gap(
     assert artifact.sha256 is not None
     pin = ArtifactUse(artifact_id=artifact.artifact_id, sha256=artifact.sha256)
     first = _job("recover-counter-gap", used_artifact_refs=[pin])
-    real_write = queue._write_immutable_artifact_use_record  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    real_write = queue_artifact_lineage.write_immutable_use_record
     failed_once = False
 
-    def fail_before_mapping(path: Path, record: UsedArtifactRef) -> None:
+    def fail_before_mapping(
+        store: Any,
+        path: Path,
+        record: UsedArtifactRef,
+    ) -> None:
         nonlocal failed_once
         if not failed_once and path.parent.name == "by_consumer":
             failed_once = True
             raise OSError("simulated failure after counter advance")
-        real_write(path, record)
+        real_write(store, path, record)
 
-    monkeypatch.setattr(queue, "_write_immutable_artifact_use_record", fail_before_mapping)
+    monkeypatch.setattr(queue_artifact_lineage, "write_immutable_use_record", fail_before_mapping)
     with pytest.raises(OSError, match="counter advance"):
         queue.submit_job(first)
 

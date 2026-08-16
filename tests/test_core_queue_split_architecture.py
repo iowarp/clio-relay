@@ -16,6 +16,7 @@ from pytest import MonkeyPatch
 
 from clio_relay import core_queue as core_queue_module
 from clio_relay import (
+    queue_artifact_lineage,
     queue_endpoints,
     queue_events,
     queue_idempotency,
@@ -30,11 +31,13 @@ from clio_relay import (
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
+    ArtifactUse,
     EndpointRegistration,
     EndpointRole,
     JarvisRunSpec,
     JobKind,
     RelayJob,
+    UsedArtifactRef,
 )
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
@@ -59,6 +62,8 @@ _OWNER_RANK = {
     "queue_events": 14,
     "queue_idempotency": 15,
     "queue_endpoints": 16,
+    "queue_artifact_lineage": 17,
+    "queue_artifacts": 18,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -78,6 +83,8 @@ _OWNER_BUDGETS = {
     "queue_events": 270,
     "queue_idempotency": 270,
     "queue_endpoints": 340,
+    "queue_artifact_lineage": 500,
+    "queue_artifacts": 220,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -126,6 +133,10 @@ class _IdempotencyStoreLookupSabotage(RuntimeError):
 
 class _EndpointStoreLookupSabotage(RuntimeError):
     """Raised only when CQ8 endpoint registration reaches its store-write owner."""
+
+
+class _ArtifactLineageWriteLookupSabotage(RuntimeError):
+    """Raised only when CQ9 submission-edge validation reaches its write owner."""
 
 
 @dataclass(frozen=True)
@@ -442,6 +453,67 @@ def test_cq8_endpoint_registration_uses_its_store_write_lookup_and_typed_mixin(
         queue.register_endpoint(endpoint)
 
     assert ClioCoreQueue.register_endpoint is queue_endpoints.QueueEndpointsMixin.register_endpoint
+
+
+def test_cq9_submission_edge_validation_uses_the_lineage_write_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Submission-edge validation must write through the CQ9 lineage owner seam."""
+    queue = ClioCoreQueue(tmp_path)
+    consumer = RelayJob(
+        cluster="cluster-cq9",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq9-consumer",
+        used_artifact_refs=[ArtifactUse(artifact_id="artifact-cq9", sha256="9" * 64)],
+    )
+    record = UsedArtifactRef(
+        artifact_id="artifact-cq9",
+        consumer_job_id=consumer.job_id,
+        producer_job_id="producer-cq9",
+        sequence=1,
+        sha256="9" * 64,
+        created_at=datetime(2026, 8, 15, 12, tzinfo=UTC),
+    )
+
+    def artifact_records(
+        _job: RelayJob,
+        *,
+        allocate_sequences: bool,
+    ) -> list[UsedArtifactRef]:
+        del allocate_sequences
+        return [record]
+
+    def ignore_optional(*_args: object) -> None:
+        return None
+
+    def ignore_write(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        queue,
+        "_artifact_use_records_unlocked",
+        artifact_records,
+    )
+    monkeypatch.setattr(queue, "_read_optional", ignore_optional)
+    monkeypatch.setattr(queue, "_write", ignore_write)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _ArtifactLineageWriteLookupSabotage("queue_artifact_lineage write lookup engaged")
+
+    monkeypatch.setattr(queue_artifact_lineage, "write_immutable_use_record", sabotage)
+
+    with pytest.raises(
+        _ArtifactLineageWriteLookupSabotage,
+        match="queue_artifact_lineage write lookup engaged",
+    ):
+        queue._ensure_artifact_use_indexes_unlocked(consumer)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    assert (
+        ClioCoreQueue._ensure_artifact_use_indexes_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        is queue_artifact_lineage.QueueArtifactLineageMixin._ensure_artifact_use_indexes_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
