@@ -1189,9 +1189,14 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         command: list[str],
         *,
         timeout_seconds: float | None = None,
+        **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         del timeout_seconds
-        if command[0] == "ssh" and "bootstrap-inspect" in command[-1]:
+        # The preflight delivers its script on stdin, so it is identified by
+        # its argv shape rather than by script content in argv (#158). This
+        # branch must precede the script-file branch below, which would
+        # otherwise also match on its trailing "bash".
+        if command[0] == "ssh" and command[-2:] == ["bash", "-s"]:
             stdout = "bootstrap_preflight_unsupported=not_installed\n"
         elif command[0] == "ssh" and command[-2].endswith("bash"):
             stdout = "bootstrap_receipt_json=" + json.dumps(receipt) + "\n"

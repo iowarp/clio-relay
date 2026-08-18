@@ -56,8 +56,27 @@ RATCHET_BASELINE: dict[str, int] = {
     # regression. A justified, minimal ratchet-up.
     "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5782,
     "jarvis-packages/clio_relay/clio_relay/process_containment.py": 2678,
-    "src/clio_relay/bootstrap.py": 8733,
-    "src/clio_relay/bootstrap_journal.py": 1497,
+    # #158: +17 net lines -- the preflight script now travels on STDIN instead
+    # of in argv. Some ssh clients silently truncate a long command-line
+    # argument (the MSYS2 OpenSSH in Git for Windows drops everything past
+    # roughly 8-10 KB; the preflight is ~11 KB), and the remote shell then
+    # reports a syntax error for a script that was cut mid-token, naming
+    # neither the truncation nor the transport. The added lines are the _run
+    # input_bytes passthrough and the comment recording the hazard.
+    # #158: +4 further lines -- the uv adoption check compares the version
+    # TOKEN instead of the whole `uv --version` line. uv prints a platform
+    # suffix, so a byte-identical pinned uv (its sha256 already verified) was
+    # rejected over cosmetics.
+    "src/clio_relay/bootstrap.py": 8754,
+    # #158: +37 net lines -- the descriptor-pinned directory walk resolves the
+    # SITE prefix (the operator's home) before pinning, so a cluster whose
+    # /home is a symlink onto shared storage (ares: /home -> /mnt/common) can
+    # be bootstrapped at all. Everything below the prefix is bootstrap-owned
+    # and stays unresolved, so an owned intermediate swapped for a symlink
+    # between two journal actions is still refused rather than laundered by
+    # realpath. Two small helpers plus the comment recording why the guard is
+    # scoped exactly there.
+    "src/clio_relay/bootstrap_journal.py": 1534,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now

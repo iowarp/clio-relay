@@ -64,7 +64,7 @@ def kit_pin_sites(
             placeholder,
             "JARVIS_MCP_VERSION script placeholder (f-string interpolation of "
             "CLIO_KIT_JARVIS_MCP_VERSION -- never a literal copy)",
-            line=7351,
+            line=7365,
             placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
             mutable=False,
         ),

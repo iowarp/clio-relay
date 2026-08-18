@@ -107,6 +107,11 @@ def _assert_bootstrap_rejected_before_remote_call(
             "",
         )
 
+    # The preflight script rides on stdin, so a remote call is recognized by
+    # its argv shape rather than by scanning argv for script content (#158).
+    def _is_preflight(command: list[str]) -> bool:
+        return command[0] == "ssh" and command[-2:] == ["bash", "-s"]
+
     monkeypatch.setattr(bootstrap, "_run", record_remote_call)
     expected_sha256 = relay_artifact_sha256
     if expected_sha256 is None:
@@ -122,9 +127,7 @@ def _assert_bootstrap_rejected_before_remote_call(
             relay_artifact_sha256=expected_sha256,
             jarvis_resource_graph_profile="ares",
         )
-    assert all(
-        command[0] == "ssh" and "bootstrap-inspect" in command[-1] for command in remote_calls
-    )
+    assert all(_is_preflight(command) for command in remote_calls)
     assert not any(command[0] == "scp" or "mkdir --" in command[-1] for command in remote_calls)
 
 
@@ -615,7 +618,9 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
         observed_timeouts.append(timeout_seconds)
-        if command[0] == "ssh" and "bootstrap-inspect" in command[-1]:
+        # Preflight now delivers its script on stdin, so it is identified by
+        # its argv shape rather than by script content in argv (#158).
+        if command[0] == "ssh" and command[-2:] == ["bash", "-s"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
