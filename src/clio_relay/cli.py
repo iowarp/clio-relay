@@ -69,6 +69,7 @@ import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report_module
 from clio_relay.bootstrap import install_local_frp
+from clio_relay.bootstrap_pin import pin_reconciliation_lines, reconcile_cluster_runtime_pin
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.bounded_process import BoundedProcessError
@@ -3461,6 +3462,22 @@ def cluster_bootstrap(
                     metadata=target_identity,
                 )
             )
+            with recorder.check(
+                "cluster.bootstrap.runtime-pin",
+                "re-point the cluster registry at the runtime bootstrap produced",
+            ) as pin_evidence:
+                pin_reconciliation = reconcile_cluster_runtime_pin(
+                    cluster=cluster,
+                    registry_path=default_registry_path(),
+                )
+                pin_evidence.append(
+                    EvidenceReference(
+                        kind="bootstrap_runtime_pin",
+                        reference=f"cluster-pin:{cluster}",
+                        metadata=pin_reconciliation,
+                    )
+                )
+                lines.extend(pin_reconciliation_lines(pin_reconciliation))
             if receipt.get("outcome") in {"noop_verified", "repaired"}:
                 with recorder.check(
                     "cluster.bootstrap.reuse-slo",

@@ -44,6 +44,10 @@ import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
+from clio_relay.bootstrap_pin import (
+    BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
+    BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
+)
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -10897,6 +10901,143 @@ def test_cli_remote_wait_rejects_contradictory_terminal_claim(
     assert "remote job wait returned an invalid result" in result.output
 
 
+def _bootstrap_cli_fakes(
+    monkeypatch: MonkeyPatch,
+    *,
+    outcome: str = "noop_verified",
+) -> None:
+    """Install the standard cluster-bootstrap CLI fakes used by the pin tests."""
+
+    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
+        receipt = {
+            "schema_version": "clio-relay.bootstrap-receipt.v2",
+            "outcome": outcome,
+            "invocation_id": "bootstrap_test",
+            "bootstrap_profile": "linux-user",
+            "relay_install_spec": "clio-relay==1.0.0",
+            "install_receipt_sha256": "a" * 64,
+            "completed_at": "2026-07-11T00:00:00Z",
+        }
+        return [
+            "bootstrapped",
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+            "bootstrap_invocation_id=bootstrap_test",
+            "bootstrap_install_receipt_sha256=" + "a" * 64,
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+        ]
+
+    def fake_remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
+        return {
+            "schema_version": "clio-relay.cluster-target-info.v1",
+            "hostname": definition.ssh_host,
+            "fqdn": "ares.example.test",
+            "scheduler_provider": "external",
+            "scheduler_cluster_name": None,
+            "site_marker_sha256": "b" * 64,
+            "ssh_host": definition.ssh_host,
+            "ssh_host_key_sha256": ["SHA256:test"],
+            "expected_hostnames": ["ares.example.test"],
+            "expected_ssh_host_key_sha256": ["SHA256:test"],
+            "expected_scheduler_cluster_name": None,
+            "expected_site_marker_sha256": "b" * 64,
+            "verified": True,
+        }
+
+    def fake_bootstrap_reuse_acceptance_evidence(
+        receipt: dict[str, object],
+        *,
+        elapsed_seconds: float | int,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
+            "outcome": receipt["outcome"],
+            "elapsed_seconds": float(elapsed_seconds),
+            "maximum_seconds": 30.0,
+            "payload_free": True,
+            "scheduler_untouched": True,
+            "jarvis_preserved": True,
+            "component_actions": {},
+            "service_operations": {},
+        }
+
+    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        bootstrap_acceptance,
+        "bootstrap_reuse_acceptance_evidence",
+        fake_bootstrap_reuse_acceptance_evidence,
+    )
+
+
+def test_cluster_bootstrap_repoints_a_stale_relay_executable_pin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Bootstrap must leave the registry pointing at what it actually produced.
+
+    clio-relay#158: bootstrap installs the relay at its canonical stable
+    launcher, but the registry pin was never reconciled. A cluster pinned to a
+    generation path that has since been garbage-collected therefore stayed
+    pinned to the dead path -- bootstrap reported success (even
+    ``noop_verified``, because its preflight probes the canonical path, not the
+    pin) while every session command kept failing on the stale pointer. An
+    install that leaves a dead pointer behind is a silent half-deploy.
+    """
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry(
+        clusters={
+            "ares": ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+                relay_install_receipt="/srv/generations/gone/install-receipt.json",
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+    _bootstrap_cli_fakes(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        ["cluster", "bootstrap", "--cluster", "ares"],
+    )
+
+    assert result.exit_code == 0
+    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
+    assert saved.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
+    assert saved.relay_install_receipt == BOOTSTRAP_PRODUCED_INSTALL_RECEIPT
+    # The repoint must be announced, never silent.
+    assert "relay_executable_repointed" in result.output
+
+
+def test_cluster_bootstrap_leaves_an_already_correct_pin_untouched(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Reconciling the pin is idempotent and stays quiet when nothing changed."""
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry(
+        clusters={
+            "ares": ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable=BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
+                relay_install_receipt=BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+    _bootstrap_cli_fakes(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        ["cluster", "bootstrap", "--cluster", "ares"],
+    )
+
+    assert result.exit_code == 0
+    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
+    assert saved.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
+    assert "relay_executable_repointed" not in result.output
+
+
 def test_cli_cluster_bootstrap_uses_package_source_root(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -11025,8 +11166,11 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     assert report["checks"][0]["check_id"] == "cluster.bootstrap"
     assert report["checks"][1]["check_id"] == "worker.target-identity"
     assert report["checks"][1]["evidence"][0]["kind"] == "cluster_target"
-    assert report["checks"][2]["check_id"] == "cluster.bootstrap.reuse-slo"
-    reuse_evidence = report["checks"][2]["evidence"][0]
+    # The runtime pin is reconciled only after the physical target verifies.
+    assert report["checks"][2]["check_id"] == "cluster.bootstrap.runtime-pin"
+    assert report["checks"][2]["evidence"][0]["kind"] == "bootstrap_runtime_pin"
+    assert report["checks"][3]["check_id"] == "cluster.bootstrap.reuse-slo"
+    reuse_evidence = report["checks"][3]["evidence"][0]
     assert reuse_evidence["kind"] == "bootstrap_reuse_acceptance"
     assert reuse_evidence["reference"] == "bootstrap-reuse:bootstrap_test"
     assert reuse_evidence["metadata"]["payload_free"] is True

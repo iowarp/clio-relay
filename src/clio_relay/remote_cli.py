@@ -33,7 +33,7 @@ from clio_relay.errors import (
     ObservationTimeoutError,
     RelayError,
     RemoteCommandFailed,
-    RemoteExecutableMissingError,
+    relay_executable_missing,
 )
 from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
@@ -282,13 +282,11 @@ def _remote_command_failure(
             f"remote command refused delivery ({code}): {describe_delivery_refusal(refusal)}"
         )
     if result.returncode == SHELL_COMMAND_NOT_FOUND_STATUS and definition is not None:
-        return RemoteExecutableMissingError(
-            "configured relay_executable is absent on the remote host "
-            f"({definition.ssh_host}): {definition.relay_executable}. "
-            "Re-run `clio-relay cluster bootstrap --cluster "
-            f"{definition.name}` to reinstall the relay and re-point the "
-            "registry at what it produced. "
-            f"{_command_error('remote detail', result)}",
+        return relay_executable_missing(
+            cluster=definition.name,
+            ssh_host=definition.ssh_host,
+            relay_executable=definition.relay_executable,
+            detail=_command_error("remote detail", result).removeprefix("remote detail: "),
             exit_status=result.returncode,
         )
     return RemoteCommandFailed(
