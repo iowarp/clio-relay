@@ -17,7 +17,7 @@ import stat
 import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -88,7 +88,7 @@ def create_journal(
         target = Path(item["path"])
         if _entry_exists_without_following(target):
             raise BootstrapJournalError(f"bootstrap-owned path already exists: {target}")
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     value: dict[str, Any] = {
         "schema_version": BOOTSTRAP_TRANSACTION_SCHEMA,
         "invocation_id": invocation_id,
@@ -150,7 +150,7 @@ def advance_journal(
         value["state"] = state
         if state == "migration_started":
             value["irreversible_boundary"] = True
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -178,7 +178,7 @@ def record_phase(path: Path, phase: str, identity: str) -> dict[str, Any]:
             raise BootstrapJournalError(f"bootstrap phase identity changed: {phase}")
         phases[phase] = identity
         value["phase_identities"] = phases
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -232,7 +232,7 @@ def record_owned_path(path: Path, owned_name: str) -> dict[str, Any]:
             raise BootstrapJournalError(f"bootstrap owned path identity changed: {owned_name}")
         item["identity"] = observed
         value["owned_paths"] = owned
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -403,7 +403,7 @@ def _create_and_record_owned_path(
                     raise BootstrapJournalError(f"bootstrap owned path kind changed: {target}")
                 item["identity"] = observed
                 value["owned_paths"] = owned
-                value["updated_at"] = datetime.now(UTC).isoformat()
+                value["updated_at"] = datetime.now(timezone.utc).isoformat()
                 _validate_journal(value)
                 _atomic_json_at(
                     journal_fd,
@@ -489,7 +489,7 @@ def discard_full_transaction(path: Path, *, home: Path) -> dict[str, Any]:
                 )
         value["recovered_from"] = value["state"]
         value["state"] = "recovered"
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             journal_fd,
