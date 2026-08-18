@@ -27,6 +27,7 @@ from clio_relay import (
     queue_gateways,
     queue_gc_storage,
     queue_idempotency,
+    queue_index_migration,
     queue_index_state,
     queue_input_ingest,
     queue_job_gc,
@@ -37,6 +38,7 @@ from clio_relay import (
     queue_lease_indexes,
     queue_lease_records,
     queue_leases,
+    queue_legacy_audit,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_order_index,
@@ -45,9 +47,11 @@ from clio_relay import (
     queue_progress,
     queue_scheduler_cancel_records,
     queue_scheduler_cancel_state,
+    queue_startup,
     queue_store_read,
     queue_store_write,
     queue_tasks,
+    queue_transitions,
 )
 from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.core_queue import ClioCoreQueue
@@ -161,6 +165,28 @@ _OWNER_RANK = {
     "queue_gc_storage": 39,
     "queue_job_gc_protections": 40,
     "queue_job_gc": 41,
+    # CQ19: index discovery (the three bounded, no-history-scan migration-
+    # state repairs -- schema upgrade, capacity-gate reconciliation, state
+    # extension -- none has an inbound edge from any other owner) lands
+    # first at 42. queue_startup (initialize plus its locked-core/
+    # permission-repair helpers) lands at 43, immediately after: initialize
+    # self-calls index_discovery's three methods. queue_index_migration
+    # (the bounded v0.9-to-indexed migration batch driver) lands at 44 --
+    # CQ19-ST-01 typed deviation, not the doc's naive "discovery/migration
+    # ahead of startup" order: migrate_indexes_batch/index_migration_status
+    # both self-call self.initialize() as their first line, a real,
+    # pre-existing edge that requires queue_startup to land before it.
+    # queue_transitions (the transition-intent applier,
+    # _reconcile_transition_intents_unlocked) lands last at 45: every kind
+    # branch dispatches into an already-landed owner's real mutation
+    # primitive, so it must rank after all of them. See each module's own
+    # docstring for the full account, including CQ19-TI-01 (the write-
+    # ahead-log primitives that stay facade-resident because many earlier-
+    # ranked owners already self-call them).
+    "queue_index_discovery": 42,
+    "queue_startup": 43,
+    "queue_index_migration": 44,
+    "queue_transitions": 45,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -209,6 +235,10 @@ _OWNER_BUDGETS = {
     "queue_gc_storage": 280,
     "queue_job_gc_protections": 320,
     "queue_job_gc": 720,
+    "queue_index_discovery": 380,
+    "queue_startup": 550,
+    "queue_index_migration": 720,
+    "queue_transitions": 280,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -354,6 +384,28 @@ class _JobGcStorageMoveLookupSabotage(RuntimeError):
     """Raised only when CQ18 trash-staging reaches
     ``queue_gc_storage.move_gc_path`` through the ``queue_job_gc`` owner's
     module-qualified collaborator-attribute lookup."""
+
+
+class _IndexMigrationBatchPathsLookupSabotage(RuntimeError):
+    """Raised only when CQ19's ``migrate_indexes_batch`` reaches
+    ``queue_store_read.migration_batch_paths`` through the
+    ``queue_index_migration`` owner's module-qualified lookup (the design
+    row's "one domain-migration lookup")."""
+
+
+class _TransitionApplierBoundedPathsLookupSabotage(RuntimeError):
+    """Raised only when CQ19's transition-intent applier
+    (``_reconcile_transition_intents_unlocked``) reaches
+    ``queue_store_read.bounded_json_record_paths`` through the
+    ``queue_transitions`` owner's module-qualified lookup (the design row's
+    "one transition-applier lookup")."""
+
+
+class _StartupAuditBeforeInitializationLookupSabotage(RuntimeError):
+    """Raised only when CQ19's ``queue_startup.initialize`` reaches
+    ``queue_legacy_audit.audit_before_initialization`` through the owner's
+    module-qualified lookup (the design row's exact named seam:
+    "queue_startup.queue_legacy_audit.audit_before_initialization")."""
 
 
 @dataclass(frozen=True)
@@ -1901,6 +1953,122 @@ def test_cq18_job_gc_uses_the_gc_storage_move_lookup(
     assert ClioCoreQueue.collect_terminal_job is queue_job_gc.QueueJobGcMixin.collect_terminal_job
 
 
+def test_cq19_index_migration_uses_the_migration_batch_paths_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The bounded v0.9-to-indexed migration batch driver must resolve its
+    per-family record-path listing through the ``queue_store_read.
+    migration_batch_paths`` seam (isolated-namespace pattern -- design row:
+    "Patch one domain-migration lookup"). A flat legacy job record (written
+    directly, bypassing ``ClioCoreQueue``) keeps the fresh-seed migration
+    checkpoint incomplete so the batch driver's first per-family loop
+    iteration reaches the lookup instead of returning early."""
+    (tmp_path / "jobs").mkdir(parents=True)
+    legacy_job = RelayJob(
+        cluster="cq19-migration",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq19-legacy-job",
+    )
+    (tmp_path / "jobs" / f"{legacy_job.job_id}.json").write_text(
+        legacy_job.model_dump_json(indent=2), encoding="utf-8"
+    )
+    queue = ClioCoreQueue(tmp_path)
+
+    def sabotage(*_args: object, **_kwargs: object) -> tuple[list[Path], bool]:
+        raise _IndexMigrationBatchPathsLookupSabotage(
+            "queue_index_migration store-read migration_batch_paths lookup engaged"
+        )
+
+    isolated_store_read = SimpleNamespace(
+        **{**vars(queue_store_read), "migration_batch_paths": sabotage}
+    )
+    monkeypatch.setattr(queue_index_migration, "queue_store_read", isolated_store_read)
+
+    with pytest.raises(
+        _IndexMigrationBatchPathsLookupSabotage,
+        match="migration_batch_paths lookup engaged",
+    ):
+        queue.migrate_indexes_batch(batch_size=1)
+
+    assert (
+        ClioCoreQueue.migrate_indexes_batch
+        is queue_index_migration.QueueIndexMigrationMixin.migrate_indexes_batch
+    )
+
+
+def test_cq19_transition_applier_uses_the_bounded_json_record_paths_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The transition-intent applier must resolve its journal listing through
+    the ``queue_store_read.bounded_json_record_paths`` seam (isolated-
+    namespace pattern -- design row: "one transition-applier lookup"). Calls
+    ``_reconcile_transition_intents_unlocked`` directly (through the public
+    ``reconcile_pending_transitions`` wrapper, after the queue is already
+    initialized) so the sabotage exercises the applier's own journal read,
+    not initialization's separate bootstrap path."""
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+
+    def sabotage(*_args: object, **_kwargs: object) -> list[Path]:
+        raise _TransitionApplierBoundedPathsLookupSabotage(
+            "queue_transitions store-read bounded_json_record_paths lookup engaged"
+        )
+
+    isolated_store_read = SimpleNamespace(
+        **{**vars(queue_store_read), "bounded_json_record_paths": sabotage}
+    )
+    monkeypatch.setattr(queue_transitions, "queue_store_read", isolated_store_read)
+
+    with pytest.raises(
+        _TransitionApplierBoundedPathsLookupSabotage,
+        match="bounded_json_record_paths lookup engaged",
+    ):
+        queue.reconcile_pending_transitions()
+
+    assert (
+        ClioCoreQueue._reconcile_transition_intents_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        is queue_transitions.QueueTransitionsMixin._reconcile_transition_intents_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_cq19_startup_uses_the_legacy_audit_before_initialization_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Queue startup must resolve its pre-initialization legacy-state audit
+    through the ``queue_legacy_audit.audit_before_initialization`` seam
+    (isolated-namespace pattern -- design row's exact named CQ19 seam:
+    "queue_startup.queue_legacy_audit.audit_before_initialization"). A fresh
+    queue's first ``initialize()`` call always takes the exclusive-lifetime,
+    missing-seal path that reaches this lookup."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> object:
+        raise _StartupAuditBeforeInitializationLookupSabotage(
+            "queue_startup legacy-audit audit_before_initialization lookup engaged"
+        )
+
+    isolated_legacy_audit = SimpleNamespace(
+        **{**vars(queue_legacy_audit), "audit_before_initialization": sabotage}
+    )
+    monkeypatch.setattr(queue_startup, "queue_legacy_audit", isolated_legacy_audit)
+
+    with pytest.raises(
+        _StartupAuditBeforeInitializationLookupSabotage,
+        match="audit_before_initialization lookup engaged",
+    ):
+        ClioCoreQueue(tmp_path).initialize()
+
+    # CQ19-ST-02 typed deviation: unlike every other CQ19 seam, ``initialize``
+    # is deliberately NOT a ``QueueStartupMixin`` method (it stays a thin
+    # facade-resident dispatch to the module-level ``queue_startup.
+    # initialize`` function) -- see that module's docstring for why.
+    assert not hasattr(queue_startup.QueueStartupMixin, "initialize")
+    assert ClioCoreQueue.initialize.__module__ == "clio_relay.core_queue"
+
+
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
     """A top-level absolute owner import cannot bypass bare-function checks."""
     tree = ast.parse("from queue_layout import validate_canonical_access\n")
@@ -2090,9 +2258,35 @@ def test_lease_decoder_lookup_is_owned_by_the_cq4_module(
 
 
 def test_scheduler_decoder_lookup_is_owned_by_the_cq4_module(
+    tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """The facade's scheduler decoder must re-resolve the CQ4 owner lookup."""
+    """CQ19's operational-record migration must re-resolve the CQ4 owner
+    decoder lookup through its real ``queue_index_migration`` call site.
+    Corrected from the dead facade wrapper ``core_queue_module.
+    _cancellation_requested_at`` (deleted once its only caller,
+    ``_migrate_operational_record_unlocked``, moved to ``queue_index_
+    migration`` and started calling ``queue_scheduler_cancel_records.
+    cancellation_requested_at`` module-qualified directly) -- design doc §4's
+    own rule: patch the module containing the real call expression, never a
+    dead facade shim."""
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cq4-decoder",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq4-decoder-job",
+            metadata={
+                "cancellation_request": {
+                    "schema_version": "clio-relay.cancellation-request.v1",
+                    "cancel_scheduler": True,
+                    "requested_at": "2026-08-15T12:00:00+00:00",
+                }
+            },
+        )
+    )
 
     def sabotage(*_args: object, **_kwargs: object) -> None:
         raise _CodecLookupSabotage("queue_scheduler_cancel_records decoder lookup engaged")
@@ -2103,9 +2297,7 @@ def test_scheduler_decoder_lookup_is_owned_by_the_cq4_module(
         _CodecLookupSabotage,
         match="queue_scheduler_cancel_records decoder lookup engaged",
     ):
-        core_queue_module._cancellation_requested_at(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            {"requested_at": "2026-08-15T12:00:00+00:00"}
-        )
+        queue._migrate_operational_record_unlocked("jobs", job)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_legacy_output_decoder_lookup_is_owned_by_the_cq4_module(

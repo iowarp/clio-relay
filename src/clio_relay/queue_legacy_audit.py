@@ -618,3 +618,18 @@ class QueueLegacyAuditMixin:
                     path=path,
                     reason="idempotency filename/content identity mismatch",
                 )
+
+
+audit_before_initialization = (
+    QueueLegacyAuditMixin._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]
+)
+"""Module-qualified alias over the unbound audit method (CQ19 failing-first
+seam: design doc row "queue_startup.queue_legacy_audit.audit_before_
+initialization"). ``queue_startup.initialize()`` calls this as
+``queue_legacy_audit.audit_before_initialization(self)`` instead of
+``self._audit_legacy_state_before_initialization()`` so a test can intercept
+it with a module-qualified isolated-namespace patch on ``queue_startup.
+queue_legacy_audit`` -- the same ``name = Mixin._method`` idiom
+``queue_legacy_output_audit.audit_state_before_initialization`` already
+uses for the same reason.
+"""

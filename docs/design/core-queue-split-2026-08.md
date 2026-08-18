@@ -1200,3 +1200,256 @@ validation.py`, `tests/test_transform_provenance.py`, `tests/
 test_endpoint.py`, `tests/test_cli.py`) all pass green in combined runs,
 zero failures beyond the same pre-existing, A/B-verified `[corrupt/missing/
 renamed]` cross-branch flake CQ17 already exempted.
+
+
+## 14. CQ19 landing — index discovery/migration, transition applier, startup
+
+CQ19 (predecessors CQ2-CQ18, all landed) lands as **four** owners: the three
+bounded, no-history-scan index-migration-state repairs
+(`queue_index_discovery.py`), the resumable v0.9-to-indexed migration batch
+driver and its per-family projection dispatchers (`queue_index_migration.py`),
+the bounded write-ahead-log transition-intent applier
+(`queue_transitions.py`), and the bulk of queue startup
+(`queue_startup.py`).
+
+### 14.1 owner ranks and real line counts
+
+| Rank | Owner | Real | Cap | Note |
+|---:|---|---:|---:|---|
+| 42 | `queue_index_discovery.py` | 352 | 380 | no inbound edge from any other owner |
+| 43 | `queue_startup.py` | 527 | 550 | CQ19-ST-01/-02, see §14.2/§14.3 |
+| 44 | `queue_index_migration.py` | 696 | 720 | ranked after `queue_startup`, CQ19-ST-01 |
+| 45 | `queue_transitions.py` | 254 | 280 | ranks last: dispatches into every earlier owner |
+
+`core_queue.py` fell from 2077 to 746 physical lines (net removal 1331,
+including the new thin `initialize` dispatch wrapper -- see §14.3). This is
+under the 800-line hard gate and under `DEFAULT_MAX_LINES`, so
+`scripts/check_file_size.py`'s `RATCHET_BASELINE` entry for `core_queue.py`
+is removed entirely rather than lowered (the script's own documented
+convention: "remove the entry once the file is under DEFAULT_MAX_LINES").
+Every landed cap is below the 800-line hard gate; the facade public method
+count stays exactly 128 (`test_facade_public_method_set_stays_at_the_
+128_method_base`); 46 owners are landed. `core_queue.py`'s own budget is not
+yet at its originally planned 200-line facade cap -- CQ1's jarvis-input
+delegator pattern, CQ13-IO-01's `_assert_input_ingest_quota_unlocked`
+deviation, and this slice's own CQ19-TI-01/CQ19-ST-02 deviations (below) all
+still live there by design; closing that gap is CQ20's job, not this
+slice's.
+
+### 14.2 typed deviation CQ19-TI-01: the write-ahead-log primitives stay facade-resident
+
+The design's section-1 per-line inventory placed the transition-intent
+write/recovery primitives inside the same contiguous band as the transition
+applier -- physical position, not call-graph rank. Reconciling that against
+the real dependency graph (ledger §9.3/§10.2/§11.2/§12.2/§13.2 precedent:
+hoist or split, never force a reverse edge) found a genuine hub-method
+problem with no clean split:
+
+- `_write_transition_intent_unlocked` (write one bounded WAL intent),
+  `_recover_pending_transitions_unlocked` (the ``initialize()``-adjacent
+  crash-recovery entrypoint, a thin wrapper over the transition applier),
+  `_require_index_migration_complete`, `_read_index_migration_state`/
+  `_write_index_migration_state`, and `_lease_capacity_migration_complete_
+  unlocked` are each self-called by many already-landed owners spanning
+  ranks 18 (`queue_endpoints`) through 40 (`queue_job_gc_protections`) --
+  `queue_execution_cleanup` (rank 23) is the earliest. Extracting any one of
+  them into a rank-42+ CQ19 owner would create a reverse-rank edge the
+  architecture guard rejects, and no single earlier-ranked owner has the
+  combined headroom to host all of them as a shared primitive (mirroring
+  the CQ13-IO-01 `_assert_input_ingest_quota_unlocked` deviation for the
+  same class of problem).
+- All six stay exactly where they already were in `core_queue.py`,
+  unmoved by this slice. Because none of them is owned by any `queue_*.py`
+  Mixin, every existing self-call into them from any owner -- early or
+  late -- carries no architecture-guard edge at all, before or after this
+  slice.
+
+### 14.3 typed deviation CQ19-ST-01/CQ19-ST-02: `queue_startup` ranks before `queue_index_migration`, and `initialize` is a bare module function
+
+Two related, CQ19-discovered reverse-rank problems, both resolved without
+re-ranking every caller:
+
+- **CQ19-ST-01 (rank order).** The design doc's own CQwave listed
+  "index discovery/migration" ahead of "startup." The real graph requires
+  the opposite for one edge: `migrate_indexes_batch`/`index_migration_
+  status` both self-call `self.initialize()` as their first line (a real,
+  pre-existing edge, unchanged by this slice). `queue_index_migration`
+  therefore ranks 44, immediately after `queue_startup` (43); `queue_
+  index_discovery` (42) still lands first since `queue_startup.initialize`
+  calls into it, and `queue_transitions` (45) has no edge to or from
+  `queue_startup`/`queue_index_migration` at all.
+- **CQ19-ST-02 (module-level function, not a Mixin method).** Making
+  `initialize` a real `QueueStartupMixin` method looked like the obvious
+  move -- until the architecture guard's self-call scanner (which resolves
+  `self.<name>` through the real, non-stub mixin-method manifest) started
+  tracking `self.initialize()` as a genuine rank-ordered edge from **every**
+  owner across the whole rank range (it is the first line of nearly every
+  public method on nearly every owner, not just this slice's own two
+  callers), producing reverse-rank violations from ranks as early as
+  `queue_lease_admission` (33). No rank can simultaneously satisfy "before
+  every caller in the codebase" and "after its own collaborators, up to
+  `queue_lease_capacity_state` at rank 30 via `queue_index_discovery`" --
+  a genuine cycle, not a missing hoist target, and unlike CQ19-TI-01's
+  primitives it cannot simply stay unmoved, since the design doc's CQ19 row
+  and its failing-first prescription both require `queue_startup.py` to
+  exist and host the real body. Resolution: `initialize`'s bulk body moves
+  to `queue_startup.py` as a bare **module-level function**,
+  `initialize(queue: QueueStartupMixin, *, ...)` (the established
+  module-level-twin idiom, e.g. `queue_lease_indexes.sync_operational_
+  indexes(queue, ...)`), while `ClioCoreQueue.initialize` stays a thin
+  facade-resident dispatch (`return queue_startup.initialize(self, ...)`).
+  Since the dispatch point is a bare function (not a `*Mixin` method) and
+  the facade wrapper names no owner, every `self.initialize()` call
+  anywhere in the codebase is invisible to the edge scanner again, exactly
+  as it was before this slice when `initialize` lived directly on
+  `ClioCoreQueue`. The two lifetime-pinning helpers (`_initialize_with_
+  exclusive_lifetime`, `_initialize_under_locked_core`, both genuinely
+  zero-inbound-edge) stay real `QueueStartupMixin` methods and call the
+  module function as `initialize(self, ...)`.
+- Every `queue._foo` private-attribute/method access inside the module-level
+  `initialize` function (44 sites) carries `# pyright: ignore[
+  reportPrivateUsage]` -- unlike a bound `self.foo` access inside the
+  owning class's own method, `queue.foo` from a plain module-level function
+  is `strict`-mode `reportPrivateUsage` regardless of `queue`'s declared
+  type being `QueueStartupMixin` itself, matching the identical `# pyright:
+  ignore[reportPrivateUsage]` annotations already on `queue_gateway_
+  indexes.sync_gateway_session_derived`'s own `queue._storage_root` access.
+
+### 14.4 failing-first sabotage (`tests/test_core_queue_split_architecture.py`)
+
+Three new sabotage tests, all isolated-namespace pattern, all verified red
+via call-site bypass (by hand: temporarily replacing the module-qualified
+call with a pre-captured/inline equivalent, confirming `DID NOT RAISE`,
+then restoring) and green after:
+
+- `test_cq19_index_migration_uses_the_migration_batch_paths_lookup` --
+  writes one flat legacy job record directly to disk (bypassing
+  `ClioCoreQueue`) so the fresh-seed migration checkpoint stays incomplete,
+  then patches `queue_index_migration.queue_store_read.migration_batch_
+  paths` and calls `migrate_indexes_batch(batch_size=1)`; design row's "one
+  domain-migration lookup."
+- `test_cq19_transition_applier_uses_the_bounded_json_record_paths_lookup`
+  -- patches `queue_transitions.queue_store_read.bounded_json_record_paths`
+  and calls the public `reconcile_pending_transitions()` on an already-
+  initialized queue; design row's "one transition-applier lookup."
+- `test_cq19_startup_uses_the_legacy_audit_before_initialization_lookup` --
+  patches `queue_startup.queue_legacy_audit` (isolated namespace) and calls
+  a fresh queue's first `initialize()`; the design row's exact named seam,
+  "`queue_startup.queue_legacy_audit.audit_before_initialization`."
+
+### 14.5 `audit_before_initialization` alias (`queue_legacy_audit.py`)
+
+`queue_legacy_audit.py` gains one new module-level alias, matching the
+`queue_legacy_output_audit.audit_state_before_initialization` idiom it
+already established:
+
+```python
+audit_before_initialization = (
+    QueueLegacyAuditMixin._audit_legacy_state_before_initialization
+)
+```
+
+`queue_startup.initialize` calls it as `queue_legacy_audit.audit_before_
+initialization(cast(queue_legacy_audit.QueueLegacyAuditMixin, queue))` --
+module-qualified, not `queue._audit_legacy_state_before_initialization()` --
+so a test can intercept it with a module-qualified isolated-namespace patch.
+The underlying bound method (`QueueLegacyAuditMixin._audit_legacy_state_
+before_initialization`, landed CQ6) is unchanged.
+
+### 14.6 patch-seam audit corrections (real lookup site moved)
+
+Design §4's own row for this exact seam ("`ClioCoreQueue._audit_legacy_
+state_before_initialization` -> `queue_startup.queue_legacy_audit.audit_
+before_initialization`") is realized exactly as prescribed. Five
+pre-existing tests that patched the now-dead `ClioCoreQueue._audit_legacy_
+state_before_initialization`/`core_queue_module.exclusive_migration_
+lifetime` class-attribute seams moved to the real module-qualified lookups:
+
+- `tests/test_queue_startup_audit.py`: `test_indexed_era_fresh_process_
+  startup_does_not_scan_record_history`,
+  `test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock`, and
+  `test_crash_after_durable_seal_recovers_without_reauditing_history` move
+  their `monkeypatch.setattr(ClioCoreQueue, "_audit_legacy_state_before_
+  initialization", ...)` to `monkeypatch.setattr(queue_legacy_audit,
+  "audit_before_initialization", ...)`.
+  `test_sealed_startup_never_upgrades_shared_writer_ownership` moves
+  `monkeypatch.setattr(core_queue_module, "exclusive_migration_lifetime",
+  ...)` to the isolated-namespace `queue_startup.worker_lifetime_lock` seam
+  (design §4's own row).
+- `tests/test_worker_lifetime_lock.py`: `test_authoritative_migration_api_
+  enters_exclusive_lifetime_guard` and `test_locked_initialization_never_
+  writes_replacement_root_after_path_swap` move their `ClioCoreQueue._
+  audit_legacy_state_before_initialization` patches to `queue_legacy_audit.
+  audit_before_initialization`; the alias-retargeting migration test moves
+  its `core_queue_module.exclusive_migration_lifetime` patch to the same
+  isolated-namespace `queue_startup.worker_lifetime_lock` seam. Both files'
+  now-unused `import clio_relay.core_queue as core_queue_module` are
+  removed.
+- `tests/test_core_queue_split_architecture.py::test_scheduler_decoder_
+  lookup_is_owned_by_the_cq4_module` patched `core_queue_module.
+  _cancellation_requested_at` (a facade wrapper deleted outright once its
+  only caller, `_migrate_operational_record_unlocked`, moved into `queue_
+  index_migration.py` and started calling `queue_scheduler_cancel_records.
+  cancellation_requested_at` module-qualified directly). Corrected to
+  submit a real job carrying `cancellation_request` metadata and call
+  `queue._migrate_operational_record_unlocked("jobs", job)` directly, with
+  the same `queue_scheduler_cancel_records.cancellation_requested_at`
+  patch as before -- design §4's own rule: patch the module containing the
+  real call expression, never a dead facade shim.
+
+### 14.7 production and facade collateral
+
+- `core_queue.py` module-level aliases `_ORDER_FAMILIES`/
+  `_GLOBAL_ORDER_FAMILIES`/`_RETENTION_INDEX_FAMILIES`/`_OPERATIONAL_INDEX_
+  FAMILIES`/`_INITIALIZED_QUEUE_FAMILIES`/`_ADDITIVE_QUEUE_FAMILIES`/`_
+  LEGACY_ONLY_QUEUE_FAMILIES`/`_UnsafeQueueDirectoryProtection` are deleted:
+  every remaining use was inside the moved bodies, and a repository-wide
+  grep confirmed zero external (production or test) consumers.
+  `QueueSealRequiresExclusive` is kept -- `storage_runtime.py` imports it
+  directly from `clio_relay.core_queue` as a real, live compatibility
+  re-export (confirmed via the same grep; caught only by running the full
+  test suite's collection phase, since no targeted CQ19 test file exercises
+  `storage_runtime.py`'s own import).
+- The now-orphaned module-level functions `_unlink_durable_path`,
+  `_scheduler_cancellation_request`, `_cancellation_requested_at`, and
+  `_path_lstat` are deleted from `core_queue.py`: each had exactly one
+  caller, and that caller moved into a CQ19 owner and now calls the real
+  `queue_store_write.unlink_durable_path`/`queue_scheduler_cancel_records.
+  scheduler_cancellation_request`/`cancellation_requested_at`/`queue_store_
+  read.path_lstat` module-qualified directly (CQ15 §10.3 residual-caller
+  precedent). `_record_is_reparse` and `_read_bounded_record_bytes` stay --
+  each still has a live caller in the facade-resident `_bounded_regular_
+  json_count`/`_read_unique_json_document` (`_QueueStoreAdapter`'s own
+  bounded-count seam and the sealed-state document reader, both CQ20
+  territory, not CQ19's).
+- `errno`, `from contextlib import suppress`, and the bare `worker_
+  lifetime_lock.{LockedCoreIdentity,exclusive_migration_lifetime,require_
+  active_locked_core}` imports drop out of `core_queue.py` entirely (all
+  three were only ever used inside the moved bodies); `os`/`stat` stay
+  (each still has a live caller in `_bounded_regular_json_count`/
+  `_QueueStoreAdapter`). `core_queue.py` gains one new `TYPE_CHECKING`
+  import, `clio_relay.worker_lifetime_lock.LockedCoreIdentity`, for the
+  thin `initialize` wrapper's own signature.
+
+### 14.8 gates
+
+`ruff check`/`ruff format --check`, `pyright` (0 errors across every
+touched/new file; the sole pre-existing `service_runtime.py`
+`reportUnnecessaryCast` finding, confirmed present before this slice, is
+unrelated and untouched), `scripts/check_file_size.py` (`core_queue.py`'s
+`RATCHET_BASELINE` entry removed entirely -- 2077 lines, now 746, under the
+800-line default cap; all four new owners within their stated caps), and
+`scripts/check_release_identity.py` (78/80 sites agree) all pass.
+`tests/test_queue.py`, `tests/test_core_queue_split_architecture.py`
+(49 -> 52 tests, 3 new), `tests/test_release_pins.py`, `tests/test_queue_
+startup_audit.py`, `tests/test_operational_indexes.py`, `tests/test_core_
+index_safety.py`, `tests/test_legacy_output_migration.py`, `tests/test_
+worker_lifetime_lock.py` (337 tests combined), plus the startup/migration-
+adjacent suites `tests/test_queue_readiness.py`, `tests/test_lease_
+capacity.py`, `tests/test_queue_management.py`, `tests/test_queue_record_
+codecs.py`, `tests/test_storage_managed_queue.py`, `tests/test_core_
+retention.py`, `tests/test_retention.py`, `tests/test_artifact_lineage.py`,
+`tests/test_fastmcp_server.py` (154 tests) all pass green, plus a full
+`tests/` collection-and-run pass confirming zero import breaks anywhere in
+the tree, zero failures beyond the pre-existing, A/B-known `#239` sidecar
+family.

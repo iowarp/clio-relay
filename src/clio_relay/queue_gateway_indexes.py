@@ -10,11 +10,11 @@ lookup a test can patch on this module -- design doc CQ16 row: "Patch each
 caller owner's collaborator attribute for browser CAS and backlink
 synchronization" (the backlink-synchronization half). The bound method
 ``_sync_gateway_session_derived_unlocked`` stays a real, directly patchable
-instance method (facade-resident ``_reconcile_transition_intents_unlocked``
-self-calls it by that exact name on the ``gateway_sync`` transition-intent
-replay path) and is a thin wrapper over the module function, matching the
-``queue_jobs.write_job``/``queue_lease_indexes.sync_operational_indexes``
-precedent.
+instance method (CQ19's ``queue_transitions.QueueTransitionsMixin.
+_reconcile_transition_intents_unlocked`` self-calls it by that exact name on
+the ``gateway_sync`` transition-intent replay path) and is a thin wrapper
+over the module function, matching the ``queue_jobs.write_job``/``queue_
+lease_indexes.sync_operational_indexes`` precedent.
 """
 
 from __future__ import annotations

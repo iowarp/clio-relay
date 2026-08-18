@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_legacy_audit, queue_legacy_output_audit
+from clio_relay import (
+    queue_legacy_audit,
+    queue_legacy_output_audit,
+    queue_startup,
+    worker_lifetime_lock,
+)
 from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
@@ -50,8 +55,8 @@ def test_indexed_era_fresh_process_startup_does_not_scan_record_history(
         queue.submit_job(_job(f"job_indexed_{index}"))
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         _refuse_history_scan,
     )
     monkeypatch.setattr(
@@ -96,11 +101,10 @@ def test_sealed_startup_never_upgrades_shared_writer_ownership(
     """A healthy seal retains the bounded shared-writer startup path."""
     root = tmp_path / "core"
     ClioCoreQueue(root).initialize()
-    monkeypatch.setattr(
-        core_queue_module,
-        "exclusive_migration_lifetime",
-        _refuse_history_scan,
+    isolated_worker_lifetime_lock = SimpleNamespace(
+        **{**vars(worker_lifetime_lock), "exclusive_migration_lifetime": _refuse_history_scan}
     )
+    monkeypatch.setattr(queue_startup, "worker_lifetime_lock", isolated_worker_lifetime_lock)
 
     ClioCoreQueue(root).initialize()
 
@@ -242,7 +246,7 @@ def test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock(
     queue = ClioCoreQueue(root)
     queue.submit_job(_job("job_single_audit"))
     _audit_marker(root).unlink()
-    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_audit = queue_legacy_audit.audit_before_initialization
     lock_observations: list[bool] = []
 
     def observe_audit(candidate: ClioCoreQueue) -> object:
@@ -250,8 +254,8 @@ def test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock(
         return original_audit(candidate)
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         observe_audit,
     )
 
@@ -307,8 +311,8 @@ def test_crash_after_durable_seal_recovers_without_reauditing_history(
         staticmethod(_no_audit_fault),
     )
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         _refuse_history_scan,
     )
     ClioCoreQueue(root).initialize()

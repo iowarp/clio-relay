@@ -202,7 +202,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # collection, split CQ18-JG-01) moves to queue_job_gc.py / queue_job_gc_
     # protections.py; GC quarantine-tree storage moves to queue_gc_storage.py.
     # Net: 3056 -> 2077.
-    "src/clio_relay/core_queue.py": 2077,
+    # #231 CQ19: index discovery (schema-upgrade/gate-reconciliation/state-
+    # extension) moves to queue_index_discovery.py, the bounded migration
+    # batch driver to queue_index_migration.py, the transition-intent
+    # applier to queue_transitions.py, and queue startup (initialize plus
+    # its locked-core/permission-repair helpers) to queue_startup.py. Net:
+    # 2077 -> 713 -- under the 800-line default cap, so core_queue.py drops
+    # out of the ratchet baseline entirely (this script's own documented
+    # convention: "remove the entry once the file is under
+    # DEFAULT_MAX_LINES").
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
