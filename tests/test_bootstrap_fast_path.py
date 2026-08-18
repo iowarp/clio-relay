@@ -1421,7 +1421,13 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SSH receives one quoted command whose Bash payload retains its line boundaries."""
+    """SSH receives the Bash payload on STDIN with its line boundaries intact.
+
+    The payload used to ride in argv as one quoted argument. That is unsafe at
+    this size: some ssh clients silently truncate a long command-line argument
+    (clio-relay#158), so the structure asserted here must reach the remote over
+    stdin instead.
+    """
     identity = bootstrap.bootstrap_relay_identity(
         source_root=tmp_path / "release",
         relay_wheel=None,
@@ -1442,9 +1448,17 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
         jarvis_resource_graph_profile="ares",
     )
     observed: list[list[str]] = []
+    delivered: list[bytes] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1465,10 +1479,11 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    assert observed[0][:2] == ["ssh", "ares"]
-    assert len(observed[0]) == 3
-    ssh_remote_command = " ".join(observed[0][2:])
-    remote_argv = shlex.split(ssh_remote_command, posix=True)
+    # Nothing script-sized may ride in argv, whatever its quoting.
+    assert observed[0] == ["ssh", "ares", "bash", "-s"]
+    assert len(delivered) == 1
+    remote_command = delivered[0].decode("utf-8")
+    remote_argv = shlex.split(remote_command, posix=True)
     exec_index = remote_argv.index("exec")
     assert remote_argv[:4] == ["if", "[", "-n", "${BASH_VERSION-}"]
     assert remote_argv[exec_index : exec_index + 3] == ["exec", "bash", "-c"]

@@ -56,7 +56,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # regression. A justified, minimal ratchet-up.
     "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5782,
     "jarvis-packages/clio_relay/clio_relay/process_containment.py": 2678,
-    "src/clio_relay/bootstrap.py": 8733,
+    # #158: +17 net lines -- the preflight script now travels on STDIN instead
+    # of in argv. Some ssh clients silently truncate a long command-line
+    # argument (the MSYS2 OpenSSH in Git for Windows drops everything past
+    # roughly 8-10 KB; the preflight is ~11 KB), and the remote shell then
+    # reports a syntax error for a script that was cut mid-token, naming
+    # neither the truncation nor the transport. The added lines are the _run
+    # input_bytes passthrough and the comment recording the hazard.
+    "src/clio_relay/bootstrap.py": 8750,
     "src/clio_relay/bootstrap_journal.py": 1497,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering

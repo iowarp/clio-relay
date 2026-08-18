@@ -2699,7 +2699,17 @@ def _bootstrap_preflight_over_ssh(
             f"exec bash -c {shlex.quote(command)}",
         ]
     )
-    result = _run(["ssh", ssh_host, remote_command], timeout_seconds=timeout_seconds)
+    # The preflight script is ~11 KB. It travels on STDIN, never in argv: some
+    # ssh clients silently truncate a long command-line argument (the MSYS2
+    # OpenSSH in Git for Windows drops everything past roughly 8-10 KB), and
+    # the remote shell then fails to parse a script that was cut mid-token --
+    # reporting a syntax error that names neither the truncation nor the
+    # transport (clio-relay#158).
+    result = _run(
+        ["ssh", ssh_host, "bash", "-s"],
+        input_bytes=remote_command.encode("utf-8"),
+        timeout_seconds=timeout_seconds,
+    )
     lines = result.stdout.splitlines()
     payload_lines = [
         line.removeprefix("bootstrap_preflight_json=")
@@ -8703,11 +8713,17 @@ def _run(
     command: list[str],
     *,
     cwd: Path | None = None,
+    input_bytes: bytes | None = None,
     timeout_seconds: float | None = None,
     stdout_maximum_bytes: int = 2 * 1024 * 1024,
     stderr_maximum_bytes: int = 64 * 1024,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one local transport command with finite time and output bounds."""
+    """Run one local transport command with finite time and output bounds.
+
+    ``input_bytes`` carries a payload on stdin, which is how any
+    script-sized content must reach a remote shell: command-line arguments
+    are subject to client length limits that truncate SILENTLY (#158).
+    """
     env = os.environ.copy()
     effective_timeout = 120.0 if timeout_seconds is None else timeout_seconds
     try:
@@ -8715,6 +8731,7 @@ def _run(
             command,
             cwd=cwd,
             environment=env,
+            input_bytes=input_bytes,
             timeout_seconds=effective_timeout,
             stdout_maximum_bytes=stdout_maximum_bytes,
             stderr_maximum_bytes=stderr_maximum_bytes,
