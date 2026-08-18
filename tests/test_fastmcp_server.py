@@ -1381,10 +1381,16 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
             with pytest.raises(MCPError) as failure:
                 await call_tool_task(client, "relay_submit_agent", arguments)
             assert failure.value.code == mcp_types.INVALID_PARAMS
-            assert "different semantics" in str(failure.value)
+            # clio-relay#242 actionability audit: the wire message names the
+            # conflicting task and the query verb instead of a bare "MCP
+            # task conflict." title -- an agent meeting this refusal can
+            # course-correct without needing anything beyond the message.
+            assert conflicting_task_ids
+            assert conflicting_task_ids[-1] in str(failure.value)
+            assert "tasks/get" in str(failure.value)
+            assert "not retryable" in str(failure.value)
             # door_errors.as_mcp_error always carries data={"reason": ..., ...}
             # so the caller can query the failure by its frozen reason.
-            assert conflicting_task_ids
             assert failure.value.data == {
                 "reason": "mcp_task_conflict",
                 "task_id": conflicting_task_ids[-1],

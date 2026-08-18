@@ -25,10 +25,11 @@ from clio_relay.contract_gate import (
     SurfaceContractDegradation,
     SurfaceContractStatus,
     mcp_contract_digest,
+    require_surface_contract,
     run_json_probe,
 )
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled, enforce
-from clio_relay.errors import ConfigurationError, contract_surface_unavailable
+from clio_relay.errors import ConfigurationError
 from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -3544,16 +3545,20 @@ def verify_remote_clio_kit_native_execution_component(
     :class:`clio_relay.errors.ContractSurfaceUnavailableError` naming
     surface/have/need instead of the generic message below, which stays for
     a receipt that never probed the surface at all.
+
+    In dev mode (clio-relay#242 course correction), the below-pin refusal
+    :func:`clio_relay.contract_gate.require_surface_contract` raises is
+    deferred (logged at WARNING, never silent), and this returns the
+    worker's self-reported runtime identity UNVERIFIED instead of falling
+    into the generic "omitted" error next -- dev mode means the surface
+    still serves.
     """
     component = receipt.component_artifacts.get("clio-kit")
     if component is None or component.native_execution is None:
         jarvis_surface = receipt.contract_surfaces.get("jarvis")
         if jarvis_surface is not None and not jarvis_surface.meets_requirement:
-            raise contract_surface_unavailable(
-                surface=jarvis_surface.surface,
-                have=jarvis_surface.shipped_contract_id,
-                need=jarvis_surface.required_contract_id,
-            )
+            require_surface_contract(jarvis_surface)
+            return _remote_component_runtime_identity(info, "clio-kit")
         raise ConfigurationError("worker installation omitted the clio-kit native JARVIS contract")
     if not _native_capability_matches_component(
         component.native_execution,

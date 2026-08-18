@@ -225,7 +225,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # re-classify an already-typed error) followed by a catch-all that
     # routes every other exception through `door_errors.classify`/
     # `as_mcp_error`. A justified, minimal ratchet-up.
-    "src/clio_relay/fastmcp_server.py": 1234,
+    # clio-relay#242 actionability audit: +23 net lines -- the
+    # `mcp_task_conflict` QueueConflictError handler passed no explicit
+    # `message=`, so `door_errors.classify()` fell back to the generic
+    # reason title ("MCP task conflict.") instead of naming the conflicting
+    # task -- discovered because it made the PRE-EXISTING
+    # `test_task_projection_conflict_surfaces_as_typed_mcp_error` fail on
+    # `develop` before this change (its "different semantics" assertion
+    # expected raw exception detail that was never reaching the wire). Now
+    # builds an authored, actionable message naming the conflicting
+    # task_id and the `tasks/get` query verb. A justified, minimal
+    # ratchet-up for a real bug fix, not accretion.
+    "src/clio_relay/fastmcp_server.py": 1257,
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which
@@ -254,7 +265,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # marks QueueConflictError only and keeps OS/runtime text private.
     # #231 R9 fix round 3: +6 lines repoint every HTTP/WebSocket surface
     # adapter call to the cohesive door_error_adapters owner.
-    "src/clio_relay/http_api.py": 3241,
+    # clio-relay#242 actionability audit: +26 net lines -- `mcp_submission_
+    # conflict` (the live case: the ares agent's spack_find hit this reason
+    # with no way to tell retry from refresh-and-resubmit apart) and
+    # `job_submission_conflict` now carry an authored, actionable `message=`
+    # (refresh-discovery guidance; the at-fault idempotency_key plus the
+    # retry-with-a-new-key move) instead of only the raw invariant text. A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/http_api.py": 3267,
     "src/clio_relay/input_staging.py": 814,
     # clio-relay#242: -12 net lines -- `_run_json_probe`/`_mcp_contract_digest`
     # move to the new contract_gate.py owner module (single owner for every
@@ -262,7 +280,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # enumeration), offsetting the new InstallReceipt contract_surfaces/
     # contract_degradations fields and the typed use-time refusal in
     # verify_remote_clio_kit_native_execution_component. A ratchet-down.
-    "src/clio_relay/installation.py": 3706,
+    # clio-relay#242 dev-mode course correction: +5 net lines --
+    # `verify_remote_clio_kit_native_execution_component`'s below-pin jarvis
+    # refusal now delegates to `contract_gate.require_surface_contract`
+    # (dev-mode aware) instead of raising `contract_surface_unavailable`
+    # inline, and returns the worker's unverified runtime identity when dev
+    # mode defers rather than falling into the generic "omitted" error. A
+    # justified, minimal ratchet-up.
+    "src/clio_relay/installation.py": 3711,
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
     # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s
@@ -367,7 +392,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # on the envelope FIRST and raises the refusal's own message/code,
     # instead of the generic "encoding is unsupported" that misdescribes
     # why the artifact is unavailable. A justified, minimal ratchet-up.
-    "src/clio_relay/remote_mcp.py": 5319,
+    # clio-relay#242 dev-mode course correction: +60 net lines -- the
+    # declared-contract catalog-withholding gate (the exact "jarvis withheld
+    # ... declared contract ... failed: ...drifted" failure the ares live
+    # run hit) and the server-artifact-identity dev-mode bypass (previously
+    # silent) now both stay LOUD when dev mode defers them: a `logger`, the
+    # `RemoteMcpCatalogIssue.enforcement` marker field plus its docstring,
+    # and a WARNING log call at each site. No deletion offsets it -- this is
+    # genuinely new structure the owner ruling requires, not a fixable
+    # regression. A justified, minimal ratchet-up.
+    "src/clio_relay/remote_mcp.py": 5377,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     "src/clio_relay/retention.py": 951,

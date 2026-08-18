@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -19,7 +20,7 @@ from click import unstyle
 from jsonschema import Draft4Validator, Draft201909Validator, Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
-from pytest import MonkeyPatch
+from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.cli as relay_cli
@@ -5388,6 +5389,68 @@ def test_spack_configuration_manifest_parser_rejects_unsafe_input(
         parse_manifest(manifest)
 
 
+def _unverified_server_artifact_registration_and_entry() -> tuple[RemoteMcpServerConfig, Any]:
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=["--from", "/opt/wheels/science.whl", "science-mcp"],
+        allow_tools=["*"],
+        profiles=["user"],
+    )
+    unverified_artifact = {**_server_artifact(registration), "verified": False}
+    payload = _discovery_artifact(
+        registration,
+        tools=[_tool("inspect", required=["path"])],
+        server_artifact=unverified_artifact,
+    )
+    entry = _entry_from_payload(registration, payload)
+    return registration, entry
+
+
+def test_unverified_server_artifact_withholds_the_server_in_enforcing_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Enforcing mode (dev mode off, the default): unchanged."""
+    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
+    registration, entry = _unverified_server_artifact_registration_and_entry()
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.tools == {}
+    assert len(catalog.issues) == 1
+    assert catalog.issues[0].enforcement == "enforced"
+    assert "unverified" in catalog.issues[0].reason
+
+
+def test_unverified_server_artifact_dev_mode_defers_loudly_and_serves(
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """clio-relay#242 course correction: this dev-mode bypass predates this
+    change but was SILENT (no recorded issue, no log) -- the no-silent-
+    fallback doctrine requires it be loud too. It must now record a
+    deferred-enforcement issue and log a WARNING, in addition to serving."""
+    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
+    registration, entry = _unverified_server_artifact_registration_and_entry()
+    with caplog.at_level(logging.WARNING, logger=remote_mcp.__name__):
+        catalog = build_virtual_remote_mcp_catalog(
+            ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}),
+            RemoteMcpSchemaCache(entries=[entry]),
+            profile="user",
+            now=NOW,
+        )
+    assert catalog.tools != {}
+    assert len(catalog.issues) == 1
+    assert catalog.issues[0].enforcement == "deferred_dev_mode"
+    assert "unverified" in catalog.issues[0].reason
+    assert any(
+        "deferred_dev_mode" in record.message and "science" in record.message
+        for record in caplog.records
+    )
+
+
 def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
     registration = RemoteMcpServerConfig(
         command="uvx",
@@ -5423,6 +5486,94 @@ def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
     assert catalog.tools == {}
     assert len(catalog.issues) == 1
     assert "declared contract" in catalog.issues[0].reason
+    assert catalog.issues[0].enforcement == "enforced"
+
+
+def _drifted_jarvis_registration_and_entry() -> tuple[RemoteMcpServerConfig, Any]:
+    """Build a jarvis registration whose LIVE server answers with the exact
+    declared tool NAMES but a mutated schema -- a digest-only drift, the
+    live shape of the "declared contract ... failed: ...drifted" failure
+    the ares run hit (clio-relay#242)."""
+    current_id = remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ID
+    artifact_name = remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ARTIFACT_BY_ID[current_id]
+    artifact = cast(
+        dict[str, object],
+        json.loads(
+            (Path(remote_mcp.__file__).with_name("_contracts") / artifact_name).read_text(
+                encoding="utf-8"
+            )
+        ),
+    )
+    tools = cast(list[dict[str, object]], artifact["tools"])
+    drifted_tools = deepcopy(tools)
+    drifted_tools[0]["description"] = "drifted description"
+    tool_names = [cast(str, tool["name"]) for tool in drifted_tools]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=["--from", "/opt/wheels/clio-kit.whl", "clio-kit", "mcp-server", "jarvis"],
+        allow_tools=tool_names,
+        profiles=["user"],
+        contract=cast(Any, current_id),
+    )
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="jarvis",
+        tools=drifted_tools,
+    )
+    return registration, entry
+
+
+def test_declared_jarvis_contract_fails_closed_before_catalog_exposure_in_enforcing_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Enforcing mode (dev mode off, the default) withholds jarvis exactly as
+    before this file learned about dev mode -- byte-identical behavior."""
+    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
+    registration, entry = _drifted_jarvis_registration_and_entry()
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"jarvis": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    assert catalog.tools == {}
+    contract_issues = [issue for issue in catalog.issues if "declared contract" in issue.reason]
+    assert len(contract_issues) == 1
+    assert contract_issues[0].enforcement == "enforced"
+
+
+def test_declared_jarvis_contract_dev_mode_defers_and_serves_the_drifted_tools(
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """clio-relay#242 owner ruling: dev mode is LOUD AND NON-BLOCKING -- an
+    agent must be able to deploy and run WITH jarvis under no security
+    enforcement of sha/version/contract. The exact live ares failure
+    (jarvis withheld from the remote MCP catalog on a declared-contract
+    drift) now serves the drifted tools instead, with the same reason
+    recorded loudly (enforcement="deferred_dev_mode") and logged at WARNING.
+    """
+    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
+    registration, entry = _drifted_jarvis_registration_and_entry()
+    with caplog.at_level(logging.WARNING, logger=remote_mcp.__name__):
+        catalog = build_virtual_remote_mcp_catalog(
+            ClusterRegistry(clusters={"alpha": _cluster("alpha", {"jarvis": registration})}),
+            RemoteMcpSchemaCache(entries=[entry]),
+            profile="user",
+            now=NOW,
+        )
+
+    assert catalog.tools != {}
+    assert any(alias.startswith("remote_jarvis_") for alias in catalog.tools)
+    contract_issues = [issue for issue in catalog.issues if "declared contract" in issue.reason]
+    assert len(contract_issues) == 1
+    assert contract_issues[0].enforcement == "deferred_dev_mode"
+    assert any(
+        "deferred_dev_mode" in record.message and "jarvis" in record.message
+        for record in caplog.records
+    )
 
 
 def _spack_v2_3_registration(**overrides: object) -> RemoteMcpServerConfig:

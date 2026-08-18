@@ -1326,8 +1326,20 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 "job_submission_refused", exc=door_errors.public_message_error(exc)
             ) from exc
         except QueueConflictError as exc:
+            # clio-relay#242 actionability audit (R9 doctrine): name the
+            # exact idempotency_key at fault and the two ways to move
+            # forward, instead of leaving the agent only the raw storage
+            # invariant text.
             raise door_errors.http_problem(
-                "job_submission_conflict", exc=door_errors.public_message_error(exc)
+                "job_submission_conflict",
+                exc=exc,
+                message=(
+                    f"{exc}; not retryable with idempotency_key="
+                    f"{job.idempotency_key!r} -- submit again with a new "
+                    "idempotency_key for a genuinely new request, or if this was "
+                    "meant to replay the same request, its payload changed since "
+                    "the key was first used"
+                ),
             ) from exc
         except StorageAdmissionError as exc:
             raise door_errors.http_problem("storage_admission_refused", exc=exc) from exc
@@ -1709,8 +1721,22 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
                 timeout_seconds=request.timeout_seconds,
             )
         except (ConfigurationError, ValueError) as exc:
+            # clio-relay#242 actionability audit (R9 doctrine): every failure
+            # here is a stale/mismatched cached admission fact (route,
+            # registration, contract, or discovery evidence changed since
+            # the caller last refreshed it) -- name the fix explicitly
+            # rather than leaving the agent only the raw mismatch detail.
+            # Live case: the ares agent's spack_find hit this reason with no
+            # way to tell retry from refresh-and-resubmit apart.
             raise door_errors.http_problem(
-                "mcp_submission_conflict", exc=door_errors.public_message_error(exc)
+                "mcp_submission_conflict",
+                exc=exc,
+                message=(
+                    f"{exc}; not retryable with this cached admission/discovery "
+                    "evidence -- call tools/list for this server again to refresh "
+                    "it (or resubmit without control-query evidence, as a "
+                    "workload call), then retry"
+                ),
             ) from exc
         return submit_owned(
             RelayJob(

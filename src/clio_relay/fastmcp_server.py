@@ -1111,10 +1111,33 @@ class RelayTasksExtension(ServerExtension):
                 if isinstance(outcome.structured_content, dict)
                 else None
             )
+            # clio-relay#242 actionability audit (R9 doctrine): an agent
+            # meeting this refusal must be told what to do next, not just
+            # that a conflict happened -- door_errors.classify() falls back
+            # to the generic reason title ("MCP task conflict.") for an
+            # unmarked QueueConflictError with no explicit message=, which
+            # left the caller nothing to act on. Name the conflicting task
+            # and the tasks/get query verb explicitly.
+            conflict_message = (
+                (
+                    f"a task ({conflicting_task_id}) already handles this exact "
+                    "submission; not retryable with the same input -- poll it via "
+                    f"tasks/get with task_id={conflicting_task_id!r}, or change an "
+                    "input field (e.g. supply a fresh idempotency key) to submit a "
+                    "genuinely new task"
+                )
+                if conflicting_task_id is not None
+                else (
+                    "an existing task already handles this exact submission; not "
+                    "retryable with the same input -- change an input field (e.g. "
+                    "supply a fresh idempotency key) to submit a genuinely new task"
+                )
+            )
             raise door_error_adapters.as_mcp_error(
                 door_errors.classify(
                     exc,
                     reason="mcp_task_conflict",
+                    message=conflict_message,
                     data={"task_id": conflicting_task_id},
                 )
             ) from exc

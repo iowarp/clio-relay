@@ -644,6 +644,76 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
 
 
+def test_mcp_submission_conflict_names_the_refresh_move(tmp_path: Path) -> None:
+    """clio-relay#242 actionability audit (R9 doctrine).
+
+    Live case: the ares agent's spack_find hit a non-retryable
+    ``mcp_submission_conflict`` with no way to tell retry from
+    refresh-and-resubmit apart. A ``registered semantic contract`` submitted
+    with no configured cluster route is the simplest way to reach this
+    reason -- the wire message must name the concrete fix (call tools/list
+    to refresh), not just echo the raw mismatch.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "expected_registered_contract": "clio-kit-spack-user-v2",
+            "tool": "spack_find",
+            "idempotency_key": "mcp-submission-conflict",
+        },
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == "mcp_submission_conflict"
+    assert "tools/list" in body["detail"]
+    assert "not retryable" in body["detail"]
+
+
+def test_job_submission_conflict_names_the_idempotency_key_move(tmp_path: Path) -> None:
+    """clio-relay#242 actionability audit (R9 doctrine): a reused
+    idempotency_key with a different payload must tell the agent the exact
+    key at fault and that a fresh key is the way to submit a new request."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+    identity_headers = {
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+    first = client.post(
+        "/jobs/jarvis",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "pipeline_yaml": "name: first\npkgs: []\n",
+            "idempotency_key": "reused-key",
+        },
+    )
+    assert first.status_code == 200
+
+    response = client.post(
+        "/jobs/jarvis",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "pipeline_yaml": "name: different\npkgs: []\n",
+            "idempotency_key": "reused-key",
+        },
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == "job_submission_conflict"
+    assert "reused-key" in body["detail"]
+    assert "not retryable" in body["detail"]
+    assert "new idempotency_key" in body["detail"]
+
+
 def test_http_remote_agent_submission_requires_typed_owner_session_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

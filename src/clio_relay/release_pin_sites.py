@@ -249,7 +249,10 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242: mechanical relocation only -- new contract_gate.py
         # imports pushed this unchanged constant from line 54 to line 60.
         # The requirement itself (v3.7) is untouched.
-        line=60,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new require_surface_contract import pushed this
+        # unchanged constant from line 60 to line 61.
+        line=61,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -319,7 +322,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _FN,
         "CLIO_KIT_JARVIS_USER_CONTRACT_ARTIFACT_BY_ID current-contract entry",
-        line=129,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` + module `logger` pushed this
+        # unchanged entry from line 129 to line 132.
+        line=132,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -415,7 +421,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "contract-id/filename tuple entry",
-        line=135,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` pushed this unchanged tuple from
+        # line 135 to line 136.
+        line=136,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -425,7 +434,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "vendored contract file path reference",
-        line=1406,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` pushed this unchanged reference
+        # from line 1406 to line 1407.
+        line=1407,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -435,7 +447,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "contract= keyword argument",
-        line=1425,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` pushed this unchanged argument
+        # from line 1425 to line 1426.
+        line=1426,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -594,7 +609,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID current-contract entry",
-        line=106,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` + module `logger` pushed this
+        # unchanged digest from line 106 to line 109.
+        line=109,
         pattern=_HEX,
         value_group="jarvis_contract_sha256",
     ),
@@ -636,7 +654,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "CLIO_KIT_JARVIS_USER_WIRE_SHA256_BY_ID current-contract entry",
-        line=114,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` + module `logger` pushed this
+        # unchanged digest from line 114 to line 117.
+        line=117,
         pattern=_HEX,
         value_group="jarvis_contract_wire_sha256",
     ),
@@ -656,7 +677,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "CLIO_KIT_JARVIS_USER_ARTIFACT_SHA256_BY_ID current-contract entry",
-        line=122,
+        # clio-relay#242 dev-mode course correction: mechanical relocation
+        # only -- the new `import logging` + module `logger` pushed this
+        # unchanged digest from line 122 to line 125.
+        line=125,
         pattern=_HEX,
         value_group="jarvis_contract_artifact_sha256",
     ),
