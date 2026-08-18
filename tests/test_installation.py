@@ -19,8 +19,9 @@ from typing import cast
 import pytest
 
 import clio_relay.installation as installation_module
+from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
 from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
 from clio_relay.installation import (
     CLIO_KIT_JARVIS_CONTRACT_ID,
     INSTALL_RECEIPT_PATH_ENV,
@@ -844,6 +845,70 @@ def test_install_receipt_binds_running_package_to_wheel_bytes(tmp_path: Path) ->
     assert loaded.component_artifacts["clio-kit"].requested_source == "pypi"
     assert info["receipt_matches_install"] is True
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_install_receipt_defaults_contract_surfaces_empty_when_omitted(tmp_path: Path) -> None:
+    """Every existing caller of write_install_receipt keeps working unchanged.
+
+    (c) of iowarp/clio-relay#242's acceptance: a receipt where every surface
+    meets its requirement -- including "no surface was probed at all" --
+    carries no degradation record.
+    """
+    wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"candidate-wheel")
+    receipt = write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=tmp_path / "install-receipt.json",
+    )
+    assert receipt.contract_surfaces == {}
+    assert receipt.contract_degradations == []
+
+
+def test_install_receipt_round_trips_surface_status_and_degradation(tmp_path: Path) -> None:
+    """(a) of iowarp/clio-relay#242's acceptance: a below-pin surface is
+    recorded on the receipt, not just implied by an absent native_execution."""
+    wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"candidate-wheel")
+    jarvis_status = SurfaceContractStatus(
+        surface="jarvis",
+        shipped_contract_id="clio-kit-jarvis-user-v3.6",
+        shipped_contract_sha256="b" * 64,
+        required_contract_id=CLIO_KIT_JARVIS_CONTRACT_ID,
+        meets_requirement=False,
+    )
+    spack_status = SurfaceContractStatus(
+        surface="spack",
+        shipped_contract_id="clio-kit-spack-user-v2.1",
+        shipped_contract_sha256="c" * 64,
+        required_contract_id="clio-kit-spack-user-v2.1",
+        meets_requirement=True,
+    )
+    degradation = SurfaceContractDegradation(
+        surface="jarvis",
+        have="clio-kit-jarvis-user-v3.6",
+        need=CLIO_KIT_JARVIS_CONTRACT_ID,
+        tracking_issue="iowarp/clio-relay#242",
+        detected_at=datetime.now(UTC),
+    )
+    receipt_path = tmp_path / "install-receipt.json"
+    receipt = write_install_receipt(
+        install_spec=str(wheel),
+        artifact_path=wheel,
+        path=receipt_path,
+        contract_surfaces={"jarvis": jarvis_status, "spack": spack_status},
+        contract_degradations=[degradation],
+    )
+    assert receipt.contract_surfaces["jarvis"].meets_requirement is False
+    assert receipt.contract_surfaces["spack"].meets_requirement is True
+    assert len(receipt.contract_degradations) == 1
+    assert receipt.contract_degradations[0].reason == "contract_surface_below_pin"
+
+    loaded = load_install_receipt(receipt_path)
+    assert loaded == receipt
+    assert loaded.contract_surfaces["jarvis"].shipped_contract_id == "clio-kit-jarvis-user-v3.6"
+    assert loaded.contract_degradations[0].have == "clio-kit-jarvis-user-v3.6"
+    assert loaded.contract_degradations[0].need == CLIO_KIT_JARVIS_CONTRACT_ID
 
 
 def test_session_api_receipt_skips_unrelated_component_runtime_probes(
@@ -1683,6 +1748,64 @@ def test_remote_clio_kit_component_requires_receipt_bound_native_contract(
         verify_remote_clio_kit_native_execution_component(info, receipt)
 
 
+def test_remote_clio_kit_component_refuses_typed_for_recorded_jarvis_degradation(
+    tmp_path: Path,
+) -> None:
+    """(a) of iowarp/clio-relay#242's acceptance: jarvis submission refuses
+    typed with have/need once bootstrap already recorded the surface as
+    below-pin -- never the generic "omitted the clio-kit native JARVIS
+    contract" message, which stays reserved for a receipt that never probed
+    the surface at all."""
+    jarvis_status = SurfaceContractStatus(
+        surface="jarvis",
+        shipped_contract_id="clio-kit-jarvis-user-v3.6",
+        shipped_contract_sha256="b" * 64,
+        required_contract_id=CLIO_KIT_JARVIS_CONTRACT_ID,
+        meets_requirement=False,
+    )
+    receipt = write_install_receipt(
+        install_spec="checkout",
+        path=tmp_path / "receipt.json",
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                distribution_version="2.3.1",
+                install_spec="clio-kit==2.3.1",
+                requested_source="pypi",
+                artifact_sha256="c" * 64,
+                runtime_artifact_path="/home/test/clio_kit.whl",
+                runtime_command=["clio-kit", "mcp-server", "jarvis"],
+                native_execution=None,
+            )
+        },
+        contract_surfaces={"jarvis": jarvis_status},
+    )
+    info: dict[str, object] = {"installation": {"component_runtime": {}}}
+
+    with pytest.raises(ContractSurfaceUnavailableError) as excinfo:
+        verify_remote_clio_kit_native_execution_component(info, receipt)
+    error = excinfo.value
+    assert error.surface == "jarvis"
+    assert error.have == "clio-kit-jarvis-user-v3.6"
+    assert error.need == CLIO_KIT_JARVIS_CONTRACT_ID
+    assert error.reason == "contract_surface_unavailable"
+
+
+def test_remote_clio_kit_component_generic_error_when_never_probed(tmp_path: Path) -> None:
+    """A receipt that never probed the jarvis surface at all (pre-#242
+    receipts, or a component-artifact omitted entirely) keeps the original,
+    generic refusal -- the typed refusal is reserved for a KNOWN, RECORDED
+    degradation."""
+    receipt = write_install_receipt(
+        install_spec="checkout",
+        path=tmp_path / "receipt.json",
+    )
+    info: dict[str, object] = {"installation": {"component_runtime": {}}}
+
+    with pytest.raises(ConfigurationError, match="omitted the clio-kit native JARVIS contract"):
+        verify_remote_clio_kit_native_execution_component(info, receipt)
+
+
 def test_clio_kit_probe_requires_unified_progress_and_artifact_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1694,7 +1817,7 @@ def test_clio_kit_probe_requires_unified_progress_and_artifact_query(
 
     monkeypatch.setattr(
         installation_module,
-        "_run_json_probe",
+        "run_json_probe",
         probe,
     )
 
@@ -1722,7 +1845,7 @@ def test_clio_kit_probe_rejects_execution_query_without_artifact_selector(
 
     monkeypatch.setattr(
         installation_module,
-        "_run_json_probe",
+        "run_json_probe",
         probe,
     )
 

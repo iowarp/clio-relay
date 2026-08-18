@@ -67,7 +67,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # TOKEN instead of the whole `uv --version` line. uv prints a platform
     # suffix, so a byte-identical pinned uv (its sha256 already verified) was
     # rejected over cosmetics.
-    "src/clio_relay/bootstrap.py": 8754,
     # #158: +37 net lines -- the descriptor-pinned directory walk resolves the
     # SITE prefix (the operator's home) before pinning, so a cluster whose
     # /home is a symlink onto shared storage (ares: /home -> /mnt/common) can
@@ -76,7 +75,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # between two journal actions is still refused rather than laundered by
     # realpath. Two small helpers plus the comment recording why the guard is
     # scoped exactly there.
-    "src/clio_relay/bootstrap_journal.py": 1534,
+    # clio-relay#242: +104 net lines -- the two receipt-minting heredocs
+    # (relay-only reconcile + fresh install) each gain a per-surface,
+    # INTEGRITY-only jarvis contract probe (`probe_surface_contract_identity`)
+    # that runs before the strict, single-id probe and records the result on
+    # the receipt's new `contract_surfaces`/`contract_degradations` fields
+    # instead of letting an unconditional strict ask kill the whole cluster
+    # bootstrap; the relay-only reconcile path's own post-write verification
+    # heredoc gains the matching tolerance for a RECORDED, below-pin jarvis
+    # surface. No deletion offsets it -- this is the genuinely new
+    # capability-by-negotiation logic the doctrine comment on #242 describes,
+    # not a fixable regression. A justified, minimal ratchet-up.
+    "src/clio_relay/bootstrap.py": 8858,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
@@ -235,7 +245,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # adapter call to the cohesive door_error_adapters owner.
     "src/clio_relay/http_api.py": 3241,
     "src/clio_relay/input_staging.py": 814,
-    "src/clio_relay/installation.py": 3718,
+    # clio-relay#242: -12 net lines -- `_run_json_probe`/`_mcp_contract_digest`
+    # move to the new contract_gate.py owner module (single owner for every
+    # contract-identity probe/digest, reused by the per-surface bootstrap
+    # enumeration), offsetting the new InstallReceipt contract_surfaces/
+    # contract_degradations fields and the typed use-time refusal in
+    # verify_remote_clio_kit_native_execution_component. A ratchet-down.
+    "src/clio_relay/installation.py": 3706,
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
     # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s

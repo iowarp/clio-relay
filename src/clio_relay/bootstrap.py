@@ -5011,11 +5011,14 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
     "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_GENERATION_RECEIPT__'
 import json
 import os
+import sys
 from importlib.metadata import distribution
 from pathlib import Path
 
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState
+from clio_relay.contract_gate import evaluate_degradation, probe_surface_contract_identity
 from clio_relay.installation import (
+    CLIO_KIT_MCP_CONTRACT_SCHEMA,
     ComponentArtifactIdentity,
     load_install_receipt,
     probe_clio_kit_native_execution_contract,
@@ -5025,6 +5028,11 @@ from clio_relay.installation import (
 )
 from clio_relay.jarvis_mcp import jarvis_mcp_server_artifact_verified
 from clio_relay.mcp_call.runner import mcp_server_artifact_identity
+from clio_relay.remote_mcp import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+)
 from clio_relay.validation_report import sha256_file
 
 desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
@@ -5078,6 +5086,8 @@ component_artifacts = {{
     **old.component_artifacts,
     "clio-relay": relay_component,
 }}
+contract_surfaces = dict(old.contract_surfaces)
+contract_degradations = list(old.contract_degradations)
 if os.environ["BOOTSTRAP_PLAN_MODE"] == "component-upgrade":
     clio_kit_wheel = Path(os.environ["JARVIS_MCP_ARTIFACT_PATH"]).resolve(strict=True)
     clio_kit_sha256 = os.environ["JARVIS_MCP_ARTIFACT_SHA256"]
@@ -5086,7 +5096,40 @@ if os.environ["BOOTSTRAP_PLAN_MODE"] == "component-upgrade":
     clio_kit_executable = os.environ["CLIO_KIT_EXECUTABLE"]
     clio_kit_provider = os.environ["CLIO_KIT_PROVIDER_PYTHON"]
     clio_kit_command = [clio_kit_executable, "mcp-server", "jarvis"]
-    clio_kit_native = probe_clio_kit_native_execution_contract(clio_kit_command)
+    # clio-relay#242: bootstrap-time enumeration is INTEGRITY-only and
+    # per-surface -- it never fails the whole cluster bootstrap just because
+    # jarvis shipped behind this relay's pin. probe_surface_contract_identity
+    # negotiates down to whichever known contract id clio-kit actually
+    # answers to and records it on the receipt regardless of outcome; the
+    # strict, deep-shape probe below only runs (and can only succeed) when
+    # the shipped id already meets the current pin.
+    jarvis_surface = probe_surface_contract_identity(
+        [clio_kit_executable],
+        surface="jarvis",
+        candidate_contract_ids=(
+            CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+            CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+        ),
+        contract_schema_version=CLIO_KIT_MCP_CONTRACT_SCHEMA,
+        sha256_by_id=CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
+    )
+    contract_surfaces["jarvis"] = jarvis_surface
+    clio_kit_native = (
+        probe_clio_kit_native_execution_contract(clio_kit_command)
+        if jarvis_surface.meets_requirement
+        else None
+    )
+    jarvis_degradation = evaluate_degradation(
+        jarvis_surface, tracking_issue="iowarp/clio-relay#242"
+    )
+    if jarvis_degradation is not None:
+        contract_degradations.append(jarvis_degradation)
+        print(
+            "WARNING: contract_surface_degraded surface=jarvis have="
+            + jarvis_degradation.have + " need=" + jarvis_degradation.need
+            + " issue=" + jarvis_degradation.tracking_issue,
+            file=sys.stderr,
+        )
     clio_kit_persistent = probe_persistent_uv_tool_identity(
         uv_executable=str(Path.home() / ".local/bin/uv"),
         tool_executable=clio_kit_executable,
@@ -5153,6 +5196,8 @@ write_install_receipt(
     path=generation / "install-receipt.json",
     components=components,
     component_artifacts=component_artifacts,
+    contract_surfaces=contract_surfaces,
+    contract_degradations=contract_degradations,
     deployment_fingerprint=desired.fingerprint,
     deployment_manifest=desired.model_dump(mode="json"),
     generation=desired.fingerprint,
@@ -5164,11 +5209,31 @@ __CLIO_RELAY_GENERATION_RECEIPT__
     "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_VERIFY_GENERATION__'
 import json
 import os
+import sys
 from pathlib import Path
 
 info = json.loads(Path(os.environ["BOOTSTRAP_GENERATION"] + "/installation-info.json").read_text())
 runtime = info.get("component_runtime", {{}})
 jarvis_runtime = runtime.get("jarvis-cd", {{}})
+# clio-relay#242: a RECORDED, below-pin jarvis surface is not a runtime
+# verification failure -- bootstrap already proved and logged the gap via
+# probe_surface_contract_identity when the receipt was minted. Only skip the
+# strict native-execution self-consistency check for that known, typed case;
+# every other reason this could be unverified still fails the generation.
+receipt_payload = info.get("receipt", {{}})
+jarvis_surface = receipt_payload.get("contract_surfaces", {{}}).get("jarvis")
+jarvis_surface_degraded = (
+    isinstance(jarvis_surface, dict) and jarvis_surface.get("meets_requirement") is False
+)
+if jarvis_surface_degraded:
+    print(
+        "WARNING: contract_surface_degraded surface=jarvis have="
+        + str(jarvis_surface.get("shipped_contract_id"))
+        + " need=" + str(jarvis_surface.get("required_contract_id"))
+        + " -- jarvis submission refuses at use-time until clio-kit ships the pin "
+        "(iowarp/clio-relay#242)",
+        file=sys.stderr,
+    )
 checks = {{
     "receipt_matches_install": info.get("receipt_matches_install") is True,
     "clio-relay.persistent_tool_verified": (
@@ -5181,7 +5246,8 @@ checks = {{
         runtime.get("clio-kit", {{}}).get("persistent_tool_verified") is True
     ),
     "clio-kit.native_execution_capability_verified": (
-        runtime.get("clio-kit", {{}}).get("native_execution_capability_verified") is True
+        jarvis_surface_degraded
+        or runtime.get("clio-kit", {{}}).get("native_execution_capability_verified") is True
     ),
     "jarvis-cd.verified": jarvis_runtime.get("verified") is True,
 }}
@@ -7596,7 +7662,9 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState
+from clio_relay.contract_gate import evaluate_degradation, probe_surface_contract_identity
 from clio_relay.installation import (
+    CLIO_KIT_MCP_CONTRACT_SCHEMA,
     ComponentArtifactIdentity,
     probe_persistent_uv_tool_identity,
     probe_clio_kit_native_execution_contract,
@@ -7604,6 +7672,11 @@ from clio_relay.installation import (
     write_install_receipt,
 )
 from clio_relay.mcp_call.runner import mcp_server_artifact_identity
+from clio_relay.remote_mcp import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+)
 from clio_relay.validation_report import sha256_file
 
 artifact_value = os.environ["CLIO_RELAY_BOOTSTRAP_ARTIFACT"]
@@ -7645,7 +7718,36 @@ runtime_command = [
 ]
 if not runtime_command:
     raise SystemExit("clio-kit native JARVIS contract requires a persistent uv tool")
-clio_kit_native_execution = probe_clio_kit_native_execution_contract(runtime_command)
+# clio-relay#242: bootstrap-time enumeration is INTEGRITY-only and
+# per-surface -- see the identical comment in the component-upgrade
+# reconcile heredoc above. The strict, deep-shape probe only runs (and can
+# only succeed) once the shipped id already meets the current pin.
+jarvis_surface = probe_surface_contract_identity(
+    [runtime_command[0]],
+    surface="jarvis",
+    candidate_contract_ids=(
+        CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+        CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+    ),
+    contract_schema_version=CLIO_KIT_MCP_CONTRACT_SCHEMA,
+    sha256_by_id=CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
+)
+contract_surfaces = {{"jarvis": jarvis_surface}}
+contract_degradations = []
+clio_kit_native_execution = (
+    probe_clio_kit_native_execution_contract(runtime_command)
+    if jarvis_surface.meets_requirement
+    else None
+)
+jarvis_degradation = evaluate_degradation(jarvis_surface, tracking_issue="iowarp/clio-relay#242")
+if jarvis_degradation is not None:
+    contract_degradations.append(jarvis_degradation)
+    print(
+        "WARNING: contract_surface_degraded surface=jarvis have="
+        + jarvis_degradation.have + " need=" + jarvis_degradation.need
+        + " issue=" + jarvis_degradation.tracking_issue,
+        file=sys.stderr,
+    )
 persistent_clio_kit_tool = probe_persistent_uv_tool_identity(
     uv_executable=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_UV_EXECUTABLE"],
     tool_executable=os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"],
@@ -7784,6 +7886,8 @@ receipt = write_install_receipt(
             native_execution=jarvis_execution_native_execution,
         ),
     }},
+    contract_surfaces=contract_surfaces,
+    contract_degradations=contract_degradations,
     deployment_fingerprint=desired.fingerprint,
     deployment_manifest=desired.model_dump(mode="json"),
     generation=desired.fingerprint,

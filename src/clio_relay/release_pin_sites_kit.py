@@ -64,7 +64,12 @@ def kit_pin_sites(
             placeholder,
             "JARVIS_MCP_VERSION script placeholder (f-string interpolation of "
             "CLIO_KIT_JARVIS_MCP_VERSION -- never a literal copy)",
-            line=7365,
+            # clio-relay#242 + #158 merge: mechanical relocation only -- the
+            # per-surface jarvis contract probe AND the stdin preflight
+            # transport both grew render_linux_user_bootstrap_script,
+            # pushing this unchanged placeholder to line 7431 (measured
+            # in the merged tree).
+            line=7431,
             placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
             mutable=False,
         ),
