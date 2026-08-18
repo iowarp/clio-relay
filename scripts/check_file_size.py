@@ -191,7 +191,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # _job_record_path/_write_transition_intent_unlocked/
     # _recover_pending_transitions_unlocked stay facade-resident (still
     # un-extracted, self-called as before). Net: 8430 -> 8009.
-    "src/clio_relay/core_queue.py": 4848,
+    # #231 CQ16: gateways, browser attachments, gateway indexes, and monitor
+    # rules move to queue_gateways.py / queue_browser_attachments.py /
+    # queue_gateway_indexes.py / queue_monitor_rules.py. Net: 4848 -> 3606.
+    "src/clio_relay/core_queue.py": 3606,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
@@ -346,7 +349,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
     # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
-    "src/clio_relay/service_runtime.py": 9391,
+    # #231 CQ16 cross-file fix: +4 net lines -- _revoke_browser_attachment's
+    # except clause now discriminates BrowserAttachmentIdentityConflictError
+    # by type instead of a "changed before revocation" substring match on
+    # QueueConflictError (the banned prose-match pattern); the wider import
+    # block costs more lines than the shorter except body saves. A justified,
+    # minimal ratchet-up confined to the except clause and its import.
+    "src/clio_relay/service_runtime.py": 9395,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new

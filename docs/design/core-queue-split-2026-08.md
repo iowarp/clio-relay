@@ -758,3 +758,185 @@ cancel_attempt`/`_confirmation`, `record_scheduler_cancel_attempt`/
 `_observation`, `renew_lease`) are all unchanged public-signature calls,
 confirmed via `tests/test_endpoint.py`'s existing lease/scheduler-cancel
 coverage.
+
+## 11. CQ16 landing — gateways, browser attachments, gateway indexes, monitor rules
+
+CQ16 (predecessors CQ3-CQ5, CQ7, CQ9, CQ10, CQ12, CQ14, all landed) lands as
+four owners: canonical gateway-session records and their public lifecycle
+(`queue_gateways.py`), the sole browser-attachment ownership-intent CAS
+lifecycle (`queue_browser_attachments.py`), gateway backlink/reverse-index
+convergence (`queue_gateway_indexes.py`), and durable monitor rules
+(`queue_monitor_rules.py`).
+
+### 11.1 owner ranks and real line counts
+
+| Rank | Owner | Real | Cap | Note |
+|---:|---|---:|---:|---|
+| 20 | `queue_gateway_indexes.py` | 524 | 540 | re-ranked ahead of its callers, §11.2 |
+| 34 | `queue_gateways.py` | 383 | 400 | |
+| 35 | `queue_browser_attachments.py` | 407 | 420 | |
+| 36 | `queue_monitor_rules.py` | 212 | 230 | |
+
+`core_queue.py` fell from 4,848 to 3,606 physical lines (net removal 1,242;
+the ratchet in `scripts/check_file_size.py` is lowered to 3606 in the same
+change). Every landed cap is below the 800-line hard gate; the facade public
+method count stays exactly 128
+(`test_facade_public_method_set_stays_at_the_128_method_base`), since every
+moved method keeps its existing name and signature.
+
+### 11.2 reverse-rank resolution: `queue_gateway_indexes` re-ranked, not re-called
+
+The design's section-1 per-line inventory placed the gateway/browser/monitor
+block after jobs, input-ingest, progress, and tasks in the pinned `d6253d7`
+file -- physical position, not call-graph rank. Reconciling that against the
+real dependency graph (ledger §9.3/§10.2 precedent: resolve a reverse-rank
+self-call by hoisting the collaborator earlier, never by re-ranking every
+caller) found one genuine class of reverse edge and its resolution:
+
+- **`queue_jobs`/`queue_tasks`/`queue_artifacts`/`queue_input_ingest`
+  self-call into `queue_gateway_indexes`.** Four already-landed owners call
+  inherited `QueueGatewayIndexesMixin` methods directly:
+  `queue_jobs._sync_job_derived_unlocked` and
+  `queue_tasks._sync_task_retention_indexes_unlocked`'s sibling call both
+  self-call `_sync_scheduler_source_unlocked`; `queue_artifacts.create_artifact`
+  and `queue_input_ingest`'s equivalent both self-call
+  `_link_gateways_for_artifact_unlocked`. All four call sites already carried
+  `TYPE_CHECKING` stubs for these two methods before this slice landed (added
+  proactively by their own authors), confirming the edge was anticipated.
+  `queue_gateway_indexes` itself has no forward need for any of
+  CQ7/CQ9/CQ10/CQ12/CQ14 -- its own real dependencies are just
+  `queue_context`/`queue_layout`/`queue_store_lock`/`queue_store_read`/
+  `queue_store_write` (ranks 0, 2-5). The design doc's CQ16 predecessor list
+  describes what `queue_gateways` (owner-session intake) and
+  `queue_monitor_rules` (`append_event`, `get_job`) need, not what
+  `queue_gateway_indexes` needs. Resolution: `queue_gateway_indexes` lands at
+  rank 20, immediately before its earliest caller (`queue_artifacts`, itself
+  shifted to 21); every subsequent owner through rank 33 shifts by exactly
+  one to keep the dense 0..N-1 permutation
+  (`test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest`).
+  `queue_gateways`(34), `queue_browser_attachments`(35), and
+  `queue_monitor_rules`(36) land last, after every one of their own real
+  collaborators. This produces zero reverse-rank edges -- no typed deviation
+  was needed, unlike CQ15's genuine two-owner cycle.
+
+### 11.3 two module-level collaborator-attribute seams (mandated, not discovered)
+
+The design's own CQ16 row prescribes the failing-first shape: "Patch each
+caller owner's collaborator attribute for browser CAS and backlink
+synchronization." Two bound methods therefore keep module-level twins,
+matching the `queue_jobs.write_job`/`queue_lease_indexes.
+sync_operational_indexes` precedent:
+
+- **Browser CAS**: `queue_browser_attachments._write_browser_attachment_
+  transition_unlocked` resolves its canonical write through
+  `queue_gateways.write_gateway_session(cast(queue_gateways.
+  QueueGatewaysMixin, self), updated)` -- a module-qualified lookup a test
+  can patch via `monkeypatch.setattr(queue_browser_attachments,
+  "queue_gateways", isolated_namespace)`.
+- **Backlink synchronization**: `queue_gateways.write_gateway_session`
+  (the module function; `QueueGatewaysMixin._write_gateway_session_unlocked`
+  is its thin, name-preserving wrapper) resolves index convergence through
+  `queue_gateway_indexes.sync_gateway_session_derived(cast(...), session.
+  session_id)` -- patched via `monkeypatch.setattr(queue_gateways,
+  "queue_gateway_indexes", isolated_namespace)`.
+  `QueueGatewayIndexesMixin._sync_gateway_session_derived_unlocked` stays a
+  real, directly patchable instance method because facade-resident
+  `_reconcile_transition_intents_unlocked`'s `gateway_sync` transition-intent
+  replay branch still self-calls it by that exact name.
+
+Both seams were verified failing-first by hand: temporarily reverting each
+call site to a plain `self.<method>` self-call makes its paired sabotage
+test fail with "DID NOT RAISE" (the isolated-namespace patch no longer
+intercepts a module-qualified lookup that no longer exists); restoring the
+module-qualified call turns both green again.
+
+### 11.4 typed browser-attachment identity conflict (cross-file, `service_runtime.py`)
+
+`ServiceRuntimeSupervisor._revoke_browser_attachment`
+(`service_runtime.py`) caught `QueueConflictError` and inspected
+`str(exc)` for the substring `"changed before revocation"` to decide
+whether to remap it to a public `ConfigurationError` -- the banned
+prose-match pattern (both of `queue_browser_attachments`'s revoke-lifecycle
+identity-mismatch raises, `begin_gateway_browser_attachment_revoke`'s
+`"...changed before revocation: ..."` and
+`finish_gateway_browser_attachment_revoke`'s `"...changed before revocation
+completed: ..."`, satisfy that substring, so both were silently in scope of
+the check even though only the `begin_...` call site sits inside the
+guarded `try`).
+
+Fix, mirroring the `TaskInputParkConflictError` precedent
+(`errors.py`): a new `BrowserAttachmentIdentityConflictError(
+QueueConflictError)` subtype. Both raise sites in
+`queue_browser_attachments.py` now raise the typed subtype with their exact,
+unchanged relay-authored messages. `service_runtime.py`'s except clause
+now reads:
+
+```python
+except BrowserAttachmentIdentityConflictError as exc:
+    raise ConfigurationError(
+        "browser attachment id does not match the gateway record"
+    ) from exc
+```
+
+with no trailing bare `except QueueConflictError: raise` -- removing the
+substring branch already lets every other `QueueConflictError` (missing
+attachment, invalid record, canonical identity mismatch, ...) propagate
+unmapped, exactly as the old `else: raise` did. This is the sanctioned
+cross-file edit named in the slice's handoff: minimal (the except clause and
+its import only), `service_runtime.py` stays outside the queue family, and
+its file-size ratchet moves by a justified +4 net lines (`scripts/
+check_file_size.py`: 9391 -> 9395 -- the shorter except body is outweighed
+by the wider multi-line import block) rather than net-zero.
+
+Failing-first proof (`tests/test_service_runtime.py::
+test_browser_detach_maps_only_the_typed_identity_conflict_not_any_
+queue_conflict_error`): a decoy plain `QueueConflictError` carrying the same
+substring for an unrelated reason is raised from a patched
+`queue.begin_gateway_browser_attachment_revoke`. Verified red against the
+old substring-matching implementation (misclassified as
+`ConfigurationError`) and green against the typed catch (propagates
+unchanged as `QueueConflictError`), confirmed by toggling the fix and
+re-running the single test both ways.
+
+### 11.5 patch-seam audit corrections (real lookup site moved)
+
+- `tests/test_core_index_safety.py::
+  test_gateway_reverse_indexes_refuse_cardinality_overflow` patched
+  `core_queue_module.MAX_GATEWAY_INDEX_RECORDS`, a compatibility re-export
+  that no post-split reader consults. `queue_gateway_indexes.py` reads the
+  constant module-qualified from `queue_layout` at every use site (never a
+  locally rebound copy, matching the CQ15 `MAX_LIVE_LEASE_RECORDS`
+  precedent), so the patch is moved to `queue_layout.
+  MAX_GATEWAY_INDEX_RECORDS` -- confirmed dead beforehand (the facade still
+  re-exports the name, `hasattr` succeeds, but rebinding it has no effect on
+  `queue_gateway_indexes`'s reads) and confirmed live after.
+- The one residual facade-resident bare-function call, `_write_transition_
+  intent_unlocked`'s `_stable_ref_token(kind, identity)`, is rewired to
+  `queue_gateway_indexes._stable_ref_token(kind, identity)` -- the design's
+  own residual-caller pattern (ledger §10.3).
+- `_safe_global_record_id` (a one-line `queue_layout.safe_global_record_id`
+  wrapper, exclusively called from `prepare_gateway_teardown_intent`) is
+  deleted rather than moved; `queue_gateways.py` calls `queue_layout.
+  safe_global_record_id(operation_id)` directly, matching
+  `queue_order_index.py`'s own existing usage of the same function.
+
+### 11.6 gates
+
+`ruff check`/`ruff format --check`, `pyright` (0 errors on all four new
+files + `core_queue.py` + `errors.py` + every touched test file; the one
+`service_runtime.py` finding, an unrelated pre-existing `reportUnnecessaryCast`
+at its `FileLock` cast, is confirmed present before this slice via
+`git stash`), `scripts/check_file_size.py` (ratchet lowered 4848 -> 3606 for
+`core_queue.py`, justified +4 for `service_runtime.py`; all four new owners
+within their stated caps, none exceeding the 800-line hard gate), and
+`scripts/check_release_identity.py` (78/80 sites agree) all pass.
+`tests/test_queue.py`, `tests/test_core_queue_split_architecture.py` (41 -> 43
+tests, 2 new: the browser-CAS and backlink-synchronization
+collaborator-attribute sabotage tests), `tests/test_release_pins.py`,
+`tests/test_browser_attachment_queue.py`, `tests/test_service_runtime.py`
+(adds the typed-conflict failing-first test), `tests/test_core_index_safety.py`,
+and the gateway/monitor-focused suites (`tests/test_gateway_public_projection.py`,
+`tests/test_core_global_pagination.py`, `tests/test_core_retention.py`,
+`tests/test_operational_indexes.py`) all pass green in one combined run --
+436 passed in 439.32s, zero failures beyond the slice's own named A/B-known
+cross-branch and #239 exemption families (none of which fired here).

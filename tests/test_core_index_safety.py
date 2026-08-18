@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_layout
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
@@ -71,7 +71,7 @@ def test_gateway_reverse_indexes_refuse_cardinality_overflow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(core_queue_module, "MAX_GATEWAY_INDEX_RECORDS", 2)
+    monkeypatch.setattr(queue_layout, "MAX_GATEWAY_INDEX_RECORDS", 2)
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(_job("gateway-index-bound"))
     for index in range(3):

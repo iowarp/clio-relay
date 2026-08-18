@@ -19,8 +19,11 @@ from pytest import MonkeyPatch
 from clio_relay import core_queue as core_queue_module
 from clio_relay import (
     queue_artifact_lineage,
+    queue_browser_attachments,
     queue_endpoints,
     queue_events,
+    queue_gateway_indexes,
+    queue_gateways,
     queue_idempotency,
     queue_index_state,
     queue_input_ingest,
@@ -42,6 +45,7 @@ from clio_relay import (
     queue_store_write,
     queue_tasks,
 )
+from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
@@ -50,6 +54,8 @@ from clio_relay.models import (
     ArtifactUse,
     EndpointRegistration,
     EndpointRole,
+    GatewaySession,
+    GatewaySessionState,
     InputArtifactIngestPolicy,
     InputArtifactSpec,
     JarvisRunSpec,
@@ -90,19 +96,34 @@ _OWNER_RANK = {
     "queue_idempotency": 17,
     "queue_endpoints": 18,
     "queue_artifact_lineage": 19,
-    "queue_artifacts": 20,
-    "queue_scheduler_cancel_state": 21,
-    "queue_jobs": 22,
-    "queue_input_ingest": 23,
-    "queue_progress": 24,
-    "queue_tasks": 25,
-    "queue_lease_indexes": 26,
-    "queue_lease_capacity_state": 27,
-    "queue_lease_capacity_audit": 28,
-    "queue_lease_recovery": 29,
-    "queue_lease_admission": 30,
-    "queue_leases": 31,
-    "queue_scheduler_cancel_claims": 32,
+    # queue_gateway_indexes lands here, ahead of every caller that self-calls
+    # into it (queue_artifacts/queue_input_ingest/queue_jobs/queue_tasks,
+    # each already landed at the time of the original per-line inventory in
+    # section 1 of the design doc). Its own real dependencies are just the
+    # base store/layout family (ranks 0-5); it has no forward need for any
+    # of CQ7/CQ9/CQ10/CQ12/CQ14 despite those appearing in the design doc's
+    # CQ16 predecessor list -- that list describes queue_gateways' and
+    # queue_monitor_rules' real needs (owner-session intake, append_event,
+    # get_job), not queue_gateway_indexes'. Ledger §9.3/§10.2 precedent:
+    # resolve a reverse-rank self-call edge by hoisting the collaborator
+    # earlier, not by re-ranking its callers.
+    "queue_gateway_indexes": 20,
+    "queue_artifacts": 21,
+    "queue_scheduler_cancel_state": 22,
+    "queue_jobs": 23,
+    "queue_input_ingest": 24,
+    "queue_progress": 25,
+    "queue_tasks": 26,
+    "queue_lease_indexes": 27,
+    "queue_lease_capacity_state": 28,
+    "queue_lease_capacity_audit": 29,
+    "queue_lease_recovery": 30,
+    "queue_lease_admission": 31,
+    "queue_leases": 32,
+    "queue_scheduler_cancel_claims": 33,
+    "queue_gateways": 34,
+    "queue_browser_attachments": 35,
+    "queue_monitor_rules": 36,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -138,6 +159,10 @@ _OWNER_BUDGETS = {
     "queue_lease_admission": 590,
     "queue_leases": 360,
     "queue_scheduler_cancel_claims": 560,
+    "queue_gateway_indexes": 540,
+    "queue_gateways": 400,
+    "queue_browser_attachments": 420,
+    "queue_monitor_rules": 230,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -235,6 +260,18 @@ class _LeaseAdmissionWriteJobLookupSabotage(RuntimeError):
 class _LeaseRecoveryWriteJobLookupSabotage(RuntimeError):
     """Raised only when CQ15 stale-lease recovery (``queue_lease_recovery``) reaches
     queue_jobs.write_job through its owner seam."""
+
+
+class _BrowserAttachmentCasLookupSabotage(RuntimeError):
+    """Raised only when CQ16 browser-attachment CAS transitions
+    (``queue_browser_attachments``) reach ``queue_gateways.write_gateway_session``
+    through the owner's module-qualified collaborator-attribute lookup."""
+
+
+class _GatewayBacklinkSyncLookupSabotage(RuntimeError):
+    """Raised only when a CQ16 canonical gateway write (``queue_gateways``) reaches
+    ``queue_gateway_indexes.sync_gateway_session_derived`` through the owner's
+    module-qualified collaborator-attribute lookup."""
 
 
 @dataclass(frozen=True)
@@ -1438,6 +1475,106 @@ def test_cq15_stale_recovery_uses_the_write_job_lookup(
         queue.recover_stale_job(job.job_id, cluster="cluster-cq15")
 
     assert queue_leases.QueueLeasesMixin.recover_stale_job is ClioCoreQueue.recover_stale_job
+
+
+def _owned_ready_gateway(queue: ClioCoreQueue, *, cluster: str, name: str) -> GatewaySession:
+    return queue.create_gateway_session(
+        GatewaySession(
+            cluster=cluster,
+            name=name,
+            state=GatewaySessionState.READY,
+            gateway={
+                "runtime_spec": {"deployment_driver": "jarvis-bound"},
+                "jarvis_runtime_binding": {"schema_version": "binding"},
+            },
+            metadata={"owner": "clio-relay"},
+        )
+    )
+
+
+def test_cq16_browser_attachment_cas_uses_the_write_gateway_session_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Browser-attachment CAS transitions must resolve their canonical write
+    through the ``queue_gateways.write_gateway_session`` seam (isolated-namespace
+    pattern -- design row: "Patch each caller owner's collaborator attribute
+    for browser CAS and backlink synchronization" (the browser-CAS half))."""
+    queue = ClioCoreQueue(tmp_path)
+    session = _owned_ready_gateway(queue, cluster="cluster-cq16", name="paraview-cas")
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _BrowserAttachmentCasLookupSabotage(
+            "queue_browser_attachments write_gateway_session lookup engaged"
+        )
+
+    isolated_gateways = SimpleNamespace(
+        **{**vars(queue_gateways), "write_gateway_session": sabotage}
+    )
+    monkeypatch.setattr(queue_browser_attachments, "queue_gateways", isolated_gateways)
+
+    attachment = BrowserAttachmentRecord(
+        attachment_id="browser-cq16",
+        state="starting",
+        issued_at="2026-08-18T00:00:00+00:00",
+        expires_at="2026-08-18T00:30:00+00:00",
+        token_sha256="a" * 64,
+        bind_port=28791,
+        revocation_path="C:/runtime/browser-cq16.revoked",
+    )
+    intent: dict[str, object] = {
+        "schema_version": "clio-relay.gateway-ownership-intent.v1",
+        "state": "starting",
+        "attachment_id": attachment.attachment_id,
+        "owner_token": "owner-token-cq16",
+        "connector_generation_id": "generation-cq16",
+        "config_path": "C:/runtime/browser-cq16.json",
+    }
+
+    with pytest.raises(
+        _BrowserAttachmentCasLookupSabotage,
+        match="queue_browser_attachments write_gateway_session lookup engaged",
+    ):
+        queue.prepare_gateway_browser_attachment(
+            session.session_id,
+            attachment=attachment,
+            browser_proxy_intent=intent,
+        )
+
+    assert (
+        ClioCoreQueue.prepare_gateway_browser_attachment
+        is queue_browser_attachments.QueueBrowserAttachmentsMixin.prepare_gateway_browser_attachment
+    )
+
+
+def test_cq16_gateway_canonical_write_uses_the_backlink_sync_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Every canonical gateway write must resolve backlink convergence through
+    the ``queue_gateway_indexes.sync_gateway_session_derived`` seam (design
+    row: "... and backlink synchronization" (the backlink-synchronization
+    half))."""
+    queue = ClioCoreQueue(tmp_path)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _GatewayBacklinkSyncLookupSabotage("queue_gateways backlink sync lookup engaged")
+
+    isolated_gateway_indexes = SimpleNamespace(
+        **{**vars(queue_gateway_indexes), "sync_gateway_session_derived": sabotage}
+    )
+    monkeypatch.setattr(queue_gateways, "queue_gateway_indexes", isolated_gateway_indexes)
+
+    with pytest.raises(
+        _GatewayBacklinkSyncLookupSabotage,
+        match="queue_gateways backlink sync lookup engaged",
+    ):
+        _owned_ready_gateway(queue, cluster="cluster-cq16", name="paraview-backlink")
+
+    assert (
+        ClioCoreQueue.create_gateway_session
+        is queue_gateways.QueueGatewaysMixin.create_gateway_session
+    )
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:

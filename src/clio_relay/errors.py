@@ -83,5 +83,22 @@ class TaskInputParkConflictError(QueueConflictError):
     """
 
 
+class BrowserAttachmentIdentityConflictError(QueueConflictError):
+    """A browser attachment's identity changed underneath an in-flight revoke.
+
+    Raised only by ``queue_browser_attachments`` when the current gateway
+    record's attachment id no longer matches the one the caller is trying to
+    revoke (``begin_gateway_browser_attachment_revoke``) or finish revoking
+    (``finish_gateway_browser_attachment_revoke``). This is a caller-supplied
+    identity mismatch that ``ServiceRuntimeSupervisor._revoke_browser_
+    attachment`` maps to a public ``ConfigurationError`` -- unlike every
+    other ``QueueConflictError`` this same call can raise (missing
+    attachment, invalid record, ...), which must propagate unmapped. A
+    distinct subtype, rather than a substring match on the exception
+    message, is what lets that caller discriminate the two conflict sources
+    by type instead of by prose (clio-relay#231 CQ16 rework).
+    """
+
+
 class NotFoundError(PublicMessageError, RelayError):
     """Raised when a requested record is missing."""

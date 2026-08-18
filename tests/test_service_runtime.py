@@ -34,7 +34,12 @@ from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
+from clio_relay.errors import (
+    BrowserAttachmentIdentityConflictError,
+    ConfigurationError,
+    QueueConflictError,
+    RelayError,
+)
 from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
@@ -347,6 +352,54 @@ def test_remote_connector_start_rejects_response_identity_drift(
                 "connector_generation_id": generation_id,
             },
         )
+
+
+def test_browser_detach_maps_only_the_typed_identity_conflict_not_any_queue_conflict_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CQ16 typed-conflict fix, failing-first proof.
+
+    ``_revoke_browser_attachment`` used to catch ``QueueConflictError`` and
+    inspect ``str(exc)`` for the substring "changed before revocation" to
+    decide whether to remap it to a public ``ConfigurationError`` -- the
+    banned prose-match pattern. A decoy ``QueueConflictError`` that happens
+    to carry that same substring for an unrelated reason proves the
+    difference: under the old substring check this decoy would have been
+    misclassified and remapped to ``ConfigurationError``; under the typed
+    ``except BrowserAttachmentIdentityConflictError`` catch it must
+    propagate unchanged as a plain ``QueueConflictError``. This test fails
+    against the old substring-matching implementation and passes only once
+    the catch discriminates by exception type.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    session = queue.create_gateway_session(
+        GatewaySession(cluster="test-cluster", name="decoy-conflict")
+    )
+    supervisor = ServiceRuntimeSupervisor(
+        settings=settings,
+        queue=queue,
+        cluster="test-cluster",
+        definition=_definition(),
+        token="token",
+        secret_key="secret",
+    )
+
+    def decoy_revoke(*_args: object, **_kwargs: object) -> GatewaySession:
+        raise QueueConflictError(
+            "browser attachment changed before revocation for an unrelated reason"
+        )
+
+    monkeypatch.setattr(queue, "begin_gateway_browser_attachment_revoke", decoy_revoke)
+
+    with pytest.raises(QueueConflictError) as excinfo:
+        supervisor.browser_detach(
+            session_id=session.session_id,
+            attachment_id="browser-decoy",
+        )
+    assert not isinstance(excinfo.value, ConfigurationError)
+    assert not isinstance(excinfo.value, BrowserAttachmentIdentityConflictError)
 
 
 @pytest.fixture(autouse=True)
