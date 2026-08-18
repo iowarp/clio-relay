@@ -25,6 +25,13 @@ every per-family batch in ``migrate_indexes_batch`` resolves its bounded
 record-path listing through ``queue_index_migration.queue_store_read.
 migration_batch_paths`` -- an isolated-namespace patch on that lookup fails
 every batch phase identically.
+
+CQ20 dissolution: this owner's every per-family canonical read and every
+job/artifact/progress order-key derivation were the sole remaining callers
+of two now-deleted facade wrappers, ``_read_canonical_record``/
+``_durable_key``. All nine call sites now call ``queue_store_read.
+read_canonical_record``/``queue_layout.QueueLayout.durable_key`` directly,
+matching this module's own existing module-qualified idiom above.
 """
 
 from __future__ import annotations
@@ -81,9 +88,6 @@ class QueueIndexMigrationMixin:
         ) -> None: ...
         def _read_index_migration_state(self) -> dict[str, object]: ...
         def _write_index_migration_state(self, state: dict[str, object]) -> None: ...
-        def _read_canonical_record[Record: BaseModel](
-            self, path: Path, model: type[Record]
-        ) -> Record: ...
         @classmethod
         def _scan_many[Record: BaseModel](
             cls,
@@ -95,8 +99,6 @@ class QueueIndexMigrationMixin:
         ) -> tuple[list[Record], bool]: ...
         def _write(self, path: Path, record: BaseModel) -> None: ...
         def _job_record_path(self, family: str, job_id: str, record_id: str) -> Path: ...
-        @staticmethod
-        def _durable_key(value: str) -> str: ...
         def _read_legacy_record_audit_marker(
             self,
             *,
@@ -228,7 +230,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_canonical_record(path, model)
+                    record = queue_store_read.read_canonical_record(self._storage_root, path, model)
                     self._migrate_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -262,7 +264,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_canonical_record(path, model)
+                    record = queue_store_read.read_canonical_record(self._storage_root, path, model)
                     self._migrate_order_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -297,7 +299,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_canonical_record(path, model)
+                    record = queue_store_read.read_canonical_record(self._storage_root, path, model)
                     record_id = getattr(record, identity_field, None)
                     if not isinstance(record_id, str) or not record_id:
                         raise QueueConflictError(f"global-order record identity is invalid: {path}")
@@ -338,7 +340,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_canonical_record(path, model)
+                    record = queue_store_read.read_canonical_record(self._storage_root, path, model)
                     self._migrate_retention_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -422,7 +424,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    record = self._read_canonical_record(path, model)
+                    record = queue_store_read.read_canonical_record(self._storage_root, path, model)
                     self._migrate_operational_record_unlocked(family, record)
                 if paths:
                     checkpoint["cursor"] = paths[-1].name
@@ -443,7 +445,7 @@ class QueueIndexMigrationMixin:
                     limit=batch_size,
                 )
                 for path in paths:
-                    job = self._read_canonical_record(path, RelayJob)
+                    job = queue_store_read.read_canonical_record(self._storage_root, path, RelayJob)
                     self._finalize_job_index_unlocked(job.job_id)
                 if paths:
                     finalize["cursor"] = paths[-1].name
@@ -649,7 +651,9 @@ class QueueIndexMigrationMixin:
         if family == "tasks" and isinstance(record, RelayTask):
             sequence = record.sequence or (
                 queue_order_index.last_contiguous_sequence(
-                    self._storage_root / "task_order_by_job" / self._durable_key(record.job_id)
+                    self._storage_root
+                    / "task_order_by_job"
+                    / queue_layout.QueueLayout.durable_key(record.job_id)
                 )
                 + 1
             )
@@ -661,7 +665,9 @@ class QueueIndexMigrationMixin:
         if family == "artifacts" and isinstance(record, ArtifactRef):
             sequence = record.sequence or (
                 queue_order_index.last_contiguous_sequence(
-                    self._storage_root / "artifact_order_by_job" / self._durable_key(record.job_id)
+                    self._storage_root
+                    / "artifact_order_by_job"
+                    / queue_layout.QueueLayout.durable_key(record.job_id)
                 )
                 + 1
             )
@@ -681,7 +687,9 @@ class QueueIndexMigrationMixin:
         if family == "progress" and isinstance(record, ProgressRecord):
             sequence = record.sequence or (
                 queue_order_index.last_contiguous_sequence(
-                    self._storage_root / "progress_order_by_job" / self._durable_key(record.job_id)
+                    self._storage_root
+                    / "progress_order_by_job"
+                    / queue_layout.QueueLayout.durable_key(record.job_id)
                 )
                 + 1
             )

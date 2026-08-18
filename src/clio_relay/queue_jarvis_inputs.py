@@ -1,4 +1,19 @@
-"""Durable JARVIS input-contract, binding, lineage, and manifest ownership."""
+"""Durable JARVIS input-contract, binding, lineage, and manifest ownership.
+
+CQ20-JI-01 (dissolved CQ1 deviation): CQ1's original zero-inbound peel used
+instance composition (``ClioCoreQueue.__init__`` held a private
+``QueueJarvisInputs`` helper object) rather than mixin inheritance, since it
+landed before ``QueueStoreProtocol``/``_QueueStoreAdapter`` had any other
+owner to model the pattern on. Every public method below was still a
+facade-resident delegator (``return self._jarvis_inputs.get_x(...)``) at the
+top of the CQ1-CQ19 split. CQ20 dissolves that gap now that the pattern is
+established everywhere else: this module is a real ``QueueJarvisInputsMixin``
+composed directly into ``ClioCoreQueue`` like every CQ3+ owner, and each
+method reads ``self._store_adapter`` -- the same private store adapter every
+other owner already depends on -- instead of a separately held reference.
+The eight public methods keep their exact prior names and signatures; the
+facade no longer defines any of them.
+"""
 
 from __future__ import annotations
 
@@ -22,22 +37,25 @@ MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS = 10_000
 MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS = 10_000
 
 
-class QueueJarvisInputs:
-    """Own durable JARVIS input records through a typed queue store."""
+class QueueJarvisInputsMixin:
+    """Own durable JARVIS input records through the composed private store adapter."""
 
-    def __init__(self, store: queue_context.QueueStoreProtocol) -> None:
-        self._store = store
+    _store_adapter: queue_context.QueueStoreProtocol
 
     def get_jarvis_package_input_contract(
         self,
         route: JarvisPackageInputRoute,
     ) -> JarvisPackageInputContractRecord | None:
         """Load one exact checksum-bound package input contract record."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = route.identity_sha256()
-        path = self._store.storage_root / "jarvis_package_input_contracts" / f"{route_sha256}.json"
-        with self._store.lock:
-            record = self._store.read_optional(path, JarvisPackageInputContractRecord)
+        path = (
+            self._store_adapter.storage_root
+            / "jarvis_package_input_contracts"
+            / f"{route_sha256}.json"
+        )
+        with self._store_adapter.lock:
+            record = self._store_adapter.read_optional(path, JarvisPackageInputContractRecord)
             if record is None:
                 return None
             if record.route != route or record.route_sha256 != route_sha256:
@@ -51,14 +69,14 @@ class QueueJarvisInputs:
         record: JarvisPackageInputContractRecord,
     ) -> JarvisPackageInputContractRecord:
         """Persist immutable package semantics for one exact registered route."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = record.route.identity_sha256()
         if record.route_sha256 != route_sha256:
             raise ValueError("package input contract route checksum changed before persistence")
-        directory = self._store.storage_root / "jarvis_package_input_contracts"
+        directory = self._store_adapter.storage_root / "jarvis_package_input_contracts"
         path = directory / f"{route_sha256}.json"
-        with self._store.lock:
-            existing = self._store.read_optional(path, JarvisPackageInputContractRecord)
+        with self._store_adapter.lock:
+            existing = self._store_adapter.read_optional(path, JarvisPackageInputContractRecord)
             if existing is not None:
                 if (
                     existing.route != record.route
@@ -70,7 +88,7 @@ class QueueJarvisInputs:
                         "immutable JARVIS package input contract changed on the same route"
                     )
                 return existing
-            count, over_capacity = self._store.bounded_regular_json_count(
+            count, over_capacity = self._store_adapter.bounded_regular_json_count(
                 directory,
                 limit=MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS,
                 label="JARVIS package input contract",
@@ -79,7 +97,7 @@ class QueueJarvisInputs:
                 raise QueueConflictError(
                     "JARVIS package input contracts reached their bounded record capacity"
                 )
-            self._store.write(path, record)
+            self._store_adapter.write(path, record)
             return record
 
     def get_jarvis_pipeline_input_lineage(
@@ -87,11 +105,15 @@ class QueueJarvisInputs:
         route: JarvisPipelineInputRoute,
     ) -> JarvisPipelineInputLineage | None:
         """Load one exact checksum-bound pipeline input lineage record."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = route.identity_sha256()
-        path = self._store.storage_root / "jarvis_pipeline_input_lineage" / f"{route_sha256}.json"
-        with self._store.lock:
-            record = self._store.read_optional(path, JarvisPipelineInputLineage)
+        path = (
+            self._store_adapter.storage_root
+            / "jarvis_pipeline_input_lineage"
+            / f"{route_sha256}.json"
+        )
+        with self._store_adapter.lock:
+            record = self._store_adapter.read_optional(path, JarvisPipelineInputLineage)
             if record is None:
                 return None
             if record.route != route or record.route_sha256 != route_sha256:
@@ -105,11 +127,15 @@ class QueueJarvisInputs:
         route: JarvisPipelineInputRoute,
     ) -> JarvisPipelineInputBindings | None:
         """Load current local-file bindings for one exact registered pipeline route."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = route.identity_sha256()
-        path = self._store.storage_root / "jarvis_pipeline_input_bindings" / f"{route_sha256}.json"
-        with self._store.lock:
-            record = self._store.read_optional(path, JarvisPipelineInputBindings)
+        path = (
+            self._store_adapter.storage_root
+            / "jarvis_pipeline_input_bindings"
+            / f"{route_sha256}.json"
+        )
+        with self._store_adapter.lock:
+            record = self._store_adapter.read_optional(path, JarvisPipelineInputBindings)
             if record is None:
                 return None
             if record.route != route or record.route_sha256 != route_sha256:
@@ -126,9 +152,9 @@ class QueueJarvisInputs:
         remove: tuple[tuple[str, str], ...] = (),
     ) -> JarvisPipelineInputBindings:
         """Atomically update exact step/setting bindings for one pipeline route."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = route.identity_sha256()
-        directory = self._store.storage_root / "jarvis_pipeline_input_bindings"
+        directory = self._store_adapter.storage_root / "jarvis_pipeline_input_bindings"
         path = directory / f"{route_sha256}.json"
         remove_set = set(remove)
         if len(remove_set) != len(remove):
@@ -138,11 +164,11 @@ class QueueJarvisInputs:
             raise ValueError("pipeline input binding upserts must be unique")
         if remove_set.intersection(upsert_identities):
             raise ValueError("pipeline input binding cannot be removed and upserted together")
-        with self._store.lock:
-            existing = self._store.read_optional(path, JarvisPipelineInputBindings)
+        with self._store_adapter.lock:
+            existing = self._store_adapter.read_optional(path, JarvisPipelineInputBindings)
             mutation_at = utc_now()
             if existing is None:
-                count, over_capacity = self._store.bounded_regular_json_count(
+                count, over_capacity = self._store_adapter.bounded_regular_json_count(
                     directory,
                     limit=MAX_JARVIS_PIPELINE_INPUT_BINDING_RECORDS,
                     label="JARVIS pipeline input bindings",
@@ -170,7 +196,7 @@ class QueueJarvisInputs:
                 created_at=created_at,
                 updated_at=mutation_at,
             )
-            self._store.write(path, record)
+            self._store_adapter.write(path, record)
             return record
 
     def get_jarvis_run_input_manifest(
@@ -180,14 +206,18 @@ class QueueJarvisInputs:
         idempotency_key: str,
     ) -> JarvisRunInputManifest | None:
         """Load an immutable input manifest for one exact jarvis_run admission."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         identity_sha256 = JarvisRunInputManifest.storage_identity_sha256(
             route=route,
             idempotency_key=idempotency_key,
         )
-        path = self._store.storage_root / "jarvis_run_input_manifests" / f"{identity_sha256}.json"
-        with self._store.lock:
-            record = self._store.read_optional(path, JarvisRunInputManifest)
+        path = (
+            self._store_adapter.storage_root
+            / "jarvis_run_input_manifests"
+            / f"{identity_sha256}.json"
+        )
+        with self._store_adapter.lock:
+            record = self._store_adapter.read_optional(path, JarvisRunInputManifest)
             if record is None:
                 return None
             if (
@@ -203,12 +233,12 @@ class QueueJarvisInputs:
         record: JarvisRunInputManifest,
     ) -> JarvisRunInputManifest:
         """Persist the first exact input manifest admitted for one run key."""
-        self._store.initialize()
+        self._store_adapter.initialize()
         identity_sha256 = record.identity_sha256()
-        directory = self._store.storage_root / "jarvis_run_input_manifests"
+        directory = self._store_adapter.storage_root / "jarvis_run_input_manifests"
         path = directory / f"{identity_sha256}.json"
-        with self._store.lock:
-            existing = self._store.read_optional(path, JarvisRunInputManifest)
+        with self._store_adapter.lock:
+            existing = self._store_adapter.read_optional(path, JarvisRunInputManifest)
             if existing is not None:
                 if (
                     existing.route != record.route
@@ -217,7 +247,7 @@ class QueueJarvisInputs:
                 ):
                     raise QueueConflictError("durable JARVIS run input manifest identity changed")
                 return existing
-            count, over_capacity = self._store.bounded_regular_json_count(
+            count, over_capacity = self._store_adapter.bounded_regular_json_count(
                 directory,
                 limit=MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS,
                 label="JARVIS run input manifest",
@@ -226,7 +256,7 @@ class QueueJarvisInputs:
                 raise QueueConflictError(
                     "JARVIS run input manifests reached their bounded record capacity"
                 )
-            self._store.write(path, record)
+            self._store_adapter.write(path, record)
             return record
 
     def merge_jarvis_pipeline_input_lineage(
@@ -243,15 +273,15 @@ class QueueJarvisInputs:
             character not in "0123456789abcdef" for character in manifest_sha256
         ):
             raise ValueError("pipeline input lineage manifest must be a canonical SHA-256")
-        self._store.initialize()
+        self._store_adapter.initialize()
         route_sha256 = route.identity_sha256()
-        directory = self._store.storage_root / "jarvis_pipeline_input_lineage"
+        directory = self._store_adapter.storage_root / "jarvis_pipeline_input_lineage"
         path = directory / f"{route_sha256}.json"
-        with self._store.lock:
-            existing = self._store.read_optional(path, JarvisPipelineInputLineage)
+        with self._store_adapter.lock:
+            existing = self._store_adapter.read_optional(path, JarvisPipelineInputLineage)
             mutation_at = utc_now()
             if existing is None:
-                count, over_capacity = self._store.bounded_regular_json_count(
+                count, over_capacity = self._store_adapter.bounded_regular_json_count(
                     directory,
                     limit=MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS,
                     label="JARVIS pipeline input lineage",
@@ -288,5 +318,5 @@ class QueueJarvisInputs:
                 created_at=created_at,
                 updated_at=mutation_at,
             )
-            self._store.write(path, record)
+            self._store_adapter.write(path, record)
             return record

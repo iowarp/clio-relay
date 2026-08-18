@@ -84,13 +84,6 @@ class QueueJobGcProtectionsMixin:
             session_generation_id: str | None = None,
         ) -> OwnerSessionClosure | None: ...
         def _read_job_index(self, job_id: str) -> dict[str, object] | None: ...
-        @staticmethod
-        def _bounded_json_record_paths(
-            directory: Path,
-            *,
-            limit: int,
-            label: str,
-        ) -> list[Path]: ...
         def _artifact_user_order_root(self, artifact_id: str) -> Path: ...
         def _read_artifact_user_order_head(self, artifact_id: str) -> int: ...
         def _validate_artifact_use_record(self, record: UsedArtifactRef) -> None: ...
@@ -219,19 +212,19 @@ class QueueJobGcProtectionsMixin:
         try:
             artifacts = self.list_artifacts(job.job_id)
             for artifact in artifacts:
-                reverse_paths = self._bounded_json_record_paths(
+                reverse_paths = queue_store_read.bounded_json_record_paths(
                     self._storage_root / "artifact_users" / artifact.artifact_id,
                     limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                     label=f"consumers of artifact {artifact.artifact_id}",
                 )
                 order_root = self._artifact_user_order_root(artifact.artifact_id)
                 self._read_artifact_user_order_head(artifact.artifact_id)
-                entry_paths = self._bounded_json_record_paths(
+                entry_paths = queue_store_read.bounded_json_record_paths(
                     order_root / "entries",
                     limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                     label=f"ordered consumers of artifact {artifact.artifact_id}",
                 )
-                mapping_paths = self._bounded_json_record_paths(
+                mapping_paths = queue_store_read.bounded_json_record_paths(
                     order_root / "by_consumer",
                     limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                     label=f"consumer order mappings for artifact {artifact.artifact_id}",

@@ -32,6 +32,19 @@ reverse-rank edge the architecture guard rejects, and no earlier-ranked owner
 has the headroom to host all of them. This module's three methods below have
 no such inbound edge from any other owner (verified: zero external callers),
 so they extract cleanly at rank 42.
+
+CQ20 dissolution: the facade's own ``_read_sealed_index_migration_state``
+(a thin ``queue_index_state.read_sealed_index_migration_state`` forward,
+left behind when CQ19-TI-01 was written) is deleted outright rather than
+moved -- ``queue_legacy_audit.QueueLegacyAuditMixin`` (rank 12) already owns
+a byte-identical private equivalent, ``_read_sealed_state`` (same forward,
+its own per-owner ``_unique_json`` document reader). Both of this module's
+two real external callers (this file's own
+``_upgrade_sealed_lease_operational_schema_unlocked``, and
+``queue_startup.initialize``) now call ``self._read_sealed_state(...)``
+directly -- a forward self-call to the earlier-ranked owner, exactly the
+CQ9-ledger §9.3 "hoist to whichever side the topology requires" precedent,
+except here the target already existed and needed no new duplicate at all.
 """
 
 from __future__ import annotations
@@ -45,6 +58,7 @@ from clio_relay import (
     queue_lease_indexes,
     queue_lease_records,
     queue_store_lock,
+    queue_store_read,
 )
 from clio_relay.errors import QueueConflictError
 
@@ -62,25 +76,18 @@ class QueueIndexDiscoveryMixin:
 
         def _read_index_migration_state(self) -> dict[str, object]: ...
         def _write_index_migration_state(self, state: dict[str, object]) -> None: ...
-        def _read_sealed_index_migration_state(
+        def _read_sealed_state(
             self,
             *,
             allow_legacy_lease_schema: bool = False,
         ) -> dict[str, object]: ...
-        @staticmethod
-        def _bounded_json_record_paths(
-            directory: Path,
-            *,
-            limit: int,
-            label: str,
-        ) -> list[Path]: ...
         def _read_lease_capacity_aggregate_unlocked(self) -> _LeaseCapacityPair: ...
 
     def _upgrade_sealed_lease_operational_schema_unlocked(self) -> None:
         """Invalidate exact v1 lease indexes so the bounded v2 migration can rebuild them."""
         if not self._lock.is_locked:
             raise RuntimeError("sealed lease index upgrade requires the queue lock")
-        state = self._read_sealed_index_migration_state(allow_legacy_lease_schema=True)
+        state = self._read_sealed_state(allow_legacy_lease_schema=True)
         operational = cast(dict[str, object], state["operational_families"])
         lease_checkpoint = cast(dict[str, object], operational["leases"])
         repair = cast(dict[str, object], state["lease_operational_repair"])
@@ -257,7 +264,7 @@ class QueueIndexDiscoveryMixin:
                 )
                 changed = True
         pending_transition = bool(
-            self._bounded_json_record_paths(
+            queue_store_read.bounded_json_record_paths(
                 self._storage_root / "transition_intents",
                 limit=queue_layout.MAX_TRANSITION_INTENT_RECORDS,
                 label="queue transition intent directory",

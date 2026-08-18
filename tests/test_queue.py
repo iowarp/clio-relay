@@ -56,6 +56,12 @@ def test_canonical_read_resolves_validation_through_store_read_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """CQ20 note: the facade's ``_read_canonical_record`` forward is deleted
+    (its every real caller, all six inside ``queue_index_migration.py``, now
+    calls ``queue_store_read.read_canonical_record`` directly). This test now
+    exercises that real, module-qualified call site directly rather than a
+    dead facade shim -- design doc §4's own preservation rule.
+    """
     queue = ClioCoreQueue(tmp_path)
     endpoint = EndpointRegistration(
         cluster="configured-target",
@@ -85,7 +91,8 @@ def test_canonical_read_resolves_validation_through_store_read_owner(
         _StoreLookupSabotage,
         match="queue_store_read canonical validation lookup engaged",
     ):
-        queue._read_canonical_record(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue_store_read.read_canonical_record(
+            queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             path,
             EndpointRegistration,
         )

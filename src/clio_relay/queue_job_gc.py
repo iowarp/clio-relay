@@ -93,13 +93,6 @@ class QueueJobGcMixin:
         def get_job(self, job_id: str) -> RelayJob: ...
         def get_job_tombstone(self, job_id: str) -> JobTombstone | None: ...
         def _terminal_job_gc_protections(self, job: RelayJob) -> list[str]: ...
-        @staticmethod
-        def _bounded_json_record_paths(
-            directory: Path,
-            *,
-            limit: int,
-            label: str,
-        ) -> list[Path]: ...
         def _artifact_user_order_root(self, artifact_id: str) -> Path: ...
         def _read_artifact_user_order_head(self, artifact_id: str) -> int: ...
         def _scheduler_reverse_ref_path(
@@ -614,7 +607,7 @@ class QueueJobGcMixin:
             reverse_directory = self._storage_root / "artifact_users" / record.artifact_id
             order_root = self._artifact_user_order_root(record.artifact_id)
             self._read_artifact_user_order_head(record.artifact_id)
-            if self._bounded_json_record_paths(
+            if queue_store_read.bounded_json_record_paths(
                 reverse_directory,
                 limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                 label=f"consumers of artifact {record.artifact_id}",
@@ -622,11 +615,11 @@ class QueueJobGcMixin:
                 raise QueueConflictError(
                     f"artifact still has retained consumers: {record.artifact_id}"
                 )
-            if self._bounded_json_record_paths(
+            if queue_store_read.bounded_json_record_paths(
                 order_root / "entries",
                 limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                 label=f"ordered consumers of artifact {record.artifact_id}",
-            ) or self._bounded_json_record_paths(
+            ) or queue_store_read.bounded_json_record_paths(
                 order_root / "by_consumer",
                 limit=queue_layout.MAX_ARTIFACT_CONSUMERS,
                 label=f"consumer order mappings for artifact {record.artifact_id}",

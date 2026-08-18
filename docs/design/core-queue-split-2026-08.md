@@ -1453,3 +1453,312 @@ retention.py`, `tests/test_retention.py`, `tests/test_artifact_lineage.py`,
 `tests/` collection-and-run pass confirming zero import breaks anywhere in
 the tree, zero failures beyond the pre-existing, A/B-known `#239` sidecar
 family.
+
+## 15. CQ20 landing — final facade collapse (campaign close)
+
+CQ20 (predecessors CQ1-CQ19, all landed) is the closing slice: collapse the
+746 lines CQ19 left behind into the pure composition facade sections 1-8
+describe. No new owner module is created and no owner's rank changes; every
+change is either a dissolution (a residual body moves to, or reuses, a real
+owner) or a documented, permanent typed deviation.
+
+### 15.1 classification inventory
+
+Every one of the 746 lines CQ19 left in `core_queue.py` falls into exactly
+one of the three buckets the issue prescribed:
+
+| Class | Count | Members |
+|---|---:|---|
+| (a) stays -- facade glue | ~470 | module docstring/imports/re-exports; `_QueueStoreAdapter`; the `ClioCoreQueue` class statement, mixin composition, `__init__`/state; `initialize` (CQ19-ST-02); `reconcile_pending_transitions`, `_assert_input_ingest_quota_unlocked`, `_write_transition_intent_unlocked`, `_recover_pending_transitions_unlocked`, `_read_index_migration_state`/`_write_index_migration_state`, `_require_index_migration_complete`, `_lease_capacity_migration_complete_unlocked` (CQ13-IO-01/CQ19-TI-01, unchanged); `_job_record_path`, `_write`, `_write_json`, `_read_optional`, `_scan_many`, `_read_json_file`, `_read_json_document` (new deviation CQ20-FA-01, §15.2); `_is_canonical_event_path`, `_bounded_regular_json_count`, `_record_is_reparse` (unchanged, `_QueueStoreAdapter`-dependent) |
+| (b) moved/dissolved | 12 owner methods + 2 module fns | CQ1's 8 jarvis-input delegators -> real `QueueJarvisInputsMixin` methods (CQ20-JI-01); `_read_sealed_index_migration_state`/`_read_unique_json_document` -> reused `queue_legacy_audit._read_sealed_state` (CQ20-SA-01, no new duplicate); `_storage_root_stat` -> `queue_lease_indexes.py`'s `self._layout.storage_root_stat()`; `_durable_key` (3 call sites) -> `queue_layout.QueueLayout.durable_key` in `queue_index_migration.py`; `_require_safe_write_directory`/`_purge_write_staging_unlocked` -> `queue_store_write.*` in `queue_startup.py`; `_write_text` -> `queue_store_write.write_text` in `queue_lease_indexes.py`; `_read_canonical_record` (6 call sites) -> `queue_store_read.read_canonical_record` in `queue_index_migration.py`; `_bounded_json_record_paths` (8 call sites: `queue_index_discovery.py`, `queue_job_gc.py` x3, `queue_job_gc_protections.py` x3, `_assert_input_ingest_quota_unlocked` itself) -> `queue_store_read.bounded_json_record_paths` |
+| (c) dead residue, deleted | 4 | `_require_durable_record_id` (zero production callers -- every owner already builds its own local `queue_layout.QueueLayout.require_durable_record_id` alias); `_label_key` (same, `queue_owner_session_lifecycle.py`/`queue_owner_session_records.py` already alias it directly); `_read_many` (the classmethod itself had zero production callers left -- every reader that needs an unbounded scan, e.g. `queue_progress.list_progress`, already calls `queue_store_read.read_many` module-qualified; only a negative test-safety-net patch referenced it -- see §15.4); `_read_bounded_record_bytes` (orphaned once `_read_unique_json_document`, its only caller, dissolved) |
+
+`core_queue.py` falls from **746 to 598** physical lines (net removal 148).
+It has no `RATCHET_BASELINE` entry (removed at CQ19, still correctly absent
+-- 598 is well under `DEFAULT_MAX_LINES`). The facade public method count
+stays exactly 128 (`test_facade_public_method_set_stays_at_the_128_method_
+base`); every moved method keeps its existing name and signature except the
+two intentionally renamed private methods (`_read_sealed_index_migration_
+state` -> `_read_sealed_state`, `_storage_root_stat`/`_durable_key`/etc.
+deleted in favor of the module call they already forwarded to), none of
+which are part of the public 128.
+
+### 15.2 typed deviation CQ20-FA-01: the store-adapter hub family stays
+
+`_job_record_path`, `_write`, `_write_json`, `_read_optional`, `_scan_many`,
+`_read_json_file`, and `_read_json_document` all stay facade-resident,
+unmoved. Two independent constraints force this, the same "hub method, no
+clean hoist target" class CQ19-TI-01 already established:
+
+- `_write`/`_write_json`/`_read_optional`/`_read_json_document` are called
+  by `_QueueStoreAdapter` as `self._queue._write(...)` etc (ledger §9.5's
+  own fix): routing through the *instance* rather than the bare module
+  function is what keeps `monkeypatch.setattr(queue, "_write", ...)` -- an
+  established, widely used test seam across the whole suite -- live. A
+  module-qualified rewrite would silently break every such patch, exactly
+  the class of defect §9.5 fixed once already.
+- `_job_record_path` (26 external callers), `_write` (12+ external
+  callers), `_write_json` (20), `_read_optional` (6), and
+  `_recover_pending_transitions_unlocked` (42, already CQ19-TI-01) are each
+  self-called from many already-landed owners spanning the full rank range
+  0-45. `_scan_many` is additionally inherited directly by
+  `storage_runtime.StorageManagedQueue(ClioCoreQueue)` -- a real production
+  *subclass* outside the queue-owner family entirely (`recover_stale_jobs`/
+  `acquire_job`/etc call `self._scan_many(...)` through inheritance, not
+  composition), which no owner-module extraction could preserve without
+  also rewriting `storage_runtime.py` itself -- out of scope by the same
+  "queue owners do not absorb process/transport/scheduler/connector
+  behavior" boundary design doc §5 already draws.
+
+None of these calls are owned by any `queue_*.py` mixin, so they carry no
+architecture-guard edge regardless of rank -- the same invisibility
+CQ19-ST-02 established for `initialize`. This closes out ledger §9.5's own
+open question ("full retirement stays CQ19/CQ20 scope"): the verdict is
+**`_QueueStoreAdapter` and its four instance-routed methods are permanent**,
+not a residual gap -- CQ20's own issue text names "the private store
+adapter" as facade-legitimate for exactly this reason.
+
+### 15.3 typed deviation CQ20-SA-01: the sealed-state duplicate is dissolved, not duplicated
+
+`_read_sealed_index_migration_state` (a thin
+`queue_index_state.read_sealed_index_migration_state` forward) and its
+private document-reader `_read_unique_json_document` looked, at first
+glance, like another CQ19-TI-01-class hub (two external callers at
+different ranks: `queue_index_discovery.py` rank 42,
+`queue_startup.py`'s bare `initialize` function). They are not: neither
+docstring that named them among the "stays" family (`queue_index_
+discovery.py`, `queue_startup.py`) had actually re-verified that claim
+against the real call graph. `queue_legacy_audit.QueueLegacyAuditMixin`
+(rank 12, already a valid predecessor for both callers) already owns a
+byte-identical private equivalent, `_read_sealed_state` (same forward, its
+own already-established per-owner `_unique_json` document reader). Both
+real callers now call `self._read_sealed_state(...)`/`queue._read_sealed_
+state()` directly -- a forward self-call to the earlier-ranked owner
+(ledger §9.3/§10.2 "hoist to whichever side the topology requires"
+precedent, except here the target already existed). The facade's own copy
+and its private JSON reader are deleted outright, not moved; deleting the
+latter also orphaned `_read_bounded_record_bytes` (§15.1's dead-residue
+row).
+
+### 15.4 dissolved: CQ1's jarvis-input composition -> `QueueJarvisInputsMixin` (CQ20-JI-01)
+
+CQ1's original zero-inbound peel (design doc §3) used instance composition
+(`ClioCoreQueue.__init__` held a private `QueueJarvisInputs` helper object,
+`self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._store_
+adapter)`) rather than mixin inheritance -- it landed before any other
+owner had established the `*Mixin` pattern to follow. Every one of its
+eight public methods was still a facade-resident delegator (`return self.
+_jarvis_inputs.get_x(...)`) through the whole CQ1-CQ19 split; design doc
+§14.1 named this explicitly as an open gap left for CQ20.
+
+`queue_jarvis_inputs.py`'s `QueueJarvisInputs` class is renamed
+`QueueJarvisInputsMixin` and added to `ClioCoreQueue`'s bases (still rank 1,
+unchanged -- it was already a landed owner in the dependency-rank sense,
+just composed rather than inherited). Its `__init__`/`self._store` are
+deleted; every method reads `self._store_adapter` directly (the same
+private adapter attribute every other owner already depends on) instead of
+a separately held reference. `ClioCoreQueue.__init__` drops its `self.
+_jarvis_inputs = ...` line. The eight facade-resident delegator methods are
+deleted from `core_queue.py` outright -- they are now real inherited
+`QueueJarvisInputsMixin` methods, reached through the composed MRO exactly
+like every CQ3+ owner's public surface. Every signature is byte-for-byte
+unchanged (`test_jarvis_input_methods_are_inherited_from_the_owner_mixin`,
+replacing the now-vacuous CQ1 signature-parity check with a same-identity
+assertion: `getattr(ClioCoreQueue, symbol) is getattr(QueueJarvisInputsMixin,
+symbol)`).
+
+`queue_jarvis_inputs.py` grows 292 -> 322 real lines (the `_OWNER_BUDGETS`
+cap is raised 300 -> 340, justified: the eight former delegator bodies now
+live here instead of on the facade, and ruff's line-length wrap of the
+longer `self._store_adapter.storage_root / ...` expression -- versus the
+old `self._store.storage_root / ...` -- added a handful of physical lines
+across four methods).
+
+### 15.5 fixed in-campaign: a pre-existing, CQ16-vintage dead test seam
+
+The broad regression sweep (§15.6) surfaced
+`tests/test_identifiers.py::test_canonical_scan_layouts_bind_filename_to_
+record_identity` failing with `AttributeError: module 'clio_relay.core_
+queue' has no attribute '_stable_ref_token'` -- confirmed failing
+identically on the unmodified CQ19 tip via `git stash` (not a CQ20
+regression). Ledger §11.5 already recorded the real fix at CQ16 landing:
+`_stable_ref_token` moved from the facade to `queue_gateway_indexes.py`,
+and every production call site was rewired -- but this one test call site
+was missed and has been silently broken (not merely stale-patched; a
+genuine `AttributeError`) since CQ16. Fixed in-campaign per this
+repository's own no-deferral convention: the test now calls
+`queue_gateway_indexes._stable_ref_token("Target:GPU")` directly.
+
+### 15.6 gates
+
+`ruff check`/`ruff format --check` (whole `src/`+`tests/` tree, not just
+touched files), `pyright` (0 errors on every touched/new file; the same
+14 pre-existing errors on `tests/test_queue.py`/`tests/test_identifiers.py`
+-- `QueueLockProtocol` attribute-visibility findings and the now-fixed
+`_stable_ref_token` one, confirmed present before this slice via `git
+stash` -- are unrelated and untouched), `scripts/check_file_size.py` (no
+file under `src/clio_relay`/`jarvis-packages/clio_relay` exceeds its
+ratchet baseline; `core_queue.py` has no baseline entry and stays that
+way), and `scripts/check_release_identity.py` (78/80 sites agree) all pass.
+
+`tests/test_queue.py`, `tests/test_core_queue_split_architecture.py` (53
+tests: the prior 52 plus the new MRO proof;
+`test_jarvis_input_facade_signatures_match_the_owner` is renamed/repurposed
+rather than counted as a net-new test), `tests/test_release_pins.py`,
+`tests/test_fastmcp_server.py`, and `tests/test_endpoint.py` all pass
+green (`test_endpoint.py`'s three `test_unresolved_runtime_sidecar_
+failure_retains_recovery_evidence[corrupt|missing|renamed]` cases are the
+named, pre-existing, A/B-verified `#239` sidecar-family exemption --
+confirmed failing identically on the unmodified CQ19 tip).
+
+The broad adjacent sweep (every suite CQ13-CQ19's own reports used, plus
+`tests/test_identifiers.py` and `tests/test_core_index_safety.py` for this
+slice's own store-read/lease-index rewires): `test_core_retention.py`,
+`test_retention.py`, `test_operational_indexes.py`, `test_lease_capacity.
+py`, `test_queue_management.py`, `test_storage_managed_queue.py`,
+`test_control_query_admission.py`, `test_core_idempotency.py`,
+`test_artifact_lineage.py`, `test_jarvis_lost_response_recovery.py`,
+`test_jarvis_recovery_scheduling.py`, `test_legacy_output_migration.py`,
+`test_release_validation.py`, `test_transform_provenance.py`,
+`test_queue_readiness.py`, `test_queue_record_codecs.py`,
+`test_worker_lifetime_lock.py`, `test_queue_startup_audit.py`,
+`test_browser_attachment_queue.py`, `test_service_runtime.py`,
+`test_gateway_public_projection.py`, `test_core_global_pagination.py`,
+`test_input_staging.py`, `test_builtin_jarvis_input_staging.py`, and
+`test_cli.py` all pass green (331 tests in the combined sweep run, plus
+`test_cli.py`'s own full suite, plus `test_fastmcp_server.py`/`test_
+endpoint.py`'s 154). A full `tests/` collection pass
+(`pytest tests/ --collect-only`) confirms zero import errors anywhere in
+the tree.
+
+### 15.7 the MRO proof (design doc §3's own CQ20 acceptance criterion)
+
+`tests/test_core_queue_split_architecture.py::
+test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_
+allowlist` walks all 128 public `ClioCoreQueue` methods and, for each,
+finds its real defining class by walking `ClioCoreQueue.__mro__` in
+resolution order (the same lookup Python itself performs). Every name
+outside the allowlist below must resolve to a `*Mixin` owner class, never
+to `ClioCoreQueue` itself; both allowlisted names are checked in the
+opposite direction, so the allowlist cannot silently go stale if a future
+slice moves one of them into a real owner. The allowlist, verbatim:
+
+```python
+_FACADE_RESIDENT_PUBLIC_METHODS: frozenset[str] = frozenset(
+    {
+        # CQ19-ST-02: a thin dispatch to the bare module-level
+        # ``queue_startup.initialize`` function, kept off the owner mixin
+        # manifest on purpose.
+        "initialize",
+        # CQ19-TI-01: a thin dispatch over the write-ahead-log primitives
+        # that themselves stay facade-resident (``_recover_pending_
+        # transitions_unlocked`` and friends).
+        "reconcile_pending_transitions",
+    }
+)
+```
+
+Every other one of the 126 remaining public methods resolves to a composed
+owner mixin. (Private facade-resident methods -- the CQ20-FA-01 store-
+adapter family, CQ13-IO-01, and the rest of CQ19-TI-01 -- are deliberately
+outside this proof's scope: the design doc's own acceptance text and
+`test_facade_public_method_set_stays_at_the_128_method_base` both scope the
+128-method pin, and by extension this proof, to the *public* surface.)
+
+### 15.8 final owner table (all 46 owners, campaign close)
+
+| Rank | Owner | Real lines | Rank | Owner | Real lines |
+|---:|---|---:|---:|---|---:|
+| 0 | `queue_context.py` | 69 | 23 | `queue_execution_cleanup.py` | 352 |
+| 1 | `queue_jarvis_inputs.py` | 322 | 24 | `queue_jobs.py` | 786 |
+| 2 | `queue_layout.py` | 391 | 25 | `queue_input_ingest.py` | 696 |
+| 3 | `queue_store_lock.py` | 270 | 26 | `queue_progress.py` | 176 |
+| 4 | `queue_store_read.py` | 412 | 27 | `queue_tasks.py` | 405 |
+| 5 | `queue_store_write.py` | 225 | 28 | `queue_execution_cleanup_markers.py` | 335 |
+| 6 | `queue_lease_records.py` | 679 | 29 | `queue_lease_indexes.py` | 610 |
+| 7 | `queue_scheduler_cancel_records.py` | 133 | 30 | `queue_lease_capacity_state.py` | 474 |
+| 8 | `queue_legacy_output_codec.py` | 499 | 31 | `queue_lease_capacity_audit.py` | 584 |
+| 9 | `queue_index_state.py` | 262 | 32 | `queue_lease_recovery.py` | 601 |
+| 10 | `queue_legacy_output_audit.py` | 519 | 33 | `queue_lease_admission.py` | 571 |
+| 11 | `queue_legacy_output_migration.py` | 230 | 34 | `queue_leases.py` | 340 |
+| 12 | `queue_legacy_audit.py` | 635 | 35 | `queue_scheduler_cancel_claims.py` | 538 |
+| 13 | `queue_order_index.py` | 449 | 36 | `queue_gateways.py` | 383 |
+| 14 | `queue_events.py` | 269 | 37 | `queue_browser_attachments.py` | 407 |
+| 15 | `queue_owner_session_records.py` | 686 | 38 | `queue_monitor_rules.py` | 212 |
+| 16 | `queue_owner_session_lifecycle.py` | 335 | 39 | `queue_gc_storage.py` | 250 |
+| 17 | `queue_idempotency.py` | 270 | 40 | `queue_job_gc_protections.py` | 283 |
+| 18 | `queue_endpoints.py` | 334 | 41 | `queue_job_gc.py` | 670 |
+| 19 | `queue_artifact_lineage.py` | 494 | 42 | `queue_index_discovery.py` | 359 |
+| 20 | `queue_gateway_indexes.py` | 524 | 43 | `queue_startup.py` | 543 |
+| 21 | `queue_artifacts.py` | 218 | 44 | `queue_index_migration.py` | 704 |
+| 22 | `queue_scheduler_cancel_state.py` | 436 | 45 | `queue_transitions.py` | 254 |
+
+Sum across the 46 owners: 19,194 real lines. Plus `core_queue.py` (598):
+**19,792** total physical lines across the fully split queue, versus
+16,137 at the pinned `d6253d7` evidence commit -- the difference is
+`Overhead` (imports, docstrings, `TYPE_CHECKING` stubs, module framing,
+typed-deviation documentation) that section 2's planning table always
+budgeted for, plus deliberate typed-deviation narrative this ledger
+accumulated slice by slice. Every owner is below the 800-line hard gate;
+the largest is `queue_jobs.py` at 786.
+
+### 15.9 typed deviations, final disposition
+
+| Deviation | Landed at | End-state |
+|---|---|---|
+| CQ4-IO-01 (`queue_scheduler_cancel_state` inline quota helper) | CQ4 | Permanent -- same class of problem as CQ13-IO-01, unaffected by CQ20 |
+| CQ9 lineage/artifacts 2-cycle (`get_job`/`get_artifact`) | CQ9 (ledger §9.3) | Permanent -- resolved via shared `queue_store_read.read_required_job`/`read_required_artifact` primitives |
+| CQ13-IO-01 (`_assert_input_ingest_quota_unlocked`) | CQ13 | **Permanent**, facade-resident, unchanged this slice (still the caller-adjacency constraint against `queue_jobs.submit_job`) |
+| CQ15-LR-01 (`queue_leases`/`queue_lease_recovery` cycle) | CQ15 (ledger §10.2) | Permanent -- `_delete_lease_unlocked` hosted on `queue_lease_recovery`, resolved at landing |
+| CQ15's `sync_operational_indexes` module-level twin | CQ15 | Permanent -- mandated by the design's own failing-first prescription |
+| CQ16 gateway-indexes re-rank | CQ16 (ledger §11.2) | Permanent -- a rank correction, not a deviation from the facade |
+| CQ17-EC-01 (execution-cleanup two-owner split) | CQ17 | Permanent -- forced by a genuine rank conflict between `queue_jobs` and `queue_tasks` |
+| CQ18-JG-01 (job-GC protections/orchestration split) | CQ18 | Permanent -- size-forced, clean one-directional dependency |
+| CQ19-ST-01 (`queue_startup` ranks before `queue_index_migration`) | CQ19 | Permanent -- a rank correction |
+| CQ19-ST-02 (`initialize` bare module function + facade dispatcher) | CQ19 | **Permanent**, in the CQ20 MRO-proof allowlist by name |
+| CQ19-TI-01 (WAL primitives stay facade-resident) | CQ19 | **Permanent**, unchanged this slice; `reconcile_pending_transitions` is in the MRO-proof allowlist, the rest are private (outside the proof's public-only scope) |
+| CQ20-JI-01 (CQ1 jarvis-input composition) | CQ20 | **Dissolved** -- real `QueueJarvisInputsMixin`, §15.4 |
+| CQ20-SA-01 (sealed-state duplicate) | CQ20 | **Dissolved** -- reuses `queue_legacy_audit._read_sealed_state`, no new duplicate, §15.3 |
+| CQ20-FA-01 (store-adapter hub family) | CQ20 | **Permanent**, newly named and documented this slice, §15.2 |
+| `_QueueStoreAdapter` full retirement (ledger §9.5's open question) | CQ20 | **Closed: permanent.** CQ20's own issue text names it facade-legitimate; §15.2 records the two independent reasons it cannot retire |
+
+Two dissolved, twelve permanent (all pre-existing plus the one new family
+this slice had to name), zero left open.
+
+### 15.10 execution status: the split is COMPLETE
+
+All eight measurable exit criteria in section 7 now hold:
+
+1. `core_queue.py` is 598 physical lines -- below 800, and contains only
+   typed owner-mixin composition, the private store adapter, constructor/
+   context wiring, and the two documented CQ19-ST-02/CQ19-TI-01 facade
+   dispatchers plus the CQ20-FA-01 store-adapter hub family and CQ13-IO-01.
+2. Every target in section 2 is at or below its (ratcheted, justified)
+   planned cap and below the 800-line hard gate; §15.8's table is the
+   final accounting. No new file-size baseline was added.
+3. The section 1 inventory's disjointness is preserved by construction --
+   CQ20 only moves or deletes lines already assigned to `core_queue.py` at
+   CQ19; nothing is copied.
+4. The call graph topologically sorts per section 3's DAG; no owner
+   imports `core_queue`; no bare cross-owner collaborator import. CQ20
+   added zero new edges (every dissolution either reuses an
+   already-earlier-ranked owner as a forward self-call, or moves a call
+   site to a module-qualified reference with no owner-rank implication at
+   all).
+5. All patch sites remain public-facade patches or the module containing
+   the real post-split call expression; §15.5 fixed the one CQ16-vintage
+   exception the broad sweep found.
+6. CQ14's `QueueTasksMixin` composition proof stands unchanged from its
+   own slice; CQ20 adds the general-purpose MRO proof (§15.7) as the
+   campaign-wide version of the same idea, covering all 128 public
+   methods rather than one owner's.
+7. On-disk paths, JSON bytes/digests, exception types/messages,
+   signatures, cursors, lock boundaries, and crash replay are unchanged --
+   every CQ20 rewire is a pure call-site relocation to the same underlying
+   function, never a behavior change.
+8. `ruff check --fix`, `ruff format`, `pyright`, `pytest`, and `scripts/
+   check_file_size.py` all pass with no failure or skip (§15.6); the
+   `core_queue.py` ratchet has nothing left to lower (no baseline entry
+   since CQ19).
+
+**The `core_queue.py` split (issue #231, CQ1-CQ20) is COMPLETE.**

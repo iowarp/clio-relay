@@ -78,7 +78,7 @@ from clio_relay.models import (
     deterministic_input_artifact_id,
     new_id,
 )
-from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
+from clio_relay.queue_jarvis_inputs import QueueJarvisInputsMixin
 from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
@@ -190,7 +190,13 @@ _OWNER_RANK = {
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
-    "queue_jarvis_inputs": 300,
+    # CQ20-JI-01: cap raised 300 -> 340. Dissolving CQ1's instance-composition
+    # deviation into a real QueueJarvisInputsMixin absorbed the eight public
+    # delegator bodies core_queue.py used to hold (net new lines here), and
+    # ruff's line-length wrap of `self._store_adapter.storage_root / ...`
+    # (longer than the old `self._store.storage_root / ...`) added a few
+    # more physical lines across four methods.
+    "queue_jarvis_inputs": 340,
     "queue_layout": 410,
     "queue_store_lock": 270,
     # CQ18: +2 real lines (migration_batch_paths, the shared primitive
@@ -257,11 +263,16 @@ _JARVIS_INPUT_SYMBOLS = (
     "merge_jarvis_pipeline_input_lineage",
 )
 _LAYOUT_METHODS = {
-    "_storage_root_stat": "storage_root_stat",
+    # CQ20 dissolved the other four members this dict used to check
+    # (``_storage_root_stat``, ``_durable_key``, ``_require_durable_record_
+    # id``, ``_label_key``): each was a facade-resident single-call forward
+    # whose one remaining production caller was rewired to call
+    # ``queue_layout``/``queue_store_write`` module-qualified directly (two
+    # of the four had zero production callers left at all). Only
+    # ``_job_record_path`` survives as a facade-resident delegator -- it has
+    # 26 real callers spanning the full rank range (CQ20-FA-01) -- so this
+    # signature-parity check now covers just that one member.
     "_job_record_path": "job_record_path",
-    "_durable_key": "durable_key",
-    "_require_durable_record_id": "require_durable_record_id",
-    "_label_key": "label_key",
 }
 
 
@@ -1091,7 +1102,7 @@ def test_cq10_owner_session_closure_uses_the_records_write_lookup(
     closing_path = (
         queue._storage_root  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         / "owner_sessions"
-        / f"{queue._label_key(owner_session_id, domain='owner-session')}.closing.json"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        / f"{QueueLayout.label_key(owner_session_id, domain='owner-session')}.closing.json"
     )
     closing_path.parent.mkdir(parents=True)
     closing_path.write_text(
@@ -2131,13 +2142,21 @@ def test_guard_discovers_and_rejects_unregistered_owner_fixture(tmp_path: Path) 
 def test_queue_store_protocol_is_implemented_by_one_private_adapter(
     tmp_path: Path,
 ) -> None:
-    """CQ3 owners share one private adapter, never the public facade surface."""
+    """CQ3 owners share one private adapter, never the public facade surface.
+
+    CQ20-JI-01 note: ``queue_jarvis_inputs`` used to hold its own private
+    reference to this adapter (an instance-composition ``QueueJarvisInputs``
+    helper, checked here as ``queue._jarvis_inputs._store is adapter``).
+    Dissolving that into a real ``QueueJarvisInputsMixin`` means its methods
+    now read ``self._store_adapter`` directly through the composed instance
+    -- the exact same attribute this test already asserts is the queue's one
+    private adapter, so there is no second reference left to check.
+    """
     queue = ClioCoreQueue(tmp_path)
 
     adapter = queue._store_adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert adapter is not queue
     assert queue._layout._store is adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert queue._jarvis_inputs._store is adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
@@ -2149,6 +2168,79 @@ def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
     }
 
     assert len(public_methods) == 128
+
+
+# CQ20's own acceptance test (design doc §3 row: "Run a reflection/MRO test
+# over every public method before deleting the last body"). Every public
+# ClioCoreQueue method must resolve -- through ordinary inherited attribute
+# lookup, walking the real MRO -- to a body defined on one of the composed
+# ``*Mixin`` owner classes, never to a body written directly on
+# ``ClioCoreQueue`` in core_queue.py. The two facade-legitimate exceptions
+# are pinned here by name, each with its own typed-deviation citation; an
+# addition to core_queue.py that grows this set must be added to the
+# allowlist explicitly in the same change, or this test goes red.
+_FACADE_RESIDENT_PUBLIC_METHODS: frozenset[str] = frozenset(
+    {
+        # CQ19-ST-02: a thin dispatch to the bare module-level
+        # ``queue_startup.initialize`` function, kept off the owner mixin
+        # manifest on purpose -- see that method's own docstring and
+        # ``queue_startup.py``'s module docstring for the full account.
+        "initialize",
+        # CQ19-TI-01: a thin dispatch over the write-ahead-log primitives
+        # that themselves stay facade-resident (``_recover_pending_
+        # transitions_unlocked`` and friends) -- see ``queue_transitions.
+        # py``'s module docstring for the full account.
+        "reconcile_pending_transitions",
+    }
+)
+
+
+def _mro_defining_class(name: str) -> type:
+    """Return the first class in ``ClioCoreQueue.__mro__`` that defines ``name``."""
+    for klass in ClioCoreQueue.__mro__:
+        if name in vars(klass):
+            return klass
+    raise AssertionError(f"{name!r} is not defined anywhere in the ClioCoreQueue MRO")
+
+
+def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist() -> None:
+    """CQ20's MRO proof: the facade composes owners, it does not implement them.
+
+    Walks every public method on the pinned 128-method surface (``test_
+    facade_public_method_set_stays_at_the_128_method_base``) and asserts
+    each one's real defining class -- found by walking ``ClioCoreQueue.
+    __mro__`` in resolution order, the same lookup Python itself performs --
+    is a composed ``*Mixin`` owner, never ``ClioCoreQueue`` itself, except
+    the two names in ``_FACADE_RESIDENT_PUBLIC_METHODS`` above. Those two are
+    checked in the opposite direction: each must still genuinely be defined
+    directly on ``ClioCoreQueue``, so the allowlist cannot silently go stale
+    if a future slice moves one of them into a real owner.
+    """
+    public_methods = {
+        name
+        for name, member in inspect.getmembers(ClioCoreQueue)
+        if not name.startswith("_") and (inspect.isfunction(member) or isinstance(member, property))
+    }
+    assert public_methods >= _FACADE_RESIDENT_PUBLIC_METHODS
+
+    for name in sorted(public_methods - _FACADE_RESIDENT_PUBLIC_METHODS):
+        defining_class = _mro_defining_class(name)
+        assert defining_class is not ClioCoreQueue, (
+            f"{name!r} is a core_queue-defined body, not inherited from an "
+            "owner mixin -- move it to its owner, or add it to "
+            "_FACADE_RESIDENT_PUBLIC_METHODS with a typed-deviation citation "
+            "if it is genuinely facade-legitimate."
+        )
+        assert defining_class.__name__.endswith("Mixin"), (
+            f"{name!r} resolves to {defining_class!r}, which is not a *Mixin owner class."
+        )
+
+    for name in sorted(_FACADE_RESIDENT_PUBLIC_METHODS):
+        assert _mro_defining_class(name) is ClioCoreQueue, (
+            f"{name!r} is pinned in _FACADE_RESIDENT_PUBLIC_METHODS as a "
+            "facade-resident deviation, but it is no longer defined on "
+            "ClioCoreQueue -- remove it from the allowlist."
+        )
 
 
 def test_index_completeness_gate_reads_through_the_cq5_owner(
@@ -2187,7 +2279,14 @@ def test_index_completeness_gate_reads_through_the_cq5_owner(
 
 
 def test_cq5_sealed_state_preserves_duplicate_key_rejection(tmp_path: Path) -> None:
-    """CQ5 keeps the sealed-state reader's strict duplicate-key contract."""
+    """CQ5 keeps the sealed-state reader's strict duplicate-key contract.
+
+    CQ20 dissolution: the facade's own ``_read_sealed_index_migration_state``
+    forward is deleted; ``queue_legacy_audit.QueueLegacyAuditMixin``'s
+    byte-identical ``_read_sealed_state`` (already exercised by that owner's
+    own audit methods) is the one real implementation left, reached here
+    through the composed ``ClioCoreQueue`` MRO.
+    """
     migrations = tmp_path / "migrations"
     migrations.mkdir()
     (migrations / "index-v1.json").write_text(
@@ -2196,18 +2295,28 @@ def test_cq5_sealed_state_preserves_duplicate_key_rejection(tmp_path: Path) -> N
     )
 
     with pytest.raises(core_queue_module.LegacyQueueStateError) as raised:
-        ClioCoreQueue(tmp_path)._read_sealed_index_migration_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ClioCoreQueue(tmp_path)._read_sealed_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert isinstance(raised.value.__cause__, QueueConflictError)
     assert "duplicate JSON key 'complete'" in str(raised.value.__cause__)
 
 
-def test_jarvis_input_facade_signatures_match_the_owner() -> None:
-    """CQ1 keeps every public facade signature byte-for-byte equivalent."""
+def test_jarvis_input_methods_are_inherited_from_the_owner_mixin() -> None:
+    """CQ20-JI-01: every jarvis-input public method resolves to the real owner.
+
+    CQ1 originally kept these eight methods as facade-resident delegators
+    with byte-for-byte matching signatures over a separately composed
+    ``QueueJarvisInputs`` helper. CQ20 dissolves that gap: the facade no
+    longer defines any of them, so the meaningful check is no longer
+    "do the two signatures match" (there is only one definition left) but
+    "does each one actually resolve to ``QueueJarvisInputsMixin``, not a
+    residual ``ClioCoreQueue``-defined body" -- exactly what the MRO proof
+    below also checks, made explicit here per-symbol for this family.
+    """
     for symbol in _JARVIS_INPUT_SYMBOLS:
-        facade_signature = inspect.signature(getattr(ClioCoreQueue, symbol))
-        owner_signature = inspect.signature(getattr(QueueJarvisInputs, symbol))
-        assert facade_signature == owner_signature, symbol
+        assert symbol not in vars(ClioCoreQueue), symbol
+        assert symbol in vars(QueueJarvisInputsMixin), symbol
+        assert getattr(ClioCoreQueue, symbol) is getattr(QueueJarvisInputsMixin, symbol), symbol
 
 
 def test_layout_facade_signatures_match_the_owner() -> None:

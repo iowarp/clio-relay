@@ -8,11 +8,9 @@ idempotency, leases, and cursor replay rather than a database choice.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar, cast
 
@@ -70,16 +68,8 @@ from clio_relay.errors import (
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
-    ArtifactUse,
     InputArtifactIngestPolicy,
     InputArtifactSpec,
-    JarvisPackageInputContractRecord,
-    JarvisPackageInputRoute,
-    JarvisPipelineInputBinding,
-    JarvisPipelineInputBindings,
-    JarvisPipelineInputLineage,
-    JarvisPipelineInputRoute,
-    JarvisRunInputManifest,
     JobKind,
     OwnerSessionJobMembership,
     RelayEvent,
@@ -238,6 +228,7 @@ class _QueueStoreAdapter:
 
 
 class ClioCoreQueue(
+    queue_jarvis_inputs.QueueJarvisInputsMixin,
     queue_index_discovery.QueueIndexDiscoveryMixin,
     queue_startup.QueueStartupMixin,
     queue_index_migration.QueueIndexMigrationMixin,
@@ -298,7 +289,6 @@ class ClioCoreQueue(
         self._store_adapter: queue_context.QueueStoreProtocol = _QueueStoreAdapter(self)
         self._jarvis_input_store = self._store_adapter
         self._layout = queue_layout.QueueLayout(self._store_adapter)
-        self._jarvis_inputs = queue_jarvis_inputs.QueueJarvisInputs(self._store_adapter)
 
     def initialize(
         self,
@@ -329,103 +319,11 @@ class ClioCoreQueue(
             allow_exclusive_seal=allow_exclusive_seal,
         )
 
-    def _storage_root_stat(self) -> os.stat_result:
-        """Inspect the queue root through its held descriptor when migration-pinned."""
-        return self._layout.storage_root_stat()
-
-    def _read_sealed_index_migration_state(
-        self,
-        *,
-        allow_legacy_lease_schema: bool = False,
-    ) -> dict[str, object]:
-        """Read and strictly validate indexed-era state without repairing or scanning."""
-        return queue_index_state.read_sealed_index_migration_state(
-            self._storage_root,
-            allow_legacy_lease_schema=allow_legacy_lease_schema,
-            checkpoint_validator=self._require_sealed_checkpoint,
-            document_reader=_read_unique_json_document,
-        )
-
     def reconcile_pending_transitions(self) -> None:
         """Replay bounded write-ahead transitions left by another process."""
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
-
-    def get_jarvis_package_input_contract(
-        self,
-        route: JarvisPackageInputRoute,
-    ) -> JarvisPackageInputContractRecord | None:
-        """Load one exact checksum-bound package input contract record."""
-        return self._jarvis_inputs.get_jarvis_package_input_contract(route)
-
-    def put_jarvis_package_input_contract(
-        self,
-        record: JarvisPackageInputContractRecord,
-    ) -> JarvisPackageInputContractRecord:
-        """Persist immutable package semantics for one exact registered route."""
-        return self._jarvis_inputs.put_jarvis_package_input_contract(record)
-
-    def get_jarvis_pipeline_input_lineage(
-        self,
-        route: JarvisPipelineInputRoute,
-    ) -> JarvisPipelineInputLineage | None:
-        """Load one exact checksum-bound pipeline input lineage record."""
-        return self._jarvis_inputs.get_jarvis_pipeline_input_lineage(route)
-
-    def get_jarvis_pipeline_input_bindings(
-        self,
-        route: JarvisPipelineInputRoute,
-    ) -> JarvisPipelineInputBindings | None:
-        """Load current local-file bindings for one exact registered pipeline route."""
-        return self._jarvis_inputs.get_jarvis_pipeline_input_bindings(route)
-
-    def update_jarvis_pipeline_input_bindings(
-        self,
-        route: JarvisPipelineInputRoute,
-        *,
-        upserts: tuple[JarvisPipelineInputBinding, ...] = (),
-        remove: tuple[tuple[str, str], ...] = (),
-    ) -> JarvisPipelineInputBindings:
-        """Atomically update exact step/setting bindings for one pipeline route."""
-        return self._jarvis_inputs.update_jarvis_pipeline_input_bindings(
-            route,
-            upserts=upserts,
-            remove=remove,
-        )
-
-    def get_jarvis_run_input_manifest(
-        self,
-        route: JarvisPipelineInputRoute,
-        *,
-        idempotency_key: str,
-    ) -> JarvisRunInputManifest | None:
-        """Load an immutable input manifest for one exact jarvis_run admission."""
-        return self._jarvis_inputs.get_jarvis_run_input_manifest(
-            route,
-            idempotency_key=idempotency_key,
-        )
-
-    def put_jarvis_run_input_manifest(
-        self,
-        record: JarvisRunInputManifest,
-    ) -> JarvisRunInputManifest:
-        """Persist the first exact input manifest admitted for one run key."""
-        return self._jarvis_inputs.put_jarvis_run_input_manifest(record)
-
-    def merge_jarvis_pipeline_input_lineage(
-        self,
-        route: JarvisPipelineInputRoute,
-        artifact_uses: tuple[ArtifactUse, ...],
-        *,
-        manifest_sha256: str,
-    ) -> JarvisPipelineInputLineage:
-        """Atomically merge staged inputs for one exact registered pipeline route."""
-        return self._jarvis_inputs.merge_jarvis_pipeline_input_lineage(
-            route,
-            artifact_uses,
-            manifest_sha256=manifest_sha256,
-        )
 
     def _assert_input_ingest_quota_unlocked(
         self,
@@ -476,7 +374,7 @@ class ClioCoreQueue(
             owner_session_id,
             session_generation_id=session_generation_id,
         )
-        paths = self._bounded_json_record_paths(
+        paths = queue_store_read.bounded_json_record_paths(
             directory,
             limit=MAX_ACTIVE_JOB_RECORDS,
             label="owner-session input ingest quota membership",
@@ -586,35 +484,45 @@ class ClioCoreQueue(
     def _job_record_path(self, family: str, job_id: str, record_id: str) -> Path:
         return self._layout.job_record_path(family, job_id, record_id)
 
-    @staticmethod
-    def _durable_key(value: str) -> str:
-        return queue_layout.QueueLayout.durable_key(value)
-
-    @staticmethod
-    def _require_durable_record_id(value: str, *, field: str) -> str:
-        return queue_layout.QueueLayout.require_durable_record_id(value, field=field)
-
-    @staticmethod
-    def _label_key(value: str, *, domain: str) -> str:
-        return queue_layout.QueueLayout.label_key(value, domain=domain)
+    # CQ20-FA-01 typed deviation: the methods below (plus ``_job_record_path``
+    # above) are the private "store adapter" family -- thin, single-call
+    # forwards to ``queue_store_read``/``queue_store_write`` module functions
+    # that stay facade-resident rather than moving to any one CQ20 owner.
+    # Two independent constraints force this, mirroring CQ19-TI-01's own
+    # "hub method, no clean hoist target" class:
+    #   * ``_write``/``_write_json``/``_read_optional``/``_read_json_document``
+    #     are called by ``_QueueStoreAdapter`` as ``self._queue._write(...)``
+    #     etc (ledger §9.5): routing through the *instance* rather than the
+    #     bare module function is what keeps ``monkeypatch.setattr(queue,
+    #     "_write", ...)`` (an established, widely used test seam) live. A
+    #     module-qualified rewrite would silently break every such patch.
+    #   * ``_job_record_path``/``_write``/``_write_json``/``_read_optional``/
+    #     ``_scan_many``/``_recover_pending_transitions_unlocked`` (above) are
+    #     each self-called from many already-landed owners spanning the full
+    #     rank range, and ``_scan_many`` is additionally inherited directly by
+    #     ``storage_runtime.StorageManagedQueue(ClioCoreQueue)`` -- a real
+    #     production subclass outside the queue-owner family entirely, not
+    #     just another mixin caller. None of these calls are owned by any
+    #     ``queue_*.py`` mixin, so they carry no architecture-guard edge
+    #     regardless of rank (same invisibility CQ19-ST-02 established for
+    #     ``initialize``).
+    # Every other CQ19-era single-caller wrapper (``_storage_root_stat``,
+    # ``_durable_key``, ``_require_durable_record_id``, ``_label_key``,
+    # ``_require_safe_write_directory``, ``_purge_write_staging_unlocked``,
+    # ``_write_text``, ``_read_canonical_record``, ``_bounded_json_record_
+    # paths``, the dead ``_read_many``, and the ``_read_sealed_index_
+    # migration_state``/``_read_unique_json_document`` pair) is dissolved in
+    # CQ20: either its one real caller now calls the module function (or, for
+    # the sealed-state pair, ``queue_legacy_audit``'s existing equivalent
+    # ``_read_sealed_state``) directly, or -- ``_require_durable_record_id``/
+    # ``_label_key`` -- it had zero production callers left at all. See the
+    # design doc ledger §15 for the full accounting.
 
     def _write(self, path: Path, record: BaseModel) -> None:
         queue_store_write.write_model(self._storage_root, path, record)
 
     def _write_json(self, path: Path, record: dict[str, object]) -> None:
         queue_store_write.write_json(self._storage_root, path, record)
-
-    def _require_safe_write_directory(self, directory: Path) -> os.stat_result:
-        return queue_store_write.require_safe_write_directory(self._storage_root, directory)
-
-    def _purge_write_staging_unlocked(self) -> None:
-        queue_store_write.purge_write_staging(self._storage_root)
-
-    def _write_text(self, path: Path, text: str) -> None:
-        queue_store_write.write_text(self._storage_root, path, text)
-
-    def _read_canonical_record(self, path: Path, model: type[Record]) -> Record:
-        return queue_store_read.read_canonical_record(self._storage_root, path, model)
 
     def _read_optional(self, path: Path, model: type[Record]) -> Record | None:
         record = queue_store_read.read_optional(self._storage_root, path, model)
@@ -625,21 +533,6 @@ class ClioCoreQueue(
         ):
             self._validate_legacy_output_event_access(path, record)
         return record
-
-    @classmethod
-    def _read_many(
-        cls,
-        directory: Path,
-        model: type[Record],
-        *,
-        identity_field: str | None = None,
-    ) -> Iterable[Record]:
-        del cls
-        return queue_store_read.read_many(
-            directory,
-            model,
-            identity_field=identity_field,
-        )
 
     @classmethod
     def _scan_many(
@@ -659,49 +552,12 @@ class ClioCoreQueue(
         )
 
     @staticmethod
-    def _bounded_json_record_paths(
-        directory: Path,
-        *,
-        limit: int,
-        label: str,
-    ) -> list[Path]:
-        return queue_store_read.bounded_json_record_paths(
-            directory,
-            limit=limit,
-            label=label,
-        )
-
-    @staticmethod
     def _read_json_file(path: Path, model: type[Record]) -> Record:
         return queue_store_read.read_json_file(path, model)
 
     @staticmethod
     def _read_json_document(path: Path) -> object:
         return queue_store_read.read_json_document(path)
-
-
-def _read_unique_json_document(path: Path) -> object:
-    """Read JSON while rejecting duplicate keys at every object depth."""
-
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        document: dict[str, object] = {}
-        for key, value in pairs:
-            if key in document:
-                raise QueueConflictError(f"duplicate JSON key {key!r} in {path}")
-            document[key] = value
-        return document
-
-    try:
-        return json.loads(
-            _read_bounded_record_bytes(path),
-            object_pairs_hook=unique_object,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise queue_conflict_from_cause(
-            f"invalid JSON record {path}",
-            cause=exc,
-            logger=logger,
-        ) from exc
 
 
 def _is_canonical_event_path(storage_root: Path, path: Path, family: str) -> bool:
@@ -740,7 +596,3 @@ def _bounded_regular_json_count(
 
 def _record_is_reparse(file_stat: os.stat_result) -> bool:
     return queue_layout.record_is_reparse(file_stat)
-
-
-def _read_bounded_record_bytes(path: Path) -> bytes:
-    return queue_store_read.read_bounded_record_bytes(path)

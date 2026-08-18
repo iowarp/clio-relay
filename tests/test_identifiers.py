@@ -12,9 +12,8 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from clio_relay import core_queue as core_queue_module
 from clio_relay import mcp_server as mcp_server_module
-from clio_relay import queue_layout
+from clio_relay import queue_gateway_indexes, queue_layout, queue_store_read
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
@@ -221,7 +220,11 @@ def test_canonical_scan_layouts_bind_filename_to_record_identity(tmp_path: Path)
     assert [item.job_id for item in active] == [job.job_id]
     assert [item.lease_id for item in job_leases] == [lease.lease_id]
     assert [item.job_id for item in due] == [pending.job_id]
-    cluster_token = core_queue_module._stable_ref_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # Pre-existing (pre-CQ20) drift, fixed in-campaign: CQ16 (ledger §11.5)
+    # moved ``_stable_ref_token`` from the facade to ``queue_gateway_indexes``
+    # but this call site was never updated, leaving it broken since CQ16
+    # landed (confirmed failing identically on the unmodified CQ19 tip).
+    cluster_token = queue_gateway_indexes._stable_ref_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "Target:GPU"
     )
     assert (
@@ -593,7 +596,13 @@ def test_runtime_canonical_read_delegates_to_the_layout_owner(
     monkeypatch.setattr(queue_layout, "validate_canonical_access", sabotage)
 
     with pytest.raises(CanonicalAccessSabotage):
-        queue._read_canonical_record(path, RelayJob)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        # CQ20: the facade's ``_read_canonical_record`` forward is deleted;
+        # every real caller now calls this module-qualified directly.
+        queue_store_read.read_canonical_record(
+            queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path,
+            RelayJob,
+        )
 
 
 def test_legacy_canonical_reparse_family_fails_before_writes(tmp_path: Path) -> None:

@@ -17,6 +17,13 @@ precedent. ``lease_operational_records_present`` also lives here per the
 design's disjoint-inventory note even though its only callers today remain
 facade-resident startup/migration code (not yet split); it is an I/O-bearing
 scan of the same five index families this owner already manages.
+
+CQ20 dissolution: this owner's two remaining facade-wrapper calls each had
+exactly one caller in the whole codebase, right here. The bounded manifest
+write (``_write_text``) now calls ``queue_store_write.write_text`` directly,
+module-qualified; the root-descriptor stat (``_storage_root_stat``) now
+calls the composed ``self._layout.storage_root_stat()`` directly, matching
+``queue_legacy_audit.py``'s own established ``self._layout`` usage.
 """
 
 from __future__ import annotations
@@ -111,7 +118,11 @@ def sync_operational_indexes(
         queue._lease_expiry_ref_path(identity),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     ):
         queue._require_safe_lease_index_directory(path.parent, create=True)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        queue._write_text(path, "")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue_store_write.write_text(
+            queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path,
+            "",
+        )
     return identity
 
 
@@ -121,11 +132,10 @@ class QueueLeaseIndexesMixin:
     _storage_root: Path
     _lock: queue_context.QueueLockProtocol
     _store_adapter: queue_context.QueueStoreProtocol
+    _layout: queue_layout.QueueLayout
 
     if TYPE_CHECKING:
 
-        def _write_text(self, path: Path, text: str) -> None: ...
-        def _storage_root_stat(self) -> os.stat_result: ...
         def _write_json(self, path: Path, record: dict[str, object]) -> None: ...
 
     def _lease_index_identity(
@@ -351,7 +361,7 @@ class QueueLeaseIndexesMixin:
         }:
             raise QueueConflictError(f"unsupported lease index directory: {directory}")
         try:
-            root_stat = self._storage_root_stat()
+            root_stat = self._layout.storage_root_stat()
         except FileNotFoundError as exc:
             raise QueueConflictError(f"queue root is missing: {self._storage_root}") from exc
         if not stat.S_ISDIR(root_stat.st_mode) or queue_layout.record_is_reparse(root_stat):

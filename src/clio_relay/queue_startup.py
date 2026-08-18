@@ -61,11 +61,23 @@ imported bare, so the existing patch sites keep a live seam to move to.
 
 CQ19-TI-01 (see ``queue_index_discovery.py``'s module docstring for the full
 account): ``_read_index_migration_state``/``_write_index_migration_state``/
-``_read_sealed_index_migration_state``/``_recover_pending_transitions_
-unlocked``/``_require_safe_write_directory``/``_write_json``/``_purge_write_
-staging_unlocked`` all stay facade-resident and are called on ``queue``
-unchanged -- none of them are owned by any ``queue_*.py`` mixin, so these
-calls carry no architecture-guard edge at all.
+``_recover_pending_transitions_unlocked``/``_write_json`` all stay
+facade-resident and are called on ``queue`` unchanged -- none of them are
+owned by any ``queue_*.py`` mixin, so these calls carry no architecture-guard
+edge at all.
+
+CQ20 dissolution: the other three items this docstring used to group with
+that list turned out not to share its constraint once actually checked
+against the call graph, so CQ20 dissolves all three instead of leaving them
+facade-resident. ``_require_safe_write_directory``/``_purge_write_staging_
+unlocked`` each had exactly one caller in the whole codebase -- this
+function, right here -- so both now call their real ``queue_store_write``
+module function directly, module-qualified. ``_read_sealed_index_migration_
+state`` (also single-purpose, two callers) is deleted outright: ``queue_
+legacy_audit.QueueLegacyAuditMixin`` (rank 12, already a valid predecessor)
+owns a byte-identical private equivalent, ``_read_sealed_state``; this
+function now calls ``queue._read_sealed_state()`` instead of maintaining a
+second, facade-resident copy of the same forward.
 """
 
 from __future__ import annotations
@@ -85,6 +97,7 @@ from clio_relay import (
     queue_legacy_audit,
     queue_store_lock,
     queue_store_read,
+    queue_store_write,
     worker_lifetime_lock,
 )
 from clio_relay.errors import ConfigurationError
@@ -183,7 +196,10 @@ def initialize(
                 legacy_output_audit = locked_indexed_audit
             for family in queue_store_lock.ADDITIVE_QUEUE_FAMILIES:
                 directory = queue._storage_root / family  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                directory_stat = queue._require_safe_write_directory(directory)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                directory_stat = queue_store_write.require_safe_write_directory(
+                    queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    directory,
+                )
                 queue._require_owner_private_queue_directory(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     family,
                     directory,
@@ -193,7 +209,9 @@ def initialize(
                 legacy_output_audit,
                 migrate_legacy_output=migrate_legacy_output,
             )
-            queue._purge_write_staging_unlocked()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue_store_write.purge_write_staging(
+                queue._storage_root  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
             queue._migrate_legacy_output_events_unlocked(legacy_output_audit)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             migration_path = queue._storage_root / "migrations" / "index-v1.json"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             if not migration_path.exists():
@@ -323,7 +341,7 @@ def initialize(
             else:
                 queue._upgrade_sealed_lease_operational_schema_unlocked()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 queue._reconcile_sealed_lease_capacity_gate_unlocked()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                queue._read_sealed_index_migration_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                queue._read_sealed_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue._initialized = True  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     except queue_store_lock.QueueSealRequiresExclusive:
         if not allow_exclusive_seal:
@@ -371,11 +389,9 @@ class QueueStartupMixin:
         def _upgrade_sealed_lease_operational_schema_unlocked(self) -> None: ...
         def _reconcile_sealed_lease_capacity_gate_unlocked(self) -> None: ...
 
-        def _require_safe_write_directory(self, directory: Path) -> os.stat_result: ...
-        def _purge_write_staging_unlocked(self) -> None: ...
         def _write_json(self, path: Path, record: dict[str, object]) -> None: ...
         def _recover_pending_transitions_unlocked(self) -> list[RelayJob]: ...
-        def _read_sealed_index_migration_state(
+        def _read_sealed_state(
             self,
             *,
             allow_legacy_lease_schema: bool = False,
