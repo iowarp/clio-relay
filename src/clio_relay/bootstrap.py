@@ -7148,7 +7148,11 @@ else:
         text=True,
         timeout=10,
     )
-    if completed.returncode != 0 or completed.stdout.strip() != "uv {UV_VERSION}":
+    # uv prints "uv <version> (<platform> <date>)"; older builds printed just
+    # "uv <version>". Compare the version TOKEN, never the whole line, or a
+    # byte-identical pinned uv is rejected over a cosmetic suffix (#158).
+    version_fields = completed.stdout.strip().split()
+    if completed.returncode != 0 or version_fields[:2] != ["uv", "{UV_VERSION}"]:
         raise SystemExit("bootstrap cannot adopt an existing uv version")
 
 jarvis_util = home / ".local/src/jarvis-util"

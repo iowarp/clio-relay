@@ -63,7 +63,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # reports a syntax error for a script that was cut mid-token, naming
     # neither the truncation nor the transport. The added lines are the _run
     # input_bytes passthrough and the comment recording the hazard.
-    "src/clio_relay/bootstrap.py": 8750,
+    # #158: +4 further lines -- the uv adoption check compares the version
+    # TOKEN instead of the whole `uv --version` line. uv prints a platform
+    # suffix, so a byte-identical pinned uv (its sha256 already verified) was
+    # rejected over cosmetics.
+    "src/clio_relay/bootstrap.py": 8754,
     "src/clio_relay/bootstrap_journal.py": 1497,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
