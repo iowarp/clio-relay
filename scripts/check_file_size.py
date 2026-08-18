@@ -191,7 +191,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # _job_record_path/_write_transition_intent_unlocked/
     # _recover_pending_transitions_unlocked stay facade-resident (still
     # un-extracted, self-called as before). Net: 8430 -> 8009.
-    "src/clio_relay/core_queue.py": 8009,
+    "src/clio_relay/core_queue.py": 4848,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_

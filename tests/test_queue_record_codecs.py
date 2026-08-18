@@ -23,7 +23,15 @@ from clio_relay.models import (
 
 
 def test_lease_record_codec_is_byte_identical_to_the_parent_facade() -> None:
-    """The CQ4 lease owner preserves the pre-move JSON byte ordering and values."""
+    """The CQ4 lease owner preserves the pre-move JSON byte ordering and values.
+
+    Post-CQ15 update: the facade's ``_lease_index_document`` re-export is gone
+    -- both of its former callers (``queue_lease_indexes``,
+    ``queue_lease_recovery``) now call ``queue_lease_records.
+    lease_index_document`` directly, so there is no facade copy left to
+    compare against. This still pins the exact expected byte string (design
+    §4: preserve lookup-site ownership, not a dead facade shim).
+    """
     identity = queue_lease_records.LeaseIndexIdentity(
         lease_id="lease-cq4",
         job_id="job-cq4",
@@ -32,18 +40,16 @@ def test_lease_record_codec_is_byte_identical_to_the_parent_facade() -> None:
         job_kind=JobKind.JARVIS,
         expires_at=datetime(2026, 8, 15, 12, 34, 56, 789, tzinfo=UTC),
     )
-    parent_document = core_queue_module._lease_index_document(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     owner_document = queue_lease_records.lease_index_document(identity)
-    parent_bytes = json.dumps(parent_document).encode("utf-8")
     owner_bytes = json.dumps(owner_document).encode("utf-8")
-    expected_parent_bytes = (
+    expected_bytes = (
         b'{"schema_version": "clio-relay.lease-operational-index.v2", '
         b'"lease_id": "lease-cq4", "job_id": "job-cq4", '
         b'"endpoint_id": "endpoint-cq4", "cluster": "cluster-cq4", '
         b'"job_kind": "jarvis", "expires_at": "2026-08-15T12:34:56.000789+00:00"}'
     )
 
-    assert parent_bytes == owner_bytes == expected_parent_bytes
+    assert owner_bytes == expected_bytes
     decoded = queue_lease_records.lease_index_identity_from_document(
         json.loads(owner_bytes),
         label="CQ4 lease round trip",

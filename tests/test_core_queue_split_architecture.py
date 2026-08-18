@@ -25,7 +25,11 @@ from clio_relay import (
     queue_index_state,
     queue_input_ingest,
     queue_jobs,
+    queue_lease_admission,
+    queue_lease_capacity_audit,
+    queue_lease_indexes,
     queue_lease_records,
+    queue_leases,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_order_index,
@@ -92,6 +96,13 @@ _OWNER_RANK = {
     "queue_input_ingest": 23,
     "queue_progress": 24,
     "queue_tasks": 25,
+    "queue_lease_indexes": 26,
+    "queue_lease_capacity_state": 27,
+    "queue_lease_capacity_audit": 28,
+    "queue_lease_recovery": 29,
+    "queue_lease_admission": 30,
+    "queue_leases": 31,
+    "queue_scheduler_cancel_claims": 32,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -120,6 +131,13 @@ _OWNER_BUDGETS = {
     "queue_input_ingest": 715,
     "queue_progress": 190,
     "queue_tasks": 420,
+    "queue_lease_indexes": 620,
+    "queue_lease_capacity_state": 490,
+    "queue_lease_capacity_audit": 600,
+    "queue_lease_recovery": 620,
+    "queue_lease_admission": 590,
+    "queue_leases": 360,
+    "queue_scheduler_cancel_claims": 560,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -202,6 +220,21 @@ class _PutMcpTaskCompositionSabotage(RuntimeError):
 
 class _ProgressIndexStateLookupSabotage(RuntimeError):
     """Raised only when CQ14 latest-progress reaches its index-state owner."""
+
+
+class _LeaseCapacityAuditSyncLookupSabotage(RuntimeError):
+    """Raised only when CQ15 repair reaches queue_lease_indexes.sync_operational_indexes
+    through the ``queue_lease_capacity_audit`` owner's module-qualified lookup."""
+
+
+class _LeaseAdmissionWriteJobLookupSabotage(RuntimeError):
+    """Raised only when CQ15 lease acquisition (``queue_lease_admission``) reaches
+    queue_jobs.write_job through its owner seam."""
+
+
+class _LeaseRecoveryWriteJobLookupSabotage(RuntimeError):
+    """Raised only when CQ15 stale-lease recovery (``queue_lease_recovery``) reaches
+    queue_jobs.write_job through its owner seam."""
 
 
 @dataclass(frozen=True)
@@ -1291,6 +1324,122 @@ def test_cq14_latest_job_progress_uses_the_index_state_lookup(
     )
 
 
+def test_cq15_repair_uses_the_lease_indexes_sync_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Lease-operational-index repair must resolve convergence through the
+    CQ15 owner seam onto ``queue_lease_indexes.sync_operational_indexes``
+    (isolated-namespace pattern -- design row: "Patch ``queue_lease_capacity_
+    audit.queue_lease_indexes.sync_operational_indexes``, then each
+    lifecycle/recovery job-write lookup.")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq15",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq15-repair",
+        )
+    )
+    lease = queue.acquire_job(job.job_id, "worker-cq15", cluster="cluster-cq15")
+    assert lease is not None
+
+    def sabotage(*_args: object, **_kwargs: object) -> object:
+        raise _LeaseCapacityAuditSyncLookupSabotage(
+            "queue_lease_capacity_audit lease-indexes sync lookup engaged"
+        )
+
+    isolated_lease_indexes = SimpleNamespace(
+        **{**vars(queue_lease_indexes), "sync_operational_indexes": sabotage}
+    )
+    monkeypatch.setattr(queue_lease_capacity_audit, "queue_lease_indexes", isolated_lease_indexes)
+
+    with pytest.raises(
+        _LeaseCapacityAuditSyncLookupSabotage,
+        match="queue_lease_capacity_audit lease-indexes sync lookup engaged",
+    ):
+        queue.repair_lease_operational_indexes()
+
+    assert (
+        ClioCoreQueue.repair_lease_operational_indexes
+        is queue_lease_capacity_audit.QueueLeaseCapacityAuditMixin.repair_lease_operational_indexes
+    )
+
+
+def test_cq15_lease_acquisition_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Worker-lane lease acquisition (``queue_lease_admission``) must resolve
+    its canonical job write through the ``queue_jobs.write_job`` seam
+    (design row: "then each lifecycle/recovery job-write lookup" -- the
+    lifecycle half)."""
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq15",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq15-acquire",
+        )
+    )
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _LeaseAdmissionWriteJobLookupSabotage(
+            "queue_lease_admission write_job lookup engaged"
+        )
+
+    # queue_lease_admission calls self._write_job_unlocked(...), the inherited
+    # QueueJobsMixin wrapper whose body calls the bare ``write_job`` name
+    # resolved from queue_jobs.py's own module globals -- the real lookup
+    # site, matching the CQ12 precedent (test_cq12_submit_job_uses_the_
+    # write_job_lookup patches this exact same global).
+    monkeypatch.setattr(queue_jobs, "write_job", sabotage)
+
+    with pytest.raises(
+        _LeaseAdmissionWriteJobLookupSabotage,
+        match="queue_lease_admission write_job lookup engaged",
+    ):
+        queue.acquire_job(job.job_id, "worker-cq15", cluster="cluster-cq15")
+
+    assert ClioCoreQueue.acquire_job is queue_lease_admission.QueueLeaseAdmissionMixin.acquire_job
+
+
+def test_cq15_stale_recovery_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Stale-lease recovery (``queue_lease_recovery``) must resolve its
+    requeue/fail job write through the ``queue_jobs.write_job`` seam
+    (design row: "then each lifecycle/recovery job-write lookup" -- the
+    recovery half)."""
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq15",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq15-recover",
+        )
+    )
+    lease = queue.acquire_job(job.job_id, "worker-cq15", cluster="cluster-cq15", ttl_seconds=-1)
+    assert lease is not None
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _LeaseRecoveryWriteJobLookupSabotage("queue_lease_recovery write_job lookup engaged")
+
+    monkeypatch.setattr(queue_jobs, "write_job", sabotage)
+
+    with pytest.raises(
+        _LeaseRecoveryWriteJobLookupSabotage,
+        match="queue_lease_recovery write_job lookup engaged",
+    ):
+        queue.recover_stale_job(job.job_id, cluster="cluster-cq15")
+
+    assert queue_leases.QueueLeasesMixin.recover_stale_job is ClioCoreQueue.recover_stale_job
+
+
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
     """A top-level absolute owner import cannot bypass bare-function checks."""
     tree = ast.parse("from queue_layout import validate_canonical_access\n")
@@ -1440,31 +1589,43 @@ def test_layout_facade_signatures_match_the_owner() -> None:
         assert facade_signature == owner_signature, facade_symbol
 
 
-def test_lease_decoder_lookup_is_owned_by_the_cq4_module(monkeypatch: MonkeyPatch) -> None:
-    """The facade's lease decoder must re-resolve the CQ4 owner lookup."""
+def test_lease_decoder_lookup_is_owned_by_the_cq4_module(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The CQ15 ``queue_lease_indexes`` owner must re-resolve the CQ4 decoder
+    lookup for the lease operational-index manifest it reads.
+
+    Post-CQ15 update: the facade no longer keeps a bare
+    ``_lease_index_identity_from_document`` re-export -- both of its former
+    callers (``queue_lease_indexes._read_lease_index_identity_by_token`` and
+    the recovery-intent replay path) now call ``queue_lease_records.
+    lease_index_identity_from_document`` directly. The real call site moved;
+    this test follows it (design §4: "patch the module containing the real
+    call expression, not ... a dead facade shim").
+    """
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq4-lease",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq4-lease-decoder",
+        )
+    )
+    lease = queue.acquire_job(job.job_id, "worker-cq4-lease", cluster="cluster-cq4-lease")
+    assert lease is not None
 
     def sabotage(*_args: object, **_kwargs: object) -> None:
         raise _CodecLookupSabotage("queue_lease_records decoder lookup engaged")
 
     monkeypatch.setattr(queue_lease_records, "lease_index_identity_from_document", sabotage)
-    document = {
-        "schema_version": "clio-relay.lease-operational-index.v2",
-        "lease_id": "lease-cq4",
-        "job_id": "job-cq4",
-        "endpoint_id": "endpoint-cq4",
-        "cluster": "cluster-cq4",
-        "job_kind": JobKind.JARVIS.value,
-        "expires_at": datetime(2026, 8, 15, 12, tzinfo=UTC).isoformat(),
-    }
 
     with pytest.raises(
         _CodecLookupSabotage,
         match="queue_lease_records decoder lookup engaged",
     ):
-        core_queue_module._lease_index_identity_from_document(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            document,
-            label="CQ4 lease",
-        )
+        queue._read_lease_index_identity(lease.lease_id)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_scheduler_decoder_lookup_is_owned_by_the_cq4_module(

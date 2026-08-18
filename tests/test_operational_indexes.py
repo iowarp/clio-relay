@@ -8,11 +8,18 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-from clio_relay import queue_jobs
+from clio_relay import (
+    queue_jobs,
+    queue_lease_admission,
+    queue_lease_capacity_audit,
+    queue_lease_indexes,
+    queue_store_read,
+)
 from clio_relay.core_queue import (
     DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     LEASE_OPERATIONAL_INDEX_SCHEMA,
@@ -104,19 +111,30 @@ def test_preexisting_over_capacity_queue_can_still_drain(
             pid=123,
         )
     )
-    original_scan = queue._scan_many  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # Post-CQ15: acquire_next_job's queued-jobs scan resolves through
+    # queue_lease_admission.queue_store_read.scan_many directly (design §4
+    # row: "queue._scan_many -> queue_leases.queue_store_read.scan_many";
+    # the real owner landed as queue_lease_admission, a same-rank peer split
+    # out of queue_leases -- see that module's docstring), not the facade's
+    # bare _scan_many classmethod. Isolated-namespace pattern so only this
+    # owner's lookup is sabotaged.
+    original_scan = queue_store_read.scan_many
 
     def truncated_queued_scan(
         directory: Path,
         model: type[RelayJob],
         *,
         limit: int,
+        identity_field: str | None = None,
     ) -> tuple[list[RelayJob], bool]:
         if directory == queue.root / "jobs_queued":
             return [job], True
-        return original_scan(directory, model, limit=limit)
+        return original_scan(directory, model, limit=limit, identity_field=identity_field)
 
-    monkeypatch.setattr(queue, "_scan_many", truncated_queued_scan)
+    isolated_store_read = SimpleNamespace(
+        **{**vars(queue_store_read), "scan_many": truncated_queued_scan}
+    )
+    monkeypatch.setattr(queue_lease_admission, "queue_store_read", isolated_store_read)
 
     lease = queue.acquire_next_job(endpoint.endpoint_id, cluster="ares")
 
@@ -401,13 +419,22 @@ def test_lease_index_repair_intent_rebuilds_after_clear_crash(
     def crash_during_rebuild(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated repair rebuild crash")
 
-    monkeypatch.setattr(
-        queue,
-        "_sync_lease_operational_indexes_unlocked",
-        crash_during_rebuild,
+    # Post-CQ15: the repair loop resolves convergence through the
+    # module-qualified queue_lease_capacity_audit.queue_lease_indexes.
+    # sync_operational_indexes lookup, not a bound self.-method (design doc
+    # CQ15 row: "Patch queue_lease_capacity_audit.queue_lease_indexes.
+    # sync_operational_indexes"). Isolated-namespace pattern so only this
+    # owner's lookup is sabotaged.
+    isolated_lease_indexes = SimpleNamespace(
+        **{**vars(queue_lease_indexes), "sync_operational_indexes": crash_during_rebuild}
     )
+    monkeypatch.setattr(queue_lease_capacity_audit, "queue_lease_indexes", isolated_lease_indexes)
     with pytest.raises(RuntimeError, match="repair rebuild crash"):
         queue.repair_lease_operational_indexes()
+    # Undo before the restart: the crash-recovery replay below must reach the
+    # real (non-sabotaged) convergence, exactly as the original instance-level
+    # patch (which a fresh ``restarted`` instance never inherited) did.
+    monkeypatch.undo()
 
     restarted = ClioCoreQueue(root)
     restarted.initialize()

@@ -526,3 +526,235 @@ owners per this file's original inventory). This duplication is intentional
 and stays until CQ13/CQ18 land and a real shared owner exists to hold one
 copy; noted here per this batch's review so it is not mistaken for
 undiscovered drift.
+
+## 10. CQ15 landing — lease capacity, indexes, leases, recovery, scheduler claims
+
+CQ15 (predecessors CQ3-CQ5, CQ11, CQ12, all landed) is the largest single
+slice: lease-capacity aggregate/checkpoint state, its repair/audit
+orchestration, every lease operational-index primitive, the full lease
+lifecycle (listing, admission/acquisition, renewal, release), the stale-lease
+recovery engine, and the scheduler-cancellation attempt/confirmation claim
+methods. It lands as **seven** owners, not the doc's original six: the
+worker-lane admission/acquisition path (`acquire_next_job`, `acquire_job`,
+`submit_and_acquire_job`, `_lease_job_unlocked`, the MCP admission-lane
+matcher/counter, `_active_lease_for_endpoint`) split out of `queue_leases.py`
+into `queue_lease_admission.py` as a same-rank peer once the combined file
+exceeded the 800-line hard gate (854 real lines); the two owners have zero
+call-graph overlap, so the split is a clean peer separation, not a forced one.
+
+### 10.1 owner ranks and real line counts
+
+| Rank | Owner | Real | Cap | Gross+overhead plan |
+|---:|---|---:|---:|---|
+| 26 | `queue_lease_indexes.py` | 600 | 620 | `queue_lease_indexes.py` planned 730 |
+| 27 | `queue_lease_capacity_state.py` | 474 | 490 | `queue_lease_capacity_state.py` planned 470 |
+| 28 | `queue_lease_capacity_audit.py` | 584 | 600 | `queue_lease_capacity_audit.py` planned 440 |
+| 29 | `queue_lease_recovery.py` | 601 | 620 | `queue_lease_recovery.py` planned 440 |
+| 30 | `queue_lease_admission.py` | 571 | 590 | (new split; not in the original six) |
+| 31 | `queue_leases.py` | 340 | 360 | `queue_leases.py` planned 650 |
+| 32 | `queue_scheduler_cancel_claims.py` | 538 | 560 | `queue_scheduler_cancel_claims.py` planned 520 |
+
+`core_queue.py` fell from 8,009 to 4,848 physical lines (net removal 3,161;
+the ratchet in `scripts/check_file_size.py` is lowered to 4848 in the same
+change). Every landed cap is below the 800-line hard gate; the facade public
+method count stays exactly 128
+(`test_facade_public_method_set_stays_at_the_128_method_base`).
+
+### 10.2 ownership resolution beyond the original per-line inventory
+
+The design's section-1 inventory assigned lines by their *physical position*
+in the pinned `d6253d7` file, not by call-graph analysis. Reconciling that
+against the real dependency graph (CQ13-IO-01/CQ4-IO-01 precedent: fix the
+cause, keep byte-identical bodies, document any resulting deviation) produced
+one genuine two-owner cycle and its resolution:
+
+- **`queue_leases` <-> `queue_lease_recovery` cycle (CQ15-LR-01).**
+  `queue_leases.acquire_next_job`/`acquire_job`/`submit_and_acquire_job` (via
+  the now-split `queue_lease_admission`) must reconcile stale leases
+  *before* computing admission capacity, so admission depends on the
+  recovery engine. The recovery engine's stale-sweep in turn deletes expired
+  leases through `_delete_lease_unlocked` — a `release_lease`/
+  `recover_stale_job` primitive that is conceptually "leases" CRUD. Hosting
+  `_delete_lease_unlocked` (plus its two fault-injection seams,
+  `_after_lease_canonical_delete`/`_after_lease_index_delete`) on the
+  earlier-ranked `queue_lease_recovery` breaks the cycle: `queue_leases`/
+  `queue_lease_admission` self-call the inherited method (forward edge,
+  rank 29 < 30/31); `queue_lease_recovery` never calls back into either.
+  This mirrors ledger §9.3's `get_job`/`get_artifact` resolution — hoist the
+  shared primitive to whichever side the topology requires, not to whichever
+  side "conceptually" owns it.
+- **`sync_operational_indexes` module-level twin (mandated, not discovered).**
+  `queue_lease_indexes._sync_lease_operational_indexes_unlocked` keeps its
+  bound-method name (tests and `queue_transition_crash_fixture.py` call/patch
+  it directly), but its real body is a module-level function,
+  `sync_operational_indexes(queue, lease, *, job, previous_lease=None)`,
+  because `queue_lease_capacity_audit`'s repair path must resolve it through
+  a module-qualified lookup a test can patch on `queue_lease_capacity_audit.
+  queue_lease_indexes` — the design's own CQ15 failing-first prescription.
+  Every other CQ15 self-call between sibling owners (identity construction/
+  validation, ref-path derivation, capacity-transition prepare/apply, the
+  fault-injection seams) stays a plain inherited `self.` call; no other
+  module-level twin was needed.
+- **`_lease_index_identity` and friends stay bound methods.** These live on
+  `queue_lease_indexes` (rank 26, earliest of the six original owners) and
+  are self-called by every later-ranked sibling (`queue_lease_capacity_state`
+  27, `queue_lease_capacity_audit` 28, `queue_lease_recovery` 29,
+  `queue_lease_admission`/`queue_leases` 30/31) — all forward edges, no
+  hoisting required.
+
+### 10.3 tail module-function deletions and residual-caller conversions
+
+Twenty-seven module-level `core_queue.py` functions that only delegated to
+`queue_lease_records`/`queue_lease_indexes`/`queue_index_state` are deleted
+(their sole callers all moved into CQ15 owners, which now call the real
+module function directly): `_lease_operational_records_present` (moved to
+`queue_lease_indexes.lease_operational_records_present`, a public function --
+its own callers stay facade-resident, converted to the qualified call),
+`_lease_scope_ref_name`, `_lease_index_document`,
+`_lease_capacity_aggregate_document`, `_serialized_lease_capacity_counts`,
+`_lease_capacity_checkpoint_document`, `_new_lease_capacity_pair`,
+`_normalize_lease_capacity_counts`, `_lease_capacity_aggregate_from_document`,
+`_lease_capacity_checkpoint_from_document`, `_validate_lease_capacity_pair`,
+`_lease_capacity_pair_payload`, `_lease_capacity_pair_from_payload`,
+`_is_capacity_identity`, `_lease_index_identity_from_document`,
+`_lease_reference_from_scope_ref`, `_lease_reference`,
+`_parse_lease_identity_ref_name`, `_is_short_ref_token`, `_lease_index_token`,
+`_lease_job_token`, `_lease_endpoint_token`, `_lease_cluster_token`,
+`_lease_expiry_key`, `_lease_expiry_ref_name`, `_lease_identity_token`,
+`_parse_lease_expiry_ref_name`, `_job_matches_mcp_admission_class` (moved to
+`queue_lease_admission.py`, still private), `_index_integer` (both its call
+sites were inside the moved `repair_lease_operational_indexes`/
+`_apply_lease_index_repair_intent_unlocked` bodies, so it had zero remaining
+callers post-move), `_index_migration_components_complete` (same: both call
+sites were inside moved CQ15 bodies), and `_validate_record_stat` (its one
+call site moved with `_lease_capacity_record_paths_unlocked`).
+
+Four residual facade-resident call sites (in still-unmoved startup/migration
+code, `_initialize_under_locked_core` and `_ensure_extended_migration_state`/
+`_reconcile_transition_intents_unlocked`) referenced these now-deleted names
+and are rewired to the real module function directly:
+`queue_lease_indexes.lease_operational_records_present(self._storage_root)`
+(4 call sites), `queue_lease_records.new_lease_capacity_pair(...)`,
+`queue_lease_records.is_capacity_identity(...)`, and
+`queue_lease_records.lease_index_identity_from_document(...)`. `_stable_ref_
+token`, `_record_is_reparse`, `_read_bounded_record_bytes`,
+`_unlink_durable_path`, `_is_sha256_digest`, `_scheduler_cancellation_
+request`/`_cancellation_requested_at`, and `_safe_global_record_id` all stay
+in `core_queue.py`: each still has a live caller in not-yet-extracted
+gateway/monitor/job-gc/index-migration code. `queue_lease_capacity_state.py`
+and `queue_lease_recovery.py` each keep a private duplicate of
+`_stable_ref_token`/`_read_unique_json_document` (the latter rejects
+duplicate JSON keys; `core_queue.py`'s own copy stays live as the
+`_read_sealed_index_migration_state` document-reader callback) -- the
+established per-owner-duplication idiom (ledger §9.6).
+
+### 10.4 `_is_sha256_digest` dedup decision (ledger §9.6 follow-up)
+
+Ledger §9.6 flagged this slice as owning the `_is_sha256_digest` dedup
+decision for "the lease-recovery copies." Investigation found no such copy:
+the facade's `_is_sha256_digest` (kept, per above) is called only from
+unmoved job-GC code (`_terminal_job_gc_protections`,
+`_read_committed_job_digest`) — neither is CQ15 territory — and no CQ15-owned
+method (lease capacity state/audit, indexes, leases, admission, recovery,
+scheduler claims) calls `_is_sha256_digest` at all. There is no lease-recovery
+copy to deduplicate; `queue_jobs.py`/`queue_artifact_lineage.py`'s existing
+copies (§9.6's actual subject) remain untouched and still deferred to
+CQ13/CQ18 as that note already recorded. No action was needed beyond this
+verification.
+
+### 10.5 failing-first sabotage (`tests/test_core_queue_split_architecture.py`)
+
+Three new sabotage tests, all isolated-namespace pattern, all verified
+green post-wiring:
+
+- `test_cq15_repair_uses_the_lease_indexes_sync_lookup` — patches
+  `queue_lease_capacity_audit.queue_lease_indexes.sync_operational_indexes`
+  and calls `repair_lease_operational_indexes()`; the mandated CQ15 seam.
+- `test_cq15_lease_acquisition_uses_the_write_job_lookup` — patches
+  `queue_jobs.write_job` and calls `acquire_job(...)`; the "lifecycle"
+  job-write lookup (`queue_lease_admission._lease_job_unlocked`).
+- `test_cq15_stale_recovery_uses_the_write_job_lookup` — patches
+  `queue_jobs.write_job` and calls `recover_stale_job(...)`; the "recovery"
+  job-write lookup (`queue_lease_recovery._apply_stale_lease_recovery_intent_
+  unlocked`).
+
+### 10.6 pre-existing tests updated (real lookup site moved)
+
+Design §4's hand-audit rows for this family were regenerated against the
+landed call graph; two rows needed correction from their originally-guessed
+target and three pre-existing tests needed their patch site moved to follow
+the real call expression (§4's own rule: never patch a dead facade shim):
+
+- `test_lease_decoder_lookup_is_owned_by_the_cq4_module`
+  (`test_core_queue_split_architecture.py`) and
+  `test_lease_record_codec_is_byte_identical_to_the_parent_facade`
+  (`test_queue_record_codecs.py`) both called/compared against the deleted
+  `core_queue_module._lease_index_document` /
+  `_lease_index_identity_from_document` shims. Rewritten to exercise the real
+  owner (`queue_lease_indexes._read_lease_index_identity_by_token` via a real
+  `ClioCoreQueue` instance) and to assert the expected byte string directly.
+- `test_lease_index_repair_intent_rebuilds_after_clear_crash`
+  (`test_operational_indexes.py`) patched the instance method `queue.
+  _sync_lease_operational_indexes_unlocked`; moved to the isolated-namespace
+  `queue_lease_capacity_audit.queue_lease_indexes` seam (§4 row:
+  "`queue._sync_lease_operational_indexes_unlocked` ->
+  `queue_lease_capacity_audit.queue_lease_indexes.sync_operational_indexes`,
+  the repair caller at `core_queue.py:3561`" — confirmed still accurate).
+  The sabotage now also fires during the test's crash-recovery replay
+  (`restarted.initialize()`) unless explicitly undone first
+  (`monkeypatch.undo()`) — the original instance-level patch never reached a
+  freshly constructed `restarted` instance, so the module-qualified
+  equivalent must be scoped the same way.
+- `test_preexisting_over_capacity_queue_can_still_drain`
+  (`test_operational_indexes.py`) patched the instance classmethod `queue.
+  _scan_many`; corrected from §4's guessed `queue_leases.queue_store_read.
+  scan_many` to the real post-split-owner target,
+  `queue_lease_admission.queue_store_read.scan_many` (the admission path
+  split out of `queue_leases` per §10 above).
+- `test_diagnosis_models_predecessor_consuming_last_global_lease_slot`
+  (`test_queue_management.py`) patched `core_queue_module.
+  MAX_LIVE_LEASE_RECORDS`; corrected from §4's guessed
+  `queue_lease_capacity_state.MAX_LIVE_LEASE_RECORDS` to the real constant
+  source, `queue_layout.MAX_LIVE_LEASE_RECORDS` — every CQ15 owner reads it
+  module-qualified from `queue_layout` directly (matching the established
+  convention for shared constants), never a locally rebound copy, so the one
+  correct lever is the shared source module, not any one owner.
+- `test_stale_recovery_uses_exact_scheduler_indexes_without_global_task_scan`
+  (`test_core_index_safety.py`) patches `queue._read_many` and asserts it is
+  *never* called during recovery; §4's guessed target
+  (`queue_lease_recovery.queue_store_read.read_many`) does not exist — no
+  CQ15 method calls `_read_many` at all (the facade classmethod remains,
+  used only by unmoved gateway/monitor code). The test's negative assertion
+  holds unchanged; no source or test change was needed for this row.
+
+### 10.7 production (non-test, non-owner) collateral
+
+`src/clio_relay/storage_runtime.py` imported the private
+`_job_matches_mcp_admission_class` from `clio_relay.core_queue` (pre-existing
+`pyright: ignore[reportPrivateUsage]`-annotated cross-module private import,
+unrelated to the owner-split AST guard since `storage_runtime.py` is not a
+`queue_*.py` owner). Retargeted to `clio_relay.queue_lease_admission`, its
+real new home.
+
+### 10.8 gates
+
+`ruff check`/`ruff format --check`, `pyright` (0 errors on all seven new
+files + `core_queue.py` + every touched test file), `scripts/
+check_file_size.py` (ratchet lowered 8009 -> 4848 for `core_queue.py`; all
+seven new owners within their stated caps, none exceeding the 800-line hard
+gate), and `scripts/check_release_identity.py` (unaffected, 78/80 sites
+agree) all pass. `tests/test_queue.py`, `tests/
+test_core_queue_split_architecture.py` (41 tests, 3 new), `tests/
+test_release_pins.py`, `tests/test_queue_readiness.py`,
+`tests/test_operational_indexes.py`, `tests/test_lease_capacity.py`,
+`tests/test_queue_management.py`, `tests/test_storage_managed_queue.py`,
+`tests/test_core_index_safety.py`, and `tests/test_queue_record_codecs.py`
+all pass green. `tests/test_endpoint_worker_lanes.py` (the #238 poisoned-
+record quarantine path, called from `endpoint_worker_lanes.py` on
+`develop`) is absent on this branch -- that file has not landed here yet;
+`endpoint.py`'s own lease/recovery call sites (`recover_stale_jobs`,
+`acquire_next_job`, `release_lease`, `scan_job_leases`, `claim_scheduler_
+cancel_attempt`/`_confirmation`, `record_scheduler_cancel_attempt`/
+`_observation`, `renew_lease`) are all unchanged public-signature calls,
+confirmed via `tests/test_endpoint.py`'s existing lease/scheduler-cancel
+coverage.
