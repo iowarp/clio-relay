@@ -37,7 +37,11 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
-from clio_relay.errors import RelayError
+from clio_relay.errors import (
+    SHELL_COMMAND_NOT_FOUND_STATUS,
+    RelayError,
+    RemoteExecutableMissingError,
+)
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
@@ -7231,6 +7235,13 @@ def start_remote_session_durable(
             plan=plan,
             transport_deadline_exceeded=True,
         )
+    except _RemoteSessionCommandAmbiguous:
+        # The transport ended without proving whether the remote transition
+        # happened, so the durable start may exist. Resolve it against remote
+        # state rather than escaping as a bare RelayError, which would discard
+        # a start the caller may well have created (clio-relay#158). This is
+        # NOT a deadline, so the deadline flag stays false.
+        return query_remote_session_start(definition=definition, plan=plan)
     except _RemoteSessionCommandRejected as exc:
         rejection = exc.rejection
         if not (
@@ -7753,6 +7764,19 @@ def _ssh_script(
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
+        if result.returncode == SHELL_COMMAND_NOT_FOUND_STATUS:
+            # Status 127 proves the shell never executed anything, so no
+            # durable remote transition can have occurred. Reporting this as
+            # transport AMBIGUITY would send the caller to poll a session that
+            # was never started (clio-relay#158).
+            raise RemoteExecutableMissingError(
+                "configured relay_executable is absent on the remote host "
+                f"({definition.ssh_host}): {definition.relay_executable}. "
+                "Re-run `clio-relay cluster bootstrap --cluster "
+                f"{definition.name}` to reinstall the relay and re-point the "
+                f"registry at what it produced. remote detail: {detail}",
+                exit_status=result.returncode,
+            )
         try:
             rejection = OwnedSessionStartRejection.model_validate_json(stdout)
         except ValueError:

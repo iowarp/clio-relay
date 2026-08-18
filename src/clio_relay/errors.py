@@ -81,3 +81,42 @@ class TaskInputParkConflictError(QueueConflictError):
 
 class NotFoundError(PublicMessageError, RelayError):
     """Raised when a requested record is missing."""
+
+
+SHELL_COMMAND_NOT_FOUND_STATUS = 127
+"""POSIX shell exit status for "command not found".
+
+A structured protocol signal (not prose), so classifying on it is typed
+discrimination rather than message matching.
+"""
+
+
+class RemoteCommandFailed(RelayError):
+    """A cluster-targeted remote command exited non-zero.
+
+    Carries the exit status so callers discriminate failure shapes
+    structurally instead of matching on the raw stderr blob.
+    """
+
+    reason = "remote_command_failed"
+
+    def __init__(self, message: str, *, exit_status: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+
+
+class RemoteExecutableMissingError(RemoteCommandFailed):
+    """The cluster's configured relay executable is absent on the remote host.
+
+    A POSIX shell reports exit status 127 when it cannot find the command it
+    was asked to run. For a cluster-targeted invocation that means the
+    registry's ``relay_executable`` points at a path that no longer exists --
+    typically a generation directory that was garbage-collected out from under
+    the pin (clio-relay#158).
+
+    Typed separately because it is a REPAIRABLE DEPLOYMENT state, not a remote
+    error: the cure is to re-run ``cluster bootstrap``, which reinstalls the
+    relay and re-points the registry at what it produced.
+    """
+
+    reason = "relay_executable_missing"

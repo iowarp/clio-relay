@@ -26,7 +26,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import RelayError, RemoteExecutableMissingError
 from clio_relay.installation import InstallReceipt
 from clio_relay.session_lifecycle import (
     SESSION_CONNECTORS_CHECK_ID,
@@ -4758,6 +4758,111 @@ def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) ->
         status_remote_session(
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             session_id="session-1",
+        )
+
+
+def test_absent_relay_executable_is_typed_rather_than_ambiguous(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Exit 127 proves the command never ran -- that is NOT transport ambiguity.
+
+    clio-relay#158: a dead relay_executable pointer surfaced as
+    _RemoteSessionCommandAmbiguous, which means "we cannot tell whether the
+    remote transition happened". Shell status 127 proves nothing executed, so
+    there is no durable ambiguity to preserve -- and reporting one sends the
+    caller to poll a session that was never started.
+    """
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert not isinstance(
+        captured.value,
+        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_durable_start_resolves_transport_ambiguity_instead_of_escaping(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An ambiguous transport must be RESOLVED against durable state, not raised.
+
+    _RemoteSessionCommandAmbiguous was raised by the transport but never
+    handled by start_remote_session_durable, so it escaped as a bare
+    RelayError -- discarding the durable start the caller may well have
+    created.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def ambiguous(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise session_lifecycle._RemoteSessionCommandAmbiguous(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "transport ended without an exact structured response"
+        )
+
+    def ready_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _durable_start_status(plan, state="ready")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", ready_status)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=ambiguous,
+    )
+
+    assert result.state == "ready"
+
+
+def test_durable_start_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A broken deployment must stay typed, never become a retryable 'starting'.
+
+    query_remote_session_start converts any RelayError from the status probe
+    into start_state="starting", retryable=True. If a missing executable
+    reached that path it would be reported as a session that is merely still
+    coming up -- the exact silent degradation the no-silent-fallback rule
+    forbids, since every retry hits the same dead pointer.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def missing(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise RemoteExecutableMissingError(
+            "configured relay_executable is absent on the remote host",
+            exit_status=127,
+        )
+
+    def unexpected_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise AssertionError("a dead pointer must not be polled as a live session")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unexpected_status)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_lifecycle.start_remote_session_durable(
+            definition=definition,
+            plan=plan,
+            api_token=None,
+            expected_api_release_identity=release,
+            starter=missing,
         )
 
 
