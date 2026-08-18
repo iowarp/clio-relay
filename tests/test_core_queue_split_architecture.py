@@ -21,9 +21,11 @@ from clio_relay import (
     queue_events,
     queue_idempotency,
     queue_index_state,
+    queue_jobs,
     queue_lease_records,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
+    queue_order_index,
     queue_owner_session_lifecycle,
     queue_owner_session_records,
     queue_scheduler_cancel_records,
@@ -70,6 +72,7 @@ _OWNER_RANK = {
     "queue_artifact_lineage": 19,
     "queue_artifacts": 20,
     "queue_scheduler_cancel_state": 21,
+    "queue_jobs": 22,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -94,6 +97,7 @@ _OWNER_BUDGETS = {
     "queue_artifact_lineage": 500,
     "queue_artifacts": 220,
     "queue_scheduler_cancel_state": 450,
+    "queue_jobs": 800,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -154,6 +158,14 @@ class _OwnerSessionWriteLookupSabotage(RuntimeError):
 
 class _SchedulerCancelStateWriteLookupSabotage(RuntimeError):
     """Raised only when CQ11 pending-state creation reaches its store-write owner."""
+
+
+class _JobsOrderIndexLookupSabotage(RuntimeError):
+    """Raised only when CQ12 submission reaches the order-index owner through queue_jobs."""
+
+
+class _JobsWriteLookupSabotage(RuntimeError):
+    """Raised only when CQ12 submission reaches the queue_jobs write_job seam."""
 
 
 @dataclass(frozen=True)
@@ -659,6 +671,66 @@ def test_cq11_scheduler_cancel_pending_creation_uses_the_state_write_lookup(
         queue_scheduler_cancel_state.QueueSchedulerCancelStateMixin.ensure_scheduler_cancel_pending
     )  # noqa: E501
     assert ClioCoreQueue.ensure_scheduler_cancel_pending is owner_ensure_pending
+
+
+def test_cq12_submit_job_uses_the_order_index_ensure_global_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Job submission's global-order entry must resolve through the CQ12 owner seam."""
+    queue = ClioCoreQueue(tmp_path)
+    job = RelayJob(
+        cluster="cluster-cq12",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq12-order",
+    )
+
+    def sabotage(*_args: object, **_kwargs: object) -> int:
+        raise _JobsOrderIndexLookupSabotage("queue_jobs order-index ensure_global lookup engaged")
+
+    isolated_order_index = SimpleNamespace(
+        **{
+            **vars(queue_order_index),
+            "ensure_global": sabotage,
+        }
+    )
+    monkeypatch.setattr(queue_jobs, "queue_order_index", isolated_order_index)
+
+    with pytest.raises(
+        _JobsOrderIndexLookupSabotage,
+        match="queue_jobs order-index ensure_global lookup engaged",
+    ):
+        queue.submit_job(job)
+
+    assert ClioCoreQueue.submit_job is queue_jobs.QueueJobsMixin.submit_job
+
+
+def test_cq12_submit_job_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Job submission's canonical write must resolve through the CQ12 write_job seam."""
+    queue = ClioCoreQueue(tmp_path)
+    job = RelayJob(
+        cluster="cluster-cq12",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq12-write",
+    )
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _JobsWriteLookupSabotage("queue_jobs write_job lookup engaged")
+
+    monkeypatch.setattr(queue_jobs, "write_job", sabotage)
+
+    with pytest.raises(
+        _JobsWriteLookupSabotage,
+        match="queue_jobs write_job lookup engaged",
+    ):
+        queue.submit_job(job)
+
+    assert ClioCoreQueue.submit_job is queue_jobs.QueueJobsMixin.submit_job
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:

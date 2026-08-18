@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_artifact_lineage
+from clio_relay import queue_artifact_lineage, queue_jobs
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -418,17 +418,17 @@ def test_reserved_submission_recovers_partial_lineage_edge_idempotently(
     assert artifact.sha256 is not None
     pin = ArtifactUse(artifact_id=artifact.artifact_id, sha256=artifact.sha256)
     first = _job("recover-partial-lineage", used_artifact_refs=[pin])
-    real_write_job = queue._write_job_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    real_write_job = queue_jobs.write_job
     failed_once = False
 
-    def fail_after_forward_edge(job: RelayJob) -> None:
+    def fail_after_forward_edge(host: queue_jobs.QueueJobsMixin, job: RelayJob) -> None:
         nonlocal failed_once
         if not failed_once and job.job_id == first.job_id:
             failed_once = True
             raise OSError("simulated failure after lineage edge persistence")
-        real_write_job(job)
+        real_write_job(host, job)
 
-    monkeypatch.setattr(queue, "_write_job_unlocked", fail_after_forward_edge)
+    monkeypatch.setattr(queue_jobs, "write_job", fail_after_forward_edge)
     with pytest.raises(OSError, match="simulated failure"):
         queue.submit_job(first)
 

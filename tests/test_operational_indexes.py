@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from clio_relay import queue_jobs
 from clio_relay.core_queue import (
     DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     LEASE_OPERATIONAL_INDEX_SCHEMA,
@@ -453,7 +454,7 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         },
     )
 
-    def crash_after_canonical(record: RelayJob) -> None:
+    def crash_after_canonical(_host: queue_jobs.QueueJobsMixin, record: RelayJob) -> None:
         (root / "jobs").mkdir(parents=True, exist_ok=True)
         (root / "jobs" / f"{record.job_id}.json").write_text(
             record.model_dump_json(),
@@ -462,7 +463,7 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         raise RuntimeError("simulated hard crash")
 
     with monkeypatch.context() as crash:
-        crash.setattr(queue, "_write_job_unlocked", crash_after_canonical)
+        crash.setattr(queue_jobs, "write_job", crash_after_canonical)
         with pytest.raises(RuntimeError, match="simulated hard crash"):
             queue.submit_job(job)
 

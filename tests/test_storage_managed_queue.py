@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import clio_relay.storage_policy as storage_module
+from clio_relay import queue_jobs
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -366,17 +367,15 @@ def test_managed_queue_recovers_crash_reserved_canonical_id_without_leak(
 ) -> None:
     queue = storage_managed_queue(_settings(tmp_path))
     original = _job("managed-crash-reserved")
-    original_ensure = (
-        queue._ensure_global_order_entry_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    )
+    original_ensure_global = queue_jobs.queue_order_index.ensure_global
 
-    def fail_before_job_write(_family: str, _record_id: str) -> int:
+    def fail_before_job_write(_store: object, _family: str, _record_id: str) -> int:
         raise RuntimeError("fault after idempotency reservation")
 
-    monkeypatch.setattr(queue, "_ensure_global_order_entry_unlocked", fail_before_job_write)
+    monkeypatch.setattr(queue_jobs.queue_order_index, "ensure_global", fail_before_job_write)
     with pytest.raises(RuntimeError, match="fault after idempotency reservation"):
         queue.submit_job(original)
-    monkeypatch.setattr(queue, "_ensure_global_order_entry_unlocked", original_ensure)
+    monkeypatch.setattr(queue_jobs.queue_order_index, "ensure_global", original_ensure_global)
     assert queue.storage_runtime.policy.release(original.job_id).reason.value == (
         "reservation_absent"
     )

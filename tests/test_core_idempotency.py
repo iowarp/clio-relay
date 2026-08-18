@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay import queue_jobs
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
@@ -42,15 +43,15 @@ def test_idempotency_resolution_recovers_canonical_crash_reserved_job_id(
     assert fresh.canonical_job_id == original.job_id
     assert fresh.existing_job is None
 
-    original_ensure = queue._ensure_global_order_entry_unlocked  # pyright: ignore[reportPrivateUsage]
+    original_ensure_global = queue_jobs.queue_order_index.ensure_global
 
-    def fail_before_job_write(_family: str, _record_id: str) -> int:
+    def fail_before_job_write(_store: object, _family: str, _record_id: str) -> int:
         raise RuntimeError("fault after idempotency reservation")
 
-    monkeypatch.setattr(queue, "_ensure_global_order_entry_unlocked", fail_before_job_write)
+    monkeypatch.setattr(queue_jobs.queue_order_index, "ensure_global", fail_before_job_write)
     with pytest.raises(RuntimeError, match="fault after idempotency reservation"):
         queue.submit_job(original)
-    monkeypatch.setattr(queue, "_ensure_global_order_entry_unlocked", original_ensure)
+    monkeypatch.setattr(queue_jobs.queue_order_index, "ensure_global", original_ensure_global)
 
     retry_candidate = _job("crash-reserved")
     assert retry_candidate.job_id != original.job_id

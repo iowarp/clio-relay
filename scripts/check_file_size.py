@@ -152,7 +152,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # _scheduler_cancel_due_sort_key module shims a repository-wide call-site
     # audit found unreferenced once their only caller moved. Net: 10065 ->
     # 9688.
-    "src/clio_relay/core_queue.py": 9688,
+    # #231 CQ12: move submit_job, the job CRUD/paging/scan surface, and the
+    # state-transition methods (update_job_state/cancel_job_if_active/
+    # acknowledge_job_cancellation/update_job_metadata) plus their unlocked
+    # write/capacity/index primitives into the new queue_jobs.py owner.
+    # submit_job's two _ensure_global_order_entry_unlocked call sites become
+    # direct queue_order_index.ensure_global calls (CQ7's owner); the real
+    # _write_job_unlocked body becomes the module-level write_job, and the
+    # facade's old method is replaced by a thin instance-method wrapper so
+    # every not-yet-extracted caller elsewhere keeps working unchanged.
+    # Deletes the now-dead _committed_idempotency_record and _UNSET module
+    # aliases a repository-wide call-site audit found unreferenced once
+    # their only callers moved. Net: 9688 -> 9043.
+    "src/clio_relay/core_queue.py": 9043,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
