@@ -65,7 +65,7 @@ MCP_JARVIS_EXECUTION_ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 MCP_JARVIS_ARTIFACT_SCHEMA = "jarvis.artifact.v1"
 MCP_JARVIS_EXECUTION_SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 MCP_JARVIS_NATIVE_PROGRESS_BRIDGE_SCHEMA = "clio-relay.mcp-jarvis-progress-bridge.v1"
-REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT = "clio-kit-jarvis-user-v3.7"
+_QUERY_CONTRACTS = ("clio-kit-jarvis-user-v3.6", "clio-kit-jarvis-user-v3.7")
 MCP_REQUEST_MAX_BYTES = 16 * 1024 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATION_BYTES = 64 * 1024
 MCP_PACKAGE_PROGRESS_MAX_NOTIFICATIONS = 10_000
@@ -925,10 +925,7 @@ def _is_validated_jarvis_execution_query(
         or server_artifact.get("verified") is not True
     ):
         return False
-    if (
-        expected_registered_contract == REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
-        and expected_jarvis_cd_lock_binding is None
-    ):
+    if expected_registered_contract in _QUERY_CONTRACTS and expected_jarvis_cd_lock_binding is None:
         return True
     if expected_jarvis_cd_lock_binding is None or expected_registered_contract is not None:
         return False
@@ -2051,8 +2048,7 @@ def _package_progress_bridge_from_invocation(
     if operation != "tools/call" or tool != "jarvis_run":
         return None
     registered_route = (
-        expected_registered_contract == REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
-        and expected_jarvis_cd_lock_binding is None
+        expected_registered_contract in _QUERY_CONTRACTS and expected_jarvis_cd_lock_binding is None
     )
     built_in_route = (
         expected_registered_contract is None and expected_jarvis_cd_lock_binding is not None
@@ -5518,7 +5514,7 @@ def _jarvis_input_manifest(
     if (
         operation != "tools/call"
         or tool != "jarvis_run"
-        or expected_registered_contract != REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
+        or expected_registered_contract != _QUERY_CONTRACTS[-1]
         or expected_jarvis_cd_lock_binding is not None
         or not isinstance(value, dict)
     ):
@@ -5559,7 +5555,7 @@ def _jarvis_input_manifest(
     if (
         set(typed_route) != expected_route_fields
         or typed_route.get("schema_version") != "clio-relay.jarvis-pipeline-input-route.v1"
-        or typed_route.get("contract") != REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT
+        or typed_route.get("contract") != _QUERY_CONTRACTS[-1]
         or typed_route.get("pipeline_id") != arguments.get("pipeline_id")
     ):
         raise ValueError("JARVIS input manifest route is invalid")

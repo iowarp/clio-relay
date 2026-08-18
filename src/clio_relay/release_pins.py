@@ -22,11 +22,10 @@ A :class:`PinSite`'s ``kind`` documents *how* it is recognized (doc §7's
 selector taxonomy: line, key, filename, placeholder, regex, or
 derived-digest); its ``value_group`` says which other sites must currently
 agree with it -- exactly the sites one version bump moves together. The
-:data:`PINSITES` table itself lives in the companion module
-:mod:`clio_relay.release_pin_sites` (~70 rows -- too large for this file's
-own 800-line cap alongside the logic below, the same reasoning that split
-``frp_link.py`` from ``frp_transport.py`` in R4/R5); every name a caller
-needs is re-exported from here.
+:data:`PINSITES` table is composed in :mod:`clio_relay.release_pin_sites`,
+with its clio-kit family rows in a second private data module. The roughly
+70 rows are too large for one file alongside the logic below; every name a
+caller needs is still re-exported from here.
 
 ``scripts/bump_release_version.py`` rewrites every mutable site through this
 registry. ``scripts/check_release_identity.py`` is the fast preflight: every
@@ -420,6 +419,7 @@ _SWEEP_EXCLUDED_FILES = frozenset(
     {
         "src/clio_relay/release_pins.py",
         "src/clio_relay/release_pin_sites.py",
+        "src/clio_relay/release_pin_sites_kit.py",
         "tests/test_release_pins.py",
     }
 )

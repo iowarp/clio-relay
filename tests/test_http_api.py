@@ -540,7 +540,16 @@ def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
 
 
 def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        spool_max_log_bytes_per_stream=50,
+        spool_max_log_bytes_per_job=100,
+        storage_minimum_free_bytes=0,
+        storage_max_job_reservation_bytes=1_000,
+        storage_job_core_allowance_bytes=20,
+        storage_job_result_allowance_bytes=30,
+    )
     queue = ClioCoreQueue(settings.core_dir)
     client = cast(Any, TestClient(create_app(settings)))
     prompt_path = tmp_path / "prompt.md"
@@ -1955,18 +1964,16 @@ def test_session_job_submission_rejects_missing_and_stale_identity(
         core_dir=tmp_path / "unbound-core",
         spool_dir=tmp_path / "unbound-spool",
         api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
     )
-    unbound = cast(Any, TestClient(create_app(unbound_settings))).post(
-        "/jobs/jarvis-pipeline",
-        headers={
-            **authorization,
-            OWNER_SESSION_ID_HEADER: "desktop-session-1",
-            SESSION_GENERATION_ID_HEADER: "generation-1",
-        },
-        json=payload,
-    )
-    assert unbound.status_code == 409
-    assert unbound.json()["reason"] == "unbound_session_api"
+    with pytest.raises(
+        ConfigurationError,
+        match="owned relay session API requires process-bound cluster authority",
+    ):
+        create_app(unbound_settings)
 
 
 def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cache(

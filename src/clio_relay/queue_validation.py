@@ -187,7 +187,18 @@ def run_queue_management_validation(
             owned_jobs[job_id] = "queue-validation-anchor"
 
         result_limit = min(MAX_RESULT_LIMIT, scan_limit)
-        capacity = worker_status(queue, cluster=cluster)
+        # A just-registered fleet's slot heartbeats race this first read, so retry
+        # a transient not-yet-complete generation on the usual bounded budget.
+        capacity_deadline = time.monotonic() + scheduler_timeout_seconds
+        while True:
+            capacity = worker_status(queue, cluster=cluster)
+            settled = (
+                capacity.get("worker_generation_id") is None
+                or capacity.get("worker_generation_complete") is not False
+            )
+            if settled or time.monotonic() >= capacity_deadline:
+                break
+            time.sleep(min(scheduler_poll_seconds, max(0.0, capacity_deadline - time.monotonic())))
         kind_limit, configured_total = _controlled_capacity(capacity, JobKind.JARVIS)
         _require(
             kind_limit == VALIDATION_KIND_LIMIT,
@@ -1501,7 +1512,12 @@ def _process_exists(process_id: int) -> bool:
             )
         except (OSError, subprocess.TimeoutExpired):
             return True
-        return result.returncode == 0 and f'"{process_id}"' in result.stdout
+        if result.returncode != 0:
+            # An errored probe (e.g. tasklist "Access denied") is not
+            # evidence of absence — mirror the OSError branch above and
+            # assume the process is alive rather than falsely settling it.
+            return True
+        return f'"{process_id}"' in result.stdout
     try:
         os.kill(process_id, 0)
     except ProcessLookupError:

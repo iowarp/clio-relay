@@ -754,28 +754,9 @@ class JarvisMcpCallSubmitRequest(BaseModel):
                 raise ValueError("arguments must be empty for tools/list")
             if self.expected_server_artifact_digest is not None:
                 raise ValueError("tools/list must not carry an expected server artifact digest")
-            if (
-                self.timeout_seconds is not None
-                and self.timeout_seconds > MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
-            ):
-                raise ValueError(
-                    "pinned MCP control-query timeout exceeds "
-                    f"{MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds"
-                )
             return self
         if self.tool == "jarvis_run" and "wait" in self.arguments:
             raise ValueError("jarvis_run does not accept internal wait; use jarvis_get_execution")
-        if (
-            self.expected_server_artifact_digest is not None
-            and self.tool is not None
-            and is_virtual_jarvis_control_query(self.tool)
-            and self.timeout_seconds is not None
-            and self.timeout_seconds > MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
-        ):
-            raise ValueError(
-                "pinned MCP control-query timeout exceeds "
-                f"{MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds"
-            )
         return self
 
 

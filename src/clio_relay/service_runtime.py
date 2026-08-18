@@ -219,7 +219,6 @@ class _BoundedHttpResponse:
 class _BoundedHttpReadState:
     """Cross-thread state for one absolute-deadline HTTP response read."""
 
-    response: httpx.Response | None = None
     result: _BoundedHttpResponse | None = None
     error: BaseException | None = None
 
@@ -6749,15 +6748,13 @@ def _read_bounded_http_response(
         raise httpx.TimeoutException("HTTP response total deadline expired before connection")
 
     state = _BoundedHttpReadState()
-    state_lock = threading.Lock()
+    cancelled = threading.Event()
     completed = threading.Event()
     client = _new_readiness_http_client(remaining)
 
     def read_response() -> None:
         try:
             with client.stream("GET", url, headers=headers) as response:
-                with state_lock:
-                    state.response = response
                 if maximum_bytes is None:
                     state.result = _BoundedHttpResponse(
                         status_code=response.status_code,
@@ -6777,11 +6774,15 @@ def _read_bounded_http_response(
                         )
                 content = bytearray()
                 for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                    if cancelled.is_set():
+                        return
                     if len(content) + len(chunk) > maximum_bytes:
                         raise ValueError(
                             f"HTTP response exceeds the {maximum_bytes}-byte decompressed limit"
                         )
                     content.extend(chunk)
+                if cancelled.is_set():
+                    return
                 state.result = _BoundedHttpResponse(
                     status_code=response.status_code,
                     headers=httpx.Headers(response.headers),
@@ -6802,13 +6803,7 @@ def _read_bounded_http_response(
     reader.start()
     completed_before_deadline = completed.wait(max(0.0, effective_deadline - time.monotonic()))
     if not completed_before_deadline or time.monotonic() > effective_deadline:
-        with state_lock:
-            active_response = state.response
-        if active_response is not None:
-            with suppress(Exception):
-                active_response.close()
-        with suppress(Exception):
-            client.close()
+        cancelled.set()
         raise httpx.TimeoutException("HTTP response exceeded its total monotonic deadline")
     if state.error is not None:
         raise state.error
@@ -6818,9 +6813,9 @@ def _read_bounded_http_response(
 
 
 def _new_readiness_http_client(timeout_seconds: float) -> httpx.Client:
-    """Create one operation-owned client whose pool can be closed at the deadline."""
+    """Create one operation-owned client without ambient proxy discovery."""
 
-    return httpx.Client(timeout=timeout_seconds)
+    return httpx.Client(timeout=timeout_seconds, trust_env=False)
 
 
 def _sleep_before_deadline(

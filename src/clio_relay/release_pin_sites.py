@@ -6,7 +6,7 @@ rule 6): the registry genuinely has ~70 real sites (doc
 module's completeness sweep), and a data table that size does not fit under
 the 800-line cap in the same file as the logic that reads it -- the same
 reasoning that split ``frp_link.py`` from ``frp_transport.py`` in R4/R5. This
-is a private companion: callers import everything from
+and the family-specific data module are private companions: callers import everything from
 :mod:`clio_relay.release_pins`, which re-exports :data:`PINSITES` and the
 types below.
 """
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from clio_relay.errors import RelayError
+from clio_relay.release_pin_sites_kit import kit_pin_sites
 
 
 class PinFamily(StrEnum):
@@ -145,8 +146,6 @@ _CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-(v[0-9]+\.[0-9]+)")
 #: A bare `vX.Y` token with no surrounding contract-name context (doc §7's
 #: two frozen "v3.6" sites: a description sentence and a stable check-id).
 _BARE_V = re.compile(r"\b(v[0-9]+\.[0-9]+)\b")
-#: A clio-kit-shaped `X.Y.Z` version literal, wherever it appears on a line.
-_KV = re.compile(r"([0-9]+\.[0-9]+\.[0-9]+)")
 #: A lowercase SHA-256 hex digest, wherever it appears on the line.
 _HEX = re.compile(r"([0-9a-f]{64})")
 
@@ -369,8 +368,31 @@ PINSITES: tuple[PinSite, ...] = (
         "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py",
         _JC,
         _LN,
-        "REGISTERED_JARVIS_EXECUTION_QUERY_CONTRACT",
+        "current member of the supported JARVIS execution query contracts",
         line=68,
+        pattern=re.compile(
+            r'^_QUERY_CONTRACTS = \("clio-kit-jarvis-user-v3\.6", '
+            r'"clio-kit-jarvis-user-(v[0-9]+\.[0-9]+)"\)$'
+        ),
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.relay_schema_equality_contract_const",
+        "tests/fixtures/relay_schema_equality_v1.json",
+        _JC,
+        _LN,
+        "RelayJob package route contract const in the schema-equality golden",
+        line=354,
+        pattern=_CONTRACT,
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.relay_schema_equality_contract_default",
+        "tests/fixtures/relay_schema_equality_v1.json",
+        _JC,
+        _LN,
+        "RelayJob package route contract default in the schema-equality golden",
+        line=355,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -390,7 +412,7 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "contract-id/filename tuple entry",
-        line=120,
+        line=135,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -400,7 +422,7 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "vendored contract file path reference",
-        line=1391,
+        line=1406,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -410,7 +432,7 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "contract= keyword argument",
-        line=1410,
+        line=1425,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -645,155 +667,12 @@ PINSITES: tuple[PinSite, ...] = (
         pattern=_HEX,
         value_group="jarvis_contract_artifact_sha256",
     ),
-    # -- kit_version: the clio-kit distribution pin -- TWO axes, not one. --
-    # -- clio-relay#190/#199 (41b912c/eef50b5) deliberately decoupled the --
-    # -- default *bootstrap* install pin from the *ares acceptance-policy* --
-    # -- pin ("a separate, self-consistent live-cluster acceptance policy --
-    # -- pin... not part of this issue" -- eef50b5's own message): the --
-    # -- acceptance fixture records what a PAST live run actually had --
-    # -- installed, not "whatever the current default is". They are --
-    # -- independent value_groups on purpose; a bump moving one must never --
-    # -- silently move the other, and the preflight must never fail just --
-    # -- because they currently differ (doc §7.9's cross-axis INFO note). --
-    _row(
-        "kv.jarvis_mcp_version",
-        "src/clio_relay/jarvis_mcp.py",
-        _KV_FAM,
-        _LN,
-        "CLIO_KIT_JARVIS_MCP_VERSION (sole canonical bootstrap definition)",
-        line=32,
-        pattern=_KV,
-        value_group="bootstrap_kit_version_text",
-    ),
-    _row(
-        "kv.jarvis_mcp_wheel_sha256",
-        "src/clio_relay/jarvis_mcp.py",
-        _KV_FAM,
-        _LN,
-        "CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 (sole canonical bootstrap definition)",
-        line=39,
-        pattern=_HEX,
-        value_group="bootstrap_kit_wheel_sha256",
-    ),
-    _row(
-        "kv.bootstrap_placeholder",
-        "src/clio_relay/bootstrap.py",
-        _KV_FAM,
-        _PH,
-        "JARVIS_MCP_VERSION script placeholder (f-string interpolation of "
-        "CLIO_KIT_JARVIS_MCP_VERSION -- never a literal copy)",
-        line=7351,
-        placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
-        mutable=False,
-    ),
-    *(
-        _row(
-            f"kv.ci_yml_{job}_filename",
-            ".github/workflows/ci.yml",
-            _KV_FAM,
-            _LN,
-            f"stage exact clio-kit release wheel ({job} build job): filename",
-            line=fline,
-            pattern=_KV,
-            value_group="bootstrap_kit_version_text",
-        )
-        for job, fline in (("job1", 62), ("job2", 166))
-    ),
-    *(
-        _row(
-            f"kv.ci_yml_{job}_sha256",
-            ".github/workflows/ci.yml",
-            _KV_FAM,
-            _LN,
-            f"stage exact clio-kit release wheel ({job} build job): SHA-256",
-            line=sline,
-            pattern=_HEX,
-            value_group="bootstrap_kit_wheel_sha256",
-        )
-        for job, sline in (("job1", 63), ("job2", 167))
-    ),
-    *(
-        _row(
-            f"kv.ci_yml_{job}_url",
-            ".github/workflows/ci.yml",
-            _KV_FAM,
-            _FN,
-            f"stage exact clio-kit release wheel ({job} build job): URL",
-            line=uline,
-            pattern=_KV,
-            value_group="bootstrap_kit_version_text",
-        )
-        for job, uline in (("job1", 64), ("job2", 168))
-    ),
-    _row(
-        "kv.operations_doc",
-        "docs/operations.md",
-        _KV_FAM,
-        _FN,
-        "Use Remote JARVIS MCP: uv tool install wheel URL",
-        line=719,
-        pattern=_KV,
-        value_group="bootstrap_kit_version_text",
-    ),
-    _row(
-        "kv.remote_mcp_federation_filename",
-        "docs/remote-mcp-federation.md",
-        _KV_FAM,
-        _FN,
-        "kit-pin digests paragraph: exact release wheel filename",
-        line=472,
-        pattern=_KV,
-        value_group="bootstrap_kit_version_text",
-    ),
-    _row(
-        "kv.remote_mcp_federation_sha256",
-        "docs/remote-mcp-federation.md",
-        _KV_FAM,
-        _LN,
-        "kit-pin digests paragraph: exact release wheel SHA-256",
-        line=473,
-        pattern=_HEX,
-        value_group="bootstrap_kit_wheel_sha256",
-    ),
-    _row(
-        "kv.remote_mcp_federation_release_gate_prose",
-        "docs/remote-mcp-federation.md",
-        _KV_FAM,
-        _LN,
-        "'the release gate requires that exact ... artifact' prose -- "
-        "describes the ACCEPTANCE-policy pin, not the bootstrap default",
-        line=467,
-        pattern=_KV,
-        value_group="acceptance_kit_version_text",
-    ),
-    *(
-        _row(
-            f"kv.release_gate_text_{gline}",
-            "docs/release-gate-1.0.yaml",
-            _KV_FAM,
-            _RX,
-            "worker component-identity block: clio-kit version literal "
-            "(ares acceptance-policy pin, independent of the bootstrap default)",
-            line=gline,
-            pattern=_KV,
-            value_group="acceptance_kit_version_text",
-            sweep="release_gate_kit_text",
-        )
-        for gline in (115, 121, 122, 226, 230, 231, 294, 299, 300, 302, 309, 374, 1187)
-    ),
-    *(
-        _row(
-            f"kv.release_gate_digest_{dline}",
-            "docs/release-gate-1.0.yaml",
-            _KV_FAM,
-            _RX,
-            "worker component-identity block: clio-kit wheel SHA-256 "
-            "(ares acceptance-policy pin, independent of the bootstrap default)",
-            line=dline,
-            pattern=_HEX,
-            value_group="acceptance_kit_wheel_sha256",
-            sweep="release_gate_kit_digest",
-        )
-        for dline in (124, 233, 303, 311, 371, 680, 782, 887)
+    *kit_pin_sites(
+        _row,
+        family=_KV_FAM,
+        line=_LN,
+        filename=_FN,
+        placeholder=_PH,
+        regex=_RX,
     ),
 )
