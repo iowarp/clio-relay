@@ -1046,8 +1046,19 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None:
-    """Every migrated ``exc=`` site rejects raw exception text as wire detail."""
+def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None:
+    """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
+
+    clio-relay#242 actionability audit: 2 of the original 58 sites
+    (``mcp_submission_conflict`` on ``submit_mcp_call``,
+    ``job_submission_conflict`` on ``submit_owned``) deliberately opted OUT
+    of this closed set -- an agent meeting either refusal needs the raw
+    conflict/mismatch detail PLUS an authored what-to-do-next tail (the
+    conflicting idempotency_key and the retry-with-a-new-key move; the
+    refresh-discovery move), so they now pass an explicit, reviewed
+    ``message=`` instead of relying on the generic reason title. The
+    remaining 56 keep the closed-set discipline this test proves.
+    """
     source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
         encoding="utf-8"
     )
@@ -1062,7 +1073,7 @@ def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None
         and len(node.args) == 1
         and not any(keyword.arg == "message" for keyword in node.keywords)
     ]
-    assert len(calls) == 58
+    assert len(calls) == 56
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])

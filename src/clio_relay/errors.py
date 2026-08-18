@@ -176,7 +176,13 @@ class ContractSurfaceUnavailableError(ConfigurationError):
         self.need = need
         super().__init__(
             f"contract surface unavailable: {surface} requires {need}, have "
-            f"{have or 'none'} (iowarp/clio-relay#242)"
+            f"{have or 'none'} (iowarp/clio-relay#242). Not retryable as-is: "
+            f"upgrade clio-kit on the worker to a build that ships {need} and "
+            "re-bootstrap, or register the surface at its shipped (lower) "
+            "contract id if that is acceptable. During development only, "
+            "set CLIO_RELAY_DEV_MODE=1 (or the cluster's dev_mode flag) to "
+            "defer this enforcement and let the surface serve unverified -- "
+            "never in production."
         )
 
 

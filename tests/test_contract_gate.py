@@ -10,6 +10,7 @@ surface/have/need.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -24,6 +25,7 @@ from clio_relay.contract_gate import (
     probe_surface_contract_identity,
     require_surface_contract,
 )
+from clio_relay.dev_mode import DEV_MODE_ENV
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
 from clio_relay.installation import CLIO_KIT_MCP_CONTRACT_SCHEMA
 from clio_relay.remote_mcp import (
@@ -270,14 +272,22 @@ def test_require_surface_contract_is_noop_when_meets_requirement() -> None:
     require_surface_contract(status)  # must not raise
 
 
-def test_require_surface_contract_raises_typed_error_with_have_need() -> None:
-    status = SurfaceContractStatus(
+def _below_pin_jarvis_status() -> SurfaceContractStatus:
+    return SurfaceContractStatus(
         surface="jarvis",
         shipped_contract_id=LEGACY_ID,
         shipped_contract_sha256=LEGACY_SHA256,
         required_contract_id=CURRENT_ID,
         meets_requirement=False,
     )
+
+
+def test_require_surface_contract_raises_typed_error_with_have_need(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enforcing mode (dev mode off, the default): unchanged, still refuses."""
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    status = _below_pin_jarvis_status()
     with pytest.raises(ContractSurfaceUnavailableError) as excinfo:
         require_surface_contract(status)
     error = excinfo.value
@@ -288,3 +298,60 @@ def test_require_surface_contract_raises_typed_error_with_have_need() -> None:
     assert "jarvis" in str(error)
     assert LEGACY_ID in str(error)
     assert CURRENT_ID in str(error)
+
+
+def test_require_surface_contract_explicit_dev_mode_false_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit dev_mode=False refuses even when the ambient env is on."""
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+    with pytest.raises(ContractSurfaceUnavailableError):
+        require_surface_contract(_below_pin_jarvis_status(), dev_mode=False)
+
+
+def test_require_surface_contract_env_dev_mode_defers_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """clio-relay#242 owner ruling: dev mode is LOUD AND NON-BLOCKING.
+
+    The ``CLIO_RELAY_DEV_MODE`` env switch (no explicit ``dev_mode=``
+    argument) defers the below-pin refusal instead of raising, and logs the
+    same typed surface/have/need record at WARNING with
+    ``enforcement="deferred_dev_mode"`` stamped on it -- so the surface
+    serves and a security-phase retest can still find exactly what was
+    deferred.
+    """
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+    with caplog.at_level(logging.WARNING, logger=contract_gate_module.__name__):
+        require_surface_contract(_below_pin_jarvis_status())  # must not raise
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelno == logging.WARNING
+    assert "DEV MODE" in record.message
+    assert "jarvis" in record.message
+    assert LEGACY_ID in record.message
+    assert CURRENT_ID in record.message
+    assert "deferred_dev_mode" in record.message
+
+
+def test_require_surface_contract_explicit_dev_mode_true_defers_without_env(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A caller-threaded ``dev_mode=True`` (e.g. a cluster registry flag)
+    defers identically without the environment switch ever being set."""
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    with caplog.at_level(logging.WARNING, logger=contract_gate_module.__name__):
+        require_surface_contract(_below_pin_jarvis_status(), dev_mode=True)
+    assert any("deferred_dev_mode" in record.message for record in caplog.records)
+
+
+def test_surface_contract_degradation_enforcement_defaults_enforced() -> None:
+    """The bootstrap-time record's new field never changes existing behavior
+    unless a caller explicitly stamps a deferral onto one (only the
+    USE-time gate does, and only when it actually defers)."""
+    status = _below_pin_jarvis_status()
+    degradation = evaluate_degradation(status, tracking_issue="iowarp/clio-relay#242")
+    assert degradation is not None
+    assert degradation.enforcement == "enforced"

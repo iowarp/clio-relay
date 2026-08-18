@@ -45,17 +45,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict
 
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
+from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import ConfigurationError, contract_surface_unavailable
+
+logger = logging.getLogger(__name__)
 
 SURFACE_CONTRACT_STATUS_SCHEMA = "clio-relay.surface-contract-status.v1"
 SURFACE_CONTRACT_DEGRADATION_SCHEMA = "clio-relay.surface-contract-degradation.v1"
 SURFACE_CONTRACT_DEGRADATION_REASON = "contract_surface_below_pin"
+#: clio-relay#242 course correction: the tracking issue every USE-time
+#: deferral cites -- the same one bootstrap-time degradations already cite
+#: via their own explicit ``tracking_issue`` argument.
+CONTRACT_GATE_TRACKING_ISSUE = "iowarp/clio-relay#242"
 
 #: clio-kit's own wording (external to this repo) when its ``mcp-contract``
 #: subcommand is asked to describe an id it does not recognize at all. Only
@@ -90,6 +98,16 @@ class SurfaceContractDegradation(BaseModel):
     Never a warning that scrolls away: this is a structured value that lands
     in the install receipt and the bootstrap report (no-silent-fallback
     doctrine), naming exactly what is missing and where it is tracked.
+
+    ``enforcement`` (clio-relay#242 dev-mode course correction) marks
+    whether the USE-time gate this below-pin surface feeds
+    (:func:`require_surface_contract`) will actually refuse ("enforced",
+    the default -- byte-identical to before this field existed) or has been
+    told to defer to dev mode ("deferred_dev_mode"). Bootstrap-time
+    recording (:func:`evaluate_degradation`) leaves this at its default
+    unless told otherwise; the USE-time gate stamps it explicitly on the
+    record it logs when it defers, so a retest can tell "below pin" apart
+    from "below pin AND let through" by this field alone.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -101,6 +119,7 @@ class SurfaceContractDegradation(BaseModel):
     reason: str = SURFACE_CONTRACT_DEGRADATION_REASON
     tracking_issue: str
     detected_at: datetime
+    enforcement: Literal["enforced", "deferred_dev_mode"] = "enforced"
 
 
 def run_json_probe(command: list[str], *, label: str) -> dict[str, object]:
@@ -264,14 +283,52 @@ def evaluate_degradation(
     )
 
 
-def require_surface_contract(status: SurfaceContractStatus) -> None:
+def require_surface_contract(
+    status: SurfaceContractStatus,
+    *,
+    dev_mode: bool | None = None,
+) -> None:
     """Refuse at USE-time when one surface's shipped contract is below pin.
+
+    Owner ruling (clio-relay#242 dev-mode course correction): dev mode means
+    LOUD AND NON-BLOCKING. Production (dev mode off, the default) is
+    byte-identical to before this gate learned about dev mode: it raises.
+    Dev mode logs the SAME typed record this would-have-raised error carries
+    (surface/have/need, the ``SurfaceContractDegradation`` shape) at WARNING
+    with ``enforcement="deferred_dev_mode"`` stamped on it, then returns
+    normally -- the surface serves, the tool executes. Never silent: the
+    runtime log is the queryable trail a security-phase retest greps for
+    every deferred enforcement.
+
+    Args:
+        status: The surface's bootstrap-recorded contract identity.
+        dev_mode: Explicit override. Defaults to
+            :func:`clio_relay.dev_mode.dev_mode_enabled` (the
+            ``CLIO_RELAY_DEV_MODE`` environment switch, or a cluster's
+            ``dev_mode`` registry flag when the caller threads it in) so
+            every existing caller honors it for free.
 
     Raises:
         clio_relay.errors.ContractSurfaceUnavailableError: ``status`` does
-            not meet its required contract id.
+            not meet its required contract id, and dev mode is off.
     """
     if status.meets_requirement:
+        return
+    resolved_dev_mode = dev_mode_enabled() if dev_mode is None else dev_mode
+    if resolved_dev_mode:
+        deferral = SurfaceContractDegradation(
+            surface=status.surface,
+            have=status.shipped_contract_id,
+            need=status.required_contract_id,
+            tracking_issue=CONTRACT_GATE_TRACKING_ISSUE,
+            detected_at=datetime.now(UTC),
+            enforcement="deferred_dev_mode",
+        )
+        logger.warning(
+            "clio-relay: DEV MODE -- contract surface gate deferred (would refuse in "
+            "enforcing mode): %s",
+            deferral.model_dump(mode="json"),
+        )
         return
     raise contract_surface_unavailable(
         surface=status.surface,

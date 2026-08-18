@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -1748,14 +1749,9 @@ def test_remote_clio_kit_component_requires_receipt_bound_native_contract(
         verify_remote_clio_kit_native_execution_component(info, receipt)
 
 
-def test_remote_clio_kit_component_refuses_typed_for_recorded_jarvis_degradation(
+def _receipt_with_below_pin_jarvis_surface(
     tmp_path: Path,
-) -> None:
-    """(a) of iowarp/clio-relay#242's acceptance: jarvis submission refuses
-    typed with have/need once bootstrap already recorded the surface as
-    below-pin -- never the generic "omitted the clio-kit native JARVIS
-    contract" message, which stays reserved for a receipt that never probed
-    the surface at all."""
+) -> tuple[InstallReceipt, SurfaceContractStatus]:
     jarvis_status = SurfaceContractStatus(
         surface="jarvis",
         shipped_contract_id="clio-kit-jarvis-user-v3.6",
@@ -1780,6 +1776,20 @@ def test_remote_clio_kit_component_refuses_typed_for_recorded_jarvis_degradation
         },
         contract_surfaces={"jarvis": jarvis_status},
     )
+    return receipt, jarvis_status
+
+
+def test_remote_clio_kit_component_refuses_typed_for_recorded_jarvis_degradation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) of iowarp/clio-relay#242's acceptance: jarvis submission refuses
+    typed with have/need once bootstrap already recorded the surface as
+    below-pin -- never the generic "omitted the clio-kit native JARVIS
+    contract" message, which stays reserved for a receipt that never probed
+    the surface at all. Enforcing mode (dev mode off, the default)."""
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+    receipt, _jarvis_status = _receipt_with_below_pin_jarvis_surface(tmp_path)
     info: dict[str, object] = {"installation": {"component_runtime": {}}}
 
     with pytest.raises(ContractSurfaceUnavailableError) as excinfo:
@@ -1789,6 +1799,32 @@ def test_remote_clio_kit_component_refuses_typed_for_recorded_jarvis_degradation
     assert error.have == "clio-kit-jarvis-user-v3.6"
     assert error.need == CLIO_KIT_JARVIS_CONTRACT_ID
     assert error.reason == "contract_surface_unavailable"
+
+
+def test_remote_clio_kit_component_dev_mode_defers_and_returns_unverified_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """clio-relay#242 owner ruling: dev mode is LOUD AND NON-BLOCKING -- an
+    agent must be able to deploy and run WITH jarvis under no security
+    enforcement of sha/version/contract. The exact same recorded below-pin
+    jarvis surface that refuses typed in enforcing mode instead defers
+    (logged at WARNING, enforcement="deferred_dev_mode") and returns the
+    worker's self-reported runtime identity unverified."""
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+    receipt, _jarvis_status = _receipt_with_below_pin_jarvis_surface(tmp_path)
+    info: dict[str, object] = {
+        "installation": {"component_runtime": {"clio-kit": {"artifact_identity_verified": True}}}
+    }
+
+    with caplog.at_level(logging.WARNING, logger="clio_relay.contract_gate"):
+        runtime = verify_remote_clio_kit_native_execution_component(info, receipt)
+    assert runtime == {"artifact_identity_verified": True}
+    assert any(
+        "deferred_dev_mode" in record.message and "jarvis" in record.message
+        for record in caplog.records
+    )
 
 
 def test_remote_clio_kit_component_generic_error_when_never_probed(tmp_path: Path) -> None:

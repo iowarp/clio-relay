@@ -13,6 +13,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -91,6 +92,8 @@ MAX_VIRTUAL_REMOTE_MCP_CANDIDATES = 10_000
 MAX_REMOTE_MCP_CATALOG_ISSUES = 10_000
 MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
+
+logger = logging.getLogger(__name__)
 REMOTE_MCP_REPLACE_ATTEMPTS = 25
 REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = REGISTERED_JARVIS_USER_CONTRACT
@@ -791,7 +794,16 @@ class RemoteMcpSchemaCache(BaseModel):
 
 
 class RemoteMcpCatalogIssue(BaseModel):
-    """Reason a registered or discovered remote capability is not exposed."""
+    """Reason a registered or discovered remote capability is not exposed.
+
+    ``enforcement`` (clio-relay#242 dev-mode course correction) marks a
+    version/sha/contract-grounded issue that dev mode chose to LOG AND
+    PROCEED past rather than withhold the capability for --
+    ``"deferred_dev_mode"`` means this registration/tool IS in
+    ``VirtualRemoteMcpCatalog.tools`` despite the reason recorded here; the
+    default ``"enforced"`` means the capability really is withheld, exactly
+    as every issue meant before this field existed.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -799,6 +811,7 @@ class RemoteMcpCatalogIssue(BaseModel):
     server_name: str
     reason: str
     tool_name: str | None = None
+    enforcement: Literal["enforced", "deferred_dev_mode"] = "enforced"
 
 
 class RemoteMcpAcceptanceCheck(BaseModel):
@@ -2212,11 +2225,13 @@ def build_virtual_remote_mcp_catalog(
                 )
                 continue
             server_artifact_verified = _server_artifact_verified(entry.provenance.server_artifact)
+            artifact_verification_deferred = False
             if server_artifact_verified is False:
                 from clio_relay.dev_mode import dev_mode_enabled
 
                 if dev_mode_enabled():
                     server_artifact_verified = True
+                    artifact_verification_deferred = True
             if not server_artifact_verified and not registration.allow_mutable_artifact:
                 record_issue(
                     RemoteMcpCatalogIssue(
@@ -2229,9 +2244,34 @@ def build_virtual_remote_mcp_catalog(
                     )
                 )
                 continue
+            if artifact_verification_deferred:
+                # clio-relay#242 course correction: dev mode is LOUD AND
+                # NON-BLOCKING -- the boolean flip above must never be
+                # silent. Record the same reason a withheld registration
+                # would carry, tagged as deferred (this tool IS served),
+                # and log it at WARNING so a security-phase retest can find
+                # it after the fact.
+                record_issue(
+                    RemoteMcpCatalogIssue(
+                        cluster=cluster_name,
+                        server_name=server_name,
+                        reason="discovery server artifact identity is unverified",
+                        enforcement="deferred_dev_mode",
+                    )
+                )
+                logger.warning(
+                    "clio-relay: DEV MODE enforcement=deferred_dev_mode cluster=%s server=%s "
+                    "reason=%s",
+                    cluster_name,
+                    server_name,
+                    "discovery server artifact identity is unverified",
+                )
             if registration.contract is not None:
                 contract_check = _declared_contract_check(entry, registration)
                 if not contract_check.passed:
+                    from clio_relay.dev_mode import dev_mode_enabled
+
+                    contract_deferred = dev_mode_enabled()
                     record_issue(
                         RemoteMcpCatalogIssue(
                             cluster=cluster_name,
@@ -2240,9 +2280,27 @@ def build_virtual_remote_mcp_catalog(
                                 f"declared contract {registration.contract!r} failed: "
                                 f"{contract_check.message}"
                             ),
+                            enforcement=("deferred_dev_mode" if contract_deferred else "enforced"),
                         )
                     )
-                    continue
+                    if not contract_deferred:
+                        continue
+                    # Owner ruling (clio-relay#242 course correction): an
+                    # agent must be able to deploy and run WITH jarvis under
+                    # no security enforcement of sha/version/contract in dev
+                    # mode -- this is the exact "jarvis withheld from the
+                    # catalog" failure the ares live run hit. PROCEED past
+                    # the declared-contract refusal instead of withholding
+                    # the whole registration; the per-tool allowlist/schema
+                    # checks below still gate exactly what gets served.
+                    logger.warning(
+                        "clio-relay: DEV MODE enforcement=deferred_dev_mode cluster=%s server=%s "
+                        "declared_contract=%r reason=%s",
+                        cluster_name,
+                        server_name,
+                        registration.contract,
+                        contract_check.message,
+                    )
                 drift_notice = contract_check.evidence.get("contract_drift_notice")
                 if isinstance(drift_notice, str) and drift_notice:
                     # Non-fatal: the declared contract still passed (its exact
