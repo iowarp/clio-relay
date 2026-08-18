@@ -94,25 +94,28 @@ def reconcile_cluster_runtime_pin(
     exists, never mint a new one.
     """
     before: dict[str, object] = {}
-    current = ClusterRegistry.load(registry_path).require(cluster)
-    if current.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE:
-        action = "unchanged"
-    elif pinned_runtime_present:
-        action = "preserved_custom_pin"
-    else:
-        action = "repointed"
 
     def update(registry: ClusterRegistry) -> None:
+        # Classified inside the mutation so the whole reconciliation is ONE
+        # registry read-modify-write. Loading first to inspect the pin would
+        # double the config-directory traversal that every registry access
+        # performs.
         definition = registry.require(cluster)
         before["relay_executable"] = definition.relay_executable
         before["relay_install_receipt"] = definition.relay_install_receipt
-        if action != "repointed":
+        if definition.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE:
+            before["action"] = "unchanged"
             return
+        if pinned_runtime_present:
+            before["action"] = "preserved_custom_pin"
+            return
+        before["action"] = "repointed"
         definition.relay_executable = BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
         if definition.relay_install_receipt is not None:
             definition.relay_install_receipt = BOOTSTRAP_PRODUCED_INSTALL_RECEIPT
 
     registry = ClusterRegistry.mutate(registry_path, update)
+    action = cast(str, before["action"])
     definition = registry.require(cluster)
     previous_executable = cast(str, before.get("relay_executable"))
     previous_receipt = cast("str | None", before.get("relay_install_receipt"))
