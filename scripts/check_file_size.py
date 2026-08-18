@@ -87,6 +87,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # capability-by-negotiation logic the doctrine comment on #242 describes,
     # not a fixable regression. A justified, minimal ratchet-up.
     "src/clio_relay/bootstrap.py": 8858,
+    # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
+    # measured; restored after a merge-resolution slip dropped the entry.
+    "src/clio_relay/bootstrap_journal.py": 1534,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
