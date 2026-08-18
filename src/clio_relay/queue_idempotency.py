@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -15,6 +14,7 @@ from clio_relay import (
     queue_layout,
     queue_lease_records,
     queue_order_index,
+    queue_owner_session_records,
     queue_store_read,
     queue_store_write,
 )
@@ -48,7 +48,6 @@ class QueueIdempotencyMixin(queue_order_index.QueueOrderIndexMixin):
     _storage_root: Path
     _lock: queue_context.QueueLockProtocol
     _store_adapter: queue_context.QueueStoreProtocol
-    _validate_new_owner_session_metadata: Callable[[dict[str, object]], None]
 
     def resolve_idempotent_submission(
         self,
@@ -56,7 +55,9 @@ class QueueIdempotencyMixin(queue_order_index.QueueOrderIndexMixin):
     ) -> IdempotentSubmissionResolution:
         """Resolve canonical idempotency identity without repairing or writing records."""
         queue_layout.QueueLayout.require_durable_record_id(job.job_id, field="job_id")
-        self._validate_new_owner_session_metadata(job.metadata)
+        queue_owner_session_records._validate_new_owner_session_metadata(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            job.metadata
+        )
         self._store_adapter.initialize()
         queue_index_state.require_index_migration_complete(self._storage_root)
         key_path = (

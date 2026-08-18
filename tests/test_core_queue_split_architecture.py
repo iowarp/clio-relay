@@ -24,6 +24,8 @@ from clio_relay import (
     queue_lease_records,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
+    queue_owner_session_lifecycle,
+    queue_owner_session_records,
     queue_scheduler_cancel_records,
     queue_store_read,
     queue_store_write,
@@ -60,10 +62,12 @@ _OWNER_RANK = {
     "queue_legacy_audit": 12,
     "queue_order_index": 13,
     "queue_events": 14,
-    "queue_idempotency": 15,
-    "queue_endpoints": 16,
-    "queue_artifact_lineage": 17,
-    "queue_artifacts": 18,
+    "queue_owner_session_records": 15,
+    "queue_owner_session_lifecycle": 16,
+    "queue_idempotency": 17,
+    "queue_endpoints": 18,
+    "queue_artifact_lineage": 19,
+    "queue_artifacts": 20,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -81,6 +85,8 @@ _OWNER_BUDGETS = {
     "queue_legacy_audit": 650,
     "queue_order_index": 450,
     "queue_events": 270,
+    "queue_owner_session_records": 690,
+    "queue_owner_session_lifecycle": 350,
     "queue_idempotency": 270,
     "queue_endpoints": 340,
     "queue_artifact_lineage": 500,
@@ -137,6 +143,10 @@ class _EndpointStoreLookupSabotage(RuntimeError):
 
 class _ArtifactLineageWriteLookupSabotage(RuntimeError):
     """Raised only when CQ9 submission-edge validation reaches its write owner."""
+
+
+class _OwnerSessionWriteLookupSabotage(RuntimeError):
+    """Raised only when CQ10 closure reaches its store-write owner."""
 
 
 @dataclass(frozen=True)
@@ -514,6 +524,91 @@ def test_cq9_submission_edge_validation_uses_the_lineage_write_lookup(
         ClioCoreQueue._ensure_artifact_use_indexes_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         is queue_artifact_lineage.QueueArtifactLineageMixin._ensure_artifact_use_indexes_unlocked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     )
+
+
+def test_cq10_owner_session_closure_uses_the_records_write_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Owner-session closure must persist through the CQ10 records owner seam."""
+    queue = ClioCoreQueue(tmp_path)
+    owner_session_id = "session-cq10"
+    generation_id = "generation-cq10"
+    closing_path = (
+        queue._storage_root  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        / "owner_sessions"
+        / f"{queue._label_key(owner_session_id, domain='owner-session')}.closing.json"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+    closing_path.parent.mkdir(parents=True)
+    closing_path.write_text(
+        json.dumps(
+            {
+                "owner_session_id": owner_session_id,
+                "session_generation_id": generation_id,
+                "closing": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    saved: dict[Path, object] = {}
+
+    def read_closing(path: Path) -> object:
+        if path == closing_path:
+            return {
+                "owner_session_id": owner_session_id,
+                "session_generation_id": generation_id,
+                "closing": True,
+            }
+        return None
+
+    def active_generation(_owner_session_id: str) -> str:
+        return generation_id
+
+    def read_optional(path: Path, _model: type[object]) -> object | None:
+        return saved.get(path)
+
+    def save_write(path: Path, record: object) -> None:
+        saved[path] = record
+
+    monkeypatch.setattr(queue, "initialize", lambda: None)
+    monkeypatch.setattr(queue, "_lock", nullcontext())
+    monkeypatch.setattr(queue, "_read_json_document", read_closing)
+    monkeypatch.setattr(queue, "_owner_session_active_generation", active_generation)
+    monkeypatch.setattr(queue, "_read_optional", read_optional)
+    monkeypatch.setattr(queue, "_write", save_write)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _OwnerSessionWriteLookupSabotage(
+            "queue_owner_session_records store-write lookup engaged"
+        )
+
+    isolated_store_write = SimpleNamespace(
+        **{
+            **vars(queue_store_write),
+            "write_model": sabotage,
+        }
+    )
+    monkeypatch.setattr(
+        queue_owner_session_records,
+        "queue_store_write",
+        isolated_store_write,
+    )
+
+    with pytest.raises(
+        _OwnerSessionWriteLookupSabotage,
+        match="queue_owner_session_records store-write lookup engaged",
+    ):
+        queue.set_owner_session_closed(
+            owner_session_id,
+            session_generation_id=generation_id,
+        )
+
+    assert (
+        ClioCoreQueue.set_owner_session_closed
+        is queue_owner_session_records.QueueOwnerSessionRecordsMixin.set_owner_session_closed
+    )
+    owner_status = queue_owner_session_lifecycle.QueueOwnerSessionLifecycleMixin.owner_session_generation_status  # noqa: E501
+    assert ClioCoreQueue.owner_session_generation_status is owner_status
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:

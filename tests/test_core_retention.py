@@ -5,11 +5,14 @@ import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic import BaseModel
 
 import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_owner_session_records, queue_store_write
 from clio_relay.core_queue import (
     RECORD_FAMILY_MAX_BYTES,
     ClioCoreQueue,
@@ -930,10 +933,17 @@ def test_owner_session_closure_recovers_if_history_directory_disappears(
         owner_session_id,
         session_generation_id=generation_id,
     )
-    original_write = cast(Any, queue)._write
+    # CQ10 moved owner-session closure persistence into queue_owner_session_records,
+    # which funnels durable writes through its own `queue_store_write` reference
+    # (verified by test_core_queue_split_architecture.py::
+    # test_cq10_owner_session_closure_uses_the_records_write_lookup) rather than
+    # through the generic ClioCoreQueue._write seam this test used pre-move. Patch
+    # the write-model lookup at its current owner so the injected failure still
+    # lands on the real closure-write call.
+    original_write_model = queue_store_write.write_model
     attempts = 0
 
-    def remove_history_directory_once(path: Path, record: object) -> None:
+    def remove_history_directory_once(storage_root: Path, path: Path, record: BaseModel) -> None:
         nonlocal attempts
         if path == closure_path and attempts == 0:
             attempts += 1
@@ -941,9 +951,12 @@ def test_owner_session_closure_recovers_if_history_directory_disappears(
             path.parent.rmdir()
             raise FileNotFoundError(2, "injected closure-directory removal", str(path))
         attempts += 1
-        original_write(path, record)
+        original_write_model(storage_root, path, record)
 
-    monkeypatch.setattr(queue, "_write", remove_history_directory_once)
+    isolated_store_write = SimpleNamespace(
+        **{**vars(queue_store_write), "write_model": remove_history_directory_once}
+    )
+    monkeypatch.setattr(queue_owner_session_records, "queue_store_write", isolated_store_write)
 
     closure = queue.set_owner_session_closed(
         owner_session_id,

@@ -138,7 +138,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # ratchet by 504 lines.
     # #231 CQ9 fix round: restore the CQ1 protocol alias while deleting two
     # confirmed facade corpse wrappers. Net facade ratchet-down: 11011 -> 11004.
-    "src/clio_relay/core_queue.py": 11004,
+    # #231 CQ10: move owner-session lifecycle/record bodies and identity
+    # validators into their two budgeted owners, then compose the lifecycle
+    # mixin and retain only qualified owner lookups. Net: 11004 -> 10065.
+    "src/clio_relay/core_queue.py": 10065,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
