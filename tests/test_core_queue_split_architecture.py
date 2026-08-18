@@ -27,6 +27,7 @@ from clio_relay import (
     queue_owner_session_lifecycle,
     queue_owner_session_records,
     queue_scheduler_cancel_records,
+    queue_scheduler_cancel_state,
     queue_store_read,
     queue_store_write,
 )
@@ -68,6 +69,7 @@ _OWNER_RANK = {
     "queue_endpoints": 18,
     "queue_artifact_lineage": 19,
     "queue_artifacts": 20,
+    "queue_scheduler_cancel_state": 21,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -91,6 +93,7 @@ _OWNER_BUDGETS = {
     "queue_endpoints": 340,
     "queue_artifact_lineage": 500,
     "queue_artifacts": 220,
+    "queue_scheduler_cancel_state": 450,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -147,6 +150,10 @@ class _ArtifactLineageWriteLookupSabotage(RuntimeError):
 
 class _OwnerSessionWriteLookupSabotage(RuntimeError):
     """Raised only when CQ10 closure reaches its store-write owner."""
+
+
+class _SchedulerCancelStateWriteLookupSabotage(RuntimeError):
+    """Raised only when CQ11 pending-state creation reaches its store-write owner."""
 
 
 @dataclass(frozen=True)
@@ -609,6 +616,49 @@ def test_cq10_owner_session_closure_uses_the_records_write_lookup(
     )
     owner_status = queue_owner_session_lifecycle.QueueOwnerSessionLifecycleMixin.owner_session_generation_status  # noqa: E501
     assert ClioCoreQueue.owner_session_generation_status is owner_status
+
+
+def test_cq11_scheduler_cancel_pending_creation_uses_the_state_write_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Ensuring pending scheduler-cancellation state must write through the CQ11 owner seam."""
+    queue = ClioCoreQueue(tmp_path)
+    job = RelayJob(
+        cluster="cluster-cq11",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="cq11-pending",
+    )
+    queue.submit_job(job)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _SchedulerCancelStateWriteLookupSabotage(
+            "queue_scheduler_cancel_state store-write lookup engaged"
+        )
+
+    isolated_store_write = SimpleNamespace(
+        **{
+            **vars(queue_store_write),
+            "write_model": sabotage,
+        }
+    )
+    monkeypatch.setattr(
+        queue_scheduler_cancel_state,
+        "queue_store_write",
+        isolated_store_write,
+    )
+
+    with pytest.raises(
+        _SchedulerCancelStateWriteLookupSabotage,
+        match="queue_scheduler_cancel_state store-write lookup engaged",
+    ):
+        queue.ensure_scheduler_cancel_pending(job.job_id, reason="operator_request")
+
+    owner_ensure_pending = (
+        queue_scheduler_cancel_state.QueueSchedulerCancelStateMixin.ensure_scheduler_cancel_pending
+    )  # noqa: E501
+    assert ClioCoreQueue.ensure_scheduler_cancel_pending is owner_ensure_pending
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:

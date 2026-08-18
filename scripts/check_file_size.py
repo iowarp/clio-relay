@@ -141,7 +141,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 CQ10: move owner-session lifecycle/record bodies and identity
     # validators into their two budgeted owners, then compose the lifecycle
     # mixin and retain only qualified owner lookups. Net: 11004 -> 10065.
-    "src/clio_relay/core_queue.py": 10065,
+    # #231 CQ11: move the scheduler-cancellation pending/disposition public
+    # methods and the CQ4-IO-01 deviation's four durable-state helpers
+    # (_scheduler_cancel_record_path/_ensure_scheduler_cancel_pending_unlocked/
+    # _require_scheduler_cancel_pending_unlocked/
+    # _persist_scheduler_cancel_record_unlocked, deliberately left resident at
+    # CQ4 because queue_scheduler_cancel_records.py is a store-independent
+    # codec module) into the new queue_scheduler_cancel_state.py owner, and
+    # deletes the two now-dead _scheduler_cancel_record_is_due/
+    # _scheduler_cancel_due_sort_key module shims a repository-wide call-site
+    # audit found unreferenced once their only caller moved. Net: 10065 ->
+    # 9688.
+    "src/clio_relay/core_queue.py": 9688,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
