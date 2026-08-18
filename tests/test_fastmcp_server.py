@@ -392,7 +392,6 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
@@ -571,7 +570,6 @@ def _mock_local_job_admission(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
@@ -1519,7 +1517,6 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(

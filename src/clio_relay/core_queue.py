@@ -38,7 +38,6 @@ from clio_relay import (
     queue_lease_records,
     queue_legacy_audit,
     queue_legacy_output_audit,
-    queue_legacy_output_codec,
     queue_legacy_output_migration,
     queue_order_index,
     queue_owner_session_lifecycle,
@@ -50,9 +49,6 @@ from clio_relay import (
     queue_store_write,
 )
 from clio_relay.browser_gateway import BrowserAttachmentRecord
-from clio_relay.cluster_config import (
-    ensure_private_configuration_path,  # pyright: ignore[reportUnusedImport]  # noqa: F401 - live compatibility patch seam
-)
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import (
     ConfigurationError,
@@ -137,7 +133,6 @@ OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS = queue_layout.OWNER_SESSION_CLOSURE_WRITE_
 JOB_INDEX_SCHEMA = queue_layout.JOB_INDEX_SCHEMA
 INDEX_MIGRATION_SCHEMA = queue_layout.INDEX_MIGRATION_SCHEMA
 LEASE_OPERATIONAL_INDEX_SCHEMA = queue_layout.LEASE_OPERATIONAL_INDEX_SCHEMA
-_LEGACY_LEASE_OPERATIONAL_INDEX_SCHEMA = queue_layout.LEGACY_LEASE_OPERATIONAL_INDEX_SCHEMA
 LEASE_CAPACITY_AGGREGATE_SCHEMA = queue_layout.LEASE_CAPACITY_AGGREGATE_SCHEMA
 LEASE_CAPACITY_CHECKPOINT_SCHEMA = queue_layout.LEASE_CAPACITY_CHECKPOINT_SCHEMA
 LEASE_CAPACITY_AUDIT_SCHEMA = queue_layout.LEASE_CAPACITY_AUDIT_SCHEMA
@@ -215,10 +210,6 @@ _LeaseCapacityCheckpoint = queue_lease_records.LeaseCapacityCheckpoint
 _LeaseCapacityPair = queue_lease_records.LeaseCapacityPair
 
 
-_LegacyOutputAudit = queue_legacy_output_codec.LegacyOutputAudit
-_LegacyOutputRecord = queue_legacy_output_codec.LegacyOutputRecord
-
-
 _artifact_with_sequence = queue_artifacts.artifact_with_sequence
 
 
@@ -255,7 +246,7 @@ class _QueueStoreAdapter:
 
     def read_json_document(self, path: Path) -> object:
         """Read one strict JSON document through the store-read owner."""
-        return queue_store_read.read_json_document(path)
+        return self._queue._read_json_document(path)  # pyright: ignore[reportPrivateUsage]
 
     def write(self, path: Path, record: BaseModel) -> None:
         """Persist one typed record through the store-write owner."""
@@ -263,7 +254,7 @@ class _QueueStoreAdapter:
 
     def write_json(self, path: Path, record: dict[str, object]) -> None:
         """Persist one JSON object through the store-write owner."""
-        queue_store_write.write_json(self.storage_root, path, record)
+        self._queue._write_json(path, record)  # pyright: ignore[reportPrivateUsage]
 
     def bounded_regular_json_count(
         self,
@@ -6277,22 +6268,6 @@ class ClioCoreQueue(
         if session is not None:
             self._index_gateway_session_unlocked(session)
 
-    def _unindex_gateway_session_unlocked(
-        self,
-        session: GatewaySession,
-        *,
-        preserve: GatewaySession | None = None,
-    ) -> None:
-        preserved = (
-            preserve
-            if preserve is not None and preserve.state is not GatewaySessionState.CLOSED
-            else None
-        )
-        self._unindex_gateway_session_id_unlocked(
-            session.session_id,
-            preserve=preserved,
-        )
-
     def _unindex_gateway_session_id_unlocked(
         self,
         session_id: str,
@@ -8143,18 +8118,6 @@ class ClioCoreQueue(
     def _write_text(self, path: Path, text: str) -> None:
         queue_store_write.write_text(self._storage_root, path, text)
 
-    def _write_bytes(self, path: Path, payload: bytes, *, max_bytes: int) -> None:
-        queue_store_write.write_bytes(
-            self._storage_root,
-            path,
-            payload,
-            max_bytes=max_bytes,
-        )
-
-    @staticmethod
-    def _fsync_write_directory(path: Path) -> None:
-        queue_store_write.fsync_write_directory(path)
-
     def _read_canonical_record(self, path: Path, model: type[Record]) -> Record:
         return queue_store_read.read_canonical_record(self._storage_root, path, model)
 
@@ -8244,9 +8207,6 @@ def _read_unique_json_document(path: Path) -> object:
             cause=exc,
             logger=logger,
         ) from exc
-
-
-_record_identity_field = queue_layout.record_identity_field
 
 
 def _is_canonical_event_path(storage_root: Path, path: Path, family: str) -> bool:
@@ -8429,9 +8389,6 @@ def _metadata_scheduler_gc_state(metadata: dict[str, object]) -> tuple[set[str],
                 scheduler_marker_seen = True
                 scheduler_ids.add(raw_id)
     return scheduler_ids, scheduler_marker_seen and scheduler_ids != terminal_ids
-
-
-_safe_owner_legacy_job_id = queue_layout.safe_owner_legacy_job_id
 
 
 def _safe_global_record_id(record_id: object) -> bool:
@@ -8918,9 +8875,6 @@ def _validate_gc_candidate_ancestry(root: Path, candidate: Path) -> None:
             raise QueueConflictError(f"GC candidate has unsafe ancestry: {candidate}")
 
 
-_record_max_bytes = queue_layout.record_max_bytes
-
-
 def _record_is_reparse(file_stat: os.stat_result) -> bool:
     return queue_layout.record_is_reparse(file_stat)
 
@@ -8929,14 +8883,8 @@ def _validate_record_stat(file_stat: os.stat_result, *, path: Path) -> None:
     queue_layout.validate_record_stat(file_stat, path=path)
 
 
-_record_stats_match = queue_layout.record_stats_match
-
-
 def _read_bounded_record_bytes(path: Path) -> bytes:
     return queue_store_read.read_bounded_record_bytes(path)
-
-
-_transient_record_access_conflict = queue_store_read.transient_record_access_conflict
 
 
 def _unlink_durable_path(path: Path, *, missing_ok: bool = False) -> None:

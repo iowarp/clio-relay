@@ -7,14 +7,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import (
     queue_context,
-    queue_events,
     queue_index_state,
     queue_layout,
     queue_order_index,
     queue_store_read,
 )
-from clio_relay.errors import NotFoundError, QueueConflictError
-from clio_relay.models import ArtifactRef, ArtifactUseProvenance, RelayJob, TransformRef
+from clio_relay.errors import QueueConflictError
+from clio_relay.models import ArtifactRef, ArtifactUseProvenance, RelayEvent, RelayJob, TransformRef
 
 _require_durable_record_id = queue_layout.QueueLayout.require_durable_record_id
 
@@ -52,7 +51,15 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
         def _link_gateways_for_artifact_unlocked(self, artifact: ArtifactRef) -> None: ...
 
-        def get_job(self, job_id: str) -> RelayJob: ...
+        def append_event(
+            self,
+            job_id: str,
+            event_type: str,
+            message: str,
+            *,
+            locked: bool = False,
+            payload: dict[str, object] | None = None,
+        ) -> RelayEvent: ...
 
     def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
         """Index an artifact reference."""
@@ -61,7 +68,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
         self._store_adapter.initialize()
         with self._lock:
             root = self._storage_root
-            self.get_job(artifact.job_id)
+            queue_store_read.read_required_job(self._storage_root, artifact.job_id)
             sequence = self._next_job_record_sequence_unlocked(artifact.job_id, "artifact_count")
             saved = artifact_with_sequence(artifact, sequence)
             self._store_adapter.write(root / "artifacts" / f"{saved.artifact_id}.json", saved)
@@ -80,8 +87,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
             queue_order_index.increment_job_index(
                 self._store_adapter, artifact.job_id, "artifact_count"
             )
-            queue_events.QueueEventsMixin.append_event(
-                cast(queue_events.QueueEventsMixin, self),
+            self.append_event(
                 artifact.job_id,
                 "artifact.created",
                 f"Artifact indexed: {artifact.uri}",
@@ -148,14 +154,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def get_artifact(self, artifact_id: str) -> ArtifactRef:
         """Return an artifact by id."""
-        artifact_id = _require_durable_record_id(artifact_id, field="artifact_id")
-        path = self._storage_root / "artifacts" / f"{artifact_id}.json"
-        artifact = self._store_adapter.read_optional(path, ArtifactRef)
-        if artifact is None:
-            raise NotFoundError(f"artifact not found: {artifact_id}")
-        if artifact.artifact_id != artifact_id:
-            raise QueueConflictError(f"canonical artifact identity mismatch: {path}")
-        return artifact
+        return queue_store_read.read_required_artifact(self._storage_root, artifact_id)
 
     def record_transform_ref(self, transform: TransformRef) -> TransformRef:
         """Persist one immutable transform independently from its used-edge count."""
@@ -163,7 +162,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
         self._store_adapter.initialize()
         path = self._storage_root / "transforms" / f"{job_id}.json"
         with self._lock:
-            job = self.get_job(job_id)
+            job = queue_store_read.read_required_job(self._storage_root, job_id)
             self._validate_transform_ref_unlocked(job, transform)
             existing = self._store_adapter.read_optional(path, TransformRef)
             if existing is not None:
@@ -177,7 +176,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
         """Return the nullable immutable transform associated with one retained job."""
         job_id = _require_durable_record_id(job_id, field="job_id")
         self._store_adapter.initialize()
-        self.get_job(job_id)
+        queue_store_read.read_required_job(self._storage_root, job_id)
         record = self._store_adapter.read_optional(
             self._storage_root / "transforms" / f"{job_id}.json",
             TransformRef,

@@ -514,7 +514,6 @@ class QueueLegacyOutputAuditMixin:
         )
 
 
-audit_completed_state = QueueLegacyOutputAuditMixin._audit_completed_legacy_output_state  # pyright: ignore[reportPrivateUsage]
 audit_state_before_initialization = (
     QueueLegacyOutputAuditMixin._audit_legacy_output_state_before_initialization  # pyright: ignore[reportPrivateUsage]
 )

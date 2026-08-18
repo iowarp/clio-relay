@@ -22,7 +22,6 @@ from clio_relay.errors import NotFoundError, QueueConflictError, queue_conflict_
 from clio_relay.models import ProgressRecord, RelayJob
 
 logger = logging.getLogger(__name__)
-index_integer = queue_index_state.index_integer
 
 
 def _stable_ref_token(value: str) -> str:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
 from clio_relay import queue_context, queue_layout, queue_store_read, queue_store_write
 from clio_relay.errors import QueueConflictError as _Conflict
@@ -133,11 +133,6 @@ class QueueArtifactLineageMixin:
 
     _storage_root: Path
     _store_adapter: queue_context.QueueStoreProtocol
-    if TYPE_CHECKING:
-
-        def get_artifact(self, artifact_id: str) -> ArtifactRef: ...
-
-        def get_job(self, job_id: str) -> RelayJob: ...
 
     def list_used_artifacts_page(
         self,
@@ -152,7 +147,7 @@ class QueueArtifactLineageMixin:
             cursor = queue_layout.QueueLayout.require_durable_record_id(cursor, field="cursor")
         limit = validate_response_page_limit(limit)
         self._store_adapter.initialize()
-        job = self.get_job(job_id)
+        job = queue_store_read.read_required_job(self._storage_root, job_id)
         records, next_cursor, total = self._read_artifact_use_page(
             self._storage_root
             / "used_artifacts_by_job"
@@ -192,7 +187,7 @@ class QueueArtifactLineageMixin:
         cursor_sequence = 0 if cursor is None else _artifact_user_cursor_sequence(cursor)
         limit = validate_response_page_limit(limit)
         self._store_adapter.initialize()
-        self.get_artifact(artifact_id)
+        queue_store_read.read_required_artifact(self._storage_root, artifact_id)
         order_root = self._artifact_user_order_root(artifact_id)
         entry_paths = queue_store_read.bounded_json_record_paths(
             order_root / "entries",
@@ -481,13 +476,13 @@ class QueueArtifactLineageMixin:
         return record
 
     def _validate_artifact_use_record(self, record: UsedArtifactRef) -> None:
-        artifact = self.get_artifact(record.artifact_id)
+        artifact = queue_store_read.read_required_artifact(self._storage_root, record.artifact_id)
         if artifact.job_id != record.producer_job_id or artifact.sha256 != record.sha256:
             raise _C(
                 f"used-artifact edge no longer matches canonical artifact: {record.artifact_id}"
             )
-        consumer = self.get_job(record.consumer_job_id)
-        producer = self.get_job(record.producer_job_id)
+        consumer = queue_store_read.read_required_job(self._storage_root, record.consumer_job_id)
+        producer = queue_store_read.read_required_job(self._storage_root, record.producer_job_id)
         require_artifact_lineage_owner_match(consumer=consumer, producer=producer)
         pinned = {item.artifact_id: item for item in consumer.used_artifact_refs}
         expected = pinned.get(record.artifact_id)

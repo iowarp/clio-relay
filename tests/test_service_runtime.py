@@ -1402,7 +1402,6 @@ def _start_lifecycle_frp_runtime(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
         "clio_relay.service_runtime",
     ):
@@ -1411,6 +1410,12 @@ def _start_lifecycle_frp_runtime(
             allow_private_path,
             raising=False,
         )
+    for module_name in (
+        # service_runtime never imports ensure_private_configuration_path -- it
+        # only uses ensure_private_configuration_directory (src/clio_relay/service_runtime.py).
+        "clio_relay.cluster_config",
+        "clio_relay.worker_lifetime_lock",
+    ):
         monkeypatch.setattr(
             f"{module_name}.ensure_private_configuration_path",
             allow_private_path,

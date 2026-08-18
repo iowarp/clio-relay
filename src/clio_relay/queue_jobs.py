@@ -32,9 +32,10 @@ from clio_relay import (
     queue_store_read,
     queue_store_write,
 )
-from clio_relay.errors import NotFoundError, QueueConflictError, queue_conflict_from_cause
+from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 from clio_relay.models import (
     TERMINAL_STATES,
+    InputArtifactIngestPolicy,
     JobKind,
     JobState,
     JobTombstone,
@@ -104,7 +105,9 @@ class QueueJobsMixin:
         def _assert_owner_session_intake_open_unlocked(
             self, metadata: dict[str, object], *, require_active: bool = False
         ) -> None: ...
-        def _assert_input_ingest_quota_unlocked(self, job: RelayJob) -> None: ...
+        def _assert_input_ingest_quota_unlocked(
+            self, job: RelayJob, *, policy: InputArtifactIngestPolicy | None = None
+        ) -> None: ...
         def _artifact_use_records_unlocked(
             self, job: RelayJob, *, allocate_sequences: bool
         ) -> list[UsedArtifactRef]: ...
@@ -293,14 +296,7 @@ class QueueJobsMixin:
 
     def get_job(self, job_id: str) -> RelayJob:
         """Return a job by id."""
-        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
-        path = self._storage_root / "jobs" / f"{job_id}.json"
-        job = self._store_adapter.read_optional(path, RelayJob)
-        if job is None:
-            raise NotFoundError(f"job not found: {job_id}")
-        if job.job_id != job_id:
-            raise QueueConflictError(f"canonical job identity mismatch: {path}")
-        return job
+        return queue_store_read.read_required_job(self._storage_root, job_id)
 
     def get_job_tombstone(self, job_id: str) -> JobTombstone | None:
         """Return the durable terminal tombstone for a retired job, if present."""

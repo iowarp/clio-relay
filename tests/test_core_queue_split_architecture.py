@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 import json
 from contextlib import nullcontext
@@ -48,6 +49,7 @@ from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
+_TESTS_ROOT = Path(__file__).parent
 _NON_OWNER_QUEUE_MODULES = frozenset({"queue_management", "queue_validation"})
 _OWNER_RANK = {
     "queue_context": 0,
@@ -79,14 +81,14 @@ _OWNER_BUDGETS = {
     "queue_jarvis_inputs": 300,
     "queue_layout": 410,
     "queue_store_lock": 270,
-    "queue_store_read": 350,
+    "queue_store_read": 410,
     "queue_store_write": 230,
     "queue_lease_records": 680,
     "queue_scheduler_cancel_records": 260,
     "queue_legacy_output_codec": 500,
     "queue_index_state": 270,
     "queue_legacy_output_audit": 520,
-    "queue_legacy_output_migration": 210,
+    "queue_legacy_output_migration": 250,
     "queue_legacy_audit": 650,
     "queue_order_index": 450,
     "queue_events": 270,
@@ -229,22 +231,125 @@ def _bare_owner_import_lines(
     functions_by_owner: dict[str, set[str]],
     owners: tuple[str, ...] = _OWNER_MANIFEST,
 ) -> list[int]:
+    """Return lines that bind a cross-owner function to an unqualified name.
+
+    Two syntaxes create the same hazard: ``from collaborator import func``
+    (an ``ImportFrom``) and ``alias = collaborator.func`` (an ``Assign`` or
+    ``AnnAssign``). Both bind a bare local name at import time that a
+    monkeypatch on ``collaborator.func`` can no longer intercept -- F5
+    (block-2 review): the original guard only walked ``ImportFrom`` and
+    missed the assignment form entirely.
+    """
     violations: list[int] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        collaborator = _imported_owner(node.module, owners=owners)
-        if collaborator is None or collaborator == caller:
-            continue
-        if any(alias.name in functions_by_owner.get(collaborator, set()) for alias in node.names):
-            violations.append(node.lineno)
+        if isinstance(node, ast.ImportFrom):
+            collaborator = _imported_owner(node.module, owners=owners)
+            if collaborator is None or collaborator == caller:
+                continue
+            if any(
+                alias.name in functions_by_owner.get(collaborator, set()) for alias in node.names
+            ):
+                violations.append(node.lineno)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if not (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)):
+                continue
+            collaborator = _imported_owner(value.value.id, owners=owners)
+            if collaborator is None or collaborator == caller:
+                continue
+            if value.attr in functions_by_owner.get(collaborator, set()):
+                violations.append(node.lineno)
     return violations
+
+
+def _mixin_classes(tree: ast.Module) -> list[ast.ClassDef]:
+    """Return the owner's composed ``*Mixin`` class definitions.
+
+    Every class actually mixed into ``ClioCoreQueue`` (directly, or as a base
+    of another mixin) is named ``...Mixin`` in this codebase -- confirmed by
+    the full class inventory across ``src/clio_relay/queue_*.py``. Plain
+    record/protocol/helper classes (e.g. ``QueueLayout``, ``LeaseIndexIdentity``)
+    are held by composition (``self._layout``), not MRO, so ``self.<name>()``
+    can never resolve into them and they are excluded here.
+    """
+    return [
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name.endswith("Mixin")
+    ]
+
+
+def _real_method_names(class_node: ast.ClassDef) -> set[str]:
+    """Return the class's directly-defined method names (real bodies only).
+
+    ``if TYPE_CHECKING:`` stub declarations are not walked here on purpose:
+    a stub documents an *expected* cross-owner edge for the type checker, it
+    is never itself the real definition. Using only real definitions makes
+    the manifest reflect where a name is actually implemented.
+    """
+    return {
+        item.name
+        for item in class_node.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _mixin_method_owner_manifest(
+    owners: tuple[str, ...] = _OWNER_MANIFEST,
+) -> dict[str, str]:
+    """Map each unambiguous mixin method name to its one defining owner."""
+    owner_by_method: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for owner in owners:
+        for class_node in _mixin_classes(_owner_tree(owner)):
+            for name in _real_method_names(class_node):
+                if name in owner_by_method and owner_by_method[name] != owner:
+                    ambiguous.add(name)
+                owner_by_method[name] = owner
+    for name in ambiguous:
+        del owner_by_method[name]
+    return owner_by_method
+
+
+_MIXIN_METHOD_OWNERS = _mixin_method_owner_manifest()
+
+
+def _self_call_edges(
+    caller: str,
+    tree: ast.Module,
+    *,
+    method_owners: dict[str, str] = _MIXIN_METHOD_OWNERS,
+) -> set[_OwnerDependency]:
+    """Return caller->collaborator edges for ``self.<name>(...)`` calls.
+
+    These resolve only through the fully composed ``ClioCoreQueue`` MRO at
+    runtime -- invisible to a static per-module import scan. F4 (block-2
+    review): five such calls to ``self.get_job(...)`` created reverse-rank
+    edges onto the later-landed ``queue_jobs`` owner, undetected until now.
+    """
+    dependencies: set[_OwnerDependency] = set()
+    for class_node in _mixin_classes(tree):
+        own_methods = _real_method_names(class_node)
+        for node in ast.walk(class_node):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+            ):
+                continue
+            name = node.func.attr
+            if name in own_methods:
+                continue
+            collaborator = method_owners.get(name)
+            if collaborator is not None and collaborator != caller:
+                dependencies.add(_OwnerDependency(caller, collaborator))
+    return dependencies
 
 
 def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
     dependencies: set[_OwnerDependency] = set()
     for caller in _OWNER_MANIFEST:
-        for node in ast.walk(_owner_tree(caller)):
+        tree = _owner_tree(caller)
+        for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 collaborator = _imported_owner(node.module)
                 if collaborator is not None and collaborator != caller:
@@ -258,7 +363,163 @@ def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
                     collaborator = _imported_owner(alias.name)
                     if collaborator is not None and collaborator != caller:
                         dependencies.add(_OwnerDependency(caller, collaborator))
+        dependencies |= _self_call_edges(caller, tree)
     return tuple(sorted(dependencies, key=lambda edge: (edge.caller, edge.collaborator)))
+
+
+# --- §4 audit extension: dynamically-built (f-string/loop) monkeypatch seams ---
+#
+# The static `monkeypatch.setattr("clio_relay.module.attr", ...)` string-literal
+# sites are covered by the design §4 table by hand. A patch target built as
+# `f"{module_name}.attr"` inside a `for module_name in (...)` loop is invisible
+# to that hand-audit: F1/F2 (block-2 review) found a real dead seam this way --
+# `queue_legacy_audit.py` moved its real call off `clio_relay.core_queue`, but
+# three test loops kept patching `clio_relay.core_queue.ensure_private_configuration_directory`,
+# which either raised AttributeError (no `raising=False`) or silently patched
+# nothing at all (`raising=False`). Neither is caught by the string-literal
+# audit. This extractor + guard makes that class of break fail loudly here
+# instead of only at a flaky/silent runtime seam.
+_KNOWN_DYNAMIC_SEAM_EXEMPTIONS: frozenset[str] = frozenset()
+"""Explicitly justified (module, attr) dynamic targets allowed to not resolve.
+
+Empty by design: every dynamic loop-built monkeypatch target discovered in
+``tests/`` must resolve on the real module it names. An addition here must
+carry its own justification in the same change that adds it -- this is not a
+default escape hatch (design doc §4: "a temporary re-export ... is never an
+injection seam").
+"""
+
+
+def _loop_string_literals(loop: ast.For) -> tuple[str, ...] | None:
+    """Return the loop's iterated string literals, or None if not all-literal."""
+    if not isinstance(loop.target, ast.Name):
+        return None
+    if not isinstance(loop.iter, (ast.Tuple, ast.List)):
+        return None
+    literals: list[str] = []
+    for element in loop.iter.elts:
+        if not (isinstance(element, ast.Constant) and isinstance(element.value, str)):
+            return None
+        literals.append(element.value)
+    return tuple(literals)
+
+
+def _fstring_loop_variable_suffix(joined: ast.JoinedStr, *, loop_variable: str) -> str | None:
+    """Return the static suffix of ``f"{loop_variable}<suffix>"``, or None."""
+    if len(joined.values) != 2:
+        return None
+    head, tail = joined.values
+    if not (
+        isinstance(head, ast.FormattedValue)
+        and isinstance(head.value, ast.Name)
+        and head.value.id == loop_variable
+    ):
+        return None
+    if not (isinstance(tail, ast.Constant) and isinstance(tail.value, str)):
+        return None
+    return tail.value
+
+
+def _setattr_raising_is_false(call: ast.Call) -> bool:
+    return any(
+        keyword.arg == "raising"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is False
+        for keyword in call.keywords
+    )
+
+
+def _dynamic_setattr_targets(tree: ast.Module) -> tuple[tuple[str, bool], ...]:
+    """Return every ``(module.attr, raising)`` pair built from a string-literal
+    loop feeding an f-string into ``monkeypatch.setattr(...)``."""
+    targets: list[tuple[str, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For):
+            continue
+        literals = _loop_string_literals(node)
+        if literals is None or not isinstance(node.target, ast.Name):
+            continue
+        loop_variable = node.target.id
+        for call in ast.walk(node):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "setattr"
+                and call.args
+                and isinstance(call.args[0], ast.JoinedStr)
+            ):
+                continue
+            suffix = _fstring_loop_variable_suffix(call.args[0], loop_variable=loop_variable)
+            if suffix is None:
+                continue
+            raising_false = _setattr_raising_is_false(call)
+            targets.extend((f"{literal}{suffix}", raising_false) for literal in literals)
+    return tuple(targets)
+
+
+def _resolve_dynamic_target(target: str) -> bool:
+    """Return True when ``module.path.attr`` names a real, existing attribute."""
+    module_path, _, attribute = target.rpartition(".")
+    if not module_path:
+        return False
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError:
+        return False
+    return hasattr(module, attribute)
+
+
+def test_dynamic_fstring_loop_monkeypatch_targets_resolve_or_are_registered() -> None:
+    """Every loop-built monkeypatch target across ``tests/`` must name a real
+    attribute on the real module, or be an explicitly justified exemption.
+
+    This is the §4 audit extension (F3, block-2 review): the hand-maintained
+    string-literal patch table cannot see targets assembled as
+    ``f"{module_name}.attr"`` inside a ``for module_name in (...)`` loop. Two
+    sites used exactly that shape and went dead when CQ6 moved the real call
+    off ``clio_relay.core_queue`` without updating them: the three loops in
+    ``tests/test_fastmcp_server.py`` (F1) and the one in
+    ``tests/test_service_runtime.py`` (F2).
+    """
+    violations: list[str] = []
+    for test_file in sorted(_TESTS_ROOT.glob("test_*.py")):
+        tree = ast.parse(test_file.read_text(encoding="utf-8"), filename=test_file.name)
+        for target, raising_false in _dynamic_setattr_targets(tree):
+            if not target.startswith("clio_relay."):
+                continue
+            if target in _KNOWN_DYNAMIC_SEAM_EXEMPTIONS:
+                continue
+            if not _resolve_dynamic_target(target):
+                violations.append(f"{test_file.name}: {target} (raising=False: {raising_false})")
+    assert violations == []
+
+
+def test_guard_detects_a_dead_fstring_loop_seam_fixture() -> None:
+    """Fixture proof the extractor+resolver catch F1/F2's exact break shape,
+    including the ``raising=False`` variant that produces no test failure on
+    its own (F2)."""
+    source = (
+        "def f(monkeypatch):\n"
+        "    for module_name in (\n"
+        '        "clio_relay.cluster_config",\n'
+        '        "clio_relay.core_queue",\n'
+        "    ):\n"
+        "        monkeypatch.setattr(\n"
+        '            f"{module_name}.ensure_private_configuration_directory",\n'
+        "            lambda *a, **k: None,\n"
+        "            raising=False,\n"
+        "        )\n"
+    )
+    targets = _dynamic_setattr_targets(ast.parse(source))
+
+    assert targets == (
+        ("clio_relay.cluster_config.ensure_private_configuration_directory", True),
+        ("clio_relay.core_queue.ensure_private_configuration_directory", True),
+    )
+    # cluster_config really defines the function; core_queue does not -- this
+    # is the live F1/F2 seam, byte-for-byte.
+    assert _resolve_dynamic_target(targets[0][0]) is True
+    assert _resolve_dynamic_target(targets[1][0]) is False
 
 
 def test_split_owners_never_import_the_core_queue_facade() -> None:
@@ -323,6 +584,42 @@ def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
         budget = _OWNER_BUDGETS[owner]
         line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
+
+
+def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None:
+    """F9 (block-2 review): both exemption tables must be loud diffs, never
+    silent. ``_OWNER_RANK.get(x, len(_OWNER_RANK))`` (used by the topology
+    check) treats an owner missing from the rank table as "ranked last" --
+    a genuine omission would pass silently instead of failing loudly. And
+    nothing previously stopped ``_NON_OWNER_QUEUE_MODULES`` from growing to
+    quietly exempt a real owner from every guard in this file. Both are
+    pinned here against the real filesystem manifest.
+    """
+    # 1. The exemption set is pinned to its exact, reviewed contents -- a
+    #    change to the source constant must show as a diff on this line too.
+    assert frozenset({"queue_management", "queue_validation"}) == _NON_OWNER_QUEUE_MODULES
+
+    # 2. Every exempted module is substantively non-owner: it composes no
+    #    ``*Mixin`` class, so it structurally cannot join ClioCoreQueue's
+    #    MRO. This is not just trusting the name is on the list.
+    for module in _NON_OWNER_QUEUE_MODULES:
+        assert _mixin_classes(_owner_tree(module)) == [], (
+            f"{module} is exempted as non-owner but defines a *Mixin class"
+        )
+
+    # 3. Every module actually on disk is exactly either a ranked owner or an
+    #    exempted non-owner -- no third, silently-ignored category.
+    all_queue_modules = frozenset(path.stem for path in _SOURCE_ROOT.glob("queue_*.py"))
+    assert all_queue_modules == set(_OWNER_MANIFEST) | _NON_OWNER_QUEUE_MODULES
+    assert set(_OWNER_MANIFEST) & _NON_OWNER_QUEUE_MODULES == set()
+
+    # 4. _OWNER_RANK is keyed on exactly the discovered owners -- an owner
+    #    missing here would otherwise fall back to _OWNER_RANK.get(x,
+    #    len(_OWNER_RANK)) in the topology check and never be flagged.
+    assert set(_OWNER_RANK) == set(_OWNER_MANIFEST)
+
+    # 5. Ranks are a dense 0..N-1 permutation: no duplicate or skipped rank.
+    assert sorted(_OWNER_RANK.values()) == list(range(len(_OWNER_RANK)))
 
 
 @pytest.mark.parametrize("caller", ["auxiliary", "event_audit"])
@@ -569,32 +866,21 @@ def test_cq10_owner_session_closure_uses_the_records_write_lookup(
         ),
         encoding="utf-8",
     )
-    saved: dict[Path, object] = {}
-
-    def read_closing(path: Path) -> object:
-        if path == closing_path:
-            return {
-                "owner_session_id": owner_session_id,
-                "session_generation_id": generation_id,
-                "closing": True,
-            }
-        return None
 
     def active_generation(_owner_session_id: str) -> str:
         return generation_id
 
-    def read_optional(path: Path, _model: type[object]) -> object | None:
-        return saved.get(path)
-
-    def save_write(path: Path, record: object) -> None:
-        saved[path] = record
-
+    # F10 (block-2 review): CQ10's real read/write path calls
+    # queue_store_read.read_json_document / queue_store_read.read_optional /
+    # queue_store_write.write_model directly (module-qualified) rather than
+    # through self._read_json_document / self._read_optional / self._write --
+    # patching those three facade instance methods was inert scaffolding that
+    # never fired. Only the closing-marker file on disk (written above) and
+    # the active-generation patch below are on the real call path; the
+    # write_model sabotage below is what the assertion actually exercises.
     monkeypatch.setattr(queue, "initialize", lambda: None)
     monkeypatch.setattr(queue, "_lock", nullcontext())
-    monkeypatch.setattr(queue, "_read_json_document", read_closing)
     monkeypatch.setattr(queue, "_owner_session_active_generation", active_generation)
-    monkeypatch.setattr(queue, "_read_optional", read_optional)
-    monkeypatch.setattr(queue, "_write", save_write)
 
     def sabotage(*_args: object, **_kwargs: object) -> None:
         raise _OwnerSessionWriteLookupSabotage(
@@ -673,18 +959,28 @@ def test_cq11_scheduler_cancel_pending_creation_uses_the_state_write_lookup(
     assert ClioCoreQueue.ensure_scheduler_cancel_pending is owner_ensure_pending
 
 
+@pytest.mark.parametrize("branch", ["initial_submission", "idempotent_replay"])
 def test_cq12_submit_job_uses_the_order_index_ensure_global_lookup(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    branch: str,
 ) -> None:
-    """Job submission's global-order entry must resolve through the CQ12 owner seam."""
+    """Job submission's global-order entry must resolve through the CQ12 owner
+    seam on both designed call sites (design §3 CQ12 row): the first-ever
+    submission (``queue_jobs.py:283``) and the idempotent-resubmission REPLAY
+    branch that finds an already-written job for the same key
+    (``queue_jobs.py:234``). F6 (block-2 review): only the first site was
+    covered before this parametrization.
+    """
     queue = ClioCoreQueue(tmp_path)
     job = RelayJob(
         cluster="cluster-cq12",
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(command=["true"]),
-        idempotency_key="cq12-order",
+        idempotency_key=f"cq12-order-{branch}",
     )
+    if branch == "idempotent_replay":
+        queue.submit_job(job)
 
     def sabotage(*_args: object, **_kwargs: object) -> int:
         raise _JobsOrderIndexLookupSabotage("queue_jobs order-index ensure_global lookup engaged")
@@ -706,18 +1002,27 @@ def test_cq12_submit_job_uses_the_order_index_ensure_global_lookup(
     assert ClioCoreQueue.submit_job is queue_jobs.QueueJobsMixin.submit_job
 
 
+@pytest.mark.parametrize("branch", ["initial_submission", "idempotent_replay"])
 def test_cq12_submit_job_uses_the_write_job_lookup(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    branch: str,
 ) -> None:
-    """Job submission's canonical write must resolve through the CQ12 write_job seam."""
+    """Job submission's canonical write must resolve through the CQ12
+    ``write_job`` seam on both designed call sites (design §3 CQ12 row): the
+    first-ever submission (``queue_jobs.py:286``) and the idempotent-
+    resubmission REPLAY branch (``queue_jobs.py:239``). F6 (block-2 review):
+    only the first site was covered before this parametrization.
+    """
     queue = ClioCoreQueue(tmp_path)
     job = RelayJob(
         cluster="cluster-cq12",
         kind=JobKind.JARVIS,
         spec=JarvisRunSpec(command=["true"]),
-        idempotency_key="cq12-write",
+        idempotency_key=f"cq12-write-{branch}",
     )
+    if branch == "idempotent_replay":
+        queue.submit_job(job)
 
     def sabotage(*_args: object, **_kwargs: object) -> None:
         raise _JobsWriteLookupSabotage("queue_jobs write_job lookup engaged")
@@ -743,6 +1048,36 @@ def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
     )
 
     assert violations == [1]
+
+
+def test_guard_rejects_bare_owner_assign_alias_fixture() -> None:
+    """F5: an ``Assign``/``AnnAssign`` re-export is the same hazard as a bare
+    ``ImportFrom`` -- both must be caught. This is exactly the shape of the
+    live ``queue_order_index.index_integer = queue_index_state.index_integer``
+    bug this widened guard found and this batch fixed."""
+    functions_by_owner = {"queue_layout": {"validate_canonical_access"}}
+    assign_tree = ast.parse("alias = queue_layout.validate_canonical_access\n")
+    ann_assign_tree = ast.parse("alias: object = queue_layout.validate_canonical_access\n")
+
+    assert _bare_owner_import_lines(
+        assign_tree,
+        caller="queue_store_read",
+        functions_by_owner=functions_by_owner,
+    ) == [1]
+    assert _bare_owner_import_lines(
+        ann_assign_tree,
+        caller="queue_store_read",
+        functions_by_owner=functions_by_owner,
+    ) == [1]
+    # A same-owner assignment (no cross-owner rebinding) is not a violation.
+    assert (
+        _bare_owner_import_lines(
+            assign_tree,
+            caller="queue_layout",
+            functions_by_owner=functions_by_owner,
+        )
+        == []
+    )
 
 
 def test_guard_rejects_package_from_core_import_fixture() -> None:

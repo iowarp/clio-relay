@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import clio_relay.models as models
 from clio_relay import queue_context, queue_layout, queue_store_read, queue_store_write
@@ -75,10 +75,6 @@ class QueueOwnerSessionRecordsMixin:
     _storage_root: Path
     _lock: queue_context.QueueLockProtocol
     _store_adapter: queue_context.QueueStoreProtocol
-
-    if TYPE_CHECKING:
-
-        def get_job(self, job_id: str) -> models.RelayJob: ...
 
     def prepare_owner_session_start(
         self,
@@ -323,7 +319,7 @@ class QueueOwnerSessionRecordsMixin:
                 residual_resource_ids=residual_resource_ids or [],
             )
             for legacy_job_id in legacy_job_ids:
-                legacy_job = self.get_job(legacy_job_id)
+                legacy_job = queue_store_read.read_required_job(self._storage_root, legacy_job_id)
                 if (
                     legacy_job.metadata.get("owner_session_id") != owner_session_id
                     or legacy_job.metadata.get("owner_session_generation_id") is not None

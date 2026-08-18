@@ -391,3 +391,138 @@ its planned cap; and pass all local gates with zero skips or failures.
 No issue may combine nonadjacent DAG nodes merely to hide a reverse dependency.
 If implementation discovers a missing edge, the design and topological order
 must be corrected before extraction continues.
+
+## 9. block-2 checkpoint fix batch (2026-08-18)
+
+A review of CQ1-CQ12 (landed through `5d0afbc`) found 14 findings, six
+blocking. This section records the resulting corrections; sections 1-8 above
+remain pinned to the evidence commit `d6253d7` and are not rewritten.
+
+### 9.1 patch-on-owner for `ensure_private_configuration_directory`
+
+CQ6 moved `queue_legacy_audit.py`'s real call off `clio_relay.core_queue`
+(`_prepare_queue_root_for_lock`) without updating three dynamically-built test
+patch loops (`f"{module_name}.ensure_private_configuration_directory"` inside
+`for module_name in (...)`) in `tests/test_fastmcp_server.py` and one in
+`tests/test_service_runtime.py`. `queue_legacy_audit.py` now imports
+`cluster_config` module-qualified and calls
+`cluster_config.ensure_private_configuration_directory(...)` -- the same
+patch-on-owner idiom `queue_store_write.py` already used. The four test loops
+now patch only `clio_relay.cluster_config` and `clio_relay.worker_lifetime_lock`
+(plus `clio_relay.service_runtime` for the service-runtime loop), the modules
+that actually own a real call site; `clio_relay.core_queue` never had one.
+
+### 9.2 §4 audit extension: dynamically-built patch targets
+
+The hand-maintained §4 table only records `monkeypatch.setattr("literal.string",
+...)` sites. A patch target assembled as `f"{module_name}.attr"` inside a
+`for module_name in (...)` loop is invisible to that audit, which is exactly
+how 9.1's break went unnoticed by three copies of the same loop plus a fourth,
+`raising=False` copy that never even raised on the dead seam.
+`tests/test_core_queue_split_architecture.py` now walks every `tests/*.py`
+file for this loop-plus-f-string shape, resolves each concrete `(module,
+attr)` pair via `importlib`, and asserts every one exists on the real module
+(`test_dynamic_fstring_loop_monkeypatch_targets_resolve_or_are_registered`,
+backed by `_KNOWN_DYNAMIC_SEAM_EXEMPTIONS` -- empty by design; an addition
+must carry its own justification in the same change). Extending this to the
+whole test tree also found a second, unrelated dead seam of the same shape,
+predating this batch: `tests/test_service_runtime.py`'s
+`_start_lifecycle_frp_runtime` helper patched
+`clio_relay.service_runtime.ensure_private_configuration_path`, which that
+module never imports (it only uses `ensure_private_configuration_directory`).
+Fixed by splitting that helper's single loop into two, one per real symbol.
+
+### 9.3 mixin self-call edges are now part of the dependency graph
+
+`_owner_dependencies()` previously walked only static `import`/`from import`
+statements. A `self.method(...)` call that resolves solely through
+`ClioCoreQueue`'s composed MRO -- never a static import in the caller's own
+module -- was invisible to it. Five such calls to `self.get_job(...)` created
+reverse-rank edges from earlier-landed owners onto the later-landed
+`queue_jobs` (CQ12): `queue_artifacts.py` (3 sites), `queue_artifact_lineage.py`
+(3 sites), `queue_owner_session_records.py` (1 site), and
+`queue_scheduler_cancel_state.py` (1 site). A sixth and seventh site,
+`queue_artifact_lineage.py` calling `self.get_artifact(...)` (owned by
+`queue_artifacts`, landed one rank later), closed a genuine 2-cycle between
+the two CQ9 co-landed owners.
+
+`_owner_dependencies()` now also resolves `self.<name>(...)` calls against a
+mixin method-ownership manifest (built from every `*Mixin` class's real,
+non-stub method definitions) and folds the resulting edges into the same
+rank-ordering check used for static imports
+(`test_split_owner_dependencies_follow_the_migration_topology`).
+
+The resolution chosen is "invert the calls," not re-ranking: `get_job` and
+`get_artifact` are simple "read one typed record by id, raise `NotFoundError`
+if absent, verify canonical identity" reads with no CRUD/business logic of
+their own. Both bodies moved to new shared primitives,
+`queue_store_read.read_required_job` and `queue_store_read.read_required_artifact`
+(rank 4, already a valid predecessor for every affected caller). `queue_jobs.get_job`
+and `queue_artifacts.get_artifact` now delegate to those primitives instead of
+owning the read logic outright, so the public facade behavior, exceptions, and
+messages are unchanged. All seven call sites now call the shared primitive
+directly instead of `self.get_job(...)` / `self.get_artifact(...)`, and the
+now-unneeded `TYPE_CHECKING` stubs for those two names were removed from the
+four callers.
+
+### 9.4 owner budget reconciliation
+
+Real per-owner line counts after this batch (`queue_store_read` and
+`queue_legacy_output_migration` grew for real, justified reasons below; every
+other landed owner is within its section-2 planned cap):
+
+| Owner | Real count | Cap | Headroom | Note |
+|---|---:|---:|---:|---|
+| `queue_context` | 69 | 70 | 1 | |
+| `queue_jarvis_inputs` | 292 | 300 | 8 | |
+| `queue_layout` | 391 | 410 | 19 | |
+| `queue_store_lock` | 270 | 270 | 0 | at cap, unchanged this batch |
+| `queue_store_read` | 390 | 410 | 20 | cap raised from 350: +2 shared read primitives (§9.3) |
+| `queue_store_write` | 225 | 230 | 5 | |
+| `queue_lease_records` | 679 | 680 | 1 | at cap, unchanged this batch |
+| `queue_scheduler_cancel_records` | 133 | 260 | 127 | |
+| `queue_legacy_output_codec` | 499 | 500 | 1 | at cap, unchanged this batch |
+| `queue_index_state` | 262 | 270 | 8 | |
+| `queue_legacy_output_audit` | 519 | 520 | 1 | at cap; -1 line, F14 deleted a dead alias |
+| `queue_legacy_output_migration` | 230 | 250 | 20 | cap raised from 210: +3 TYPE_CHECKING stubs, F12 |
+| `queue_legacy_audit` | 620 | 650 | 30 | +9 net: restored `_unique_json` error handling (F14), -1 dead alias |
+| `queue_order_index` | 449 | 450 | 1 | at cap; -1 line, F5 deleted a dead re-export alias |
+| `queue_events` | 269 | 270 | 1 | at cap; -1 line, F12 removed an unbound-call bypass |
+| `queue_owner_session_records` | 686 | 690 | 4 | at cap; F4/F12 net -4 |
+| `queue_owner_session_lifecycle` | 335 | 350 | 15 | |
+| `queue_idempotency` | 270 | 270 | 0 | at cap, unchanged this batch |
+| `queue_endpoints` | 334 | 340 | 6 | |
+| `queue_artifact_lineage` | 494 | 500 | 6 | at cap; F4/F12 net -5 |
+| `queue_artifacts` | 218 | 220 | 2 | at cap; F4/F12 roughly net-neutral |
+| `queue_scheduler_cancel_state` | 436 | 450 | 14 | justified (F4 net -1) |
+| `queue_jobs` | 786 | 800 | 14 | justified (F4/F13 net -3) |
+
+`queue_store_lock`, `queue_lease_records`, `queue_legacy_output_codec`,
+`queue_idempotency` were already at (or one line from) their cap before this
+batch and are untouched by it; they are listed here for the same honest-
+headroom reason, not because this batch changed them.
+
+### 9.5 `_QueueStoreAdapter` partial fix; full retirement stays CQ19/CQ20 scope
+
+`_QueueStoreAdapter.read_optional` and `.write` already routed through the
+facade instance (`self._queue._read_optional` / `self._queue._write`), so an
+instance-level patch of either stayed valid. `.read_json_document` and
+`.write_json` instead called the store-read/store-write module functions
+directly, bypassing `self._queue._read_json_document` /
+`self._queue._write_json` -- an instance patch of either was silently inert,
+including for `submit_job`'s idempotency-record writes. Both now route
+through the instance, at zero behavior cost (`_read_json_document` and
+`_write_json` were already thin passthroughs to the same module functions).
+`_QueueStoreAdapter` has roughly 140 references across the codebase; retiring
+it in favor of owners depending on the store modules directly stays CQ19/CQ20
+scope, not this batch's.
+
+### 9.6 `_is_sha256_digest` duplication
+
+`queue_jobs.py` and `queue_artifact_lineage.py` each keep a private
+`_is_sha256_digest` copy rather than one reaching into the other's module (or
+into `queue_job_gc` / `queue_input_ingest`, its doc-assigned but not-yet-landed
+owners per this file's original inventory). This duplication is intentional
+and stays until CQ13/CQ18 land and a real shared owner exists to hold one
+copy; noted here per this batch's review so it is not mistaken for
+undiscovered drift.

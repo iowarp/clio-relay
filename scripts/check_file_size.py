@@ -164,7 +164,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # Deletes the now-dead _committed_idempotency_record and _UNSET module
     # aliases a repository-wide call-site audit found unreferenced once
     # their only callers moved. Net: 9688 -> 9043.
-    "src/clio_relay/core_queue.py": 9043,
+    "src/clio_relay/core_queue.py": 8991,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_

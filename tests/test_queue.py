@@ -106,19 +106,11 @@ def test_atomic_write_resolves_private_file_through_store_write_owner(
     def open_test_file(path: Path) -> BinaryIO:
         return path.open("xb")
 
+    # queue_legacy_audit.cluster_config and queue_store_write.cluster_config
+    # are the same module object (clio_relay.cluster_config); patching it once
+    # through either owner reference covers both real call sites.
     monkeypatch.setattr(
-        queue_legacy_audit,
-        "ensure_private_configuration_directory",
-        create_test_directory,
-    )
-    monkeypatch.setattr(
-        core_queue_module,
-        "ensure_private_configuration_path",
-        accept_test_path,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        queue_store_write.cluster_config,
+        queue_legacy_audit.cluster_config,
         "ensure_private_configuration_directory",
         create_test_directory,
     )

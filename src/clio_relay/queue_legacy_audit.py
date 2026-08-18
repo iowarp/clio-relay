@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Protocol, TypeVar, cast
 from pydantic import BaseModel
 
 from clio_relay import (
+    cluster_config,
     queue_context,
     queue_index_state,
     queue_layout,
@@ -21,8 +23,7 @@ from clio_relay import (
     queue_store_read,
     queue_store_write,
 )
-from clio_relay.cluster_config import ensure_private_configuration_directory
-from clio_relay.errors import QueueConflictError
+from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.models import (
     ArtifactRef,
@@ -37,6 +38,7 @@ from clio_relay.models import (
     TaskTimelineEvent,
 )
 
+logger = logging.getLogger(__name__)
 Record = TypeVar("Record", bound=BaseModel)
 LegacyQueueStateError = queue_store_lock.LegacyQueueStateError
 QueueSealRequiresExclusive = queue_store_lock.QueueSealRequiresExclusive
@@ -61,7 +63,17 @@ def _unique_json(path: Path) -> object:
             result[key] = value
         return result
 
-    return json.loads(queue_store_read.read_bounded_record_bytes(path), object_pairs_hook=unique)
+    try:
+        return json.loads(
+            queue_store_read.read_bounded_record_bytes(path),
+            object_pairs_hook=unique,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise queue_conflict_from_cause(
+            f"invalid JSON record {path}",
+            cause=exc,
+            logger=logger,
+        ) from exc
 
 
 class QueueLegacyAuditMixin:
@@ -81,7 +93,7 @@ class QueueLegacyAuditMixin:
             root_stat = self._layout.storage_root_stat()
         except FileNotFoundError:
             try:
-                ensure_private_configuration_directory(self._storage_root)
+                cluster_config.ensure_private_configuration_directory(self._storage_root)
                 root_stat = self._layout.storage_root_stat()
             except OSError as error:
                 raise LegacyQueueStateError(
@@ -606,6 +618,3 @@ class QueueLegacyAuditMixin:
                     path=path,
                     reason="idempotency filename/content identity mismatch",
                 )
-
-
-audit_before_initialization = QueueLegacyAuditMixin._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import cast
 
-from clio_relay import queue_layout, queue_order_index
+from clio_relay import queue_index_state, queue_layout, queue_order_index
 from clio_relay.errors import NotFoundError, QueueConflictError, queue_conflict_from_cause
 from clio_relay.models import Cursor, RelayEvent, RelayTask, TaskTimelineEvent
 from clio_relay.pagination import validate_record_cursor, validate_response_page_limit
@@ -40,8 +40,7 @@ class QueueEventsMixin(queue_order_index.QueueOrderIndexMixin):
                 root / "task_event_heads" / f"{event.task_id}.json",
                 {"task_id": event.task_id, "latest_seq": seq},
             )
-            QueueEventsMixin.append_event(
-                self,
+            self.append_event(
                 task.job_id,
                 f"task.timeline.{event.event_type}",
                 event.summary,
@@ -202,7 +201,7 @@ class QueueEventsMixin(queue_order_index.QueueOrderIndexMixin):
         root = self._store_adapter.storage_root
         index = queue_order_index.read_job_index(self._store_adapter, job_id)
         if index is not None:
-            latest_seq = queue_order_index.index_integer(index, "latest_event_seq")
+            latest_seq = queue_index_state.index_integer(index, "latest_event_seq")
             if latest_seq == 0:
                 return None, False
             event = self._store_adapter.read_optional(
@@ -229,7 +228,7 @@ class QueueEventsMixin(queue_order_index.QueueOrderIndexMixin):
     def _next_event_seq(self, job_id: str, event_dir: Path) -> int:
         index = queue_order_index.read_job_index(self._store_adapter, job_id)
         if index is not None:
-            indexed_seq = queue_order_index.index_integer(index, "latest_event_seq")
+            indexed_seq = queue_index_state.index_integer(index, "latest_event_seq")
             candidate = indexed_seq + 1
             while (event_dir / f"{candidate:020d}.json").exists():
                 candidate += 1

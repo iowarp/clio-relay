@@ -14,7 +14,8 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from clio_relay import queue_layout
-from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
+from clio_relay.errors import NotFoundError, QueueConflictError, queue_conflict_from_cause
+from clio_relay.models import ArtifactRef, RelayJob
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,45 @@ def read_canonical_record[Record: BaseModel](
     record = read_json_file(path, model)
     queue_layout.validate_canonical_access(storage_root, path, record)
     return record
+
+
+def read_required_job(storage_root: Path, job_id: str) -> RelayJob:
+    """Return the canonical job record, raising ``NotFoundError`` when absent.
+
+    Shared by every owner that needs to read/validate a job by id without
+    creating a reverse dependency on the later-landed ``queue_jobs`` CRUD
+    owner (design §3: ``queue_artifacts``, ``queue_artifact_lineage``,
+    ``queue_owner_session_records``, and ``queue_scheduler_cancel_state`` all
+    land before CQ12's ``queue_jobs`` and must not import forward to it).
+    ``queue_jobs.get_job`` itself delegates here so the lookup has one body.
+    """
+    job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
+    path = storage_root / "jobs" / f"{job_id}.json"
+    job = read_optional(storage_root, path, RelayJob)
+    if job is None:
+        raise NotFoundError(f"job not found: {job_id}")
+    if job.job_id != job_id:
+        raise QueueConflictError(f"canonical job identity mismatch: {path}")
+    return job
+
+
+def read_required_artifact(storage_root: Path, artifact_id: str) -> ArtifactRef:
+    """Return the canonical artifact record, raising ``NotFoundError`` when absent.
+
+    Shared by ``queue_artifacts`` (the owner) and ``queue_artifact_lineage``,
+    which must not close a 2-cycle by calling back into the artifacts owner
+    (design §3, F4 block-2 review).
+    """
+    artifact_id = queue_layout.QueueLayout.require_durable_record_id(
+        artifact_id, field="artifact_id"
+    )
+    path = storage_root / "artifacts" / f"{artifact_id}.json"
+    artifact = read_optional(storage_root, path, ArtifactRef)
+    if artifact is None:
+        raise NotFoundError(f"artifact not found: {artifact_id}")
+    if artifact.artifact_id != artifact_id:
+        raise QueueConflictError(f"canonical artifact identity mismatch: {path}")
+    return artifact
 
 
 def read_optional[Record: BaseModel](

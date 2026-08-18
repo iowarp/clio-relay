@@ -18,7 +18,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from clio_relay import (
     queue_context,
@@ -51,10 +51,6 @@ class QueueSchedulerCancelStateMixin:
     _lock: queue_context.QueueLockProtocol
     _store_adapter: queue_context.QueueStoreProtocol
 
-    if TYPE_CHECKING:
-
-        def get_job(self, job_id: str) -> RelayJob: ...
-
     def ensure_scheduler_cancel_pending(
         self,
         job_id: str,
@@ -66,7 +62,7 @@ class QueueSchedulerCancelStateMixin:
         self._store_adapter.initialize()
         queue_index_state.require_index_migration_complete(self._storage_root)
         with self._lock:
-            job = self.get_job(job_id)
+            job = queue_store_read.read_required_job(self._storage_root, job_id)
             return self._ensure_scheduler_cancel_pending_unlocked(
                 job,
                 requested_at=utc_now(),

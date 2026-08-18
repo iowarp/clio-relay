@@ -1,12 +1,12 @@
 import logging
 import os
 import stat
+from collections.abc import Iterable
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, Literal
 
 from clio_relay import (
     queue_layout,
-    queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_store_lock,
     queue_store_read,
@@ -17,7 +17,6 @@ from clio_relay.models import JobTombstone
 
 LegacyOutputAudit = queue_legacy_output_codec.LegacyOutputAudit
 LegacyOutputRecord = queue_legacy_output_codec.LegacyOutputRecord
-_AuditMixin = queue_legacy_output_audit.QueueLegacyOutputAuditMixin
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +28,31 @@ class QueueLegacyOutputMigrationMixin:
     """Own authorized legacy-output writes on the composed queue facade."""
 
     _storage_root: Path
+
+    if TYPE_CHECKING:
+        # F12 (block-2 review): declared so these resolve through normal
+        # self.method() lookup -- and therefore stay valid under a
+        # ClioCoreQueue/instance patch -- instead of the prior
+        # _AuditMixin.method(cast(_AuditMixin, self), ...) unbound-call
+        # style, which bypassed MRO entirely.
+        def _audit_one_legacy_output_event(
+            self,
+            path: Path,
+            *,
+            job_id: str,
+            seq: int,
+        ) -> LegacyOutputRecord | None: ...
+
+        def _audit_legacy_output_auxiliary_state(self) -> None: ...
+
+        def _iter_legacy_output_auxiliary_paths(
+            self,
+            family: Literal[
+                "legacy_output_archives",
+                "legacy_output_receipts",
+                "legacy_output_retired",
+            ],
+        ) -> Iterable[tuple[Path, str, int]]: ...
 
     def _write_legacy_output_archive(self, path: Path, record: LegacyOutputRecord) -> None:
         if queue_store_read.path_lstat(path) is not None:
@@ -66,10 +90,7 @@ class QueueLegacyOutputMigrationMixin:
                     f"legacy output event disappeared after its complete audit: {path}"
                 )
             was_oversized = path.stat().st_size > queue_layout.RECORD_FAMILY_MAX_BYTES["events"]
-            audit_owner = cast(_AuditMixin, self)
-            record = _AuditMixin._audit_one_legacy_output_event(  # pyright: ignore[reportPrivateUsage]
-                audit_owner, path, job_id=job_id, seq=seq
-            )
+            record = self._audit_one_legacy_output_event(path, job_id=job_id, seq=seq)
             if record is None:
                 continue
             migration_records += 1
@@ -105,12 +126,11 @@ class QueueLegacyOutputMigrationMixin:
         )
         if observed != audit:
             raise QueueConflictError("legacy output state changed after its complete audit")
-        audit_owner = cast(_AuditMixin, self)
-        _AuditMixin._audit_legacy_output_auxiliary_state(audit_owner)  # pyright: ignore[reportPrivateUsage]
+        self._audit_legacy_output_auxiliary_state()
         receipt_paths = {
             (job_id, seq): path
-            for path, job_id, seq in _AuditMixin._iter_legacy_output_auxiliary_paths(  # pyright: ignore[reportPrivateUsage]
-                audit_owner, "legacy_output_receipts"
+            for path, job_id, seq in self._iter_legacy_output_auxiliary_paths(
+                "legacy_output_receipts"
             )
         }
         if len(receipt_paths) != migration_records:
