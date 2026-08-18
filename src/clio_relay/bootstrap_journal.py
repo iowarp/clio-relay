@@ -729,26 +729,49 @@ def _normalized_absolute(path: Path, description: str) -> Path:
     return path
 
 
+def _default_site_prefix() -> Path:
+    """Return the site-owned prefix whose layout the cluster operator controls."""
+    return Path(os.path.expanduser("~"))
+
+
+def _resolve_site_prefix(path: Path, prefix: Path) -> Path:
+    """Resolve symlinks in the SITE prefix only, never in the owned subtree.
+
+    A cluster may legitimately place home directories behind a symlink -- on
+    ares ``/home`` is itself a link to ``/mnt/common/`` -- and refusing that
+    made first-install bootstrap impossible there (#158). That layout is the
+    operator's, so it is resolved once here.
+
+    Everything below the prefix is bootstrap-OWNED and is deliberately left
+    unresolved, so the O_NOFOLLOW walk still sees it component by component.
+    Resolving the whole parent chain instead would launder a swap: an owned
+    intermediate directory replaced by a symlink BETWEEN two journal actions
+    would be silently followed on the next call, because ``realpath`` would
+    quietly resolve it before the walk ever looked.
+    """
+    try:
+        remainder = path.relative_to(prefix)
+    except ValueError:
+        return path
+    resolved_prefix = Path(os.path.realpath(str(prefix)))
+    if remainder == Path("."):
+        return _normalized_absolute(resolved_prefix, "bootstrap directory")
+    return _normalized_absolute(resolved_prefix / remainder, "bootstrap directory")
+
+
 @contextmanager
-def _open_absolute_directory(path: Path, *, create: bool = False) -> Generator[int]:
+def _open_absolute_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    site_prefix: Path | None = None,
+) -> Generator[int]:
     """Open an absolute directory chain without following any symbolic link."""
     normalized = _normalized_absolute(path, "bootstrap directory")
     if os.name == "nt":
         raise BootstrapJournalError("descriptor-pinned traversal requires POSIX")
-    # Resolve the site-owned ancestor chain ONCE, before pinning descriptors.
-    # A cluster may legitimately place home directories behind a symlink -- on
-    # ares `/home` is itself a link to `/mnt/common/` -- and refusing that made
-    # first-install bootstrap impossible there (#158). The anti-swap guarantee
-    # below is about the bootstrap-OWNED subtree, so the walk is pinned to the
-    # resolved chain instead of rejecting a site's stable layout. The final
-    # component is deliberately NOT resolved: a symlink standing where a
-    # bootstrap-owned directory belongs is still refused, and a component
-    # swapped for a symlink after this point still breaks the O_NOFOLLOW walk.
-    if normalized.parent != normalized:
-        normalized = _normalized_absolute(
-            Path(os.path.realpath(str(normalized.parent))) / normalized.name,
-            "bootstrap directory",
-        )
+    prefix = _default_site_prefix() if site_prefix is None else site_prefix
+    normalized = _resolve_site_prefix(normalized, prefix)
     flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     descriptor = os.open(os.sep, flags)
     try:

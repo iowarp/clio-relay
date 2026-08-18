@@ -31,22 +31,60 @@ from clio_relay import bootstrap_journal
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned traversal is POSIX")
 
 
-def test_a_symlinked_ancestor_is_traversed(tmp_path: Path) -> None:
-    """The ares shape: a symlink standing in for a real directory above us."""
+def test_a_symlinked_site_prefix_is_traversed(tmp_path: Path) -> None:
+    """The ares shape: the operator's home sits behind a symlink."""
     real_root = tmp_path / "shared"
     real_root.mkdir()
     (real_root / "user").mkdir()
     link_root = tmp_path / "home"
     link_root.symlink_to(real_root, target_is_directory=True)
 
-    target = link_root / "user" / "state" / "component-wheels"
+    site_prefix = link_root / "user"
+    target = site_prefix / "state" / "component-wheels"
 
     with bootstrap_journal._open_absolute_directory(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        target, create=True
+        target, create=True, site_prefix=site_prefix
     ) as descriptor:
         assert isinstance(descriptor, int)
 
     assert (real_root / "user" / "state" / "component-wheels").is_dir()
+
+
+def test_an_owned_directory_swapped_between_calls_is_refused(tmp_path: Path) -> None:
+    """Review F2: resolution must not launder a swap of an OWNED component.
+
+    Resolving the whole parent chain would re-trust every intermediate on each
+    call, so an owned directory replaced by a symlink between two journal
+    actions would be followed silently. Only the site prefix is resolved, so
+    the O_NOFOLLOW walk still inspects the owned subtree component by
+    component -- across calls, not merely within one.
+    """
+    site_prefix = tmp_path / "home"
+    site_prefix.mkdir()
+    target = site_prefix / "state" / "component-wheels"
+
+    # First action: create the owned chain normally.
+    with bootstrap_journal._open_absolute_directory(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target, create=True, site_prefix=site_prefix
+    ):
+        pass
+    assert target.is_dir()
+
+    # Between actions, an owned INTERMEDIATE is swapped for a symlink.
+    elsewhere = tmp_path / "attacker"
+    (elsewhere / "component-wheels").mkdir(parents=True)
+    owned_intermediate = site_prefix / "state"
+    for child in sorted(owned_intermediate.iterdir()):
+        child.rmdir()
+    owned_intermediate.rmdir()
+    owned_intermediate.symlink_to(elsewhere, target_is_directory=True)
+
+    # Second action must refuse rather than operate inside the replacement.
+    opener = bootstrap_journal._open_absolute_directory(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target, create=True, site_prefix=site_prefix
+    )
+    with pytest.raises(bootstrap_journal.BootstrapJournalError), opener:
+        pass
 
 
 def test_a_symlink_at_the_target_itself_is_still_refused(tmp_path: Path) -> None:

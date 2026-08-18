@@ -1687,8 +1687,17 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     )
     observed: list[list[str]] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    delivered: list[bytes] = []
+
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1709,7 +1718,9 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    remote_script = observed[0][-1]
+    # The script rides on stdin, not in argv (#158).
+    assert len(delivered) == 1
+    remote_script = delivered[0].decode("utf-8")
     classifier = remote_script.index('relay.get("persistent_tool")')
     old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" bootstrap-inspect')
     assert classifier < old_relay
@@ -1819,8 +1830,17 @@ def test_preflight_allows_only_exact_repairable_queue_permission_report(
     )
     observed: list[list[str]] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    delivered: list[bytes] = []
+
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1841,7 +1861,9 @@ def test_preflight_allows_only_exact_repairable_queue_permission_report(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    remote_script = observed[0][-1]
+    # The script rides on stdin, not in argv (#158).
+    assert len(delivered) == 1
+    remote_script = delivered[0].decode("utf-8")
     execution_driver = r"""
 import base64
 import json
