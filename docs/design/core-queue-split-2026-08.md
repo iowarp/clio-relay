@@ -940,3 +940,263 @@ and the gateway/monitor-focused suites (`tests/test_gateway_public_projection.py
 `tests/test_operational_indexes.py`) all pass green in one combined run --
 436 passed in 439.32s, zero failures beyond the slice's own named A/B-known
 cross-branch and #239 exemption families (none of which fired here).
+
+## 12. CQ17 landing — execution cleanup (shard/detection + marker mutation split)
+
+CQ17 (predecessors CQ3-CQ5, CQ12, all landed) lands as **two** owners, not
+the doc's original one: the execution-cleanup shard layout, flat-to-shard
+migration, and detection machinery (`queue_execution_cleanup.py`), and the
+durable-marker mutation methods that persist an updated task's
+`execution_cleanup` metadata (`queue_execution_cleanup_markers.py`).
+
+### 12.1 owner ranks and real line counts
+
+| Rank | Owner | Real | Cap | Note |
+|---:|---|---:|---:|---|
+| 23 | `queue_execution_cleanup.py` | 352 | 380 | re-ranked ahead of `queue_jobs`, §12.2 |
+| 28 | `queue_execution_cleanup_markers.py` | 335 | 360 | ranked after `queue_tasks`, §12.2 |
+
+`core_queue.py` fell from 3606 to 3056 physical lines (net removal 550,
+including the now-dead `hashlib` import; the ratchet in
+`scripts/check_file_size.py` is lowered to 3056 in the same change). Every
+landed cap is below the 800-line hard gate; the facade public method count
+stays exactly 128, since every moved method keeps its existing name and
+signature. 39 owners are landed.
+
+### 12.2 typed deviation CQ17-EC-01: a forced two-owner split, not a re-rank
+
+The design's section-1 per-line inventory placed execution cleanup as one
+contiguous band (`7788-8338` in the pinned `d6253d7` numbering) between
+tasks/events and input-ingest -- physical position, not call-graph rank.
+Reconciling that against the real dependency graph found a genuine ordering
+conflict that cannot be resolved by re-ranking alone (ledger §9.3/§10.2/
+§11.2 precedent: hoist or split, never force a reverse edge):
+
+- **`queue_jobs.write_job` (CQ12, already landed) needs the shard/migration
+  half before it.** `write_job`'s body already called
+  `queue._migrate_execution_cleanup_shard_unlocked(...)`/
+  `queue._execution_cleanup_shard(...)` directly on every canonical job
+  write (crash-safety ordering: the shard migration for a job's cluster
+  must complete before that job's own record is replaced), with
+  `TYPE_CHECKING` stubs for both names already present in `queue_jobs.py`
+  -- a real, pre-existing edge this slice discovered, not one it
+  introduced. This forces the shard/migration owner's rank strictly below
+  `queue_jobs`.
+- **The marker-mutation methods need `queue_tasks` (CQ14) after it.**
+  `register_execution_cleanup`, `acknowledge_execution_cleanup`,
+  `migrate_execution_cleanup_plan`, and `stage_execution_cleanup_sidecar`
+  each persist an updated `RelayTask` and therefore each call
+  `queue_tasks`'s `_sync_task_retention_indexes_unlocked` on every write --
+  a real, non-trivial method (itself calling into `queue_gateway_indexes`),
+  not a candidate for duplication. This forces the marker-mutation owner's
+  rank strictly above `queue_tasks`, which itself already ranks above
+  `queue_jobs`.
+
+A single owner cannot be simultaneously ranked below `queue_jobs` and above
+`queue_tasks` (`queue_jobs` already ranks below `queue_tasks`). The
+resolution mirrors CQ15's `queue_lease_admission` peer split: the two
+halves have **zero call-graph overlap in the reverse direction** --
+`queue_execution_cleanup_markers.py` self-calls into
+`queue_execution_cleanup.py` (a forward edge: the markers half needs
+`_migrate_execution_cleanup_shard_unlocked`, `_execution_cleanup_path`,
+`_execution_cleanup_job_path`, `_fsync_execution_cleanup_directory`, and
+`_execution_cleanup_shard`), and `queue_execution_cleanup.py` never calls
+back. `queue_execution_cleanup.py` lands at rank 23, immediately before
+`queue_jobs`; `queue_execution_cleanup_markers.py` lands at rank 28,
+immediately after `queue_tasks`. Every other landed owner from rank 23
+onward shifts by two to keep the dense `0..N-1` permutation.
+
+A second, smaller resolution closes what would otherwise have been a
+genuine 2-cycle: `job_has_pending_execution_cleanup`'s former
+`self.get_job(job_id)` call (queue_jobs-owned) is replaced with the CQ9-
+ledger-precedent (§9.3) shared primitive
+`queue_store_read.read_required_job(self._storage_root, job_id)` --
+exactly the body `queue_jobs.get_job` itself already delegates to, so the
+observable behavior (including the exact `NotFoundError`) is unchanged.
+This removes the shard/detection half's only dependency on `queue_jobs`,
+leaving the two-owner split as the sole remaining deviation.
+
+### 12.3 failing-first sabotage (`tests/test_core_queue_split_architecture.py`)
+
+Two new sabotage tests, isolated-namespace pattern, both verified red via
+call-site bypass (by hand: temporarily replacing the module-qualified call
+with an equivalent inline read/write, confirming `DID NOT RAISE`, then
+restoring) and green after:
+
+- `test_cq17_execution_cleanup_migration_uses_the_store_read_lookup` --
+  patches `queue_execution_cleanup.queue_store_read.read_json_file` and
+  calls `_migrate_execution_cleanup_shard_unlocked` directly (not through
+  `scan_execution_cleanup`'s outer shard loop, so the sabotage exercises
+  the migration step's own legacy-marker read, not a later, unrelated read
+  of the already-migrated file); the design row's "shard read" half.
+- `test_cq17_execution_cleanup_migration_uses_the_store_write_lookup` --
+  same direct-call shape, patches
+  `queue_execution_cleanup.queue_store_write.write_json` (the migration
+  completion receipt write); the design row's "shard write" half.
+
+### 12.4 gates
+
+`ruff check`/`ruff format --check`, `pyright` (0 errors on both new files +
+`core_queue.py` + the touched test file), `scripts/check_file_size.py`
+(ratchet lowered 3606 -> 3056; both new owners within their stated caps),
+and `scripts/check_release_identity.py` (78/80 sites agree) all pass.
+`tests/test_queue.py`, `tests/test_core_queue_split_architecture.py` (43 ->
+45 tests, 2 new), `tests/test_release_pins.py`, and the execution-cleanup-
+focused suites (`tests/test_endpoint.py`, `tests/test_control_query_
+admission.py`, `tests/test_core_retention.py`, `tests/test_jarvis_lost_
+response_recovery.py`, `tests/test_jarvis_recovery_scheduling.py`,
+`tests/test_release_validation.py`) all pass green, zero failures beyond
+the pre-existing, A/B-verified `[corrupt/missing/renamed]` cross-branch
+flake in `test_unresolved_runtime_sidecar_failure_retains_recovery_evidence`
+(confirmed failing identically on the unmodified `b2cd1bf` tip via
+`git stash`).
+
+## 13. CQ18 landing — job GC (protections + orchestration + storage)
+
+CQ18 (predecessors CQ6, CQ9-CQ17, all landed) lands as **three** owners,
+not the doc's original two: pure GC quarantine-tree filesystem primitives
+(`queue_gc_storage.py`), the fail-closed terminal-job GC eligibility gate
+(`queue_job_gc_protections.py`), and the phased trash-staging orchestration
+that reads it (`queue_job_gc.py`).
+
+### 13.1 owner ranks and real line counts
+
+| Rank | Owner | Real | Cap | Note |
+|---:|---|---:|---:|---|
+| 39 | `queue_gc_storage.py` | 250 | 280 | no dependency on job_gc or its protections |
+| 40 | `queue_job_gc_protections.py` | 290 | 320 | typed deviation CQ18-JG-01 |
+| 41 | `queue_job_gc.py` | 677 | 720 | reads the protections gate; must rank after it |
+
+`core_queue.py` fell from 3056 to 2077 physical lines (net removal 979;
+the ratchet in `scripts/check_file_size.py` is lowered to 2077 in the same
+change). Every landed cap is below the 800-line hard gate; the facade
+public method count stays exactly 128. 42 owners are landed.
+
+### 13.2 typed deviation CQ18-JG-01: eligibility split from orchestration
+
+The design's section-1 per-line inventory assigned job GC to two bands
+(`3976-4172` and `12494-12770` in the pinned `d6253d7` numbering) that
+this slice's real dependency graph confirms belong to one concern -- but
+combined, the eligibility-gate and trash-staging-orchestration bodies
+total ~890 real lines even after every filesystem primitive already moved
+to `queue_gc_storage.py`, exceeding the 800-line hard gate. Unlike CQ17's
+split (forced by a genuine rank conflict), this one is size-forced, but
+the same "clean one-directional dependency" test still applies (ledger
+§10's `queue_lease_admission` precedent: split only when the two halves
+have zero reverse call-graph edges):
+
+- `_terminal_job_gc_protections` (plus its own `_artifact_lineage_gc_
+  protections`/`_indexed_gc_entry_state` helpers) has no write behavior of
+  its own -- every protection check is a read: index-migration state,
+  execution-cleanup pending state, scheduler-cancel pending state,
+  owner-session closure, idempotency record state, the job order index,
+  and five indexed per-job families (leases/tasks/scheduler/monitor/
+  gateway), plus the artifact-lineage consumer-reference count.
+- `plan_terminal_job_gc`/`collect_terminal_job` (and the trash-staging
+  primitives underneath them) self-call `self._terminal_job_gc_
+  protections(job)` to decide eligibility before ever touching a durable
+  record. The eligibility gate never calls back into orchestration.
+
+This is a clean, one-directional dependency, so `queue_job_gc_
+protections.py` lands at rank 40, immediately before `queue_job_gc.py`
+(rank 41), which composes it as a forward edge with no reverse-rank
+findings.
+
+### 13.3 `_is_sha256_digest` dedup (ledger §9.6/§10.4 follow-up, resolved)
+
+Ledger §9.6 named this slice as owning the facade's `_is_sha256_digest`
+copy's real disposition, since its only two callers
+(`_terminal_job_gc_protections`, `_read_committed_job_digest`) move here.
+The facade's copy is **deleted outright**, not moved: `queue_job_gc_
+protections.py` keeps its own private duplicate, matching the
+already-established per-owner idiom four other owners already use
+(`queue_jobs.py`, `queue_artifact_lineage.py`, `queue_lease_records.py`,
+`queue_legacy_output_codec.py`). `queue_jobs`/`queue_artifact_lineage`
+keep their existing copies unchanged and do **not** import this module's
+copy: both rank well before `queue_job_gc_protections` (rank 40), so a
+shared import would be a reverse-rank edge the architecture guard rejects.
+Per-owner duplication of this six-line pure predicate remains the correct
+resolution, not an oversight.
+
+### 13.4 shared-primitive hoist: `_migration_batch_paths`
+
+`_migration_batch_paths` (a pure, stateless "bounded lexicographic path
+batch" helper, no `self` dependency) had callers in both this slice's
+`_trash_job_references_unlocked` and the not-yet-extracted index-migration
+facade code (`migrate_indexes_batch`, CQ19 territory). Neither caller-group
+may depend on the other, so -- ledger §9.3/§10.2 precedent -- it hoists to
+the earliest-ranked owner that is already a valid predecessor for both:
+`queue_store_read.migration_batch_paths` (rank 4). The six residual
+facade-resident call sites in `migrate_indexes_batch` are rewired to the
+same qualified target. `queue_store_read.py` grows from 390 to 412 real
+lines (budget raised 410 -> 420, a justified, minimal ratchet-up).
+
+### 13.5 production and test collateral
+
+- `retention.py` imported `purge_quarantined_tree_batch` bare from
+  `clio_relay.core_queue` (a pre-existing production, non-owner import).
+  Retargeted to `clio_relay.queue_gc_storage` directly (CQ15 §10.7
+  `storage_runtime.py` precedent: retarget a moved-symbol import to its
+  real new owner, never add a facade re-export for a production caller).
+  `retention.py`'s own ratchet moves by a justified +1 net line (951 ->
+  952: one combined import line splits into two single-name imports).
+- `tests/test_core_retention.py` imported `_purge_tree_batch` bare from
+  `clio_relay.core_queue` (private-name direct import); retargeted to
+  `queue_gc_storage.purge_tree_batch`. Its `core_queue_module.
+  _remove_gc_candidate(...)` call and paired `core_queue_module.os`
+  attribute patch retarget to `queue_gc_storage._remove_gc_candidate`/
+  `queue_gc_storage.os` (the same singleton `os` module either way, but
+  now naming the real post-split caller). The now-fully-unused `import
+  clio_relay.core_queue as core_queue_module` is removed.
+- Design §4's own already-recorded row for the `_after_gc_checkpoint`
+  fault-injection seam (`queue._after_gc_checkpoint` ->
+  `queue_gc_storage.after_gc_checkpoint`) is realized exactly as
+  prescribed: the seam's real body is now the bare module-level
+  `queue_gc_storage.after_gc_checkpoint(phase)`, called module-qualified
+  from every `collect_terminal_job` checkpoint. `tests/test_core_
+  retention.py`'s two instance-level `monkeypatch.setattr(queue,
+  "_after_gc_checkpoint", ...)` sites move to
+  `monkeypatch.setattr(queue_gc_storage, "after_gc_checkpoint", ...)`.
+
+### 13.6 failing-first sabotage (`tests/test_core_queue_split_architecture.py`)
+
+Four new sabotage tests, all verified red via call-site bypass (by hand:
+temporarily replacing the module-qualified call with an inline equivalent,
+confirming `DID NOT RAISE`, then restoring) and green after:
+
+- `test_cq18_terminal_job_gc_protections_resolve_through_the_protections_mixin`
+  -- a CQ14-style composition proof: patches `queue_job_gc_protections.
+  QueueJobGcProtectionsMixin._terminal_job_gc_protections` at class level
+  (inert against a residual facade body, live only once composed).
+- `test_cq18_protections_use_the_execution_cleanup_pending_check_lookup` and
+  `test_cq18_protections_use_the_owner_session_closure_lookup` -- each an
+  instance-level sabotage on a protection-owner lookup
+  (`_job_has_pending_execution_cleanup_unlocked`, `get_owner_session_
+  closed`), using a sabotage exception type deliberately **not** caught by
+  the gate's own narrow `except (OSError, ValueError, QueueConflictError)`
+  clauses, so the sabotage propagates cleanly to the caller; design row:
+  "patch each protection-owner lookup in queue_job_gc".
+- `test_cq18_job_gc_uses_the_gc_storage_move_lookup` -- isolated-namespace
+  pattern, patches `queue_job_gc.queue_gc_storage.move_gc_path`; the
+  design row's explicitly named seam ("then `queue_job_gc.queue_gc_
+  storage.move_gc_path`").
+
+### 13.7 gates
+
+`ruff check`/`ruff format --check`, `pyright` (0 errors across every
+touched/new file), `scripts/check_file_size.py` (ratchet lowered 3056 ->
+2077 for `core_queue.py`; justified +22 for `queue_store_read.py`,
+justified +1 for `retention.py`; all three new owners within their stated
+caps), and `scripts/check_release_identity.py` (78/80 sites agree) all
+pass. `tests/test_queue.py`, `tests/test_core_queue_split_architecture.py`
+(45 -> 49 tests, 4 new), `tests/test_release_pins.py`, and the job-GC/
+GC-storage-focused suites (`tests/test_core_retention.py`, `tests/
+test_retention.py`, `tests/test_control_query_admission.py`, `tests/
+test_core_idempotency.py`, `tests/test_artifact_lineage.py`, `tests/
+test_fastmcp_server.py`, `tests/test_jarvis_lost_response_recovery.py`,
+`tests/test_jarvis_recovery_scheduling.py`, `tests/test_legacy_output_
+migration.py`, `tests/test_operational_indexes.py`, `tests/test_release_
+validation.py`, `tests/test_transform_provenance.py`, `tests/
+test_endpoint.py`, `tests/test_cli.py`) all pass green in combined runs,
+zero failures beyond the same pre-existing, A/B-verified `[corrupt/missing/
+renamed]` cross-branch flake CQ17 already exempted.

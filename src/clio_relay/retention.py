@@ -19,7 +19,7 @@ from uuid import uuid4
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field
 
-from clio_relay.core_queue import ClioCoreQueue, purge_quarantined_tree_batch
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.models import (
@@ -28,6 +28,7 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.pagination import validate_gc_batch_size
+from clio_relay.queue_gc_storage import purge_quarantined_tree_batch
 from clio_relay.spool import read_owned_regular_file_bytes
 
 RETENTION_RECEIPT_SCHEMA = "clio-relay.spool-retention-receipt.v1"

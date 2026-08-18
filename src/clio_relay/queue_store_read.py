@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import heapq
 import json
 import logging
 import os
@@ -388,3 +389,24 @@ def path_lstat(path: Path) -> os.stat_result | None:
         return os.lstat(path)
     except FileNotFoundError:
         return None
+
+
+def migration_batch_paths(
+    directory: Path,
+    *,
+    cursor: str | None,
+    limit: int,
+) -> tuple[list[Path], bool]:
+    """Return one lexicographically stable, cursor-bounded batch of record paths.
+
+    Shared primitive (ledger precedent: hoist to whichever earlier-rank owner
+    already serves as a valid predecessor for every caller, §9.3/§10.2):
+    used by both the not-yet-extracted index-migration facade code and
+    ``queue_job_gc.py``'s reference-trashing walk.
+    """
+    candidates = heapq.nsmallest(
+        limit + 1,
+        (path for path in directory.glob("*.json") if cursor is None or path.name > cursor),
+        key=lambda path: path.name,
+    )
+    return candidates[:limit], len(candidates) > limit

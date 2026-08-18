@@ -198,7 +198,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # durable-marker mutation half, split CQ17-EC-01) moves to queue_
     # execution_cleanup.py / queue_execution_cleanup_markers.py; the facade's
     # now-dead `hashlib` import is also dropped. Net: 3606 -> 3056.
-    "src/clio_relay/core_queue.py": 3056,
+    # #231 CQ18: job GC (eligibility protections plus phased trash-staging
+    # collection, split CQ18-JG-01) moves to queue_job_gc.py / queue_job_gc_
+    # protections.py; GC quarantine-tree storage moves to queue_gc_storage.py.
+    # Net: 3056 -> 2077.
+    "src/clio_relay/core_queue.py": 2077,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
@@ -347,7 +351,12 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/remote_mcp.py": 5319,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
-    "src/clio_relay/retention.py": 951,
+    # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
+    # queue_gc_storage.py; the combined `from clio_relay.core_queue import
+    # ClioCoreQueue, purge_quarantined_tree_batch` splits into two single-name
+    # import lines (CQ15 §10.7 precedent: retarget a moved-symbol import to
+    # its real new owner, never a facade re-export).
+    "src/clio_relay/retention.py": 952,
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,
     # #231 R10: the local owned-visitor render/write/spawn path now delegates

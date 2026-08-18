@@ -11,12 +11,10 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_owner_session_records, queue_store_write
+from clio_relay import queue_gc_storage, queue_owner_session_records, queue_store_write
 from clio_relay.core_queue import (
     RECORD_FAMILY_MAX_BYTES,
     ClioCoreQueue,
-    _purge_tree_batch,  # pyright: ignore[reportPrivateUsage]
 )
 from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
@@ -180,7 +178,7 @@ def test_terminal_gc_resumes_after_every_phase_and_never_reexecutes_idempotency(
             injected = True
             raise RuntimeError(f"fault after {phase.value}")
 
-    monkeypatch.setattr(queue, "_after_gc_checkpoint", fail_after_checkpoint)
+    monkeypatch.setattr(queue_gc_storage, "after_gc_checkpoint", fail_after_checkpoint)
     with pytest.raises(RuntimeError, match=f"fault after {fault_phase.value}"):
         for _ in range(1_000):
             queue.collect_terminal_job(
@@ -197,7 +195,7 @@ def test_terminal_gc_resumes_after_every_phase_and_never_reexecutes_idempotency(
     def accept_checkpoint(_phase: JobGcPhase) -> None:
         return
 
-    monkeypatch.setattr(queue, "_after_gc_checkpoint", accept_checkpoint)
+    monkeypatch.setattr(queue_gc_storage, "after_gc_checkpoint", accept_checkpoint)
     _finish_gc(queue, job.job_id)
 
     tombstone = queue.get_job_tombstone(job.job_id)
@@ -744,7 +742,7 @@ def test_gc_purge_is_iterative_and_detects_directory_swap_races(
     (leaf / "record.json").write_text("{}", encoding="utf-8")
     complete = False
     for _ in range(depth + 2):
-        _removed, complete = _purge_tree_batch(deep_root, limit=100)
+        _removed, complete = queue_gc_storage.purge_tree_batch(deep_root, limit=100)
         if complete:
             break
     assert complete is True
@@ -771,7 +769,7 @@ def test_gc_purge_is_iterative_and_detects_directory_swap_races(
 
     monkeypatch.setattr(os, "scandir", _SwapAfterScan)
     with pytest.raises(QueueConflictError, match="changed during traversal"):
-        _purge_tree_batch(race_root, limit=1)
+        queue_gc_storage.purge_tree_batch(race_root, limit=1)
     assert (moved_root / "record.json").is_file()
 
 
@@ -804,10 +802,10 @@ def test_gc_windows_delete_does_not_retry_a_replaced_path(
         original_unlink(path, missing_ok=missing_ok)
 
     with monkeypatch.context() as patch:
-        patch.setattr(core_queue_module.os, "name", "nt")
+        patch.setattr(queue_gc_storage.os, "name", "nt")
         patch.setattr(Path, "unlink", swap_then_unlink)
         with pytest.raises(QueueConflictError, match="could not remove quarantined path"):
-            core_queue_module._remove_gc_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue_gc_storage._remove_gc_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 root,
                 candidate,
                 root_stat=root_stat,

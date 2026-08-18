@@ -25,9 +25,12 @@ from clio_relay import (
     queue_execution_cleanup,
     queue_gateway_indexes,
     queue_gateways,
+    queue_gc_storage,
     queue_idempotency,
     queue_index_state,
     queue_input_ingest,
+    queue_job_gc,
+    queue_job_gc_protections,
     queue_jobs,
     queue_lease_admission,
     queue_lease_capacity_audit,
@@ -148,13 +151,27 @@ _OWNER_RANK = {
     "queue_gateways": 36,
     "queue_browser_attachments": 37,
     "queue_monitor_rules": 38,
+    # CQ18: queue_gc_storage (pure GC quarantine-tree filesystem primitives,
+    # no dependency on job_gc or its protections -- appended last purely
+    # because nothing else needs it earlier), queue_job_gc_protections (the
+    # fail-closed eligibility gate, typed deviation CQ18-JG-01), queue_job_gc
+    # (the phased trash-staging orchestration that reads the protections
+    # gate -- must rank after it). See queue_job_gc_protections.py's own
+    # module docstring for the split's full account.
+    "queue_gc_storage": 39,
+    "queue_job_gc_protections": 40,
+    "queue_job_gc": 41,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
     "queue_jarvis_inputs": 300,
     "queue_layout": 410,
     "queue_store_lock": 270,
-    "queue_store_read": 410,
+    # CQ18: +2 real lines (migration_batch_paths, the shared primitive
+    # queue_job_gc._trash_job_references_unlocked hoists here -- ledger
+    # §9.3/§10.2 precedent -- and the not-yet-extracted index-migration
+    # facade code both need it). A justified, minimal ratchet-up.
+    "queue_store_read": 420,
     "queue_store_write": 230,
     "queue_lease_records": 680,
     "queue_scheduler_cancel_records": 260,
@@ -189,6 +206,9 @@ _OWNER_BUDGETS = {
     "queue_gateways": 400,
     "queue_browser_attachments": 420,
     "queue_monitor_rules": 230,
+    "queue_gc_storage": 280,
+    "queue_job_gc_protections": 320,
+    "queue_job_gc": 720,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -310,6 +330,30 @@ class _ExecutionCleanupShardWriteLookupSabotage(RuntimeError):
     """Raised only when CQ17 flat-to-shard migration reaches
     ``queue_store_write.write_json`` through the ``queue_execution_cleanup``
     owner's module-qualified lookup."""
+
+
+class _JobGcProtectionsCompositionSabotage(RuntimeError):
+    """Raised only when ``ClioCoreQueue._terminal_job_gc_protections``
+    resolves through the inherited ``QueueJobGcProtectionsMixin`` body (the
+    CQ18-JG-01 composition proof -- not a collaborator lookup sabotage)."""
+
+
+class _JobGcExecutionCleanupLookupSabotage(RuntimeError):
+    """Raised only when CQ18 eligibility protections reach
+    ``_job_has_pending_execution_cleanup_unlocked`` through the
+    ``queue_job_gc_protections`` owner's protection-owner lookup."""
+
+
+class _JobGcOwnerSessionClosureLookupSabotage(RuntimeError):
+    """Raised only when CQ18 eligibility protections reach
+    ``get_owner_session_closed`` through the ``queue_job_gc_protections``
+    owner's protection-owner lookup."""
+
+
+class _JobGcStorageMoveLookupSabotage(RuntimeError):
+    """Raised only when CQ18 trash-staging reaches
+    ``queue_gc_storage.move_gc_path`` through the ``queue_job_gc`` owner's
+    module-qualified collaborator-attribute lookup."""
 
 
 @dataclass(frozen=True)
@@ -1710,6 +1754,151 @@ def test_cq17_execution_cleanup_migration_uses_the_store_write_lookup(
         ClioCoreQueue.scan_execution_cleanup
         is queue_execution_cleanup.QueueExecutionCleanupMixin.scan_execution_cleanup
     )
+
+
+def _cq18_terminal_job(queue: ClioCoreQueue, key: str, **metadata: object) -> RelayJob:
+    """Submit and terminalize one clean job for CQ18 GC-eligibility tests."""
+    submitted = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq18",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key=key,
+            metadata=metadata,
+        )
+    )
+    return queue.update_job_state(submitted.job_id, JobState.SUCCEEDED)
+
+
+def test_cq18_terminal_job_gc_protections_resolve_through_the_protections_mixin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """``plan_terminal_job_gc`` must resolve its eligibility gate through the
+    inherited ``QueueJobGcProtectionsMixin`` body, not a residual facade
+    implementation (CQ18-JG-01 composition proof, mirroring CQ14's
+    ``put_mcp_task`` pattern -- patching the owner method itself rather than
+    a collaborator lookup)."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq18_terminal_job(queue, "cq18-composition")
+
+    def sabotage(self: object, job: RelayJob) -> list[str]:
+        del self, job
+        raise _JobGcProtectionsCompositionSabotage(
+            "queue_job_gc_protections.QueueJobGcProtectionsMixin._terminal_job_gc_protections "
+            "engaged"
+        )
+
+    monkeypatch.setattr(
+        queue_job_gc_protections.QueueJobGcProtectionsMixin,
+        "_terminal_job_gc_protections",
+        sabotage,
+    )
+
+    with pytest.raises(
+        _JobGcProtectionsCompositionSabotage,
+        match="_terminal_job_gc_protections engaged",
+    ):
+        queue.plan_terminal_job_gc(job.job_id)
+
+    assert ClioCoreQueue.plan_terminal_job_gc is queue_job_gc.QueueJobGcMixin.plan_terminal_job_gc
+    assert (
+        ClioCoreQueue._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        is queue_job_gc_protections.QueueJobGcProtectionsMixin._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_cq18_protections_use_the_execution_cleanup_pending_check_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The eligibility gate must resolve its pending-cleanup check through
+    the inherited ``queue_execution_cleanup`` protection-owner lookup
+    (design row: "patch each protection-owner lookup in queue_job_gc")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq18_terminal_job(queue, "cq18-execution-cleanup-protection")
+
+    def sabotage(*_args: object, **_kwargs: object) -> bool:
+        raise _JobGcExecutionCleanupLookupSabotage(
+            "queue_job_gc_protections execution-cleanup pending-check lookup engaged"
+        )
+
+    monkeypatch.setattr(queue, "_job_has_pending_execution_cleanup_unlocked", sabotage)
+
+    with pytest.raises(
+        _JobGcExecutionCleanupLookupSabotage,
+        match="execution-cleanup pending-check lookup engaged",
+    ):
+        queue.plan_terminal_job_gc(job.job_id)
+
+    assert (
+        ClioCoreQueue._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        is queue_job_gc_protections.QueueJobGcProtectionsMixin._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_cq18_protections_use_the_owner_session_closure_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The eligibility gate must resolve its owner-session closure check
+    through the inherited ``queue_owner_session_records`` protection-owner
+    lookup (design row: "patch each protection-owner lookup in
+    queue_job_gc")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq18_terminal_job(
+        queue,
+        "cq18-owner-session-protection",
+        owner_session_id="owner-session-cq18",
+        owner_session_generation_id="generation-cq18",
+    )
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _JobGcOwnerSessionClosureLookupSabotage(
+            "queue_job_gc_protections owner-session closure lookup engaged"
+        )
+
+    monkeypatch.setattr(queue, "get_owner_session_closed", sabotage)
+
+    with pytest.raises(
+        _JobGcOwnerSessionClosureLookupSabotage,
+        match="owner-session closure lookup engaged",
+    ):
+        queue.plan_terminal_job_gc(job.job_id)
+
+    assert (
+        ClioCoreQueue._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        is queue_job_gc_protections.QueueJobGcProtectionsMixin._terminal_job_gc_protections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_cq18_job_gc_uses_the_gc_storage_move_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Terminal-job trash-staging must resolve its quarantine move through
+    the ``queue_gc_storage.move_gc_path`` seam (isolated-namespace pattern --
+    design row: "then queue_job_gc.queue_gc_storage.move_gc_path")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq18_terminal_job(queue, "cq18-gc-storage-move")
+
+    def sabotage(*_args: object, **_kwargs: object) -> bool:
+        raise _JobGcStorageMoveLookupSabotage("queue_job_gc queue_gc_storage.move_gc_path engaged")
+
+    isolated_gc_storage = SimpleNamespace(**{**vars(queue_gc_storage), "move_gc_path": sabotage})
+    monkeypatch.setattr(queue_job_gc, "queue_gc_storage", isolated_gc_storage)
+
+    with pytest.raises(
+        _JobGcStorageMoveLookupSabotage,
+        match="queue_gc_storage.move_gc_path engaged",
+    ):
+        queue.collect_terminal_job(
+            job.job_id,
+            execute=True,
+            external_quarantine_id=f"cq18-quarantine:{job.job_id}",
+        )
+
+    assert ClioCoreQueue.collect_terminal_job is queue_job_gc.QueueJobGcMixin.collect_terminal_job
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
