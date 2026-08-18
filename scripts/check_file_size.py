@@ -149,7 +149,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
     # of inheriting a stale populated record from the spread source
     # document. A justified, minimal ratchet-up.
-    "src/clio_relay/endpoint.py": 8719,
+    # #238: +24 net lines -- the daemon-mode worker-slot silent-death fix.
+    # `_serve_worker_slot`'s per-slot loop and
+    # `_reconcile_pending_execution_cleanup`'s one unguarded recovery-intent
+    # fetch now delegate to the new `endpoint_worker_lanes.py` owner module
+    # (quarantine_relay_error / run_worker_lane_iteration) instead of
+    # growing inline case logic here; the two call sites plus one new
+    # import account for the delta. A justified, minimal ratchet-up -- the
+    # alternative (leaving either call site unguarded) is the silent
+    # slot-death and 0-byte-log defect the issue reports.
+    "src/clio_relay/endpoint.py": 8743,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
