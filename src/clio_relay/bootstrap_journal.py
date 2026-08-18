@@ -735,6 +735,20 @@ def _open_absolute_directory(path: Path, *, create: bool = False) -> Generator[i
     normalized = _normalized_absolute(path, "bootstrap directory")
     if os.name == "nt":
         raise BootstrapJournalError("descriptor-pinned traversal requires POSIX")
+    # Resolve the site-owned ancestor chain ONCE, before pinning descriptors.
+    # A cluster may legitimately place home directories behind a symlink -- on
+    # ares `/home` is itself a link to `/mnt/common/` -- and refusing that made
+    # first-install bootstrap impossible there (#158). The anti-swap guarantee
+    # below is about the bootstrap-OWNED subtree, so the walk is pinned to the
+    # resolved chain instead of rejecting a site's stable layout. The final
+    # component is deliberately NOT resolved: a symlink standing where a
+    # bootstrap-owned directory belongs is still refused, and a component
+    # swapped for a symlink after this point still breaks the O_NOFOLLOW walk.
+    if normalized.parent != normalized:
+        normalized = _normalized_absolute(
+            Path(os.path.realpath(str(normalized.parent))) / normalized.name,
+            "bootstrap directory",
+        )
     flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     descriptor = os.open(os.sep, flags)
     try:

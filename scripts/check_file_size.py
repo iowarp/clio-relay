@@ -68,7 +68,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # suffix, so a byte-identical pinned uv (its sha256 already verified) was
     # rejected over cosmetics.
     "src/clio_relay/bootstrap.py": 8754,
-    "src/clio_relay/bootstrap_journal.py": 1497,
+    # #158: +14 net lines -- the descriptor-pinned directory walk resolves the
+    # site-owned ancestor chain once before pinning, so a cluster whose /home
+    # is a symlink onto shared storage (ares: /home -> /mnt/common) can be
+    # bootstrapped at all. The final component stays unresolved, so a symlink
+    # standing where a bootstrap-owned directory belongs is still refused. Most
+    # of the addition is the comment recording why the guard is scoped that way.
+    "src/clio_relay/bootstrap_journal.py": 1511,
     "src/clio_relay/bootstrap_reconcile.py": 4462,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
