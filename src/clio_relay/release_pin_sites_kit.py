@@ -64,12 +64,13 @@ def kit_pin_sites(
             placeholder,
             "JARVIS_MCP_VERSION script placeholder (f-string interpolation of "
             "CLIO_KIT_JARVIS_MCP_VERSION -- never a literal copy)",
-            # clio-relay#242 + #158 merge: mechanical relocation only -- the
-            # per-surface jarvis contract probe AND the stdin preflight
-            # transport both grew render_linux_user_bootstrap_script,
-            # pushing this unchanged placeholder to line 7431 (measured
-            # in the merged tree).
-            line=7431,
+            # Mechanical relocation (third drift in two days: 7351 -> 7431
+            # -> 7437 as #158/#242/dev-mode edits grew the script above it).
+            # STRUCTURAL NOTE: this line-anchored pin breaks on every
+            # bootstrap.py edit above the placeholder; it should become a
+            # content-anchored search-window site (the placeholder string is
+            # unique in the file) -- tracked with the pin-registry follow-ups.
+            line=7437,
             placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
             mutable=False,
         ),
