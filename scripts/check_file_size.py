@@ -164,7 +164,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # Deletes the now-dead _committed_idempotency_record and _UNSET module
     # aliases a repository-wide call-site audit found unreferenced once
     # their only callers moved. Net: 9688 -> 9043.
-    "src/clio_relay/core_queue.py": 8991,
+    # #231 CQ13: move the input-artifact ingest lifecycle (begin/fail/
+    # recover/reconcile/complete, the two event-exists predicates, and the
+    # module-level attempt/identity-compare helpers) into the new
+    # queue_input_ingest.py owner. CQ13-IO-01 typed deviation:
+    # _assert_input_ingest_quota_unlocked stays facade-resident -- its only
+    # external caller, queue_jobs.submit_job (786/800, no headroom), would
+    # otherwise create a reverse-rank queue_jobs -> queue_input_ingest self-
+    # call edge the architecture guard rejects, and no earlier-ranked owner
+    # has ~90 spare lines to host it as a shared primitive instead; its
+    # one-caller quota-consumption predicate,
+    # _input_ingest_consumes_quota_unlocked, carries no such constraint and
+    # moved as designed. Net: 8991 -> 8430.
+    "src/clio_relay/core_queue.py": 8430,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_

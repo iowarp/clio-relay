@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import inspect
 import json
@@ -22,6 +23,7 @@ from clio_relay import (
     queue_events,
     queue_idempotency,
     queue_index_state,
+    queue_input_ingest,
     queue_jobs,
     queue_lease_records,
     queue_legacy_output_audit,
@@ -37,13 +39,19 @@ from clio_relay import (
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
+    INPUT_INGEST_POLICY_METADATA_KEY,
+    ArtifactRef,
     ArtifactUse,
     EndpointRegistration,
     EndpointRole,
+    InputArtifactIngestPolicy,
+    InputArtifactSpec,
     JarvisRunSpec,
     JobKind,
     RelayJob,
     UsedArtifactRef,
+    deterministic_input_artifact_id,
+    new_id,
 )
 from clio_relay.queue_jarvis_inputs import QueueJarvisInputs
 from clio_relay.queue_layout import QueueLayout
@@ -75,6 +83,7 @@ _OWNER_RANK = {
     "queue_artifacts": 20,
     "queue_scheduler_cancel_state": 21,
     "queue_jobs": 22,
+    "queue_input_ingest": 23,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -100,6 +109,7 @@ _OWNER_BUDGETS = {
     "queue_artifacts": 220,
     "queue_scheduler_cancel_state": 450,
     "queue_jobs": 800,
+    "queue_input_ingest": 715,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -168,6 +178,10 @@ class _JobsOrderIndexLookupSabotage(RuntimeError):
 
 class _JobsWriteLookupSabotage(RuntimeError):
     """Raised only when CQ12 submission reaches the queue_jobs write_job seam."""
+
+
+class _InputIngestWriteJobLookupSabotage(RuntimeError):
+    """Raised only when CQ13's begin/fail/complete paths reach queue_jobs.write_job."""
 
 
 @dataclass(frozen=True)
@@ -1036,6 +1050,145 @@ def test_cq12_submit_job_uses_the_write_job_lookup(
         queue.submit_job(job)
 
     assert ClioCoreQueue.submit_job is queue_jobs.QueueJobsMixin.submit_job
+
+
+def _cq13_input_ingest_policy_metadata(
+    *, max_count: int = 16, max_total_bytes: int = 4_194_304
+) -> dict[str, object]:
+    return {
+        "owner": "clio-relay",
+        "owner_session_id": "session-cq13",
+        "owner_session_generation_id": "generation-cq13",
+        INPUT_INGEST_POLICY_METADATA_KEY: InputArtifactIngestPolicy(
+            max_file_count=max_count,
+            max_total_bytes=max_total_bytes,
+        ).model_dump(mode="json"),
+    }
+
+
+def _cq13_submit_input_ingest_job(
+    queue: ClioCoreQueue,
+    *,
+    idempotency_key: str,
+    payload: bytes,
+) -> RelayJob:
+    queue.prepare_owner_session_start(
+        "session-cq13",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-cq13",
+    )
+    spec = InputArtifactSpec(
+        logical_name="input.txt",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    return queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq13",
+            kind=JobKind.INPUT_INGEST,
+            spec=spec,
+            idempotency_key=idempotency_key,
+            metadata=_cq13_input_ingest_policy_metadata(),
+        )
+    )
+
+
+def _cq13_isolated_write_job_sabotage(monkeypatch: MonkeyPatch) -> None:
+    """F11 (block-2 review) pattern: rebind ``queue_input_ingest``'s own
+    reference to an isolated ``queue_jobs`` copy instead of mutating the
+    real, shared ``queue_jobs`` module object in place."""
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _InputIngestWriteJobLookupSabotage("queue_input_ingest write_job lookup engaged")
+
+    isolated_queue_jobs = SimpleNamespace(**{**vars(queue_jobs), "write_job": sabotage})
+    monkeypatch.setattr(queue_input_ingest, "queue_jobs", isolated_queue_jobs)
+
+
+def test_cq13_begin_input_ingest_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Claiming a synchronous ingest attempt must resolve through the CQ13
+    ``write_job`` seam (design §3 CQ13 row: "Patch ``queue_input_ingest.
+    queue_jobs.write_job`` on begin/fail/complete paths")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq13_submit_input_ingest_job(queue, idempotency_key="cq13-begin", payload=b"payload")
+    _cq13_isolated_write_job_sabotage(monkeypatch)
+
+    with pytest.raises(
+        _InputIngestWriteJobLookupSabotage,
+        match="queue_input_ingest write_job lookup engaged",
+    ):
+        queue.begin_input_ingest(job.job_id, attempt_id=new_id("ingest_attempt"))
+
+    assert (
+        ClioCoreQueue.begin_input_ingest
+        is queue_input_ingest.QueueInputIngestMixin.begin_input_ingest
+    )
+
+
+def test_cq13_fail_input_ingest_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Terminalizing a failed ingest attempt must resolve through the CQ13
+    ``write_job`` seam (design §3 CQ13 row)."""
+    queue = ClioCoreQueue(tmp_path)
+    job = _cq13_submit_input_ingest_job(queue, idempotency_key="cq13-fail", payload=b"payload")
+    attempt_id = new_id("ingest_attempt")
+    queue.begin_input_ingest(job.job_id, attempt_id=attempt_id)
+    _cq13_isolated_write_job_sabotage(monkeypatch)
+
+    with pytest.raises(
+        _InputIngestWriteJobLookupSabotage,
+        match="queue_input_ingest write_job lookup engaged",
+    ):
+        queue.fail_input_ingest(job.job_id, attempt_id=attempt_id, error="cq13 sabotage")
+
+    assert (
+        ClioCoreQueue.fail_input_ingest
+        is queue_input_ingest.QueueInputIngestMixin.fail_input_ingest
+    )
+
+
+def test_cq13_complete_input_ingest_uses_the_write_job_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Idempotent ingest completion must resolve through the CQ13
+    ``write_job`` seam (design §3 CQ13 row)."""
+    queue = ClioCoreQueue(tmp_path)
+    payload = b"payload"
+    job = _cq13_submit_input_ingest_job(queue, idempotency_key="cq13-complete", payload=payload)
+    attempt_id = new_id("ingest_attempt")
+    running, _claimed = queue.begin_input_ingest(job.job_id, attempt_id=attempt_id)
+    artifact = ArtifactRef(
+        artifact_id=deterministic_input_artifact_id(job.job_id),
+        job_id=job.job_id,
+        uri=f"file:///{job.job_id}/input.txt",
+        kind="input",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        created_at=running.created_at,
+        metadata={
+            "schema_version": "clio-relay.input-artifact.v1",
+            "logical_name": "input.txt",
+        },
+    )
+    queue.reconcile_input_artifact(artifact, attempt_id=attempt_id)
+    _cq13_isolated_write_job_sabotage(monkeypatch)
+
+    with pytest.raises(
+        _InputIngestWriteJobLookupSabotage,
+        match="queue_input_ingest write_job lookup engaged",
+    ):
+        queue.complete_input_ingest(job.job_id, attempt_id=attempt_id)
+
+    assert (
+        ClioCoreQueue.complete_input_ingest
+        is queue_input_ingest.QueueInputIngestMixin.complete_input_ingest
+    )
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
