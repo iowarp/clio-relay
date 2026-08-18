@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_jobs
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.http_api import JarvisMcpCallSubmitRequest, create_app
@@ -227,7 +227,7 @@ def test_idempotent_retry_replays_pre_handle_jarvis_record(
 
     with monkeypatch.context() as legacy_release:
         legacy_release.setattr(
-            core_queue_module,
+            queue_jobs,
             "prepare_owned_jarvis_run_submission",
             preserve_legacy_submission,
         )

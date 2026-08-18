@@ -45,7 +45,13 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
+from clio_relay.errors import (
+    BrowserAttachmentIdentityConflictError,
+    ConfigurationError,
+    NotFoundError,
+    QueueConflictError,
+    RelayError,
+)
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_link import FrpLinkConfig, render_proxy_config, start_owned_frp_visitor
 from clio_relay.frp_remote_scripts import (
@@ -2806,12 +2812,10 @@ class ServiceRuntimeSupervisor:
                 session.session_id,
                 attachment_id=attachment_id,
             )
-        except QueueConflictError as exc:
-            if "changed before revocation" in str(exc):
-                raise ConfigurationError(
-                    "browser attachment id does not match the gateway record"
-                ) from exc
-            raise
+        except BrowserAttachmentIdentityConflictError as exc:
+            raise ConfigurationError(
+                "browser attachment id does not match the gateway record"
+            ) from exc
         raw_record = session.gateway.get("browser_attachment")
         try:
             record = BrowserAttachmentRecord.model_validate(raw_record)

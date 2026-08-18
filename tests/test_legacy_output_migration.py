@@ -11,10 +11,17 @@ from typing import Literal
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay import (
+    queue_layout,
+    queue_legacy_audit,
+    queue_legacy_output_audit,
+    queue_legacy_output_codec,
+    queue_legacy_output_migration,
+)
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JobKind, JobState, JobTombstone, RelayEvent, utc_now
+from clio_relay.queue_store_lock import LegacyQueueStateError
 
 
 def _event_path(root: Path, job_id: str, seq: int) -> Path:
@@ -118,7 +125,7 @@ def test_multimegabyte_v09_output_is_archived_and_sequence_is_preserved(
     replacement = RelayEvent.model_validate_json(replacement_bytes)
     assert replacement.seq == 2
     assert replacement.event_type == "stdout.delta"
-    assert len(replacement_bytes) <= core_queue_module.RECORD_FAMILY_MAX_BYTES["events"]
+    assert len(replacement_bytes) <= queue_layout.RECORD_FAMILY_MAX_BYTES["events"]
     compatibility = replacement.payload["legacy_output"]
     assert compatibility["representation"] == "archive"
     archive = _archive_path(root, job_id, 2)
@@ -142,7 +149,7 @@ def test_migration_preserves_payload_text_that_fits_the_normal_event_cap(
     root = tmp_path / "core"
     text = ("visible-output" * 12_000) + "\n"
     original = _write_v09_output_event(root, text=text)
-    assert len(original) > core_queue_module.RECORD_FAMILY_MAX_BYTES["events"]
+    assert len(original) > queue_layout.RECORD_FAMILY_MAX_BYTES["events"]
 
     ClioCoreQueue(root).initialize(migrate_legacy_output=True)
 
@@ -161,9 +168,9 @@ def test_newline_only_v09_output_uses_the_exact_fallback_message(
 ) -> None:
     """The v0.9 fallback message remains eligible when output is only newlines."""
     root = tmp_path / "core"
-    monkeypatch.setitem(core_queue_module.RECORD_FAMILY_MAX_BYTES, "events", 2_048)
+    monkeypatch.setitem(queue_layout.RECORD_FAMILY_MAX_BYTES, "events", 2_048)
     original = _write_v09_output_event(root, text="\n" * 2_000)
-    assert len(original) > core_queue_module.RECORD_FAMILY_MAX_BYTES["events"]
+    assert len(original) > queue_layout.RECORD_FAMILY_MAX_BYTES["events"]
 
     ClioCoreQueue(root).initialize(migrate_legacy_output=True)
 
@@ -198,8 +205,8 @@ def test_migration_recovers_idempotently_from_each_durable_phase_crash(
             raise RuntimeError(f"simulated {phase} crash")
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_output_migration_phase",
+        queue_legacy_output_migration,
+        "after_migration_phase",
         staticmethod(crash_after),
     )
     with pytest.raises(RuntimeError, match=f"simulated {phase} crash"):
@@ -216,8 +223,8 @@ def test_migration_recovers_idempotently_from_each_durable_phase_crash(
         assert event.read_bytes() != original
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_output_migration_phase",
+        queue_legacy_output_migration,
+        "after_migration_phase",
         staticmethod(_no_migration_fault),
     )
     ClioCoreQueue(root).initialize(migrate_legacy_output=True)
@@ -242,10 +249,10 @@ def test_complete_marker_skips_later_deep_event_history_scans(
     root = tmp_path / "core"
     _write_v09_output_event(root, text=("marker\n" * 80_000))
     ClioCoreQueue(root).initialize(migrate_legacy_output=True)
-    original_iterator = ClioCoreQueue._iter_legacy_event_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_iterator = queue_legacy_output_codec.iter_legacy_event_paths
 
     def refuse_history_scan(
-        _self: ClioCoreQueue,
+        storage_root: Path,
         _family: str,
         *,
         max_directories: int,
@@ -254,13 +261,17 @@ def test_complete_marker_skips_later_deep_event_history_scans(
         if _family == "events":
             raise AssertionError("completed migration must not scan event history")
         return original_iterator(
-            _self,
+            storage_root,
             _family,
             max_directories=max_directories,
             max_records=max_records,
         )
 
-    monkeypatch.setattr(ClioCoreQueue, "_iter_legacy_event_paths", refuse_history_scan)
+    monkeypatch.setattr(
+        queue_legacy_output_audit.queue_legacy_output_codec,
+        "iter_legacy_event_paths",
+        refuse_history_scan,
+    )
     ClioCoreQueue(root).initialize()
 
 
@@ -423,8 +434,12 @@ def test_event_audit_streams_beyond_the_previous_global_scan_cap(
                 payload={"stream": "stdout", "text": f"line {seq}\n"},
             ),
         )
-    monkeypatch.setattr(core_queue_module, "MAX_BOUNDED_SCAN_RECORDS", 2)
-    monkeypatch.setattr(core_queue_module, "MAX_LEGACY_EVENT_AUDIT_RECORDS", 10)
+    monkeypatch.setattr(queue_legacy_audit.queue_layout, "MAX_BOUNDED_SCAN_RECORDS", 2)
+    monkeypatch.setattr(
+        queue_legacy_output_audit.queue_layout,
+        "MAX_LEGACY_EVENT_AUDIT_RECORDS",
+        10,
+    )
 
     ClioCoreQueue(root).initialize()
 
@@ -463,7 +478,7 @@ def test_unknown_oversized_output_shape_fails_closed(tmp_path: Path) -> None:
         payload={"stream": "stdout", "text": f"different-{text}"},
     )
     original = _write_event(root, event)
-    assert len(original) > core_queue_module.RECORD_FAMILY_MAX_BYTES["events"]
+    assert len(original) > queue_layout.RECORD_FAMILY_MAX_BYTES["events"]
 
     with pytest.raises(LegacyQueueStateError, match="exact duplicated v0.9 delta"):
         ClioCoreQueue(root).initialize()
@@ -483,7 +498,7 @@ def test_legacy_output_per_record_and_aggregate_budgets_fail_closed(
         text=("per-record\n" * 40_000),
     )
     monkeypatch.setattr(
-        core_queue_module,
+        queue_legacy_output_codec.queue_layout,
         "MAX_LEGACY_OUTPUT_RECORD_BYTES",
         len(per_record) - 1,
     )
@@ -492,7 +507,7 @@ def test_legacy_output_per_record_and_aggregate_budgets_fail_closed(
     assert not (per_record_root / "legacy_output_archives").exists()
 
     monkeypatch.setattr(
-        core_queue_module,
+        queue_legacy_output_codec.queue_layout,
         "MAX_LEGACY_OUTPUT_RECORD_BYTES",
         16 * 1_048_576,
     )
@@ -510,7 +525,7 @@ def test_legacy_output_per_record_and_aggregate_budgets_fail_closed(
         text=("aggregate-two\n" * 30_000),
     )
     monkeypatch.setattr(
-        core_queue_module,
+        queue_legacy_output_audit.queue_layout,
         "MAX_LEGACY_OUTPUT_MIGRATION_BYTES",
         len(first) + len(second) - 1,
     )
@@ -550,8 +565,8 @@ def test_hard_linked_legacy_event_and_archive_fail_closed(
             raise RuntimeError("archive ready")
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_output_migration_phase",
+        queue_legacy_output_migration,
+        "after_migration_phase",
         staticmethod(crash_after_archive),
     )
     with pytest.raises(RuntimeError, match="archive ready"):
@@ -559,8 +574,8 @@ def test_hard_linked_legacy_event_and_archive_fail_closed(
     archive = _archive_path(archive_root, "job_linked_archive", 1)
     os.link(archive, archive_root / "operator-archive-hard-link.json")
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_output_migration_phase",
+        queue_legacy_output_migration,
+        "after_migration_phase",
         staticmethod(_no_migration_fault),
     )
     with pytest.raises(LegacyQueueStateError):

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
+import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_context
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -461,7 +465,7 @@ def test_pipeline_input_lineage_first_merge_uses_one_mutation_timestamp(
     """A first lineage write cannot observe creation after its update timestamp."""
     mutation_at = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
     later_model_default = mutation_at + timedelta(microseconds=1)
-    monkeypatch.setattr("clio_relay.core_queue.utc_now", lambda: mutation_at)
+    monkeypatch.setattr("clio_relay.queue_jarvis_inputs.utc_now", lambda: mutation_at)
     monkeypatch.setattr("clio_relay.models.utc_now", lambda: later_model_default)
     route = jarvis_pipeline_input_route(
         cluster="ares",
@@ -724,3 +728,74 @@ def test_run_manifest_is_restart_safe_idempotent_and_step_setting_exact(
         )
         == admitted
     )
+
+
+def test_put_run_manifest_uses_the_extracted_queue_store_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The facade must route manifest persistence through the CQ1 store protocol."""
+    route = jarvis_pipeline_input_route(
+        cluster="ares",
+        server_name="jarvis-demo",
+        cluster_route_revision="a" * 64,
+        registration_revision="b" * 64,
+        expected_server_artifact_digest="c" * 64,
+        pipeline_id="science-run",
+        owner_session_id="desktop-session",
+        owner_session_generation_id="generation_0123456789abcdef0123456789abcdef",
+    )
+    binding = _tracked_binding()
+    manifest = JarvisRunInputManifest.create(
+        route=route,
+        idempotency_key="delegation-sabotage",
+        resolutions=(
+            JarvisRunInputResolution(
+                binding=binding,
+                disposition="reused",
+                previous_sha256=binding.sha256,
+            ),
+        ),
+    )
+    queue = ClioCoreQueue(tmp_path / "core")
+    store: queue_context.QueueStoreProtocol = queue._jarvis_input_store  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_write = store.write
+    observed_paths: list[Path] = []
+
+    def skip_initialization() -> None:
+        return None
+
+    def read_no_existing_record(_path: Path, _model: type[BaseModel]) -> None:
+        return None
+
+    def skip_facade_write(_path: Path, _record: BaseModel) -> None:
+        return None
+
+    def report_empty_family(
+        _directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[int, bool]:
+        del limit, label
+        return 0, False
+
+    def observe_protocol_write(path: Path, record: BaseModel) -> None:
+        observed_paths.append(path)
+        original_write(path, record)
+
+    monkeypatch.setattr(queue, "initialize", skip_initialization)
+    monkeypatch.setattr(queue, "_lock", nullcontext())
+    monkeypatch.setattr(queue, "_read_optional", read_no_existing_record)
+    monkeypatch.setattr(queue, "_write", skip_facade_write)
+    monkeypatch.setattr(
+        core_queue_module,
+        "_bounded_regular_json_count",
+        report_empty_family,
+    )
+    monkeypatch.setattr(store, "write", observe_protocol_write)
+
+    assert queue.put_jarvis_run_input_manifest(manifest) == manifest
+    assert observed_paths == [
+        store.storage_root / "jarvis_run_input_manifests" / f"{manifest.identity_sha256()}.json"
+    ]

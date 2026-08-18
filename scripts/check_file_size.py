@@ -190,17 +190,109 @@ RATCHET_BASELINE: dict[str, int] = {
     # deletion offsets it: these are two new, real config fields, not a fixable
     # regression.
     "src/clio_relay/cluster_config.py": 1863,
-    # #231 R9 fix round 3: +80 lines curate and server-log 21 foreign caught
-    # exception details found by the complete RelayAuthoredError/
-    # QueueConflictError constructor audit. The public conflict strings keep
-    # only operation and owned-record identities.
-    "src/clio_relay/core_queue.py": 16217,
+    # #231 CQ8: idempotency admission and endpoint registration/heartbeat
+    # ownership move behind typed owner/store seams, lowering the facade
+    # ratchet by 504 lines.
+    # #231 CQ9 fix round: restore the CQ1 protocol alias while deleting two
+    # confirmed facade corpse wrappers. Net facade ratchet-down: 11011 -> 11004.
+    # #231 CQ10: move owner-session lifecycle/record bodies and identity
+    # validators into their two budgeted owners, then compose the lifecycle
+    # mixin and retain only qualified owner lookups. Net: 11004 -> 10065.
+    # #231 CQ11: move the scheduler-cancellation pending/disposition public
+    # methods and the CQ4-IO-01 deviation's four durable-state helpers
+    # (_scheduler_cancel_record_path/_ensure_scheduler_cancel_pending_unlocked/
+    # _require_scheduler_cancel_pending_unlocked/
+    # _persist_scheduler_cancel_record_unlocked, deliberately left resident at
+    # CQ4 because queue_scheduler_cancel_records.py is a store-independent
+    # codec module) into the new queue_scheduler_cancel_state.py owner, and
+    # deletes the two now-dead _scheduler_cancel_record_is_due/
+    # _scheduler_cancel_due_sort_key module shims a repository-wide call-site
+    # audit found unreferenced once their only caller moved. Net: 10065 ->
+    # 9688.
+    # #231 CQ12: move submit_job, the job CRUD/paging/scan surface, and the
+    # state-transition methods (update_job_state/cancel_job_if_active/
+    # acknowledge_job_cancellation/update_job_metadata) plus their unlocked
+    # write/capacity/index primitives into the new queue_jobs.py owner.
+    # submit_job's two _ensure_global_order_entry_unlocked call sites become
+    # direct queue_order_index.ensure_global calls (CQ7's owner); the real
+    # _write_job_unlocked body becomes the module-level write_job, and the
+    # facade's old method is replaced by a thin instance-method wrapper so
+    # every not-yet-extracted caller elsewhere keeps working unchanged.
+    # Deletes the now-dead _committed_idempotency_record and _UNSET module
+    # aliases a repository-wide call-site audit found unreferenced once
+    # their only callers moved. Net: 9688 -> 9043.
+    # #231 CQ13: move the input-artifact ingest lifecycle (begin/fail/
+    # recover/reconcile/complete, the two event-exists predicates, and the
+    # module-level attempt/identity-compare helpers) into the new
+    # queue_input_ingest.py owner. CQ13-IO-01 typed deviation:
+    # _assert_input_ingest_quota_unlocked stays facade-resident -- its only
+    # external caller, queue_jobs.submit_job (786/800, no headroom), would
+    # otherwise create a reverse-rank queue_jobs -> queue_input_ingest self-
+    # call edge the architecture guard rejects, and no earlier-ranked owner
+    # has ~90 spare lines to host it as a shared primitive instead; its
+    # one-caller quota-consumption predicate,
+    # _input_ingest_consumes_quota_unlocked, carries no such constraint and
+    # moved as designed. Net: 8991 -> 8430.
+    # #231 CQ14: move the task and MCP task-projection CRUD (append_task,
+    # put_mcp_task/update_mcp_task_projection/get_mcp_task -- the durable
+    # boundary the merged #234 admission/park machinery persists through,
+    # unmoved itself per design §5 -- update_task_state/_metadata, list/page/
+    # scan_job_tasks, get_task) and structured job-progress CRUD
+    # (append_progress, list/page_progress, latest_job_progress), plus their
+    # unlocked write/derived-index primitives and the module-level
+    # _canonical_mcp_task_arguments identity-compare helper, into the new
+    # queue_tasks.py and queue_progress.py owners. No typed deviation: every
+    # collaborator (queue_jobs.get_job, queue_events.append_event, every
+    # queue_order_index job-index primitive) is an already-landed
+    # earlier-ranked owner, and _job_record_path/_write_transition_intent_
+    # unlocked/_recover_pending_transitions_unlocked stay facade-resident
+    # (still un-extracted, self-called as before). _sync_scheduler_source_
+    # unlocked stayed facade-resident too at CQ14 landing time, but was
+    # itself extracted later, to queue_gateway_indexes.py at CQ16 -- this
+    # net delta is unaffected (it predates that move), corrected here only
+    # so the claim does not go on describing a fact that stopped being true
+    # two slices later (N14, closing-round review). Net: 8430 -> 8009.
+    # #231 CQ15 (N14, closing-round review: this entry was missing): the
+    # lease/recovery family, seven owners -- queue_lease_indexes,
+    # queue_lease_capacity_state, queue_lease_capacity_audit, queue_lease_
+    # recovery, queue_lease_admission (gate-forced split from queue_leases
+    # at 854 > 800, zero call-graph overlap), queue_leases, queue_
+    # scheduler_cancel_claims. 27 delegating tail shims deleted; residual
+    # facade call sites rewired to direct module calls. Typed deviations:
+    # CQ15-LR-01 (_delete_lease_unlocked hosted on queue_lease_recovery to
+    # break a genuine admission<->recovery cycle, ledger §9.3 precedent);
+    # the sync_operational_indexes module twin (design-prescribed patchable
+    # seam); the gate-forced admission split above. _is_sha256_digest: no
+    # lease-recovery copy exists -- the facade copy stays with its unmoved
+    # job-GC callers (CQ18, §13.3). Net: 8009 -> 4848.
+    # #231 CQ16: gateways, browser attachments, gateway indexes, and monitor
+    # rules move to queue_gateways.py / queue_browser_attachments.py /
+    # queue_gateway_indexes.py / queue_monitor_rules.py. Net: 4848 -> 3606.
+    # #231 CQ17: execution cleanup (shard layout/migration/detection plus the
+    # durable-marker mutation half, split CQ17-EC-01) moves to queue_
+    # execution_cleanup.py / queue_execution_cleanup_markers.py; the facade's
+    # now-dead `hashlib` import is also dropped. Net: 3606 -> 3056.
+    # #231 CQ18: job GC (eligibility protections plus phased trash-staging
+    # collection, split CQ18-JG-01) moves to queue_job_gc.py / queue_job_gc_
+    # protections.py; GC quarantine-tree storage moves to queue_gc_storage.py.
+    # Net: 3056 -> 2077.
+    # #231 CQ19: index discovery (schema-upgrade/gate-reconciliation/state-
+    # extension) moves to queue_index_discovery.py, the bounded migration
+    # batch driver to queue_index_migration.py, the transition-intent
+    # applier to queue_transitions.py, and queue startup (initialize plus
+    # its locked-core/permission-repair helpers) to queue_startup.py. Net:
+    # 2077 -> 746 (corrected from a stale "713" -- the real count at the
+    # CQ19 landing commit, 17061e4 -- N14, closing-round review) -- under
+    # the 800-line default cap, so core_queue.py drops out of the ratchet
+    # baseline entirely (this script's own documented convention: "remove
+    # the entry once the file is under DEFAULT_MAX_LINES").
     "src/clio_relay/deployment.py": 1243,
     # #231 R9 fix round 3: cohesive wire-adapter owner split out of
     # door_errors.py. Both sides are recorded exactly even below the default
     # cap so this decomposition cannot silently re-accrete.
+    # Campaign merge: values are the MEASURED merged-tree counts.
     "src/clio_relay/door_error_adapters.py": 170,
-    "src/clio_relay/door_errors.py": 739,
+    "src/clio_relay/door_errors.py": 734,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
@@ -404,13 +496,23 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/remote_mcp.py": 5377,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
-    "src/clio_relay/retention.py": 951,
+    # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
+    # queue_gc_storage.py; the combined `from clio_relay.core_queue import
+    # ClioCoreQueue, purge_quarantined_tree_batch` splits into two single-name
+    # import lines (CQ15 §10.7 precedent: retarget a moved-symbol import to
+    # its real new owner, never a facade re-export).
+    "src/clio_relay/retention.py": 952,
     "src/clio_relay/runtime_metadata.py": 1749,
     "src/clio_relay/scheduler_providers.py": 1153,
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
     # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
-    "src/clio_relay/service_runtime.py": 9386,
+    # #231 CQ16 cross-file fix: +4 net lines -- _revoke_browser_attachment's
+    # except clause now discriminates BrowserAttachmentIdentityConflictError
+    # by type instead of a substring match on QueueConflictError (the banned
+    # prose-match pattern). Campaign merge: 9391 base -5 (#242 gating)
+    # +4 (CQ16) = 9390, the measured merged count.
+    "src/clio_relay/service_runtime.py": 9390,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
@@ -437,7 +539,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
     # while exposing only StorageDecision.message, never its serialized
     # exception payload.
-    "src/clio_relay/storage_runtime.py": 1122,
+    "src/clio_relay/storage_runtime.py": 1124,
+    # N13 (closing-round review): +2 lines -- the blanket `# pyright:
+    # ignore` on the cross-owner `_job_matches_mcp_admission_class` import
+    # is re-narrowed to `[reportPrivateUsage]`, which forces the import
+    # onto its own three-line parenthesized form to keep the ignore
+    # comment on the diagnostic's own line under the 100-col limit.
     # #231 R4: local-visitor spawn/health/cleanup delegates to the new
     # frp_link.py substrate (HeldFrpVisitor) instead of duplicating it;
     # run_frp_http_probe collapses into a thin proxy_type="stcp" wrapper

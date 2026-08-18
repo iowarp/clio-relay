@@ -6,7 +6,9 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+from clio_relay import queue_jobs, queue_order_index
 from clio_relay.config import RelaySettings
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
 from clio_relay.storage_runtime import storage_managed_queue
@@ -50,11 +52,17 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    def hard_crash(family: str, record_id: str) -> int:
-        del family, record_id
+    def hard_crash(store: object, family: str, record_id: str) -> int:
+        del store, family, record_id
         os._exit(91)
 
-    queue._ensure_global_order_entry_unlocked = hard_crash  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # F11 (block-2 review): rebind queue_jobs' own reference to an isolated
+    # SimpleNamespace copy rather than mutating the real, shared
+    # queue_order_index module object in place -- the same process-global
+    # fixture repoint pattern used elsewhere in this test suite.
+    queue_jobs.queue_order_index = SimpleNamespace(
+        **{**vars(queue_order_index), "ensure_global": hard_crash}
+    )
     queue.submit_job(job)
     raise AssertionError("hard crash fault was not reached")
 

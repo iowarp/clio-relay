@@ -47,7 +47,12 @@ from pydantic import PrivateAttr
 from clio_relay import __version__, door_error_adapters, door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError, QueueConflictError, TaskInputParkConflictError
+from clio_relay.errors import (
+    McpTaskIdentityConflictError,
+    NotFoundError,
+    QueueConflictError,
+    TaskInputParkConflictError,
+)
 from clio_relay.jarvis_mcp import is_virtual_jarvis_tool
 from clio_relay.mcp_server import (
     McpSessionState,
@@ -1099,13 +1104,8 @@ class RelayTasksExtension(ServerExtension):
             # non-heuristic discrimination rather than a message/keyword
             # match against the genuine task-identity conflict below.
             raise door_error_adapters.as_mcp_error(door_errors.classify(exc)) from exc
-        except QueueConflictError as exc:
-            # relay#218, grounding now owned by
-            # door_errors.REASONS["mcp_task_conflict"]'s docstring.
-            # Call-path-scoped: a bare QueueConflictError means this only on
-            # this MCP-task-creation path (it is raised 651 other times
-            # elsewhere in core_queue.py for unrelated invariants), so the
-            # reason is supplied here rather than derived from the type alone.
+        except McpTaskIdentityConflictError as exc:
+            # Only this type carries a reviewed public queue-conflict message.
             conflicting_task_id = (
                 outcome.structured_content.get("job_id")
                 if isinstance(outcome.structured_content, dict)
@@ -1135,7 +1135,7 @@ class RelayTasksExtension(ServerExtension):
             )
             raise door_error_adapters.as_mcp_error(
                 door_errors.classify(
-                    exc,
+                    door_errors.public_message_error(exc),
                     reason="mcp_task_conflict",
                     message=conflict_message,
                     data={"task_id": conflicting_task_id},

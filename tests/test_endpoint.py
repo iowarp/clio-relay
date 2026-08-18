@@ -20,9 +20,8 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import core_queue as core_queue_module
 from clio_relay import endpoint as endpoint_module
-from clio_relay import process_containment
+from clio_relay import process_containment, queue_artifacts
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -5876,7 +5875,7 @@ def test_worker_indexes_agent_result_artifacts(
             return list(artifacts), None, len(artifacts)
 
         def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
-            saved = cast(Any, core_queue_module)._artifact_with_sequence(
+            saved = queue_artifacts.artifact_with_sequence(
                 artifact,
                 len(artifacts) + 1,
             )

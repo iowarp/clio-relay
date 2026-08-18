@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import clio_relay.cli as cli_module
-import clio_relay.core_queue as core_queue_module
 import clio_relay.mcp_server as mcp_server_module
+from clio_relay import queue_idempotency
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
@@ -120,7 +120,7 @@ def test_legacy_artifact_use_wire_and_digests_remain_stable() -> None:
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     assert (
-        core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             job
         )
         == expected_job_digest

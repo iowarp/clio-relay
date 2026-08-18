@@ -48,6 +48,10 @@ class QueueConflictError(RelayError):
     """Raised when a queue operation violates an invariant."""
 
 
+class McpTaskIdentityConflictError(QueueConflictError):
+    """A caller reused one durable MCP task identity for different semantics."""
+
+
 def queue_conflict_from_cause(
     message: str,
     *,
@@ -72,10 +76,27 @@ class TaskInputParkConflictError(QueueConflictError):
     ``update_mcp_task_projection``'s optimistic-concurrency check keeps
     losing a race after every retry attempt. This is a transient
     concurrency conflict, never a client parameter problem -- unlike
-    ``put_mcp_task``'s genuine task-identity-reuse ``QueueConflictError``,
+    ``put_mcp_task``'s genuine task-identity-reuse conflict,
     it must never be surfaced as ``INVALID_PARAMS`` (clio-relay#218 rework).
     A distinct subtype, rather than a message/keyword match, is what lets
     ``intercept_tool_call`` discriminate the two conflict sources by type.
+    """
+
+
+class BrowserAttachmentIdentityConflictError(QueueConflictError):
+    """A browser attachment's identity changed underneath an in-flight revoke.
+
+    Raised only by ``queue_browser_attachments`` when the current gateway
+    record's attachment id no longer matches the one the caller is trying to
+    revoke (``begin_gateway_browser_attachment_revoke``) or finish revoking
+    (``finish_gateway_browser_attachment_revoke``). This is a caller-supplied
+    identity mismatch that ``ServiceRuntimeSupervisor._revoke_browser_
+    attachment`` maps to a public ``ConfigurationError`` -- unlike every
+    other ``QueueConflictError`` this same call can raise (missing
+    attachment, invalid record, ...), which must propagate unmapped. A
+    distinct subtype, rather than a substring match on the exception
+    message, is what lets that caller discriminate the two conflict sources
+    by type instead of by prose (clio-relay#231 CQ16 rework).
     """
 
 

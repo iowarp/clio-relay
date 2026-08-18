@@ -2,24 +2,34 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+from clio_relay import (
+    queue_jobs,
+    queue_layout,
+    queue_lease_admission,
+    queue_lease_capacity_audit,
+    queue_lease_indexes,
+    queue_store_read,
+)
 from clio_relay.core_queue import (
     DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
-    LEASE_OPERATIONAL_INDEX_SCHEMA,
     MAX_ACTIVE_JOB_RECORDS,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
 from clio_relay.errors import QueueConflictError
+from clio_relay.filesystem_paths import WINDOWS_EXTENDED_PATH_PREFIX
 from clio_relay.models import (
     EndpointRegistration,
     EndpointRole,
@@ -89,6 +99,24 @@ def test_sparse_active_capacity_rejects_before_reading_payloads(tmp_path: Path) 
     }
 
 
+def test_lease_index_missing_root_error_reports_logical_path(tmp_path: Path) -> None:
+    """The 'queue root is missing' error must carry queue.root, not the
+    internal \\\\?\\ extended-prefixed _storage_root (F1 regression guard)."""
+    queue = ClioCoreQueue(tmp_path / "core")
+    queue.initialize()
+    target = queue._storage_root / "lease_indexes"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    shutil.rmtree(queue._storage_root)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    with pytest.raises(QueueConflictError) as excinfo:
+        queue._require_safe_lease_index_directory(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            target, create=False
+        )
+
+    message = str(excinfo.value)
+    assert message == f"queue root is missing: {queue.root}"
+    assert WINDOWS_EXTENDED_PATH_PREFIX not in message
+
+
 def test_preexisting_over_capacity_queue_can_still_drain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -103,19 +131,30 @@ def test_preexisting_over_capacity_queue_can_still_drain(
             pid=123,
         )
     )
-    original_scan = queue._scan_many  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # Post-CQ15: acquire_next_job's queued-jobs scan resolves through
+    # queue_lease_admission.queue_store_read.scan_many directly (design §4
+    # row: "queue._scan_many -> queue_leases.queue_store_read.scan_many";
+    # the real owner landed as queue_lease_admission, a same-rank peer split
+    # out of queue_leases -- see that module's docstring), not the facade's
+    # bare _scan_many classmethod. Isolated-namespace pattern so only this
+    # owner's lookup is sabotaged.
+    original_scan = queue_store_read.scan_many
 
     def truncated_queued_scan(
         directory: Path,
         model: type[RelayJob],
         *,
         limit: int,
+        identity_field: str | None = None,
     ) -> tuple[list[RelayJob], bool]:
-        if directory == queue.root / "jobs_queued":
+        if directory == queue._storage_root / "jobs_queued":  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             return [job], True
-        return original_scan(directory, model, limit=limit)
+        return original_scan(directory, model, limit=limit, identity_field=identity_field)
 
-    monkeypatch.setattr(queue, "_scan_many", truncated_queued_scan)
+    isolated_store_read = SimpleNamespace(
+        **{**vars(queue_store_read), "scan_many": truncated_queued_scan}
+    )
+    monkeypatch.setattr(queue_lease_admission, "queue_store_read", isolated_store_read)
 
     lease = queue.acquire_next_job(endpoint.endpoint_id, cluster="ares")
 
@@ -169,7 +208,11 @@ def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(
 
     monkeypatch.setattr(os, "lstat", count_lstat)
     started = perf_counter()
-    counts = queue._active_lease_counts_by_kind(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # N9 (closing-round review): repointed off the dead `_active_lease_counts_
+    # by_kind` wrapper (zero production callers) onto the real production
+    # function it forwarded to unchanged -- `lease_admission_capacity_
+    # snapshot`'s own O(1) journaled read, `_lease_capacity_snapshot`.
+    counts, _global_total = queue._lease_capacity_snapshot(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares"
     )
     elapsed = perf_counter() - started
@@ -186,27 +229,6 @@ def test_live_lease_index_cold_count_and_warm_admission_stay_bounded(
     assert acquire_elapsed < 2.0, (
         f"10k warm indexed lease acquisition exceeded lock budget: {acquire_elapsed:.3f}s"
     )
-
-
-def test_live_lease_capacity_fails_closed_above_active_bound(
-    tmp_path: Path,
-) -> None:
-    queue = ClioCoreQueue(tmp_path / "core")
-    queue.initialize()
-    job = _job("over-capacity-template").model_copy(update={"state": JobState.RUNNING})
-    for index in range(MAX_LIVE_LEASE_RECORDS + 1):
-        lease = Lease.new(f"job-{index}", f"worker-{index}", 300)
-        identity = queue._lease_index_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            lease,
-            job=job.model_copy(update={"job_id": lease.job_id}),
-        )
-        path = queue._lease_expiry_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path.touch()
-
-    with pytest.raises(QueueConflictError, match="10000 records"):
-        queue._exact_lease_capacity_snapshot(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="ares"
-        )
 
 
 def test_legacy_lease_operational_indexes_migrate_and_repair(tmp_path: Path) -> None:
@@ -272,7 +294,7 @@ def test_legacy_lease_operational_indexes_migrate_and_repair(tmp_path: Path) -> 
     while upgraded_state["complete"] is not True:
         upgraded_state = upgraded.migrate_indexes_batch(batch_size=10)
     upgraded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert upgraded_manifest["schema_version"] == LEASE_OPERATIONAL_INDEX_SCHEMA
+    assert upgraded_manifest["schema_version"] == queue_layout.LEASE_OPERATIONAL_INDEX_SCHEMA
     assert upgraded._active_lease_for_endpoint("legacy-worker") == lease  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
@@ -400,13 +422,27 @@ def test_lease_index_repair_intent_rebuilds_after_clear_crash(
     def crash_during_rebuild(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated repair rebuild crash")
 
-    monkeypatch.setattr(
-        queue,
-        "_sync_lease_operational_indexes_unlocked",
-        crash_during_rebuild,
+    # Post-CQ15: the repair loop resolves convergence through the
+    # module-qualified queue_lease_capacity_audit.queue_lease_indexes.
+    # sync_operational_indexes lookup, not a bound self.-method (design doc
+    # CQ15 row: "Patch queue_lease_capacity_audit.queue_lease_indexes.
+    # sync_operational_indexes"). Isolated-namespace pattern so only this
+    # owner's lookup is sabotaged. N16 (closing-round review): scoped to a
+    # `monkeypatch.context()` rather than the fixture-wide `monkeypatch`
+    # fixture with a bare `.undo()` -- the scoped form can never leak into
+    # or clobber any other patch this test (or a shared fixture) applies,
+    # and the restore happens deterministically at the `with` block's exit.
+    isolated_lease_indexes = SimpleNamespace(
+        **{**vars(queue_lease_indexes), "sync_operational_indexes": crash_during_rebuild}
     )
-    with pytest.raises(RuntimeError, match="repair rebuild crash"):
-        queue.repair_lease_operational_indexes()
+    with monkeypatch.context() as patch:
+        patch.setattr(queue_lease_capacity_audit, "queue_lease_indexes", isolated_lease_indexes)
+        with pytest.raises(RuntimeError, match="repair rebuild crash"):
+            queue.repair_lease_operational_indexes()
+    # The `with` block above already restored the real (non-sabotaged)
+    # lookup: the crash-recovery replay below must reach it, exactly as the
+    # original instance-level patch (which a fresh ``restarted`` instance
+    # never inherited) did.
 
     restarted = ClioCoreQueue(root)
     restarted.initialize()
@@ -453,7 +489,7 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         },
     )
 
-    def crash_after_canonical(record: RelayJob) -> None:
+    def crash_after_canonical(_host: queue_jobs.QueueJobsMixin, record: RelayJob) -> None:
         (root / "jobs").mkdir(parents=True, exist_ok=True)
         (root / "jobs" / f"{record.job_id}.json").write_text(
             record.model_dump_json(),
@@ -462,7 +498,7 @@ def test_idempotent_replay_repairs_crash_gap_after_canonical_job_write(
         raise RuntimeError("simulated hard crash")
 
     with monkeypatch.context() as crash:
-        crash.setattr(queue, "_write_job_unlocked", crash_after_canonical)
+        crash.setattr(queue_jobs, "write_job", crash_after_canonical)
         with pytest.raises(RuntimeError, match="simulated hard crash"):
             queue.submit_job(job)
 

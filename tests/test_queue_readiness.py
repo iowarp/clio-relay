@@ -10,10 +10,11 @@ from pathlib import Path
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay import queue_store_read
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import EndpointRegistration, EndpointRole
+from clio_relay.queue_store_lock import LegacyQueueStateError
 
 
 def _tree_identity(root: Path) -> dict[str, tuple[bytes, int]]:
@@ -94,7 +95,8 @@ def test_read_only_fresh_endpoint_lookup_never_scans_history_or_writes(
         )
     )
     before = _tree_identity(root)
-    original_scan = ClioCoreQueue._scan_json_record_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_scan = queue_store_read.scan_json_record_paths
+    observed_directories: list[Path] = []
 
     def reject_historical_scan(
         directory: Path,
@@ -102,15 +104,12 @@ def test_read_only_fresh_endpoint_lookup_never_scans_history_or_writes(
         limit: int,
         label: str,
     ) -> tuple[list[Path], bool]:
+        observed_directories.append(directory)
         if directory == root / "endpoints":
             raise AssertionError("historical endpoints must not be scanned")
         return original_scan(directory, limit=limit, label=label)
 
-    monkeypatch.setattr(
-        core_queue_module.ClioCoreQueue,
-        "_scan_json_record_paths",
-        staticmethod(reject_historical_scan),
-    )
+    monkeypatch.setattr(queue_store_read, "scan_json_record_paths", reject_historical_scan)
 
     endpoints, truncated = ClioCoreQueue(root).scan_fresh_endpoints_read_only(
         limit=10,
@@ -121,7 +120,29 @@ def test_read_only_fresh_endpoint_lookup_never_scans_history_or_writes(
 
     assert truncated is False
     assert [endpoint.endpoint_id for endpoint in endpoints] == [current.endpoint_id]
+    assert observed_directories
     assert _tree_identity(root) == before
+
+
+def test_scan_many_resolves_the_json_scan_through_its_owner_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CQ3 scan seam lives on ``queue_store_read``, not the facade."""
+
+    def sabotage(
+        _directory: Path,
+        *,
+        limit: int,
+        label: str,
+    ) -> tuple[list[Path], bool]:
+        del limit, label
+        raise RuntimeError("queue_store_read scan lookup engaged")
+
+    monkeypatch.setattr(queue_store_read, "scan_json_record_paths", sabotage)
+
+    with pytest.raises(RuntimeError, match="queue_store_read scan lookup engaged"):
+        queue_store_read.scan_many(tmp_path, EndpointRegistration, limit=1)
 
 
 def test_read_only_fresh_endpoint_lookup_refuses_unsealed_queue_without_writes(

@@ -19,7 +19,8 @@ from uuid import uuid4
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field
 
-from clio_relay.core_queue import ClioCoreQueue, purge_quarantined_tree_batch
+from clio_relay import queue_gc_storage
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError, queue_conflict_from_cause
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.models import (
@@ -262,7 +263,7 @@ class TerminalRetentionCoordinator:
                 self._write_receipt(receipt)
                 self._after_retention_checkpoint(SpoolRetentionPhase.PURGING)
             if receipt.phase is SpoolRetentionPhase.PURGING and actions < batch_size:
-                removed, complete = purge_quarantined_tree_batch(
+                removed, complete = queue_gc_storage.purge_quarantined_tree_batch(
                     self._quarantine_path(receipt),
                     limit=batch_size - actions,
                 )

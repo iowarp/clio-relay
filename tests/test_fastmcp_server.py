@@ -30,7 +30,7 @@ import clio_relay.fastmcp_server as fastmcp_server_module
 from clio_relay import door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.errors import McpTaskIdentityConflictError, NotFoundError, QueueConflictError
 from clio_relay.fastmcp_server import (
     MAX_TASK_ARGUMENT_BYTES,
     RelayMcpRuntime,
@@ -49,6 +49,7 @@ from clio_relay.models import (
     RelayMcpTaskRecord,
     RemoteAgentTaskSpec,
 )
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.remote_mcp import VirtualRemoteMcpCatalog
 
 JSON = dict[str, Any]
@@ -392,7 +393,6 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
@@ -408,7 +408,7 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
         return path.open("xb")
 
     monkeypatch.setattr(
-        "clio_relay.core_queue.open_private_atomic_file",
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
         _open_atomic,
     )
 
@@ -571,7 +571,6 @@ def _mock_local_job_admission(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
@@ -586,7 +585,10 @@ def _mock_local_job_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     def _open_atomic(path: Path) -> BinaryIO:
         return path.open("xb")
 
-    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+    monkeypatch.setattr(
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        _open_atomic,
+    )
 
     def _no_cluster(_cluster: str) -> None:
         return None
@@ -1147,7 +1149,7 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
         assert progressed_replay == first
         assert progressed_replay.projection.initial_result["state"] == JobState.QUEUED.value
 
-        with pytest.raises(QueueConflictError, match="different semantics"):
+        with pytest.raises(McpTaskIdentityConflictError, match="different semantics"):
             await runtime.create_task(
                 tool=tool,
                 arguments={"value": "different"},
@@ -1347,7 +1349,7 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
     """#218: a genuine task-identity conflict must surface as a typed MCPError.
 
     ``intercept_tool_call`` calls ``create_task`` with no surrounding
-    try/except, so an unhandled ``QueueConflictError`` from ``put_mcp_task``
+    try/except, so an unhandled task identity conflict from ``put_mcp_task``
     previously escaped through FastMCP's generic handler as a bare, typeless
     -32603 internal error (the exact live symptom). A real conflict (as
     opposed to the control-only-argument false positive covered above) must
@@ -1369,7 +1371,7 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
 
     def forced_conflict(task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
         conflicting_task_ids.append(task.task_id)
-        raise QueueConflictError(
+        raise McpTaskIdentityConflictError(
             f"MCP task identity was reused with different semantics: {task.task_id}"
         )
 
@@ -1395,6 +1397,50 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
                 "reason": "mcp_task_conflict",
                 "task_id": conflicting_task_ids[-1],
             }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        queue.put_mcp_task = real_put_mcp_task  # type: ignore[method-assign]
+
+
+def test_legacy_queue_state_during_task_creation_keeps_foreign_text_private(
+    tmp_path: Path,
+) -> None:
+    """Only a task-identity conflict may publish its queue-conflict message."""
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    server = _task_server(settings, queue)
+    real_put_mcp_task = queue.put_mcp_task
+    foreign_text = "FOREIGN pydantic validator disclosed secret diagnostic"
+
+    def legacy_state(_task: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        raise LegacyQueueStateError(
+            family="events",
+            path=settings.core_dir / "events" / "foreign.json",
+            reason=f"event record is invalid: ValueError: {foreign_text}",
+        )
+
+    async def scenario() -> None:
+        async with Client(server, mode="auto") as client:
+            queue.put_mcp_task = legacy_state  # type: ignore[method-assign]
+            with pytest.raises(MCPError) as failure:
+                await call_tool_task(
+                    client,
+                    "relay_submit_agent",
+                    _submit_arguments(tmp_path, "legacy-task-creation"),
+                )
+            spec = door_errors.REASONS["internal_error"]
+            assert failure.value.code == spec.mcp_code
+            assert failure.value.data == {"reason": "internal_error"}
+            assert door_errors.public_message(reason=spec.reason, title=spec.title) in str(
+                failure.value
+            )
+            assert foreign_text not in str(failure.value)
+            assert foreign_text not in json.dumps(failure.value.data, default=str)
 
     try:
         asyncio.run(scenario())
@@ -1478,7 +1524,6 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.core_queue",
         "clio_relay.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
@@ -1493,7 +1538,10 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
     def _open_atomic(path: Path) -> BinaryIO:
         return path.open("xb")
 
-    monkeypatch.setattr("clio_relay.core_queue.open_private_atomic_file", _open_atomic)
+    monkeypatch.setattr(
+        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        _open_atomic,
+    )
 
     def _no_cluster(_cluster: str) -> None:
         return None
