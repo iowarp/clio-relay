@@ -1271,7 +1271,6 @@ def test_live_acceptance_rejects_invalid_explicit_progress_adapter(adapter: str)
 
 
 def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -> None:
-
     def fake_runner(
         command: list[str],
         *,
@@ -1418,7 +1417,6 @@ def test_native_jarvis_progress_requires_trusted_matching_nonterminal_documents(
 
 
 def test_live_acceptance_rejects_package_progress_before_running_event() -> None:
-
     def fake_runner(
         command: list[str],
         *,

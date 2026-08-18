@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import urllib.error
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 import yaml
 
+from clio_relay.errors import ConfigurationError
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME,
@@ -17,6 +21,7 @@ from clio_relay.remote_mcp import (
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION,
     CLIO_KIT_SPACK_USER_WHEEL_VERSION,
 )
+from tests import clio_kit_test_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -52,6 +57,69 @@ CONTRACT_CERTIFICATION_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/v2.7.2/"
     f"{CONTRACT_CERTIFICATION_WHEEL_FILENAME}"
 )
+
+
+def _configure_fixture_wheel_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    filename: str,
+    payload: bytes,
+) -> None:
+    """Point the provisioning helper at one small deterministic test wheel."""
+    monkeypatch.setattr(
+        clio_kit_test_artifacts,
+        "CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME",
+        filename,
+    )
+    monkeypatch.setattr(
+        clio_kit_test_artifacts,
+        "CLIO_KIT_JARVIS_MCP_WHEEL_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    monkeypatch.setattr(
+        clio_kit_test_artifacts,
+        "CLIO_KIT_JARVIS_MCP_WHEEL_URL",
+        f"https://downloads.invalid/{filename}",
+    )
+
+
+def test_contract_wheel_provisioning_reuses_a_verified_cross_worktree_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh checkout can reuse exact cached bytes without sibling artifacts."""
+    payload = b"small immutable wheel fixture"
+    filename = "clio_kit-9.9.9-py3-none-any.whl"
+    _configure_fixture_wheel_pin(monkeypatch, filename=filename, payload=payload)
+    monkeypatch.delenv("CLIO_RELAY_CLIO_KIT_WHEEL", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_CLIO_KIT_WHEEL_SHA256", raising=False)
+    monkeypatch.setenv("CLIO_RELAY_CLIO_KIT_WHEEL_CACHE", str(tmp_path))
+    cached = tmp_path / filename
+    cached.write_bytes(payload)
+
+    assert clio_kit_test_artifacts.provision_clio_kit_wheel() == cached.resolve()
+
+
+def test_contract_wheel_provisioning_reports_an_actionable_offline_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable immutable artifact is a typed configuration error, never a skip."""
+    payload = b"absent wheel fixture"
+    filename = "clio_kit-9.9.8-py3-none-any.whl"
+    _configure_fixture_wheel_pin(monkeypatch, filename=filename, payload=payload)
+    monkeypatch.delenv("CLIO_RELAY_CLIO_KIT_WHEEL", raising=False)
+    monkeypatch.delenv("CLIO_RELAY_CLIO_KIT_WHEEL_SHA256", raising=False)
+    monkeypatch.setenv("CLIO_RELAY_CLIO_KIT_WHEEL_CACHE", str(tmp_path))
+
+    def unavailable(_request: object, *, timeout: float) -> Any:
+        del timeout
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(clio_kit_test_artifacts.urllib.request, "urlopen", unavailable)
+
+    with pytest.raises(ConfigurationError, match="provide the verified release artifact"):
+        clio_kit_test_artifacts.provision_clio_kit_wheel()
 
 
 def test_bootstrap_jarvis_mcp_install_pin_is_self_consistent() -> None:

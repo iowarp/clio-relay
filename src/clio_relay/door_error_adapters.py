@@ -155,6 +155,8 @@ def as_http_problem(fault: RelayFaultLike) -> JSON:
         "retryable": fault.retryable,
         "truncation": fault.truncation,
     }
+    if fault.reason == "owner_session_identity_refused":
+        document["message"] = fault.message
     return _bounded_document(document)
 
 

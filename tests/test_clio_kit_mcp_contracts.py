@@ -52,6 +52,7 @@ from clio_relay.remote_mcp import (
     RemoteMcpToolSchema,
     remote_mcp_schema_digest,
 )
+from tests.clio_kit_test_artifacts import provision_clio_kit_wheel
 
 JSON = dict[str, Any]
 CONTRACT_INDEX_PATH = "clio_kit/_mcp_contracts/index.json"
@@ -290,24 +291,8 @@ def _build_uv_tool_layout_probe_wheel(tmp_path: Path) -> Path:
 
 @pytest.fixture(scope="module")
 def clio_kit_wheel() -> Path:
-    """Return the exact external wheel used for cross-repository verification."""
-    configured = os.getenv("CLIO_RELAY_CLIO_KIT_WHEEL")
-    if configured is not None:
-        wheel = Path(configured).expanduser().resolve(strict=True)
-        if not wheel.is_file() or wheel.suffix != ".whl":
-            raise AssertionError("CLIO_RELAY_CLIO_KIT_WHEEL must name one built wheel")
-    else:
-        sibling_dist = Path(__file__).resolve().parents[2] / "clio-kit" / "dist"
-        wheels = sorted(sibling_dist.glob("clio_kit-*.whl"))
-        if len(wheels) != 1:
-            raise AssertionError(
-                "set CLIO_RELAY_CLIO_KIT_WHEEL to the exact clio-kit release wheel; "
-                f"found {len(wheels)} sibling build artifacts"
-            )
-        wheel = wheels[0].resolve(strict=True)
-    expected_sha256 = os.getenv("CLIO_RELAY_CLIO_KIT_WHEEL_SHA256")
-    if expected_sha256 is not None:
-        assert hashlib.sha256(wheel.read_bytes()).hexdigest() == expected_sha256
+    """Provision the exact external wheel used for cross-repository verification."""
+    wheel = provision_clio_kit_wheel()
     assert f"-{CLIO_KIT_SPACK_USER_WHEEL_VERSION}-" in wheel.name
     return wheel
 

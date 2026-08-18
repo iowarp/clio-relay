@@ -3946,20 +3946,10 @@ def _run_bounded_command(
 def _current_session_api_release_identity() -> SessionApiReleaseIdentity:
     """Return the exact locally installed release identity for an API child."""
     from clio_relay.installation import verified_session_api_install_receipt
+    from clio_relay.session_install_identity import release_identity_from_receipt
 
     receipt = verified_session_api_install_receipt()
-    artifact_sha256 = receipt.artifact_sha256
-    if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
-        from clio_relay.dev_mode import dev_mode_enabled
-
-        if not dev_mode_enabled():
-            raise RelayError("session API installation identity is incomplete")
-        artifact_sha256 = "0" * 64
-    return SessionApiReleaseIdentity(
-        distribution_version=receipt.distribution_version,
-        artifact_sha256=artifact_sha256,
-        software=receipt.software,
-    )
+    return release_identity_from_receipt(receipt)
 
 
 def _validated_start_registry(
@@ -4808,9 +4798,12 @@ def execute_owned_session_start(
         request.expected_api_release_identity is not None
         and release_identity != request.expected_api_release_identity
     ):
-        from clio_relay.dev_mode import dev_mode_enabled
+        from clio_relay.session_install_identity import release_identity_is_accepted
 
-        if not dev_mode_enabled():
+        if not release_identity_is_accepted(
+            release_identity,
+            request.expected_api_release_identity,
+        ):
             raise RelayError("session API installation changed after compatibility verification")
     api_token = _owned_session_api_token(require_token=request.require_token)
     settings_core_dir = RelaySettings.from_env().core_dir if core_dir is None else core_dir

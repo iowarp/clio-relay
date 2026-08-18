@@ -385,14 +385,14 @@ def test_legacy_jarvis_contract_does_not_activate_transparent_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A loadable legacy route remains pass-through and cannot opt into v3.6 staging."""
+    """A loadable legacy route remains pass-through and cannot opt into v3.7 staging."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "in.lj").write_text("run 1\n", encoding="utf-8")
     settings, definition, catalog, harness = _configured_flow(
         tmp_path,
         workspace=workspace,
-        contract_id="clio-kit-jarvis-user-v3.5",
+        contract_id="clio-kit-jarvis-user-v3.6",
     )
     current_catalog = {"value": catalog}
     _patch_flow(

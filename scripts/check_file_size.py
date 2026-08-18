@@ -54,7 +54,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # offsets it -- this is genuinely new structure the doc's own §6.4/§6.5
     # ledger names as never having existed before R6, not a fixable
     # regression. A justified, minimal ratchet-up.
-    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5786,
+    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5782,
     "jarvis-packages/clio_relay/clio_relay/process_containment.py": 2678,
     "src/clio_relay/bootstrap.py": 8733,
     "src/clio_relay/bootstrap_journal.py": 1497,
@@ -142,7 +142,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 3: cohesive wire-adapter owner split out of
     # door_errors.py. Both sides are recorded exactly even below the default
     # cap so this decomposition cannot silently re-accrete.
-    "src/clio_relay/door_error_adapters.py": 168,
+    "src/clio_relay/door_error_adapters.py": 170,
     "src/clio_relay/door_errors.py": 739,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
@@ -188,7 +188,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # marks QueueConflictError only and keeps OS/runtime text private.
     # #231 R9 fix round 3: +6 lines repoint every HTTP/WebSocket surface
     # adapter call to the cohesive door_error_adapters owner.
-    "src/clio_relay/http_api.py": 3260,
+    "src/clio_relay/http_api.py": 3241,
     "src/clio_relay/input_staging.py": 814,
     "src/clio_relay/installation.py": 3718,
     "src/clio_relay/jarvis_execution.py": 875,
@@ -258,7 +258,15 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/models.py": 2299,
     "src/clio_relay/process_containment.py": 2678,
     "src/clio_relay/queue_management.py": 1671,
-    "src/clio_relay/queue_validation.py": 1530,
+    # +11 net lines -- the first live worker_status() read raced a
+    # just-registered fleet's own background slot heartbeats
+    # (worker_generation_complete could read transiently False before the
+    # supervised generation settled), failing run_queue_management_validation
+    # with "configured kind concurrency is not an object" under full-suite
+    # timing. Retried on the module's usual bounded budget instead of a
+    # one-shot read; a real misconfiguration (no worker_generation_id at all)
+    # still fails immediately. A justified, minimal ratchet-up.
+    "src/clio_relay/queue_validation.py": 1546,
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
@@ -296,14 +304,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
     # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
-    "src/clio_relay/service_runtime.py": 9391,
+    "src/clio_relay/service_runtime.py": 9386,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
     # session_wire_models.py, re-exported here under their original names
     # (RemoteSession is not re-exported -- nothing outside the wire-model
     # module ever referenced it, confirmed by ruff F401). 8326 -> 7801.
-    "src/clio_relay/session_lifecycle.py": 7801,
+    "src/clio_relay/session_lifecycle.py": 7794,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

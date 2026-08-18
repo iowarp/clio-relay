@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import stat
+import sys
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -82,6 +83,20 @@ from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def packaged_relay_executable(monkeypatch: MonkeyPatch) -> Path:
+    """Bind stdio validation to this test environment's packaged relay."""
+    executable_name = "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    executable = Path(sys.executable).with_name(executable_name).resolve()
+    if not executable.is_file():
+        raise ConfigurationError(
+            "remote MCP CLI validation requires the clio-relay console script adjacent to "
+            f"the active Python interpreter; expected {executable}"
+        )
+    monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
+    return executable
 
 
 class _SchemaValidator(Protocol):
@@ -5656,10 +5671,12 @@ def test_unknown_declared_spack_contract_still_raises() -> None:
 def test_cli_validate_calls_virtual_alias_and_writes_report(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    packaged_relay_executable: Path,
     remote_schema: dict[str, object] | None,
     arguments_json: str,
     expected_remote_arguments: dict[str, object],
 ) -> None:
+    del packaged_relay_executable
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -5783,9 +5800,11 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
 def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    packaged_relay_executable: Path,
     complete: bool,
 ) -> None:
     """CLI validation waits on the queued call and projects catalog semantics."""
+    del packaged_relay_executable
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))

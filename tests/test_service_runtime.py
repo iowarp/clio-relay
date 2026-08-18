@@ -6905,8 +6905,10 @@ def test_local_readiness_response_has_one_absolute_slow_drip_deadline() -> None:
     listener.settimeout(1.0)
     port = int(listener.getsockname()[1])
     stop = threading.Event()
+    server_ready = threading.Event()
 
     def serve_slow_response() -> None:
+        server_ready.set()
         try:
             connection, _address = listener.accept()
         except OSError:
@@ -6928,6 +6930,7 @@ def test_local_readiness_response_has_one_absolute_slow_drip_deadline() -> None:
 
     server_thread = threading.Thread(target=serve_slow_response, daemon=True)
     server_thread.start()
+    assert server_ready.wait(timeout=1.0), "slow-drip server thread did not reach accept()"
     started_at = time.monotonic()
     try:
         deadline = started_at + 0.2
