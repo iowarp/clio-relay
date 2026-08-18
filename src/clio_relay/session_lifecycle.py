@@ -3903,6 +3903,18 @@ class _RemoteSessionCommandAmbiguous(RelayError):
     """The SSH transport ended without proving whether the remote command completed."""
 
 
+class _BoundedCommandTimeout(RelayError):
+    """A locally bounded child command exceeded its own deadline.
+
+    Carried as a DISTINCT TYPE so callers discriminate a real transport
+    deadline structurally. Flattening ``BoundedProcessTimeout`` into a
+    prose ``RelayError`` forced callers to re-sniff ``"timed out" in
+    str(exc)``, which misclassified any remote failure whose message merely
+    mentioned a timeout -- routing it into the deadline RETRY path
+    (clio-relay#158).
+    """
+
+
 def _run_bounded_command(
     command: list[str],
     *,
@@ -3931,7 +3943,9 @@ def _run_bounded_command(
             require_enforceable=os.name == "nt",
         )
     except BoundedProcessTimeout as exc:
-        raise RelayError(f"bounded command timed out after {timeout_seconds:g} seconds") from exc
+        raise _BoundedCommandTimeout(
+            f"bounded command timed out after {timeout_seconds:g} seconds"
+        ) from exc
     except BoundedProcessOutputLimit as exc:
         raise RelayError("bounded command output exceeded its byte limit") from exc
     except BoundedProcessError as exc:
@@ -7729,11 +7743,11 @@ def _ssh_script(
             stdout_limit=_MAX_REMOTE_SESSION_STDOUT_BYTES,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
+    except _BoundedCommandTimeout as exc:
+        raise _RemoteSessionCommandDeadline(
+            f"remote session command timed out after {timeout_seconds:g} seconds"
+        ) from exc
     except RelayError as exc:
-        if "timed out" in str(exc):
-            raise _RemoteSessionCommandDeadline(
-                f"remote session command timed out after {timeout_seconds:g} seconds"
-            ) from exc
         raise RelayError(f"remote session command failed safely: {exc}") from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
@@ -7775,12 +7789,12 @@ def _ssh_stdin_command(
             stdout_limit=stdout_limit,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
+    except _BoundedCommandTimeout as exc:
+        raise _RemoteSessionCommandDeadline(
+            "remote session command timed out after "
+            f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
+        ) from exc
     except RelayError as exc:
-        if "timed out" in str(exc):
-            raise RelayError(
-                "remote session command timed out after "
-                f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
-            ) from exc
         raise RelayError(f"remote session command failed safely: {exc}") from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()

@@ -4748,7 +4748,9 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
     def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        raise RelayError("bounded command timed out after 120 seconds")
+        raise session_lifecycle._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "bounded command timed out after 120 seconds"
+        )
 
     monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
 
@@ -4757,6 +4759,57 @@ def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) ->
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             session_id="session-1",
         )
+
+
+def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> None:
+    """The transport deadline must be discriminable by type, never by message text."""
+    assert issubclass(
+        session_lifecycle._BoundedCommandTimeout,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        RelayError,
+    )
+
+
+def test_typed_bounded_timeout_routes_to_the_session_deadline(monkeypatch: MonkeyPatch) -> None:
+    """A real transport deadline reaches _RemoteSessionCommandDeadline by TYPE."""
+
+    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_lifecycle._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
+
+    with pytest.raises(session_lifecycle._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+
+def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Prose must never decide control flow (clio-relay#158 root fix).
+
+    A remote failure that merely MENTIONS a timeout -- e.g. the cluster
+    reporting that some upstream job timed out -- is not a local transport
+    deadline. Classifying it as one routes into the deadline RETRY path,
+    which re-drives a command that already failed for an unrelated reason.
+    """
+
+    def failed(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise RelayError("remote refused the request: an upstream job timed out earlier")
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", failed)
+
+    with pytest.raises(RelayError) as captured:
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+    assert not isinstance(
+        captured.value,
+        session_lifecycle._RemoteSessionCommandDeadline,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
 
 def test_detach_remote_session_retains_verified_remote_api(monkeypatch: MonkeyPatch) -> None:
