@@ -253,15 +253,24 @@ def origin_dependency_relocations(payload):
         return []
     if string_address is None or string_size is None or string_size < 1:
         raise SystemExit("staged provider ELF string table is missing")
-    string_candidates = [
+    # Resolve the string table by the segment holding its START, then bound the
+    # whole range against the FILE. Requiring one segment to contain the entire
+    # table rejects ordinary binaries: in CPython 3.12.13 as shipped by uv,
+    # .dynstr begins in one PT_LOAD and continues into the next (the two are
+    # contiguous and share a vaddr-to-offset delta), so NO segment contained it
+    # and the count-based test reported "ambiguous" for a perfectly good file
+    # (#158). A set keeps the anti-tamper property: segments that disagree
+    # about the offset are still refused.
+    string_candidates = {
         file_offset + string_address - virtual_address
         for file_offset, virtual_address, file_size in load_segments
-        if virtual_address <= string_address
-        and string_address + string_size <= virtual_address + file_size
-    ]
+        if virtual_address <= string_address < virtual_address + file_size
+    }
     if len(string_candidates) != 1:
         raise SystemExit("staged provider ELF string table is ambiguous")
-    string_offset = string_candidates[0]
+    string_offset = next(iter(string_candidates))
+    if string_offset < 0 or string_offset + string_size > len(payload):
+        raise SystemExit("staged provider ELF string table exceeds the file")
     string_end = string_offset + string_size
     origin_prefix = b"$ORIGIN/../lib/"
     relocations = []
@@ -1173,15 +1182,19 @@ def origin_dependency_relocations(payload):
         return []
     if string_address is None or string_size is None or string_size < 1:
         raise SystemExit("candidate provider ELF string table is missing")
-    string_candidates = [
+    # Same resolution as the staged-provider path above: locate by the segment
+    # holding the table's START and bound the range against the file, because a
+    # real .dynstr can span two contiguous PT_LOAD segments (#158).
+    string_candidates = {
         file_offset + string_address - virtual_address
         for file_offset, virtual_address, file_size in load_segments
-        if virtual_address <= string_address
-        and string_address + string_size <= virtual_address + file_size
-    ]
+        if virtual_address <= string_address < virtual_address + file_size
+    }
     if len(string_candidates) != 1:
         raise SystemExit("candidate provider ELF string table is ambiguous")
-    string_offset = string_candidates[0]
+    string_offset = next(iter(string_candidates))
+    if string_offset < 0 or string_offset + string_size > len(payload):
+        raise SystemExit("candidate provider ELF string table exceeds the file")
     string_end = string_offset + string_size
     origin_prefix = b"$ORIGIN/../lib/"
     relocations = []
