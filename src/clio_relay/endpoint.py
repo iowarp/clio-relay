@@ -6,6 +6,7 @@ import base64
 import concurrent.futures
 import ctypes
 import errno
+import functools
 import getpass
 import hashlib
 import hmac
@@ -34,6 +35,10 @@ from clio_relay.bootstrap_reconcile import resolve_receipt_bound_jarvis_python
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
+from clio_relay.endpoint_worker_lanes import (
+    quarantine_relay_error,
+    run_worker_lane_iteration,
+)
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import (
     WINDOWS_LEGACY_PATH_HEADROOM,
@@ -639,15 +644,25 @@ class EndpointWorker:
             },
         )
         worker.endpoint = self.queue.register_endpoint(endpoint)
+        registered_endpoint = worker.endpoint
+        admission_limit = (
+            self.control_query_concurrency
+            if admission_class is McpAdmissionClass.CONTROL_QUERY
+            else None
+        )
         while True:
-            worker.run_once(
-                mcp_admission_class=admission_class,
-                mcp_admission_limit=(
-                    self.control_query_concurrency
-                    if admission_class is McpAdmissionClass.CONTROL_QUERY
-                    else None
+            # clio-relay#238: contain any otherwise-unhandled exception here
+            # instead of a silent per-slot thread death (endpoint_worker_lanes).
+            registered_endpoint = run_worker_lane_iteration(
+                functools.partial(
+                    worker.run_once,
+                    mcp_admission_class=admission_class,
+                    mcp_admission_limit=admission_limit,
                 ),
+                queue=self.queue,
+                endpoint=registered_endpoint,
             )
+            worker.endpoint = registered_endpoint
             time.sleep(poll_seconds)
 
     def _run_job(self, job: RelayJob, lease: Lease) -> None:
@@ -4464,7 +4479,16 @@ class EndpointWorker:
                 continue
             if any(not lease.is_expired() for lease in leases):
                 continue
-            recovery_intent = _durable_jarvis_execution_recovery(job, task)
+            # clio-relay#238: this fetch sits outside the per-marker
+            # try/except below and previously killed the calling worker slot
+            # on one poisoned record -- see quarantine_relay_error's docstring.
+            recovery_intent = quarantine_relay_error(
+                functools.partial(_durable_jarvis_execution_recovery, job, task),
+                queue=self.queue,
+                job_id=job.job_id,
+                task_id=task.task_id,
+                context="execution_cleanup_reconciliation",
+            )
             if (
                 recovery_intent is not None
                 and recovery_intent["state"] == "pending"
