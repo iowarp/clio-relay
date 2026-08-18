@@ -22,6 +22,7 @@ from clio_relay import (
     queue_browser_attachments,
     queue_endpoints,
     queue_events,
+    queue_execution_cleanup,
     queue_gateway_indexes,
     queue_gateways,
     queue_idempotency,
@@ -65,6 +66,7 @@ from clio_relay.models import (
     RelayJob,
     RelayMcpTaskProjection,
     RelayMcpTaskRecord,
+    RelayTask,
     UsedArtifactRef,
     deterministic_input_artifact_id,
     new_id,
@@ -110,20 +112,42 @@ _OWNER_RANK = {
     "queue_gateway_indexes": 20,
     "queue_artifacts": 21,
     "queue_scheduler_cancel_state": 22,
-    "queue_jobs": 23,
-    "queue_input_ingest": 24,
-    "queue_progress": 25,
-    "queue_tasks": 26,
-    "queue_lease_indexes": 27,
-    "queue_lease_capacity_state": 28,
-    "queue_lease_capacity_audit": 29,
-    "queue_lease_recovery": 30,
-    "queue_lease_admission": 31,
-    "queue_leases": 32,
-    "queue_scheduler_cancel_claims": 33,
-    "queue_gateways": 34,
-    "queue_browser_attachments": 35,
-    "queue_monitor_rules": 36,
+    # queue_execution_cleanup (the shard-layout/flat-to-shard-migration/
+    # detection half of CQ17, typed deviation CQ17-EC-01) lands here,
+    # immediately before its earliest caller. queue_jobs.write_job (CQ12,
+    # already landed with TYPE_CHECKING stubs anticipating exactly this)
+    # calls its _migrate_execution_cleanup_shard_unlocked/_execution_cleanup_
+    # shard directly on every canonical job write, so this owner must rank
+    # before queue_jobs. Its own real dependencies are just the base store/
+    # layout family (ranks 2-5); the former self.get_job(...) call is
+    # replaced with the shared queue_store_read.read_required_job primitive
+    # (ledger §9.3 precedent), so it has no forward need for queue_jobs at
+    # all. See queue_execution_cleanup.py's own module docstring for the
+    # full two-owner-split account.
+    "queue_execution_cleanup": 23,
+    "queue_jobs": 24,
+    "queue_input_ingest": 25,
+    "queue_progress": 26,
+    "queue_tasks": 27,
+    # queue_execution_cleanup_markers (the durable-marker-mutation half of
+    # CQ17: register/acknowledge/migrate_plan/stage_sidecar) lands here,
+    # immediately after queue_tasks. Every one of its methods persists an
+    # updated RelayTask through queue_tasks._sync_task_retention_indexes_
+    # unlocked, so it must rank after queue_tasks -- which itself must rank
+    # after queue_jobs (CQ12) and therefore after queue_execution_cleanup
+    # above. A single combined owner cannot satisfy both "before queue_jobs"
+    # and "after queue_tasks" at once, hence the CQ17-EC-01 split.
+    "queue_execution_cleanup_markers": 28,
+    "queue_lease_indexes": 29,
+    "queue_lease_capacity_state": 30,
+    "queue_lease_capacity_audit": 31,
+    "queue_lease_recovery": 32,
+    "queue_lease_admission": 33,
+    "queue_leases": 34,
+    "queue_scheduler_cancel_claims": 35,
+    "queue_gateways": 36,
+    "queue_browser_attachments": 37,
+    "queue_monitor_rules": 38,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -148,10 +172,12 @@ _OWNER_BUDGETS = {
     "queue_artifact_lineage": 500,
     "queue_artifacts": 220,
     "queue_scheduler_cancel_state": 450,
+    "queue_execution_cleanup": 380,
     "queue_jobs": 800,
     "queue_input_ingest": 715,
     "queue_progress": 190,
     "queue_tasks": 420,
+    "queue_execution_cleanup_markers": 360,
     "queue_lease_indexes": 620,
     "queue_lease_capacity_state": 490,
     "queue_lease_capacity_audit": 600,
@@ -272,6 +298,18 @@ class _GatewayBacklinkSyncLookupSabotage(RuntimeError):
     """Raised only when a CQ16 canonical gateway write (``queue_gateways``) reaches
     ``queue_gateway_indexes.sync_gateway_session_derived`` through the owner's
     module-qualified collaborator-attribute lookup."""
+
+
+class _ExecutionCleanupShardReadLookupSabotage(RuntimeError):
+    """Raised only when CQ17 flat-to-shard migration reaches
+    ``queue_store_read.read_json_file`` through the ``queue_execution_cleanup``
+    owner's module-qualified lookup."""
+
+
+class _ExecutionCleanupShardWriteLookupSabotage(RuntimeError):
+    """Raised only when CQ17 flat-to-shard migration reaches
+    ``queue_store_write.write_json`` through the ``queue_execution_cleanup``
+    owner's module-qualified lookup."""
 
 
 @dataclass(frozen=True)
@@ -1574,6 +1612,103 @@ def test_cq16_gateway_canonical_write_uses_the_backlink_sync_lookup(
     assert (
         ClioCoreQueue.create_gateway_session
         is queue_gateways.QueueGatewaysMixin.create_gateway_session
+    )
+
+
+def _legacy_execution_cleanup_marker(
+    queue: ClioCoreQueue,
+    *,
+    cluster: str,
+    job_id: str,
+) -> Path:
+    """Plant one flat (pre-shard-migration) execution-cleanup marker on disk."""
+    marker = RelayTask(job_id=job_id, name="legacy-cleanup", metadata={"cluster": cluster})
+    shard = queue._execution_cleanup_shard(job_id)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    shard_path = queue._execution_cleanup_shard_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster, shard
+    )
+    shard_path.mkdir(parents=True, exist_ok=True)
+    legacy_path = shard_path / f"{marker.task_id}.json"
+    legacy_path.write_text(marker.model_dump_json(), encoding="utf-8")
+    return legacy_path
+
+
+def test_cq17_execution_cleanup_migration_uses_the_store_read_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Flat-to-shard execution-cleanup migration must resolve its legacy-marker
+    read through the ``queue_store_read.read_json_file`` seam (isolated-namespace
+    pattern -- design row: "Patch its shard read/write lookup and prove
+    flat-to-shard migration delegates" (the read half)). Calls the migration
+    primitive directly (not through ``scan_execution_cleanup``'s outer shard
+    loop) so the sabotage exercises the migration's own read, not a later,
+    unrelated read of the already-migrated marker."""
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    cluster = "cluster-cq17"
+    job_id = new_id("job")
+    _legacy_execution_cleanup_marker(queue, cluster=cluster, job_id=job_id)
+    shard = queue._execution_cleanup_shard(job_id)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def sabotage(*_args: object, **_kwargs: object) -> RelayTask:
+        raise _ExecutionCleanupShardReadLookupSabotage(
+            "queue_execution_cleanup store-read lookup engaged"
+        )
+
+    isolated_store_read = SimpleNamespace(**{**vars(queue_store_read), "read_json_file": sabotage})
+    monkeypatch.setattr(queue_execution_cleanup, "queue_store_read", isolated_store_read)
+
+    with pytest.raises(
+        _ExecutionCleanupShardReadLookupSabotage,
+        match="queue_execution_cleanup store-read lookup engaged",
+    ):
+        queue._migrate_execution_cleanup_shard_unlocked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster, shard, limit=10
+        )
+
+    assert (
+        ClioCoreQueue.scan_execution_cleanup
+        is queue_execution_cleanup.QueueExecutionCleanupMixin.scan_execution_cleanup
+    )
+
+
+def test_cq17_execution_cleanup_migration_uses_the_store_write_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Flat-to-shard execution-cleanup migration must resolve its completion
+    receipt write through the ``queue_store_write.write_json`` seam
+    (isolated-namespace pattern -- design row: "Patch its shard read/write
+    lookup and prove flat-to-shard migration delegates" (the write half)).
+    Calls the migration primitive directly for the same reason as the read
+    half above."""
+    queue = ClioCoreQueue(tmp_path)
+    queue.initialize()
+    cluster = "cluster-cq17"
+    job_id = new_id("job")
+    _legacy_execution_cleanup_marker(queue, cluster=cluster, job_id=job_id)
+    shard = queue._execution_cleanup_shard(job_id)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _ExecutionCleanupShardWriteLookupSabotage(
+            "queue_execution_cleanup store-write lookup engaged"
+        )
+
+    isolated_store_write = SimpleNamespace(**{**vars(queue_store_write), "write_json": sabotage})
+    monkeypatch.setattr(queue_execution_cleanup, "queue_store_write", isolated_store_write)
+
+    with pytest.raises(
+        _ExecutionCleanupShardWriteLookupSabotage,
+        match="queue_execution_cleanup store-write lookup engaged",
+    ):
+        queue._migrate_execution_cleanup_shard_unlocked(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster, shard, limit=10
+        )
+
+    assert (
+        ClioCoreQueue.scan_execution_cleanup
+        is queue_execution_cleanup.QueueExecutionCleanupMixin.scan_execution_cleanup
     )
 
 

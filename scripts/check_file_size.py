@@ -194,7 +194,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 CQ16: gateways, browser attachments, gateway indexes, and monitor
     # rules move to queue_gateways.py / queue_browser_attachments.py /
     # queue_gateway_indexes.py / queue_monitor_rules.py. Net: 4848 -> 3606.
-    "src/clio_relay/core_queue.py": 3606,
+    # #231 CQ17: execution cleanup (shard layout/migration/detection plus the
+    # durable-marker mutation half, split CQ17-EC-01) moves to queue_
+    # execution_cleanup.py / queue_execution_cleanup_markers.py; the facade's
+    # now-dead `hashlib` import is also dropped. Net: 3606 -> 3056.
+    "src/clio_relay/core_queue.py": 3056,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
