@@ -90,6 +90,7 @@ from clio_relay.cluster_config import (
     open_private_configuration_windows_descriptor,
     release_private_configuration_windows_parent_guard,
 )
+from clio_relay.cluster_probe import probe_cluster_runtime
 from clio_relay.config import RelaySettings
 from clio_relay.deployment import render_endpoint_user_service, write_endpoint_user_service
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
@@ -3275,6 +3276,19 @@ def _invalidate_remote_mcp_cache_after_bootstrap(
         "removed_server_count": len(removed_server_names),
         "removed_server_names": list(removed_server_names),
     }
+
+
+@cluster_app.command("probe")
+def cluster_probe_command(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+) -> None:
+    """Report a cluster's runtime health without invoking the remote relay.
+
+    Safe to run against a broken deployment: it never dereferences the pinned
+    relay executable, so it still answers when everything else fails on it.
+    """
+    definition = _require_cluster(cluster)
+    _run_or_exit(lambda: typer.echo(json.dumps(probe_cluster_runtime(definition), indent=2)))
 
 
 @cluster_app.command("bootstrap")

@@ -134,7 +134,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # src/clio_relay/bootstrap_pin.py; what remains here is the recorder.check
     # block, which must sit inside the command's evidence scope. A justified,
     # minimal ratchet-up.
-    "src/clio_relay/cli.py": 18834,
+    # #158 (probe): +14 further lines -- the `cluster probe` command, a
+    # read-only recon surface that never dereferences relay_executable, so a
+    # deployment whose pin is dead can still be inspected. Its logic lives in
+    # the new owner module src/clio_relay/cluster_probe.py; only the Typer
+    # command body is here.
+    "src/clio_relay/cli.py": 18848,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
