@@ -21,8 +21,14 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
+from clio_relay.contract_gate import (
+    SurfaceContractDegradation,
+    SurfaceContractStatus,
+    mcp_contract_digest,
+    run_json_probe,
+)
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled, enforce
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, contract_surface_unavailable
 from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -301,6 +307,16 @@ class InstallReceipt(BaseModel):
     software: SoftwareIdentity
     components: dict[str, str] = Field(default_factory=dict)
     component_artifacts: dict[str, ComponentArtifactIdentity] = Field(default_factory=dict)
+    # Per-surface MCP contract identity (iowarp/clio-relay#242): what each
+    # probed surface actually shipped, recorded regardless of whether it
+    # meets this relay's pin, plus the typed degradation for any surface
+    # that does not. An absent/empty mapping (every receipt written before
+    # this change) means "not probed this way" -- callers that gate on a
+    # specific surface fall back to their pre-existing behavior.
+    contract_surfaces: dict[str, SurfaceContractStatus] = Field(default_factory=dict)
+    contract_degradations: list[SurfaceContractDegradation] = Field(
+        default_factory=lambda: list[SurfaceContractDegradation]()
+    )
     deployment_fingerprint: str | None = None
     deployment_manifest: dict[str, object] | None = None
     generation: str | None = None
@@ -394,6 +410,8 @@ def write_install_receipt(
     path: Path | None = None,
     components: dict[str, str] | None = None,
     component_artifacts: dict[str, ComponentArtifactIdentity] | None = None,
+    contract_surfaces: dict[str, SurfaceContractStatus] | None = None,
+    contract_degradations: list[SurfaceContractDegradation] | None = None,
     deployment_fingerprint: str | None = None,
     deployment_manifest: dict[str, object] | None = None,
     generation: str | None = None,
@@ -412,6 +430,8 @@ def write_install_receipt(
         software=detect_software_identity(),
         components=components or {},
         component_artifacts=component_artifacts or {},
+        contract_surfaces=contract_surfaces or {},
+        contract_degradations=contract_degradations or [],
         deployment_fingerprint=deployment_fingerprint,
         deployment_manifest=deployment_manifest,
         generation=generation,
@@ -1979,7 +1999,7 @@ def probe_clio_kit_native_execution_contract(
         "mcp-contract",
         CLIO_KIT_JARVIS_CONTRACT_ID,
     ]
-    document = _run_json_probe(probe_command, label="clio-kit native execution contract")
+    document = run_json_probe(probe_command, label="clio-kit native execution contract")
     if (
         document.get("schema_version") != CLIO_KIT_MCP_CONTRACT_SCHEMA
         or document.get("contract_id") != CLIO_KIT_JARVIS_CONTRACT_ID
@@ -2023,7 +2043,7 @@ def probe_clio_kit_native_execution_contract(
     )
     _require_native_execution_query_contract(by_name["jarvis_get_execution"])
     contract_sha256 = document.get("contract_sha256")
-    observed_contract_sha256 = _mcp_contract_digest(tools)
+    observed_contract_sha256 = mcp_contract_digest(tools)
     from clio_relay.jarvis_mcp import CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
 
     if (
@@ -2082,7 +2102,7 @@ print(json.dumps({{
     "contract_sha256": None,
 }}, sort_keys=True))
 """
-    document = _run_json_probe(
+    document = run_json_probe(
         [python, "-c", script],
         label="JARVIS-CD native execution capability",
     )
@@ -2095,29 +2115,6 @@ print(json.dumps({{
     if not _native_capability_matches_component(capability, component_name="jarvis-cd"):
         raise ConfigurationError("JARVIS-CD native execution capability did not match")
     return capability
-
-
-def _run_json_probe(command: list[str], *, label: str) -> dict[str, object]:
-    """Run one bounded component probe and require exactly one JSON object."""
-    try:
-        completed = run_bounded_process(
-            command,
-            timeout_seconds=30,
-            stdout_maximum_bytes=4 * 1024 * 1024,
-            stderr_maximum_bytes=64 * 1024,
-        )
-    except (OSError, BoundedProcessError) as exc:
-        raise ConfigurationError(f"{label} failed: {type(exc).__name__}: {exc}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
-        raise ConfigurationError(f"{label} failed: {detail[:2000]}")
-    try:
-        loaded = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise ConfigurationError(f"{label} returned invalid JSON: {exc}") from exc
-    if not isinstance(loaded, dict):
-        raise ConfigurationError(f"{label} did not return a JSON object")
-    return {str(key): value for key, value in cast(dict[object, object], loaded).items()}
 
 
 def _require_native_query_input(tool: dict[str, object]) -> None:
@@ -2402,32 +2399,6 @@ def _require_native_output_documents(
             raise ConfigurationError(
                 f"clio-kit native JARVIS {field_name} schema identity did not match"
             )
-
-
-def _mcp_contract_digest(tools: list[dict[str, object]]) -> str:
-    """Recompute clio-kit's documented agent-facing contract projection."""
-    projected = [
-        {
-            "annotations": tool.get("annotations"),
-            "description": tool.get("description"),
-            "input_schema": tool.get("inputSchema"),
-            "name": tool.get("name"),
-            "output_schema": tool.get("outputSchema"),
-            "title": tool.get("title"),
-        }
-        for tool in sorted(tools, key=lambda item: str(item.get("name")))
-    ]
-    try:
-        payload = json.dumps(
-            {"tools": projected},
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"clio-kit native execution contract was not JSON: {exc}") from exc
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _native_capability_matches_component(
@@ -3563,9 +3534,26 @@ def verify_remote_clio_kit_native_execution_component(
     info: dict[str, object],
     receipt: InstallReceipt,
 ) -> dict[str, object]:
-    """Require the exact receipt-bound clio-kit native JARVIS MCP contract."""
+    """Require the exact receipt-bound clio-kit native JARVIS MCP contract.
+
+    A receipt with no ``native_execution`` for a RECORDED, below-pin jarvis
+    surface (``receipt.contract_surfaces["jarvis"].meets_requirement`` is
+    False) is not a generic configuration problem: bootstrap already proved
+    that surface's shipped identity and recorded the gap loudly
+    (iowarp/clio-relay#242). Refuse with the typed
+    :class:`clio_relay.errors.ContractSurfaceUnavailableError` naming
+    surface/have/need instead of the generic message below, which stays for
+    a receipt that never probed the surface at all.
+    """
     component = receipt.component_artifacts.get("clio-kit")
     if component is None or component.native_execution is None:
+        jarvis_surface = receipt.contract_surfaces.get("jarvis")
+        if jarvis_surface is not None and not jarvis_surface.meets_requirement:
+            raise contract_surface_unavailable(
+                surface=jarvis_surface.surface,
+                have=jarvis_surface.shipped_contract_id,
+                need=jarvis_surface.required_contract_id,
+            )
         raise ConfigurationError("worker installation omitted the clio-kit native JARVIS contract")
     if not _native_capability_matches_component(
         component.native_execution,

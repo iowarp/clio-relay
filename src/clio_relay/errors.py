@@ -153,3 +153,38 @@ def relay_executable_missing(
         f"it produced. remote detail: {detail}",
         exit_status=exit_status,
     )
+
+
+class ContractSurfaceUnavailableError(ConfigurationError):
+    """One MCP surface's shipped contract does not meet the relay's requirement.
+
+    Typed separately (error.v1 style: surface/have/need) so a caller
+    discriminates a below-pin SURFACE from a generic configuration problem
+    structurally, never by re-sniffing a prose message. This is the USE-time
+    half of the capability-by-negotiation split (iowarp/clio-relay#242):
+    integrity pinning (wheel sha256, contract digests) stays exact at
+    bootstrap; a per-surface capability gap below that pin is refused HERE,
+    for the one operation that actually needed the surface -- never as a
+    cluster-wide bootstrap failure for surfaces nobody asked about.
+    """
+
+    reason = "contract_surface_unavailable"
+
+    def __init__(self, *, surface: str, have: str | None, need: str) -> None:
+        self.surface = surface
+        self.have = have
+        self.need = need
+        super().__init__(
+            f"contract surface unavailable: {surface} requires {need}, have "
+            f"{have or 'none'} (iowarp/clio-relay#242)"
+        )
+
+
+def contract_surface_unavailable(
+    *,
+    surface: str,
+    have: str | None,
+    need: str,
+) -> ContractSurfaceUnavailableError:
+    """Build the one typed refusal for a below-pin MCP contract surface."""
+    return ContractSurfaceUnavailableError(surface=surface, have=have, need=need)

@@ -246,7 +246,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "CLIO_KIT_JARVIS_CONTRACT_ID",
-        line=54,
+        # clio-relay#242: mechanical relocation only -- new contract_gate.py
+        # imports pushed this unchanged constant from line 54 to line 60.
+        # The requirement itself (v3.7) is untouched.
+        line=60,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
