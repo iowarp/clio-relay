@@ -14,6 +14,8 @@ typed state plus the command that repairs it.
 
 from __future__ import annotations
 
+from typing import cast
+
 from clio_relay.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
     BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
@@ -70,6 +72,26 @@ def _parse_presence(output: str) -> dict[str, bool]:
     return presence
 
 
+def pinned_runtime_present(definition: ClusterDefinition) -> bool:
+    """Report whether the cluster's CURRENTLY pinned executable exists on the host.
+
+    Used to decide whether a pin may be repaired. Two deliberate shortcuts:
+
+    * A pin that already names the produced runtime needs no round trip.
+    * If the host cannot be observed at all, the answer is ``True``. An
+      unobservable pin must never be treated as broken -- rewriting one on the
+      strength of a failed probe would clobber a working custom deployment
+      because the network blinked.
+    """
+    if definition.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE:
+        return True
+    report = probe_cluster_runtime(definition)
+    if not report.get("ssh_reachable"):
+        return True
+    pinned = cast(dict[str, object], report["relay_executable"])
+    return bool(pinned["present"])
+
+
 def probe_cluster_runtime(definition: ClusterDefinition) -> dict[str, object]:
     """Report one cluster's runtime health without invoking the relay.
 
@@ -87,6 +109,14 @@ def probe_cluster_runtime(definition: ClusterDefinition) -> dict[str, object]:
     ``ssh_unreachable``
         The host could not be reached, which is a transport fact and a
         distinct state from any install problem.
+
+    Known scope bound: ``ssh_unreachable`` is deliberately coarse. A refused
+    connection, a DNS failure, a transport timeout and an authentication
+    failure all land here, because OpenSSH reports every one of them as exit
+    255 and this probe does not parse its stderr to guess which occurred --
+    guessing from prose is exactly the discrimination-by-message this work
+    removed elsewhere. ``detail`` carries the underlying message for a human;
+    splitting auth from network needs a structured signal ssh does not give us.
     """
     report: dict[str, object] = {
         "schema_version": CLUSTER_PROBE_SCHEMA,

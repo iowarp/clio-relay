@@ -39,12 +39,16 @@ PIN_RECONCILIATION_SCHEMA = "clio-relay.bootstrap-pin-reconciliation.v1"
 def pin_reconciliation_lines(record: dict[str, object]) -> list[str]:
     """Render the operator-visible report for a pin reconciliation.
 
-    Empty when nothing changed, so an idempotent bootstrap stays quiet; a
-    repoint is always announced rather than being applied silently.
+    Empty only when the pin already named the produced runtime, so an
+    idempotent bootstrap stays quiet. Both a repoint AND a preserved custom pin
+    are announced: each is a real deployment fact the operator must be able to
+    see in the bootstrap output.
     """
+    executable = cast(dict[str, object], record["relay_executable"])
+    if record["action"] == "preserved_custom_pin":
+        return [f"relay_executable_pin_preserved={executable['before']}"]
     if not record["changed"]:
         return []
-    executable = cast(dict[str, object], record["relay_executable"])
     receipt = cast(dict[str, object], record["relay_install_receipt"])
     lines = [f"relay_executable_repointed={executable['after']}"]
     if receipt["before"] != receipt["after"]:
@@ -56,12 +60,28 @@ def reconcile_cluster_runtime_pin(
     *,
     cluster: str,
     registry_path: Path,
+    pinned_runtime_present: bool,
 ) -> dict[str, object]:
-    """Point one cluster's runtime pin at the paths bootstrap publishes.
+    """Repair one cluster's runtime pin, but only when it is proven broken.
 
-    Returns a typed record describing what changed. ``changed`` is ``False``
-    when the pin already matched, which keeps a repeated bootstrap idempotent
-    and silent.
+    ``pinned_runtime_present`` is the caller's REMOTE observation of whether
+    the currently pinned executable exists on the host. It is required, not
+    inferred: ``relay_executable`` is a free-form path field, and an operator
+    may legitimately point a cluster at a relay outside the canonical location
+    -- a shared-filesystem deployment, or a second tenant on one host.
+    Rewriting such a pin because it merely LOOKS unusual would silently
+    relocate that cluster on a routine bootstrap re-run, so only a pin proven
+    absent is repaired (clio-relay#158, review F1).
+
+    Returns a typed record whose ``action`` is one of:
+
+    ``unchanged``
+        The pin already names the produced runtime.
+    ``preserved_custom_pin``
+        The pin differs from the produced runtime but RESOLVES on the host, so
+        it is deliberate and is kept -- announced, never silent.
+    ``repointed``
+        The pin does not resolve on the host and has been repaired.
 
     Only ``relay_executable`` and ``relay_install_receipt`` are touched --
     every other field on the entry is preserved exactly, matching the
@@ -74,11 +94,20 @@ def reconcile_cluster_runtime_pin(
     exists, never mint a new one.
     """
     before: dict[str, object] = {}
+    current = ClusterRegistry.load(registry_path).require(cluster)
+    if current.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE:
+        action = "unchanged"
+    elif pinned_runtime_present:
+        action = "preserved_custom_pin"
+    else:
+        action = "repointed"
 
     def update(registry: ClusterRegistry) -> None:
         definition = registry.require(cluster)
         before["relay_executable"] = definition.relay_executable
         before["relay_install_receipt"] = definition.relay_install_receipt
+        if action != "repointed":
+            return
         definition.relay_executable = BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
         if definition.relay_install_receipt is not None:
             definition.relay_install_receipt = BOOTSTRAP_PRODUCED_INSTALL_RECEIPT
@@ -94,6 +123,7 @@ def reconcile_cluster_runtime_pin(
     return {
         "schema_version": PIN_RECONCILIATION_SCHEMA,
         "cluster": cluster,
+        "action": action,
         "changed": changed,
         "relay_executable": {
             "before": previous_executable,

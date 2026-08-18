@@ -40,6 +40,7 @@ from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.errors import (
     SHELL_COMMAND_NOT_FOUND_STATUS,
     RelayError,
+    RemoteExecutableMissingError,
     relay_executable_missing,
 )
 from clio_relay.errors import BoundedCommandTimeout as _BoundedCommandTimeout
@@ -7116,6 +7117,14 @@ def query_remote_session_start(
             selector=plan.status_selector,
             wait_seconds=wait_seconds,
         )
+    except RemoteExecutableMissingError:
+        # A dead pin is a broken DEPLOYMENT, not an in-flight start: the shell
+        # executed nothing, and every retry re-executes the same missing
+        # binary. Laundering it into starting/retryable below would rebuild the
+        # retry-forever loop the typed 127 discrimination exists to remove
+        # (clio-relay#158). Genuinely ambiguous transport errors still fall
+        # through to the recovery status, which is what that path is for.
+        raise
     except RelayError as exc:
         status = OwnedSessionRecoveryStatus(
             cluster=plan.cluster,
@@ -7722,6 +7731,29 @@ def _validate_durable_session_identity(value: str, *, field: str) -> str:
         raise RelayError(f"invalid {field}: {error}") from error
 
 
+def _raise_if_relay_executable_missing(
+    definition: ClusterDefinition,
+    *,
+    returncode: int,
+    detail: str,
+) -> None:
+    """Refuse a dead registry pin with a typed, repairable error.
+
+    Shell status 127 proves the remote shell executed nothing, so no durable
+    transition can have occurred -- there is no ambiguity to preserve and no
+    session to poll (clio-relay#158).
+    """
+    if returncode != SHELL_COMMAND_NOT_FOUND_STATUS:
+        return
+    raise relay_executable_missing(
+        cluster=definition.name,
+        ssh_host=definition.ssh_host,
+        relay_executable=definition.relay_executable,
+        detail=detail,
+        exit_status=returncode,
+    )
+
+
 def _ssh_script(
     definition: ClusterDefinition,
     script: str,
@@ -7751,16 +7783,7 @@ def _ssh_script(
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
-        if result.returncode == SHELL_COMMAND_NOT_FOUND_STATUS:
-            # 127 proves nothing executed, so there is no durable ambiguity to
-            # preserve -- reporting one would poll a never-started session (#158).
-            raise relay_executable_missing(
-                cluster=definition.name,
-                ssh_host=definition.ssh_host,
-                relay_executable=definition.relay_executable,
-                detail=detail,
-                exit_status=result.returncode,
-            )
+        _raise_if_relay_executable_missing(definition, returncode=result.returncode, detail=detail)
         try:
             rejection = OwnedSessionStartRejection.model_validate_json(stdout)
         except ValueError:
@@ -7808,6 +7831,7 @@ def _ssh_stdin_command(
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
+        _raise_if_relay_executable_missing(definition, returncode=result.returncode, detail=detail)
         raise RelayError(f"remote session command failed: {detail}")
     return result.stdout.decode("utf-8", errors="replace")
 

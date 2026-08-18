@@ -90,7 +90,7 @@ from clio_relay.cluster_config import (
     open_private_configuration_windows_descriptor,
     release_private_configuration_windows_parent_guard,
 )
-from clio_relay.cluster_probe import probe_cluster_runtime
+from clio_relay.cluster_probe import pinned_runtime_present, probe_cluster_runtime
 from clio_relay.config import RelaySettings
 from clio_relay.deployment import render_endpoint_user_service, write_endpoint_user_service
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
@@ -3478,11 +3478,12 @@ def cluster_bootstrap(
             )
             with recorder.check(
                 "cluster.bootstrap.runtime-pin",
-                "re-point the cluster registry at the runtime bootstrap produced",
+                "repair the cluster registry pin only when it is proven broken",
             ) as pin_evidence:
                 pin_reconciliation = reconcile_cluster_runtime_pin(
                     cluster=cluster,
                     registry_path=default_registry_path(),
+                    pinned_runtime_present=pinned_runtime_present(definition),
                 )
                 pin_evidence.append(
                     EvidenceReference(

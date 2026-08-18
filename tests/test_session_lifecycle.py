@@ -4866,6 +4866,70 @@ def test_durable_start_never_launders_a_dead_pointer_into_starting(
         )
 
 
+def test_poll_path_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The REAL poll path must not turn a dead pin into a retryable 'starting'.
+
+    Review F2: status_remote_session_start catches only the deadline, so the
+    typed RemoteExecutableMissingError raised by _ssh_script fell through to
+    query_remote_session_start's blanket ``except RelayError``, which rewrites
+    ANY failure as start_state="starting", start_retryable=True. That
+    reproduces the exact retry-forever bug the typed-127 work claims to remove:
+    every retry re-executes the same missing binary.
+
+    Drives the real _ssh_script (via the bounded-command seam), NOT a
+    monkeypatched status function -- the earlier durable-start test stubbed
+    status_remote_session_start and so could never see this.
+    """
+    definition, _release, plan = _durable_start_plan()
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_lifecycle.query_remote_session_start(definition=definition, plan=plan)
+
+
+def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch) -> None:
+    """Review F3: the stdin transport needs the same typed 127 discrimination.
+
+    Its cleanup/report callers otherwise still receive an untyped RelayError
+    carrying a raw shell blob when the pin is dead.
+    """
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+            input_bytes=b"{}",
+            input_limit=1024,
+            stdout_limit=1024,
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert captured.value.exit_status == 127
+
+
 def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> None:
     """The transport deadline must be discriminable by type, never by message text."""
     assert issubclass(
