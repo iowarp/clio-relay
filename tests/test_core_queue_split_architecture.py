@@ -31,10 +31,12 @@ from clio_relay import (
     queue_order_index,
     queue_owner_session_lifecycle,
     queue_owner_session_records,
+    queue_progress,
     queue_scheduler_cancel_records,
     queue_scheduler_cancel_state,
     queue_store_read,
     queue_store_write,
+    queue_tasks,
 )
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -48,7 +50,11 @@ from clio_relay.models import (
     InputArtifactSpec,
     JarvisRunSpec,
     JobKind,
+    JobState,
+    ProgressRecord,
     RelayJob,
+    RelayMcpTaskProjection,
+    RelayMcpTaskRecord,
     UsedArtifactRef,
     deterministic_input_artifact_id,
     new_id,
@@ -84,6 +90,8 @@ _OWNER_RANK = {
     "queue_scheduler_cancel_state": 21,
     "queue_jobs": 22,
     "queue_input_ingest": 23,
+    "queue_progress": 24,
+    "queue_tasks": 25,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -110,6 +118,8 @@ _OWNER_BUDGETS = {
     "queue_scheduler_cancel_state": 450,
     "queue_jobs": 800,
     "queue_input_ingest": 715,
+    "queue_progress": 190,
+    "queue_tasks": 420,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -182,6 +192,16 @@ class _JobsWriteLookupSabotage(RuntimeError):
 
 class _InputIngestWriteJobLookupSabotage(RuntimeError):
     """Raised only when CQ13's begin/fail/complete paths reach queue_jobs.write_job."""
+
+
+class _PutMcpTaskCompositionSabotage(RuntimeError):
+    """Raised only when ``ClioCoreQueue.put_mcp_task`` resolves through the
+    inherited ``QueueTasksMixin`` body (the CQ14 owner-composition proof --
+    not a collaborator store-lookup sabotage)."""
+
+
+class _ProgressIndexStateLookupSabotage(RuntimeError):
+    """Raised only when CQ14 latest-progress reaches its index-state owner."""
 
 
 @dataclass(frozen=True)
@@ -1188,6 +1208,86 @@ def test_cq13_complete_input_ingest_uses_the_write_job_lookup(
     assert (
         ClioCoreQueue.complete_input_ingest
         is queue_input_ingest.QueueInputIngestMixin.complete_input_ingest
+    )
+
+
+def test_cq14_put_mcp_task_resolves_through_the_queue_tasks_mixin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """``put_mcp_task`` must be the inherited ``QueueTasksMixin`` method, not a
+    facade-local body (design §5/§9 row: "Patch ``queue_tasks.QueueTasksMixin.
+    put_mcp_task`` and assert ``ClioCoreQueue`` resolves that inherited lookup
+    before wiring; FastMCP tests are acceptance only"). Unlike every other
+    sabotage test in this file, this one patches the owner method itself
+    rather than a collaborator store lookup -- it is the composition proof,
+    demonstrably red while ``ClioCoreQueue`` still defines and executes the
+    old facade body (patching ``QueueTasksMixin.put_mcp_task`` has no effect
+    on a name resolved directly on ``ClioCoreQueue``'s own class dict), green
+    only after that body is deleted and the mixin is composed into the MRO.
+    """
+    task_id = new_id("mcp_task")
+    task = RelayMcpTaskRecord(
+        task_id=task_id,
+        job_id=task_id,
+        state=JobState.QUEUED,
+        projection=RelayMcpTaskProjection(
+            tool_name="relay_submit_agent",
+            profile="user",
+            arguments={},
+            initial_result={"job_id": task_id, "state": "queued", "terminal": False},
+        ),
+    )
+
+    def sabotage(self: object, submitted: RelayMcpTaskRecord) -> RelayMcpTaskRecord:
+        del self, submitted
+        raise _PutMcpTaskCompositionSabotage("queue_tasks.QueueTasksMixin.put_mcp_task engaged")
+
+    monkeypatch.setattr(queue_tasks.QueueTasksMixin, "put_mcp_task", sabotage)
+    queue = ClioCoreQueue(tmp_path)
+
+    with pytest.raises(
+        _PutMcpTaskCompositionSabotage,
+        match="queue_tasks.QueueTasksMixin.put_mcp_task engaged",
+    ):
+        queue.put_mcp_task(task)
+
+    assert ClioCoreQueue.put_mcp_task is queue_tasks.QueueTasksMixin.put_mcp_task
+
+
+def test_cq14_latest_job_progress_uses_the_index_state_lookup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Latest-progress resolution must resolve its indexed count through the
+    CQ14 owner seam onto the CQ5 index-state owner (standard store-lookup
+    sabotage, isolated-namespace pattern -- design row: "the standard
+    store-lookup sabotage for queue_progress")."""
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="cluster-cq14",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="cq14-progress",
+        )
+    )
+    queue.append_progress(ProgressRecord(job_id=job.job_id, label="cq14-progress"))
+
+    def sabotage(*_args: object, **_kwargs: object) -> int:
+        raise _ProgressIndexStateLookupSabotage("queue_progress index-state lookup engaged")
+
+    isolated_index_state = SimpleNamespace(**{**vars(queue_index_state), "index_integer": sabotage})
+    monkeypatch.setattr(queue_progress, "queue_index_state", isolated_index_state)
+
+    with pytest.raises(
+        _ProgressIndexStateLookupSabotage,
+        match="queue_progress index-state lookup engaged",
+    ):
+        queue.latest_job_progress(job.job_id)
+
+    assert (
+        ClioCoreQueue.latest_job_progress is queue_progress.QueueProgressMixin.latest_job_progress
     )
 
 

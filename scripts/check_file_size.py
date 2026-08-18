@@ -176,7 +176,22 @@ RATCHET_BASELINE: dict[str, int] = {
     # one-caller quota-consumption predicate,
     # _input_ingest_consumes_quota_unlocked, carries no such constraint and
     # moved as designed. Net: 8991 -> 8430.
-    "src/clio_relay/core_queue.py": 8430,
+    # #231 CQ14: move the task and MCP task-projection CRUD (append_task,
+    # put_mcp_task/update_mcp_task_projection/get_mcp_task -- the durable
+    # boundary the merged #234 admission/park machinery persists through,
+    # unmoved itself per design §5 -- update_task_state/_metadata, list/page/
+    # scan_job_tasks, get_task) and structured job-progress CRUD
+    # (append_progress, list/page_progress, latest_job_progress), plus their
+    # unlocked write/derived-index primitives and the module-level
+    # _canonical_mcp_task_arguments identity-compare helper, into the new
+    # queue_tasks.py and queue_progress.py owners. No typed deviation: every
+    # collaborator (queue_jobs.get_job, queue_events.append_event, every
+    # queue_order_index job-index primitive) is an already-landed
+    # earlier-ranked owner, and _sync_scheduler_source_unlocked/
+    # _job_record_path/_write_transition_intent_unlocked/
+    # _recover_pending_transitions_unlocked stay facade-resident (still
+    # un-extracted, self-called as before). Net: 8430 -> 8009.
+    "src/clio_relay/core_queue.py": 8009,
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
