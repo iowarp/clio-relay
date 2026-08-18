@@ -86,11 +86,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # surface. No deletion offsets it -- this is the genuinely new
     # capability-by-negotiation logic the doctrine comment on #242 describes,
     # not a fixable regression. A justified, minimal ratchet-up.
-    "src/clio_relay/bootstrap.py": 8858,
+    # #158: +25 net lines -- the JARVIS resource-graph activation check now
+    # verifies what JARVIS actually attests (that the SOURCE it read is our
+    # packaged builtin, carrying the digest it reported) instead of demanding
+    # the ACTIVATED file be a byte copy of it. JARVIS normalizes the graph while
+    # activating it, so byte equality failed every fresh bootstrap.
+    "src/clio_relay/bootstrap.py": 8883,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     "src/clio_relay/bootstrap_journal.py": 1534,
-    "src/clio_relay/bootstrap_reconcile.py": 4462,
+    # #158: +6 net lines -- the receipt binds that activation evidence was
+    # recorded, rather than equating the activated digest with the packaged
+    # source digest, which JARVIS's normalization makes legitimately unequal.
+    "src/clio_relay/bootstrap_reconcile.py": 4468,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.

@@ -2947,12 +2947,50 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
     assert isinstance(service, dict)
     assert service["pending_install"] is True
 
-    with pytest.raises(ValueError, match="packaged source digest"):
+    # JARVIS normalizes the graph while activating it (expands ${USER}, fills
+    # derived fields), so the activated digest legitimately differs from the
+    # packaged source digest. Requiring equality here failed every fresh
+    # bootstrap on a real cluster (#158); a differing source digest must now be
+    # accepted, because that is what a correct activation actually looks like.
+    accepted = make_bootstrap_receipt(
+        invocation_id="bootstrap_normalized_builtin",
+        desired=desired,
+        outcome="full",
+        inspection=inspection,
+        started_at=datetime.now(UTC),
+        transaction=None,
+        previous_generation=None,
+        active_generation=desired.fingerprint,
+        components=components,
+        jarvis_init_action="initialized",
+        jarvis_init_duration_seconds=1.0,
+        jarvis_graph_action="loaded",
+        jarvis_graph_duration_seconds=1.0,
+        jarvis_builtin_result={
+            **loaded_builtin_result,
+            "source_sha256": "e" * 64,
+        },
+    )
+    accepted_graph = accepted["jarvis_resource_graph"]
+    assert isinstance(accepted_graph, dict)
+    accepted_builtin = accepted_graph["builtin_result"]
+    assert isinstance(accepted_builtin, dict)
+    assert accepted_builtin["source_sha256"] == "e" * 64
+
+    # What the receipt DOES require is that activation evidence was recorded.
+    graphless = inspection.model_copy(
+        update={
+            "jarvis_state": inspection.jarvis_state.model_copy(
+                update={"resource_graph_sha256": None}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="activated resource graph digest"):
         make_bootstrap_receipt(
-            invocation_id="bootstrap_mismatched_builtin",
+            invocation_id="bootstrap_unrecorded_activation",
             desired=desired,
             outcome="full",
-            inspection=inspection,
+            inspection=graphless,
             started_at=datetime.now(UTC),
             transaction=None,
             previous_generation=None,
@@ -2962,10 +3000,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
             jarvis_init_duration_seconds=1.0,
             jarvis_graph_action="loaded",
             jarvis_graph_duration_seconds=1.0,
-            jarvis_builtin_result={
-                **loaded_builtin_result,
-                "source_sha256": "e" * 64,
-            },
+            jarvis_builtin_result=loaded_builtin_result,
         )
 
     unavailable: dict[str, object] = {

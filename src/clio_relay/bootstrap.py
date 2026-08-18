@@ -3413,10 +3413,16 @@ def _validate_bootstrap_receipt(
         or not isinstance(repository_update.get("removed_previous_managed_repos"), list)
     ):
         raise RelayError("bootstrap JARVIS repository hashes do not bind preservation evidence")
-    if jarvis_graph_action == "loaded" and cast(dict[str, object], jarvis_builtin_result).get(
-        "source_sha256"
-    ) != after_state.get("resource_graph_sha256"):
-        raise RelayError("loaded JARVIS graph does not match its packaged source digest")
+    if jarvis_graph_action == "loaded" and not _is_sha256_value(
+        after_state.get("resource_graph_sha256")
+    ):
+        # The activated graph is JARVIS's normalized derivative of the packaged
+        # builtin, so its digest legitimately differs from source_sha256 and
+        # cannot be bound by equality here (#158). Source identity is proven
+        # remotely, where the packaged file actually lives -- the cluster-side
+        # step hashes the source JARVIS names and fails closed on a mismatch.
+        # What the host binds is that activation evidence was recorded at all.
+        raise RelayError("loaded JARVIS graph did not record its activated resource graph digest")
     if outcome == "noop_verified":
         if (
             any(action != "reused" for action in component_actions.values())
@@ -7982,6 +7988,27 @@ action = result["action"]
 if action == "loaded":
     source_sha256 = result["source_sha256"]
     assert isinstance(source_sha256, str)
+    # JARVIS NORMALIZES the graph as it activates it -- it expands the USER
+    # variable, fills derived fields such as 1m_seqwrite_bw and needs_root, and
+    # rewrites shared -- so the activated file is a DERIVATIVE of the builtin,
+    # never a byte copy of it. Requiring byte equality here made every fresh
+    # bootstrap fail with "does not match builtin evidence" (#158).
+    #
+    # Verify instead exactly what jarvis attests: that the source it read is
+    # the packaged builtin carrying the digest it reported. That is the real
+    # integrity property -- the graph came from our packaged profile and not
+    # from somewhere else on the host. The activated file's own digest is
+    # recorded as activation evidence rather than being asserted equal to it.
+    source_path = Path(str(result["source"]))
+    source_before = source_path.lstat()
+    if not stat.S_ISREG(source_before.st_mode) or not 0 < source_before.st_size <= 64 * 1024 * 1024:
+        raise SystemExit("packaged JARVIS resource graph source is not one bounded regular file")
+    source_digest = hashlib.sha256()
+    with source_path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            source_digest.update(chunk)
+    if source_digest.hexdigest() != source_sha256:
+        raise SystemExit("packaged JARVIS resource graph source does not match builtin evidence")
     graph_before = active_graph_path.lstat()
     if not stat.S_ISREG(graph_before.st_mode) or not 0 < graph_before.st_size <= 64 * 1024 * 1024:
         raise SystemExit("activated JARVIS resource graph is not one bounded regular file")
@@ -8002,8 +8029,6 @@ if action == "loaded":
         graph_after.st_mtime_ns,
     ):
         raise SystemExit("activated JARVIS resource graph changed during validation")
-    if digest.hexdigest() != source_sha256:
-        raise SystemExit("activated JARVIS resource graph does not match builtin evidence")
 print(action)
 __CLIO_RELAY_JARVIS_BUILTIN_RESULT__
   )"

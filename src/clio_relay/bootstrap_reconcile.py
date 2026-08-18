@@ -2282,12 +2282,18 @@ def make_bootstrap_receipt(
         expected_builtin_action = "loaded" if jarvis_graph_action == "loaded" else "unavailable"
         if jarvis_builtin_result["action"] != expected_builtin_action:
             raise ValueError("JARVIS graph action does not match builtin activation evidence")
-        if (
-            jarvis_graph_action == "loaded"
-            and jarvis_builtin_result["source_sha256"]
-            != inspection.jarvis_state.resource_graph_sha256
+        if jarvis_graph_action == "loaded" and not _is_sha256(
+            inspection.jarvis_state.resource_graph_sha256
         ):
-            raise ValueError("loaded JARVIS graph does not match the packaged source digest")
+            # JARVIS normalizes the graph while activating it, so the activated
+            # file is a derivative of the packaged builtin and its digest
+            # legitimately differs from source_sha256 -- requiring equality
+            # here failed every fresh bootstrap (#158). Source identity is
+            # proven cluster-side, against the packaged file itself; the
+            # receipt binds that activation evidence was recorded.
+            raise ValueError(
+                "loaded JARVIS graph did not record an activated resource graph digest"
+            )
         if jarvis_graph_action == "built" and not desired.allow_jarvis_resource_graph_build:
             raise ValueError("JARVIS graph build was not enabled by the desired state")
     before = jarvis_state_before or inspection.jarvis_state
