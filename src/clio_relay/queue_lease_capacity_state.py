@@ -84,19 +84,6 @@ class QueueLeaseCapacityStateMixin:
         def _require_index_migration_complete(self) -> None: ...
         def _recover_pending_transitions_unlocked(self) -> list[RelayJob]: ...
         def _lease_index_identity(self, lease: Lease, *, job: RelayJob) -> _LeaseIndexIdentity: ...
-        def _scan_lease_scope_refs(
-            self,
-            directory: Path,
-            *,
-            scope: tuple[str, ...],
-            limit: int,
-            label: str,
-        ) -> tuple[list[tuple[str, str]], bool]: ...
-        def _scan_expiry_refs(self, *, limit: int) -> tuple[list[_LeaseExpiryReference], bool]: ...
-        def _scan_lease_identity_refs(
-            self, *, limit: int
-        ) -> tuple[list[tuple[str, str]], bool]: ...
-        def _lease_cluster_kind_directory(self, cluster: str, kind: JobKind) -> Path: ...
 
     def _lease_capacity_directory(self) -> Path:
         return self._storage_root / "lease_capacity"
@@ -366,11 +353,6 @@ class QueueLeaseCapacityStateMixin:
             indexed.append((lease, job, identity))
         return indexed, queue_lease_records.normalize_lease_capacity_counts(counts)
 
-    def _active_lease_counts_by_kind(self, *, cluster: str) -> dict[JobKind, int]:
-        """Count structurally validated refs without opening global lease JSON."""
-        counts, _global_total = self._lease_capacity_snapshot(cluster=cluster)
-        return counts
-
     def lease_admission_capacity_snapshot(
         self,
         *,
@@ -397,78 +379,3 @@ class QueueLeaseCapacityStateMixin:
             queue_lease_records.lease_cluster_token(cluster), {}
         )
         return dict(counts), pair.aggregate.global_live_leases
-
-    def _exact_lease_capacity_snapshot(
-        self,
-        *,
-        cluster: str,
-        expiry_refs: list[_LeaseExpiryReference] | None = None,
-    ) -> tuple[dict[JobKind, int], int]:
-        """Audit exact expiry, identity, and cluster-kind operational indexes."""
-        if expiry_refs is None:
-            expiry_refs, expiry_truncated = self._scan_expiry_refs(
-                limit=queue_layout.MAX_LIVE_LEASE_RECORDS,
-            )
-            if expiry_truncated:
-                raise QueueConflictError(
-                    "active lease population exceeded its safety bound of "
-                    f"{queue_layout.MAX_LIVE_LEASE_RECORDS} records"
-                )
-        expiry_pairs = [
-            (lease_token, identity_token) for *_, lease_token, identity_token in expiry_refs
-        ]
-        if len(set(expiry_pairs)) != len(expiry_pairs) or len(
-            {lease_token for lease_token, _identity_token in expiry_pairs}
-        ) != len(expiry_pairs):
-            raise QueueConflictError("lease expiry index contains duplicate identities")
-        identity_refs, identity_truncated = self._scan_lease_identity_refs(
-            limit=queue_layout.MAX_LIVE_LEASE_RECORDS,
-        )
-        if identity_truncated:
-            raise QueueConflictError(
-                "active lease population exceeded its safety bound of "
-                f"{queue_layout.MAX_LIVE_LEASE_RECORDS} records"
-            )
-        if set(identity_refs) != set(expiry_pairs):
-            raise QueueConflictError("lease identity and expiry indexes disagree")
-        cluster_token = queue_lease_records.lease_cluster_token(cluster)
-        expected_by_kind: dict[JobKind, set[tuple[str, str]]] = {kind: set() for kind in JobKind}
-        for (
-            _expires,
-            indexed_cluster,
-            kind,
-            _endpoint_token,
-            _job_token,
-            lease_token,
-            identity_token,
-        ) in expiry_refs:
-            if indexed_cluster == cluster_token:
-                expected_by_kind[kind].add((lease_token, identity_token))
-        counts: dict[JobKind, int] = {}
-        total = 0
-        for kind in JobKind:
-            lease_refs, truncated = self._scan_lease_scope_refs(
-                self._lease_cluster_kind_directory(cluster, kind),
-                scope=("cluster-kind", cluster_token, kind.value),
-                limit=queue_layout.MAX_LIVE_LEASE_RECORDS,
-                label=f"lease cluster-kind index {cluster}/{kind.value}",
-            )
-            if truncated:
-                raise QueueConflictError(
-                    "active lease population exceeded its safety bound of "
-                    f"{queue_layout.MAX_LIVE_LEASE_RECORDS} records"
-                )
-            observed = set(lease_refs)
-            if observed != expected_by_kind[kind]:
-                raise QueueConflictError(
-                    f"lease cluster-kind and expiry indexes disagree: {cluster}/{kind.value}"
-                )
-            if observed:
-                counts[kind] = len(observed)
-                total += len(observed)
-        if total > queue_layout.MAX_LIVE_LEASE_RECORDS:
-            raise QueueConflictError(
-                "active lease population exceeded its safety bound of "
-                f"{queue_layout.MAX_LIVE_LEASE_RECORDS} records"
-            )
-        return counts, len(expiry_refs)

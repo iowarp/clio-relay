@@ -11,11 +11,13 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
-from clio_relay import queue_gc_storage, queue_owner_session_records, queue_store_write
-from clio_relay.core_queue import (
-    RECORD_FAMILY_MAX_BYTES,
-    ClioCoreQueue,
+from clio_relay import (
+    queue_gc_storage,
+    queue_layout,
+    queue_owner_session_records,
+    queue_store_write,
 )
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
     ArtifactRef,
@@ -1060,7 +1062,7 @@ def test_legacy_unversioned_jobs_require_exact_immutable_closure_coverage(
 
 def test_core_record_caps_reject_oversized_writes_and_forged_reads(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
-    oversized = "x" * (RECORD_FAMILY_MAX_BYTES["jobs"] + 1)
+    oversized = "x" * (queue_layout.RECORD_FAMILY_MAX_BYTES["jobs"] + 1)
     with pytest.raises(QueueConflictError, match="jobs record exceeds"):
         queue.submit_job(_intent("oversized-write", metadata={"oversized": oversized}))
 
@@ -1068,7 +1070,7 @@ def test_core_record_caps_reject_oversized_writes_and_forged_reads(tmp_path: Pat
     del intent
     job_path = tmp_path / "jobs" / f"{job.job_id}.json"
     with job_path.open("wb") as stream:
-        stream.write(b"{" + b" " * RECORD_FAMILY_MAX_BYTES["jobs"] + b"}")
+        stream.write(b"{" + b" " * queue_layout.RECORD_FAMILY_MAX_BYTES["jobs"] + b"}")
     with pytest.raises(QueueConflictError, match="jobs record exceeds"):
         queue.get_job(job.job_id)
 

@@ -10,8 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_artifact_lineage, queue_jobs
+from clio_relay import queue_artifact_lineage, queue_idempotency, queue_jobs
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -294,7 +293,7 @@ def test_empty_lineage_preserves_pre_upgrade_idempotency_digest() -> None:
     ).hexdigest()
 
     assert (
-        core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             job
         )
         == expected

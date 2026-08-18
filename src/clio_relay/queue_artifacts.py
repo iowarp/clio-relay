@@ -15,8 +15,6 @@ from clio_relay import (
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import ArtifactRef, ArtifactUseProvenance, RelayEvent, RelayJob, TransformRef
 
-_require_durable_record_id = queue_layout.QueueLayout.require_durable_record_id
-
 
 def artifact_with_sequence(artifact: ArtifactRef, sequence: int) -> ArtifactRef:
     """Return an indexed artifact with relay order mirrored into CLIO provenance."""
@@ -63,8 +61,10 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def append_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
         """Index an artifact reference."""
-        _require_durable_record_id(artifact.artifact_id, field="artifact_id")
-        _require_durable_record_id(artifact.job_id, field="job_id")
+        queue_layout.QueueLayout.require_durable_record_id(
+            artifact.artifact_id, field="artifact_id"
+        )
+        queue_layout.QueueLayout.require_durable_record_id(artifact.job_id, field="job_id")
         self._store_adapter.initialize()
         with self._lock:
             root = self._storage_root
@@ -98,7 +98,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def list_artifacts(self, job_id: str) -> list[ArtifactRef]:
         """Return artifact refs for a job."""
-        job_id = _require_durable_record_id(job_id, field="job_id")
+        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
         self._store_adapter.initialize()
         root = self._storage_root
         key = queue_layout.QueueLayout.durable_key(job_id)
@@ -128,7 +128,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
         limit: int = 100,
     ) -> tuple[list[ArtifactRef], int | None, int]:
         """Read one stable artifact page from the per-job sequence index."""
-        job_id = _require_durable_record_id(job_id, field="job_id")
+        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
         return self._read_ordered_job_page(
             job_id,
             family="artifact",
@@ -140,7 +140,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def job_artifact_count(self, job_id: str) -> tuple[int, bool]:
         """Return the exact indexed artifact count or a bounded legacy lower bound."""
-        job_id = _require_durable_record_id(job_id, field="job_id")
+        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
         index = queue_order_index.read_job_index(self._store_adapter, job_id)
         if index is not None:
             return queue_index_state.index_integer(index, "artifact_count"), False
@@ -158,7 +158,9 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def record_transform_ref(self, transform: TransformRef) -> TransformRef:
         """Persist one immutable transform independently from its used-edge count."""
-        job_id = _require_durable_record_id(transform.job_id, field="job_id")
+        job_id = queue_layout.QueueLayout.require_durable_record_id(
+            transform.job_id, field="job_id"
+        )
         self._store_adapter.initialize()
         path = self._storage_root / "transforms" / f"{job_id}.json"
         with self._lock:
@@ -174,7 +176,7 @@ class QueueArtifactsMixin(queue_order_index.QueueOrderIndexMixin):
 
     def get_transform_ref(self, job_id: str) -> TransformRef | None:
         """Return the nullable immutable transform associated with one retained job."""
-        job_id = _require_durable_record_id(job_id, field="job_id")
+        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
         self._store_adapter.initialize()
         queue_store_read.read_required_job(self._storage_root, job_id)
         record = self._store_adapter.read_optional(

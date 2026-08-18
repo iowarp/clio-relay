@@ -15,7 +15,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from clio_relay import mcp_server as mcp_server_module
 from clio_relay import queue_gateway_indexes, queue_layout, queue_store_read
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.identifiers import (
     DURABLE_RECORD_ID_MAX_BYTES,
@@ -43,6 +43,7 @@ from clio_relay.models import (
     SchedulerCancelPending,
     TaskTimelineEvent,
 )
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.session_lifecycle import RemoteSessionStateEvidence, SessionLifecycleReport
 from clio_relay.validation_report import CleanupEvidence
 
@@ -603,6 +604,44 @@ def test_runtime_canonical_read_delegates_to_the_layout_owner(
             path,
             RelayJob,
         )
+
+
+def test_migrate_indexes_batch_delegates_canonical_read_to_the_layout_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N16 (closing-round review): the test above only proves the module
+    function ``queue_store_read.read_canonical_record`` resolves validation
+    through the CQ2 owner seam when called directly -- it never proves a
+    real production caller reaches it. ``migrate_indexes_batch`` owns all
+    six real ``read_canonical_record`` call sites (``queue_index_
+    migration.py``); this restores the same sabotage through it.
+    """
+
+    class CanonicalAccessSabotage(RuntimeError):
+        pass
+
+    for family in ("jobs", "tasks", "leases", "artifacts", "progress", "events"):
+        (tmp_path / "core" / family).mkdir(parents=True, exist_ok=True)
+    job = RelayJob(
+        job_id="job_migration_layout_owner",
+        cluster="target",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="migration-layout-owner",
+    )
+    (tmp_path / "core" / "jobs" / f"{job.job_id}.json").write_text(
+        job.model_dump_json(), encoding="utf-8"
+    )
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise CanonicalAccessSabotage
+
+    monkeypatch.setattr(queue_layout, "validate_canonical_access", sabotage)
+
+    with pytest.raises(CanonicalAccessSabotage):
+        queue.migrate_indexes_batch(batch_size=1)
 
 
 def test_legacy_canonical_reparse_family_fails_before_writes(tmp_path: Path) -> None:

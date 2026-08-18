@@ -28,10 +28,12 @@ by name (``self._assert_input_ingest_quota_unlocked(...)``, stubbed under
 MRO exactly like the other still-facade-resident helpers stubbed here.
 
 Since none of this owner's own bodies call ``_is_sha256_digest``, the design
-doc §9.6 ledger's ``queue_jobs``/``queue_artifact_lineage`` duplication is
-intentionally *not* touched by this slice -- consolidating it still needs
-``queue_job_gc`` (CQ18, not yet landed) to exist as the real shared owner,
-per that same ledger note.
+doc §9.6 ledger's ``queue_jobs``/``queue_artifact_lineage`` duplication was
+intentionally *not* touched by this slice. ``queue_job_gc`` (CQ18) has since
+landed and resolved it as ledger §13.3 records: six per-owner holders plus
+one consumer (``queue_idempotency``, reaching into ``queue_lease_records``'s
+copy), not a shared import -- per-owner duplication of this six-line pure
+predicate, not an oversight.
 """
 
 from __future__ import annotations

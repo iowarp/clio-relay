@@ -10,10 +10,8 @@ from typing import Any, cast
 
 import pytest
 
+from clio_relay import queue_layout
 from clio_relay.core_queue import (
-    LEASE_CAPACITY_AGGREGATE_SCHEMA,
-    LEASE_CAPACITY_AUDIT_SCHEMA,
-    MAX_LEASE_CAPACITY_RECORD_BYTES,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
@@ -176,7 +174,7 @@ def test_capacity_pair_corruption_fails_closed(
     elif corruption == "generation-mismatch":
         checkpoint_path.write_bytes(initial_checkpoint)
     elif corruption == "oversized":
-        aggregate_path.write_bytes(b"x" * (MAX_LEASE_CAPACITY_RECORD_BYTES + 1))
+        aggregate_path.write_bytes(b"x" * (queue_layout.MAX_LEASE_CAPACITY_RECORD_BYTES + 1))
     else:  # pragma: no cover - exhaustive parameter guard
         raise AssertionError(corruption)
 
@@ -184,7 +182,7 @@ def test_capacity_pair_corruption_fails_closed(
     with pytest.raises(QueueConflictError):
         restarted.lease_admission_capacity_snapshot(cluster=job.cluster)
     report = restarted.audit_lease_capacity()
-    assert report["schema_version"] == LEASE_CAPACITY_AUDIT_SCHEMA
+    assert report["schema_version"] == queue_layout.LEASE_CAPACITY_AUDIT_SCHEMA
     assert report["valid"] is False
 
 
@@ -286,10 +284,10 @@ def test_capacity_aggregate_supports_worst_case_sparse_scope_document(tmp_path: 
     )
     aggregate_path = queue.root / "lease_capacity" / "aggregate.json"
     aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
-    assert aggregate["schema_version"] == LEASE_CAPACITY_AGGREGATE_SCHEMA
+    assert aggregate["schema_version"] == queue_layout.LEASE_CAPACITY_AGGREGATE_SCHEMA
     assert aggregate["global_live_leases"] == MAX_LIVE_LEASE_RECORDS
     assert len(aggregate["cluster_kind_counts"]) == MAX_LIVE_LEASE_RECORDS
-    assert aggregate_path.stat().st_size < MAX_LEASE_CAPACITY_RECORD_BYTES
+    assert aggregate_path.stat().st_size < queue_layout.MAX_LEASE_CAPACITY_RECORD_BYTES
 
 
 def test_full_audit_matches_real_canonical_and_index_records(tmp_path: Path) -> None:

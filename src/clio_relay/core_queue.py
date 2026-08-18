@@ -41,7 +41,6 @@ from clio_relay import (
     queue_lease_capacity_audit,
     queue_lease_capacity_state,
     queue_lease_indexes,
-    queue_lease_records,
     queue_lease_recovery,
     queue_leases,
     queue_legacy_audit,
@@ -52,7 +51,6 @@ from clio_relay import (
     queue_owner_session_records,
     queue_progress,
     queue_scheduler_cancel_claims,
-    queue_scheduler_cancel_records,
     queue_scheduler_cancel_state,
     queue_startup,
     queue_store_lock,
@@ -82,95 +80,42 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 Record = TypeVar("Record", bound=BaseModel)
-_LeaseExpiryReference = queue_layout.LeaseExpiryReference
-INPUT_INGEST_ATTEMPT_METADATA_KEY = queue_layout.INPUT_INGEST_ATTEMPT_METADATA_KEY
-INPUT_INGEST_ATTEMPT_SCHEMA = queue_layout.INPUT_INGEST_ATTEMPT_SCHEMA
-INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY = queue_layout.INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY
-DEFAULT_INPUT_INGEST_ABANDONED_AFTER_SECONDS = (
-    queue_layout.DEFAULT_INPUT_INGEST_ABANDONED_AFTER_SECONDS
-)
-MAX_INPUT_INGEST_RECOVERY_BATCH = queue_layout.MAX_INPUT_INGEST_RECOVERY_BATCH
+
+# --- module-level re-exports with a real consumer (F5, closing-round review) ---
+#
+# The pre-review block re-exported 75 ``queue_layout``/``queue_store_lock``
+# names. An audit (docs/design/core-queue-split-2026-08.md CQ20-FA-01) found
+# 54 with zero consumers anywhere -- deleted outright -- and 11 with
+# test-only consumers, retargeted to their real owner module in the handful
+# of tests that used them (the alias added no value once nothing outside
+# this file's own body needed it). Every name below still has one: either
+# production code imports it directly from ``clio_relay.core_queue``, or
+# this file's own ``ClioCoreQueue``/``_QueueStoreAdapter`` body references it
+# unqualified. ``test_core_queue_split_architecture.py`` pins this set so a
+# dead re-export cannot re-accrete.
+
+# facade-internal: ClioCoreQueue.__init__'s lock_timeout_seconds default (below);
+# also imported directly by storage_runtime.py.
 DEFAULT_CORE_LOCK_TIMEOUT_SECONDS = queue_layout.DEFAULT_CORE_LOCK_TIMEOUT_SECONDS
-MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS = queue_layout.MIN_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
-MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS = queue_layout.MAX_SCHEDULER_CANCEL_CLAIM_LEASE_SECONDS
-ATOMIC_REPLACE_ATTEMPTS = queue_layout.ATOMIC_REPLACE_ATTEMPTS
-ATOMIC_REPLACE_RETRY_SECONDS = queue_layout.ATOMIC_REPLACE_RETRY_SECONDS
-WRITE_STAGING_FAMILY = queue_layout.WRITE_STAGING_FAMILY
-WRITE_STAGING_MAX_LEFTOVERS = queue_layout.WRITE_STAGING_MAX_LEFTOVERS
-OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS = queue_layout.OWNER_SESSION_CLOSURE_WRITE_ATTEMPTS
-JOB_INDEX_SCHEMA = queue_layout.JOB_INDEX_SCHEMA
-INDEX_MIGRATION_SCHEMA = queue_layout.INDEX_MIGRATION_SCHEMA
-LEASE_OPERATIONAL_INDEX_SCHEMA = queue_layout.LEASE_OPERATIONAL_INDEX_SCHEMA
-LEASE_CAPACITY_AGGREGATE_SCHEMA = queue_layout.LEASE_CAPACITY_AGGREGATE_SCHEMA
-LEASE_CAPACITY_CHECKPOINT_SCHEMA = queue_layout.LEASE_CAPACITY_CHECKPOINT_SCHEMA
-LEASE_CAPACITY_AUDIT_SCHEMA = queue_layout.LEASE_CAPACITY_AUDIT_SCHEMA
+# production consumer: http_api.py.
+INPUT_INGEST_ATTEMPT_METADATA_KEY = queue_layout.INPUT_INGEST_ATTEMPT_METADATA_KEY
+# production consumer: http_api.py.
+INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY = queue_layout.INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY
+# production consumer: storage_runtime.py.
+MAX_INPUT_INGEST_RECOVERY_BATCH = queue_layout.MAX_INPUT_INGEST_RECOVERY_BATCH
+# production consumer: endpoint.py.
 DEFAULT_EXACT_RECORD_LIMIT = queue_layout.DEFAULT_EXACT_RECORD_LIMIT
+# facade-internal: this file's owner-session input-ingest quota scan bound (below);
+# also imported directly by storage_runtime.py.
 MAX_ACTIVE_JOB_RECORDS = queue_layout.MAX_ACTIVE_JOB_RECORDS
+# production consumer: queue_management.py, storage_runtime.py.
 MAX_LIVE_LEASE_RECORDS = queue_layout.MAX_LIVE_LEASE_RECORDS
-MAX_LEASE_CAPACITY_SCOPES = queue_layout.MAX_LEASE_CAPACITY_SCOPES
-MAX_LEASE_CAPACITY_RECORD_BYTES = queue_layout.MAX_LEASE_CAPACITY_RECORD_BYTES
-MAX_BOUNDED_SCAN_RECORDS = queue_layout.MAX_BOUNDED_SCAN_RECORDS
-MAX_GATEWAY_INDEX_RECORDS = queue_layout.MAX_GATEWAY_INDEX_RECORDS
-MAX_SCHEDULER_METADATA_RECORDS = queue_layout.MAX_SCHEDULER_METADATA_RECORDS
-MAX_TRANSITION_INTENT_RECORDS = queue_layout.MAX_TRANSITION_INTENT_RECORDS
-MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS = queue_layout.MAX_JARVIS_PACKAGE_INPUT_CONTRACT_RECORDS
-MAX_JARVIS_PIPELINE_INPUT_BINDING_RECORDS = queue_layout.MAX_JARVIS_PIPELINE_INPUT_BINDING_RECORDS
-MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS = queue_layout.MAX_JARVIS_PIPELINE_INPUT_LINEAGE_RECORDS
-MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS = queue_layout.MAX_JARVIS_RUN_INPUT_MANIFEST_RECORDS
-MAX_ARTIFACT_USES_PER_JOB = queue_layout.MAX_ARTIFACT_USES_PER_JOB
-MAX_ARTIFACT_CONSUMERS = queue_layout.MAX_ARTIFACT_CONSUMERS
-ARTIFACT_USER_CURSOR_PREFIX = queue_layout.ARTIFACT_USER_CURSOR_PREFIX
-ARTIFACT_USER_CURSOR_DIGITS = queue_layout.ARTIFACT_USER_CURSOR_DIGITS
-ENDPOINT_FRESH_BUCKET_SECONDS = queue_layout.ENDPOINT_FRESH_BUCKET_SECONDS
+# production consumer: installation.py.
 MAX_ENDPOINT_FRESH_SECONDS = queue_layout.MAX_ENDPOINT_FRESH_SECONDS
-MAX_ENDPOINT_FRESH_CLUSTER_ROOTS = queue_layout.MAX_ENDPOINT_FRESH_CLUSTER_ROOTS
-ORDER_INDEX_SCHEMA = queue_layout.ORDER_INDEX_SCHEMA
-RETENTION_INDEX_SCHEMA = queue_layout.RETENTION_INDEX_SCHEMA
-GLOBAL_ORDER_INDEX_SCHEMA = queue_layout.GLOBAL_ORDER_INDEX_SCHEMA
-GC_TRASH_SCHEMA = queue_layout.GC_TRASH_SCHEMA
-MAX_GC_PURGE_DEPTH = queue_layout.MAX_GC_PURGE_DEPTH
-MAX_GC_PURGE_SCAN_ENTRIES = queue_layout.MAX_GC_PURGE_SCAN_ENTRIES
-DEFAULT_RECORD_MAX_BYTES = queue_layout.DEFAULT_RECORD_MAX_BYTES
-LEGACY_OUTPUT_MIGRATION_SCHEMA = queue_layout.LEGACY_OUTPUT_MIGRATION_SCHEMA
-LEGACY_OUTPUT_COMPATIBILITY_SCHEMA = queue_layout.LEGACY_OUTPUT_COMPATIBILITY_SCHEMA
-LEGACY_OUTPUT_RECEIPT_SCHEMA = queue_layout.LEGACY_OUTPUT_RECEIPT_SCHEMA
-LEGACY_RECORD_AUDIT_SCHEMA = queue_layout.LEGACY_RECORD_AUDIT_SCHEMA
-CANONICAL_RECORD_ACCESS_SCHEMA = queue_layout.CANONICAL_RECORD_ACCESS_SCHEMA
-QUEUE_LAYOUT_SCHEMA = queue_layout.QUEUE_LAYOUT_SCHEMA
-MAX_LEGACY_OUTPUT_RECORD_BYTES = queue_layout.MAX_LEGACY_OUTPUT_RECORD_BYTES
-MAX_LEGACY_OUTPUT_MIGRATION_BYTES = queue_layout.MAX_LEGACY_OUTPUT_MIGRATION_BYTES
-MAX_LEGACY_OUTPUT_MIGRATION_RECORDS = queue_layout.MAX_LEGACY_OUTPUT_MIGRATION_RECORDS
-MAX_LEGACY_EVENT_AUDIT_DIRECTORIES = queue_layout.MAX_LEGACY_EVENT_AUDIT_DIRECTORIES
-MAX_LEGACY_EVENT_AUDIT_RECORDS = queue_layout.MAX_LEGACY_EVENT_AUDIT_RECORDS
-RECORD_FAMILY_MAX_BYTES = queue_layout.RECORD_FAMILY_MAX_BYTES
-
-
-_TransientRecordReplacement = queue_layout.TransientRecordReplacement
-
-
-LegacyQueueStateError = queue_store_lock.LegacyQueueStateError
+# production consumer: storage_runtime.py.
 QueueSealRequiresExclusive = queue_store_lock.QueueSealRequiresExclusive
-_GC_TERMINAL_SCHEDULER_PHASES = queue_store_lock.GC_TERMINAL_SCHEDULER_PHASES
+# facade-internal: ClioCoreQueue.__init__ constructs self._lock from this.
 _FairBoundedFileLock = queue_store_lock.FairBoundedFileLock
-
-
-IdempotentSubmissionResolution = queue_idempotency.IdempotentSubmissionResolution
-_job_idempotency_digest = queue_idempotency._job_idempotency_digest  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-_idempotency_key_filename = queue_idempotency._idempotency_key_filename  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-
-SchedulerCancelIdentityRegistration = (
-    queue_scheduler_cancel_records.SchedulerCancelIdentityRegistration
-)
-SchedulerCancelAttemptClaim = queue_scheduler_cancel_records.SchedulerCancelAttemptClaim
-SchedulerCancelConfirmationClaim = queue_scheduler_cancel_records.SchedulerCancelConfirmationClaim
-_LeaseIndexIdentity = queue_lease_records.LeaseIndexIdentity
-_LeaseCapacityAggregate = queue_lease_records.LeaseCapacityAggregate
-_LeaseCapacityCheckpoint = queue_lease_records.LeaseCapacityCheckpoint
-_LeaseCapacityPair = queue_lease_records.LeaseCapacityPair
-
-
-_artifact_with_sequence = queue_artifacts.artifact_with_sequence
 
 
 class _QueueStoreAdapter:
@@ -206,7 +151,7 @@ class _QueueStoreAdapter:
 
     def read_json_document(self, path: Path) -> object:
         """Read one strict JSON document through the store-read owner."""
-        return self._queue._read_json_document(path)  # pyright: ignore[reportPrivateUsage]
+        return queue_store_read.read_json_document(path)
 
     def write(self, path: Path, record: BaseModel) -> None:
         """Persist one typed record through the store-write owner."""
@@ -214,7 +159,7 @@ class _QueueStoreAdapter:
 
     def write_json(self, path: Path, record: dict[str, object]) -> None:
         """Persist one JSON object through the store-write owner."""
-        self._queue._write_json(path, record)  # pyright: ignore[reportPrivateUsage]
+        queue_store_write.write_json(self.storage_root, path, record)
 
     def bounded_regular_json_count(
         self,
@@ -382,7 +327,7 @@ class ClioCoreQueue(
         file_count = 0
         total_bytes = 0
         for path in paths:
-            membership = self._read_json_file(path, OwnerSessionJobMembership)
+            membership = queue_store_read.read_json_file(path, OwnerSessionJobMembership)
             if (
                 membership.owner_session_id != owner_session_id
                 or membership.session_generation_id != session_generation_id
@@ -448,7 +393,8 @@ class ClioCoreQueue(
             kind, identity
         )
         path = self._storage_root / "transition_intents" / f"{kind}-{token}.json"
-        self._write_json(
+        queue_store_write.write_json(
+            self._storage_root,
             path,
             {
                 "schema_version": "clio-relay.queue-transition-intent.v1",
@@ -484,28 +430,41 @@ class ClioCoreQueue(
     def _job_record_path(self, family: str, job_id: str, record_id: str) -> Path:
         return self._layout.job_record_path(family, job_id, record_id)
 
-    # CQ20-FA-01 typed deviation: the methods below (plus ``_job_record_path``
-    # above) are the private "store adapter" family -- thin, single-call
-    # forwards to ``queue_store_read``/``queue_store_write`` module functions
-    # that stay facade-resident rather than moving to any one CQ20 owner.
-    # Two independent constraints force this, mirroring CQ19-TI-01's own
-    # "hub method, no clean hoist target" class:
-    #   * ``_write``/``_write_json``/``_read_optional``/``_read_json_document``
-    #     are called by ``_QueueStoreAdapter`` as ``self._queue._write(...)``
-    #     etc (ledger §9.5): routing through the *instance* rather than the
-    #     bare module function is what keeps ``monkeypatch.setattr(queue,
-    #     "_write", ...)`` (an established, widely used test seam) live. A
-    #     module-qualified rewrite would silently break every such patch.
-    #   * ``_job_record_path``/``_write``/``_write_json``/``_read_optional``/
-    #     ``_scan_many``/``_recover_pending_transitions_unlocked`` (above) are
-    #     each self-called from many already-landed owners spanning the full
-    #     rank range, and ``_scan_many`` is additionally inherited directly by
-    #     ``storage_runtime.StorageManagedQueue(ClioCoreQueue)`` -- a real
-    #     production subclass outside the queue-owner family entirely, not
-    #     just another mixin caller. None of these calls are owned by any
-    #     ``queue_*.py`` mixin, so they carry no architecture-guard edge
-    #     regardless of rank (same invisibility CQ19-ST-02 established for
-    #     ``initialize``).
+    # CQ20-FA-01 typed deviation, corrected N6 (closing-round review): the
+    # methods below (plus ``_job_record_path`` above) are the private "store
+    # adapter" family -- thin, single-call forwards to ``queue_store_read``/
+    # ``queue_store_write`` module functions that stay facade-resident rather
+    # than moving to any one CQ20 owner. This was originally justified as one
+    # "hub method, no clean hoist target" class (CQ19-TI-01's own), citing a
+    # caller count for every member; re-auditing the real call graph found
+    # two of those counts inflated (``_write_json`` claimed 20, had 2;
+    # ``_read_optional`` claimed 6, had 2) and neither ``_write_json`` nor
+    # ``_read_json_document`` had a live monkeypatch seam despite the shared
+    # claim that all four did -- so both are now dissolved (see
+    # ``queue_lease_indexes.py``/``queue_startup.py`` and
+    # ``_QueueStoreAdapter`` above for their direct ``queue_store_write``/
+    # ``queue_store_read`` call sites). What remains here has two
+    # *independent*, individually-sufficient reasons, restated honestly per
+    # member rather than as one blanket claim:
+    #   * ``_write``/``_read_optional`` are called by ``_QueueStoreAdapter``
+    #     as ``self._queue._write(...)`` etc (ledger §9.5): routing through
+    #     the *instance* rather than the bare module function is what keeps
+    #     real, live seams -- ``monkeypatch.setattr(queue, "_write", ...)``
+    #     in ``tests/test_endpoint.py``/``tests/test_input_staging.py``,
+    #     ``monkeypatch.setattr(queue, "_read_optional", ...)`` in
+    #     ``tests/test_input_staging.py`` -- working. A module-qualified
+    #     rewrite would silently break every such patch.
+    #   * ``_job_record_path`` (26 real external callers), ``_write`` (12),
+    #     ``_read_optional`` (2, but see above -- kept for the seam, not the
+    #     count), and ``_recover_pending_transitions_unlocked`` (44, already
+    #     CQ19-TI-01) are each self-called from many already-landed owners
+    #     spanning the full rank range. ``_scan_many`` is additionally
+    #     inherited directly by ``storage_runtime.StorageManagedQueue
+    #     (ClioCoreQueue)`` -- a real production subclass outside the
+    #     queue-owner family entirely, not just another mixin caller. None
+    #     of these calls are owned by any ``queue_*.py`` mixin, so they carry
+    #     no architecture-guard edge regardless of rank (same invisibility
+    #     CQ19-ST-02 established for ``initialize``).
     # Every other CQ19-era single-caller wrapper (``_storage_root_stat``,
     # ``_durable_key``, ``_require_durable_record_id``, ``_label_key``,
     # ``_require_safe_write_directory``, ``_purge_write_staging_unlocked``,
@@ -520,9 +479,6 @@ class ClioCoreQueue(
 
     def _write(self, path: Path, record: BaseModel) -> None:
         queue_store_write.write_model(self._storage_root, path, record)
-
-    def _write_json(self, path: Path, record: dict[str, object]) -> None:
-        queue_store_write.write_json(self._storage_root, path, record)
 
     def _read_optional(self, path: Path, model: type[Record]) -> Record | None:
         record = queue_store_read.read_optional(self._storage_root, path, model)
@@ -550,14 +506,6 @@ class ClioCoreQueue(
             limit=limit,
             identity_field=identity_field,
         )
-
-    @staticmethod
-    def _read_json_file(path: Path, model: type[Record]) -> Record:
-        return queue_store_read.read_json_file(path, model)
-
-    @staticmethod
-    def _read_json_document(path: Path) -> object:
-        return queue_store_read.read_json_document(path)
 
 
 def _is_canonical_event_path(storage_root: Path, path: Path, family: str) -> bool:

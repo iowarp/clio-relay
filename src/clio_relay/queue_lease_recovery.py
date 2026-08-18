@@ -52,7 +52,8 @@ _LeaseExpiryReference = queue_layout.LeaseExpiryReference
 
 
 def _stable_ref_token(*values: str) -> str:
-    return hashlib.sha256("\x00".join(values).encode("utf-8")).hexdigest()[:32]
+    encoded = "\x00".join(values).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:32]
 
 
 class QueueLeaseRecoveryMixin:

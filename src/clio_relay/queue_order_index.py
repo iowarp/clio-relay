@@ -24,7 +24,7 @@ from clio_relay.models import ProgressRecord, RelayJob
 logger = logging.getLogger(__name__)
 
 
-def _stable_ref_token(value: str) -> str:
+def _single_value_ref_token(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
@@ -112,7 +112,7 @@ def ensure_global(
     if not queue_layout.safe_global_record_id(record_id):
         raise QueueConflictError(f"unsafe global-order record id: {record_id!r}")
     root = store.storage_root / "global_order" / family
-    mapping_path = root / "by_id" / f"{_stable_ref_token(record_id)}.json"
+    mapping_path = root / "by_id" / f"{_single_value_ref_token(record_id)}.json"
     mapping = _read_global_record(store, mapping_path, family=family)
     latest = _read_global_head(store, family)
     if mapping is not None:
@@ -259,7 +259,7 @@ class QueueOrderIndexMixin:
                 )
             mapping = _read_global_record(
                 self._store_adapter,
-                root / "by_id" / f"{_stable_ref_token(record_id)}.json",
+                root / "by_id" / f"{_single_value_ref_token(record_id)}.json",
                 family=family,
             )
             if mapping != entry:

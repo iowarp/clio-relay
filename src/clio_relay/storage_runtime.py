@@ -44,7 +44,9 @@ from clio_relay.models import (
     RelayJob,
     StorageReservationEstimate,
 )
-from clio_relay.queue_lease_admission import _job_matches_mcp_admission_class  # pyright: ignore
+from clio_relay.queue_lease_admission import (
+    _job_matches_mcp_admission_class,  # pyright: ignore[reportPrivateUsage]
+)
 from clio_relay.storage_policy import (
     StorageDecision,
     StorageLimits,

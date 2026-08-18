@@ -20,9 +20,10 @@ import clio_relay.endpoint as endpoint_module
 import clio_relay.storage_runtime as storage_runtime_module
 from clio_relay import queue_legacy_audit, queue_startup, worker_lifetime_lock
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import EndpointRole, JarvisRunSpec, JobKind, RelayEvent, RelayJob
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.storage_runtime import storage_managed_queue
 from clio_relay.worker_lifetime_lock import (
     WORKER_LIFETIME_GUARD_FD_ENV,

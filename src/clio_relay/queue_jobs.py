@@ -2,10 +2,12 @@
 
 Owns every public method that submits, reads, pages, scans, or transitions a
 ``RelayJob``, plus its unlocked write/derived-index primitives. Two typed
-deviations: ``_is_sha256_digest`` keeps a private duplicate (matching
-``queue_artifact_lineage``'s own copy) instead of reaching into
-``queue_job_gc``/``queue_input_ingest``, its doc-assigned but not-yet-landed
-owners; ``write_job`` is the real, patchable ``_write_job_unlocked`` body,
+deviations: ``_is_sha256_digest`` keeps a private duplicate rather than
+reaching into another owner's copy -- both ``queue_job_gc`` (CQ18) and
+``queue_input_ingest`` (CQ13) have since landed, but per-owner duplication
+of this six-line pure predicate is the resolved design (§13.3: six holders,
+one consumer -- see ``queue_job_gc.py``'s module docstring for the full
+census); ``write_job`` is the real, patchable ``_write_job_unlocked`` body,
 kept as a thin wrapper so unmoved callers elsewhere keep working.
 """
 

@@ -7,8 +7,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from clio_relay import core_queue as core_queue_module
 from clio_relay import (
+    queue_layout,
     queue_lease_records,
     queue_legacy_output_codec,
     queue_scheduler_cancel_records,
@@ -87,7 +87,7 @@ def test_scheduler_cancel_record_codec_is_byte_identical_to_parent_store_encodin
 
 
 def _legacy_parent_bytes() -> bytes:
-    text = "x" * (core_queue_module.RECORD_FAMILY_MAX_BYTES["events"] + 1)
+    text = "x" * (queue_layout.RECORD_FAMILY_MAX_BYTES["events"] + 1)
     return json.dumps(
         {
             "job_id": "job-cq4",
@@ -116,7 +116,7 @@ def test_legacy_output_codec_is_byte_identical_to_parent_replacement(
         update={
             "message": (
                 "Legacy stdout output archived "
-                f"({core_queue_module.RECORD_FAMILY_MAX_BYTES['events'] + 1} UTF-8 bytes)"
+                f"({queue_layout.RECORD_FAMILY_MAX_BYTES['events'] + 1} UTF-8 bytes)"
             ),
             "payload": {
                 "stream": "stdout",
@@ -126,10 +126,10 @@ def test_legacy_output_codec_is_byte_identical_to_parent_replacement(
                     "archive_sha256": original_sha256,
                     "archive_size_bytes": len(original_bytes),
                     "original_message_utf8_bytes": (
-                        core_queue_module.RECORD_FAMILY_MAX_BYTES["events"] + 1
+                        queue_layout.RECORD_FAMILY_MAX_BYTES["events"] + 1
                     ),
                     "original_payload_text_utf8_bytes": (
-                        core_queue_module.RECORD_FAMILY_MAX_BYTES["events"] + 1
+                        queue_layout.RECORD_FAMILY_MAX_BYTES["events"] + 1
                     ),
                     "representation": "archive",
                 },
@@ -142,7 +142,7 @@ def test_legacy_output_codec_is_byte_identical_to_parent_replacement(
         original_bytes,
         job_id="job-cq4",
         seq=7,
-        ordinary_limit=core_queue_module.RECORD_FAMILY_MAX_BYTES["events"],
+        ordinary_limit=queue_layout.RECORD_FAMILY_MAX_BYTES["events"],
         compatibility_schema="clio-relay.legacy-output-compatibility.v1",
     )
     stored_record = queue_legacy_output_codec.read_v09_legacy_output_record(

@@ -13,8 +13,6 @@ from clio_relay import (
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import OwnerSessionClosure, utc_now
 
-_label_key = queue_layout.QueueLayout.label_key
-
 
 class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSessionRecordsMixin):
     """Own owner-session quiescence, cleanup intent, and status behavior."""
@@ -44,11 +42,8 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
         if cancel_scheduler_jobs and not cancel_jobs:
             raise ValueError("cancel_scheduler_jobs requires cancel_jobs")
         self._store_adapter.initialize()
-        path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             existing_closing = self._read_owner_session_transition_record(path)
             existing_generation = self._validate_owner_session_closing_record(
@@ -156,11 +151,8 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
             field="session_generation_id",
         )
         self._store_adapter.initialize()
-        path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             closing = self._read_owner_session_transition_record(path)
             closing_generation = self._validate_owner_session_closing_record(
@@ -200,11 +192,8 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
         )
         self._store_adapter.initialize()
         active_path = self._owner_session_active_path(owner_session_id)
-        closing_path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        closing_path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             active = self._read_owner_session_transition_record(active_path)
             closing = self._read_owner_session_transition_record(closing_path)
@@ -291,11 +280,8 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
             field="session_generation_id",
         )
         self._store_adapter.initialize()
-        closing_path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        closing_path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             active_generation = self._owner_session_active_generation(owner_session_id)
             closing = self._read_owner_session_transition_record(closing_path)

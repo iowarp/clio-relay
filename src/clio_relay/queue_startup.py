@@ -27,8 +27,9 @@ every ``self.initialize()`` call across the codebase invisible to the
 edge scanner again, exactly as it was pre-CQ19 when ``initialize`` lived
 directly on ``ClioCoreQueue``. The three helpers below remain real
 ``QueueStartupMixin`` methods (self-contained, zero inbound edges from any
-other owner) and call the module function as ``initialize(self, ...)``
-rather than ``self.initialize(...)``.
+other owner); the two re-entrant sites call ``type(self).initialize(self,
+...)``, not the bare function (F4: skipped ``StorageManagedQueue.
+initialize``'s override) or ``self.initialize(...)`` (edge scanner).
 
 Predecessors: CQ2 (layout), CQ3 (store lock/read/write), CQ6 (legacy audit,
 legacy output audit/migration), CQ15 (lease capacity state -- durable empty
@@ -61,10 +62,9 @@ imported bare, so the existing patch sites keep a live seam to move to.
 
 CQ19-TI-01 (see ``queue_index_discovery.py``'s module docstring for the full
 account): ``_read_index_migration_state``/``_write_index_migration_state``/
-``_recover_pending_transitions_unlocked``/``_write_json`` all stay
-facade-resident and are called on ``queue`` unchanged -- none of them are
-owned by any ``queue_*.py`` mixin, so these calls carry no architecture-guard
-edge at all.
+``_recover_pending_transitions_unlocked`` stay facade-resident and are
+called on ``queue`` unchanged -- none of them are owned by any
+``queue_*.py`` mixin, so these calls carry no architecture-guard edge at all.
 
 CQ20 dissolution: the other three items this docstring used to group with
 that list turned out not to share its constraint once actually checked
@@ -76,8 +76,8 @@ module function directly, module-qualified. ``_read_sealed_index_migration_
 state`` (also single-purpose, two callers) is deleted outright: ``queue_
 legacy_audit.QueueLegacyAuditMixin`` (rank 12, already a valid predecessor)
 owns a byte-identical private equivalent, ``_read_sealed_state``; this
-function now calls ``queue._read_sealed_state()`` instead of maintaining a
-second, facade-resident copy of the same forward.
+function now calls ``queue._read_sealed_state()`` instead of a second copy.
+``_write_json`` is dissolved too (N6): see ``core_queue.py``'s CQ20-FA-01.
 """
 
 from __future__ import annotations
@@ -285,7 +285,8 @@ def initialize(
                             "record_count": 0,
                         }
                     )
-                queue._write_json(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                queue_store_write.write_json(
+                    queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     migration_path,
                     {
                         "schema_version": queue_layout.INDEX_MIGRATION_SCHEMA,
@@ -389,8 +390,14 @@ class QueueStartupMixin:
         def _upgrade_sealed_lease_operational_schema_unlocked(self) -> None: ...
         def _reconcile_sealed_lease_capacity_gate_unlocked(self) -> None: ...
 
-        def _write_json(self, path: Path, record: dict[str, object]) -> None: ...
         def _recover_pending_transitions_unlocked(self) -> list[RelayJob]: ...
+        def initialize(
+            self,
+            *,
+            migrate_legacy_output: bool = False,
+            locked_core: LockedCoreIdentity | None = None,
+            allow_exclusive_seal: bool = True,
+        ) -> None: ...
         def _read_sealed_state(
             self,
             *,
@@ -401,7 +408,7 @@ class QueueStartupMixin:
         """Initialize under a pinned lifetime and preserve the public legacy-state contract."""
         try:
             with worker_lifetime_lock.exclusive_migration_lifetime(self.root) as locked_core:
-                initialize(
+                type(self).initialize(
                     self,
                     migrate_legacy_output=migrate_legacy_output,
                     locked_core=locked_core,
@@ -452,7 +459,7 @@ class QueueStartupMixin:
         self._migration_lifetime_guarded = True
         try:
             self._repair_locked_queue_directory_permissions()
-            initialize(self, migrate_legacy_output=migrate_legacy_output)
+            type(self).initialize(self, migrate_legacy_output=migrate_legacy_output)
         finally:
             self._migration_lifetime_guarded = False
             self.root = original_root

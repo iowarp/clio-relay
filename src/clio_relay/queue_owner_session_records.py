@@ -12,8 +12,6 @@ from clio_relay import queue_context, queue_layout, queue_store_read, queue_stor
 from clio_relay.errors import QueueConflictError
 from clio_relay.identifiers import validate_durable_record_id
 
-_label_key = queue_layout.QueueLayout.label_key
-
 
 def _validate_new_owner_session_metadata(  # pyright: ignore[reportUnusedFunction]
     metadata: dict[str, object],
@@ -96,11 +94,8 @@ class QueueOwnerSessionRecordsMixin:
             field="candidate_generation_id",
         )
         self._store_adapter.initialize()
-        closing_path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        closing_path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             active = self._read_owner_session_transition_record(
                 self._owner_session_active_path(owner_session_id)
@@ -214,11 +209,8 @@ class QueueOwnerSessionRecordsMixin:
             field="session_generation_id",
         )
         self._store_adapter.initialize()
-        path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             if self._read_owner_session_transition_record(path) is not None:
                 raise QueueConflictError(
@@ -285,11 +277,8 @@ class QueueOwnerSessionRecordsMixin:
                 "legacy jobs cannot be covered while owner-session resources remain"
             )
         self._store_adapter.initialize()
-        closing_path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        closing_path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         with self._lock:
             try:
                 raw_closing = queue_store_read.read_json_document(closing_path)
@@ -450,25 +439,19 @@ class QueueOwnerSessionRecordsMixin:
         *,
         session_generation_id: str | None = None,
     ) -> Path:
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
         if session_generation_id is None:
-            return (
-                self._storage_root
-                / "owner_sessions"
-                / f"{_label_key(owner_session_id, domain='owner-session')}.closed.json"
-            )
+            return self._storage_root / "owner_sessions" / f"{session_label}.closed.json"
         return (
             self._storage_root
             / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closures"
+            / f"{session_label}.closures"
             / f"{_stable_ref_token(session_generation_id)}.json"
         )
 
     def _owner_session_active_path(self, owner_session_id: str) -> Path:
-        return (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.active.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        return self._storage_root / "owner_sessions" / f"{session_label}.active.json"
 
     def _owner_session_membership_dir(
         self,
@@ -669,11 +652,8 @@ class QueueOwnerSessionRecordsMixin:
         if not owner_session_id:
             raise ValueError("owner_session_id must not be empty")
         self._store_adapter.initialize()
-        path = (
-            self._storage_root
-            / "owner_sessions"
-            / f"{_label_key(owner_session_id, domain='owner-session')}.closing.json"
-        )
+        session_label = queue_layout.QueueLayout.label_key(owner_session_id, domain="owner-session")
+        path = self._storage_root / "owner_sessions" / f"{session_label}.closing.json"
         try:
             payload = queue_store_read.read_json_document(path)
         except (FileNotFoundError, QueueConflictError, OSError):

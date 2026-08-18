@@ -521,11 +521,64 @@ scope, not this batch's.
 
 `queue_jobs.py` and `queue_artifact_lineage.py` each keep a private
 `_is_sha256_digest` copy rather than one reaching into the other's module (or
-into `queue_job_gc` / `queue_input_ingest`, its doc-assigned but not-yet-landed
-owners per this file's original inventory). This duplication is intentional
-and stays until CQ13/CQ18 land and a real shared owner exists to hold one
-copy; noted here per this batch's review so it is not mistaken for
-undiscovered drift.
+into `queue_job_gc` / `queue_input_ingest`, its doc-assigned owners per this
+file's original inventory). This duplication is intentional; noted here per
+this batch's review so it is not mistaken for undiscovered drift. **Both
+CQ13 (`queue_input_ingest`, §9.7) and CQ18 (`queue_job_gc`, §13.3) have
+since landed** -- §13.3 records the final, corrected six-holder/one-consumer
+resolution.
+
+### 9.7 CQ13 landing — `queue_input_ingest`
+
+N14 (closing-round review): this slice never got its own numbered section;
+folded in here (as §9.7/§9.8, following the block-2 fix-batch numbering)
+rather than renumbering §10-15 down the whole rest of the document.
+
+Thirteenth slice. `queue_input_ingest.py` (696 real / 715 cap): the
+input-artifact ingest lifecycle (begin/fail/complete, abandoned-recovery,
+reconcile, quota consumption). Three sabotage tests (begin/fail/complete
+`write_job` lookups, isolated-namespace pattern) proven red via call-site
+bypass, green after. Typed deviation CQ13-IO-01: `_assert_input_ingest_
+quota_unlocked` stays facade-resident -- its only external caller,
+`queue_jobs.submit_job`, was at 786/800 with no headroom, so extraction would
+create a reverse-rank `queue_jobs -> queue_input_ingest` self-call edge the
+architecture guard rejects (mirrors CQ4-IO-01); proven live, then reverted.
+The `write_job` cast to `QueueJobsMixin` follows the `queue_legacy_audit`
+precedent. `_is_sha256_digest` untouched per ledger §9.6 (deferred to CQ15
+scope at the time; ultimately resolved at CQ18, §13.3). `core_queue.py`
+8991 -> 8430 (-561); facade pinned at 128; 24 owners. Real-toolchain: 212
+core-set + eleven adjacent suites green; 4 cross-branch reds fixed on
+`develop`. Cap: `queue_input_ingest.py` planned 730 (§2), landed at 715 --
+under plan, no raise.
+
+### 9.8 CQ14 landing — `queue_tasks` + `queue_progress`
+
+N14 (closing-round review): same numbering-gap fix as §9.7.
+
+Fourteenth slice. `queue_tasks.py` (405 real / 420 cap): the MCP task
+records -- `put_mcp_task` (the #234 terminal-at-birth machinery),
+projections, task CRUD/paging, retention-index sync. `queue_progress.py`
+(176 real / 190 cap): progress records. The strengthened composition proof:
+patching `QueueTasksMixin.put_mcp_task` was demonstrably inert while the old
+facade body resided (red captured by literally swapping in the pre-CQ14
+`core_queue.py`) and bites after deletion/composition -- FastMCP
+identity/CAS tests demoted to regression acceptance per the doc. Zero typed
+deviations -- every collaborator is an earlier-rank owner or facade-resident
+via self-call stubs. `core_queue.py` 8430 -> 8009 (-421); facade pinned at
+128; 26 owners.
+
+**Budget raise, narrated (N14: this is the "queue_tasks 340->420, queue_
+progress 140->190" gap the closing round flagged):** §2 planned
+`queue_tasks.py` at 340 and `queue_progress.py` at 140 from the Gross+
+Overhead formula alone. Both landed over plan from day one -- 405/176 real
+against 340/140 planned -- because the formula's 45/30-line overhead
+allowance did not anticipate `put_mcp_task`'s #234 terminal-at-birth
+admission logic (task CRUD absorbed real state-machine surface the original
+disjoint-function inventory undercounted for this pair). The caps were set
+to 420/190 at landing to hold real+headroom, not raised afterward; no
+regression, an initial-plan miss caught and closed the same slice. See
+§15.11 for the full campaign-wide reconciliation of every other owner whose
+final cap exceeds its §2 plan.
 
 ## 10. CQ15 landing — lease capacity, indexes, leases, recovery, scheduler claims
 
@@ -1107,16 +1160,34 @@ findings.
 Ledger §9.6 named this slice as owning the facade's `_is_sha256_digest`
 copy's real disposition, since its only two callers
 (`_terminal_job_gc_protections`, `_read_committed_job_digest`) move here.
-The facade's copy is **deleted outright**, not moved: `queue_job_gc_
-protections.py` keeps its own private duplicate, matching the
-already-established per-owner idiom four other owners already use
-(`queue_jobs.py`, `queue_artifact_lineage.py`, `queue_lease_records.py`,
-`queue_legacy_output_codec.py`). `queue_jobs`/`queue_artifact_lineage`
-keep their existing copies unchanged and do **not** import this module's
-copy: both rank well before `queue_job_gc_protections` (rank 40), so a
-shared import would be a reverse-rank edge the architecture guard rejects.
-Per-owner duplication of this six-line pure predicate remains the correct
-resolution, not an oversight.
+The facade's copy is **deleted outright**, not moved: this slice adds two
+new independent holders at once, not one -- both `queue_job_gc.py`
+(orchestration) and `queue_job_gc_protections.py` (eligibility) keep their
+own private duplicate, since each calls the predicate directly and neither
+may depend on the other (§13.2's one-directional boundary).
+
+**Corrected census (N14, closing-round review: this section undercounted
+by one holder and omitted the one consumer entirely).** The real, current
+count is **six holders, one consumer**:
+
+- Holders (each keeps its own private `_is_sha256_digest` copy):
+  `queue_jobs.py`, `queue_artifact_lineage.py`, `queue_lease_records.py`,
+  `queue_legacy_output_codec.py`, `queue_job_gc.py`, `queue_job_gc_
+  protections.py`.
+- Consumer (reaches into another owner's copy, module-qualified, instead of
+  holding its own): `queue_idempotency.py` calls `queue_lease_records.
+  _is_sha256_digest(...)` -- valid because `queue_idempotency` (rank 17)
+  ranks after `queue_lease_records` (rank 6), a forward edge the
+  architecture guard accepts.
+
+None of the six holders import another's copy: `queue_jobs`/`queue_
+artifact_lineage`/`queue_lease_records`/`queue_legacy_output_codec` all
+rank well before `queue_job_gc`/`queue_job_gc_protections` (ranks 40-41),
+so a shared import from any of them would be a reverse-rank edge the
+architecture guard rejects. Per-owner duplication of this six-line pure
+predicate remains the correct resolution for the six holders, not an
+oversight; `queue_idempotency`'s forward-ranked consumer relationship is
+the one place a shared import was actually possible and was already taken.
 
 ### 13.4 shared-primitive hoist: `_migration_batch_paths`
 
@@ -1469,7 +1540,7 @@ one of the three buckets the issue prescribed:
 
 | Class | Count | Members |
 |---|---:|---|
-| (a) stays -- facade glue | ~470 | module docstring/imports/re-exports; `_QueueStoreAdapter`; the `ClioCoreQueue` class statement, mixin composition, `__init__`/state; `initialize` (CQ19-ST-02); `reconcile_pending_transitions`, `_assert_input_ingest_quota_unlocked`, `_write_transition_intent_unlocked`, `_recover_pending_transitions_unlocked`, `_read_index_migration_state`/`_write_index_migration_state`, `_require_index_migration_complete`, `_lease_capacity_migration_complete_unlocked` (CQ13-IO-01/CQ19-TI-01, unchanged); `_job_record_path`, `_write`, `_write_json`, `_read_optional`, `_scan_many`, `_read_json_file`, `_read_json_document` (new deviation CQ20-FA-01, §15.2); `_is_canonical_event_path`, `_bounded_regular_json_count`, `_record_is_reparse` (unchanged, `_QueueStoreAdapter`-dependent) |
+| (a) stays -- facade glue | ~470 | module docstring/imports/re-exports; `_QueueStoreAdapter`; the `ClioCoreQueue` class statement, mixin composition, `__init__`/state; `initialize` (CQ19-ST-02); `reconcile_pending_transitions`, `_assert_input_ingest_quota_unlocked`, `_write_transition_intent_unlocked`, `_recover_pending_transitions_unlocked`, `_read_index_migration_state`/`_write_index_migration_state`, `_require_index_migration_complete`, `_lease_capacity_migration_complete_unlocked` (CQ13-IO-01/CQ19-TI-01, unchanged); `_job_record_path`, `_write`, `_read_optional`, `_scan_many` (new deviation CQ20-FA-01, §15.2; `_write_json`/`_read_json_document` dissolved on N6 re-audit and `_read_json_file` inlined on N8, closing-round review); `_is_canonical_event_path`, `_bounded_regular_json_count`, `_record_is_reparse` (unchanged, `_QueueStoreAdapter`-dependent) |
 | (b) moved/dissolved | 12 owner methods + 2 module fns | CQ1's 8 jarvis-input delegators -> real `QueueJarvisInputsMixin` methods (CQ20-JI-01); `_read_sealed_index_migration_state`/`_read_unique_json_document` -> reused `queue_legacy_audit._read_sealed_state` (CQ20-SA-01, no new duplicate); `_storage_root_stat` -> `queue_lease_indexes.py`'s `self._layout.storage_root_stat()`; `_durable_key` (3 call sites) -> `queue_layout.QueueLayout.durable_key` in `queue_index_migration.py`; `_require_safe_write_directory`/`_purge_write_staging_unlocked` -> `queue_store_write.*` in `queue_startup.py`; `_write_text` -> `queue_store_write.write_text` in `queue_lease_indexes.py`; `_read_canonical_record` (6 call sites) -> `queue_store_read.read_canonical_record` in `queue_index_migration.py`; `_bounded_json_record_paths` (8 call sites: `queue_index_discovery.py`, `queue_job_gc.py` x3, `queue_job_gc_protections.py` x3, `_assert_input_ingest_quota_unlocked` itself) -> `queue_store_read.bounded_json_record_paths` |
 | (c) dead residue, deleted | 4 | `_require_durable_record_id` (zero production callers -- every owner already builds its own local `queue_layout.QueueLayout.require_durable_record_id` alias); `_label_key` (same, `queue_owner_session_lifecycle.py`/`queue_owner_session_records.py` already alias it directly); `_read_many` (the classmethod itself had zero production callers left -- every reader that needs an unbounded scan, e.g. `queue_progress.list_progress`, already calls `queue_store_read.read_many` module-qualified; only a negative test-safety-net patch referenced it -- see §15.4); `_read_bounded_record_bytes` (orphaned once `_read_unique_json_document`, its only caller, dissolved) |
 
@@ -1485,23 +1556,53 @@ which are part of the public 128.
 
 ### 15.2 typed deviation CQ20-FA-01: the store-adapter hub family stays
 
-`_job_record_path`, `_write`, `_write_json`, `_read_optional`, `_scan_many`,
-`_read_json_file`, and `_read_json_document` all stay facade-resident,
-unmoved. Two independent constraints force this, the same "hub method, no
-clean hoist target" class CQ19-TI-01 already established:
+`_job_record_path`, `_write`, `_read_optional`, and `_scan_many` stay
+facade-resident, unmoved.
 
-- `_write`/`_write_json`/`_read_optional`/`_read_json_document` are called
-  by `_QueueStoreAdapter` as `self._queue._write(...)` etc (ledger §9.5's
-  own fix): routing through the *instance* rather than the bare module
-  function is what keeps `monkeypatch.setattr(queue, "_write", ...)` -- an
-  established, widely used test seam across the whole suite -- live. A
-  module-qualified rewrite would silently break every such patch, exactly
-  the class of defect §9.5 fixed once already.
-- `_job_record_path` (26 external callers), `_write` (12+ external
-  callers), `_write_json` (20), `_read_optional` (6), and
-  `_recover_pending_transitions_unlocked` (42, already CQ19-TI-01) are each
-  self-called from many already-landed owners spanning the full rank range
-  0-45. `_scan_many` is additionally inherited directly by
+**Corrected N8 (closing-round review):** this deviation originally also
+named `_read_json_file`, a single-caller `@staticmethod` forward
+(`self._read_json_file(path, model)` -> `queue_store_read.read_json_file
+(path, model)`) with exactly one call site
+(`_assert_input_ingest_quota_unlocked`). It carried none of the two
+independent constraints below -- no `_QueueStoreAdapter` routing, no
+multi-owner hub -- so it is inlined: the one caller now calls
+`queue_store_read.read_json_file` directly, module-qualified, matching
+every other CQ20-dissolved single-caller wrapper.
+
+**Corrected N6 (closing-round review):** this deviation originally also
+named `_write_json` and `_read_json_document`, and justified all four of
+`_write`/`_write_json`/`_read_optional`/`_read_json_document` with one
+blanket "hub method, no clean hoist target" claim, citing `_write_json` at
+20 callers and `_read_optional` at 6. Re-auditing the real call graph found
+both counts inflated -- `_write_json` has 2 real callers
+(`queue_lease_indexes.py`, `queue_startup.py`), `_read_optional` has 2
+(`queue_transitions.py`) -- and, more importantly, that only `_write` and
+`_read_optional` actually have a live `monkeypatch.setattr(queue, "_write"
+| "_read_optional", ...)` test seam anywhere in the suite; `_write_json` and
+`_read_json_document` have none. `_write_json`/`_read_json_document` are
+therefore dissolved: each caller (`_QueueStoreAdapter`, and `_write_json`'s
+two real owners) now calls `queue_store_write.write_json`/
+`queue_store_read.read_json_document` directly, module-qualified, matching
+every other CQ20-dissolved single/low-caller wrapper below.
+
+What stays is justified by two *independent*, individually-sufficient
+reasons, restated per member rather than as one blanket claim:
+
+- `_write`/`_read_optional` are called by `_QueueStoreAdapter` as
+  `self._queue._write(...)` etc (ledger §9.5's own fix): routing through
+  the *instance* rather than the bare module function is what keeps a real,
+  live test seam working -- `monkeypatch.setattr(queue, "_write", ...)` in
+  `tests/test_endpoint.py`/`tests/test_input_staging.py`/
+  `tests/test_core_queue_split_architecture.py`, `monkeypatch.setattr(queue,
+  "_read_optional", ...)` in `tests/test_input_staging.py`/
+  `tests/test_core_queue_split_architecture.py`. A module-qualified rewrite
+  would silently break every such patch, exactly the class of defect §9.5
+  fixed once already.
+- `_job_record_path` (26 external callers), `_write` (12 external
+  callers), `_read_optional` (2 -- kept for the seam above, not the count),
+  and `_recover_pending_transitions_unlocked` (44, already CQ19-TI-01) are
+  each self-called from many already-landed owners spanning the full rank
+  range 0-45. `_scan_many` is additionally inherited directly by
   `storage_runtime.StorageManagedQueue(ClioCoreQueue)` -- a real production
   *subclass* outside the queue-owner family entirely (`recover_stale_jobs`/
   `acquire_job`/etc call `self._scan_many(...)` through inheritance, not
@@ -1514,9 +1615,43 @@ None of these calls are owned by any `queue_*.py` mixin, so they carry no
 architecture-guard edge regardless of rank -- the same invisibility
 CQ19-ST-02 established for `initialize`. This closes out ledger §9.5's own
 open question ("full retirement stays CQ19/CQ20 scope"): the verdict is
-**`_QueueStoreAdapter` and its four instance-routed methods are permanent**,
-not a residual gap -- CQ20's own issue text names "the private store
-adapter" as facade-legitimate for exactly this reason.
+**`_QueueStoreAdapter` and its two instance-routed methods (`_write`,
+`_read_optional`) are permanent**, not a residual gap -- CQ20's own issue
+text names "the private store adapter" as facade-legitimate for exactly
+this reason. Its other two methods (`initialize`, `bounded_regular_json_
+count`) and its two now-dissolved forwards (`write_json`,
+`read_json_document`) call the real owner directly and carry no such
+constraint.
+
+**N7 addendum (closing-round review): the `_store_adapter` bypass is real,
+enumerated, and not being mass-rewired here.** `QueueStoreProtocol`
+(`queue_context.py`) exposes exactly the store-adapter hub family's own
+surface -- `storage_root`/`locked_storage_root`/`lock`/`initialize`/
+`read_optional`/`read_json_document`/`write`/`write_json`/
+`bounded_regular_json_count` -- and 26 owner mixins declare
+`_store_adapter: queue_context.QueueStoreProtocol` on their attribute
+block, available for exactly those nine operations. Per §3 ("CQ3 replaces
+the adapter with the concrete store modules"), the protocol was always a
+CQ1-era bridge, not a mandate every later owner must route through; most
+CQ4+ owners call `queue_store_read`/`queue_store_write` module functions
+directly by design. A re-audit found 12 of those 26 declaring owners
+*also* call the direct module equivalent of a protocol operation they
+could have reached through `self._store_adapter` instead -- 61 call sites
+across `write_model`/`write_json`/`read_optional`/`read_json_document`:
+`queue_gateway_indexes.py` (13: 1 write_model, 6 write_json, 2
+read_optional, 4 read_json_document), `queue_owner_session_records.py`
+(10: 2/1/4/3), `queue_scheduler_cancel_state.py` (9: 3/0/6/0),
+`queue_monitor_rules.py` (5: 4/0/1/0), `queue_execution_cleanup.py` (4:
+0/2/0/2), `queue_idempotency.py` (4: 0/1/2/1), `queue_job_gc.py` (4:
+0/1/0/3), `queue_lease_capacity_state.py` (3: 0/2/1/0),
+`queue_gateways.py` (3: 1/0/2/0), `queue_artifact_lineage.py` (2:
+1/0/1/0), `queue_job_gc_protections.py` (2: 0/0/0/2),
+`queue_lease_indexes.py` (2: 0/1/0/1). No production defect follows from
+this -- both paths reach the identical module function, `_store_adapter`
+is simply an unused-but-available shortcut at these 61 sites -- so per
+this campaign's own no-mechanical-mass-rewire discipline the fix is this
+enumeration, not a rewrite; a mechanical rewire of 61 sites across 12
+owners would need its own verification round and is out of scope here.
 
 ### 15.3 typed deviation CQ20-SA-01: the sealed-state duplicate is dissolved, not duplicated
 
@@ -1729,13 +1864,29 @@ this slice had to name), zero left open.
 
 All eight measurable exit criteria in section 7 now hold:
 
-1. `core_queue.py` is 598 physical lines -- below 800, and contains only
-   typed owner-mixin composition, the private store adapter, constructor/
-   context wiring, and the two documented CQ19-ST-02/CQ19-TI-01 facade
-   dispatchers plus the CQ20-FA-01 store-adapter hub family and CQ13-IO-01.
-2. Every target in section 2 is at or below its (ratcheted, justified)
-   planned cap and below the 800-line hard gate; §15.8's table is the
-   final accounting. No new file-size baseline was added.
+1. `core_queue.py` is 546 physical lines (598 at CQ20 landing; the closing
+   round's F5/N6/N8/N9 dead-alias deletion and hub-family dissolution cut
+   a further 52) -- below 800, and contains only typed owner-mixin
+   composition, the private store adapter, constructor/context wiring, and
+   the two documented CQ19-ST-02/CQ19-TI-01 facade dispatchers plus the
+   CQ20-FA-01 store-adapter hub family and CQ13-IO-01.
+2. **Corrected N14 (closing-round review): this criterion asserted
+   "satisfied" without stating the one real miss.** Every *owner mixin*
+   target in section 2 is at or below its (ratcheted, justified) planned
+   cap and below the 800-line hard gate -- true, and §15.8's table is the
+   final accounting for all 46. The facade itself is not: `core_queue.py`
+   planned at 200 (§2's own Gross+Overhead row: 108 transfer + 92
+   overhead), lands at 546 -- 2.7x the plan, comfortably under the 800-line
+   hard gate but nowhere near its own 200-line target. §2's "explicit
+   facade wrappers therefore cannot meet the 800-line gate" already
+   predicted a miss in kind (128 public methods' decorators/signatures
+   alone are 629 lines) but not this magnitude; the 92-line overhead
+   allowance never anticipated a private store-adapter class, the CQ13/
+   CQ19-TI-01/CQ20-FA-01 typed-deviation bodies, or the CQ1 dissolution's
+   own residue. No ratchet baseline exists for `core_queue.py` to raise
+   (it dropped out once under 800), so there is no "ratcheted, justified"
+   cover for this one -- it is a genuine plan miss, stated honestly rather
+   than folded into criterion 2's blanket "satisfied."
 3. The section 1 inventory's disjointness is preserved by construction --
    CQ20 only moves or deletes lines already assigned to `core_queue.py` at
    CQ19; nothing is copied.
@@ -1762,3 +1913,49 @@ All eight measurable exit criteria in section 7 now hold:
    since CQ19).
 
 **The `core_queue.py` split (issue #231, CQ1-CQ20) is COMPLETE.**
+
+### 15.11 campaign-wide budget-raise reconciliation (N14, closing-round review)
+
+Every per-slice landing section (§10.1, §11.1, §12.1, §13.1, §14.1, §15.8)
+already states each owner's real/cap/planned facts; none of them narrate
+*why* a cap exceeds its §2 plan except `queue_jarvis_inputs` (§15.4,
+CQ20-JI-01), `queue_store_read`, and `queue_legacy_output_migration` (both
+§9.4), plus `queue_tasks`/`queue_progress` (§9.8, added this round). This
+table is the honest, campaign-wide reconciliation for the remaining owners
+whose final cap exceeds its original §2 plan -- restated here in one place
+rather than scattered, and without inventing a per-owner root cause this
+review did not independently re-derive from git history for each one:
+
+| Owner | §2 planned | Final cap | Raise | Narrated? |
+|---|---:|---:|---:|---|
+| `queue_jarvis_inputs` | 300 | 340 | +40 | yes -- §15.4 (CQ20-JI-01) |
+| `queue_store_read` | 350 | 420 | +70 | partial -- §9.4 narrates 350->410 (+60, shared read primitives); the `_OWNER_BUDGETS` inline note narrates a further "+2" that does not arithmetically close the remaining 410->420 gap. Not re-derived further this round. |
+| `queue_legacy_output_migration` | 210 | 250 | +40 | yes -- §9.4 (F12, +3 `TYPE_CHECKING` stubs) |
+| `queue_tasks` | 340 | 420 | +80 | yes -- §9.8, added this round |
+| `queue_progress` | 140 | 190 | +50 | yes -- §9.8, added this round |
+| `queue_browser_attachments` | 410 | 420 | +10 | no -- real count 407, 13 lines of headroom; not independently re-derived |
+| `queue_gateways` | 300 | 400 | +100 | no -- real count 383; not independently re-derived |
+| `queue_index_discovery` | 270 | 380 | +110 | no -- real count 359; not independently re-derived |
+| `queue_index_migration` | 600 | 720 | +120 | no -- real count 704; not independently re-derived |
+| `queue_job_gc` | 520 | 720 | +200 | no -- real count 670; not independently re-derived |
+| `queue_jobs` | 700 | 800 | +100 | no -- real count 786, at the 800 hard-gate ceiling; not independently re-derived |
+| `queue_lease_capacity_audit` | 440 | 600 | +160 | no -- §10.1 states the bare planned/cap facts, no reason; real count 584 |
+| `queue_lease_capacity_state` | 470 | 490 | +20 | no -- §10.1 states the bare facts; real count 381 after this round's N9 dead-code deletion, well under cap |
+| `queue_lease_recovery` | 440 | 620 | +180 | no -- §10.1 states the bare facts; real count 601 |
+| `queue_monitor_rules` | 140 | 230 | +90 | no -- real count 212; not independently re-derived |
+| `queue_scheduler_cancel_claims` | 520 | 560 | +40 | no -- §10.1 states the bare facts; real count 538 |
+| `queue_scheduler_cancel_state` | 290 | 450 | +160 | no -- real count 436; not independently re-derived |
+| `queue_startup` | 460 | 550 | +90 | no -- real count 550, at cap; not independently re-derived |
+
+Eighteen owners carry a raised cap; five (28%) have a narrated reason
+somewhere in this document, thirteen do not. All eighteen are still below
+their owner-level `DEFAULT_MAX_LINES`-class headroom and none approaches
+the 800-line hard gate except `queue_jobs` (786/800) and `queue_startup`
+(550/550, exactly at cap) -- both already called out in their own landing
+sections as at-cap. This table does not close the gap for the thirteen
+unnarrated owners; it states the gap honestly instead of letting criterion
+2 (§15.10) claim a blanket "satisfied" over it. Closing it for real means
+walking each owner's `git log -p -- src/clio_relay/<owner>.py` against its
+CQ landing commit, the same archaeology this round did for CQ15 (§9.7's
+sibling gap) and the facade (criterion 2) -- left for a future slice
+rather than rushed here with fabricated per-owner reasons.

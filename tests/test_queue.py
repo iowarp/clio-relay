@@ -8,13 +8,19 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import cast
 
 import pytest
 from filelock import FileLock, Timeout
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay import queue_legacy_audit, queue_store_read, queue_store_write
+from clio_relay import (
+    queue_idempotency,
+    queue_layout,
+    queue_legacy_audit,
+    queue_store_lock,
+    queue_store_read,
+    queue_store_write,
+)
 from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
@@ -98,6 +104,52 @@ def test_canonical_read_resolves_validation_through_store_read_owner(
         )
 
 
+def test_migrate_indexes_batch_resolves_canonical_read_through_store_read_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N16 (closing-round review): the test above proves ``queue_store_read.
+    read_canonical_record`` resolves its lookup module-qualified, but only by
+    calling that module function directly -- it never proves any real
+    production caller reaches it. ``migrate_indexes_batch`` (the public
+    entrypoint that owns all six real ``read_canonical_record`` call sites,
+    ``queue_index_migration.py``) is that production caller; this restores
+    the same sabotage through it.
+    """
+    for family in ("jobs", "tasks", "leases", "artifacts", "progress", "events"):
+        (tmp_path / family).mkdir(parents=True, exist_ok=True)
+    job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["echo", "legacy"]),
+        idempotency_key="legacy-migration-production-path",
+    )
+    (tmp_path / "jobs" / f"{job.job_id}.json").write_text(
+        job.model_dump_json(indent=2), encoding="utf-8"
+    )
+    queue = ClioCoreQueue(tmp_path)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _StoreLookupSabotage("queue_store_read canonical validation lookup engaged")
+
+    monkeypatch.setattr(
+        queue_store_read,
+        "queue_layout",
+        SimpleNamespace(
+            **{
+                **vars(queue_store_read.queue_layout),
+                "validate_canonical_access": sabotage,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        _StoreLookupSabotage,
+        match="queue_store_read canonical validation lookup engaged",
+    ):
+        queue.migrate_indexes_batch(batch_size=1)
+
+
 def test_atomic_write_resolves_private_file_through_store_write_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -109,9 +161,6 @@ def test_atomic_write_resolves_private_file_through_store_write_owner(
 
     def accept_test_path(_path: Path, *, directory: bool) -> None:
         del directory
-
-    def open_test_file(path: Path) -> BinaryIO:
-        return path.open("xb")
 
     # queue_legacy_audit.cluster_config and queue_store_write.cluster_config
     # are the same module object (clio_relay.cluster_config); patching it once
@@ -125,12 +174,6 @@ def test_atomic_write_resolves_private_file_through_store_write_owner(
         queue_store_write.cluster_config,
         "ensure_private_configuration_path",
         accept_test_path,
-    )
-    monkeypatch.setattr(
-        core_queue_module,
-        "open_private_atomic_file",
-        open_test_file,
-        raising=False,
     )
 
     def sabotage(_path: Path) -> None:
@@ -199,7 +242,10 @@ def test_operator_configured_long_core_root_supports_records_and_leases(
 
 def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path, lock_timeout_seconds=2)
-    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cast(
+        queue_store_lock.FairBoundedFileLock,
+        queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
     acquired: list[int] = []
     errors: list[BaseException] = []
     threads: list[threading.Thread] = []
@@ -248,7 +294,10 @@ def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -
 
 def test_core_lock_default_is_bounded_for_production_contention(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
-    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cast(
+        queue_store_lock.FairBoundedFileLock,
+        queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
     assert DEFAULT_CORE_LOCK_TIMEOUT_SECONDS == 30.0
     assert lock.timeout == DEFAULT_CORE_LOCK_TIMEOUT_SECONDS
@@ -401,8 +450,12 @@ def test_lease_snapshot_readers_serialize_with_concurrent_release(
             logical_filesystem_path(path) == observed_path
             and threading.get_ident() == scan_thread_id
         ):
+            locked = cast(
+                queue_store_lock.FairBoundedFileLock,
+                queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
             assert (
-                queue._lock._owner_thread_id == scan_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                locked._owner_thread_id == scan_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             )
             scan_reached_record.set()
             assert release_started.wait(timeout=5)
@@ -471,8 +524,12 @@ def test_task_snapshot_readers_hold_queue_lock(
         if (
             selected_task_record or selected_order_record
         ) and threading.get_ident() == reader_thread_id:
+            locked = cast(
+                queue_store_lock.FairBoundedFileLock,
+                queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
             assert (
-                queue._lock._owner_thread_id == reader_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                locked._owner_thread_id == reader_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             )
             observed.set()
         return original_read(path)
@@ -531,8 +588,8 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
         with pytest.raises(PermissionError, match="persistent sharing violation"):
             queue.release_lease(lease.lease_id)
 
-    assert attempts == core_queue_module.ATOMIC_REPLACE_ATTEMPTS
-    assert retry_delays == [0.0] * (core_queue_module.ATOMIC_REPLACE_ATTEMPTS - 1)
+    assert attempts == queue_layout.ATOMIC_REPLACE_ATTEMPTS
+    assert retry_delays == [0.0] * (queue_layout.ATOMIC_REPLACE_ATTEMPTS - 1)
     assert indexed_path.is_file()
     assert len(list((queue.root / "transition_intents").glob("*.json"))) == 1
 
@@ -867,9 +924,7 @@ def test_concurrent_endpoint_heartbeat_replacement_is_not_a_false_hardlink(
             reader_waiting.set()
             if not heartbeat_done.wait(timeout=2):
                 raise AssertionError("concurrent heartbeat did not complete")
-            raise core_queue_module._TransientRecordReplacement(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                f"injected endpoint replacement: {path}"
-            )
+            raise queue_layout.TransientRecordReplacement(f"injected endpoint replacement: {path}")
         return original_attempt(path, limit=limit)
 
     def heartbeat() -> None:
@@ -932,7 +987,7 @@ def test_atomic_writes_stage_outside_canonical_record_directories(
         )
     )
 
-    expected_staging = logical_filesystem_path(queue.root / core_queue_module.WRITE_STAGING_FAMILY)
+    expected_staging = logical_filesystem_path(queue.root / queue_layout.WRITE_STAGING_FAMILY)
     assert replacements
     assert all(
         logical_filesystem_path(source.parent) == expected_staging for source, _ in replacements
@@ -976,7 +1031,7 @@ def test_initialize_removes_bounded_atomic_write_crash_leftovers(tmp_path: Path)
     """A new queue owner removes only structurally valid abandoned staged files."""
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    staging = queue.root / core_queue_module.WRITE_STAGING_FAMILY
+    staging = queue.root / queue_layout.WRITE_STAGING_FAMILY
     leftover = staging / f"{'a' * 32}.tmp"
     leftover.write_bytes(b"abandoned")
 
@@ -990,7 +1045,7 @@ def test_initialize_rejects_unsafe_atomic_write_staging_entries(tmp_path: Path) 
     """Cleanup must fail closed rather than unlinking unowned staging content."""
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    unsafe = queue.root / core_queue_module.WRITE_STAGING_FAMILY / "operator-note.txt"
+    unsafe = queue.root / queue_layout.WRITE_STAGING_FAMILY / "operator-note.txt"
     unsafe.write_text("keep", encoding="utf-8")
 
     with pytest.raises(QueueConflictError, match="contains an unsafe entry"):
@@ -1019,7 +1074,7 @@ def test_atomic_write_syncs_source_and_destination_directories(
     )
 
     storage_root = internal_filesystem_path(queue.root, force_extended=True)
-    assert storage_root / core_queue_module.WRITE_STAGING_FAMILY in synced
+    assert storage_root / queue_layout.WRITE_STAGING_FAMILY in synced
     assert storage_root / "endpoints" in synced
 
 
@@ -1303,7 +1358,7 @@ def test_null_jarvis_binding_preserves_pre_upgrade_mcp_submission_digest() -> No
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
-    observed = core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job
     )
 
@@ -1330,9 +1385,9 @@ def test_control_query_admission_changes_mcp_submission_digest() -> None:
         }
     )
 
-    assert core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         workload
-    ) != core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) != queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         control
     )
 

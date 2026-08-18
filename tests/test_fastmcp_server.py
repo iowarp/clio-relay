@@ -29,7 +29,7 @@ from mcp.shared.exceptions import MCPError
 import clio_relay.fastmcp_server as fastmcp_server_module
 from clio_relay import door_errors
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import McpTaskIdentityConflictError, NotFoundError, QueueConflictError
 from clio_relay.fastmcp_server import (
     MAX_TASK_ARGUMENT_BYTES,
@@ -49,6 +49,7 @@ from clio_relay.models import (
     RelayMcpTaskRecord,
     RemoteAgentTaskSpec,
 )
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.remote_mcp import VirtualRemoteMcpCatalog
 
 JSON = dict[str, Any]

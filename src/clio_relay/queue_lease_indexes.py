@@ -32,7 +32,6 @@ import logging
 import os
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from clio_relay import (
     queue_context,
@@ -129,14 +128,11 @@ def sync_operational_indexes(
 class QueueLeaseIndexesMixin:
     """Own lease operational-index identity, refs, scans, and convergence."""
 
+    root: Path
     _storage_root: Path
     _lock: queue_context.QueueLockProtocol
     _store_adapter: queue_context.QueueStoreProtocol
     _layout: queue_layout.QueueLayout
-
-    if TYPE_CHECKING:
-
-        def _write_json(self, path: Path, record: dict[str, object]) -> None: ...
 
     def _lease_index_identity(
         self,
@@ -239,7 +235,8 @@ class QueueLeaseIndexesMixin:
                 raise QueueConflictError(
                     f"lease operational index token collision: {identity.lease_id}"
                 )
-        self._write_json(
+        queue_store_write.write_json(
+            self._storage_root,
             path,
             queue_lease_records.lease_index_document(identity),
         )
@@ -363,9 +360,9 @@ class QueueLeaseIndexesMixin:
         try:
             root_stat = self._layout.storage_root_stat()
         except FileNotFoundError as exc:
-            raise QueueConflictError(f"queue root is missing: {self._storage_root}") from exc
+            raise QueueConflictError(f"queue root is missing: {self.root}") from exc
         if not stat.S_ISDIR(root_stat.st_mode) or queue_layout.record_is_reparse(root_stat):
-            raise QueueConflictError(f"queue root is unsafe: {self._storage_root}")
+            raise QueueConflictError(f"queue root is unsafe: {self.root}")
         current = self._storage_root
         for part in relative.parts:
             current /= part

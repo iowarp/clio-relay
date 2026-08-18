@@ -16,7 +16,6 @@ from types import SimpleNamespace
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import core_queue as core_queue_module
 from clio_relay import (
     queue_artifact_lineage,
     queue_browser_attachments,
@@ -33,6 +32,7 @@ from clio_relay import (
     queue_job_gc,
     queue_job_gc_protections,
     queue_jobs,
+    queue_layout,
     queue_lease_admission,
     queue_lease_capacity_audit,
     queue_lease_indexes,
@@ -48,6 +48,7 @@ from clio_relay import (
     queue_scheduler_cancel_records,
     queue_scheduler_cancel_state,
     queue_startup,
+    queue_store_lock,
     queue_store_read,
     queue_store_write,
     queue_tasks,
@@ -487,7 +488,16 @@ def _bare_owner_import_lines(
     ``AnnAssign``). Both bind a bare local name at import time that a
     monkeypatch on ``collaborator.func`` can no longer intercept -- F5
     (block-2 review): the original guard only walked ``ImportFrom`` and
-    missed the assignment form entirely.
+    missed the assignment form entirely. N12 (closing-round review): the
+    assignment form itself only matched a depth-1 chain
+    (``collaborator.func``) -- ``alias = collaborator.SomeClass.method``
+    (``queue_artifacts.py``'s real ``_require_durable_record_id =
+    queue_layout.QueueLayout.require_durable_record_id``) has an
+    ``ast.Attribute`` nested inside the attribute, not a bare ``ast.Name``,
+    so it walked straight past. Walking the chain to its root ``Name`` (via
+    ``_flatten_attribute_chain``, shared with the §4 monkeypatch audit)
+    catches both depths uniformly against ``functions_by_owner``'s
+    class-qualified (``"SomeClass.method"``) entries.
     """
     violations: list[int] = []
     for node in ast.walk(tree):
@@ -500,13 +510,16 @@ def _bare_owner_import_lines(
             ):
                 violations.append(node.lineno)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = node.value
-            if not (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)):
+            if node.value is None:
                 continue
-            collaborator = _imported_owner(value.value.id, owners=owners)
+            chain = _flatten_attribute_chain(node.value)
+            if chain is None or len(chain) < 2:
+                continue
+            root, *rest = chain
+            collaborator = _imported_owner(root, owners=owners)
             if collaborator is None or collaborator == caller:
                 continue
-            if value.attr in functions_by_owner.get(collaborator, set()):
+            if ".".join(rest) in functions_by_owner.get(collaborator, set()):
                 violations.append(node.lineno)
     return violations
 
@@ -706,16 +719,35 @@ def _dynamic_setattr_targets(tree: ast.Module) -> tuple[tuple[str, bool], ...]:
     return tuple(targets)
 
 
+def _resolve_dotted_attribute_chain(dotted: str) -> bool:
+    """Return True when ``dotted`` resolves to a real attribute.
+
+    Imports the longest possible module prefix, then ``getattr``-walks the
+    remainder. This reaches attribute chains a single ``rpartition`` cannot:
+    ``clio_relay.queue_store_write.cluster_config.open_private_atomic_file``
+    is not an importable module path (``cluster_config`` is an attribute
+    ``queue_store_write`` re-exports, not a submodule of it) -- it only
+    resolves by importing ``clio_relay.queue_store_write`` and then
+    attribute-walking ``cluster_config``, ``open_private_atomic_file``.
+    """
+    parts = dotted.split(".")
+    for split in range(len(parts), 0, -1):
+        module_path = ".".join(parts[:split])
+        try:
+            target_object: object = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        for attribute in parts[split:]:
+            if not hasattr(target_object, attribute):
+                return False
+            target_object = getattr(target_object, attribute)
+        return True
+    return False
+
+
 def _resolve_dynamic_target(target: str) -> bool:
     """Return True when ``module.path.attr`` names a real, existing attribute."""
-    module_path, _, attribute = target.rpartition(".")
-    if not module_path:
-        return False
-    try:
-        module = importlib.import_module(module_path)
-    except ImportError:
-        return False
-    return hasattr(module, attribute)
+    return _resolve_dotted_attribute_chain(target)
 
 
 def test_dynamic_fstring_loop_monkeypatch_targets_resolve_or_are_registered() -> None:
@@ -771,6 +803,158 @@ def test_guard_detects_a_dead_fstring_loop_seam_fixture() -> None:
     assert _resolve_dynamic_target(targets[1][0]) is False
 
 
+# --- §4 audit extension: plain-object monkeypatch.setattr(module, "name", ...) seams ---
+#
+# The f-string-loop extractor above only sees a target built from a string
+# literal fed through an f-string. It is blind to the far more common shape
+# ``monkeypatch.setattr(some_module_or_attr_chain, "literal_name", value, ...)``
+# -- exactly the shape F3 (closing-round review) found dead in
+# ``tests/test_queue.py``: ``monkeypatch.setattr(core_queue_module,
+# "open_private_atomic_file", open_test_file, raising=False)`` kept patching a
+# facade attribute the CQ-split moved off ``core_queue`` months ago, and
+# ``raising=False`` made the break invisible -- the assertion that actually
+# proved the behavior lived entirely on a different, still-correct patch two
+# lines later. The same review pass found this shape live-broken a second time
+# in ``tests/test_jarvis_handle_first_admission.py`` (no ``raising=False`` --
+# that one simply errored, but nothing had run it end-to-end since the facade
+# collapse) and unnecessarily flagged in ``tests/test_browser_gateway.py``
+# (``raising=False`` on an attribute that has always resolved).
+
+
+def _flatten_attribute_chain(node: ast.expr) -> tuple[str, ...] | None:
+    """Flatten a bare ``Name``/``Attribute`` chain root-first: ``a.b.c`` -> ("a", "b", "c").
+
+    Returns None for anything else (string literals, calls, subscripts, ...) --
+    those are either the string-literal form (hand-audited) or not a
+    statically resolvable target at all.
+    """
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        parts.reverse()
+        return tuple(parts)
+    return None
+
+
+def _import_local_name_map(tree: ast.Module) -> dict[str, str]:
+    """Map every name one file's imports bind to its dotted source path."""
+    mapping: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    mapping[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    mapping[top] = top
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                mapping[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return mapping
+
+
+def _plain_object_setattr_targets(tree: ast.Module) -> tuple[tuple[str, bool], ...]:
+    """Return every ``(dotted_target, raising_false)`` pair from a
+    ``monkeypatch.setattr(<module-or-attribute-chain>, "literal_attr", value, ...)``
+    call whose first argument is a bare module/attribute-chain expression
+    resolvable through this file's own imports."""
+    import_map = _import_local_name_map(tree)
+    targets: list[tuple[str, bool]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setattr"
+            and len(node.args) >= 2
+        ):
+            continue
+        target_expr, attr_expr = node.args[0], node.args[1]
+        if not (isinstance(attr_expr, ast.Constant) and isinstance(attr_expr.value, str)):
+            continue
+        chain = _flatten_attribute_chain(target_expr)
+        if not chain:
+            continue
+        root, *rest = chain
+        if root not in import_map:
+            continue
+        dotted = ".".join([import_map[root], *rest, attr_expr.value])
+        targets.append((dotted, _setattr_raising_is_false(node)))
+    return tuple(targets)
+
+
+_KNOWN_RAISING_FALSE_CROSS_PLATFORM_EXEMPTIONS: dict[str, str] = {
+    "clio_relay.cluster_config.os.getuid": (
+        "test fakes os.name = 'posix' on Windows to exercise the POSIX "
+        "ownership branch; os.getuid must be created, not just overridden"
+    ),
+    "clio_relay.service_runtime.signal.SIGKILL": "POSIX-only signal constant, absent on Windows",
+    "clio_relay.service_runtime.os.pidfd_open": (
+        "Linux-only API (glibc >= 2.26), absent on Windows and older POSIX"
+    ),
+    "clio_relay.service_runtime.signal.pidfd_send_signal": (
+        "Linux-only API (glibc >= 2.26), absent on Windows and older POSIX"
+    ),
+    "clio_relay.service_runtime.os.killpg": "POSIX-only process-group signal, absent on Windows",
+}
+"""Dotted ``module...attr`` targets where ``raising=False`` is load-bearing
+because the attribute genuinely does not exist on every platform this suite
+runs on. Never a default escape hatch (design doc §4: "a temporary
+re-export ... is never an injection seam") -- an addition here must carry its
+own one-line reason in the same change that adds it."""
+
+
+def test_plain_object_monkeypatch_targets_resolve_and_raising_false_is_pinned() -> None:
+    """Every ``monkeypatch.setattr(<module-or-attr-chain>, "literal", ...)`` call
+    across ``tests/`` must name a real, resolvable attribute; ``raising=False``
+    on a target that resolves right now is a hard error unless the target is
+    pinned to the cross-platform allowlist above with a reason (F3,
+    closing-round review). This is the plain-object sibling of
+    ``test_dynamic_fstring_loop_monkeypatch_targets_resolve_or_are_registered``
+    above -- together they cover every shape a monkeypatch target can take
+    except the hand-audited string-literal path table.
+    """
+    unresolved: list[str] = []
+    unjustified_raising_false: list[str] = []
+    for test_file in sorted(_TESTS_ROOT.glob("test_*.py")):
+        tree = ast.parse(test_file.read_text(encoding="utf-8"), filename=test_file.name)
+        for dotted, raising_false in _plain_object_setattr_targets(tree):
+            if not dotted.startswith("clio_relay."):
+                continue
+            exempt = dotted in _KNOWN_RAISING_FALSE_CROSS_PLATFORM_EXEMPTIONS
+            resolves = _resolve_dotted_attribute_chain(dotted)
+            if not resolves and not exempt:
+                unresolved.append(f"{test_file.name}: {dotted}")
+                continue
+            if raising_false and resolves and not exempt:
+                unjustified_raising_false.append(f"{test_file.name}: {dotted}")
+    assert unresolved == []
+    assert unjustified_raising_false == []
+
+
+def test_guard_detects_a_dead_plain_object_seam_fixture() -> None:
+    """Fixture proof the plain-object extractor catches F3's exact break shape:
+    a real module target whose literal attribute name no longer exists."""
+    source = (
+        "def f(monkeypatch):\n"
+        "    monkeypatch.setattr(\n"
+        "        core_queue_module,\n"
+        '        "open_private_atomic_file",\n'
+        "        lambda *a, **k: None,\n"
+        "        raising=False,\n"
+        "    )\n"
+    )
+    tree = ast.parse(source)
+    tree_with_import = ast.parse("import clio_relay.core_queue as core_queue_module\n" + source)
+    targets = _plain_object_setattr_targets(tree)
+    assert targets == ()  # no import in this file -> the root name is unresolvable, skipped
+    targets_with_import = _plain_object_setattr_targets(tree_with_import)
+    assert targets_with_import == (("clio_relay.core_queue.open_private_atomic_file", True),)
+    assert _resolve_dotted_attribute_chain(targets_with_import[0][0]) is False
+
+
 def test_split_owners_never_import_the_core_queue_facade() -> None:
     """An extracted owner must never create a callback edge to ``core_queue``."""
     violations = [
@@ -781,15 +965,33 @@ def test_split_owners_never_import_the_core_queue_facade() -> None:
     assert violations == []
 
 
+def _owner_functions_and_class_methods(owner: str) -> set[str]:
+    """Return an owner's module-level function names, plus every class-level
+    method as ``"ClassName.method"`` (N12: a static/class method reached
+    through a depth-2 chain -- ``module.Class.method`` -- is the same bare-
+    alias hazard as a bare module function; ``functions_by_owner`` must name
+    it too, or a depth-2 alias like ``queue_artifacts.py``'s real
+    ``_require_durable_record_id = queue_layout.QueueLayout.
+    require_durable_record_id`` is invisible to the guard)."""
+    tree = _owner_tree(owner)
+    names = {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for class_node in tree.body:
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        names.update(
+            f"{class_node.name}.{member.name}"
+            for member in class_node.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    return names
+
+
 def test_split_owners_never_bare_import_cross_owner_functions() -> None:
     """Collaborator functions stay qualified by their owner module."""
     functions_by_owner = {
-        owner: {
-            node.name
-            for node in _owner_tree(owner).body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        for owner in _OWNER_MANIFEST
+        owner: _owner_functions_and_class_methods(owner) for owner in _OWNER_MANIFEST
     }
     violations: list[str] = []
     for caller in _OWNER_MANIFEST:
@@ -802,6 +1004,114 @@ def test_split_owners_never_bare_import_cross_owner_functions() -> None:
             )
         )
     assert violations == []
+
+
+def _core_queue_module_tree() -> ast.Module:
+    return ast.parse(
+        (_SOURCE_ROOT / "core_queue.py").read_text(encoding="utf-8"),
+        filename="core_queue.py",
+    )
+
+
+def _core_queue_alias_assignments(tree: ast.Module) -> dict[str, str]:
+    """Return ``{alias_name: "owner_module.attr"}`` for every module-level
+    ``NAME = owner_module.attr`` re-export in ``core_queue.py`` (skips
+    anything that is not a bare ``Name = <attribute chain on an imported
+    module>`` shape at module scope -- real facade logic lives in methods,
+    never module-level statements)."""
+    import_map = _import_local_name_map(tree)
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        chain = _flatten_attribute_chain(node.value)
+        if chain is None or len(chain) < 2:
+            continue
+        root, *rest = chain
+        if root not in import_map:
+            continue
+        aliases[target.id] = ".".join([import_map[root], *rest])
+    return aliases
+
+
+def test_core_queue_module_aliases_each_have_a_named_production_consumer() -> None:
+    """Every ``core_queue.py`` module-level re-export must have a real
+    consumer (F5, closing-round review): an audit of the pre-review 75 found
+    54 with zero consumers anywhere and 11 with test-only consumers -- both
+    classes deleted (the 11 retargeted to their real owner module in the
+    handful of tests that used them). A production consumer imports the name
+    directly from ``clio_relay.core_queue`` or accesses it as an attribute of
+    a module bound to ``clio_relay.core_queue``; a facade-internal consumer
+    is an unqualified reference inside ``core_queue.py``'s own body. A name
+    with neither is a dead re-export and must not re-accrete.
+    """
+    core_queue_tree = _core_queue_module_tree()
+    aliases = _core_queue_alias_assignments(core_queue_tree)
+    alias_def_lines = {
+        node.targets[0].lineno  # type: ignore[union-attr]
+        for node in core_queue_tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in aliases
+    }
+    facade_internal = {
+        node.id
+        for node in ast.walk(core_queue_tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in aliases
+        and node.lineno not in alias_def_lines
+    }
+
+    production_consumers: set[str] = set()
+    for py_file in sorted(_SOURCE_ROOT.glob("*.py")) + sorted(_SOURCE_ROOT.rglob("*/*.py")):
+        if py_file.name == "core_queue.py":
+            continue
+        file_tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
+        for node in ast.walk(file_tree):
+            if isinstance(node, ast.ImportFrom) and node.module in {
+                "clio_relay.core_queue",
+                "core_queue",
+            }:
+                production_consumers.update(
+                    alias.name for alias in node.names if alias.name in aliases
+                )
+        module_bound = _local_names_bound_to_core_queue(file_tree)
+        if module_bound:
+            for node in ast.walk(file_tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in module_bound
+                    and node.attr in aliases
+                ):
+                    production_consumers.add(node.attr)
+
+    violations = sorted(
+        name for name in aliases if name not in facade_internal and name not in production_consumers
+    )
+    assert violations == []
+
+
+def _local_names_bound_to_core_queue(tree: ast.Module) -> set[str]:
+    """Return local names one file binds to the ``core_queue`` module object
+    (``import clio_relay.core_queue as X`` / ``from clio_relay import
+    core_queue as X``), for resolving ``X.NAME`` attribute-access consumers."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {"clio_relay.core_queue", "core_queue"}:
+                    bound.add(alias.asname or alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom) and node.module == "clio_relay":
+            for alias in node.names:
+                if alias.name == "core_queue":
+                    bound.add(alias.asname or "core_queue")
+    return bound
 
 
 def test_split_owner_dependencies_follow_the_migration_topology() -> None:
@@ -2122,6 +2432,31 @@ def test_guard_rejects_bare_owner_assign_alias_fixture() -> None:
     )
 
 
+def test_guard_rejects_depth_two_bare_owner_assign_alias_fixture() -> None:
+    """N12 (closing-round review): a depth-2 chain (``module.Class.method``)
+    is the same bare-alias hazard as ``module.func`` and must be caught too
+    -- exactly the live shape at ``queue_artifacts.py``'s ``_require_
+    durable_record_id = queue_layout.QueueLayout.require_durable_record_id``,
+    which the depth-1-only guard silently missed before this fix."""
+    functions_by_owner = {"queue_layout": {"QueueLayout.require_durable_record_id"}}
+    tree = ast.parse("alias = queue_layout.QueueLayout.require_durable_record_id\n")
+
+    assert _bare_owner_import_lines(
+        tree,
+        caller="queue_artifacts",
+        functions_by_owner=functions_by_owner,
+    ) == [1]
+    # A same-owner assignment (no cross-owner rebinding) is not a violation.
+    assert (
+        _bare_owner_import_lines(
+            tree,
+            caller="queue_layout",
+            functions_by_owner=functions_by_owner,
+        )
+        == []
+    )
+
+
 def test_guard_rejects_package_from_core_import_fixture() -> None:
     """Package-from syntax cannot bypass the facade callback guard."""
     tree = ast.parse("from clio_relay import core_queue\n")
@@ -2159,26 +2494,175 @@ def test_queue_store_protocol_is_implemented_by_one_private_adapter(
     assert queue._layout._store is adapter  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
-def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
-    """Private owner wiring must not grow the public queue facade."""
-    public_methods = {
-        name
-        for name, member in inspect.getmembers(ClioCoreQueue)
-        if not name.startswith("_") and (inspect.isfunction(member) or isinstance(member, property))
-    }
+def _callable_member_names(klass: type, *, public: bool) -> set[str]:
+    """Return every routine/property member name visible on ``klass``.
 
-    assert len(public_methods) == 128
+    N11 (closing-round review): ``inspect.isfunction(member)`` alone is
+    blind to classmethods and staticmethods -- ``inspect.getmembers``
+    resolves a classmethod through its descriptor into a bound ``method``
+    object, which ``isfunction`` returns False for (``_scan_many`` silently
+    escaped both prior copies of this filter this way). ``inspect.isroutine``
+    covers functions, bound methods, staticmethods, and
+    ``functools.cached_property`` uniformly; ``isinstance(member, property)``
+    catches properties, which ``isroutine`` does not.
+    """
+    return {
+        name
+        for name, member in inspect.getmembers(klass)
+        if name.startswith("_") != public
+        and (inspect.isroutine(member) or isinstance(member, property))
+    }
 
 
 # CQ20's own acceptance test (design doc §3 row: "Run a reflection/MRO test
-# over every public method before deleting the last body"). Every public
-# ClioCoreQueue method must resolve -- through ordinary inherited attribute
-# lookup, walking the real MRO -- to a body defined on one of the composed
-# ``*Mixin`` owner classes, never to a body written directly on
-# ``ClioCoreQueue`` in core_queue.py. The two facade-legitimate exceptions
-# are pinned here by name, each with its own typed-deviation citation; an
-# addition to core_queue.py that grows this set must be added to the
-# allowlist explicitly in the same change, or this test goes red.
+# over every public method before deleting the last body"). The full public
+# surface is pinned by NAME, not just count (N11: a same-count swap -- one
+# method renamed while another moved on -- would slip past a bare
+# ``len(...) == 128`` check unnoticed).
+_FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
+    "acknowledge_execution_cleanup",
+    "acknowledge_job_cancellation",
+    "acquire_job",
+    "acquire_next_job",
+    "active_job_capacity",
+    "append_artifact",
+    "append_event",
+    "append_monitor_rule",
+    "append_progress",
+    "append_task",
+    "append_task_event",
+    "audit_lease_capacity",
+    "begin_gateway_browser_attachment_revoke",
+    "begin_input_ingest",
+    "cancel_job_if_active",
+    "claim_scheduler_cancel_attempt",
+    "claim_scheduler_cancel_confirmation",
+    "clear_owner_session_closing",
+    "close_gateway_session",
+    "collect_terminal_job",
+    "complete_gateway_browser_attachment",
+    "complete_input_ingest",
+    "complete_scheduler_cancel_identity_scan",
+    "create_gateway_session",
+    "drain_events",
+    "drain_task_events",
+    "ensure_scheduler_cancel_pending",
+    "fail_input_ingest",
+    "finalize_scheduler_cancel_identities",
+    "finish_gateway_browser_attachment_revoke",
+    "get_artifact",
+    "get_endpoint",
+    "get_gateway_session",
+    "get_jarvis_package_input_contract",
+    "get_jarvis_pipeline_input_bindings",
+    "get_jarvis_pipeline_input_lineage",
+    "get_jarvis_run_input_manifest",
+    "get_job",
+    "get_job_tombstone",
+    "get_mcp_task",
+    "get_owner_session_cleanup_intent",
+    "get_owner_session_closed",
+    "get_scheduler_cancel_disposition",
+    "get_scheduler_cancel_pending",
+    "get_task",
+    "get_transform_ref",
+    "index_migration_status",
+    "initialize",
+    "job_artifact_count",
+    "job_has_pending_execution_cleanup",
+    "latest_job_event",
+    "latest_job_progress",
+    "lease_admission_capacity_snapshot",
+    "list_artifact_users_page",
+    "list_artifacts",
+    "list_artifacts_page",
+    "list_endpoints",
+    "list_endpoints_page",
+    "list_gateway_sessions",
+    "list_gateway_sessions_page",
+    "list_jobs",
+    "list_jobs_page",
+    "list_leases",
+    "list_monitor_rules",
+    "list_monitor_rules_page",
+    "list_owner_session_jobs_page",
+    "list_progress",
+    "list_progress_page",
+    "list_tasks",
+    "list_tasks_page",
+    "list_used_artifacts_page",
+    "merge_jarvis_pipeline_input_lineage",
+    "migrate_execution_cleanup_plan",
+    "migrate_indexes_batch",
+    "mirror_owner_session_generation_open",
+    "owner_session_generation_status",
+    "owner_session_is_closing",
+    "plan_terminal_job_gc",
+    "prepare_gateway_browser_attachment",
+    "prepare_gateway_teardown_intent",
+    "prepare_owner_session_start",
+    "put_jarvis_package_input_contract",
+    "put_jarvis_run_input_manifest",
+    "put_mcp_task",
+    "read_event_page",
+    "readiness_info",
+    "reconcile_input_artifact",
+    "reconcile_pending_transitions",
+    "record_scheduler_cancel_attempt",
+    "record_scheduler_cancel_observation",
+    "record_transform_ref",
+    "recover_abandoned_input_ingests",
+    "recover_stale_job",
+    "recover_stale_jobs",
+    "register_endpoint",
+    "register_execution_cleanup",
+    "register_scheduler_cancel_identity",
+    "register_scheduler_cancel_identity_once",
+    "release_lease",
+    "renew_lease",
+    "reopen_owner_session",
+    "repair_lease_operational_indexes",
+    "resolve_idempotent_submission",
+    "scan_active_jobs",
+    "scan_due_scheduler_cancellations",
+    "scan_endpoints",
+    "scan_execution_cleanup",
+    "scan_fresh_endpoints",
+    "scan_fresh_endpoints_read_only",
+    "scan_gateway_sessions",
+    "scan_job_leases",
+    "scan_job_tasks",
+    "scan_jobs",
+    "scan_leases",
+    "scan_monitor_rules",
+    "set_owner_session_closed",
+    "set_owner_session_closing",
+    "stage_execution_cleanup_sidecar",
+    "submit_and_acquire_job",
+    "submit_job",
+    "update_gateway_session",
+    "update_jarvis_pipeline_input_bindings",
+    "update_job_metadata",
+    "update_job_state",
+    "update_mcp_task_projection",
+    "update_monitor_rule",
+    "update_task_metadata",
+    "update_task_state",
+)
+
+
+def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
+    """Private owner wiring must not grow the public queue facade."""
+    public_methods = _callable_member_names(ClioCoreQueue, public=True)
+
+    assert public_methods == set(_FACADE_PUBLIC_METHOD_NAMES)
+    assert len(_FACADE_PUBLIC_METHOD_NAMES) == 128
+
+
+# The two facade-legitimate exceptions to "every public method resolves to a
+# composed owner" are pinned here by name, each with its own typed-deviation
+# citation; an addition to core_queue.py that grows this set must be added
+# to the allowlist explicitly in the same change, or the test below goes red.
 _FACADE_RESIDENT_PUBLIC_METHODS: frozenset[str] = frozenset(
     {
         # CQ19-ST-02: a thin dispatch to the bare module-level
@@ -2195,12 +2679,58 @@ _FACADE_RESIDENT_PUBLIC_METHODS: frozenset[str] = frozenset(
 )
 
 
+# N10 (closing-round review): the private sibling of
+# ``_FACADE_RESIDENT_PUBLIC_METHODS`` above, pinned at the measured
+# post-F5/N6/N8/N9 set -- every private (``_``-prefixed) name still defined
+# directly on ``ClioCoreQueue`` rather than inherited from a composed
+# ``*Mixin`` owner. Each carries its own citation; an addition here without
+# one is a regrowth of the facade this whole closing round exists to stop,
+# even while ``core_queue.py`` itself stays comfortably under the 800-line
+# gate (a line-count cap alone cannot see a name creeping back onto the
+# class body it was supposed to leave).
+_FACADE_RESIDENT_PRIVATE_METHODS: frozenset[str] = frozenset(
+    {
+        # Every class defines its own constructor; there is no owner to
+        # inherit it from.
+        "__init__",
+        # CQ20-FA-01 store-adapter hub family (§15.2): `_write`/
+        # `_read_optional` are called by `_QueueStoreAdapter` as
+        # `self._queue._write(...)` etc, and routing through the *instance*
+        # rather than the bare module function is what keeps a real,
+        # live `monkeypatch.setattr(queue, "_write", ...)`-style test seam
+        # working. `_job_record_path` (26 callers) and `_scan_many`
+        # (inherited directly by `storage_runtime.StorageManagedQueue`)
+        # are the family's other two hub members.
+        "_write",
+        "_read_optional",
+        "_job_record_path",
+        "_scan_many",
+        # CQ13-IO-01/CQ19-TI-01 write-ahead-log family (queue_transitions.py
+        # module docstring): each self-called from many already-landed
+        # owners spanning the full rank range, so none carry an
+        # architecture-guard edge regardless of rank.
+        "_write_transition_intent_unlocked",
+        "_recover_pending_transitions_unlocked",
+        "_read_index_migration_state",
+        "_write_index_migration_state",
+        "_require_index_migration_complete",
+        "_lease_capacity_migration_complete_unlocked",
+        "_assert_input_ingest_quota_unlocked",
+    }
+)
+
+
 def _mro_defining_class(name: str) -> type:
     """Return the first class in ``ClioCoreQueue.__mro__`` that defines ``name``."""
     for klass in ClioCoreQueue.__mro__:
         if name in vars(klass):
             return klass
     raise AssertionError(f"{name!r} is not defined anywhere in the ClioCoreQueue MRO")
+
+
+def _owner_module_name(klass: type) -> str:
+    """Return ``klass``'s module stem (``clio_relay.queue_x`` -> ``queue_x``)."""
+    return klass.__module__.rsplit(".", 1)[-1]
 
 
 def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist() -> None:
@@ -2210,18 +2740,17 @@ def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist(
     facade_public_method_set_stays_at_the_128_method_base``) and asserts
     each one's real defining class -- found by walking ``ClioCoreQueue.
     __mro__`` in resolution order, the same lookup Python itself performs --
-    is a composed ``*Mixin`` owner, never ``ClioCoreQueue`` itself, except
-    the two names in ``_FACADE_RESIDENT_PUBLIC_METHODS`` above. Those two are
+    is a composed owner mixin, never ``ClioCoreQueue`` itself, except the
+    two names in ``_FACADE_RESIDENT_PUBLIC_METHODS`` above. Those two are
     checked in the opposite direction: each must still genuinely be defined
     directly on ``ClioCoreQueue``, so the allowlist cannot silently go stale
-    if a future slice moves one of them into a real owner.
+    if a future slice moves one of them into a real owner. N11: "owner
+    mixin" is proven by ``__module__`` membership in ``_OWNER_MANIFEST``,
+    not a ``*Mixin`` name-suffix guess -- a class can rename without ever
+    tripping this proof either way.
     """
-    public_methods = {
-        name
-        for name, member in inspect.getmembers(ClioCoreQueue)
-        if not name.startswith("_") and (inspect.isfunction(member) or isinstance(member, property))
-    }
-    assert public_methods >= _FACADE_RESIDENT_PUBLIC_METHODS
+    public_methods = _callable_member_names(ClioCoreQueue, public=True)
+    assert public_methods == set(_FACADE_PUBLIC_METHOD_NAMES)
 
     for name in sorted(public_methods - _FACADE_RESIDENT_PUBLIC_METHODS):
         defining_class = _mro_defining_class(name)
@@ -2231,8 +2760,9 @@ def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist(
             "_FACADE_RESIDENT_PUBLIC_METHODS with a typed-deviation citation "
             "if it is genuinely facade-legitimate."
         )
-        assert defining_class.__name__.endswith("Mixin"), (
-            f"{name!r} resolves to {defining_class!r}, which is not a *Mixin owner class."
+        assert _owner_module_name(defining_class) in _OWNER_MANIFEST, (
+            f"{name!r} resolves to {defining_class!r}, whose module "
+            f"{defining_class.__module__!r} is not a discovered owner."
         )
 
     for name in sorted(_FACADE_RESIDENT_PUBLIC_METHODS):
@@ -2241,6 +2771,22 @@ def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist(
             "facade-resident deviation, but it is no longer defined on "
             "ClioCoreQueue -- remove it from the allowlist."
         )
+
+
+def test_facade_private_method_set_stays_pinned() -> None:
+    """N10 (closing-round review): pin the facade's private residents.
+
+    A god-file regrowth doesn't have to add physical lines to be a
+    regression -- a private method quietly re-landing directly on
+    ``ClioCoreQueue`` instead of its owner mixin regrows the facade while
+    ``core_queue.py`` can stay comfortably under the 800-line gate the whole
+    time. This pins the exact measured set (post-F5/N6/N8/N9) by name, the
+    private sibling of ``_FACADE_RESIDENT_PUBLIC_METHODS``/``test_every_
+    public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist`` above.
+    """
+    private_methods = _callable_member_names(ClioCoreQueue, public=False)
+    resident = {name for name in private_methods if _mro_defining_class(name) is ClioCoreQueue}
+    assert resident == _FACADE_RESIDENT_PRIVATE_METHODS
 
 
 def test_index_completeness_gate_reads_through_the_cq5_owner(
@@ -2257,7 +2803,7 @@ def test_index_completeness_gate_reads_through_the_cq5_owner(
     (migrations / "index-v1.json").write_text(
         json.dumps(
             {
-                "schema_version": core_queue_module.INDEX_MIGRATION_SCHEMA,
+                "schema_version": queue_layout.INDEX_MIGRATION_SCHEMA,
                 "complete": True,
             }
         ),
@@ -2294,7 +2840,7 @@ def test_cq5_sealed_state_preserves_duplicate_key_rejection(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(core_queue_module.LegacyQueueStateError) as raised:
+    with pytest.raises(queue_store_lock.LegacyQueueStateError) as raised:
         ClioCoreQueue(tmp_path)._read_sealed_state()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert isinstance(raised.value.__cause__, QueueConflictError)
@@ -2419,7 +2965,7 @@ def test_legacy_output_decoder_lookup_is_owned_by_the_cq4_module(
         raise _CodecLookupSabotage("queue_legacy_output_codec decoder lookup engaged")
 
     monkeypatch.setattr(queue_legacy_output_codec, "decode_v09_legacy_output_record", sabotage)
-    text = "x" * (core_queue_module.RECORD_FAMILY_MAX_BYTES["events"] + 1)
+    text = "x" * (queue_layout.RECORD_FAMILY_MAX_BYTES["events"] + 1)
     path = tmp_path / "legacy.json"
     path.write_text(
         json.dumps(

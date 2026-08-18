@@ -187,10 +187,27 @@ RATCHET_BASELINE: dict[str, int] = {
     # queue_tasks.py and queue_progress.py owners. No typed deviation: every
     # collaborator (queue_jobs.get_job, queue_events.append_event, every
     # queue_order_index job-index primitive) is an already-landed
-    # earlier-ranked owner, and _sync_scheduler_source_unlocked/
-    # _job_record_path/_write_transition_intent_unlocked/
-    # _recover_pending_transitions_unlocked stay facade-resident (still
-    # un-extracted, self-called as before). Net: 8430 -> 8009.
+    # earlier-ranked owner, and _job_record_path/_write_transition_intent_
+    # unlocked/_recover_pending_transitions_unlocked stay facade-resident
+    # (still un-extracted, self-called as before). _sync_scheduler_source_
+    # unlocked stayed facade-resident too at CQ14 landing time, but was
+    # itself extracted later, to queue_gateway_indexes.py at CQ16 -- this
+    # net delta is unaffected (it predates that move), corrected here only
+    # so the claim does not go on describing a fact that stopped being true
+    # two slices later (N14, closing-round review). Net: 8430 -> 8009.
+    # #231 CQ15 (N14, closing-round review: this entry was missing): the
+    # lease/recovery family, seven owners -- queue_lease_indexes,
+    # queue_lease_capacity_state, queue_lease_capacity_audit, queue_lease_
+    # recovery, queue_lease_admission (gate-forced split from queue_leases
+    # at 854 > 800, zero call-graph overlap), queue_leases, queue_
+    # scheduler_cancel_claims. 27 delegating tail shims deleted; residual
+    # facade call sites rewired to direct module calls. Typed deviations:
+    # CQ15-LR-01 (_delete_lease_unlocked hosted on queue_lease_recovery to
+    # break a genuine admission<->recovery cycle, ledger §9.3 precedent);
+    # the sync_operational_indexes module twin (design-prescribed patchable
+    # seam); the gate-forced admission split above. _is_sha256_digest: no
+    # lease-recovery copy exists -- the facade copy stays with its unmoved
+    # job-GC callers (CQ18, §13.3). Net: 8009 -> 4848.
     # #231 CQ16: gateways, browser attachments, gateway indexes, and monitor
     # rules move to queue_gateways.py / queue_browser_attachments.py /
     # queue_gateway_indexes.py / queue_monitor_rules.py. Net: 4848 -> 3606.
@@ -207,10 +224,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # batch driver to queue_index_migration.py, the transition-intent
     # applier to queue_transitions.py, and queue startup (initialize plus
     # its locked-core/permission-repair helpers) to queue_startup.py. Net:
-    # 2077 -> 713 -- under the 800-line default cap, so core_queue.py drops
-    # out of the ratchet baseline entirely (this script's own documented
-    # convention: "remove the entry once the file is under
-    # DEFAULT_MAX_LINES").
+    # 2077 -> 746 (corrected from a stale "713" -- the real count at the
+    # CQ19 landing commit, 17061e4 -- N14, closing-round review) -- under
+    # the 800-line default cap, so core_queue.py drops out of the ratchet
+    # baseline entirely (this script's own documented convention: "remove
+    # the entry once the file is under DEFAULT_MAX_LINES").
     "src/clio_relay/deployment.py": 1243,
     "src/clio_relay/door_error_adapters.py": 168,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
@@ -389,7 +407,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
     # while exposing only StorageDecision.message, never its serialized
     # exception payload.
-    "src/clio_relay/storage_runtime.py": 1122,
+    "src/clio_relay/storage_runtime.py": 1124,
+    # N13 (closing-round review): +2 lines -- the blanket `# pyright:
+    # ignore` on the cross-owner `_job_matches_mcp_admission_class` import
+    # is re-narrowed to `[reportPrivateUsage]`, which forces the import
+    # onto its own three-line parenthesized form to keep the ignore
+    # comment on the diagnostic's own line under the 100-col limit.
     # #231 R4: local-visitor spawn/health/cleanup delegates to the new
     # frp_link.py substrate (HeldFrpVisitor) instead of duplicating it;
     # run_frp_http_probe collapses into a thin proxy_type="stcp" wrapper

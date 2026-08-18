@@ -16,10 +16,15 @@ from clio_relay import (
     queue_startup,
     worker_lifetime_lock,
 )
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.worker_lifetime_lock import WorkerLifetimeLock, WorkerLifetimeLockUnavailable
+from clio_relay.queue_store_lock import LegacyQueueStateError
+from clio_relay.worker_lifetime_lock import (
+    LockedCoreIdentity,
+    WorkerLifetimeLock,
+    WorkerLifetimeLockUnavailable,
+)
 
 
 def _job(identity: str) -> RelayJob:
@@ -135,6 +140,47 @@ def test_missing_seal_is_written_once_while_exclusive_writer_ownership_is_active
     ClioCoreQueue(root).initialize()
 
     assert sealed_phases == ["marker"]
+
+
+def test_reentrant_initialize_dispatch_honors_a_subclass_override(
+    tmp_path: Path,
+) -> None:
+    """Both re-entrant ``initialize`` call sites must virtually dispatch
+    through the runtime type, not call the bare module function directly
+    (F4, closing-round review). A fresh root's missing-seal path re-enters
+    ``initialize`` twice more internally (once with ``locked_core`` set from
+    ``_initialize_with_exclusive_lifetime``, once more from
+    ``_initialize_under_locked_core``); a de-virtualized re-entry would
+    silently skip a subclass override exactly as it silently skipped
+    ``StorageManagedQueue.initialize``'s closed-guard and forced
+    ``allow_exclusive_seal=False`` in production."""
+    calls: list[LockedCoreIdentity | None] = []
+
+    class _OverridingQueue(ClioCoreQueue):
+        def initialize(
+            self,
+            *,
+            migrate_legacy_output: bool = False,
+            locked_core: LockedCoreIdentity | None = None,
+            allow_exclusive_seal: bool = True,
+        ) -> None:
+            calls.append(locked_core)
+            super().initialize(
+                migrate_legacy_output=migrate_legacy_output,
+                locked_core=locked_core,
+                allow_exclusive_seal=allow_exclusive_seal,
+            )
+
+    queue = _OverridingQueue(tmp_path / "core")
+    queue.initialize()
+
+    # entries: outer call (locked_core=None), the exclusive-lifetime
+    # re-entry (locked_core set), and the locked-core re-entry (locked_core
+    # cleared again once the swapped root is authoritative).
+    assert len(calls) == 3
+    assert calls[0] is None
+    assert calls[1] is not None
+    assert calls[2] is None
 
 
 def test_sealed_startup_refuses_malformed_index_state_without_repair_or_glob(

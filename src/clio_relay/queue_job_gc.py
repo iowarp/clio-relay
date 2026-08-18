@@ -25,18 +25,22 @@ throughout the trash-staging walk, plus the paired ``queue_gc_storage.
 purge_tree_batch``/``after_gc_checkpoint`` lookups -- all three patchable
 via ``monkeypatch.setattr(queue_job_gc, "queue_gc_storage", isolated_ns)``.
 
-``_is_sha256_digest`` dedup (ledger §9.6/§10.4 follow-up): this slice is the
-one ledger §9.6 names as owning the facade's copy's real disposition, since
-its only two callers (``_terminal_job_gc_protections``, ``_read_committed_
-job_digest``) move here. The facade's now-orphaned copy is deleted outright
-(not moved) -- this module keeps its own private duplicate, matching the
-already-established per-owner idiom (``queue_jobs.py``, ``queue_artifact_
-lineage.py``, ``queue_lease_records.py``, ``queue_legacy_output_codec.py``
-each already keep one). ``queue_jobs``/``queue_artifact_lineage`` keep
-their own existing copies unchanged: importing this module's copy would be
-a reverse-rank edge (both rank well before this owner), so per-owner
-duplication -- not a single shared import -- is the correct resolution here,
-not an oversight.
+``_is_sha256_digest`` dedup (ledger §9.6/§10.4 follow-up, resolved -- census
+corrected N14, closing-round review): this slice is the one ledger §9.6
+names as owning the facade's copy's real disposition, since its only two
+callers (``_terminal_job_gc_protections``, ``_read_committed_job_digest``)
+move here. The facade's now-orphaned copy is deleted outright (not moved)
+-- this module keeps its own private duplicate, one of **six** total
+holders (this module, ``queue_jobs.py``, ``queue_artifact_lineage.py``,
+``queue_job_gc_protections.py``, ``queue_lease_records.py``,
+``queue_legacy_output_codec.py``) plus **one** consumer
+(``queue_idempotency.py``, which reaches into ``queue_lease_records``'s
+copy module-qualified rather than holding its own -- design doc §13.3's
+full census). The other five holders keep their own existing copies
+unchanged: importing this module's copy would be a reverse-rank edge for
+every one of them (all rank well before this owner), so per-owner
+duplication -- not a single shared import -- is the correct resolution
+here, not an oversight.
 """
 
 from __future__ import annotations

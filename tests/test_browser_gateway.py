@@ -335,7 +335,6 @@ def test_browser_gateway_extends_response_header_timeout_only_for_commands(
         browser_gateway_module,
         "UPSTREAM_COMMAND_RESPONSE_TIMEOUT_SECONDS",
         0.75,
-        raising=False,
     )
     with _delayed_response_backend(delay_seconds=0.25) as (backend_port, requests):
         capability = "d" * 43

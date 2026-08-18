@@ -205,7 +205,7 @@ class QueueEndpointsMixin(queue_order_index.QueueOrderIndexMixin):
             roots = [
                 self._storage_root
                 / "endpoints_fresh"
-                / queue_order_index._stable_ref_token(cluster)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                / queue_order_index._single_value_ref_token(cluster)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ]
         else:
             roots = []
@@ -277,12 +277,12 @@ class QueueEndpointsMixin(queue_order_index.QueueOrderIndexMixin):
     def _index_fresh_endpoint_unlocked(self, endpoint: EndpointRegistration) -> None:
         """Move one endpoint's mutable presence record into its current time bucket."""
         cluster_identity = endpoint.cluster or "__desktop__"
-        cluster_token = queue_order_index._stable_ref_token(cluster_identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster_token = queue_order_index._single_value_ref_token(cluster_identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         bucket = _endpoint_fresh_bucket(endpoint.last_seen_at)
         mapping_path = (
             self._storage_root
             / "endpoints_fresh_by_id"
-            / f"{queue_order_index._stable_ref_token(endpoint.endpoint_id)}.json"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            / f"{queue_order_index._single_value_ref_token(endpoint.endpoint_id)}.json"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         )
         previous: dict[str, object] | None = None
         try:
