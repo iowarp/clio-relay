@@ -26,7 +26,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import RelayError, RemoteExecutableMissingError
 from clio_relay.installation import InstallReceipt
 from clio_relay.session_lifecycle import (
     SESSION_CONNECTORS_CHECK_ID,
@@ -4748,7 +4748,9 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
     def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        raise RelayError("bounded command timed out after 120 seconds")
+        raise session_lifecycle._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "bounded command timed out after 120 seconds"
+        )
 
     monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
 
@@ -4757,6 +4759,226 @@ def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) ->
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             session_id="session-1",
         )
+
+
+def test_absent_relay_executable_is_typed_rather_than_ambiguous(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Exit 127 proves the command never ran -- that is NOT transport ambiguity.
+
+    clio-relay#158: a dead relay_executable pointer surfaced as
+    _RemoteSessionCommandAmbiguous, which means "we cannot tell whether the
+    remote transition happened". Shell status 127 proves nothing executed, so
+    there is no durable ambiguity to preserve -- and reporting one sends the
+    caller to poll a session that was never started.
+    """
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert not isinstance(
+        captured.value,
+        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_durable_start_resolves_transport_ambiguity_instead_of_escaping(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An ambiguous transport must be RESOLVED against durable state, not raised.
+
+    _RemoteSessionCommandAmbiguous was raised by the transport but never
+    handled by start_remote_session_durable, so it escaped as a bare
+    RelayError -- discarding the durable start the caller may well have
+    created.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def ambiguous(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise session_lifecycle._RemoteSessionCommandAmbiguous(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "transport ended without an exact structured response"
+        )
+
+    def ready_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _durable_start_status(plan, state="ready")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", ready_status)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=ambiguous,
+    )
+
+    assert result.state == "ready"
+
+
+def test_durable_start_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A broken deployment must stay typed, never become a retryable 'starting'.
+
+    query_remote_session_start converts any RelayError from the status probe
+    into start_state="starting", retryable=True. If a missing executable
+    reached that path it would be reported as a session that is merely still
+    coming up -- the exact silent degradation the no-silent-fallback rule
+    forbids, since every retry hits the same dead pointer.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def missing(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise RemoteExecutableMissingError(
+            "configured relay_executable is absent on the remote host",
+            exit_status=127,
+        )
+
+    def unexpected_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise AssertionError("a dead pointer must not be polled as a live session")
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unexpected_status)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_lifecycle.start_remote_session_durable(
+            definition=definition,
+            plan=plan,
+            api_token=None,
+            expected_api_release_identity=release,
+            starter=missing,
+        )
+
+
+def test_poll_path_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The REAL poll path must not turn a dead pin into a retryable 'starting'.
+
+    Review F2: status_remote_session_start catches only the deadline, so the
+    typed RemoteExecutableMissingError raised by _ssh_script fell through to
+    query_remote_session_start's blanket ``except RelayError``, which rewrites
+    ANY failure as start_state="starting", start_retryable=True. That
+    reproduces the exact retry-forever bug the typed-127 work claims to remove:
+    every retry re-executes the same missing binary.
+
+    Drives the real _ssh_script (via the bounded-command seam), NOT a
+    monkeypatched status function -- the earlier durable-start test stubbed
+    status_remote_session_start and so could never see this.
+    """
+    definition, _release, plan = _durable_start_plan()
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_lifecycle.query_remote_session_start(definition=definition, plan=plan)
+
+
+def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch) -> None:
+    """Review F3: the stdin transport needs the same typed 127 discrimination.
+
+    Its cleanup/report callers otherwise still receive an untyped RelayError
+    carrying a raw shell blob when the pin is dead.
+    """
+
+    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+            input_bytes=b"{}",
+            input_limit=1024,
+            stdout_limit=1024,
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert captured.value.exit_status == 127
+
+
+def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> None:
+    """The transport deadline must be discriminable by type, never by message text."""
+    assert issubclass(
+        session_lifecycle._BoundedCommandTimeout,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        RelayError,
+    )
+
+
+def test_typed_bounded_timeout_routes_to_the_session_deadline(monkeypatch: MonkeyPatch) -> None:
+    """A real transport deadline reaches _RemoteSessionCommandDeadline by TYPE."""
+
+    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_lifecycle._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
+
+    with pytest.raises(session_lifecycle._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+
+def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Prose must never decide control flow (clio-relay#158 root fix).
+
+    A remote failure that merely MENTIONS a timeout -- e.g. the cluster
+    reporting that some upstream job timed out -- is not a local transport
+    deadline. Classifying it as one routes into the deadline RETRY path,
+    which re-drives a command that already failed for an unrelated reason.
+    """
+
+    def failed(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise RelayError("remote refused the request: an upstream job timed out earlier")
+
+    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", failed)
+
+    with pytest.raises(RelayError) as captured:
+        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+    assert not isinstance(
+        captured.value,
+        session_lifecycle._RemoteSessionCommandDeadline,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
 
 def test_detach_remote_session_retains_verified_remote_api(monkeypatch: MonkeyPatch) -> None:

@@ -37,7 +37,13 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
-from clio_relay.errors import RelayError
+from clio_relay.errors import (
+    SHELL_COMMAND_NOT_FOUND_STATUS,
+    RelayError,
+    RemoteExecutableMissingError,
+    relay_executable_missing,
+)
+from clio_relay.errors import BoundedCommandTimeout as _BoundedCommandTimeout
 from clio_relay.identifiers import DurableRecordId, validate_durable_record_id
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
@@ -3931,7 +3937,9 @@ def _run_bounded_command(
             require_enforceable=os.name == "nt",
         )
     except BoundedProcessTimeout as exc:
-        raise RelayError(f"bounded command timed out after {timeout_seconds:g} seconds") from exc
+        raise _BoundedCommandTimeout(
+            f"bounded command timed out after {timeout_seconds:g} seconds"
+        ) from exc
     except BoundedProcessOutputLimit as exc:
         raise RelayError("bounded command output exceeded its byte limit") from exc
     except BoundedProcessError as exc:
@@ -7109,6 +7117,14 @@ def query_remote_session_start(
             selector=plan.status_selector,
             wait_seconds=wait_seconds,
         )
+    except RemoteExecutableMissingError:
+        # A dead pin is a broken DEPLOYMENT, not an in-flight start: the shell
+        # executed nothing, and every retry re-executes the same missing
+        # binary. Laundering it into starting/retryable below would rebuild the
+        # retry-forever loop the typed 127 discrimination exists to remove
+        # (clio-relay#158). Genuinely ambiguous transport errors still fall
+        # through to the recovery status, which is what that path is for.
+        raise
     except RelayError as exc:
         status = OwnedSessionRecoveryStatus(
             cluster=plan.cluster,
@@ -7217,6 +7233,11 @@ def start_remote_session_durable(
             plan=plan,
             transport_deadline_exceeded=True,
         )
+    except _RemoteSessionCommandAmbiguous:
+        # The durable start may exist: resolve it against remote state instead
+        # of escaping as a bare RelayError. Not a deadline, so the flag stays
+        # false (clio-relay#158).
+        return query_remote_session_start(definition=definition, plan=plan)
     except _RemoteSessionCommandRejected as exc:
         rejection = exc.rejection
         if not (
@@ -7710,6 +7731,29 @@ def _validate_durable_session_identity(value: str, *, field: str) -> str:
         raise RelayError(f"invalid {field}: {error}") from error
 
 
+def _raise_if_relay_executable_missing(
+    definition: ClusterDefinition,
+    *,
+    returncode: int,
+    detail: str,
+) -> None:
+    """Refuse a dead registry pin with a typed, repairable error.
+
+    Shell status 127 proves the remote shell executed nothing, so no durable
+    transition can have occurred -- there is no ambiguity to preserve and no
+    session to poll (clio-relay#158).
+    """
+    if returncode != SHELL_COMMAND_NOT_FOUND_STATUS:
+        return
+    raise relay_executable_missing(
+        cluster=definition.name,
+        ssh_host=definition.ssh_host,
+        relay_executable=definition.relay_executable,
+        detail=detail,
+        exit_status=returncode,
+    )
+
+
 def _ssh_script(
     definition: ClusterDefinition,
     script: str,
@@ -7729,16 +7773,17 @@ def _ssh_script(
             stdout_limit=_MAX_REMOTE_SESSION_STDOUT_BYTES,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
+    except _BoundedCommandTimeout as exc:
+        raise _RemoteSessionCommandDeadline(
+            f"remote session command timed out after {timeout_seconds:g} seconds"
+        ) from exc
     except RelayError as exc:
-        if "timed out" in str(exc):
-            raise _RemoteSessionCommandDeadline(
-                f"remote session command timed out after {timeout_seconds:g} seconds"
-            ) from exc
         raise RelayError(f"remote session command failed safely: {exc}") from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
+        _raise_if_relay_executable_missing(definition, returncode=result.returncode, detail=detail)
         try:
             rejection = OwnedSessionStartRejection.model_validate_json(stdout)
         except ValueError:
@@ -7775,17 +7820,18 @@ def _ssh_stdin_command(
             stdout_limit=stdout_limit,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
+    except _BoundedCommandTimeout as exc:
+        raise _RemoteSessionCommandDeadline(
+            "remote session command timed out after "
+            f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
+        ) from exc
     except RelayError as exc:
-        if "timed out" in str(exc):
-            raise RelayError(
-                "remote session command timed out after "
-                f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
-            ) from exc
         raise RelayError(f"remote session command failed safely: {exc}") from exc
     if result.returncode != 0:
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or stdout
+        _raise_if_relay_executable_missing(definition, returncode=result.returncode, detail=detail)
         raise RelayError(f"remote session command failed: {detail}")
     return result.stdout.decode("utf-8", errors="replace")
 

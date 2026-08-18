@@ -27,7 +27,14 @@ from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
 )
-from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
+from clio_relay.errors import (
+    SHELL_COMMAND_NOT_FOUND_STATUS,
+    ConfigurationError,
+    ObservationTimeoutError,
+    RelayError,
+    RemoteCommandFailed,
+    relay_executable_missing,
+)
 from clio_relay.jarvis_mcp import JARVIS_MCP_SPACK_COMMAND_ENV
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
 
@@ -244,11 +251,15 @@ def run_remote_shell(definition: ClusterDefinition, script: str) -> str:
     except OSError as exc:
         raise RelayError(f"remote command could not start: {definition.ssh_host}: {exc}") from exc
     if result.returncode != 0:
-        raise _remote_command_failure(result)
+        raise _remote_command_failure(result, definition=definition)
     return result.stdout.decode("utf-8", errors="replace")
 
 
-def _remote_command_failure(result: subprocess.CompletedProcess[bytes]) -> RelayError:
+def _remote_command_failure(
+    result: subprocess.CompletedProcess[bytes],
+    *,
+    definition: ClusterDefinition | None = None,
+) -> RelayError:
     """Build the typed error for a failed remote command.
 
     A2/A1 (#231 R6 review): a remote CLI guard (e.g. ``job read-artifact``)
@@ -257,6 +268,12 @@ def _remote_command_failure(result: subprocess.CompletedProcess[bytes]) -> Relay
     ``bounded_payload.parse_delivery_refusal``, so its own typed code/
     message surfaces instead of the generic "remote command failed: <raw
     stdout+stderr blob>" that discards the structure.
+
+    Exit status 127 is the POSIX shell's "command not found" and is a
+    STRUCTURED signal, not prose: for a cluster-targeted invocation it means
+    the registry's ``relay_executable`` no longer exists on the host. That
+    gets its own repairable type (clio-relay#158) so a dead registry pointer
+    is distinguishable from a genuine remote failure.
     """
     refusal = parse_delivery_refusal(result.stdout)
     if refusal is not None:
@@ -264,7 +281,18 @@ def _remote_command_failure(result: subprocess.CompletedProcess[bytes]) -> Relay
         return RelayError(
             f"remote command refused delivery ({code}): {describe_delivery_refusal(refusal)}"
         )
-    return RelayError(_command_error("remote command failed", result))
+    if result.returncode == SHELL_COMMAND_NOT_FOUND_STATUS and definition is not None:
+        return relay_executable_missing(
+            cluster=definition.name,
+            ssh_host=definition.ssh_host,
+            relay_executable=definition.relay_executable,
+            detail=_command_error("remote detail", result).removeprefix("remote detail: "),
+            exit_status=result.returncode,
+        )
+    return RemoteCommandFailed(
+        _command_error("remote command failed", result),
+        exit_status=result.returncode,
+    )
 
 
 def write_remote_file(definition: ClusterDefinition, remote_path: str, data: bytes) -> None:

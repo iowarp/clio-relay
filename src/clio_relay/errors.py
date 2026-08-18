@@ -81,3 +81,75 @@ class TaskInputParkConflictError(QueueConflictError):
 
 class NotFoundError(PublicMessageError, RelayError):
     """Raised when a requested record is missing."""
+
+
+SHELL_COMMAND_NOT_FOUND_STATUS = 127
+"""POSIX shell exit status for "command not found".
+
+A structured protocol signal (not prose), so classifying on it is typed
+discrimination rather than message matching.
+"""
+
+
+class BoundedCommandTimeout(RelayError):
+    """A locally bounded child command exceeded its own deadline.
+
+    Carried as a DISTINCT TYPE so callers discriminate a real transport
+    deadline structurally. Flattening the underlying timeout into a prose
+    ``RelayError`` forced callers to re-sniff ``"timed out" in str(exc)``,
+    which misclassified any remote failure whose message merely mentioned a
+    timeout -- routing it into the deadline RETRY path (clio-relay#158).
+    """
+
+
+class RemoteCommandFailed(RelayError):
+    """A cluster-targeted remote command exited non-zero.
+
+    Carries the exit status so callers discriminate failure shapes
+    structurally instead of matching on the raw stderr blob.
+    """
+
+    reason = "remote_command_failed"
+
+    def __init__(self, message: str, *, exit_status: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+
+
+class RemoteExecutableMissingError(RemoteCommandFailed):
+    """The cluster's configured relay executable is absent on the remote host.
+
+    A POSIX shell reports exit status 127 when it cannot find the command it
+    was asked to run. For a cluster-targeted invocation that means the
+    registry's ``relay_executable`` points at a path that no longer exists --
+    typically a generation directory that was garbage-collected out from under
+    the pin (clio-relay#158).
+
+    Typed separately because it is a REPAIRABLE DEPLOYMENT state, not a remote
+    error: the cure is to re-run ``cluster bootstrap``, which reinstalls the
+    relay and re-points the registry at what it produced.
+    """
+
+    reason = "relay_executable_missing"
+
+
+def relay_executable_missing(
+    *,
+    cluster: str,
+    ssh_host: str,
+    relay_executable: str,
+    detail: str,
+    exit_status: int,
+) -> RemoteExecutableMissingError:
+    """Build the one authored message for a dead remote relay pointer.
+
+    Shared by every transport so the operator sees the same repair
+    instruction regardless of which command tripped over the stale pin.
+    """
+    return RemoteExecutableMissingError(
+        f"configured relay_executable is absent on the remote host ({ssh_host}): "
+        f"{relay_executable}. Re-run `clio-relay cluster bootstrap --cluster "
+        f"{cluster}` to reinstall the relay and re-point the registry at what "
+        f"it produced. remote detail: {detail}",
+        exit_status=exit_status,
+    )

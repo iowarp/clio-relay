@@ -28,7 +28,7 @@ from uuid import uuid4
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from clio_relay import __version__
+from clio_relay import __version__, bootstrap_pin
 from clio_relay.bootstrap_reconcile import (
     LEGACY_MANAGED_JARVIS_REPO_PATH,
     MANAGED_JARVIS_REPO_PATH,
@@ -2596,9 +2596,9 @@ def _bootstrap_preflight_over_ssh(
             f"export CLIO_RELAY_CORE_DIR={render_remote_shell_path(core_dir, field='core_dir')}",
             f"export CLIO_RELAY_SPOOL_DIR={render_remote_shell_path(spool_dir, field='spool_dir')}",
             ("export CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64=" + shlex.quote(encoded)),
-            'if [ ! -x "$HOME/.local/bin/clio-relay" ]; then '
+            f'if [ ! -x "{bootstrap_pin.BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE}" ]; then '
             "echo bootstrap_preflight_unsupported=not_installed; exit 0; fi",
-            'BOOTSTRAP_INSTALL_RECEIPT="$HOME/.local/share/clio-relay/install-receipt.json"',
+            f'BOOTSTRAP_INSTALL_RECEIPT="{bootstrap_pin.BOOTSTRAP_PRODUCED_INSTALL_RECEIPT}"',
             'if [ -e "$BOOTSTRAP_INSTALL_RECEIPT" ] || [ -L "$BOOTSTRAP_INSTALL_RECEIPT" ]; then',
             '  if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(python3 -I - '
             "\"$BOOTSTRAP_INSTALL_RECEIPT\" <<'__CLIO_RELAY_PREFLIGHT_RECEIPT__'",
@@ -2624,7 +2624,7 @@ def _bootstrap_preflight_over_ssh(
             (
                 'BOOTSTRAP_PREFLIGHT_OUTPUT="$(timeout --signal=TERM --kill-after=2s '
                 f"{remote_timeout}s "
-                '"$HOME/.local/bin/clio-relay" '
+                f'"{bootstrap_pin.BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE}" '
                 f"bootstrap-inspect --invocation-id {shlex.quote(invocation_id)} "
                 + ("--repair " if repair else "--inspect-only ")
                 + '2>&1)"'

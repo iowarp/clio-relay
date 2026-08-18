@@ -126,7 +126,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # ~15 sub-apps migrate onto `cli_support.X(...)` directly (unsequenced
     # future work, same as the R8(ii) note above). A justified, minimal
     # ratchet-up.
-    "src/clio_relay/cli.py": 18817,
+    # #158: +17 net lines -- `cluster bootstrap` gained a fourth recorded
+    # check (cluster.bootstrap.runtime-pin) that re-points the registry at the
+    # runtime it just produced, so an install can no longer leave a dead
+    # relay_executable pointer behind. The reconciliation itself and its
+    # operator-visible line rendering live in the new owner module
+    # src/clio_relay/bootstrap_pin.py; what remains here is the recorder.check
+    # block, which must sit inside the command's evidence scope. A justified,
+    # minimal ratchet-up.
+    # #158 (probe): +14 further lines -- the `cluster probe` command, a
+    # read-only recon surface that never dereferences relay_executable, so a
+    # deployment whose pin is dead can still be inspected. Its logic lives in
+    # the new owner module src/clio_relay/cluster_probe.py; only the Typer
+    # command body is here.
+    # #158 (review F1): +1 further line -- the runtime-pin check now passes the
+    # remote presence observation, so a pin is only rewritten when proven
+    # absent and a valid custom pin survives bootstrap. The observation itself
+    # lives in cluster_probe.pinned_runtime_present.
+    "src/clio_relay/cli.py": 18849,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
@@ -320,7 +337,21 @@ RATCHET_BASELINE: dict[str, int] = {
     # session_wire_models.py, re-exported here under their original names
     # (RemoteSession is not re-exported -- nothing outside the wire-model
     # module ever referenced it, confirmed by ruff F401). 8326 -> 7801.
-    "src/clio_relay/session_lifecycle.py": 7794,
+    # #158: +46 net lines -- new typed structure in the SSH transport that the
+    # file never had. (1) _raise_if_relay_executable_missing, one guard shared
+    # by both SSH transports, classifies shell status 127 as a dead
+    # relay_executable pin instead of collapsing it into
+    # _RemoteSessionCommandAmbiguous; (2) start_remote_session_durable finally
+    # HANDLES that ambiguity by resolving it against durable remote state
+    # instead of letting it escape as a bare RelayError; (3)
+    # query_remote_session_start re-raises the dead-pin error ahead of its
+    # blanket RelayError handler, which otherwise rewrote it as
+    # starting/retryable and rebuilt the retry-forever loop. The shared message
+    # factory and the deadline exception class were both pushed out to
+    # errors.py to keep this minimal; what remains needs the ClusterDefinition
+    # and the bounded result in hand, so it cannot move. A justified, minimal
+    # ratchet-up.
+    "src/clio_relay/session_lifecycle.py": 7840,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

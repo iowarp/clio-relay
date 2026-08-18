@@ -69,6 +69,7 @@ import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report_module
 from clio_relay.bootstrap import install_local_frp
+from clio_relay.bootstrap_pin import pin_reconciliation_lines, reconcile_cluster_runtime_pin
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.bounded_process import BoundedProcessError
@@ -89,6 +90,7 @@ from clio_relay.cluster_config import (
     open_private_configuration_windows_descriptor,
     release_private_configuration_windows_parent_guard,
 )
+from clio_relay.cluster_probe import pinned_runtime_present, probe_cluster_runtime
 from clio_relay.config import RelaySettings
 from clio_relay.deployment import render_endpoint_user_service, write_endpoint_user_service
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
@@ -3276,6 +3278,19 @@ def _invalidate_remote_mcp_cache_after_bootstrap(
     }
 
 
+@cluster_app.command("probe")
+def cluster_probe_command(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+) -> None:
+    """Report a cluster's runtime health without invoking the remote relay.
+
+    Safe to run against a broken deployment: it never dereferences the pinned
+    relay executable, so it still answers when everything else fails on it.
+    """
+    definition = _require_cluster(cluster)
+    _run_or_exit(lambda: typer.echo(json.dumps(probe_cluster_runtime(definition), indent=2)))
+
+
 @cluster_app.command("bootstrap")
 @_acceptance_report_command
 def cluster_bootstrap(
@@ -3461,6 +3476,23 @@ def cluster_bootstrap(
                     metadata=target_identity,
                 )
             )
+            with recorder.check(
+                "cluster.bootstrap.runtime-pin",
+                "repair the cluster registry pin only when it is proven broken",
+            ) as pin_evidence:
+                pin_reconciliation = reconcile_cluster_runtime_pin(
+                    cluster=cluster,
+                    registry_path=default_registry_path(),
+                    pinned_runtime_present=pinned_runtime_present(definition),
+                )
+                pin_evidence.append(
+                    EvidenceReference(
+                        kind="bootstrap_runtime_pin",
+                        reference=f"cluster-pin:{cluster}",
+                        metadata=pin_reconciliation,
+                    )
+                )
+                lines.extend(pin_reconciliation_lines(pin_reconciliation))
             if receipt.get("outcome") in {"noop_verified", "repaired"}:
                 with recorder.check(
                     "cluster.bootstrap.reuse-slo",
