@@ -17,6 +17,7 @@ from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_transaction as session_transaction
 from clio_relay import __version__
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -488,7 +489,7 @@ def _failed_start_fixture(
     registry_path.write_bytes(registry_payload)
     owner_token = "c" * 64
     session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity={
             "cluster": request.cluster,
@@ -930,7 +931,7 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
         "containment_broker_start_identity": None,
     }
     session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=attempt_identity,
     )
@@ -962,7 +963,7 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
         session_id=request.session_id,
         core_dir=queue.root,
         proc_root=proc_root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         metadata_error="owned session metadata is unavailable",
     )
 
@@ -999,7 +1000,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
     )
 
     report = session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
         proc_root=proc_root,
@@ -1022,7 +1023,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         session_id=request.session_id,
         document=receipt,
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
     assert status.recovery_verified is True
@@ -1053,7 +1054,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         session_id=request.session_id,
         document=cast(dict[str, object], transaction.read_json("metadata.json")),
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
     assert closed.recovery_verified is True
@@ -1078,7 +1079,7 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
         expected_cleanup_operation_id="cleanup_failed_start",
     )
     session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
         proc_root=proc_root,
@@ -1091,7 +1092,7 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
         session_id=request.session_id,
         document=receipt,
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
 
@@ -1122,7 +1123,7 @@ def test_owned_session_recovery_accepts_canonical_home_transaction(
         core_dir=queue.root,
         home=home_alias,
         proc_root=proc_root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     )
 
     assert status.metadata_verified is True
@@ -1248,13 +1249,13 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
             "containment_broker_start_identity": broker_start,
         }
         session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             operation="start",
             identity=identity,
         )
 
         recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256="b" * 64,
         )
@@ -1304,7 +1305,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         "containment_broker_start_identity": None,
     }
     session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
     )
@@ -1381,7 +1382,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         "containment_broker_start_identity": "linux-proc:1",
     }
     session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
     )
@@ -1485,14 +1486,14 @@ def test_legacy_start_attempt_migrates_only_to_caller_planned_v2_operation(
 
     with pytest.raises(RelayError, match="identity is invalid"):
         session_lifecycle._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster=request.cluster,
             session_id=request.session_id,
             start_operation_id=request.start_operation_id,
         )
 
     migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=_api_release_identity().sha256(),
     )
@@ -1549,13 +1550,13 @@ def test_legacy_old_release_replacement_requires_exact_identity_proof(
 
     with pytest.raises(RelayError, match="release identity changed"):
         session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256=current_release_sha256,
         )
 
     migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=current_release_sha256,
         replacement_identity_verified=True,
@@ -1905,7 +1906,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         """Simulated process loss immediately after the durable v2 write."""
 
     def migrate_then_crash(
-        selected_transaction: session_lifecycle._OwnedSessionTransaction,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        selected_transaction: session_transaction._OwnedSessionTransaction,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         *,
         request: OwnedSessionStartRequest,
         release_identity_sha256: str,
@@ -1945,7 +1946,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         home=home,
         proc_root=proc_root,
         effective_uid=effective_uid,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         expected_start_operation_id=request.start_operation_id,
         expected_cluster_route_revision=request.cluster_route_revision,
     )
@@ -2150,7 +2151,7 @@ def test_owned_api_startup_diagnostic_keeps_oversized_redacted_tail(tmp_path: Pa
     )
 
     detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token, frp_token),
     )
 
@@ -2175,7 +2176,7 @@ def test_owned_api_startup_diagnostic_redacts_secret_crossing_tail_boundary(
     )
 
     detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token,),
     )
 
@@ -2197,7 +2198,7 @@ def test_owned_api_startup_diagnostic_discards_unknown_bearer_crossing_tail_boun
     )
 
     detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(),
     )
 
@@ -2213,7 +2214,7 @@ def test_owned_api_startup_diagnostic_fails_closed_for_non_utf8_secret(
     (tmp_path / "api.log").write_bytes(b"startup failed\n")
 
     detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=("credential-\udcff-value",),
     )
 
@@ -2553,7 +2554,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
         ],
     }
     session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=attempt_identity,
     )
@@ -2575,7 +2576,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
     monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
     start_receipt = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         attempt=attempt,
         request=request,
         release_identity=release,
@@ -2985,7 +2986,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
 
     with _FakeSessionTransaction(session_dir, session_id="session-1") as transaction:
         target = session_lifecycle._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             name="api.log",
             maximum_bytes=None,
         )
@@ -2993,7 +2994,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
         assert target.sha256 is None
         assert target.size == 20 * 1024 * 1024
         session_lifecycle._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             [target],
         )
 
@@ -3074,7 +3075,7 @@ def test_owned_session_read_revalidates_descriptor_and_path_after_read(
     monkeypatch.setattr(os, "stat", stat_file)
     monkeypatch.setattr(os, "read", read_file)
     monkeypatch.setattr(os, "close", close_file)
-    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    transaction = session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,
         sessions_fd=-1,
@@ -3082,7 +3083,7 @@ def test_owned_session_read_revalidates_descriptor_and_path_after_read(
         lock_fd=-1,
         uid=1000,
         _fcntl=cast(
-            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             SimpleNamespace(),
         ),
     )
@@ -3653,11 +3654,11 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
         return
 
     fcntl = cast(
-        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         importlib.import_module("fcntl"),
     )
 
-    def transaction_for(path: Path) -> session_lifecycle._OwnedSessionTransaction:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def transaction_for(path: Path) -> session_transaction._OwnedSessionTransaction:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         path.mkdir(mode=0o700)
         path.chmod(0o700)
         directory_fd = os.open(
@@ -3668,7 +3669,7 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         lock_path.chmod(0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session_id="session-1",
             path=path,
             sessions_fd=os.dup(directory_fd),
@@ -3887,7 +3888,7 @@ def test_cleanup_report_candidate_scan_is_bounded_and_strict(
         return FakeScan()
 
     monkeypatch.setattr(os, "scandir", scan_directory)
-    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    transaction = session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,
         sessions_fd=-1,
@@ -3895,7 +3896,7 @@ def test_cleanup_report_candidate_scan_is_bounded_and_strict(
         lock_fd=-1,
         uid=0,
         _fcntl=cast(
-            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             SimpleNamespace(),
         ),
     )
@@ -3952,11 +3953,11 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
     lock_path = directory / "transition.lock"
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     fcntl = cast(
-        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         importlib.import_module("fcntl"),
     )
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    with session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    with session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=directory,
         sessions_fd=os.dup(directory_fd),

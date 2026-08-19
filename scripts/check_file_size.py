@@ -548,7 +548,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # errors.py to keep this minimal; what remains needs the ClusterDefinition
     # and the bounded result in hand, so it cannot move. A justified, minimal
     # ratchet-up.
-    "src/clio_relay/session_lifecycle.py": 7840,
+    # split/session-lifecycle slice A (#231 rework): the pinned owned-session
+    # directory transaction primitive (_OwnedSessionTransaction + its
+    # protocols, open_owned_session_transaction, the filename/file-identity
+    # validators) moved to the new session_transaction.py owner (768 lines);
+    # _validate_session/_validate_durable_session_identity moved to the new
+    # session_validation.py leaf (28 lines) -- both are dependency-free
+    # foundations every other owned-session lifecycle module builds on.
+    # 7840 -> 7099.
+    "src/clio_relay/session_lifecycle.py": 7099,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

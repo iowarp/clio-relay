@@ -231,7 +231,6 @@ from clio_relay.session_lifecycle import (
     execute_owned_session_identity_challenge,
     execute_owned_session_start,
     execute_owned_session_teardown,
-    open_owned_session_transaction,
     plan_remote_session_start,
     query_remote_session_start,
     session_lifecycle_report_bytes,
@@ -239,6 +238,7 @@ from clio_relay.session_lifecycle import (
     wait_owned_session_start_status,
     watch_remote_session_start,
 )
+from clio_relay.session_transaction import open_owned_session_transaction
 from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (
     CleanupEvidence,
