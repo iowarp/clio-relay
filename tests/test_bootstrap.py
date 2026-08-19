@@ -581,7 +581,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from clio_relay import bootstrap
+    from clio_relay import bootstrap, bootstrap_receipt_validation
 
     calls: list[list[str]] = []
     uploaded_scripts: list[str] = []
@@ -664,7 +664,9 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             raise RelayError("bootstrap receipt relay_install_spec changed")
 
     monkeypatch.setattr(bootstrap, "create_bootstrap_archive", fake_create_bootstrap_archive)
-    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", validate_receipt)
+    monkeypatch.setattr(
+        bootstrap_receipt_validation, "validate_bootstrap_receipt", validate_receipt
+    )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "abc"})())
 

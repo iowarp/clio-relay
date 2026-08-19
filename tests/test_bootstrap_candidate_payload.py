@@ -42,8 +42,10 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
     )
     assert set(sources) == {
         "__init__.py",
+        "bootstrap_jarvis_staging.py",
         "bootstrap_provider_build_info.py",
         "bootstrap_reconcile.py",
+        "bootstrap_recovery.py",
         "bounded_process.py",
         "errors.py",
         "process_containment.py",
@@ -63,7 +65,9 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
         legacy_root / "clio_relay",
         ignore=shutil.ignore_patterns(
             "__pycache__",
+            "bootstrap_jarvis_staging.py",
             "bootstrap_reconcile.py",
+            "bootstrap_recovery.py",
             "bounded_process.py",
             "errors.py",
             "process_containment.py",

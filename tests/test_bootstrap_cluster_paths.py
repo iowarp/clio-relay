@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from clio_relay import bootstrap, cli
+from clio_relay import bootstrap, bootstrap_receipt_validation, cli
 from clio_relay.bootstrap import (
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
@@ -1217,7 +1217,9 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         fake_render_linux_user_bootstrap_script,
     )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
-    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", validate_receipt)
+    monkeypatch.setattr(
+        bootstrap_receipt_validation, "validate_bootstrap_receipt", validate_receipt
+    )
     monkeypatch.setattr(
         bootstrap,
         "_verify_persistent_bootstrap_receipt",

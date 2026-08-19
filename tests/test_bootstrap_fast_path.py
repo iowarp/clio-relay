@@ -24,6 +24,7 @@ import pytest
 from typer.testing import CliRunner
 
 import clio_relay.bootstrap as bootstrap
+import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
@@ -2665,7 +2666,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         payload_transfer_bytes=1,
     )
 
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2684,7 +2685,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "/home/operator/custom/builtin",
     ]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             invalid_builtin_addition,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2706,7 +2707,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         cleanup_binding = cast(dict[str, object], cleanup_preservation["repositories"])
         cleanup_update = cast(dict[str, object], cleanup_binding["repositories"])
         cleanup_update["removed_previous_managed_repos"] = [relay_builtin_path]
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             builtin_cleanup,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2727,7 +2728,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     }.items():
         evidence = cast(dict[str, object], relay_components[name])
         evidence["action"] = action
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         relay_only,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2741,7 +2742,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     relay_binding = cast(dict[str, object], relay_preservation["repositories"])
     relay_binding["target"] = "/operator/unrelated-repository"
     with pytest.raises(RelayError, match="repository binding is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             invalid_relay_binding,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2757,7 +2758,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     update = cast(dict[str, object], binding["repositories"])
     update["after_sha256"] = "0" * 64
     with pytest.raises(RelayError, match="hashes do not bind"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             tampered,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2773,7 +2774,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     update = cast(dict[str, object], binding["repositories"])
     update["removed_previous_managed_repos"] = ["/operator/unrelated-repository"]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             unauthorized_removal,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2791,7 +2792,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "/home/operator/.local/share/clio-relay/operator-venv/lib/python3.12/site-packages/builtin"
     ]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             lookalike_removal,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2805,7 +2806,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     preservation = cast(dict[str, object], replaced_link["jarvis_preservation"])
     binding = cast(dict[str, object], preservation["repositories"])
     binding["link_action"] = "retargeted"
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         replaced_link,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2819,7 +2820,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     generation = cast(dict[str, object], unproven_retarget["generation"])
     generation["previous"] = "unproven"
     with pytest.raises(RelayError, match="did not preserve existing JARVIS state"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             unproven_retarget,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2934,7 +2935,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         payload_transfer_bytes=1,
     )
 
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -3358,7 +3359,12 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert 'unset "$bootstrap_environment_name"' in provider_function
     assert activation < finish < verify < activated < migration
     assert "bootstrap_candidate_action finish-activation" in recovery
-    assert "phase_identities" in recovery
+    # #247: state-aware recovery reads `phase_identities.prepared_manifest`
+    # through the new `recovery-prepared-manifest` candidate action (owned by
+    # bootstrap_recovery.require_phase_identity) rather than an inline
+    # heredoc, so it can name the exact missing key on a prior-build journal.
+    assert "bootstrap_candidate_action recovery-prepared-manifest prepared_manifest" in recovery
+    assert "recovery_needs_staged_identity" in recovery
     assert "sha256sum --check --strict -" in recovery
     assert "WORKER_LIFETIME_GUARD_FD=8" in recovery
     assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in recovery
