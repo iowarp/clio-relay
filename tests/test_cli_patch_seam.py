@@ -86,6 +86,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_job_records": _SRC_ROOT / "cli_job_records.py",
     "cli_queue": _SRC_ROOT / "cli_queue.py",
     "cli_queue_maintenance": _SRC_ROOT / "cli_queue_maintenance.py",
+    "cli_session": _SRC_ROOT / "cli_session.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -108,7 +109,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("remote_cli", "run_remote_clio", "cli"),
     ("remote_cli", "should_execute_on_cluster", "cli"),
     ("mcp_stdio_validation", "run_packaged_mcp_stdio_session", "cli"),
-    ("session_lifecycle", "detach_remote_session", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_session with the
+    # session command-group extraction (detach_remote_session's only cli.py
+    # call site was session_detach).
+    ("session_lifecycle", "detach_remote_session", "cli_session"),
     ("installation", "installation_info", "cli"),
     ("session_lifecycle", "start_remote_session", "cli"),
     ("bootstrap", "package_source_root", "cli"),
@@ -160,7 +164,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # site).
     ("installation", "verified_session_api_install_receipt", "cli_api"),
     ("session_lifecycle", "publish_owned_session_api_startup_receipt", "cli_api"),
-    ("session_api", "submit_owned_session_job", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_session with the
+    # session command-group extraction (submit_owned_session_job's only
+    # cli.py call site was session_submit_jarvis).
+    ("session_api", "submit_owned_session_job", "cli_session"),
     ("validation_report", "write_validation_report", "cli"),
     ("remote_cli", "remote_command_timeout", "cli"),
     ("application_profiles", "install_cluster_app_over_ssh", "cli"),
