@@ -313,6 +313,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "relay_storage_status",
         "relay_bind_jarvis_runtime",
         "relay_artifact_lineage",
+        "relay_list_artifacts",
+        "relay_read_artifact",
         "jarvis_create_pipeline",
         "jarvis_describe",
         "jarvis_add_step",
