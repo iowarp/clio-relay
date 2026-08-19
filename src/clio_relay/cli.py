@@ -40,6 +40,7 @@ import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_api as cli_api
+import clio_relay.cli_cluster as cli_cluster
 import clio_relay.cli_endpoint as cli_endpoint
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
@@ -80,14 +81,10 @@ from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
     ClusterRegistry,
-    ClusterTargetIdentity,
-    DirectTransportConfig,
-    FrpTransportConfig,
     RemoteMcpContract,
     RemoteMcpProfile,
     RemoteMcpServerConfig,
     WorkerCapacityPolicy,
-    cluster_route_revision,
     default_registry_path,
     ensure_private_configuration_windows_handle,
     open_private_configuration_windows_descriptor,
@@ -780,7 +777,6 @@ _acceptance_report_command = (
 
 app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
-cluster_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
 queue_app = typer.Typer(no_args_is_help=True)
@@ -790,7 +786,7 @@ remote_mcp_app = typer.Typer(no_args_is_help=True)
 app.add_typer(cli_endpoint.endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
-app.add_typer(cluster_app, name="cluster")
+app.add_typer(cli_cluster.cluster_app, name="cluster")
 app.add_typer(cli_agent.agent_app, name="agent")
 app.add_typer(cli_monitor.monitor_app, name="monitor")
 app.add_typer(cli_api.api_app, name="api")
@@ -868,425 +864,6 @@ def init(
     typer.echo(
         f"initialized core={settings.core_dir} spool={settings.spool_dir} "
         f"clusters={','.join(sorted(registry.clusters))}"
-    )
-
-
-@cluster_app.command("list")
-def cluster_list() -> None:
-    """List configured clusters."""
-    registry = ClusterRegistry.load(default_registry_path())
-    for name, definition in sorted(registry.clusters.items()):
-        capacity = definition.worker_capacity
-        typer.echo(
-            f"{name} ssh={definition.ssh_host} profile={definition.bootstrap_profile} "
-            f"worker_concurrency={capacity.concurrency} "
-            f"control_query_concurrency={capacity.control_query_concurrency}"
-        )
-
-
-def _route_revision_before_edit(cluster: str) -> str | None:
-    """Return the cluster's current route revision, or None when unconfigured."""
-    try:
-        return cluster_route_revision(
-            ClusterRegistry.load(default_registry_path()).require(cluster)
-        )
-    except ConfigurationError:
-        return None
-
-
-def _warn_if_route_revision_changed(cluster: str, *, before: str | None, after: str) -> None:
-    """Warn loudly when an edit strands cached MCP discovery evidence (clio-relay#216).
-
-    ``cluster_route_revision()`` covers every routing-relevant field except
-    ``remote_mcp_servers``/``worker_capacity``. Every call routed through
-    cached MCP discovery evidence (minted by ``remote-mcp refresh``) fails
-    typed only once dispatched -- and only per call, well after this edit --
-    unless the operator is warned here, at edit time, that a refresh is due.
-    """
-    if before is not None and before != after:
-        typer.echo(
-            f"warning: cluster {cluster!r} route revision changed "
-            f"({before[:12]} -> {after[:12]}); cached MCP discovery evidence for this "
-            f"cluster is now stale. Run 'clio-relay remote-mcp refresh --cluster {cluster}' "
-            "before the next MCP call through it, or every call will fail typed (409) only "
-            "after its full dispatch budget.",
-            err=True,
-        )
-
-
-@cluster_app.command("add")
-def cluster_add(
-    name: Annotated[str, typer.Option(help="Cluster name used by relay jobs.")],
-    ssh_host: Annotated[str, typer.Option(help="SSH host or alias for the cluster.")],
-    bootstrap_profile: Annotated[
-        str,
-        typer.Option(help="Bootstrap profile for this cluster."),
-    ] = "linux-user",
-    core_dir: Annotated[
-        str,
-        typer.Option(help="Remote clio-core directory."),
-    ] = "$HOME/.local/share/clio-relay/core",
-    spool_dir: Annotated[
-        str,
-        typer.Option(help="Remote spool directory."),
-    ] = "$HOME/.local/share/clio-relay/spool",
-    jarvis_bin: Annotated[
-        str | None,
-        typer.Option(help="Remote JARVIS-CD executable path."),
-    ] = None,
-    jarvis_resource_graph_profile: Annotated[
-        str | None,
-        typer.Option(
-            help=(
-                "Exact JARVIS builtin resource-graph profile selected by the operator; "
-                "relay never derives this from the cluster name."
-            )
-        ),
-    ] = None,
-    allow_jarvis_resource_graph_build: Annotated[
-        bool,
-        typer.Option(
-            "--allow-jarvis-resource-graph-build/--no-allow-jarvis-resource-graph-build",
-            help=(
-                "Allow one benchmark-free first-install graph build only after JARVIS "
-                "returns structured unavailable for the selected builtin profile."
-            ),
-        ),
-    ] = False,
-    spack_executable: Annotated[
-        str | None,
-        typer.Option(help="Absolute remote Spack executable used by the cluster-side JARVIS MCP."),
-    ] = None,
-    frpc_bin: Annotated[
-        str | None,
-        typer.Option(help="Remote frpc executable path."),
-    ] = None,
-    agent_bin: Annotated[
-        str | None,
-        typer.Option(help="Remote agent executable path."),
-    ] = None,
-    agent_adapter: Annotated[
-        str,
-        typer.Option(help="Remote agent adapter name."),
-    ] = "exec",
-    scheduler_provider: Annotated[
-        str,
-        typer.Option(
-            help="Registered scheduler provider for relay-owned status/cancel operations."
-        ),
-    ] = "external",
-    worker_concurrency: Annotated[
-        int,
-        typer.Option(help="Total slot capacity for the managed cluster worker service."),
-    ] = 3,
-    worker_control_query_concurrency: Annotated[
-        int,
-        typer.Option(help="Slots reserved within total worker capacity for live control queries."),
-    ] = 1,
-    worker_kind_concurrency: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--worker-kind-concurrency",
-            help="Per-kind managed-worker limit as KIND=LIMIT; repeat for multiple kinds.",
-        ),
-    ] = None,
-    agent_npm_package: Annotated[
-        str | None,
-        typer.Option(help="Optional npm package used to install the agent."),
-    ] = None,
-    agent_npm_bin: Annotated[
-        str | None,
-        typer.Option(help="Agent binary name provided by npm or PATH."),
-    ] = None,
-    frp_server_addr: Annotated[
-        str,
-        typer.Option(help="frps server address for this cluster transport."),
-    ] = "",
-    frp_server_port: Annotated[
-        int,
-        typer.Option(help="frps server port for this cluster transport."),
-    ] = 443,
-    frp_protocol: Annotated[
-        str,
-        typer.Option(help="frpc-to-frps transport protocol."),
-    ] = "wss",
-    frp_token_env: Annotated[
-        str,
-        typer.Option(help="Environment/local-secret key for the frp token."),
-    ] = "CLIO_RELAY_FRP_TOKEN",
-    stcp_secret_env: Annotated[
-        str,
-        typer.Option(help="Environment/local-secret key for the stcp secret."),
-    ] = "CLIO_RELAY_STCP_SECRET",
-    direct_transport: Annotated[
-        bool,
-        typer.Option(
-            "--direct-transport/--no-direct-transport",
-            help="Enable optional NAT-punching direct transport optimization.",
-        ),
-    ] = False,
-    direct_transport_mode: Annotated[
-        str,
-        typer.Option(help="Direct transport mode. Currently only xtcp is supported."),
-    ] = "xtcp",
-    direct_transport_fallback: Annotated[
-        str,
-        typer.Option(help="Comma-separated direct transport fallback order ending in queue."),
-    ] = "frp_stcp,queue",
-    target_hostname: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--target-hostname",
-            help="Expected remote hostname; repeat for accepted aliases.",
-        ),
-    ] = None,
-    ssh_host_key_sha256: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--ssh-host-key-sha256",
-            help="Expected SSH host-key SHA256 fingerprint; repeat for rotations.",
-        ),
-    ] = None,
-    scheduler_cluster_name: Annotated[
-        str | None,
-        typer.Option(help="Expected scheduler-native cluster name, such as SLURM ClusterName."),
-    ] = None,
-    site_marker_sha256: Annotated[
-        str | None,
-        typer.Option(help="Expected SHA-256 of the remote /etc/machine-id site marker."),
-    ] = None,
-    dev_mode: Annotated[
-        bool,
-        typer.Option(
-            "--dev-mode/--no-dev-mode",
-            help=(
-                "clio-relay#211: downgrade this cluster's install/identity/receipt/sha "
-                "verification chain to warnings instead of raising. Never for production."
-            ),
-        ),
-    ] = False,
-) -> None:
-    """Add or update a local cluster definition."""
-    if (target_hostname is None) != (ssh_host_key_sha256 is None):
-        raise typer.BadParameter(
-            "--target-hostname and --ssh-host-key-sha256 must be provided together"
-        )
-    try:
-        definition = ClusterDefinition(
-            name=name,
-            ssh_host=ssh_host,
-            bootstrap_profile=bootstrap_profile,
-            core_dir=core_dir,
-            spool_dir=spool_dir,
-            jarvis_bin=jarvis_bin,
-            jarvis_resource_graph_profile=_none_if_blank(jarvis_resource_graph_profile),
-            allow_jarvis_resource_graph_build=allow_jarvis_resource_graph_build,
-            spack_executable=_none_if_blank(spack_executable),
-            frpc_bin=frpc_bin,
-            agent_bin=_none_if_blank(agent_bin),
-            agent_adapter=agent_adapter,
-            scheduler_provider=scheduler_provider,
-            dev_mode=dev_mode,
-            worker_capacity=WorkerCapacityPolicy(
-                concurrency=worker_concurrency,
-                control_query_concurrency=worker_control_query_concurrency,
-                kind_concurrency=_kind_concurrency_options(
-                    worker_kind_concurrency,
-                    param_hint="--worker-kind-concurrency",
-                ),
-            ),
-            target_identity=(
-                ClusterTargetIdentity(
-                    hostnames=target_hostname,
-                    ssh_host_key_sha256=ssh_host_key_sha256,
-                    scheduler_cluster_name=_none_if_blank(scheduler_cluster_name),
-                    site_marker_sha256=_none_if_blank(site_marker_sha256),
-                )
-                if target_hostname is not None and ssh_host_key_sha256 is not None
-                else None
-            ),
-            agent_npm_package=_none_if_blank(agent_npm_package),
-            agent_npm_bin=_none_if_blank(agent_npm_bin),
-            frp_transport=FrpTransportConfig(
-                protocol=frp_protocol,
-                server_addr=frp_server_addr,
-                server_port=frp_server_port,
-                token_env=frp_token_env,
-                stcp_secret_env=stcp_secret_env,
-                direct=DirectTransportConfig(
-                    enabled=direct_transport,
-                    mode=direct_transport_mode,
-                    fallback_order=_split_csv(direct_transport_fallback),
-                ),
-            ),
-        )
-    except ValidationError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    before_revision = _route_revision_before_edit(name)
-    ClusterRegistry.mutate(
-        default_registry_path(),
-        lambda registry: registry.clusters.__setitem__(name, definition),
-    )
-    _warn_if_route_revision_changed(
-        name,
-        before=before_revision,
-        after=cluster_route_revision(definition),
-    )
-    typer.echo(f"{name} ssh={ssh_host} profile={bootstrap_profile}")
-
-
-@cluster_app.command("pin-target")
-def cluster_pin_target(
-    cluster: Annotated[str, typer.Option(help="Existing configured cluster name.")],
-    target_hostname: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--target-hostname",
-            help="Expected remote hostname; repeat for accepted aliases.",
-        ),
-    ] = None,
-    ssh_host_key_sha256: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--ssh-host-key-sha256",
-            help="Expected SSH host-key SHA256 fingerprint; repeat for key rotations.",
-        ),
-    ] = None,
-    scheduler_cluster_name: Annotated[
-        str | None,
-        typer.Option(help="Expected scheduler-native cluster name."),
-    ] = None,
-    site_marker_sha256: Annotated[
-        str | None,
-        typer.Option(help="Expected SHA-256 of the remote physical site marker."),
-    ] = None,
-    clear: Annotated[
-        bool,
-        typer.Option(help="Remove only the existing physical target identity pin."),
-    ] = False,
-) -> None:
-    """Pin or clear one cluster's physical target identity without replacing its config."""
-    identity_arguments_present = any(
-        value is not None
-        for value in (
-            target_hostname,
-            ssh_host_key_sha256,
-            scheduler_cluster_name,
-            site_marker_sha256,
-        )
-    )
-    if clear and identity_arguments_present:
-        raise typer.BadParameter("--clear cannot be combined with target identity values")
-    if not clear and (target_hostname is None or ssh_host_key_sha256 is None):
-        raise typer.BadParameter(
-            "--target-hostname and --ssh-host-key-sha256 are required unless --clear is used"
-        )
-    target_identity: ClusterTargetIdentity | None = None
-    if not clear:
-        assert target_hostname is not None
-        assert ssh_host_key_sha256 is not None
-        try:
-            target_identity = ClusterTargetIdentity(
-                hostnames=target_hostname,
-                ssh_host_key_sha256=ssh_host_key_sha256,
-                scheduler_cluster_name=_none_if_blank(scheduler_cluster_name),
-                site_marker_sha256=_none_if_blank(site_marker_sha256),
-            )
-        except ValidationError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-
-    def update_target_identity(registry: ClusterRegistry) -> None:
-        registry.require(cluster).target_identity = target_identity
-
-    before_revision = _route_revision_before_edit(cluster)
-    registry = ClusterRegistry.mutate(default_registry_path(), update_target_identity)
-    definition = registry.require(cluster)
-    _warn_if_route_revision_changed(
-        cluster,
-        before=before_revision,
-        after=cluster_route_revision(definition),
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "cluster": cluster,
-                "ssh_host": definition.ssh_host,
-                "target_identity": (
-                    definition.target_identity.model_dump(mode="json")
-                    if definition.target_identity is not None
-                    else None
-                ),
-            },
-            indent=2,
-        )
-    )
-
-
-@cluster_app.command("pin-runtime")
-def cluster_pin_runtime(
-    cluster: Annotated[str, typer.Option(help="Existing configured cluster name.")],
-    relay_executable: Annotated[
-        str | None,
-        typer.Option(help="Remote clio-relay executable path pinned to one generation."),
-    ] = None,
-    install_receipt: Annotated[
-        str | None,
-        typer.Option(help="Remote pinned install-receipt.json path for this cluster's generation."),
-    ] = None,
-    clear: Annotated[
-        bool,
-        typer.Option(help="Remove only the existing pinned runtime identity."),
-    ] = False,
-) -> None:
-    """Pin or clear one cluster's runtime identity without replacing its config.
-
-    Updates only ``relay_executable``/``relay_install_receipt`` on the
-    existing entry -- every other field (``remote_mcp_servers``,
-    ``target_identity``, worker capacity, transport config, ...) is
-    preserved exactly. Unlike ``cluster add``, this never replaces the
-    entry wholesale, so it is the sanctioned way to declare the per-cluster
-    pin that session-start verification honors (clio-relay#205).
-    """
-    identity_arguments_present = relay_executable is not None or install_receipt is not None
-    if clear and identity_arguments_present:
-        raise typer.BadParameter("--clear cannot be combined with pinned runtime values")
-    if not clear and not identity_arguments_present:
-        raise typer.BadParameter(
-            "--relay-executable or --install-receipt is required unless --clear is used"
-        )
-    default_relay_executable = cast(str, ClusterDefinition.model_fields["relay_executable"].default)
-
-    def update_pinned_runtime(registry: ClusterRegistry) -> None:
-        definition = registry.require(cluster)
-        if clear:
-            definition.relay_executable = default_relay_executable
-            definition.relay_install_receipt = None
-        else:
-            if relay_executable is not None:
-                definition.relay_executable = relay_executable
-            if install_receipt is not None:
-                definition.relay_install_receipt = install_receipt
-
-    before_revision = _route_revision_before_edit(cluster)
-    try:
-        registry = ClusterRegistry.mutate(default_registry_path(), update_pinned_runtime)
-    except ValidationError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    definition = registry.require(cluster)
-    _warn_if_route_revision_changed(
-        cluster,
-        before=before_revision,
-        after=cluster_route_revision(definition),
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "cluster": cluster,
-                "relay_executable": definition.relay_executable,
-                "relay_install_receipt": definition.relay_install_receipt,
-            },
-            indent=2,
-        )
     )
 
 
@@ -2799,7 +2376,7 @@ def _invalidate_remote_mcp_cache_after_bootstrap(
     }
 
 
-@cluster_app.command("probe")
+@cli_cluster.cluster_app.command("probe")
 def cluster_probe_command(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
 ) -> None:
@@ -2812,7 +2389,7 @@ def cluster_probe_command(
     _run_or_exit(lambda: typer.echo(json.dumps(probe_cluster_runtime(definition), indent=2)))
 
 
-@cluster_app.command("bootstrap")
+@cli_cluster.cluster_app.command("bootstrap")
 @_acceptance_report_command
 def cluster_bootstrap(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -3046,7 +2623,7 @@ def cluster_bootstrap(
     _run_or_exit(action)
 
 
-@cluster_app.command("install-app")
+@cli_cluster.cluster_app.command("install-app")
 def cluster_install_app(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     app_name: Annotated[
@@ -3070,7 +2647,7 @@ def cluster_install_app(
     )
 
 
-@cluster_app.command("install-endpoint-service")
+@cli_cluster.cluster_app.command("install-endpoint-service")
 def cluster_install_endpoint_service(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     ssh_host: Annotated[
@@ -3155,7 +2732,7 @@ def cluster_install_endpoint_service(
     )
 
 
-@cluster_app.command("restart-endpoint-service")
+@cli_cluster.cluster_app.command("restart-endpoint-service")
 def cluster_restart_endpoint_service(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     ssh_host: Annotated[
@@ -3187,7 +2764,7 @@ def cluster_restart_endpoint_service(
     )
 
 
-@cluster_app.command("endpoint-service-status")
+@cli_cluster.cluster_app.command("endpoint-service-status")
 def cluster_endpoint_service_status(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
     ssh_host: Annotated[
@@ -11566,10 +11143,6 @@ def _none_if_blank(value: str | None) -> str | None:
     if value is None or value.strip() == "":
         return None
     return value
-
-
-def _split_csv(value: str) -> list[str]:
-    return [entry.strip() for entry in value.split(",") if entry.strip()]
 
 
 def _parse_age_seconds(value: str) -> int:
