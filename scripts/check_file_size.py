@@ -189,7 +189,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # remote presence observation, so a pin is only rewritten when proven
     # absent and a valid custom pin survives bootstrap. The observation itself
     # lives in cluster_probe.pinned_runtime_present.
-    "src/clio_relay/cli.py": 17113,
+    "src/clio_relay/cli.py": 16273,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

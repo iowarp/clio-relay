@@ -28,7 +28,6 @@ from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import typer
-import yaml
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from pydantic import ValidationError
@@ -42,6 +41,8 @@ import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_api as cli_api
 import clio_relay.cli_cluster as cli_cluster
 import clio_relay.cli_endpoint as cli_endpoint
+import clio_relay.cli_job as cli_job
+import clio_relay.cli_job_records as cli_job_records  # noqa: F401 -- registers job_app's records commands
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_release as cli_release
@@ -126,25 +127,19 @@ from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactUse,
-    Cursor,
     GatewaySession,
     GatewaySessionState,
-    JarvisRunSpec,
     JobKind,
     JobState,
-    JobWaitResult,
     McpAdmissionClass,
     McpCallSpec,
     McpControlQueryEvidence,
     McpOperation,
     OwnerSessionClosure,
-    ProgressRecord,
     RelayJob,
     SchedulerPhase,
     SchedulerStatus,
     ServiceRuntimeSpec,
-    TaskEventStatus,
-    TaskTimelineEvent,
     artifact_use_payload,
     validate_artifact_use_collection,
 )
@@ -160,7 +155,6 @@ from clio_relay.owner_session_admission import (
 )
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.process_containment import consume_broker_child_environment
-from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.public_records import public_gateway_session
 from clio_relay.queue_management import (
     DEFAULT_RESULT_LIMIT,
@@ -175,12 +169,9 @@ from clio_relay.queue_management import (
 from clio_relay.relay_host import FrpcConfig
 from clio_relay.relay_ops import cancel_job as request_cancel_job
 from clio_relay.relay_ops import (
-    job_wait_result,
-    monitor_job,
     read_artifact_bytes,
-    read_job_log,
 )
-from clio_relay.remote_cli import stage_jarvis_yaml, staged_remote_cluster_registry
+from clio_relay.remote_cli import staged_remote_cluster_registry
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
@@ -202,7 +193,6 @@ from clio_relay.remote_mcp import (
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA, native_execution_documents
 from clio_relay.service_runtime import ServiceRuntimePendingResult
-from clio_relay.session_api import OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
 from clio_relay.session_lifecycle import (
     MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
@@ -269,7 +259,6 @@ DEFAULT_RELAY_CANCEL_POLL_SECONDS = 0.25
 MAX_RELAY_CANCEL_TIMEOUT_SECONDS = 3_600.0
 REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS = 120.0
 REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
-REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS = 30.0
 MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES = 1024 * 1024
 MAX_CLEANUP_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
 MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES = 8 * 1024 * 1024
@@ -776,7 +765,6 @@ _acceptance_report_command = (
 
 
 app = typer.Typer(no_args_is_help=True)
-job_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
 queue_app = typer.Typer(no_args_is_help=True)
@@ -784,7 +772,7 @@ remote_mcp_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(cli_endpoint.endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
-app.add_typer(job_app, name="job")
+app.add_typer(cli_job.job_app, name="job")
 app.add_typer(cli_cluster.cluster_app, name="cluster")
 app.add_typer(cli_agent.agent_app, name="agent")
 app.add_typer(cli_monitor.monitor_app, name="monitor")
@@ -6284,680 +6272,6 @@ def install_frp(
     _run_or_exit(lambda: typer.echo(f"frpc={install_local_frp(destination)}"))
 
 
-@job_app.command("submit")
-def job_submit(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    jarvis_yaml: Annotated[Path, typer.Option(help="Path to JARVIS YAML.")],
-    idempotency_key: Annotated[
-        str | None,
-        typer.Option(help="Submit/retry idempotency key."),
-    ] = None,
-    used_artifact: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--used-artifact",
-            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
-        ),
-    ] = None,
-    exclusive: Annotated[
-        bool,
-        typer.Option("--exclusive/--shared", help="Request exclusive scheduler allocation."),
-    ] = False,
-) -> None:
-    """Submit a JARVIS pipeline job."""
-    definition = _require_cluster(cluster)
-    yaml_text = jarvis_yaml.read_text(encoding="utf-8")
-    if exclusive:
-        yaml_text = _with_exclusive_scheduler(yaml_text, definition.scheduler_provider)
-    artifact_uses = _artifact_use_refs(used_artifact)
-    key = idempotency_key or (
-        _file_idempotency_key(jarvis_yaml, yaml_text)
-        + _artifact_use_idempotency_suffix(artifact_uses)
-    )
-    if remote_cli.should_execute_on_cluster(definition):
-        remote_yaml = stage_jarvis_yaml(
-            definition,
-            jarvis_yaml=jarvis_yaml,
-            pipeline_yaml_text=yaml_text,
-            idempotency_key=key,
-        )
-        remote_command = [
-            "job",
-            "submit",
-            "--cluster",
-            cluster,
-            "--jarvis-yaml",
-            remote_yaml,
-            "--idempotency-key",
-            key,
-            "--exclusive" if exclusive else "--shared",
-        ]
-        for ref in _artifact_use_refs(used_artifact):
-            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
-        _run_remote_or_exit(
-            definition,
-            remote_command,
-        )
-        return
-    job = RelayJob(
-        cluster=cluster,
-        kind=JobKind.JARVIS,
-        spec=JarvisRunSpec(pipeline_yaml=yaml_text),
-        idempotency_key=key,
-        used_artifact_refs=artifact_uses,
-    )
-    saved = _submit_managed_job(job)
-    typer.echo(saved.job_id)
-
-
-@job_app.command("submit-pipeline")
-def job_submit_pipeline(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    pipeline_name: Annotated[str, typer.Option(help="Existing JARVIS pipeline name.")],
-    idempotency_key: Annotated[
-        str | None,
-        typer.Option(help="Submit/retry idempotency key."),
-    ] = None,
-    used_artifact: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--used-artifact",
-            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
-        ),
-    ] = None,
-) -> None:
-    """Submit an existing JARVIS pipeline by name on the target cluster."""
-    definition = _require_cluster(cluster)
-    artifact_uses = _artifact_use_refs(used_artifact)
-    key = idempotency_key or (
-        f"jarvis-pipeline:{cluster}:{pipeline_name}"
-        + _artifact_use_idempotency_suffix(artifact_uses)
-    )
-    if remote_cli.should_execute_on_cluster(definition):
-        remote_command = [
-            "job",
-            "submit-pipeline",
-            "--cluster",
-            cluster,
-            "--pipeline-name",
-            pipeline_name,
-            "--idempotency-key",
-            key,
-        ]
-        for ref in _artifact_use_refs(used_artifact):
-            remote_command.extend(["--used-artifact", _artifact_use_cli_value(ref)])
-        _run_remote_or_exit(
-            definition,
-            remote_command,
-        )
-        return
-    job = RelayJob(
-        cluster=cluster,
-        kind=JobKind.JARVIS,
-        spec=JarvisRunSpec(pipeline_name=pipeline_name),
-        idempotency_key=key,
-        used_artifact_refs=artifact_uses,
-    )
-    saved = _submit_managed_job(job)
-    typer.echo(saved.job_id)
-
-
-@job_app.command("watch")
-def job_watch(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[int, typer.Option(help="First event sequence to read.")] = 1,
-    limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
-) -> None:
-    """Read job events from a cursor."""
-    cursor = _job_event_cursor(cursor)
-    if _try_remote_cluster_passthrough(
-        cluster,
-        ["job", "watch", job_id, "--cursor", str(cursor), "--limit", str(limit)],
-    ):
-        return
-    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
-    events, next_cursor = queue.drain_events(Cursor(job_id=job_id, next_seq=cursor), limit=limit)
-    for event in events:
-        typer.echo(f"{event.seq} {event.created_at.isoformat()} {event.event_type} {event.message}")
-    typer.echo(f"next_cursor={next_cursor.next_seq}")
-
-
-@job_app.command("monitor")
-def job_monitor(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[int, typer.Option(help="First event sequence to read.")] = 1,
-    limit: Annotated[int, typer.Option(help="Maximum events to read.")] = 100,
-) -> None:
-    """Read job state and event stream data from a cursor as JSON."""
-    cursor = _job_event_cursor(cursor)
-    if _try_remote_cluster_passthrough(
-        cluster,
-        ["job", "monitor", job_id, "--cursor", str(cursor), "--limit", str(limit)],
-    ):
-        return
-    result = monitor_job(
-        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir),
-        job_id,
-        cursor=cursor,
-        limit=limit,
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@job_app.command("status")
-def job_status(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-) -> None:
-    """Read job, relay queue, and scheduler status as JSON."""
-    if _try_remote_cluster_passthrough(cluster, ["job", "status", job_id]):
-        return
-    result = relay_ops.job_status(
-        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir), job_id
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@job_app.command("tasks")
-def job_tasks(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        int,
-        typer.Option(help="One-based task record cursor.", min=1),
-    ] = 1,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum task records returned.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """List one stable page of durable task records for a job as JSON."""
-    args = [
-        "job",
-        "tasks",
-        job_id,
-        "--cursor",
-        str(cursor),
-        "--limit",
-        str(limit),
-    ]
-    if _try_remote_cluster_passthrough(cluster, args):
-        return
-    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
-    tasks, next_cursor, total = queue.list_tasks_page(
-        job_id,
-        cursor=cursor,
-        limit=limit,
-    )
-    typer.echo(
-        json.dumps(
-            _record_page_payload(
-                "tasks",
-                [task.model_dump(mode="json") for task in tasks],
-                cursor=cursor,
-                limit=limit,
-                next_cursor=next_cursor,
-                total=total,
-            ),
-            indent=2,
-        )
-    )
-
-
-@job_app.command("task-events")
-def job_task_events(
-    task_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        int,
-        typer.Option(help="First task event sequence to read.", min=1),
-    ] = 1,
-    limit: Annotated[
-        int,
-        typer.Option(help="Maximum task events to read.", min=1),
-    ] = 100,
-) -> None:
-    """Read structured task timeline events from a cursor as JSON."""
-    if _try_remote_cluster_passthrough(
-        cluster,
-        ["job", "task-events", task_id, "--cursor", str(cursor), "--limit", str(limit)],
-    ):
-        return
-    events, next_cursor = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).drain_task_events(
-        task_id,
-        cursor=cursor,
-        limit=limit,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "events": [event.model_dump(mode="json") for event in events],
-                "next_cursor": next_cursor,
-            },
-            indent=2,
-        )
-    )
-
-
-@job_app.command("record-task-event")
-def job_record_task_event(
-    task_id: str,
-    event_type: Annotated[str, typer.Option(help="Structured task event type.")],
-    label: Annotated[str, typer.Option(help="Short UI step label.")],
-    summary: Annotated[str, typer.Option(help="Short event summary.")],
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to record the event over SSH."),
-    ] = None,
-    status: Annotated[
-        TaskEventStatus,
-        typer.Option(help="Task step status."),
-    ] = TaskEventStatus.RUNNING,
-    detail: Annotated[str | None, typer.Option(help="Optional detail text.")] = None,
-    path_ref: Annotated[
-        list[str] | None,
-        typer.Option(help="Path reference; repeat for multiple paths."),
-    ] = None,
-    artifact_ref: Annotated[
-        list[str] | None,
-        typer.Option(help="Artifact reference; repeat for multiple artifacts."),
-    ] = None,
-    metadata_json: Annotated[
-        str,
-        typer.Option(help="JSON object metadata for this task event."),
-    ] = "{}",
-    metadata_json_file: Annotated[
-        Path | None,
-        typer.Option(help="Path to a JSON object metadata file."),
-    ] = None,
-) -> None:
-    """Record a structured task timeline event."""
-    metadata_source = _json_text_from_option(metadata_json, metadata_json_file)
-    remote_args = [
-        "job",
-        "record-task-event",
-        task_id,
-        "--event-type",
-        event_type,
-        "--label",
-        label,
-        "--summary",
-        summary,
-        "--status",
-        status.value,
-        "--metadata-json",
-        metadata_source,
-    ]
-    if detail is not None:
-        remote_args.extend(["--detail", detail])
-    for value in path_ref or []:
-        remote_args.extend(["--path-ref", value])
-    for value in artifact_ref or []:
-        remote_args.extend(["--artifact-ref", value])
-    if _try_remote_cluster_passthrough(cluster, remote_args):
-        return
-    event = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).append_task_event(
-        TaskTimelineEvent(
-            task_id=task_id,
-            event_type=event_type,
-            label=label,
-            status=status,
-            summary=summary,
-            detail=detail,
-            path_refs=path_ref or [],
-            artifact_refs=artifact_ref or [],
-            metadata=_json_object(metadata_source),
-        )
-    )
-    typer.echo(event.model_dump_json(indent=2))
-
-
-@job_app.command("wait")
-def job_wait(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    timeout_seconds: Annotated[
-        float,
-        typer.Option(help="Maximum seconds for this terminal-state observation."),
-    ] = 600,
-    poll_seconds: Annotated[float, typer.Option(help="Polling interval.")] = 2,
-) -> None:
-    """Observe until terminal, returning current durable state when the bound expires."""
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise typer.BadParameter("timeout-seconds must be positive and finite")
-    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
-        raise typer.BadParameter("poll-seconds must be positive and finite")
-    if _try_remote_job_wait_passthrough(
-        cluster,
-        job_id=job_id,
-        timeout_seconds=timeout_seconds,
-        poll_seconds=poll_seconds,
-    ):
-        return
-    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
-    job = relay_ops.observe_until_terminal(
-        queue,
-        job_id,
-        timeout_seconds=timeout_seconds,
-        poll_seconds=poll_seconds,
-    )
-    typer.echo(job.model_dump_json(indent=2))
-
-
-@job_app.command("read-log")
-def job_read_log(
-    job_id: str,
-    stream: Annotated[str, typer.Option(help="stdout or stderr.")],
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    offset: Annotated[int, typer.Option(help="Byte offset.")] = 0,
-    limit: Annotated[int, typer.Option(help="Maximum bytes.")] = 65536,
-) -> None:
-    """Read stdout or stderr from a job log by byte offset."""
-    if _try_remote_cluster_passthrough(
-        cluster,
-        [
-            "job",
-            "read-log",
-            job_id,
-            "--stream",
-            stream,
-            "--offset",
-            str(offset),
-            "--limit",
-            str(limit),
-        ],
-    ):
-        return
-    settings = RelaySettings.from_env()
-    queue = core_queue.ClioCoreQueue(settings.core_dir)
-    if stream not in {"stdout", "stderr"}:
-        raise typer.BadParameter("--stream must be stdout or stderr")
-    result = read_job_log(
-        settings,
-        queue.get_job(job_id),
-        stream_name="stdout" if stream == "stdout" else "stderr",
-        offset=offset,
-        limit=limit,
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@job_app.command("read-artifact")
-def job_read_artifact(
-    artifact_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-) -> None:
-    """Read an artifact payload as base64 JSON."""
-    if _try_remote_cluster_passthrough(cluster, ["job", "read-artifact", artifact_id]):
-        return
-    result = read_artifact_bytes(
-        core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir), artifact_id
-    )
-    typer.echo(json.dumps(result, indent=2))
-    if is_delivery_refusal(result):
-        # F6 (#231 R6 review): a T2 refusal (doc §6.4) is not a successful
-        # read -- exit 1 so scripts piping this command's exit code (not
-        # just grepping its stdout) still observe the failure, instead of
-        # a silent 0 alongside a body that says result_available: false.
-        raise typer.Exit(code=1)
-
-
-@job_app.command("list-artifacts")
-def job_list_artifacts(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        int,
-        typer.Option(help="One-based artifact record cursor.", min=1),
-    ] = 1,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum artifact records returned.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """List one stable page of artifact references for a job as JSON."""
-    if _try_remote_cluster_passthrough(
-        cluster,
-        [
-            "job",
-            "list-artifacts",
-            job_id,
-            "--cursor",
-            str(cursor),
-            "--limit",
-            str(limit),
-        ],
-    ):
-        return
-    artifacts, next_cursor, total = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).list_artifacts_page(job_id, cursor=cursor, limit=limit)
-    typer.echo(
-        json.dumps(
-            _record_page_payload(
-                "artifacts",
-                [artifact.model_dump(mode="json") for artifact in artifacts],
-                cursor=cursor,
-                limit=limit,
-                next_cursor=next_cursor,
-                total=total,
-            ),
-            indent=2,
-        )
-    )
-
-
-@job_app.command("used-artifacts")
-def job_used_artifacts(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        str | None,
-        typer.Option(help="Artifact ID cursor returned by the previous page."),
-    ] = None,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum used-artifact records returned.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """List content-pinned artifacts consumed by a job as JSON."""
-    remote_args = ["job", "used-artifacts", job_id, "--limit", str(limit)]
-    if cursor is not None:
-        remote_args.extend(["--cursor", cursor])
-    if _try_remote_cluster_passthrough(cluster, remote_args):
-        return
-    records, next_cursor, total = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).list_used_artifacts_page(job_id, cursor=cursor, limit=limit)
-    typer.echo(
-        json.dumps(
-            {
-                "used_artifacts": [record.model_dump(mode="json") for record in records],
-                "cursor": cursor,
-                "limit": limit,
-                "next_cursor": next_cursor,
-                "total": total,
-            },
-            indent=2,
-        )
-    )
-
-
-@job_app.command("used-by")
-def job_used_by(
-    artifact_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        str | None,
-        typer.Option(help="Opaque edge cursor returned by the previous page."),
-    ] = None,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum consuming-job records returned.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """List jobs that consumed a content-pinned artifact as JSON."""
-    remote_args = ["job", "used-by", artifact_id, "--limit", str(limit)]
-    if cursor is not None:
-        remote_args.extend(["--cursor", cursor])
-    if _try_remote_cluster_passthrough(cluster, remote_args):
-        return
-    records, next_cursor, total = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).list_artifact_users_page(artifact_id, cursor=cursor, limit=limit)
-    typer.echo(
-        json.dumps(
-            {
-                "used_by": [record.model_dump(mode="json") for record in records],
-                "cursor": cursor,
-                "limit": limit,
-                "next_cursor": next_cursor,
-                "total": total,
-            },
-            indent=2,
-        )
-    )
-
-
-@job_app.command("progress")
-def job_progress(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cursor: Annotated[
-        int,
-        typer.Option(help="One-based progress record cursor.", min=1),
-    ] = 1,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum progress records returned.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """List one stable page of structured progress observations as JSON."""
-    if _try_remote_cluster_passthrough(
-        cluster,
-        [
-            "job",
-            "progress",
-            job_id,
-            "--cursor",
-            str(cursor),
-            "--limit",
-            str(limit),
-        ],
-    ):
-        return
-    progress, next_cursor, total = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).list_progress_page(job_id, cursor=cursor, limit=limit)
-    typer.echo(
-        json.dumps(
-            _record_page_payload(
-                "progress",
-                [item.model_dump(mode="json") for item in progress],
-                cursor=cursor,
-                limit=limit,
-                next_cursor=next_cursor,
-                total=total,
-            ),
-            indent=2,
-        )
-    )
-
-
-@job_app.command("record-progress")
-def job_record_progress(
-    job_id: str,
-    label: Annotated[str, typer.Option(help="Progress label.")] = "progress",
-    current: Annotated[float | None, typer.Option(help="Current progress value.")] = None,
-    total: Annotated[float | None, typer.Option(help="Total progress value.")] = None,
-    unit: Annotated[str | None, typer.Option(help="Progress unit.")] = None,
-    message: Annotated[str | None, typer.Option(help="Human-readable progress message.")] = None,
-    source_event_seq: Annotated[
-        int | None,
-        typer.Option(help="Source event sequence for this progress observation."),
-    ] = None,
-    metadata_json: Annotated[
-        str,
-        typer.Option(help="JSON object metadata for this observation."),
-    ] = "{}",
-) -> None:
-    """Record a structured progress observation for a job."""
-    metadata = external_progress_metadata("external_cli", _json_object(metadata_json))
-    progress = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir).append_progress(
-        ProgressRecord(
-            job_id=job_id,
-            label=label,
-            current=current,
-            total=total,
-            unit=unit,
-            message=message,
-            source_event_seq=source_event_seq,
-            metadata=metadata,
-        )
-    )
-    typer.echo(progress.model_dump_json(indent=2))
-
-
 @queue_app.command("list")
 def queue_list(
     cluster: Annotated[
@@ -7733,35 +7047,6 @@ def queue_validate(
                 artifact=validation_artifact,
             )
         raise
-
-
-@job_app.command("cancel")
-def job_cancel(
-    job_id: str,
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH."),
-    ] = None,
-    cancel_scheduler_job: Annotated[
-        bool,
-        typer.Option(
-            "--cancel-scheduler-job/--keep-scheduler-job",
-            help="Request scheduler cancellation for already-submitted remote work.",
-        ),
-    ] = False,
-) -> None:
-    """Cancel a queued or running job."""
-    args = ["job", "cancel", job_id]
-    if cancel_scheduler_job:
-        args.append("--cancel-scheduler-job")
-    if _try_remote_cluster_passthrough(cluster, args):
-        return
-    job = request_cancel_job(
-        _managed_queue_from_env(),
-        job_id,
-        cancel_scheduler=cancel_scheduler_job,
-    )
-    typer.echo(f"{job.job_id} {job.state.value}")
 
 
 _GENERIC_GATEWAY_RUNTIME_KEYS = frozenset(
@@ -10520,11 +9805,6 @@ def live_test(
     _run_or_exit(_run)
 
 
-def _file_idempotency_key(path: Path, text: str) -> str:
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return f"jarvis:{path.resolve()}:{digest}"
-
-
 def _live_acceptance_resume_output_path(source: Path) -> Path:
     """Return a collision-resistant sibling without altering the source checkpoint."""
     return source.with_name(f"{source.stem}.resume-{uuid4().hex[:8]}{source.suffix}")
@@ -10601,25 +9881,6 @@ def _echo_storage_admission_error(error: StorageAdmissionError) -> None:
     )
 
 
-def _record_page_payload(
-    record_key: str,
-    records: list[dict[str, object]],
-    *,
-    cursor: int,
-    limit: int,
-    next_cursor: int | None,
-    total: int,
-) -> dict[str, object]:
-    """Build the shared one-based collection response used by CLI surfaces."""
-    return {
-        record_key: records,
-        "cursor": cursor,
-        "limit": limit,
-        "next_cursor": next_cursor,
-        "total": total,
-    }
-
-
 def _json_object(value: str) -> dict[str, object]:
     source = Path(value[1:]).read_text(encoding="utf-8-sig") if value.startswith("@") else value
     try:
@@ -10639,27 +9900,6 @@ def _json_text_from_option(source: str, source_file: Path | None) -> str:
     if not source_file.exists():
         raise typer.BadParameter(f"JSON file does not exist: {source_file}")
     return source_file.read_text(encoding="utf-8-sig")
-
-
-def _with_exclusive_scheduler(pipeline_yaml: str, scheduler_provider: str) -> str:
-    loaded = yaml.safe_load(pipeline_yaml)
-    if not isinstance(loaded, dict):
-        raise ConfigurationError("JARVIS YAML must be an object to request exclusive allocation")
-    document = cast(dict[str, object], loaded)
-    scheduler = document.get("scheduler")
-    if scheduler is None:
-        if scheduler_provider == "external":
-            raise ConfigurationError(
-                "--exclusive requires an explicit scheduler provider in the cluster definition"
-            )
-        scheduler = {"name": scheduler_provider}
-    if not isinstance(scheduler, dict):
-        raise ConfigurationError("scheduler must be an object to request exclusive allocation")
-    typed_scheduler = cast(dict[str, object], scheduler)
-    typed_scheduler.setdefault("name", scheduler_provider)
-    typed_scheduler["exclusive"] = True
-    document["scheduler"] = typed_scheduler
-    return yaml.safe_dump(document, sort_keys=False)
 
 
 @dataclass(frozen=True)
@@ -16781,13 +16021,6 @@ def _echo_lines(lines: list[str]) -> None:
         typer.echo(_console_safe_text(line))
 
 
-def _job_event_cursor(cursor: int) -> int:
-    """Normalize CLI event cursors while preserving the durable cursor contract."""
-    if cursor < 0:
-        raise typer.BadParameter("cursor must be greater than or equal to 0")
-    return 1 if cursor == 0 else cursor
-
-
 def _console_safe_text(value: str) -> str:
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     return value.encode(encoding, errors="replace").decode(encoding, errors="replace")
@@ -16830,79 +16063,6 @@ def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> boo
     if not remote_cli.should_execute_on_cluster(definition):
         return False
     _run_remote_or_exit(definition, args)
-    return True
-
-
-def _try_remote_job_wait_passthrough(
-    cluster: str | None,
-    *,
-    job_id: str,
-    timeout_seconds: float,
-    poll_seconds: float,
-) -> bool:
-    """Run one bounded remote wait and preserve its durable receipt on observation expiry."""
-    if cluster is None:
-        return False
-    if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
-        return False
-    definition = _require_cluster(cluster)
-    if not remote_cli.should_execute_on_cluster(definition):
-        return False
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise typer.BadParameter("timeout-seconds must be positive and finite")
-    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
-        raise typer.BadParameter("poll-seconds must be positive and finite")
-
-    def action() -> None:
-        try:
-            with remote_cli.remote_command_timeout(
-                timeout_seconds + OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
-            ):
-                payload = remote_cli.run_remote_clio(
-                    definition,
-                    [
-                        "job",
-                        "wait",
-                        job_id,
-                        "--timeout-seconds",
-                        str(timeout_seconds),
-                        "--poll-seconds",
-                        str(poll_seconds),
-                    ],
-                )
-            document = _json_output(payload, "remote job wait")
-            if "observation" in document:
-                try:
-                    result = JobWaitResult.model_validate(document)
-                except ValidationError as exc:
-                    raise RelayError("remote job wait returned an invalid result") from exc
-            else:
-                result = job_wait_result(
-                    RelayJob.model_validate(document),
-                    timeout_seconds=timeout_seconds,
-                )
-        except ObservationTimeoutError as observation_error:
-            with remote_cli.remote_command_timeout(REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS):
-                status = _json_output(
-                    remote_cli.run_remote_clio(definition, ["job", "status", job_id]),
-                    "remote job status after bounded wait",
-                )
-            job = RelayJob.model_validate(status.get("job"))
-            terminal = job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED}
-            if status.get("terminal") is not terminal:
-                raise RelayError(
-                    "remote job status disagrees with its durable job state"
-                ) from observation_error
-            result = job_wait_result(
-                job,
-                timeout_seconds=timeout_seconds,
-            )
-
-        if result.job_id != job_id or result.cluster != cluster:
-            raise RelayError("remote job wait returned a different durable receipt")
-        typer.echo(result.model_dump_json(indent=2))
-
-    _run_or_exit(action)
     return True
 
 

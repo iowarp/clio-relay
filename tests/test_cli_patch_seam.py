@@ -82,6 +82,8 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_release": _SRC_ROOT / "cli_release.py",
     "cli_endpoint": _SRC_ROOT / "cli_endpoint.py",
     "cli_scheduler": _SRC_ROOT / "cli_scheduler.py",
+    "cli_job": _SRC_ROOT / "cli_job.py",
+    "cli_job_records": _SRC_ROOT / "cli_job_records.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -142,7 +144,9 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("bootstrap_reconcile", "write_bootstrap_receipt", "cli"),
     ("bootstrap_reconcile", "proven_active_generation_mismatch", "cli"),
     ("installation", "write_self_install_receipt", "cli"),
-    ("relay_ops", "observe_until_terminal", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_job (its only call
+    # site was job_wait).
+    ("relay_ops", "observe_until_terminal", "cli_job"),
     ("scheduler_providers", "validation_provider_for_scheduler", "cli"),
     ("cluster_config", "open_private_atomic_file", "cli"),
     ("session_lifecycle", "start_remote_session_durable", "cli"),

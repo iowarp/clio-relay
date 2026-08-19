@@ -34,7 +34,6 @@ import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
 import clio_relay.live_acceptance as live_acceptance
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
 import clio_relay.owner_session_admission as owner_session_admission
-import clio_relay.relay_ops as relay_ops
 import clio_relay.remote_cli as remote_cli
 import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.service_runtime as service_runtime
@@ -78,7 +77,6 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.live_acceptance import LiveAcceptanceOptions
 from clio_relay.models import (
-    ArtifactRef,
     Cursor,
     EndpointRegistration,
     EndpointRole,
@@ -87,7 +85,6 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
-    JobWaitResult,
     McpAdmissionClass,
     McpCallSpec,
     McpOperation,
@@ -97,7 +94,6 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
-from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES
 from clio_relay.remote_mcp import MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
 from clio_relay.scheduler_providers import SchedulerProvider
@@ -669,107 +665,6 @@ def test_installation_write_receipt_forwards_components_from(
     assert observed["force"] is False
 
 
-def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    artifact_path = tmp_path / "stdout.log"
-    artifact_path.write_text("hello\n", encoding="utf-8")
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-artifacts",
-        )
-    )
-    artifact = queue.append_artifact(
-        ArtifactRef(job_id=job.job_id, uri=artifact_path.as_uri(), kind="stdout")
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "list-artifacts", job.job_id])
-
-    assert result.exit_code == 0
-    page = json.loads(result.output)
-    assert page["artifacts"][0]["artifact_id"] == artifact.artifact_id
-    assert page["artifacts"][0]["kind"] == "stdout"
-    assert page["cursor"] == 1
-    assert page["limit"] == 100
-    assert page["next_cursor"] is None
-    assert page["total"] == 1
-
-
-def test_cli_read_artifact_prints_document_and_exits_zero_on_a_normal_read(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-read-artifact-ok",
-        )
-    )
-    owned_root = tmp_path / "spool" / job.job_id
-    owned_root.mkdir(parents=True)
-    artifact_path = owned_root / "stdout.log"
-    artifact_path.write_text("hello\n", encoding="utf-8")
-    artifact = queue.append_artifact(
-        ArtifactRef(job_id=job.job_id, uri=artifact_path.as_uri(), kind="stdout")
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
-
-    assert result.exit_code == 0, result.output
-    document = json.loads(result.output)
-    assert document["artifact"]["artifact_id"] == artifact.artifact_id
-
-
-def test_cli_read_artifact_over_budget_prints_the_refusal_and_exits_nonzero(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """F6 (#231 R6 review): ``clio job read-artifact`` used to exit 0 while
-    printing a T2 refusal document (doc §6.4) -- a script checking only the
-    exit code would treat an over-budget read as success. It must exit 1.
-    """
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-read-artifact-oversized",
-        )
-    )
-    owned_root = tmp_path / "spool" / job.job_id
-    owned_root.mkdir(parents=True)
-    oversized_path = owned_root / "large.bin"
-    with oversized_path.open("wb") as stream:
-        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
-    artifact = queue.append_artifact(
-        ArtifactRef(
-            job_id=job.job_id,
-            uri=oversized_path.as_uri(),
-            kind="stdout",
-            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
-
-    assert result.exit_code == 1, result.output
-    document = json.loads(result.output)
-    assert document["result_available"] is False
-    assert document["delivery"]["code"] == "artifact_content_too_large"
-
-
 def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message() -> None:
     """F5 (#231 R6 review): ``_decode_artifact_envelope`` (shared by
     ``_read_remote_mcp_result_artifact``, ``_read_remote_artifact_kind_bytes``,
@@ -806,32 +701,6 @@ def test_decode_artifact_envelope_still_rejects_a_genuinely_malformed_envelope()
         cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             {"encoding": "raw"}
         )
-
-
-def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-tasks",
-        )
-    )
-    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "tasks", job.job_id])
-
-    assert result.exit_code == 0
-    page = json.loads(result.output)
-    assert page["tasks"][0]["task_id"] == task.task_id
-    assert page["tasks"][0]["name"] == "jarvis.execution"
-    assert page["cursor"] == 1
-    assert page["limit"] == 100
-    assert page["next_cursor"] is None
-    assert page["total"] == 1
 
 
 def test_cli_repairs_lease_operational_indexes(
@@ -903,88 +772,6 @@ def test_cli_audits_lease_capacity_and_exits_nonzero_on_mismatch(
     invalid_report = json.loads(invalid.output)
     assert invalid_report["valid"] is False
     assert invalid_report["mismatches"][0]["type"] == "audit_error"
-
-
-def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-task-events",
-        )
-    )
-    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    record = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-task-event",
-            task.task_id,
-            "--event-type",
-            "dataset_found",
-            "--label",
-            "dataset",
-            "--summary",
-            "Found staged dataset",
-            "--status",
-            "succeeded",
-            "--path-ref",
-            "/mnt/common/datasets/example_001",
-        ],
-    )
-    read = CliRunner().invoke(app, ["job", "task-events", task.task_id])
-
-    assert record.exit_code == 0
-    assert read.exit_code == 0
-    payload = json.loads(read.output)
-    assert payload["events"][0]["event_type"] == "dataset_found"
-    assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/example_001"]
-
-
-def test_cli_job_watch_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-watch-zero-cursor",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "watch", job.job_id, "--cursor", "0"])
-
-    assert result.exit_code == 0
-    assert "job.queued" in result.output
-    assert "next_cursor=2" in result.output
-
-
-def test_cli_job_monitor_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-monitor-zero-cursor",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "monitor", job.job_id, "--cursor", "0"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["events"][0]["event_type"] == "job.queued"
-    assert payload["next_cursor"] == 2
 
 
 def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1067,102 +854,6 @@ def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch)
     assert listed_page["source_next_cursor"] is None
     assert listed_page["source_total"] == 1
     assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
-
-
-def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-status",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "status", job.job_id])
-
-    assert result.exit_code == 0
-    status = json.loads(result.output)
-    assert status["job"]["job_id"] == job.job_id
-    assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
-
-
-def test_cli_job_wait_returns_current_state_when_observation_expires(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_name="long-cli-run"),
-            idempotency_key="long-cli-run",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    observations: list[tuple[str, float, float]] = []
-
-    def observe(
-        selected_queue: ClioCoreQueue,
-        job_id: str,
-        *,
-        timeout_seconds: float,
-        poll_seconds: float,
-    ) -> JobWaitResult:
-        observations.append((job_id, timeout_seconds, poll_seconds))
-        return cli.job_wait_result(
-            selected_queue.get_job(job_id),
-            timeout_seconds=timeout_seconds,
-        )
-
-    monkeypatch.setattr(relay_ops, "observe_until_terminal", observe)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            job.job_id,
-            "--timeout-seconds",
-            "0.25",
-            "--poll-seconds",
-            "0.05",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == job.job_id
-    assert observed["state"] == "queued"
-    assert observed["observation"] == {
-        "outcome": "observation_unknown",
-        "timeout_seconds": 0.25,
-        "scheduler_action": "none",
-        "relay_action": "none",
-    }
-    assert observations == [(job.job_id, 0.25, 0.05)]
-    assert queue.get_job(job.job_id).state is JobState.QUEUED
-
-
-@pytest.mark.parametrize(
-    ("option", "value"),
-    [("--timeout-seconds", "inf"), ("--poll-seconds", "inf")],
-)
-def test_cli_job_wait_rejects_nonfinite_observation_bounds(
-    option: str,
-    value: str,
-) -> None:
-    result = CliRunner().invoke(
-        app,
-        ["job", "wait", "job_00000000000000000000000000000001", option, value],
-    )
-
-    assert result.exit_code != 0
-    assert "positive and finite" in result.output
 
 
 def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1296,101 +987,6 @@ def test_cli_queue_validation_writes_canonical_report(
         "queue.worker-containment-enforced",
     }
     assert report["cleanup"]["cancel_scheduler_jobs"] is False
-
-
-def test_cli_job_submit_can_request_exclusive_scheduler(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    yaml_path = tmp_path / "pipeline.yaml"
-    yaml_path.write_text("name: generic\npkgs: []\n", encoding="utf-8")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    _write_test_cluster(tmp_path, name="test-cluster", scheduler_provider="slurm")
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "test-cluster",
-            "--jarvis-yaml",
-            str(yaml_path),
-            "--exclusive",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).list_jobs()[0]
-    assert isinstance(job.spec, JarvisRunSpec)
-    assert "exclusive: true" in str(job.spec.pipeline_yaml)
-
-
-def test_cli_job_submit_pipeline_creates_named_jarvis_job(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit-pipeline",
-            "--cluster",
-            "ares",
-            "--pipeline-name",
-            "site_simulation_4node",
-            "--idempotency-key",
-            "named-pipeline",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
-    assert isinstance(job.spec, JarvisRunSpec)
-    assert job.spec.pipeline_name == "site_simulation_4node"
-    assert job.spec.pipeline_yaml is None
-
-
-def test_cli_record_progress_cannot_spoof_package_progress(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-record-progress",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-progress",
-            job.job_id,
-            "--metadata-json",
-            '{"source":"jarvis_package","package_name":"site.simulation","run_id":"spoofed"}',
-        ],
-    )
-
-    assert result.exit_code == 0
-    progress = ClioCoreQueue(core_dir).list_progress(job.job_id)[0]
-    assert progress.metadata["source"] == "external_cli"
-    assert "package_name" not in progress.metadata
-    assert "run_id" not in progress.metadata
 
 
 def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -7498,7 +7094,6 @@ def test_cli_init_threads_explicit_legacy_output_migration_authorization(
     assert observed == [True]
 
 
-
 def test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -9174,282 +8769,6 @@ def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: Mon
     assert job.spec.arguments == {"steps": 150, "sample": "ares-live"}
 
 
-def test_cli_remote_job_submit_stages_yaml_and_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="test-host",
-                core_dir="/remote/core",
-                spool_dir="/remote/spool",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    (tmp_path / "input.in").write_text("run 150\n", encoding="utf-8")
-    yaml_path = tmp_path / "pipeline.yaml"
-    yaml_path.write_text(
-        """
-name: remote-submit
-x_clio_relay:
-  stage_files:
-    - local_path: input.in
-      remote_path: .local/share/clio-relay/live-tests/{run_id}/input.in
-pkgs:
-  - pkg_type: site.simulation
-    input: $HOME/.local/share/clio-relay/live-tests/{run_id}/input.in
-""".lstrip(),
-        encoding="utf-8",
-    )
-    writes: dict[str, bytes] = {}
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes | None = None,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        if "cat > " in command[2]:
-            remote_path = command[2].split("cat > ", maxsplit=1)[1].split(" &&", maxsplit=1)[0]
-            writes[remote_path.strip("'")] = input or b""
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-        if '"$HOME/.local/bin/clio-relay" job submit' in command[2]:
-            assert "CLIO_RELAY_CLI_MODE=local" in command[2]
-            assert 'CLIO_RELAY_CORE_DIR="/remote/core"' in command[2]
-            return subprocess.CompletedProcess(command, 0, b"job_remote\n", b"")
-        return subprocess.CompletedProcess(command, 0, b"", b"")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "ares",
-            "--jarvis-yaml",
-            str(yaml_path),
-            "--idempotency-key",
-            "desktop-submit",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert result.output.strip() == "job_remote"
-    assert ClioCoreQueue(tmp_path / ".clio-relay" / "core").list_jobs() == []
-    assert any(path.endswith("/input.in") for path in writes)
-    staged_yaml = next(
-        data.decode("utf-8") for path, data in writes.items() if path.endswith("/pipeline.yaml")
-    )
-    assert "x_clio_relay" not in staged_yaml
-    assert ".local/share/clio-relay/live-tests/pipeline-" in staged_yaml
-    assert any('"$HOME/.local/bin/clio-relay" job submit' in command[2] for command in commands)
-
-
-def test_cli_remote_wait_passthrough_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    commands: list[list[str]] = []
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000001",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
-        idempotency_key="long-remote-run",
-    )
-    wait_result = cli.job_wait_result(remote_job, timeout_seconds=1.0)
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        assert timeout == 11.0
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            wait_result.model_dump_json().encode("utf-8"),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-            "--poll-seconds",
-            "0.1",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == remote_job.job_id
-    assert observed["observation"]["outcome"] == "observation_unknown"
-    assert len(commands) == 1
-    assert f'"$HOME/.local/bin/clio-relay" job wait {remote_job.job_id}' in commands[0][2]
-
-
-def test_cli_remote_wait_transport_expiry_reobserves_exact_status(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000002",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
-        idempotency_key="long-remote-run-timeout",
-    )
-    commands: list[list[str]] = []
-    timeouts: list[float | None] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        timeouts.append(timeout)
-        assert capture_output is True
-        assert check is False
-        if '"$HOME/.local/bin/clio-relay" job wait' in command[2]:
-            raise subprocess.TimeoutExpired(command, timeout or 0)
-        if '"$HOME/.local/bin/clio-relay" job status' in command[2]:
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps(
-                    {
-                        "job": remote_job.model_dump(mode="json"),
-                        "relay_queue": {"state": "queued"},
-                        "scheduler": [{"scheduler_job_id": "42", "raw_state": "PENDING"}],
-                        "terminal": False,
-                    }
-                ).encode("utf-8"),
-                b"",
-            )
-        raise AssertionError(f"unexpected command: {command}")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-            "--poll-seconds",
-            "0.1",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == remote_job.job_id
-    assert observed["state"] == "queued"
-    assert observed["observation"]["outcome"] == "observation_unknown"
-    assert observed["observation"]["scheduler_action"] == "none"
-    assert len(commands) == 2
-    assert timeouts == [11.0, 30.0]
-
-
-def test_cli_remote_wait_rejects_contradictory_terminal_claim(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000003",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="hostile-remote-run"),
-        idempotency_key="hostile-remote-run",
-    )
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        assert capture_output is True
-        assert check is False
-        assert timeout == 11.0
-        contradictory = {
-            **remote_job.model_dump(mode="json"),
-            "observation": {
-                "outcome": "terminal",
-                "timeout_seconds": 1,
-                "scheduler_action": "none",
-                "relay_action": "none",
-            },
-        }
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps(contradictory).encode("utf-8"),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "remote job wait returned an invalid result" in result.output
-
-
 def _bootstrap_cli_fakes(
     monkeypatch: MonkeyPatch,
     *,
@@ -10002,62 +9321,6 @@ def test_cluster_bootstrap_invalidates_cache_before_target_validation_and_record
         bootstrap_resource["metadata"]["remote_mcp_cache_invalidation"]
         == cache_evidence["metadata"]
     )
-
-
-def test_cli_remote_task_event_passthrough_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    metadata_json = tmp_path / "metadata.json"
-    metadata_json.write_text('{"surface":"cli-file"}', encoding="utf-8")
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        return subprocess.CompletedProcess(command, 0, b'{"seq":1}\n', b"")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-task-event",
-            "task_remote",
-            "--cluster",
-            "ares",
-            "--event-type",
-            "dataset_found",
-            "--label",
-            "dataset",
-            "--summary",
-            "Found staged dataset",
-            "--status",
-            "succeeded",
-            "--path-ref",
-            "/mnt/common/datasets/example_001",
-            "--metadata-json-file",
-            str(metadata_json),
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert json.loads(result.output)["seq"] == 1
-    assert len(commands) == 1
-    assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
-    assert '"$HOME/.local/bin/clio-relay" job record-task-event task_remote' in commands[0][2]
-    assert "--path-ref /mnt/common/datasets/example_001" in commands[0][2]
-    assert "cli-file" in commands[0][2]
 
 
 def test_cli_remote_gateway_passthrough_uses_cluster_core(
