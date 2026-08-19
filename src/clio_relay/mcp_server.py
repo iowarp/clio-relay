@@ -1187,10 +1187,7 @@ def _all_tool_definitions(
         },
         {
             "name": "relay_artifact_lineage",
-            "description": (
-                "Query artifact lineage in either direction: pass job_id for the artifacts "
-                "that job used, or artifact_id for the jobs that used that artifact."
-            ),
+            "description": "Query artifact lineage by job_id or artifact_id; includes produced-by.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2538,6 +2535,7 @@ def _used_by_tool(
     )
     result = {
         "used_by": [record.model_dump(mode="json") for record in records],
+        "produced_by": artifact.metadata.get("produced_by"),
         "cursor": cursor,
         "limit": limit,
         "next_cursor": next_cursor,
