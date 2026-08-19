@@ -8,11 +8,14 @@ module stays in the 150-500-line sweet spot, so ground rule 2's "split
 further if a group exceeds ~800" (the setup instructions for this campaign)
 applies: this module owns the four **cluster registry CRUD** commands
 (``list``/``add``/``pin-target``/``pin-runtime`` -- read, replace-whole, or
-patch-one-field a local ``ClusterDefinition``); the six **deployment**
-commands (``probe``/``bootstrap``/``install-app``/
-``install-endpoint-service``/``restart-endpoint-service``/
-``endpoint-service-status`` -- everything that reaches over SSH) are a
-second, later slice's real seam, not this one's.
+patch-one-field a local ``ClusterDefinition``) and the canonical
+``cluster_app`` Typer instance; the six **deployment** commands
+(``probe``/``bootstrap``/``install-app``/``install-endpoint-service``/
+``restart-endpoint-service``/``endpoint-service-status`` -- everything that
+reaches over SSH) landed separately in ``cli_cluster_deploy.py``, a sibling
+file registering onto this module's ``cluster_app`` via
+``@cli_cluster.cluster_app.command(...)``, matching the two-file-one-Typer
+pattern ``cli_queue.py``/``cli_queue_maintenance.py`` established.
 
 **Domain logic stays where it lives.** ``ClusterRegistry.mutate``/``.load``
 (``cluster_config.py``) already are the storage primitives (SS5's

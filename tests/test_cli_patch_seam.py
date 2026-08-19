@@ -88,6 +88,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_queue_maintenance": _SRC_ROOT / "cli_queue_maintenance.py",
     "cli_session": _SRC_ROOT / "cli_session.py",
     "cli_gateway_runtime": _SRC_ROOT / "cli_gateway_runtime.py",
+    "cli_cluster_deploy": _SRC_ROOT / "cli_cluster_deploy.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -116,14 +117,20 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("session_lifecycle", "detach_remote_session", "cli_session"),
     ("installation", "installation_info", "cli"),
     ("session_lifecycle", "start_remote_session", "cli"),
-    ("bootstrap", "package_source_root", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_bootstrap's
+    # only cli.py call site).
+    ("bootstrap", "package_source_root", "cli_cluster_deploy"),
     ("installation", "worker_runtime_info", "cli"),
     # #231 cli.py decomposition: moved caller cli -> cli_endpoint with the
     # endpoint command-group extraction (EndpointWorker's only cli.py call
     # site was endpoint_start).
     ("endpoint", "EndpointWorker", "cli_endpoint"),
     ("scheduler_providers", "provider_for_scheduler", "cli"),
-    ("bootstrap", "bootstrap_cluster_over_ssh", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_bootstrap's
+    # only cli.py call site).
+    ("bootstrap", "bootstrap_cluster_over_ssh", "cli_cluster_deploy"),
     ("jarvis_mcp_validation", "build_jarvis_mcp_validation_report", "cli"),
     ("frp_check", "run_frpc_connection_check", "cli"),
     ("live_acceptance", "run_live_acceptance", "cli"),
@@ -142,7 +149,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("bounded_process", "run_bounded_process", "cli"),
     ("storage_runtime", "storage_managed_queue", "cli"),
     ("service_runtime", "ServiceRuntimeSupervisor", "cli"),
-    ("deployment", "install_endpoint_user_service_over_ssh", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_install_
+    # endpoint_service's only cli.py call site).
+    ("deployment", "install_endpoint_user_service_over_ssh", "cli_cluster_deploy"),
     # R8(ii): moved caller cli -> cli_relay_host with the relay-host extraction.
     ("transport_probe", "run_frp_direct_http_probe", "cli_relay_host"),
     ("transport_probe", "run_ssh_forward_http_probe", "cli_relay_host"),
@@ -171,7 +181,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("session_api", "submit_owned_session_job", "cli_session"),
     ("validation_report", "write_validation_report", "cli"),
     ("remote_cli", "remote_command_timeout", "cli"),
-    ("application_profiles", "install_cluster_app_over_ssh", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_install_app's
+    # only cli.py call site).
+    ("application_profiles", "install_cluster_app_over_ssh", "cli_cluster_deploy"),
     # #231 cli.py decomposition: moved caller cli -> cli_gateway_runtime with
     # the gateway command-group extraction (owner_session_gateway_admission's
     # only two cli.py call sites were start-runtime and resume-runtime, both
@@ -179,14 +192,23 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("owner_session_admission", "owner_session_gateway_admission", "cli_gateway_runtime"),
     ("fastmcp_server", "run_fastmcp_stdio", "cli"),
     ("fastmcp_server", "run_fastmcp_http", "cli"),
-    ("endpoint_service_status", "endpoint_service_readiness_over_ssh", "cli"),
-    ("deployment", "restart_endpoint_user_service_over_ssh", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_endpoint_
+    # service_status's only cli.py call site).
+    ("endpoint_service_status", "endpoint_service_readiness_over_ssh", "cli_cluster_deploy"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_restart_
+    # endpoint_service's only cli.py call site).
+    ("deployment", "restart_endpoint_user_service_over_ssh", "cli_cluster_deploy"),
     ("relay_ops", "job_status", "cli"),
     ("cluster_config", "acquire_private_configuration_windows_parent_guard", "cli"),
     # #231 cli.py decomposition: moved caller cli -> cli_scheduler with the
     # scheduler command-group extraction (every call site was inside it).
     ("scheduler_providers", "allocation_connector_provider_for_scheduler", "cli_scheduler"),
-    ("bootstrap_acceptance", "bootstrap_reuse_acceptance_evidence", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
+    # the cluster deployment command-group extraction (cluster_bootstrap's
+    # only cli.py call site).
+    ("bootstrap_acceptance", "bootstrap_reuse_acceptance_evidence", "cli_cluster_deploy"),
     ("remote_mcp", "build_remote_mcp_acceptance_report", "cli"),
     ("jarvis_mcp", "jarvis_mcp_server", "cli"),
     ("remote_cli", "remove_remote_file", "cli"),

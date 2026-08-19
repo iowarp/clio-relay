@@ -14,9 +14,9 @@ docstring already applied to that test).
 
 The six **deployment** ``cluster_app`` commands (``probe``/``bootstrap``/
 ``install-app``/``install-endpoint-service``/``restart-endpoint-service``/
-``endpoint-service-status``) are a separate, later slice's real seam
-(``cli_cluster.py``'s own docstring) -- their tests stay in
-``tests/test_cli.py`` until that slice lands.
+``endpoint-service-status``) landed separately in
+``src/clio_relay/cli_cluster_deploy.py``; their tests moved to
+``tests/test_cli_cluster_deploy.py``, not here.
 
 **Autouse-fixture parity.** ``test_cli.py`` defines its own module-scoped
 ``autouse=True`` ``_default_cli_mode`` fixture (env-var defaults every CLI
