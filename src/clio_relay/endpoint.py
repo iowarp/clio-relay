@@ -55,6 +55,7 @@ from clio_relay.jarvis_dispatch_failure import (
     jarvis_dispatch_refusal,
 )
 from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
+from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs_from_path
 from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
@@ -2689,8 +2690,7 @@ class EndpointWorker:
             arguments={
                 "pipeline_id": intent["pipeline_id"],
                 "execution_id": intent["execution_id"],
-                "include_progress": True,
-                "include_service_runtimes": False,
+                "artifacts": {"page_size": 100},
             },
             timeout_seconds=MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS,
         )
@@ -5682,11 +5682,9 @@ class EndpointWorker:
         for kind, path in candidates.items():
             if not internal_filesystem_path(path).exists():
                 continue
-            candidate = (
-                self._remote_agent_final_artifact(job, spool, path)
-                if kind == "agent_last_message" and job.kind is JobKind.REMOTE_AGENT
-                else None
-            )
+            candidate = None
+            if kind == "agent_last_message" and job.kind is JobKind.REMOTE_AGENT:
+                candidate = self._remote_agent_final_artifact(job, spool, path)
             if self._append_spool_artifact_once(
                 job,
                 spool,
@@ -5773,6 +5771,8 @@ class EndpointWorker:
     ) -> bool:
         """Index one immutable spool artifact, tolerating restart replay."""
         candidate = candidate or spool.artifact_for(path, kind=kind)
+        if kind == "mcp_result":
+            ingest_jarvis_execution_outputs_from_path(self.queue, job, path, spool.path)
         cursor: int | None = 1
         while cursor is not None:
             artifacts, cursor, _total = self.queue.list_artifacts_page(

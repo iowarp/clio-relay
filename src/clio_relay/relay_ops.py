@@ -17,6 +17,7 @@ from clio_relay.bounded_payload import JSON, build_delivery_refusal
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_execution_artifacts import EXECUTION_OUTPUT_OWNERSHIP_SCHEMA
 from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
@@ -214,14 +215,18 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     if owned_root_uri is None and ownership_schema is None:
         owned_root = queue.root.parent / "spool" / artifact.job_id
     elif (
-        ownership_schema == ARTIFACT_OWNERSHIP_SCHEMA
+        ownership_schema
+        in {
+            ARTIFACT_OWNERSHIP_SCHEMA,
+            EXECUTION_OUTPUT_OWNERSHIP_SCHEMA,
+        }
         and isinstance(owned_root_uri, str)
         and owned_root_uri
     ):
         owned_root = _artifact_file_path(owned_root_uri)
     else:
         raise RelayError(f"artifact has invalid owned-root metadata: {artifact_id}")
-    if owned_root.name != artifact.job_id:
+    if ownership_schema != EXECUTION_OUTPUT_OWNERSHIP_SCHEMA and owned_root.name != artifact.job_id:
         raise RelayError(
             f"artifact owned-root metadata does not name its durable job: {artifact_id}"
         )

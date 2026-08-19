@@ -17177,7 +17177,7 @@ def _run_post_run_jarvis_execution_query(
                     definition=definition,
                     queue=queue,
                     profile=profile,
-                    arguments={**query_arguments, "artifacts": {"page_size": 25}},
+                    arguments={**query_arguments, "artifacts": {"page_size": 100}},
                     deadline=deadline,
                     poll_seconds=poll_seconds,
                 )
