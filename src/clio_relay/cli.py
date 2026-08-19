@@ -12,7 +12,6 @@ import math
 import os
 import re
 import shlex
-import socket
 import stat
 import subprocess
 import sys
@@ -41,6 +40,7 @@ import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_api as cli_api
+import clio_relay.cli_endpoint as cli_endpoint
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_release as cli_release
@@ -50,7 +50,6 @@ import clio_relay.cli_worker as cli_worker
 import clio_relay.cluster_config as cluster_config
 import clio_relay.core_queue as core_queue
 import clio_relay.deployment as deployment
-import clio_relay.endpoint as endpoint
 import clio_relay.endpoint_service_status as endpoint_service_status
 import clio_relay.fastmcp_server as fastmcp_server
 import clio_relay.frp_check as frp_check
@@ -96,7 +95,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.cluster_probe import pinned_runtime_present, probe_cluster_runtime
 from clio_relay.config import RelaySettings
-from clio_relay.deployment import render_endpoint_user_service, write_endpoint_user_service
+from clio_relay.deployment import render_endpoint_user_service
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
 from clio_relay.doctor import run_cluster_doctor, run_doctor
 from clio_relay.errors import ConfigurationError, NotFoundError, ObservationTimeoutError, RelayError
@@ -131,7 +130,6 @@ from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactUse,
     Cursor,
-    EndpointRole,
     GatewaySession,
     GatewaySessionState,
     JarvisRunSpec,
@@ -781,7 +779,6 @@ _acceptance_report_command = (
 
 
 app = typer.Typer(no_args_is_help=True)
-endpoint_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 cluster_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
@@ -790,7 +787,7 @@ queue_app = typer.Typer(no_args_is_help=True)
 scheduler_app = typer.Typer(no_args_is_help=True)
 remote_mcp_app = typer.Typer(no_args_is_help=True)
 
-app.add_typer(endpoint_app, name="endpoint")
+app.add_typer(cli_endpoint.endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
@@ -872,312 +869,6 @@ def init(
         f"initialized core={settings.core_dir} spool={settings.spool_dir} "
         f"clusters={','.join(sorted(registry.clusters))}"
     )
-
-
-@endpoint_app.command("start")
-def endpoint_start(
-    role: Annotated[EndpointRole, typer.Option(help="Endpoint role.")],
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster name for worker endpoints."),
-    ] = None,
-    once: Annotated[bool, typer.Option(help="Run one worker iteration and exit.")] = False,
-    concurrency: Annotated[
-        int | None,
-        typer.Option(
-            help=(
-                "Number of in-process worker slots for worker endpoints. Defaults to the "
-                "cluster's registered worker_capacity for worker endpoints (clio-relay#219); "
-                "1 without a configured cluster."
-            )
-        ),
-    ] = None,
-    control_query_concurrency: Annotated[
-        int | None,
-        typer.Option(
-            help=(
-                "Slots carved out of total capacity for control-class MCP queries. Defaults "
-                "to the cluster's registered worker_capacity for worker endpoints "
-                "(clio-relay#219) rather than an unpinned 0: 0 silently starves every "
-                "control-class job (jarvis_describe and kin) with no typed reason -- it just "
-                "never gets picked up."
-            )
-        ),
-    ] = None,
-    kind_concurrency: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--kind-concurrency",
-            help="Per-kind worker limit as KIND=LIMIT; repeat for multiple kinds.",
-        ),
-    ] = None,
-    scheduler_provider: Annotated[
-        str | None,
-        typer.Option(help="Explicit scheduler provider for worker observation and cancellation."),
-    ] = None,
-) -> None:
-    """Start a desktop or worker endpoint."""
-    settings = RelaySettings.from_env()
-    definition: ClusterDefinition | None = None
-    if role == EndpointRole.WORKER:
-        if cluster is None:
-            raise typer.BadParameter("--cluster is required for worker endpoints")
-        if scheduler_provider is None:
-            definition = _require_cluster(cluster)
-    if definition is not None:
-        # clio-relay#219: resolve unpinned concurrency/control_query_concurrency from
-        # the cluster's own registered WorkerCapacityPolicy (the same resolution
-        # `endpoint render-user-service` already applies) instead of this command's
-        # own disconnected CLI defaults -- a fresh worker deployment that never pins
-        # these flags otherwise gets control_query_concurrency=0 and silently
-        # starves every control-class job.
-        capacity = _resolved_worker_capacity_policy(
-            definition,
-            concurrency=concurrency,
-            control_query_concurrency=control_query_concurrency,
-            kind_concurrency=kind_concurrency,
-            clear_kind_concurrency=False,
-        )
-        resolved_concurrency = capacity.concurrency
-        resolved_control_query_concurrency = capacity.control_query_concurrency
-        resolved_kind_concurrency: dict[JobKind, int] = capacity.kind_concurrency
-    else:
-        # No cluster is configured (desktop role): preserve the historical
-        # single-slot, no-reserved-control-capacity default exactly.
-        # WorkerCapacityPolicy requires concurrency>=2, which does not fit this
-        # role's single-slot default, so its own bounds are enforced directly.
-        resolved_concurrency = 1 if concurrency is None else concurrency
-        resolved_control_query_concurrency = (
-            0 if control_query_concurrency is None else control_query_concurrency
-        )
-        if resolved_concurrency < 1:
-            raise typer.BadParameter("--concurrency must be at least 1")
-        if resolved_control_query_concurrency < 0:
-            raise typer.BadParameter("--control-query-concurrency must not be negative")
-        if resolved_control_query_concurrency >= resolved_concurrency:
-            raise typer.BadParameter("--control-query-concurrency must be less than --concurrency")
-        resolved_kind_concurrency = _kind_concurrency_options(kind_concurrency)
-    if role == EndpointRole.WORKER and resolved_control_query_concurrency == 0:
-        # clio-relay#219: a worker with zero control-query capacity accepts
-        # describe-class submissions and never runs them -- indistinguishable
-        # from slow until an operator discovers the knob. Warn loudly at
-        # startup instead of leaving that silent.
-        typer.echo(
-            f"warning: worker {cluster or 'local'!r} is starting with "
-            "control_query_concurrency=0; every describe-class control-query job "
-            "submitted to it will queue forever with no typed reason. Pass "
-            "--control-query-concurrency N (N >= 1) here, or bake it into the persisted "
-            "systemd unit with 'clio-relay endpoint render-user-service --cluster "
-            f"{cluster or '<cluster>'} --control-query-concurrency N'.",
-            err=True,
-        )
-    selected_scheduler = scheduler_provider
-    if selected_scheduler is None and definition is not None:
-        selected_scheduler = definition.scheduler_provider
-    worker = endpoint.EndpointWorker(
-        role=role,
-        settings=settings,
-        cluster=cluster or "local",
-        concurrency=resolved_concurrency,
-        control_query_concurrency=resolved_control_query_concurrency,
-        kind_concurrency=resolved_kind_concurrency,
-        scheduler_provider=(
-            scheduler_providers.provider_for_scheduler(selected_scheduler)
-            if role == EndpointRole.WORKER
-            else None
-        ),
-    )
-    try:
-        worker.register()
-        if once:
-            worker.run_once()
-            return
-        worker.serve_forever()
-    finally:
-        worker.close()
-
-
-@endpoint_app.command("status")
-def endpoint_status(
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Optional endpoint cluster filter."),
-    ] = None,
-    cursor: Annotated[
-        int,
-        typer.Option(help="One-based global endpoint source cursor.", min=1),
-    ] = 1,
-    limit: Annotated[
-        int,
-        typer.Option(
-            help="Maximum endpoint source positions read.",
-            min=1,
-            max=MAX_RESPONSE_PAGE_RECORDS,
-        ),
-    ] = DEFAULT_RESPONSE_PAGE_RECORDS,
-) -> None:
-    """Show one stable source window of durable endpoint registrations."""
-    settings = RelaySettings.from_env()
-    queue = core_queue.ClioCoreQueue(settings.core_dir)
-    queue.initialize()
-    endpoints, next_cursor, total = queue.list_endpoints_page(
-        cursor=cursor,
-        limit=limit,
-        cluster=cluster,
-    )
-    typer.echo(
-        _public_json(
-            {
-                "endpoints": [endpoint.model_dump(mode="json") for endpoint in endpoints],
-                "source_cursor": cursor,
-                "source_limit": limit,
-                "source_next_cursor": next_cursor,
-                "source_total": total,
-                "source_total_semantics": "global_endpoint_sequence_high_water",
-                "filters_apply_within_source_window": True,
-                "core_dir": str(settings.core_dir),
-                "spool_dir": str(settings.spool_dir),
-            }
-        )
-    )
-
-
-@endpoint_app.command("render-user-service")
-def endpoint_render_user_service(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    output: Annotated[
-        Path | None,
-        typer.Option(help="Optional path to write the systemd user service."),
-    ] = None,
-    concurrency: Annotated[
-        int | None,
-        typer.Option(help="Number of in-process worker slots for the user service."),
-    ] = None,
-    control_query_concurrency: Annotated[
-        int | None,
-        typer.Option(help="Slots reserved within total capacity for live control queries."),
-    ] = None,
-    kind_concurrency: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--kind-concurrency",
-            help="Per-kind worker limit as KIND=LIMIT; repeat for multiple kinds.",
-        ),
-    ] = None,
-    clear_kind_concurrency: Annotated[
-        bool,
-        typer.Option(help="Clear every persisted per-kind override in the rendered unit."),
-    ] = False,
-) -> None:
-    """Render a sudo-less systemd user service for a worker endpoint."""
-    definition = _require_cluster(cluster)
-    capacity = _resolved_worker_capacity_policy(
-        definition,
-        concurrency=concurrency,
-        control_query_concurrency=control_query_concurrency,
-        kind_concurrency=kind_concurrency,
-        clear_kind_concurrency=clear_kind_concurrency,
-    )
-    service_text = render_endpoint_user_service(
-        cluster=cluster,
-        definition=definition,
-        concurrency=capacity.concurrency,
-        control_query_concurrency=capacity.control_query_concurrency,
-        kind_concurrency=capacity.kind_concurrency,
-    )
-    if output is None:
-        typer.echo(service_text)
-        return
-    typer.echo(write_endpoint_user_service(output, service_text))
-
-
-@endpoint_app.command("worker-info")
-def endpoint_worker_info(
-    cluster: Annotated[str, typer.Option(help="Configured worker cluster name.")],
-    freshness_seconds: Annotated[
-        float,
-        typer.Option(help="Maximum acceptable durable worker heartbeat age."),
-    ] = 120.0,
-    readiness_only: Annotated[
-        bool,
-        typer.Option(help="Return bounded readiness flags without detailed installation records."),
-    ] = False,
-    pinned_install_receipt_path: Annotated[
-        str | None,
-        typer.Option(
-            "--pinned-install-receipt-path",
-            help=(
-                "Cluster-registered relay_install_receipt path (this host's "
-                "own pinned runtime) to verify the worker against, instead of "
-                "this invocation's ambient current installation."
-            ),
-        ),
-    ] = None,
-    dev_mode: Annotated[
-        bool,
-        typer.Option(
-            help=(
-                "clio-relay#211: cluster-registered dev_mode, threaded in by the "
-                "caller. Combined with CLIO_RELAY_DEV_MODE on this host either way."
-            ),
-        ),
-    ] = False,
-) -> None:
-    """Report fresh process-bound identity for the active cluster worker."""
-    _run_or_exit(
-        lambda: typer.echo(
-            json.dumps(
-                installation.worker_runtime_info(
-                    cluster=cluster,
-                    freshness_seconds=freshness_seconds,
-                    readiness_only=readiness_only,
-                    pinned_install_receipt_path=pinned_install_receipt_path,
-                    dev_mode=dev_mode_enabled(cluster_dev_mode=dev_mode),
-                ),
-                indent=2,
-            )
-        )
-    )
-
-
-@endpoint_app.command("target-info", hidden=True)
-def endpoint_target_info(
-    scheduler_provider: Annotated[
-        str,
-        typer.Option(help="Configured scheduler provider to attest."),
-    ] = "external",
-) -> None:
-    """Report physical host and scheduler identity from the cluster process context."""
-
-    def action() -> None:
-        provider = scheduler_providers.provider_for_scheduler(scheduler_provider)
-        scheduler_cluster_name = provider.scheduler_cluster_name()
-        typer.echo(
-            json.dumps(
-                {
-                    "schema_version": "clio-relay.cluster-target-info.v1",
-                    "hostname": socket.gethostname(),
-                    "fqdn": socket.getfqdn(),
-                    "site_marker_sha256": _physical_site_marker_sha256(Path("/etc/machine-id")),
-                    "scheduler_provider": provider.name,
-                    "scheduler_cluster_name": scheduler_cluster_name,
-                },
-                indent=2,
-            )
-        )
-
-    _run_or_exit(action)
-
-
-def _physical_site_marker_sha256(path: Path) -> str:
-    """Hash the exact physical-site marker bytes used by operator pinning tools."""
-    try:
-        marker = path.read_bytes()
-    except OSError as exc:
-        raise ConfigurationError(f"could not read physical site marker: {exc}") from exc
-    if not marker.strip():
-        raise ConfigurationError("physical site marker is empty")
-    return hashlib.sha256(marker).hexdigest()
 
 
 @cluster_app.command("list")

@@ -80,6 +80,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_api": _SRC_ROOT / "cli_api.py",
     "cli_worker": _SRC_ROOT / "cli_worker.py",
     "cli_release": _SRC_ROOT / "cli_release.py",
+    "cli_endpoint": _SRC_ROOT / "cli_endpoint.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -107,7 +108,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("session_lifecycle", "start_remote_session", "cli"),
     ("bootstrap", "package_source_root", "cli"),
     ("installation", "worker_runtime_info", "cli"),
-    ("endpoint", "EndpointWorker", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_endpoint with the
+    # endpoint command-group extraction (EndpointWorker's only cli.py call
+    # site was endpoint_start).
+    ("endpoint", "EndpointWorker", "cli_endpoint"),
     ("scheduler_providers", "provider_for_scheduler", "cli"),
     ("bootstrap", "bootstrap_cluster_over_ssh", "cli"),
     ("jarvis_mcp_validation", "build_jarvis_mcp_validation_report", "cli"),
