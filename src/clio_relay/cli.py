@@ -234,10 +234,10 @@ from clio_relay.session_lifecycle import (
     query_remote_session_start,
     session_lifecycle_report_bytes,
     session_lifecycle_report_sha256,
-    wait_owned_session_start_status,
     watch_remote_session_start,
 )
 from clio_relay.session_lifecycle_report import cleanup_connectors_cover_gateways
+from clio_relay.session_start_wait import wait_owned_session_start_status
 from clio_relay.session_transaction import open_owned_session_transaction
 from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (

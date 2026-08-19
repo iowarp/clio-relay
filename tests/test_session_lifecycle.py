@@ -25,6 +25,7 @@ import clio_relay.session_recovery_attempt_status as session_recovery_attempt_st
 import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
 import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_start_attempt_validation as session_start_attempt_validation
+import clio_relay.session_start_wait as session_start_wait
 import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
 from clio_relay import __version__
@@ -5419,7 +5420,7 @@ def test_owned_session_start_status_wait_returns_on_the_first_terminal_observati
             start_attempt_verified=True,
         )
 
-    status = session_lifecycle.wait_owned_session_start_status(
+    status = session_start_wait.wait_owned_session_start_status(
         cluster="ares",
         session_id="session-start",
         start_operation_id="start_test",

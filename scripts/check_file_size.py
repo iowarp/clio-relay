@@ -606,7 +606,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # (455 lines). inspect_owned_session_recovery_status itself stays
     # resident (cli.py calls it by module-qualified attribute access) and
     # now calls all three module-qualified. 5369 -> 4230.
-    "src/clio_relay/session_lifecycle.py": 4230,
+    # split/session-lifecycle slice G: the cluster-local exact-start-selector
+    # wait/poll cluster (single-observation inspector, terminal-state
+    # predicate, bounded poll loop) moved to the new session_start_wait.py
+    # owner (~130 lines) -- a one-directional dependent on
+    # inspect_owned_session_recovery_status (still resident), never called
+    # back into by anything in this module. cli.py's only touch is a
+    # one-line import repoint for the bare-imported
+    # wait_owned_session_start_status. 4230 -> 4125.
+    "src/clio_relay/session_lifecycle.py": 4125,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
