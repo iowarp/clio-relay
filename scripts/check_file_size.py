@@ -556,7 +556,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # session_validation.py leaf (28 lines) -- both are dependency-free
     # foundations every other owned-session lifecycle module builds on.
     # 7840 -> 7099.
-    "src/clio_relay/session_lifecycle.py": 7099,
+    # split/session-lifecycle slice B: process/systemd-scope identity
+    # primitives (_OwnedGenerationProcess, bounded procfs reads, scope
+    # membership/termination, the API-leader command check) moved to the new
+    # session_process_scope.py owner (163 lines); startup-receipt HMAC
+    # signing + its atomic owner-private publish moved to the new
+    # session_startup_receipt.py owner (107 lines).
+    # publish_owned_session_api_startup_receipt stays resident (cli.py calls
+    # it by module-qualified attribute access) and now delegates to both.
+    # 7099 -> 6886.
+    "src/clio_relay/session_lifecycle.py": 6886,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

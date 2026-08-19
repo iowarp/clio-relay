@@ -17,6 +17,8 @@ from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
 from clio_relay import __version__
 from clio_relay.cluster_config import (
@@ -334,7 +336,7 @@ def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
         for process_id in process_ids:
             try:
                 processes.append(
-                    session_lifecycle._read_proc_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    session_process_scope._read_proc_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                         proc_root=proc_root,
                         pid=process_id,
                     )
@@ -344,7 +346,7 @@ def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
         return processes
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_process_scope,
         "_recorded_scope_processes",
         recorded_scope_processes,
     )
@@ -396,7 +398,7 @@ def _owned_session_recovery_fixture(
         "systemd_description": systemd_description,
         "observed_at": datetime.now(UTC).isoformat(),
     }
-    receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    receipt["hmac_sha256"] = session_startup_receipt._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt,
         owner_token=owner_token,
     )
@@ -1330,7 +1332,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         raise AssertionError("distinct operation reached start mutation")
 
     monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
-    monkeypatch.setattr(session_lifecycle, "_terminate_recorded_session_scope", refuse_mutation)
+    monkeypatch.setattr(session_process_scope, "_terminate_recorded_session_scope", refuse_mutation)
 
     with pytest.raises(RelayError, match="prior owned-session start attempt identity is invalid"):
         execute_owned_session_start(
@@ -1696,7 +1698,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
 
     def receipt(**kwargs: object) -> object:
         transaction.atomic_write(cast(str, kwargs["receipt_name"]), b"{}")
-        return session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_process_scope._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             pid=7001,
             process_group_id=7001,
             start_ticks="999999",
@@ -1835,7 +1837,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     receipt = cast(dict[str, object], raw_receipt)
     receipt["api_release_identity_sha256"] = old_release.sha256()
     receipt["cluster_registry_sha256"] = registry_sha256
-    receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    receipt["hmac_sha256"] = session_startup_receipt._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt,
         owner_token=owner_token,
     )
@@ -2560,7 +2562,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
     )
     attempt = transaction.read_json("start-attempt.json")
     assert attempt is not None
-    process_identity = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    process_identity = session_process_scope._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pid=4321,
         process_group_id=4321,
         start_ticks="123456",

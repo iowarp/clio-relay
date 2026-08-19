@@ -29,6 +29,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_startup_receipt as session_startup_receipt
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
@@ -79,6 +81,7 @@ from clio_relay.session_wire_models import (
 
 if TYPE_CHECKING:
     from clio_relay.models import RelayJob
+    from clio_relay.session_process_scope import _OwnedGenerationProcess
     from clio_relay.session_transaction import _OwnedSessionTransaction
     from clio_relay.validation_report import (
         CleanupEvidence,
@@ -186,166 +189,6 @@ class _FailedStartCleanupQueue(Protocol):
         ...
 
 
-@dataclass(frozen=True)
-class _OwnedGenerationProcess:
-    """One live process carrying the exact complete owned-generation identity."""
-
-    pid: int
-    process_group_id: int
-    start_ticks: str
-
-
-def _read_bounded_proc_bytes(path: Path, *, maximum_bytes: int) -> bytes:
-    """Read one proc pseudo-file without following links or allocating without bound."""
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-        payload = bytearray()
-        while len(payload) <= maximum_bytes:
-            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - len(payload)))
-            if not chunk:
-                break
-            payload.extend(chunk)
-        if len(payload) > maximum_bytes:
-            raise RelayError(f"process identity file exceeded its byte limit: {path}")
-        return bytes(payload)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _read_proc_identity(*, proc_root: Path, pid: int) -> _OwnedGenerationProcess:
-    """Read one bounded process-group and start identity from procfs."""
-    try:
-        stat_payload = _read_bounded_proc_bytes(
-            proc_root / str(pid) / "stat",
-            maximum_bytes=_MAX_PROC_RECORD_BYTES,
-        ).decode("utf-8")
-        fields = stat_payload.rsplit(")", 1)[1].split()
-        return _OwnedGenerationProcess(
-            pid=pid,
-            process_group_id=int(fields[2]),
-            start_ticks=fields[19],
-        )
-    except (FileNotFoundError, ProcessLookupError):
-        raise
-    except (IndexError, OSError, UnicodeDecodeError, ValueError) as exc:
-        raise RelayError(f"process identity record is invalid for pid {pid}: {exc}") from exc
-
-
-def _current_linux_cgroup_path(
-    *,
-    pid: int,
-    proc_root: Path = Path("/proc"),
-    cgroup_root: Path = Path("/sys/fs/cgroup"),
-) -> Path:
-    """Return the exact cgroup-v2 path containing one process."""
-    try:
-        payload = _read_bounded_proc_bytes(
-            proc_root / str(pid) / "cgroup",
-            maximum_bytes=_MAX_PROC_RECORD_BYTES,
-        ).decode("ascii")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RelayError(f"cannot inspect process cgroup for pid {pid}: {exc}") from exc
-    matches = [line[3:] for line in payload.splitlines() if line.startswith("0::/")]
-    relative = matches[0].lstrip("/") if len(matches) == 1 else ""
-    if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
-        raise RelayError(f"process cgroup-v2 identity is invalid for pid {pid}")
-    try:
-        root = cgroup_root.resolve(strict=True)
-        observed = (root / relative).resolve(strict=True)
-    except OSError as exc:
-        raise RelayError(f"process cgroup-v2 path is unavailable for pid {pid}: {exc}") from exc
-    if observed == root or not observed.is_relative_to(root):
-        raise RelayError(f"process cgroup-v2 identity escaped its root for pid {pid}")
-    return observed
-
-
-def _startup_receipt_signature(document: dict[str, object], *, owner_token: str) -> str:
-    unsigned = {key: value for key, value in document.items() if key != "hmac_sha256"}
-    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hmac.new(owner_token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-
-
-def _atomic_write_startup_receipt(path: Path, payload: bytes) -> None:
-    """Publish one owner-private startup receipt without acquiring the parent-held lock."""
-    if len(payload) > _MAX_API_STARTUP_RECEIPT_BYTES:
-        raise RelayError("owned API startup receipt exceeds its byte limit")
-    get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
-    if get_effective_uid is None:
-        raise RelayError("owned API startup receipt cannot verify the effective user")
-    uid = get_effective_uid()
-    parent = path.parent
-    parent_status = parent.lstat()
-    if (
-        not stat.S_ISDIR(parent_status.st_mode)
-        or parent_status.st_uid != uid
-        or stat.S_IMODE(parent_status.st_mode) != 0o700
-    ):
-        raise RelayError("owned API startup receipt parent is not owner-private")
-    directory_fd = os.open(
-        parent,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
-    temporary_name = f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(
-            temporary_name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=directory_fd,
-        )
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise RelayError("owned API startup receipt write made no progress")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(existing.st_mode)
-            or existing.st_uid != uid
-            or existing.st_nlink != 1
-            or stat.S_IMODE(existing.st_mode) != 0o600
-        ):
-            raise RelayError("owned API startup receipt target is not owner-private")
-        os.replace(
-            temporary_name,
-            path.name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        os.fsync(directory_fd)
-    except FileNotFoundError:
-        os.replace(
-            temporary_name,
-            path.name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        os.fsync(directory_fd)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        with suppress(FileNotFoundError):
-            os.unlink(temporary_name, dir_fd=directory_fd)
-        os.close(directory_fd)
-
-
 def publish_owned_session_api_startup_receipt() -> bool:
     """Publish the signed API identity after gated environment and cgroup entry."""
     receipt_path_raw = os.environ.get(_API_STARTUP_RECEIPT_ENV)
@@ -381,8 +224,8 @@ def publish_owned_session_api_startup_receipt() -> bool:
     if os.environ.get("INVOCATION_ID") != invocation_id:
         raise RelayError("owned API process systemd invocation identity mismatched")
     pid = os.getpid()
-    process_identity = _read_proc_identity(proc_root=Path("/proc"), pid=pid)
-    observed_cgroup = _current_linux_cgroup_path(pid=pid)
+    process_identity = session_process_scope._read_proc_identity(proc_root=Path("/proc"), pid=pid)
+    observed_cgroup = session_process_scope._current_linux_cgroup_path(pid=pid)
     expected_cgroup = Path(cast(str, values[_SYSTEMD_CGROUP_ENV])).resolve(strict=True)
     if observed_cgroup != expected_cgroup:
         raise RelayError("owned API process is outside its persisted cgroup")
@@ -404,81 +247,15 @@ def publish_owned_session_api_startup_receipt() -> bool:
         "systemd_description": values[_SYSTEMD_DESCRIPTION_ENV],
         "observed_at": datetime.now(UTC).isoformat(),
     }
-    document["hmac_sha256"] = _startup_receipt_signature(document, owner_token=owner_token)
-    _atomic_write_startup_receipt(
+    document["hmac_sha256"] = session_startup_receipt._startup_receipt_signature(
+        document, owner_token=owner_token
+    )
+    session_startup_receipt._atomic_write_startup_receipt(
         receipt_path,
         json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
     )
     os.environ.pop("CLIO_RELAY_SESSION_OWNER_TOKEN", None)
     return True
-
-
-def _recorded_scope_processes(
-    *,
-    proc_root: Path,
-    systemd_unit: str,
-    systemd_cgroup_path: str,
-    systemd_invocation_id: str,
-    systemd_description: str,
-) -> list[_OwnedGenerationProcess]:
-    """Enumerate only members of one exact persistent systemd generation scope."""
-    from clio_relay.process_containment import recorded_linux_systemd_scope_process_ids
-
-    try:
-        process_ids = recorded_linux_systemd_scope_process_ids(
-            unit=systemd_unit,
-            cgroup_path=systemd_cgroup_path,
-            invocation_id=systemd_invocation_id,
-            description=systemd_description,
-        )
-    except RuntimeError as exc:
-        raise RelayError(f"owned session scope identity could not be verified: {exc}") from exc
-    processes: list[_OwnedGenerationProcess] = []
-    for pid in process_ids:
-        try:
-            processes.append(_read_proc_identity(proc_root=proc_root, pid=pid))
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-    return sorted(processes, key=lambda process: process.pid)
-
-
-def _terminate_recorded_session_scope(
-    *,
-    systemd_unit: str,
-    systemd_cgroup_path: str,
-    systemd_invocation_id: str,
-    systemd_description: str,
-) -> None:
-    """Terminate one exact persisted session cgroup after InvocationID verification."""
-    from clio_relay.process_containment import terminate_recorded_linux_systemd_scope
-
-    try:
-        terminate_recorded_linux_systemd_scope(
-            unit=systemd_unit,
-            cgroup_path=systemd_cgroup_path,
-            invocation_id=systemd_invocation_id,
-            description=systemd_description,
-        )
-    except RuntimeError as exc:
-        raise RelayError(f"owned session scope termination failed: {exc}") from exc
-
-
-def _is_clio_relay_api_leader(*, proc_root: Path, pid: int) -> bool:
-    """Return whether one bounded command line is the owned API leader command."""
-    try:
-        command = (
-            _read_bounded_proc_bytes(
-                proc_root / str(pid) / "cmdline",
-                maximum_bytes=_MAX_PROC_RECORD_BYTES,
-            )
-            .replace(bytes([0]), b" ")
-            .decode("utf-8", errors="replace")
-        )
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    except OSError as exc:
-        raise RelayError(f"cannot inspect API leader command for pid {pid}: {exc}") from exc
-    return "clio-relay" in command and " api " in f" {command} " and " start" in command
 
 
 def _inspect_owned_session_start_attempt_status(
@@ -636,7 +413,7 @@ def _inspect_owned_session_start_attempt_status(
     generation_process_scan_verified = False
     if phase in {"scope_bound", "contained"}:
         try:
-            generation_processes = _recorded_scope_processes(
+            generation_processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=cast(str, systemd_unit),
                 systemd_cgroup_path=cast(str, cgroup_path),
@@ -657,7 +434,7 @@ def _inspect_owned_session_start_attempt_status(
             if adopted_scope is None:
                 generation_process_scan_verified = True
             else:
-                generation_processes = _recorded_scope_processes(
+                generation_processes = session_process_scope._recorded_scope_processes(
                     proc_root=proc_root,
                     systemd_unit=adopted_scope["systemd_unit"],
                     systemd_cgroup_path=adopted_scope["cgroup_path"],
@@ -876,7 +653,7 @@ def _inspect_owned_session_failed_cleaned_receipt(
     process_absence_verified = False
     if attempt is not None and phase in {"scope_bound", "contained"}:
         try:
-            processes = _recorded_scope_processes(
+            processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=cast(str, attempt["systemd_unit"]),
                 systemd_cgroup_path=cast(str, attempt["systemd_cgroup_path"]),
@@ -1516,7 +1293,9 @@ def inspect_owned_session_recovery_status(
                 and isinstance(signature, str)
                 and hmac.compare_digest(
                     signature,
-                    _startup_receipt_signature(receipt_document, owner_token=owner_token),
+                    session_startup_receipt._startup_receipt_signature(
+                        receipt_document, owner_token=owner_token
+                    ),
                 )
             )
         except (OSError, RelayError, ValueError) as exc:
@@ -1628,7 +1407,7 @@ def inspect_owned_session_recovery_status(
         and isinstance(systemd_description, str)
     ):
         try:
-            generation_processes = _recorded_scope_processes(
+            generation_processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=systemd_unit,
                 systemd_cgroup_path=systemd_cgroup_path,
@@ -1640,7 +1419,7 @@ def inspect_owned_session_recovery_status(
             errors.append(str(exc))
         proc = proc_root / str(api_pid)
         try:
-            stat_text = _read_bounded_proc_bytes(
+            stat_text = session_process_scope._read_bounded_proc_bytes(
                 proc / "stat",
                 maximum_bytes=_MAX_PROC_RECORD_BYTES,
             ).decode("utf-8")
@@ -1670,7 +1449,9 @@ def inspect_owned_session_recovery_status(
                     and process.process_group_id == api_pgid
                     and process.start_ticks == process_start
                     for process in generation_processes
-                ) and _is_clio_relay_api_leader(proc_root=proc_root, pid=api_pid):
+                ) and session_process_scope._is_clio_relay_api_leader(
+                    proc_root=proc_root, pid=api_pid
+                ):
                     leader_process_state = "owned_running"
                 else:
                     leader_process_state = "foreign"
@@ -2256,7 +2037,7 @@ def _inspect_owned_session_cleanup_receipt(
         and isinstance(systemd_description, str)
     ):
         try:
-            generation_processes = _recorded_scope_processes(
+            generation_processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=systemd_unit,
                 systemd_cgroup_path=systemd_cgroup_path,
@@ -3477,15 +3258,21 @@ def _wait_for_api_startup_receipt(
                 and isinstance(signature, str)
                 and hmac.compare_digest(
                     signature,
-                    _startup_receipt_signature(document, owner_token=owner_token),
+                    session_startup_receipt._startup_receipt_signature(
+                        document, owner_token=owner_token
+                    ),
                 )
             ):
                 raise RelayError("owned API startup receipt identity is invalid")
-            process_identity = _read_proc_identity(proc_root=proc_root, pid=api_pid)
+            process_identity = session_process_scope._read_proc_identity(
+                proc_root=proc_root, pid=api_pid
+            )
             if (
                 process_identity.process_group_id != api_pgid
                 or process_identity.start_ticks != process_start
-                or not _is_clio_relay_api_leader(proc_root=proc_root, pid=api_pid)
+                or not session_process_scope._is_clio_relay_api_leader(
+                    proc_root=proc_root, pid=api_pid
+                )
             ):
                 raise RelayError("owned API startup receipt process identity changed")
             pids = recorded_linux_systemd_scope_process_ids(
@@ -3844,13 +3631,13 @@ def _migrate_legacy_start_attempt(
 def _owned_api_requires_token(*, proc_root: Path, pid: int) -> bool:
     """Read the exact verified API leader argv and return its auth policy."""
     try:
-        arguments = _read_bounded_proc_bytes(
+        arguments = session_process_scope._read_bounded_proc_bytes(
             proc_root / str(pid) / "cmdline",
             maximum_bytes=_MAX_PROC_RECORD_BYTES,
         ).split(bytes([0]))
     except (FileNotFoundError, ProcessLookupError) as exc:
         raise RelayError("owned API leader disappeared during auth verification") from exc
-    if not _is_clio_relay_api_leader(proc_root=proc_root, pid=pid):
+    if not session_process_scope._is_clio_relay_api_leader(proc_root=proc_root, pid=pid):
         raise RelayError("owned API auth policy cannot be tied to the verified leader")
     return b"--require-token" in arguments
 
@@ -4208,7 +3995,7 @@ def execute_owned_session_start(
                         "legacy owned-session generation conflicts with durable core admission"
                     )
                 if legacy_phase in {"scope_bound", "contained"}:
-                    _recorded_scope_processes(
+                    session_process_scope._recorded_scope_processes(
                         proc_root=proc_root,
                         systemd_unit=cast(str, legacy_attempt["systemd_unit"]),
                         systemd_cgroup_path=cast(
@@ -4456,7 +4243,7 @@ def execute_owned_session_start(
                         )
                     ):
                         raise RelayError("owned generation process identity is incomplete")
-                    _terminate_recorded_session_scope(
+                    session_process_scope._terminate_recorded_session_scope(
                         systemd_unit=cast(str, existing_unit),
                         systemd_cgroup_path=cast(str, existing_cgroup),
                         systemd_invocation_id=cast(str, existing_invocation),
@@ -4510,7 +4297,7 @@ def execute_owned_session_start(
                         raise RelayError(
                             "legacy contained start could not be adopted exactly; use --replace"
                         )
-                _recorded_scope_processes(
+                session_process_scope._recorded_scope_processes(
                     proc_root=proc_root,
                     systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
                     systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
@@ -4520,7 +4307,7 @@ def execute_owned_session_start(
                     ),
                     systemd_description=cast(str, resumable_attempt["systemd_description"]),
                 )
-                _terminate_recorded_session_scope(
+                session_process_scope._terminate_recorded_session_scope(
                     systemd_unit=cast(str, resumable_attempt["systemd_unit"]),
                     systemd_cgroup_path=cast(str, resumable_attempt["systemd_cgroup_path"]),
                     systemd_invocation_id=cast(
@@ -4925,7 +4712,7 @@ def execute_owned_session_start(
                 )
                 try:
                     if attempt_identity.get("start_phase") == "contained":
-                        _terminate_recorded_session_scope(
+                        session_process_scope._terminate_recorded_session_scope(
                             systemd_unit=cast(str, attempt_identity["systemd_unit"]),
                             systemd_cgroup_path=cast(
                                 str,
@@ -5227,7 +5014,7 @@ def _terminate_failed_start_scope(
             return []
         cgroup_path = adopted["cgroup_path"]
         invocation_id = adopted["systemd_invocation_id"]
-    processes = _recorded_scope_processes(
+    processes = session_process_scope._recorded_scope_processes(
         proc_root=proc_root,
         systemd_unit=systemd_unit,
         systemd_cgroup_path=cgroup_path,
@@ -5235,13 +5022,13 @@ def _terminate_failed_start_scope(
         systemd_description=systemd_description,
     )
     targeted = [process.pid for process in processes]
-    _terminate_recorded_session_scope(
+    session_process_scope._terminate_recorded_session_scope(
         systemd_unit=systemd_unit,
         systemd_cgroup_path=cgroup_path,
         systemd_invocation_id=invocation_id,
         systemd_description=systemd_description,
     )
-    residual = _recorded_scope_processes(
+    residual = session_process_scope._recorded_scope_processes(
         proc_root=proc_root,
         systemd_unit=systemd_unit,
         systemd_cgroup_path=cgroup_path,
@@ -5639,7 +5426,7 @@ def execute_owned_session_teardown(
         }
         receipt_committed = False
         try:
-            processes = _recorded_scope_processes(
+            processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=systemd_unit,
                 systemd_cgroup_path=systemd_cgroup_path,
@@ -5649,13 +5436,13 @@ def execute_owned_session_teardown(
             prior_running = bool(processes)
             prior_observed_at = datetime.now(UTC)
             targeted_pids = [process.pid for process in processes]
-            _terminate_recorded_session_scope(
+            session_process_scope._terminate_recorded_session_scope(
                 systemd_unit=systemd_unit,
                 systemd_cgroup_path=systemd_cgroup_path,
                 systemd_invocation_id=systemd_invocation_id,
                 systemd_description=systemd_description,
             )
-            final_processes = _recorded_scope_processes(
+            final_processes = session_process_scope._recorded_scope_processes(
                 proc_root=proc_root,
                 systemd_unit=systemd_unit,
                 systemd_cgroup_path=systemd_cgroup_path,
