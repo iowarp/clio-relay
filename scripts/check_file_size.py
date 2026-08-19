@@ -432,7 +432,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_remote_command_failure` helper, before falling into the generic
     # "remote command failed: <blob>" that discarded the refusal's own
     # typed code/message. A justified, minimal ratchet-up.
-    "src/clio_relay/live_acceptance.py": 4978,
+    "src/clio_relay/live_acceptance.py": 4761,
     # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
     # bounded_payload.is_delivery_refusal on the envelope
     # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
