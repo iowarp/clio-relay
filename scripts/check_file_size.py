@@ -582,7 +582,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # block to a single-line `from clio_relay.session_wire_models import
     # CleanupResource, OwnedSessionStartResult` -- ratchet down. 1795 -> 1794.
     "src/clio_relay/transport_probe.py": 1794,
-    "src/clio_relay/validation_report.py": 5458,
+    # #231 split/validation-report S1: the pydantic/StrEnum wire-model
+    # catalog (LiveValidationReport, ReleaseGatePolicy, InstallSource, ...)
+    # moved to validation_schema.py (650 lines) and the byte/count budget
+    # constants moved to validation_limits.py (37 lines), each re-exported
+    # here via the `X as X` self-import idiom (door_errors.py's precedent)
+    # for the existing public/monkeypatch surface -- one name per line so
+    # ruff's F401 does not prune a name this module no longer references
+    # internally. 5458 -> 4924.
+    "src/clio_relay/validation_report.py": 4924,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
