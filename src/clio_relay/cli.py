@@ -225,7 +225,6 @@ from clio_relay.session_lifecycle import (
     OwnedSessionTeardownRequest,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
-    cleanup_connectors_cover_gateways,
     execute_owned_session_cleanup_finalize,
     execute_owned_session_cleanup_report_read,
     execute_owned_session_identity_challenge,
@@ -238,6 +237,7 @@ from clio_relay.session_lifecycle import (
     wait_owned_session_start_status,
     watch_remote_session_start,
 )
+from clio_relay.session_lifecycle_report import cleanup_connectors_cover_gateways
 from clio_relay.session_transaction import open_owned_session_transaction
 from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (

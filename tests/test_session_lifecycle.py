@@ -18,6 +18,7 @@ from pytest import MonkeyPatch
 import clio_relay.installation as installation_module
 import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_lifecycle_report as session_lifecycle_report
 import clio_relay.session_process_scope as session_process_scope
 import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_startup_receipt as session_startup_receipt
@@ -34,10 +35,6 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError, RemoteExecutableMissingError
 from clio_relay.installation import InstallReceipt
 from clio_relay.session_lifecycle import (
-    SESSION_CONNECTORS_CHECK_ID,
-    SESSION_GATEWAY_CHECK_ID,
-    SESSION_SCHEDULER_CANCELED_CHECK_ID,
-    SESSION_WORKER_CHECK_ID,
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
@@ -60,6 +57,12 @@ from clio_relay.session_lifecycle import (
     start_remote_session,
     status_remote_session,
     teardown_remote_session,
+)
+from clio_relay.session_lifecycle_report import (
+    SESSION_CONNECTORS_CHECK_ID,
+    SESSION_GATEWAY_CHECK_ID,
+    SESSION_SCHEDULER_CANCELED_CHECK_ID,
+    SESSION_WORKER_CHECK_ID,
 )
 
 
@@ -3457,7 +3460,7 @@ def test_cleanup_report_read_server_boundary_rejects_drift(
     expected_error: str,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
@@ -3609,7 +3612,7 @@ def test_legacy_inline_cleanup_report_migration_recovers_after_metadata_write_fa
             home=tmp_path,
             core_dir=tmp_path / "core",
         )
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     assert (tmp_path / reference.name).read_bytes() == payload
@@ -3634,7 +3637,7 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
     tmp_path: Path,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     if os.name != "posix":
@@ -3796,17 +3799,17 @@ def test_cleanup_report_retention_prunes_one_old_generation_and_preserves_curren
             "cleanup_operation_id": "cleanup-sidecar-2",
         }
     )
-    old_reference, old_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    old_reference, old_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         old_report
     )
-    current_reference, current_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    current_reference, current_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         current_report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
     (tmp_path / old_reference.name).write_bytes(old_payload)
     (tmp_path / current_reference.name).write_bytes(current_payload)
 
-    session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction,  # pyright: ignore[reportArgumentType]
         preserve_names={
             current_reference.name,
@@ -3829,13 +3832,13 @@ def test_cleanup_report_retention_refuses_ambiguous_old_candidates(
             "cleanup_operation_id": "cleanup-current",
         }
     )
-    current_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    current_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         current
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
     if mutation == "pending":
         old = _cleanup_sidecar_report()
-        old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        old_reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             old
         )
         (tmp_path / f".{old_reference.name}.pending").write_bytes(payload)
@@ -3848,14 +3851,14 @@ def test_cleanup_report_retention_refuses_ambiguous_old_candidates(
                     "cleanup_operation_id": f"cleanup-old-{index}",
                 }
             )
-            old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            old_reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 old
             )
             (tmp_path / old_reference.name).write_bytes(payload)
         expected = "multiple unreferenced"
 
     with pytest.raises(RelayError, match=expected):
-        session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             transaction,  # pyright: ignore[reportArgumentType]
             preserve_names={
                 current_reference.name,
@@ -3916,7 +3919,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
     mutation: str,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     preserved_report = report.model_copy(
@@ -3925,7 +3928,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
             "cleanup_operation_id": "cleanup-preserved",
         }
     )
-    preserved_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    preserved_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         preserved_report
     )
     if os.name != "posix":
@@ -3942,7 +3945,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
 
         monkeypatch.setattr(transaction, "stat_regular", refuse_hostile)
         with pytest.raises(RelayError, match="owner-private regular"):
-            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 transaction,  # pyright: ignore[reportArgumentType]
                 preserve_names={preserved_reference.name},
             )
@@ -3981,7 +3984,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
             candidate.chmod(0o600)
             os.link(candidate, tmp_path / "retention-outside-hardlink")
         with pytest.raises(RelayError, match="owner-private regular"):
-            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 transaction,
                 preserve_names={preserved_reference.name},
             )
@@ -4014,7 +4017,7 @@ def test_coordinator_report_sidecar_rejects_identity_drift(
             "cancel_scheduler_jobs": False,
         },
     )
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
@@ -4050,7 +4053,7 @@ def test_coordinator_report_sidecar_rejects_identity_drift(
         )
 
     with pytest.raises(RelayError, match=expected_error):
-        session_lifecycle._read_coordinator_report_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle_report._read_coordinator_report_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             transaction,  # pyright: ignore[reportArgumentType]
             selected_reference,
             expected_session_generation_id="generation-1",
@@ -4086,7 +4089,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
             )
         ],
     )
-    reference, report_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, report_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     assert len(report_payload) > 1024 * 1024
