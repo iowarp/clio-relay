@@ -322,7 +322,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # import account for the delta. A justified, minimal ratchet-up -- the
     # alternative (leaving either call site unguarded) is the silent
     # slot-death and 0-byte-log defect the issue reports.
-    "src/clio_relay/endpoint.py": 8743,
+    # #231 endpoint split, slice 1: -90 net lines -- the three filesystem-
+    # identity dataclasses (`_PackageProgressLogState`, `_RuntimeSidecarAnchor`,
+    # `_RecoveryDirectoryAnchor`) plus every progress/runtime-sidecar byte-
+    # budget constant and the Windows kernel32 constant set move to the new
+    # leaf owner module `endpoint_sidecar_types.py` (160 lines, under the
+    # default cap). Both `EndpointWorker` and the ~90 still-co-resident
+    # module-level helper functions now import these forward from the new
+    # module by the same names, so every existing `endpoint.<name>` access
+    # and monkeypatch target keeps resolving unchanged. Net: 8743 -> 8653.
+    "src/clio_relay/endpoint.py": 8653,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
