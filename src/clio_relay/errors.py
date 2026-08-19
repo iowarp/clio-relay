@@ -44,6 +44,14 @@ class ConfigurationError(RelayError):
     """Raised when required external configuration is absent."""
 
 
+class ObservationPatternError(ConfigurationError):
+    """A caller-supplied observation regex was invalid or unsafe to execute."""
+
+    def __init__(self, *, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 class QueueConflictError(RelayError):
     """Raised when a queue operation violates an invariant."""
 

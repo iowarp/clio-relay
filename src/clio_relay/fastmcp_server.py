@@ -50,6 +50,7 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     McpTaskIdentityConflictError,
     NotFoundError,
+    ObservationPatternError,
     QueueConflictError,
     TaskInputParkConflictError,
 )
@@ -325,17 +326,26 @@ class RelayMcpRuntime:
     ) -> ToolResult:
         """Execute the established relay tool dispatcher behind FastMCP."""
         session = await _load_session()
-        raw = await asyncio.to_thread(
-            lambda: call_mcp_tool(
-                {"name": name, "arguments": arguments},
-                queue=self.queue,
-                settings=self.settings,
-                profile=self.profile,
-                session=session,
-                observed_remote_mcp_catalog_revision=catalog_revision,
-                require_advertised_remote_mcp_catalog=catalog_revision is not None,
+        try:
+            raw = await asyncio.to_thread(
+                lambda: call_mcp_tool(
+                    {"name": name, "arguments": arguments},
+                    queue=self.queue,
+                    settings=self.settings,
+                    profile=self.profile,
+                    session=session,
+                    observed_remote_mcp_catalog_revision=catalog_revision,
+                    require_advertised_remote_mcp_catalog=catalog_revision is not None,
+                )
             )
-        )
+        except ObservationPatternError as exc:
+            raise door_error_adapters.as_mcp_error(
+                door_errors.classify(
+                    exc,
+                    reason=exc.reason,
+                    message=str(exc),
+                )
+            ) from exc
         await _save_session(session)
         content = [
             mcp_types.TextContent.model_validate(item)

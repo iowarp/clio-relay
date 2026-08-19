@@ -9,6 +9,7 @@ import mcp_types
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import FastMCPTransport
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 from fastmcp.utilities.tests import asgi_server
@@ -51,8 +52,23 @@ from clio_relay.models import (
 )
 from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.remote_mcp import VirtualRemoteMcpCatalog
+from clio_relay.spool import JobSpool
 
 JSON = dict[str, Any]
+
+
+def _observe_job(
+    job: RelayJob,
+    *,
+    until_pattern: str,
+    pattern_scope: list[str] | None = None,
+) -> dict[str, object]:
+    """Build the agent-facing arguments for a pattern-triggered observe call."""
+    return {
+        "job_id": job.job_id,
+        "until_pattern": until_pattern,
+        **({} if pattern_scope is None else {"pattern_scope": pattern_scope}),
+    }
 
 
 class _NoInternalExtensionsClient(Client[FastMCPTransport]):
@@ -767,6 +783,154 @@ def test_transparent_fastmcp_call_tool_polls_relay_task_to_completion(
             assert result.is_error is False
             assert result.structured_content is not None
             assert result.structured_content["job"]["job_id"] == jobs[0].job_id
+
+    asyncio.run(scenario())
+
+
+def test_relay_observe_until_pattern_returns_before_terminal(
+    tmp_path: Path,
+) -> None:
+    """A matching streamed log returns while the durable job is still running."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=McpCallSpec(server="test", tool="run", arguments={}),
+            idempotency_key="observe-until-pattern",
+        )
+    )
+    spool = JobSpool(settings.spool_dir, job)
+    spool.initialize()
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue), mode="auto"
+        ) as client:
+            pending = asyncio.create_task(
+                client.call_tool(
+                    "relay_observe",
+                    _observe_job(job, until_pattern=r"ready", pattern_scope=["stdout"]),
+                )
+            )
+            await asyncio.sleep(0.2)
+            spool.append_stdout("worker is ready\n")
+            result = await asyncio.wait_for(pending, timeout=5)
+            assert result.is_error is False
+            assert result.structured_content is not None
+            observed = result.structured_content
+            assert observed["matched"] is True
+            assert observed["terminal"] is False
+            assert observed["match"]["stream"] == "stdout"
+            assert "ready" in observed["match"]["excerpt"]
+
+    asyncio.run(scenario())
+
+
+def test_relay_observe_until_pattern_returns_terminal_without_match(
+    tmp_path: Path,
+) -> None:
+    """A pattern observation returns the terminal snapshot with matched=false."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=McpCallSpec(server="test", tool="run", arguments={}),
+            idempotency_key="observe-until-terminal",
+        )
+    )
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue), mode="auto"
+        ) as client:
+            pending = asyncio.create_task(
+                client.call_tool("relay_observe", _observe_job(job, until_pattern=r"never"))
+            )
+            await asyncio.sleep(0.2)
+            queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+            result = await asyncio.wait_for(pending, timeout=5)
+            assert result.is_error is False
+            assert result.structured_content is not None
+            observed = result.structured_content
+            assert observed["matched"] is False
+            assert observed["terminal"] is True
+            assert observed["job"]["state"] == JobState.SUCCEEDED.value
+
+    asyncio.run(scenario())
+
+
+def test_relay_observe_until_pattern_rejects_invalid_regex_as_typed_refusal(
+    tmp_path: Path,
+) -> None:
+    """Regex syntax failures use the relay's queryable refusal reason."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=McpCallSpec(server="test", tool="run", arguments={}),
+            idempotency_key="observe-invalid-pattern",
+        )
+    )
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue), mode="auto"
+        ) as client:
+            # relay_observe is a plain (non-task-capable) tool: fastmcp wraps
+            # tool-body exceptions as ToolError and the structured error data
+            # does not survive, so the typed reason token rides the message —
+            # the one discriminable channel this transport gives plain tools.
+            with pytest.raises(ToolError) as failure:
+                await client.call_tool(
+                    "relay_observe",
+                    _observe_job(job, until_pattern="("),
+                )
+            assert "observation_pattern_invalid" in str(failure.value)
+            assert "regular expression" in str(failure.value)
+
+    asyncio.run(scenario())
+
+
+def test_relay_observe_until_pattern_bounds_huge_matching_line(
+    tmp_path: Path,
+) -> None:
+    """A match excerpt remains within the byte budget even for a huge line."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=McpCallSpec(server="test", tool="run", arguments={}),
+            idempotency_key="observe-huge-line",
+        )
+    )
+    spool = JobSpool(settings.spool_dir, job)
+    spool.initialize()
+    spool.append_stdout("x" * 100_000 + "needle" + "y" * 100_000)
+
+    async def scenario() -> None:
+        async with Client(
+            create_fastmcp_server(settings=settings, queue=queue), mode="auto"
+        ) as client:
+            result = await asyncio.wait_for(
+                client.call_tool(
+                    "relay_observe",
+                    _observe_job(job, until_pattern="needle", pattern_scope=["stdout"]),
+                ),
+                timeout=5,
+            )
+            assert result.is_error is False
+            assert result.structured_content is not None
+            excerpt = result.structured_content["match"]["excerpt"]
+            assert len(excerpt.encode("utf-8")) <= 1_024
+            assert "needle" in excerpt
 
     asyncio.run(scenario())
 
