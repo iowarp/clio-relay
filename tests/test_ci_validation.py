@@ -23,7 +23,6 @@ from clio_relay.ci_validation import (
     MAX_DISTRIBUTION_BYTES,
     MAX_DISTRIBUTION_MEMBERS,
     MAX_FIXED_JSON_BYTES,
-    MAX_JSON_DOCUMENT_BYTES,
     MAX_MANIFEST_BYTES,
     MAX_RELEASE_ASSET_AGGREGATE_BYTES,
     MAX_RELEASE_ASSET_BYTES,
@@ -1987,12 +1986,3 @@ def test_downloaded_report_verification_rejects_tampered_preflight_manifest(
 
     with pytest.raises(ProvenanceError):
         verify_downloaded_validation_report_assets(manifest, report_dir)
-
-
-def test_json_loader_rejects_oversized_input_before_decoding(tmp_path: Path) -> None:
-    document = tmp_path / "oversized.json"
-    with document.open("wb") as stream:
-        stream.truncate(MAX_JSON_DOCUMENT_BYTES + 1)
-
-    with pytest.raises(ProvenanceError, match="exceeds"):
-        ci_validation._load_json(document)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

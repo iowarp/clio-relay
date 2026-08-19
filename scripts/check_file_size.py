@@ -122,7 +122,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # computation (doc's §7 "derived-digest-with-ordering" rule: never
     # recompute the hash independently). Single owner, ground rule 1 -- a
     # justified, minimal ratchet-up.
-    "src/clio_relay/ci_validation.py": 3787,
+    # #231: -201 net lines -- provenance_primitives.py (clio-relay#231) is
+    # extracted first as the shared owner for JSON/type primitives, the
+    # ProvenanceError/GitHubNotFound exceptions, the GitHubJsonFetcher
+    # protocol + _github_fetcher, and the release policy constants every
+    # other ci_validation owner module depends on.
+    "src/clio_relay/ci_validation.py": 3586,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
