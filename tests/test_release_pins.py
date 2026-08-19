@@ -147,6 +147,31 @@ def test_the_real_registry_passes_shape_validation() -> None:
     validate_registry()  # must not raise
 
 
+def test_jarvis_contract_id_sites_round_trip_a_three_part_patch_version(
+    mirrored_root: Path,
+) -> None:
+    """clio-relay's own contract-versioning doctrine is patch-level (vX.Y.Z for
+    a small additive change), but the shared jarvis-contract pin pattern's
+    capturing group was authored assuming every revision is vX.Y -- it silently
+    TRUNCATES a 3-part value on read instead of raising or round-tripping it.
+    A real v3.7 -> v3.7.1 mint would corrupt every pin site's read value to
+    'v3.7' the moment it was written, which would then make every site
+    FALSELY agree with an actually-unbumped sibling still literally holding
+    'v3.7' -- the exact silent-drift failure #198 exists to prevent. Regression
+    for teaching the pin regex 3-part versions before any v3.7.1 mint.
+    """
+    site = next(s for s in PINSITES if s.id == "jc.jarvis_mcp_contract_id")
+    original = read_site_value(mirrored_root, site)
+
+    write_site_value(mirrored_root, site, "v3.7.1", old_value=original)
+    reread = read_site_value(mirrored_root, site)
+
+    assert reread == "v3.7.1", (
+        f"contract-pin regex truncated a 3-part patch version: read back {reread!r} "
+        "instead of 'v3.7.1' -- its capturing group only understands vX.Y"
+    )
+
+
 def test_a_key_kind_site_on_a_json_file_without_key_path_is_rejected() -> None:
     """B9: the exact bug this validator exists to catch (jc.contract_file_content
 
@@ -215,6 +240,8 @@ def _sabotage_candidate(original_value: str) -> str:
     """
     if re.fullmatch(r"[0-9a-f]{64}", original_value):
         return "0" * 63 + "1"
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", original_value):
+        return "v9.9.9"
     if re.fullmatch(r"v[0-9]+\.[0-9]+", original_value):
         return "v9.9"
     if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", original_value):
@@ -393,7 +420,7 @@ def test_an_unregistered_v37_literal_is_named_by_the_sweep(tmp_path: Path) -> No
     package_dir = tmp_path / "src" / "clio_relay"
     package_dir.mkdir(parents=True)
     (package_dir / "new_module.py").write_text(
-        'STALE_COPY = "clio-kit-jarvis-user-v3.7"\n', encoding="utf-8"
+        'STALE_COPY = "clio-kit-jarvis-user-v3.7.1"\n', encoding="utf-8"
     )
 
     hits = sweep_jarvis_contract_v37_completeness(tmp_path)
@@ -404,11 +431,12 @@ def test_an_unregistered_v37_literal_is_named_by_the_sweep(tmp_path: Path) -> No
 
 
 def test_legacy_contract_literals_are_not_swept(tmp_path: Path) -> None:
-    """v3.1-v3.6 are deliberate backward-compatibility surface, not #198's concern."""
+    """v3.1-v3.7 are deliberate backward-compatibility surface, not #198's concern."""
     package_dir = tmp_path / "src" / "clio_relay"
     package_dir.mkdir(parents=True)
     (package_dir / "legacy_module.py").write_text(
-        'OLD = "clio-kit-jarvis-user-v3.6"\n', encoding="utf-8"
+        'OLD = "clio-kit-jarvis-user-v3.6"\nALSO_OLD = "clio-kit-jarvis-user-v3.7"\n',
+        encoding="utf-8",
     )
 
     assert sweep_jarvis_contract_v37_completeness(tmp_path) == ()
@@ -422,10 +450,10 @@ def test_an_unregistered_v37_literal_in_docs_markdown_is_named_by_the_sweep(
     ai_dir = docs_dir / "ai"
     ai_dir.mkdir(parents=True)
     (docs_dir / "some-guide.md").write_text(
-        "Exact `clio-kit-jarvis-user-v3.7` routes support staging.\n", encoding="utf-8"
+        "Exact `clio-kit-jarvis-user-v3.7.1` routes support staging.\n", encoding="utf-8"
     )
     (ai_dir / "some-context.md").write_text(
-        "Registered `clio-kit-jarvis-user-v3.7` gates the staging plane.\n", encoding="utf-8"
+        "Registered `clio-kit-jarvis-user-v3.7.1` gates the staging plane.\n", encoding="utf-8"
     )
 
     hits = sweep_jarvis_contract_v37_completeness(tmp_path)
@@ -435,7 +463,7 @@ def test_an_unregistered_v37_literal_in_docs_markdown_is_named_by_the_sweep(
 
 
 def test_docs_design_prose_about_the_registry_is_not_swept(tmp_path: Path) -> None:
-    """docs/design/ is deliberately shallow-excluded: it discusses v3.7 as prose
+    """docs/design/ is deliberately shallow-excluded: it discusses v3.7.1 as prose
 
     about the pin registry itself (this section's own audit language), not a
     duplicate pin -- sweeping it recursively would flag the document that
@@ -444,7 +472,7 @@ def test_docs_design_prose_about_the_registry_is_not_swept(tmp_path: Path) -> No
     design_dir = tmp_path / "docs" / "design"
     design_dir.mkdir(parents=True)
     (design_dir / "relay-architecture-2026-08.md").write_text(
-        "The registry tracks `clio-kit-jarvis-user-v3.7` sites.\n", encoding="utf-8"
+        "The registry tracks `clio-kit-jarvis-user-v3.7.1` sites.\n", encoding="utf-8"
     )
 
     assert sweep_jarvis_contract_v37_completeness(tmp_path) == ()
@@ -532,6 +560,9 @@ def test_bump_applies_relay_version_and_recomputes_matrix_digest_via_ci_validati
 
 def test_bump_applies_contract_id_sites_without_digest_arguments(mirrored_root: Path) -> None:
     """Omitting the digest arguments leaves digest value_groups unchanged, not silently."""
+    rename_site = next(site for site in PINSITES if site.id == "jc.contract_file_rename")
+    old_contract_version = read_site_value(mirrored_root, rename_site)
+
     changes = apply_bump(mirrored_root, BumpTargets(contract_version="v3.8"))
 
     id_changes = [change for change in changes if change.site.value_group == "jarvis_contract_id"]
@@ -544,7 +575,9 @@ def test_bump_applies_contract_id_sites_without_digest_arguments(mirrored_root: 
 
     contract_path = mirrored_root / "src/clio_relay/_contracts/jarvis-user-v3.8.json"
     assert contract_path.is_file()
-    assert not (mirrored_root / "src/clio_relay/_contracts/jarvis-user-v3.7.json").exists()
+    assert not (
+        mirrored_root / f"src/clio_relay/_contracts/jarvis-user-{old_contract_version}.json"
+    ).exists()
 
 
 def test_apply_bump_reports_drift_instead_of_silently_skipping(mirrored_root: Path) -> None:

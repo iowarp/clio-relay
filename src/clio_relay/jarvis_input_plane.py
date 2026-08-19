@@ -4,7 +4,7 @@ Both JARVIS doors reach the cluster through the same package contract: a package
 description declares which settings name caller-local files, and clio-relay
 snapshots, ingests, and rewrites exactly those settings before the configuration
 reaches JARVIS. This module owns that orchestration so the registered remote-MCP
-route (``clio-kit-jarvis-user-v3.7``) and the built-in virtual JARVIS door share
+route (``clio-kit-jarvis-user-v3.7.1``) and the built-in virtual JARVIS door share
 one implementation instead of two drifting copies.
 """
 
