@@ -925,7 +925,28 @@ RATCHET_BASELINE: dict[str, int] = {
     # lineage's shape) account for the added lines, offset by deleting the
     # now-dead local-only _read_model_artifact_bytes. A justified, minimal
     # ratchet-up: 6098 -> 6107.
-    "src/clio_relay/mcp_server.py": 6107,
+    #
+    # split/mcp-server-w3 slice 1 (#231, fresh split off current develop --
+    # see this file's own docstring/history above for why the #264 routing
+    # fix is folded in rather than reapplied on top of stale wave-1 code):
+    # the tool catalog concern (doc's "mcp_server.py's tool catalog +
+    # dispatcher" owner-module row) moves to mcp_tool_catalog.py, itself a
+    # thin assembler over four tool-domain leaf modules
+    # (mcp_tool_catalog_job_lifecycle.py / _monitoring.py /
+    # _queue_retention.py / _gateway_session.py -- the real seam split the
+    # ~1,100-line `_all_tool_definitions` needed once extracted on its own,
+    # since a single ~1,270-line catalog module would itself have
+    # re-exceeded the 800-line cap). The #264 relay_list_artifacts/
+    # relay_read_artifact cluster/route_revision schema properties move with
+    # their tool definitions into mcp_tool_catalog_monitoring.py rather than
+    # being lost. mcp_server.py imports the moved names
+    # (`_all_tool_definitions`, `_authorized_static_tool_names`,
+    # `static_mcp_tool_names`, `MAX_AGENT_LOG_READ_BYTES`,
+    # `USER_MCP_TOOL_NAMES`) back for its own remaining catalog/
+    # authorization call sites and re-exports two of them so `cli.py` /
+    # `fastmcp_server.py` / `mcp_stdio_validation.py` keep importing from
+    # `clio_relay.mcp_server` unchanged.
+    "src/clio_relay/mcp_server.py": 4866,
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
@@ -994,7 +1015,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # ratchet-up note described.) (NOTE: split/mcp-stdio-validation-w2 also
     # forked before models-w2/process-containment-w2/queue-management-w2/
     # queue-validation-w2 landed and still carried their stale 2299/2678/
-    # 1671/1546 entries; omitted for the same reason as above.)
+    # 1671/1546 entries; omitted for the same reason as above.) (NOTE:
+    # split/mcp-server-w3 also forked after all four of those w2 branches had
+    # already landed on develop, so it never carried their stale entries in
+    # the first place -- no reintroduction to omit.)
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
