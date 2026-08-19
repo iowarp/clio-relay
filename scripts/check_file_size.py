@@ -127,7 +127,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # ProvenanceError/GitHubNotFound exceptions, the GitHubJsonFetcher
     # protocol + _github_fetcher, and the release policy constants every
     # other ci_validation owner module depends on.
-    "src/clio_relay/ci_validation.py": 3586,
+    # #231: -206 net lines -- payload_policy.py becomes the owner for
+    # archive-member filename/size policy (tag/candidate/tag-binding/
+    # promotion payload name validators + limits) and the SHA256SUMS
+    # checksum-manifest read/write pair.
+    "src/clio_relay/ci_validation.py": 3380,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
