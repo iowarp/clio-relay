@@ -91,7 +91,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # packaged builtin, carrying the digest it reported) instead of demanding
     # the ACTIVATED file be a byte copy of it. JARVIS normalizes the graph while
     # activating it, so byte equality failed every fresh bootstrap.
-    "src/clio_relay/bootstrap.py": 8883,
+    # #158: +13 net lines -- both provider verifications resolve the ELF string
+    # table by the segment holding its START and then bound the range against
+    # the file, instead of requiring one PT_LOAD to contain the whole table. A
+    # real .dynstr (CPython 3.12.13 as shipped by uv) spans two contiguous
+    # segments, so the old form found zero candidates and refused every staged
+    # upgrade as "ambiguous". Mostly the comments recording that layout.
+    "src/clio_relay/bootstrap.py": 8896,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     "src/clio_relay/bootstrap_journal.py": 1534,
