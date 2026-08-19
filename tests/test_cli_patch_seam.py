@@ -87,6 +87,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_queue": _SRC_ROOT / "cli_queue.py",
     "cli_queue_maintenance": _SRC_ROOT / "cli_queue_maintenance.py",
     "cli_session": _SRC_ROOT / "cli_session.py",
+    "cli_gateway_runtime": _SRC_ROOT / "cli_gateway_runtime.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -171,7 +172,11 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("validation_report", "write_validation_report", "cli"),
     ("remote_cli", "remote_command_timeout", "cli"),
     ("application_profiles", "install_cluster_app_over_ssh", "cli"),
-    ("owner_session_admission", "owner_session_gateway_admission", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_gateway_runtime with
+    # the gateway command-group extraction (owner_session_gateway_admission's
+    # only two cli.py call sites were start-runtime and resume-runtime, both
+    # of which now live in cli_gateway_runtime.py).
+    ("owner_session_admission", "owner_session_gateway_admission", "cli_gateway_runtime"),
     ("fastmcp_server", "run_fastmcp_stdio", "cli"),
     ("fastmcp_server", "run_fastmcp_http", "cli"),
     ("endpoint_service_status", "endpoint_service_readiness_over_ssh", "cli"),
