@@ -59,6 +59,14 @@ from clio_relay.validation_report import SoftwareIdentity, ValidationResource
 # confirms it, and re-exporting a name nothing consumes is dead weight, not
 # compatibility. It is still defined and tested directly against
 # session_wire_models below (test_remote_session_is_a_frozen_dataclass_record).
+#
+# OwnedSessionCleanupTarget stopped being re-exported in the
+# split/session-lifecycle rework (#231): its only session_lifecycle.py
+# consumers (_inspect_owned_session_cleanup_receipt,
+# _inspect_owned_session_failed_cleaned_receipt) moved to
+# session_recovery_cleanup_receipt.py / session_recovery_cleaned_receipt.py,
+# which import it directly from session_wire_models -- ruff's F401 confirmed
+# it, same reasoning as RemoteSession above.
 _MOVED_SYMBOLS = [
     "SessionApiReleaseIdentity",
     "OwnedSessionInputPolicy",
@@ -68,7 +76,6 @@ _MOVED_SYMBOLS = [
     "OwnedSessionStartRetrySelector",
     "OwnedSessionTeardownRequest",
     "OwnedSessionIdentityChallengeRequest",
-    "OwnedSessionCleanupTarget",
     "CleanupResource",
     "RemoteSessionStateEvidence",
     "OwnedSessionCleanupReportReference",

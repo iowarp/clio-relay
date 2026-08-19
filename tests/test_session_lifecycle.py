@@ -21,6 +21,8 @@ import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_lifecycle_report as session_lifecycle_report
 import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_recovery_attempt_status as session_recovery_attempt_status
+import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
 import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_start_attempt_validation as session_start_attempt_validation
 import clio_relay.session_startup_receipt as session_startup_receipt
@@ -40,7 +42,6 @@ from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
-    OwnedSessionCleanupTarget,
     OwnedSessionInputPolicy,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartPlan,
@@ -66,6 +67,7 @@ from clio_relay.session_lifecycle_report import (
     SESSION_SCHEDULER_CANCELED_CHECK_ID,
     SESSION_WORKER_CHECK_ID,
 )
+from clio_relay.session_wire_models import OwnedSessionCleanupTarget
 
 
 def _api_release_identity() -> SessionApiReleaseIdentity:
@@ -956,7 +958,9 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
     def _skewed_route_revision(_definition: ClusterDefinition) -> str:
         return skewed_route_revision
 
-    monkeypatch.setattr(session_lifecycle, "cluster_route_revision", _skewed_route_revision)
+    monkeypatch.setattr(
+        session_recovery_attempt_status, "cluster_route_revision", _skewed_route_revision
+    )
 
     # This exercises `_inspect_owned_session_start_attempt_status` directly
     # (not the public `inspect_owned_session_recovery_status` dispatcher):
@@ -966,8 +970,8 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
     # fallback into the pre-metadata path -- the same direct-call pattern
     # `test_contained_start_crash_is_promoted_only_after_full_identity_recheck`
     # already uses for a sibling private function.
-    caplog.set_level("WARNING", logger="clio_relay.session_lifecycle")
-    status = session_lifecycle._inspect_owned_session_start_attempt_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    caplog.set_level("WARNING", logger="clio_relay.session_recovery_attempt_status")
+    status = session_recovery_attempt_status._inspect_owned_session_start_attempt_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         core_dir=queue.root,
@@ -1027,7 +1031,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
     }
     assert "owner_token" not in receipt
     assert report.resources[0].metadata["failed_start"] is True
-    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=receipt,
@@ -1058,7 +1062,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         request.session_id,
         session_generation_id=generation,
     )
-    closed = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    closed = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=cast(dict[str, object], transaction.read_json("metadata.json")),
@@ -1096,7 +1100,7 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
     receipt = cast(dict[str, object], transaction.read_json("metadata.json"))
     receipt["owned_relay_job_ids"] = ["job-not-observed"]
 
-    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=receipt,

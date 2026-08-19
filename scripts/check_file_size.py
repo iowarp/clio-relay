@@ -595,7 +595,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # token selection, health polling, redacted log tail, startup-receipt
     # wait) moved to the new session_api_readiness.py owner (305 lines).
     # 6005 -> 5369.
-    "src/clio_relay/session_lifecycle.py": 5369,
+    # split/session-lifecycle slice F: the three recovery-inspection readers
+    # inspect_owned_session_recovery_status calls -- the pre-metadata
+    # start-attempt status projector (+ the bounded job-membership page
+    # reader, + the _FailedStartCleanupQueue protocol) to
+    # session_recovery_attempt_status.py (358 lines); the terminal
+    # failed-and-cleaned receipt validator to
+    # session_recovery_cleaned_receipt.py (439 lines); the post-metadata
+    # cleanup-receipt validator to session_recovery_cleanup_receipt.py
+    # (455 lines). inspect_owned_session_recovery_status itself stays
+    # resident (cli.py calls it by module-qualified attribute access) and
+    # now calls all three module-qualified. 5369 -> 4230.
+    "src/clio_relay/session_lifecycle.py": 4230,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
