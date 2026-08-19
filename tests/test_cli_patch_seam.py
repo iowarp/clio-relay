@@ -75,6 +75,9 @@ _SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "clio_relay"
 _GUARDED_CALLERS: dict[str, Path] = {
     "cli": _SRC_ROOT / "cli.py",
     "cli_relay_host": _SRC_ROOT / "cli_relay_host.py",
+    "cli_monitor": _SRC_ROOT / "cli_monitor.py",
+    "cli_agent": _SRC_ROOT / "cli_agent.py",
+    "cli_api": _SRC_ROOT / "cli_api.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -133,8 +136,11 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("scheduler_providers", "validation_provider_for_scheduler", "cli"),
     ("cluster_config", "open_private_atomic_file", "cli"),
     ("session_lifecycle", "start_remote_session_durable", "cli"),
-    ("installation", "verified_session_api_install_receipt", "cli"),
-    ("session_lifecycle", "publish_owned_session_api_startup_receipt", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_api with the api
+    # command-group extraction (api_start was each symbol's only cli.py call
+    # site).
+    ("installation", "verified_session_api_install_receipt", "cli_api"),
+    ("session_lifecycle", "publish_owned_session_api_startup_receipt", "cli_api"),
     ("session_api", "submit_owned_session_job", "cli"),
     ("validation_report", "write_validation_report", "cli"),
     ("remote_cli", "remote_command_timeout", "cli"),

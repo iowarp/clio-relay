@@ -29,7 +29,6 @@ from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import typer
-import uvicorn
 import yaml
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
@@ -41,6 +40,7 @@ import clio_relay.bootstrap_acceptance as bootstrap_acceptance
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli_agent as cli_agent
+import clio_relay.cli_api as cli_api
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_support as cli_support
@@ -788,7 +788,6 @@ app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 cluster_app = typer.Typer(no_args_is_help=True)
-api_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
 queue_app = typer.Typer(no_args_is_help=True)
@@ -804,7 +803,7 @@ app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(cli_agent.agent_app, name="agent")
 app.add_typer(cli_monitor.monitor_app, name="monitor")
-app.add_typer(api_app, name="api")
+app.add_typer(cli_api.api_app, name="api")
 app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
 app.add_typer(queue_app, name="queue")
@@ -4941,28 +4940,6 @@ def _session_api_release_identity_from_installation(
         artifact_sha256=artifact_sha256 or "0" * 64,
         software=software,
     )
-
-
-def _require_process_bound_session_api_release() -> None:
-    """Require the API process to match its release marker when one is present."""
-    expected_sha256 = os.environ.get("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256")
-    if expected_sha256 is None:
-        return
-    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
-        raise ConfigurationError("session API release identity marker is invalid")
-    receipt = installation.verified_session_api_install_receipt()
-    artifact_sha256 = receipt.artifact_sha256
-    if artifact_sha256 is None:  # pragma: no cover - verified helper requires it
-        if not dev_mode_enabled():
-            raise ConfigurationError("session API installation identity is incomplete")
-        artifact_sha256 = "0" * 64
-    observed = SessionApiReleaseIdentity(
-        distribution_version=receipt.distribution_version,
-        artifact_sha256=artifact_sha256,
-        software=receipt.software,
-    )
-    if observed.sha256() != expected_sha256:
-        raise ConfigurationError("session API release identity does not match running package")
 
 
 @session_app.command("status")
@@ -11442,31 +11419,6 @@ def mcp_server(
         fastmcp_server.run_fastmcp_stdio(profile=profile)
         return
     fastmcp_server.run_fastmcp_http(profile=profile, host=host, port=port, path=path)
-
-
-@api_app.command("start")
-def api_start(
-    host: Annotated[str, typer.Option(help="HTTP bind address.")] = "127.0.0.1",
-    port: Annotated[int, typer.Option(help="HTTP bind port.")] = 8765,
-    require_token: Annotated[
-        bool,
-        typer.Option(help="Fail if CLIO_RELAY_API_TOKEN is not configured."),
-    ] = False,
-) -> None:
-    """Start the desktop-facing HTTP API."""
-    if require_token and RelaySettings.from_env().api_token is None:
-        raise typer.BadParameter("CLIO_RELAY_API_TOKEN is required with --require-token")
-    try:
-        _require_process_bound_session_api_release()
-    except ConfigurationError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    # Import the process-bound app while its one-time gated environment is intact.
-    # The startup receipt then scrubs the owner token from the environment, while
-    # the app retains the validated settings needed to prove this session's identity.
-    from clio_relay.http_api import app as relay_http_app
-
-    session_lifecycle.publish_owned_session_api_startup_receipt()
-    uvicorn.run(relay_http_app, host=host, port=port)
 
 
 @app.command("installation-info")

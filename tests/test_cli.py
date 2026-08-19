@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib
 import json
 import os
 import stat
@@ -4580,59 +4579,6 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
     assert result.exit_code == 1
     assert cleanup_calls == 0
     assert starts == 0
-
-
-def test_cli_api_start_verifies_process_bound_release_identity(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    installation = _installation_identity()
-    identity = _session_api_release_identity()
-    launches: list[tuple[str, int]] = []
-    events: list[str] = []
-    bound_app = object()
-    late_app = object()
-    http_api_module = importlib.import_module("clio_relay.http_api")
-    monkeypatch.setattr(http_api_module, "app", bound_app)
-    monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "a" * 64)
-
-    def publish() -> None:
-        events.append("publish")
-        os.environ.pop("CLIO_RELAY_SESSION_OWNER_TOKEN", None)
-        cast(Any, http_api_module).app = late_app
-
-    def launch(application: object, *, host: str, port: int) -> None:
-        assert application is bound_app
-        assert "CLIO_RELAY_SESSION_OWNER_TOKEN" not in os.environ
-        events.append("serve")
-        launches.append((host, port))
-
-    receipt = cli.InstallReceipt.model_validate(installation["receipt"])
-    monkeypatch.setattr(
-        installation_module, "verified_session_api_install_receipt", lambda: receipt
-    )
-
-    def unexpected_full_installation_probe() -> dict[str, object]:
-        raise AssertionError("API startup must not run full component installation probes")
-
-    monkeypatch.setattr(
-        installation_module, "installation_info", unexpected_full_installation_probe
-    )
-    monkeypatch.setattr(session_lifecycle, "publish_owned_session_api_startup_receipt", publish)
-    monkeypatch.setattr(cli.uvicorn, "run", launch)
-    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", identity.sha256())
-
-    accepted = CliRunner().invoke(app, ["api", "start", "--port", "9001"])
-
-    assert accepted.exit_code == 0, accepted.output
-    assert launches == [("127.0.0.1", 9001)]
-    assert events == ["publish", "serve"]
-
-    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", "b" * 64)
-    rejected = CliRunner().invoke(app, ["api", "start", "--port", "9002"])
-
-    assert rejected.exit_code == 2
-    assert "release identity does not match running package" in rejected.output
-    assert launches == [("127.0.0.1", 9001)]
 
 
 def test_cli_session_submit_jarvis_uses_identity_proven_client(
