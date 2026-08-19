@@ -43,6 +43,7 @@ import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_api as cli_api
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
+import clio_relay.cli_storage as cli_storage
 import clio_relay.cli_support as cli_support
 import clio_relay.cluster_config as cluster_config
 import clio_relay.core_queue as core_queue
@@ -795,7 +796,6 @@ worker_app = typer.Typer(no_args_is_help=True)
 scheduler_app = typer.Typer(no_args_is_help=True)
 remote_mcp_app = typer.Typer(no_args_is_help=True)
 release_app = typer.Typer(no_args_is_help=True)
-storage_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
@@ -811,7 +811,7 @@ app.add_typer(worker_app, name="worker")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(remote_mcp_app, name="remote-mcp")
 app.add_typer(release_app, name="release")
-app.add_typer(storage_app, name="storage")
+app.add_typer(cli_storage.storage_app, name="storage")
 
 
 @app.callback()
@@ -857,13 +857,6 @@ def jarvis_runtime_authority(
         )
 
     _run_or_exit(action)
-
-
-@storage_app.command("status")
-def storage_status() -> None:
-    """Return machine-readable storage admission readiness."""
-    queue = storage_runtime.storage_managed_queue(RelaySettings.from_env())
-    typer.echo(json.dumps(queue.storage_runtime.status(), indent=2))
 
 
 @app.command()
