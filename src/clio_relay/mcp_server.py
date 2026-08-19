@@ -38,6 +38,7 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
+    ObservationPatternError,
     ObservationTimeoutError,
 )
 from clio_relay.filesystem_paths import logical_filesystem_text
@@ -106,6 +107,13 @@ from clio_relay.models import (
     TaskTimelineEvent,
     artifact_use_payload,
     validate_artifact_use_collection,
+)
+from clio_relay.observation import (
+    MAX_OBSERVATION_SCAN_BYTES,
+    compile_observation_pattern,
+    normalize_pattern_scope,
+    observe_until_pattern,
+    observe_until_pattern_snapshots,
 )
 from clio_relay.owner_session_admission import owner_session_gateway_admission
 from clio_relay.pagination import (
@@ -522,6 +530,13 @@ def handle_request(
             "relay storage admission denied",
             data={"storage_decision": exc.decision.to_dict()},
         )
+    except ObservationPatternError as exc:
+        return _error(
+            request_id,
+            -32602,
+            str(exc),
+            data={"reason": exc.reason},
+        )
     except Exception as exc:
         public_error = redact_sensitive_values(
             {
@@ -767,7 +782,13 @@ def _all_tool_definitions(
             "name": "relay_observe",
             "description": (
                 "Read job events from a cursor and optionally return when a regex pattern "
-                "matches stdout, stderr, or event text. For a remote job, copy cluster, "
+                "matches stdout, stderr, progress, or event text. Set until_pattern to "
+                "hold this call open until the streamed output/events match, or until the "
+                "job reaches terminal, whichever happens first; it never returns a TTL-shaped "
+                "poll-me-again result. A match returns matched=true with match.stream, "
+                "match.excerpt, match.position, and match.timestamp. Terminal without a "
+                "match returns matched=false and the terminal job state. For a remote job, "
+                "copy cluster, "
                 "job_id, and route_revision unchanged from its submission receipt on every "
                 "follow-up call, including on the same MCP connection. job_id alone is only "
                 "for a local relay job."
@@ -786,6 +807,27 @@ def _all_tool_definitions(
                         "maximum": MAX_RESPONSE_PAGE_RECORDS,
                     },
                     "pattern": {"type": "string"},
+                    "until_pattern": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "description": (
+                            "Hold open until this regex matches or the job becomes terminal. "
+                            "Invalid and potentially catastrophic regexes are typed refusals."
+                        ),
+                    },
+                    "pattern_scope": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["stdout", "stderr", "progress", "events"],
+                        },
+                        "uniqueItems": True,
+                        "minItems": 1,
+                        "default": ["events", "progress", "stderr", "stdout"],
+                        "description": (
+                            "Streams searched by until_pattern; defaults to all available streams."
+                        ),
+                    },
                     "include_logs": {"type": "boolean", "default": True},
                     "log_limit": {
                         "type": "integer",
@@ -3804,6 +3846,43 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
     cursor = int(arguments.get("cursor", 1))
     limit = _response_page_limit(arguments)
     target = _job_target(arguments)
+    until_pattern = _optional_str(arguments, "until_pattern")
+    if until_pattern is not None:
+        if arguments.get("pattern") is not None:
+            raise ValueError("pattern and until_pattern cannot be used together")
+        compiled = compile_observation_pattern(until_pattern)
+        scopes = normalize_pattern_scope(arguments.get("pattern_scope"))
+        if target is not None and should_execute_on_cluster(target):
+            result = _observe_remote_pattern(
+                target,
+                settings=settings,
+                job_id=job_id,
+                compiled=compiled,
+                scopes=scopes,
+                cursor=cursor,
+                limit=limit,
+                include_logs=arguments.get("include_logs", True) is not False,
+                log_limit=_log_limit(arguments),
+            )
+            result["cluster"] = target.name
+            result["route_revision"] = _route_revision(target)
+            return result
+        _require_local_job_cluster(queue, job_id, target)
+        result = observe_until_pattern(
+            queue,
+            settings,
+            job_id,
+            compiled=compiled,
+            scopes=scopes,
+            cursor=cursor,
+            limit=limit,
+            include_logs=arguments.get("include_logs", True) is not False,
+            log_limit=_log_limit(arguments),
+        )
+        if target is not None:
+            result["cluster"] = target.name
+            result["route_revision"] = _route_revision(target)
+        return result
     owned_logs: JSON | None = None
     if target is not None and should_execute_on_cluster(target):
         if settings.owner_session_id is not None:
@@ -3889,6 +3968,96 @@ def _observe_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettin
         result["cluster"] = target.name
         result["route_revision"] = _route_revision(target)
     return result
+
+
+def _observe_remote_pattern(
+    target: ClusterDefinition,
+    *,
+    settings: RelaySettings,
+    job_id: str,
+    compiled: re.Pattern[str],
+    scopes: tuple[str, ...],
+    cursor: int,
+    limit: int,
+    include_logs: bool,
+    log_limit: int,
+) -> JSON:
+    """Hold a routed observation open over the remote monitor/log surfaces."""
+    next_cursor = cursor
+    log_offsets = {stream: 0 for stream in ("stdout", "stderr")}
+
+    def read_snapshot() -> JSON:
+        nonlocal next_cursor
+        if settings.owner_session_id is not None:
+            with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                observed = _owned_json(
+                    client,
+                    method="GET",
+                    path=f"/jobs/{job_id}/monitor",
+                    query={"cursor": next_cursor, "limit": limit},
+                    label="owned remote pattern monitor",
+                )
+                _validate_owned_job_status(observed, job_id=job_id, cluster=target.name)
+        else:
+            observed = _remote_json(
+                target,
+                ["job", "monitor", job_id, "--cursor", str(next_cursor), "--limit", str(limit)],
+                "remote pattern monitor",
+            )
+        returned_cursor = observed.get("next_cursor")
+        if not isinstance(returned_cursor, int):
+            raise ValueError("remote pattern monitor returned an invalid event cursor")
+        next_cursor = returned_cursor
+        return observed
+
+    def read_logs() -> JSON | None:
+        if not (set(scopes) & {"stdout", "stderr"}):
+            return None
+        logs: JSON = {}
+        scan_limit = min(log_limit, MAX_OBSERVATION_SCAN_BYTES)
+        for stream in ("stdout", "stderr"):
+            if stream not in scopes:
+                continue
+            offset = log_offsets[stream]
+            if settings.owner_session_id is not None:
+                with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                    page = _owned_json(
+                        client,
+                        method="GET",
+                        path=f"/jobs/{job_id}/logs/{stream}",
+                        query={"offset": offset, "limit": scan_limit},
+                        label=f"owned remote pattern {stream} log",
+                    )
+            else:
+                page = _remote_json(
+                    target,
+                    [
+                        "job",
+                        "read-log",
+                        job_id,
+                        "--stream",
+                        stream,
+                        "--offset",
+                        str(offset),
+                        "--limit",
+                        str(scan_limit),
+                    ],
+                    f"remote pattern {stream} log",
+                )
+            next_offset = page.get("next_offset")
+            if not isinstance(next_offset, int):
+                raise ValueError(f"remote pattern {stream} log returned an invalid offset")
+            log_offsets[stream] = next_offset
+            logs[stream] = page
+        return logs
+
+    return observe_until_pattern_snapshots(
+        read_snapshot,
+        compiled=compiled,
+        scopes=scopes,
+        log_reader=read_logs,
+        include_logs=include_logs,
+    )
 
 
 def _wait_job(arguments: JSON, *, queue: ClioCoreQueue, settings: RelaySettings) -> JSON:

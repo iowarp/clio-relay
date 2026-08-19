@@ -117,6 +117,7 @@ from clio_relay.door_error_messages import public_message, resolved_public_messa
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
+    ObservationPatternError,
     ObservationTimeoutError,
     PublicMessageError,
     RelayAuthoredError,
@@ -322,6 +323,16 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             ),
             _http_row("http_request_malformed", 400, "HTTP request malformed"),
             _http_row("poll_interval_invalid", 400, "Poll interval invalid"),
+            _http_row(
+                "observation_pattern_invalid",
+                400,
+                "Observation pattern invalid",
+            ),
+            _http_row(
+                "observation_pattern_unsafe",
+                400,
+                "Observation pattern unsafe",
+            ),
             _http_row("log_stream_invalid", 400, "Log stream invalid"),
             _http_row("authentication_required", 401, "Authentication required"),
             _http_row("resource_ownership_refused", 403, "Resource ownership refused"),
@@ -454,13 +465,11 @@ class HTTPProblemError(Exception):
         self.fault = fault
 
 
-# The seven exception types with an unambiguous 1:1 reason (doc §6.3
-# dispatch rule 3). Order does not matter for correctness here -- none of
-# the seven is a superclass of another -- but is kept in the table's row
-# order for readability.
+# The exception types with an unambiguous 1:1 reason (doc §6.3 dispatch rule 3).
 _TYPE_REASONS: Final[tuple[tuple[type[BaseException], str], ...]] = (
     (TaskInputParkConflictError, "mcp_task_input_park_conflict"),
     (NotFoundError, "not_found"),
+    (ObservationPatternError, "observation_pattern_invalid"),
     (ConfigurationError, "configuration_error"),
     (StorageAdmissionError, "storage_admission_refused"),
     (StorageRuntimeViolation, "storage_safety_violation"),

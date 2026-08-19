@@ -298,7 +298,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # cap so this decomposition cannot silently re-accrete.
     # Campaign merge: values are the MEASURED merged-tree counts.
     "src/clio_relay/door_error_adapters.py": 170,
-    "src/clio_relay/door_errors.py": 734,
+    # Pattern-triggered observation adds two typed refusal reasons to the
+    # frozen door registry; the measured post-change owner count is 744.
+    "src/clio_relay/door_errors.py": 744,
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
@@ -334,7 +336,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # builds an authored, actionable message naming the conflicting
     # task_id and the `tasks/get` query verb. A justified, minimal
     # ratchet-up for a real bug fix, not accretion.
-    "src/clio_relay/fastmcp_server.py": 1257,
+    # Pattern observation errors are converted to typed MCP errors at the
+    # native FastMCP boundary; the measured post-change count is 1267.
+    "src/clio_relay/fastmcp_server.py": 1267,
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which
@@ -444,7 +448,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # the two call sites now call the imported name (-12), plus a stray
     # doubled blank line `ruff format` collapsed at the deletion site
     # (-2). A ratchet-down.
-    "src/clio_relay/mcp_server.py": 5929,
+    # The curated relay_observe schema and local/routed pattern dispatcher
+    # grew for until_pattern/pattern_scope; the measured post-change count is
+    # 6098. The matching/long-poll mechanics live in the sub-800 observation
+    # owner; the additional routed lines retain incremental remote log cursors
+    # so long-running jobs do not rescan only the first log page.
+    "src/clio_relay/mcp_server.py": 6098,
     # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
     # timeout message and log its bounded diagnostic once server-side.
     "src/clio_relay/mcp_stdio_validation.py": 1285,

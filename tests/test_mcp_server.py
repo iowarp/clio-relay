@@ -477,6 +477,18 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     for name in ("relay_observe", "relay_wait"):
         log_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
         assert log_tool["inputSchema"]["properties"]["log_limit"]["maximum"] == 32_768
+    observe_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "relay_observe"
+    )
+    assert observe_tool["inputSchema"]["properties"]["until_pattern"]["maxLength"] == 512
+    assert observe_tool["inputSchema"]["properties"]["pattern_scope"]["items"]["enum"] == [
+        "stdout",
+        "stderr",
+        "progress",
+        "events",
+    ]
+    assert "whichever happens first" in observe_tool["description"]
+    assert "matched=false" in observe_tool["description"]
     for name in ("relay_status", "relay_cancel", "relay_observe", "relay_wait"):
         followup_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
         description = followup_tool["description"]
