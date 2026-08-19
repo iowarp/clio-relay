@@ -16,8 +16,10 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
+import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
 from clio_relay import __version__
@@ -1992,7 +1994,7 @@ def test_durable_start_deadline_observes_late_ready_transition(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -2054,7 +2056,7 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
     observations = 0
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -2229,7 +2231,7 @@ def test_durable_start_status_transport_failure_is_ambiguous(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -2266,7 +2268,7 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
     )
 
     def rejected(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             rejection
         )
 
@@ -2299,22 +2301,22 @@ def test_unstructured_ssh_nonzero_is_ambiguous_not_terminal(
         stdout_limit: int,
         stderr_limit: int,
         environment: dict[str, str] | None = None,
-    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         del input_bytes, timeout_seconds, stdout_limit, stderr_limit, environment
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=255,
             stdout=b"",
             stderr=b"connection reset after remote acceptance",
         )
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_remote_command,
         "_run_bounded_command",
         connection_reset,
     )
 
     with pytest.raises(
-        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_command._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         match="without an exact structured response",
     ):
         session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -2329,7 +2331,7 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -2987,7 +2989,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
         log.truncate(20 * 1024 * 1024)
 
     with _FakeSessionTransaction(session_dir, session_id="session-1") as transaction:
-        target = session_lifecycle._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target = session_cleanup_targets._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             name="api.log",
             maximum_bytes=None,
@@ -2995,7 +2997,7 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
         assert target.identity_mode == "inode"
         assert target.sha256 is None
         assert target.size == 20 * 1024 * 1024
-        session_lifecycle._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_cleanup_targets._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             [target],
         )
@@ -4113,7 +4115,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
         stdout_limit: int,
         stderr_limit: int,
         environment: dict[str, str] | None = None,
-    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observed.update(
             command=command,
             input_bytes=input_bytes,
@@ -4122,13 +4124,13 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
             stderr_limit=stderr_limit,
             environment=environment,
         )
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=0,
             stdout=status_payload,
             stderr=b"",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", run_bounded)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", run_bounded)
     finalized = session_lifecycle.finalize_remote_session_cleanup_report(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
@@ -4750,12 +4752,14 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
-    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def timed_out(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         raise session_lifecycle._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "bounded command timed out after 120 seconds"
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", timed_out)
 
     with pytest.raises(RelayError, match="timed out after 120 seconds"):
         status_remote_session(
@@ -4776,14 +4780,16 @@ def test_absent_relay_executable_is_typed_rather_than_ambiguous(
     caller to poll a session that was never started.
     """
 
-    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=127,
             stdout=b"",
             stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError) as captured:
         session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -4798,7 +4804,7 @@ def test_absent_relay_executable_is_typed_rather_than_ambiguous(
     assert captured.value.reason == "relay_executable_missing"
     assert not isinstance(
         captured.value,
-        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_command._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     )
 
 
@@ -4815,7 +4821,7 @@ def test_durable_start_resolves_transport_ambiguity_instead_of_escaping(
     definition, release, plan = _durable_start_plan()
 
     def ambiguous(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandAmbiguous(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandAmbiguous(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "transport ended without an exact structured response"
         )
 
@@ -4887,14 +4893,16 @@ def test_poll_path_never_launders_a_dead_pointer_into_starting(
     """
     definition, _release, plan = _durable_start_plan()
 
-    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=127,
             stdout=b"",
             stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError):
         session_lifecycle.query_remote_session_start(definition=definition, plan=plan)
@@ -4907,14 +4915,16 @@ def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch
     carrying a raw shell blob when the pin is dead.
     """
 
-    def not_found(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=127,
             stdout=b"",
             stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", not_found)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError) as captured:
         session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -4944,12 +4954,14 @@ def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> N
 def test_typed_bounded_timeout_routes_to_the_session_deadline(monkeypatch: MonkeyPatch) -> None:
     """A real transport deadline reaches _RemoteSessionCommandDeadline by TYPE."""
 
-    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def timed_out(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         raise session_lifecycle._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", timed_out)
 
-    with pytest.raises(session_lifecycle._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    with pytest.raises(session_remote_command._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true",
@@ -4967,10 +4979,10 @@ def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
     which re-drives a command that already failed for an unrelated reason.
     """
 
-    def failed(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def failed(*_args: object, **_kwargs: object) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         raise RelayError("remote refused the request: an upstream job timed out earlier")
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", failed)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", failed)
 
     with pytest.raises(RelayError) as captured:
         session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -4980,7 +4992,7 @@ def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
 
     assert not isinstance(
         captured.value,
-        session_lifecycle._RemoteSessionCommandDeadline,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_command._RemoteSessionCommandDeadline,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     )
 
 

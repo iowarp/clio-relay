@@ -565,7 +565,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # publish_owned_session_api_startup_receipt stays resident (cli.py calls
     # it by module-qualified attribute access) and now delegates to both.
     # 7099 -> 6886.
-    "src/clio_relay/session_lifecycle.py": 6886,
+    # split/session-lifecycle slice C: the receipt-authorized cleanup-target
+    # capture/validate/delete primitives (shared by recovery inspection and
+    # teardown execution) moved to the new session_cleanup_targets.py owner
+    # (132 lines); the bounded local-command result type, the three
+    # remote-command outcome exceptions, and the bounding wrapper around
+    # run_bounded_process moved to the new session_remote_command.py owner
+    # (85 lines). 6886 -> 6708.
+    "src/clio_relay/session_lifecycle.py": 6708,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

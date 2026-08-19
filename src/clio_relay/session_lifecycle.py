@@ -21,7 +21,6 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -29,7 +28,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_startup_receipt as session_startup_receipt
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -618,7 +619,7 @@ def _inspect_owned_session_failed_cleaned_receipt(
 
     try:
         targets = (
-            _validate_cleanup_targets(
+            session_cleanup_targets._validate_cleanup_targets(
                 document.get("cleanup_targets"),
                 generation_id=validated_generation,
             )
@@ -1918,7 +1919,7 @@ def _inspect_owned_session_cleanup_receipt(
     validated_targets: list[OwnedSessionCleanupTarget] = []
     if validated_generation is not None:
         try:
-            validated_targets = _validate_cleanup_targets(
+            validated_targets = session_cleanup_targets._validate_cleanup_targets(
                 document.get("cleanup_targets"),
                 generation_id=validated_generation,
             )
@@ -2936,73 +2937,6 @@ def _coordinator_report_extends_remote_report(
         and report.post_session_status == remote_report.post_session_status
         and len(report.resources) >= len(remote_report.resources)
         and report.resources[: len(remote_report.resources)] == remote_report.resources
-    )
-
-
-@dataclass(frozen=True)
-class _BoundedCommandResult:
-    """Bounded output captured from one local child command."""
-
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-
-
-class _RemoteSessionCommandDeadline(RelayError):
-    """The local transport deadline expired without proving remote completion."""
-
-
-class _RemoteSessionCommandRejected(RelayError):
-    """The authenticated remote command rejected this invocation."""
-
-    def __init__(self, rejection: OwnedSessionStartRejection) -> None:
-        super().__init__(rejection.error)
-        self.rejection = rejection
-
-
-class _RemoteSessionCommandAmbiguous(RelayError):
-    """The SSH transport ended without proving whether the remote command completed."""
-
-
-def _run_bounded_command(
-    command: list[str],
-    *,
-    input_bytes: bytes = b"",
-    timeout_seconds: float,
-    stdout_limit: int,
-    stderr_limit: int,
-    environment: dict[str, str] | None = None,
-) -> _BoundedCommandResult:
-    """Run one isolated process tree while bounding both pipes before allocation."""
-    from clio_relay.bounded_process import (
-        BoundedProcessError,
-        BoundedProcessOutputLimit,
-        BoundedProcessTimeout,
-        run_bounded_process,
-    )
-
-    try:
-        result = run_bounded_process(
-            command,
-            environment=environment,
-            input_bytes=input_bytes,
-            timeout_seconds=timeout_seconds,
-            stdout_maximum_bytes=stdout_limit,
-            stderr_maximum_bytes=stderr_limit,
-            require_enforceable=os.name == "nt",
-        )
-    except BoundedProcessTimeout as exc:
-        raise _BoundedCommandTimeout(
-            f"bounded command timed out after {timeout_seconds:g} seconds"
-        ) from exc
-    except BoundedProcessOutputLimit as exc:
-        raise RelayError("bounded command output exceeded its byte limit") from exc
-    except BoundedProcessError as exc:
-        raise RelayError(f"bounded command process-tree cleanup failed: {exc}") from exc
-    return _BoundedCommandResult(
-        returncode=result.returncode,
-        stdout=result.stdout.encode("utf-8"),
-        stderr=result.stderr.encode("utf-8"),
     )
 
 
@@ -4753,123 +4687,11 @@ def execute_owned_session_start(
             os.close(log_descriptor)
 
 
-def _capture_cleanup_target(
-    transaction: _OwnedSessionTransaction,
-    *,
-    name: str,
-    maximum_bytes: int | None,
-) -> OwnedSessionCleanupTarget:
-    """Capture an exact cleanup target identity through the pinned directory."""
-    linked = transaction.stat_regular(name, required=False)
-    if linked is None:
-        return OwnedSessionCleanupTarget(name=name, present=False)
-    payload = (
-        transaction.read_bytes(name, maximum_bytes=maximum_bytes)
-        if maximum_bytes is not None
-        else None
-    )
-    final = transaction.stat_regular(name)
-    if final is None:  # pragma: no cover - required stat
-        raise RelayError(f"owned cleanup target disappeared: {name}")
-    if (linked.st_dev, linked.st_ino, linked.st_size) != (
-        final.st_dev,
-        final.st_ino,
-        final.st_size,
-    ):
-        raise RelayError(f"owned cleanup target changed while it was captured: {name}")
-    return OwnedSessionCleanupTarget(
-        name=name,
-        present=True,
-        device=linked.st_dev,
-        inode=linked.st_ino,
-        size=linked.st_size,
-        sha256=hashlib.sha256(payload).hexdigest() if payload is not None else None,
-        identity_mode="content_sha256" if payload is not None else "inode",
-    )
-
-
-def _validate_cleanup_targets(
-    raw_targets: object,
-    *,
-    generation_id: str,
-) -> list[OwnedSessionCleanupTarget]:
-    """Validate an exact, duplicate-free cleanup target identity collection."""
-    if not isinstance(raw_targets, list):
-        raise RelayError("owned session cleanup receipt targets are unavailable")
-    try:
-        targets = [
-            OwnedSessionCleanupTarget.model_validate(target)
-            for target in cast(list[object], raw_targets)
-        ]
-    except ValueError as exc:
-        raise RelayError(f"owned session cleanup receipt target is invalid: {exc}") from exc
-    expected_names = sorted(
-        (
-            "api.log",
-            "api.pid",
-            f"api-startup-{generation_id}.json",
-            f"cluster-registry-{generation_id}.json",
-        )
-    )
-    if [target.name for target in targets] != expected_names:
-        raise RelayError("owned session cleanup receipt target names are invalid")
-    if not all(target.identity_is_complete() for target in targets):
-        raise RelayError("owned session cleanup receipt target identity is incomplete")
-    return targets
-
-
-def _delete_cleanup_targets(
-    transaction: _OwnedSessionTransaction,
-    targets: list[OwnedSessionCleanupTarget],
-) -> None:
-    """Delete only receipt-authorized inodes, accepting already-absent retry targets."""
-    for target in targets:
-        current = transaction.stat_regular(target.name, required=False)
-        if not target.present:
-            if current is not None:
-                raise RelayError(f"an absent cleanup target appeared during retry: {target.name}")
-            continue
-        if current is None:
-            continue
-        if target.device is None or target.inode is None or target.size is None:
-            raise RelayError(f"cleanup target identity is incomplete: {target.name}")
-        transaction.unlink_verified(
-            target.name,
-            expected_device=target.device,
-            expected_inode=target.inode,
-            expected_size=target.size,
-            expected_sha256=target.sha256,
-            maximum_bytes=(
-                MAX_CLUSTER_REGISTRY_BYTES
-                if target.name.startswith("cluster-registry-")
-                else _MAX_OWNED_SESSION_DOCUMENT_BYTES
-                if target.identity_mode == "content_sha256"
-                else None
-            ),
-        )
-
-
-def _cleanup_intent_matches_request(
-    intent: dict[str, object],
-    request: OwnedSessionTeardownRequest,
-) -> bool:
-    """Return whether a durable intent is the request's exact immutable policy."""
-    return bool(
-        intent.get("schema_version") == "clio-relay.owner-session-cleanup-intent.v1"
-        and intent.get("operation_id") == request.expected_cleanup_operation_id
-        and intent.get("owner_session_id") == request.session_id
-        and intent.get("session_generation_id") == request.expected_session_generation_id
-        and intent.get("stop_worker") is request.stop_worker
-        and intent.get("cancel_jobs") is request.cancel_jobs
-        and intent.get("cancel_scheduler_jobs") is request.cancel_scheduler_jobs
-    )
-
-
 def _stop_owned_worker_service(*, cluster: str) -> CleanupResource:
     """Stop only a user service whose unit metadata proves relay ownership."""
     service = f"clio-relay-worker-{cluster}.service"
     try:
-        ownership = _run_bounded_command(
+        ownership = session_remote_command._run_bounded_command(
             [
                 "systemctl",
                 "--user",
@@ -4891,15 +4713,15 @@ def _stop_owned_worker_service(*, cluster: str) -> CleanupResource:
             and "clio-relay" in ownership_text
             and "endpoint start" in ownership_text
         )
-        stopped: _BoundedCommandResult | None = None
+        stopped: session_remote_command._BoundedCommandResult | None = None
         if owned:
-            stopped = _run_bounded_command(
+            stopped = session_remote_command._run_bounded_command(
                 ["systemctl", "--user", "stop", service],
                 timeout_seconds=20.0,
                 stdout_limit=64 * 1024,
                 stderr_limit=64 * 1024,
             )
-        active = _run_bounded_command(
+        active = session_remote_command._run_bounded_command(
             ["systemctl", "--user", "is-active", service],
             timeout_seconds=20.0,
             stdout_limit=64 * 1024,
@@ -4968,13 +4790,13 @@ def _complete_cleanup_receipt_retry(
     }
     if document.get("cleanup_policy") != expected_policy:
         raise RelayError("cleanup receipt policy does not match the teardown request")
-    targets = _validate_cleanup_targets(
+    targets = session_cleanup_targets._validate_cleanup_targets(
         document.get("cleanup_targets"),
         generation_id=request.expected_session_generation_id,
     )
     report = SessionLifecycleReport.model_validate(document.get("report"))
     if document.get("cleanup_paths_pending") is True:
-        _delete_cleanup_targets(transaction, targets)
+        session_cleanup_targets._delete_cleanup_targets(transaction, targets)
         for target in targets:
             if transaction.stat_regular(target.name, required=False) is not None:
                 raise RelayError(f"owned session cleanup target remained: {target.name}")
@@ -5116,7 +4938,7 @@ def _execute_owned_failed_start_teardown(
         cancel_jobs=request.cancel_jobs,
         cancel_scheduler_jobs=request.cancel_scheduler_jobs,
     )
-    if not _cleanup_intent_matches_request(intent, request):
+    if not session_cleanup_targets._cleanup_intent_matches_request(intent, request):
         raise RelayError("failed-start cleanup intent changed during teardown")
 
     jobs_before = _owned_generation_job_ids(
@@ -5167,7 +4989,7 @@ def _execute_owned_failed_start_teardown(
         )
     )
     targets = [
-        _capture_cleanup_target(
+        session_cleanup_targets._capture_cleanup_target(
             transaction,
             name=name,
             maximum_bytes=(
@@ -5270,7 +5092,7 @@ def _execute_owned_failed_start_teardown(
         "metadata.json",
         json.dumps(receipt, indent=2).encode("utf-8"),
     )
-    _delete_cleanup_targets(transaction, targets)
+    session_cleanup_targets._delete_cleanup_targets(transaction, targets)
     for target in targets:
         if transaction.stat_regular(target.name, required=False) is not None:
             raise RelayError(f"failed-start cleanup target remained: {target.name}")
@@ -5353,7 +5175,7 @@ def execute_owned_session_teardown(
             cancel_jobs=request.cancel_jobs,
             cancel_scheduler_jobs=request.cancel_scheduler_jobs,
         )
-        if not _cleanup_intent_matches_request(intent, request):
+        if not session_cleanup_targets._cleanup_intent_matches_request(intent, request):
             raise RelayError("durable cleanup intent does not match the teardown request")
         if status.cleanup_receipt:
             return _complete_cleanup_receipt_retry(
@@ -5487,7 +5309,7 @@ def execute_owned_session_teardown(
                 )
             )
             targets = [
-                _capture_cleanup_target(
+                session_cleanup_targets._capture_cleanup_target(
                     transaction,
                     name=name,
                     maximum_bytes=(
@@ -5602,7 +5424,7 @@ def execute_owned_session_teardown(
                 json.dumps(receipt, indent=2).encode("utf-8"),
             )
             receipt_committed = True
-            _delete_cleanup_targets(transaction, targets)
+            session_cleanup_targets._delete_cleanup_targets(transaction, targets)
             for target in targets:
                 if transaction.stat_regular(target.name, required=False) is not None:
                     raise RelayError(f"owned session cleanup target remained: {target.name}")
@@ -6009,7 +5831,7 @@ def status_remote_session_start(
             ),
             timeout_seconds=transport_timeout,
         )
-    except _RemoteSessionCommandDeadline as exc:
+    except session_remote_command._RemoteSessionCommandDeadline as exc:
         return OwnedSessionRecoveryStatus(
             cluster=selector.cluster,
             session_id=selector.session_id,
@@ -6288,18 +6110,18 @@ def start_remote_session_durable(
             start_operation_id=plan.start_operation_id,
             expected_cluster_route_revision=plan.cluster_route_revision,
         )
-    except _RemoteSessionCommandDeadline:
+    except session_remote_command._RemoteSessionCommandDeadline:
         return query_remote_session_start(
             definition=definition,
             plan=plan,
             transport_deadline_exceeded=True,
         )
-    except _RemoteSessionCommandAmbiguous:
+    except session_remote_command._RemoteSessionCommandAmbiguous:
         # The durable start may exist: resolve it against remote state instead
         # of escaping as a bare RelayError. Not a deadline, so the flag stays
         # false (clio-relay#158).
         return query_remote_session_start(definition=definition, plan=plan)
-    except _RemoteSessionCommandRejected as exc:
+    except session_remote_command._RemoteSessionCommandRejected as exc:
         rejection = exc.rejection
         if not (
             rejection.cluster == plan.cluster
@@ -6812,7 +6634,7 @@ def _ssh_script(
     if len(encoded_script) > _MAX_REMOTE_SESSION_SCRIPT_BYTES:
         raise RelayError("remote session command exceeds its byte limit")
     try:
-        result = _run_bounded_command(
+        result = session_remote_command._run_bounded_command(
             ["ssh", definition.ssh_host, "bash", "-s"],
             input_bytes=encoded_script,
             timeout_seconds=timeout_seconds,
@@ -6820,7 +6642,7 @@ def _ssh_script(
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
     except _BoundedCommandTimeout as exc:
-        raise _RemoteSessionCommandDeadline(
+        raise session_remote_command._RemoteSessionCommandDeadline(
             f"remote session command timed out after {timeout_seconds:g} seconds"
         ) from exc
     except RelayError as exc:
@@ -6833,11 +6655,11 @@ def _ssh_script(
         try:
             rejection = OwnedSessionStartRejection.model_validate_json(stdout)
         except ValueError:
-            raise _RemoteSessionCommandAmbiguous(
+            raise session_remote_command._RemoteSessionCommandAmbiguous(
                 "remote session transport ended without an exact structured response: "
                 f"{detail or f'exit {result.returncode}'}"
             ) from None
-        raise _RemoteSessionCommandRejected(rejection)
+        raise session_remote_command._RemoteSessionCommandRejected(rejection)
     return result.stdout.decode("utf-8", errors="replace")
 
 
@@ -6859,7 +6681,7 @@ def _ssh_stdin_command(
         raise RelayError("remote session stdin exceeds its byte limit")
     remote_command = f"bash -lc {shlex.quote(script)}"
     try:
-        result = _run_bounded_command(
+        result = session_remote_command._run_bounded_command(
             ["ssh", definition.ssh_host, remote_command],
             input_bytes=input_bytes,
             timeout_seconds=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
@@ -6867,7 +6689,7 @@ def _ssh_stdin_command(
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
         )
     except _BoundedCommandTimeout as exc:
-        raise _RemoteSessionCommandDeadline(
+        raise session_remote_command._RemoteSessionCommandDeadline(
             "remote session command timed out after "
             f"{_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS:g} seconds"
         ) from exc
