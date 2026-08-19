@@ -651,7 +651,54 @@ RATCHET_BASELINE: dict[str, int] = {
     # repointed to the real owner module, and the shim is deleted the moment
     # cli.py's own split lands and can absorb the one-line repoint itself.
     # 3801 -> 3461.
-    "src/clio_relay/session_lifecycle.py": 3461,
+    # split/session-lifecycle slice J: the crash-surviving start-promotion
+    # helpers (_OwnedSessionQueue, _RecoveredStartProbe,
+    # _promote_resumable_contained_start) plus the five execute_owned_session_*
+    # entry points (identity_challenge, start, teardown, cleanup_finalize,
+    # cleanup_report_read) and their private helpers moved out to three new
+    # owners: session_start_execution.py (~1190 lines -- identity_challenge +
+    # start + the promotion cluster, dominated by the ~910-line
+    # execute_owned_session_start), session_cleanup_execution.py (~822 lines --
+    # worker-stop/receipt-retry/failed-scope-termination/failed-start-teardown
+    # + execute_owned_session_teardown), and session_cleanup_reporting.py (256
+    # lines -- the small, self-contained cleanup_finalize/report_read pair).
+    # All three are one-directional dependents of
+    # inspect_owned_session_recovery_status and a handful of shared byte-cap/
+    # env-name constants, still resident here; nothing calls back into them.
+    # `import clio_relay.session_lifecycle as session_lifecycle` for that
+    # back-reference is deferred to the top of each function that needs it
+    # (not module scope): session_lifecycle's own compat-shim import of these
+    # three modules is what triggers their loading, so a module-scope
+    # back-import created a load-order-dependent circular ImportError
+    # whenever something imported one of them before session_lifecycle
+    # (caught live: test collection alphabetizes session_cleanup_execution
+    # before session_lifecycle). Deferring the back-import to call time makes
+    # it import-order-independent. cli.py bare-imports all five
+    # execute_owned_session_* names (confirmed: every call site in cli.py is
+    # a bare call, never module-qualified) -- repointing them would hit the
+    # same net-LOC-growth cli.py ratchet problem as slice I, so they join the
+    # existing cli.py-compatibility re-export block instead.
+    # RemoteSessionStateEvidence and OwnedSessionCleanupReportReference
+    # stopped being re-exported (their only consumers moved to
+    # session_cleanup_execution.py / session_cleanup_reporting.py, which
+    # import both directly). 3461 -> 1357.
+    "src/clio_relay/session_lifecycle.py": 1357,
+    # split/session-lifecycle slice J (#231): execute_owned_session_start
+    # alone is ~910 lines of crash-recovery start logic (systemd containment,
+    # broker handoff, resumable-attempt promotion) that does not decompose
+    # along a clean second seam without restructuring the function itself --
+    # out of scope for a mechanical extraction slice. Matches the
+    # queue_management.py/queue_validation.py precedent of a ratcheted,
+    # justified new-file cap above the 800-line default.
+    "src/clio_relay/session_start_execution.py": 1190,
+    # split/session-lifecycle slice J (#231): the failed-start teardown path
+    # (_execute_owned_failed_start_teardown, 243 lines) plus
+    # execute_owned_session_teardown (342 lines) and their three small
+    # private helpers form one cohesive, already-minimal cluster; splitting
+    # execute_owned_session_teardown itself out of its own helper cluster
+    # would separate functions that only ever call each other. 22 lines over
+    # the 800 default.
+    "src/clio_relay/session_cleanup_execution.py": 822,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

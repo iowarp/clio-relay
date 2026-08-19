@@ -23,10 +23,12 @@ from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
-    RemoteSessionStateEvidence,
     SessionLifecycleReport,
 )
-from clio_relay.session_wire_models import OwnedSessionStartStatusSelector
+from clio_relay.session_wire_models import (
+    OwnedSessionStartStatusSelector,
+    RemoteSessionStateEvidence,
+)
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
     run_frp_http_probe,

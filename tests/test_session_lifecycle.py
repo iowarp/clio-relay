@@ -17,6 +17,7 @@ from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
 import clio_relay.session_api_readiness as session_api_readiness
+import clio_relay.session_cleanup_execution as session_cleanup_execution
 import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_lifecycle_report as session_lifecycle_report
@@ -26,6 +27,7 @@ import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_r
 import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_remote_scripts as session_remote_scripts
 import clio_relay.session_start_attempt_validation as session_start_attempt_validation
+import clio_relay.session_start_execution as session_start_execution
 import clio_relay.session_start_query as session_start_query
 import clio_relay.session_start_wait as session_start_wait
 import clio_relay.session_startup_receipt as session_startup_receipt
@@ -51,7 +53,6 @@ from clio_relay.session_lifecycle import (
     OwnedSessionStartPlan,
     OwnedSessionStartRequest,
     OwnedSessionTeardownRequest,
-    RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     detach_remote_session,
@@ -71,7 +72,7 @@ from clio_relay.session_lifecycle_report import (
     SESSION_WORKER_CHECK_ID,
 )
 from clio_relay.session_start_query import challenge_remote_session_identity
-from clio_relay.session_wire_models import OwnedSessionCleanupTarget
+from clio_relay.session_wire_models import OwnedSessionCleanupTarget, RemoteSessionStateEvidence
 
 
 def _api_release_identity() -> SessionApiReleaseIdentity:
@@ -1016,7 +1017,7 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         _no_adopted_scope,
     )
 
-    report = session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report = session_cleanup_execution._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
@@ -1095,7 +1096,7 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
         expected_session_generation_id="generation-failed-start",
         expected_cleanup_operation_id="cleanup_failed_start",
     )
-    session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_cleanup_execution._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
@@ -1669,7 +1670,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     else:
         provider_interpreter.symlink_to(base_interpreter)
         assert provider_interpreter.absolute() != provider_interpreter.resolve(strict=True)
-    monkeypatch.setattr(session_lifecycle.sys, "executable", str(provider_interpreter))
+    monkeypatch.setattr(session_start_execution.sys, "executable", str(provider_interpreter))
     containment_module = importlib.import_module("clio_relay.process_containment")
     monkeypatch.setattr(
         containment_module,
@@ -2592,7 +2593,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
     monkeypatch.setattr(session_api_readiness, "_wait_for_api_startup_receipt", verify_receipt)
     monkeypatch.setattr(session_api_readiness, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
-    start_receipt = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    start_receipt = session_start_execution._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         attempt=attempt,
         request=request,
@@ -3226,7 +3227,7 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
     def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raw_reference = transaction.document.get("coordinator_report_ref")
         reference = (
-            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            session_wire_models.OwnedSessionCleanupReportReference.model_validate(raw_reference)
             if isinstance(raw_reference, dict)
             else None
         )
@@ -3579,7 +3580,7 @@ def test_legacy_inline_cleanup_report_migration_recovers_after_metadata_write_fa
         assert document is not None
         raw_reference = document.get("coordinator_report_ref")
         reference = (
-            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            session_wire_models.OwnedSessionCleanupReportReference.model_validate(raw_reference)
             if isinstance(raw_reference, dict)
             else None
         )

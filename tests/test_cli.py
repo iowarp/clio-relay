@@ -113,11 +113,11 @@ from clio_relay.service_runtime import (
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
-    RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     session_lifecycle_report_sha256,
 )
+from clio_relay.session_wire_models import RemoteSessionStateEvidence
 from clio_relay.validation_report import (
     EvidenceReference,
     InstallSource,

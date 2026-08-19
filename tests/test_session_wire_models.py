@@ -68,16 +68,27 @@ from clio_relay.validation_report import SoftwareIdentity, ValidationResource
 # which import it directly from session_wire_models -- ruff's F401 confirmed
 # it, same reasoning as RemoteSession above.
 #
-# OwnedSessionStartRejection stopped being re-exported in the same rework:
-# its only session_lifecycle.py consumer, _ssh_script's rejection-response
-# parsing, moved to session_remote_scripts.py, which imports it directly
-# from session_wire_models.
+# OwnedSessionStartRejection's only session_lifecycle.py consumer
+# (_ssh_script's rejection-response parsing) moved to
+# session_remote_scripts.py, which imports it directly from
+# session_wire_models -- but cli.py still bare-imports
+# OwnedSessionStartRejection from session_lifecycle, so slice I re-added it
+# (noqa-marked) to session_lifecycle.py's cli.py-compatibility re-export
+# block rather than dropping it here too.
 #
 # OwnedSessionStartStatusSelector and OwnedSessionStartRetrySelector stopped
 # being re-exported once plan_remote_session_start, status_remote_session_start,
 # query_remote_session_start, and watch_remote_session_start (their only
 # session_lifecycle.py consumers) moved to session_start_query.py, which
 # imports both directly from session_wire_models.
+#
+# RemoteSessionStateEvidence and OwnedSessionCleanupReportReference stopped
+# being re-exported in split/session-lifecycle slice J (#231): their only
+# session_lifecycle.py consumers (the teardown/finalize/report-read
+# execute_owned_session_* cluster) moved to session_cleanup_execution.py /
+# session_cleanup_reporting.py, which import both directly from
+# session_wire_models; nothing else in the tree still needs either name off
+# session_lifecycle.py.
 _MOVED_SYMBOLS = [
     "SessionApiReleaseIdentity",
     "OwnedSessionInputPolicy",
@@ -85,8 +96,6 @@ _MOVED_SYMBOLS = [
     "OwnedSessionTeardownRequest",
     "OwnedSessionIdentityChallengeRequest",
     "CleanupResource",
-    "RemoteSessionStateEvidence",
-    "OwnedSessionCleanupReportReference",
     "OwnedSessionRecoveryStatus",
     "OwnedSessionStartResult",
     "OwnedSessionStartReceipt",
