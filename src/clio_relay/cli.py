@@ -40,6 +40,7 @@ import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_acceptance as bootstrap_acceptance
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.bounded_process as bounded_process
+import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_support as cli_support
@@ -122,7 +123,7 @@ from clio_relay.jarvis_service_runtime import (
     resolve_local_jarvis_service_runtime_authority,
 )
 from clio_relay.live_acceptance import LiveAcceptanceOptions
-from clio_relay.mcp_server import render_agent_mcp_profile, static_mcp_tool_names
+from clio_relay.mcp_server import static_mcp_tool_names
 from clio_relay.mcp_stdio_validation import PackagedMcpStdioSession
 from clio_relay.models import (
     MCP_ADMISSION_AUTHORITY_METADATA_KEY,
@@ -142,7 +143,6 @@ from clio_relay.models import (
     OwnerSessionClosure,
     ProgressRecord,
     RelayJob,
-    RemoteAgentTaskSpec,
     SchedulerPhase,
     SchedulerStatus,
     ServiceRuntimeSpec,
@@ -788,7 +788,6 @@ app = typer.Typer(no_args_is_help=True)
 endpoint_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 cluster_app = typer.Typer(no_args_is_help=True)
-agent_app = typer.Typer(no_args_is_help=True)
 api_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
@@ -803,7 +802,7 @@ app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
 app.add_typer(job_app, name="job")
 app.add_typer(cluster_app, name="cluster")
-app.add_typer(agent_app, name="agent")
+app.add_typer(cli_agent.agent_app, name="agent")
 app.add_typer(cli_monitor.monitor_app, name="monitor")
 app.add_typer(api_app, name="api")
 app.add_typer(session_app, name="session")
@@ -10480,60 +10479,6 @@ def gateway_stop_runtime(
     _run_or_exit(guarded_action)
 
 
-@agent_app.command("run")
-def agent_run(
-    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
-    prompt: Annotated[str, typer.Option(help="Prompt file path on the cluster.")],
-    mcp_config: Annotated[
-        str | None,
-        typer.Option(help="Optional MCP config/profile path on the cluster."),
-    ] = None,
-    idempotency_key: Annotated[
-        str | None,
-        typer.Option(help="Submit/retry idempotency key."),
-    ] = None,
-    used_artifact: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--used-artifact",
-            help="Dependency as ARTIFACT_ID=SHA256 or canonical JSON with provenance. Repeatable.",
-        ),
-    ] = None,
-) -> None:
-    """Submit a remote agent task on a configured cluster."""
-    definition = _require_cluster(cluster)
-    artifact_uses = _artifact_use_refs(used_artifact)
-    key = idempotency_key or (
-        f"agent:{cluster}:{prompt}:{mcp_config}" + _artifact_use_idempotency_suffix(artifact_uses)
-    )
-    if remote_cli.should_execute_on_cluster(definition):
-        args = [
-            "agent",
-            "run",
-            "--cluster",
-            cluster,
-            "--prompt",
-            prompt,
-            "--idempotency-key",
-            key,
-        ]
-        if mcp_config is not None:
-            args.extend(["--mcp-config", mcp_config])
-        for ref in _artifact_use_refs(used_artifact):
-            args.extend(["--used-artifact", _artifact_use_cli_value(ref)])
-        _run_remote_or_exit(definition, args)
-        return
-    job = RelayJob(
-        cluster=cluster,
-        kind=JobKind.REMOTE_AGENT,
-        spec=RemoteAgentTaskSpec(prompt_path=prompt, mcp_config_path=mcp_config),
-        idempotency_key=key,
-        used_artifact_refs=artifact_uses,
-    )
-    saved = _submit_managed_job(job)
-    typer.echo(saved.job_id)
-
-
 @app.command("mcp-call")
 def mcp_call(
     cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
@@ -11522,23 +11467,6 @@ def api_start(
 
     session_lifecycle.publish_owned_session_api_startup_receipt()
     uvicorn.run(relay_http_app, host=host, port=port)
-
-
-@agent_app.command("render-mcp-config")
-def agent_render_mcp_config(
-    output: Annotated[
-        Path | None,
-        typer.Option(help="Optional path to write the agent MCP profile TOML."),
-    ] = None,
-) -> None:
-    """Render an agent profile that exposes the relay MCP tools."""
-    rendered = render_agent_mcp_profile(settings=RelaySettings.from_env())
-    if output is None:
-        typer.echo(rendered)
-        return
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered, encoding="utf-8")
-    typer.echo(output)
 
 
 @app.command("installation-info")
