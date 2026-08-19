@@ -548,141 +548,30 @@ RATCHET_BASELINE: dict[str, int] = {
     # errors.py to keep this minimal; what remains needs the ClusterDefinition
     # and the bounded result in hand, so it cannot move. A justified, minimal
     # ratchet-up.
-    # split/session-lifecycle slice A (#231 rework): the pinned owned-session
-    # directory transaction primitive (_OwnedSessionTransaction + its
-    # protocols, open_owned_session_transaction, the filename/file-identity
-    # validators) moved to the new session_transaction.py owner (768 lines);
-    # _validate_session/_validate_durable_session_identity moved to the new
-    # session_validation.py leaf (28 lines) -- both are dependency-free
-    # foundations every other owned-session lifecycle module builds on.
-    # 7840 -> 7099.
-    # split/session-lifecycle slice B: process/systemd-scope identity
-    # primitives (_OwnedGenerationProcess, bounded procfs reads, scope
-    # membership/termination, the API-leader command check) moved to the new
-    # session_process_scope.py owner (163 lines); startup-receipt HMAC
-    # signing + its atomic owner-private publish moved to the new
-    # session_startup_receipt.py owner (107 lines).
-    # publish_owned_session_api_startup_receipt stays resident (cli.py calls
-    # it by module-qualified attribute access) and now delegates to both.
-    # 7099 -> 6886.
-    # split/session-lifecycle slice C: the receipt-authorized cleanup-target
-    # capture/validate/delete primitives (shared by recovery inspection and
-    # teardown execution) moved to the new session_cleanup_targets.py owner
-    # (132 lines); the bounded local-command result type, the three
-    # remote-command outcome exceptions, and the bounding wrapper around
-    # run_bounded_process moved to the new session_remote_command.py owner
-    # (85 lines). 6886 -> 6708.
-    # split/session-lifecycle slice D: the lifecycle report wire model
-    # (SessionLifecycleReport, its live-validation projection, the two
-    # stdin request wrappers), the canonical bytes/digest encoders, and the
-    # immutable coordinator-report sidecar primitives moved to the new
-    # session_lifecycle_report.py owner (750 lines). SessionLifecycleReport
-    # and the two encoders stay bare-imported into session_lifecycle.py
-    # (still constructed/called at runtime by every still-resident
-    # remote_session_*/execute_owned_session_* entry point), matching the
-    # existing session_wire_models.py precedent; the private sidecar
-    # helpers are called module-qualified. 6708 -> 6005.
-    # split/session-lifecycle slice E: the durable start-attempt journal
-    # validator (every schema generation v1-v3), its retry-selector wrapper,
-    # the legacy identity-match check, the v1-to-current migration writer,
-    # and the shared atomic attempt-journal writer moved to the new
-    # session_start_attempt_validation.py owner (413 lines) -- a
-    # dependency-free leaf relative to the rest of the split, extracted
-    # ahead of the recovery-inspection cluster (a later slice) specifically
-    # because that cluster depends on it and depends on nothing it
-    # exports, avoiding a cycle. The API child startup/readiness substrate
-    # (release-identity lookup, registry validation, port pre-check,
-    # token selection, health polling, redacted log tail, startup-receipt
-    # wait) moved to the new session_api_readiness.py owner (305 lines).
-    # 6005 -> 5369.
-    # split/session-lifecycle slice F: the three recovery-inspection readers
-    # inspect_owned_session_recovery_status calls -- the pre-metadata
-    # start-attempt status projector (+ the bounded job-membership page
-    # reader, + the _FailedStartCleanupQueue protocol) to
-    # session_recovery_attempt_status.py (358 lines); the terminal
-    # failed-and-cleaned receipt validator to
-    # session_recovery_cleaned_receipt.py (439 lines); the post-metadata
-    # cleanup-receipt validator to session_recovery_cleanup_receipt.py
-    # (455 lines). inspect_owned_session_recovery_status itself stays
-    # resident (cli.py calls it by module-qualified attribute access) and
-    # now calls all three module-qualified. 5369 -> 4230.
-    # split/session-lifecycle slice G: the cluster-local exact-start-selector
-    # wait/poll cluster (single-observation inspector, terminal-state
-    # predicate, bounded poll loop) moved to the new session_start_wait.py
-    # owner (~130 lines) -- a one-directional dependent on
-    # inspect_owned_session_recovery_status (still resident), never called
-    # back into by anything in this module. cli.py's only touch is a
-    # one-line import repoint for the bare-imported
-    # wait_owned_session_start_status. 4230 -> 4125.
-    # split/session-lifecycle slice H: the cluster-local SSH script generators
-    # for every owned-session subcommand plus the two SSH transport wrappers
-    # (_ssh_script, _ssh_stdin_command) and the dead-executable-pin refusal
-    # they share moved to the new session_remote_scripts.py owner (372
-    # lines) -- a pure, one-directional dependent of session_remote_command.py;
-    # nothing calls back into it. Two wire models (OwnedSessionStartRejection,
-    # already-noted OwnedSessionCleanupTarget's sibling) stopped being
-    # re-exported since their only session_lifecycle.py consumer moved;
-    # cli.py's only touch is a one-line import repoint for the bare-imported
-    # OwnedSessionStartRejection. 4125 -> 3801.
-    # split\session-lifecycle slice I: the remote start planning/status/query/
-    # watch/challenge cluster (plan_remote_session_start,
-    # status_remote_session_start, _owned_session_start_result,
-    # _session_start_result_from_status, query_remote_session_start,
-    # watch_remote_session_start, challenge_remote_session_identity, plus the
-    # three module-level wait/timeout-margin constants) moved to the new
-    # session_start_query.py owner (409 lines) -- a one-directional dependent
-    # on session_remote_scripts.py, session_remote_command.py, and
-    # inspect_owned_session_recovery_status (still resident); nothing calls
-    # back into it. This slice hit the cli.py ratchet: repointing cli.py's
-    # bare imports for plan_remote_session_start, query_remote_session_start,
-    # watch_remote_session_start (moved here), wait_owned_session_start_status
-    # (session_start_wait.py, slice G) and cleanup_connectors_cover_gateways
-    # (session_lifecycle_report.py, slice D) to their real new homes is a net
-    # +2 LOC there (five single-purpose `from module import name` statements
-    # cannot collapse into fewer lines than the names removed from the old
-    # consolidated block) and would regress cli.py's own 18849 baseline.
-    # cli.py is another agent's active split-in-progress territory with its
-    # own ratchet, so instead of touching it, session_lifecycle.py re-exports
-    # those five names (plus OwnedSessionStartRejection, already-noted from
-    # slice H) under a clearly-commented "cli.py compatibility re-exports"
-    # header -- the one deliberate compatibility-shim exception in this
-    # split, scoped to cli.py's bare imports only; every other consumer
-    # (this module's own internal calls, tests, transport_probe.py) is
-    # repointed to the real owner module, and the shim is deleted the moment
-    # cli.py's own split lands and can absorb the one-line repoint itself.
-    # 3801 -> 3461.
-    # split/session-lifecycle slice J: the crash-surviving start-promotion
-    # helpers (_OwnedSessionQueue, _RecoveredStartProbe,
-    # _promote_resumable_contained_start) plus the five execute_owned_session_*
-    # entry points (identity_challenge, start, teardown, cleanup_finalize,
-    # cleanup_report_read) and their private helpers moved out to three new
-    # owners: session_start_execution.py (~1190 lines -- identity_challenge +
-    # start + the promotion cluster, dominated by the ~910-line
-    # execute_owned_session_start), session_cleanup_execution.py (~822 lines --
-    # worker-stop/receipt-retry/failed-scope-termination/failed-start-teardown
-    # + execute_owned_session_teardown), and session_cleanup_reporting.py (256
-    # lines -- the small, self-contained cleanup_finalize/report_read pair).
-    # All three are one-directional dependents of
-    # inspect_owned_session_recovery_status and a handful of shared byte-cap/
-    # env-name constants, still resident here; nothing calls back into them.
-    # `import clio_relay.session_lifecycle as session_lifecycle` for that
-    # back-reference is deferred to the top of each function that needs it
-    # (not module scope): session_lifecycle's own compat-shim import of these
-    # three modules is what triggers their loading, so a module-scope
-    # back-import created a load-order-dependent circular ImportError
-    # whenever something imported one of them before session_lifecycle
-    # (caught live: test collection alphabetizes session_cleanup_execution
-    # before session_lifecycle). Deferring the back-import to call time makes
-    # it import-order-independent. cli.py bare-imports all five
-    # execute_owned_session_* names (confirmed: every call site in cli.py is
-    # a bare call, never module-qualified) -- repointing them would hit the
-    # same net-LOC-growth cli.py ratchet problem as slice I, so they join the
-    # existing cli.py-compatibility re-export block instead.
-    # RemoteSessionStateEvidence and OwnedSessionCleanupReportReference
-    # stopped being re-exported (their only consumers moved to
-    # session_cleanup_execution.py / session_cleanup_reporting.py, which
-    # import both directly). 3461 -> 1357.
-    "src/clio_relay/session_lifecycle.py": 1357,
+    # split/session-lifecycle rework (#231, slices A-K): session_lifecycle.py
+    # was 7840 lines at the start of this rework. Slices A-J moved every
+    # bare-imported (cli.py) concern out to owner modules one at a time,
+    # each ratcheted down here in turn; slice K then found that the two
+    # remaining resident clusters (inspect_owned_session_recovery_status +
+    # its private helper, and the SSH-remote-orchestration group) reach
+    # session_lifecycle only through cli.py's MODULE-QUALIFIED attribute
+    # access (`session_lifecycle.inspect_owned_session_recovery_status(...)`),
+    # not a bare import -- and Python resolves a re-exported name off a
+    # module identically to one defined there, so the same
+    # cli.py-compatibility re-export trick used for every bare-imported name
+    # in slices A-J also covers qualified access. Slice K moved
+    # inspect_owned_session_recovery_status (self-contained: no other
+    # resident function was its consumer or dependency) to the new
+    # session_recovery_inspection.py owner and re-exported it the same way.
+    # 3461 -> 1357 -> 582 lines, back under the 800-line default cap --
+    # session_lifecycle.py graduates out of RATCHET_BASELINE. The remaining
+    # SSH-remote-orchestration cluster (start_remote_session,
+    # status_remote_session, start_remote_session_durable,
+    # teardown_remote_session, finalize_remote_session_cleanup_report,
+    # read_remote_session_cleanup_report, detach_remote_session,
+    # publish_owned_session_api_startup_receipt) and cli.py's own
+    # compatibility re-export block are what remain; full slice-by-slice
+    # detail lives in the split/session-lifecycle branch history.
     # split/session-lifecycle slice J (#231): execute_owned_session_start
     # alone is ~910 lines of crash-recovery start logic (systemd containment,
     # broker handoff, resumable-attempt promotion) that does not decompose
@@ -699,6 +588,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # would separate functions that only ever call each other. 22 lines over
     # the 800 default.
     "src/clio_relay/session_cleanup_execution.py": 822,
+    # split/session-lifecycle slice K (#231): inspect_owned_session_recovery_
+    # status is the single dominant read path every recovery/start/teardown
+    # decision in the split verifies against -- durable metadata, process
+    # identity, cluster-registry, and core-admission agreement all have to be
+    # read and cross-checked in one place. It does not decompose along a
+    # clean second seam without restructuring the function itself, out of
+    # scope for a mechanical extraction slice. Matches the
+    # queue_management.py/queue_validation.py precedent of a ratcheted,
+    # justified new-file cap above the 800-line default.
+    "src/clio_relay/session_recovery_inspection.py": 838,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

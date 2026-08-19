@@ -39,6 +39,7 @@ from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
     RemoteMcpServerConfig,
+    cluster_route_revision,
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.core_queue import ClioCoreQueue
@@ -405,7 +406,7 @@ def _owned_session_recovery_fixture(
         "api_release_identity_sha256": release.sha256(),
         "cluster_registry_path": str(registry_path),
         "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "cluster_route_revision": cluster_route_revision(definition),
         "systemd_unit": systemd_unit,
         "systemd_cgroup_path": systemd_cgroup_path,
         "systemd_invocation_id": systemd_invocation_id,
@@ -430,7 +431,7 @@ def _owned_session_recovery_fixture(
         "api_release_identity_sha256": release.sha256(),
         "cluster_registry_path": str(registry_path),
         "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "cluster_route_revision": cluster_route_revision(definition),
         "cluster_authority_verified": True,
         "process_start_ticks": "123456",
         "containment_mode": "linux_systemd_scope",
@@ -477,7 +478,7 @@ def _owned_session_start_request() -> OwnedSessionStartRequest:
         require_token=False,
         cluster_registry=registry.model_dump(mode="json"),
         cluster_registry_sha256=session_lifecycle.hashlib.sha256(payload).hexdigest(),
-        cluster_route_revision=session_lifecycle.cluster_route_revision(definition),
+        cluster_route_revision=cluster_route_revision(definition),
     )
 
 
@@ -2938,7 +2939,7 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
             for target in targets
             if target.name == "cluster-registry-generation-1.json"
         ),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(
+        "cluster_route_revision": cluster_route_revision(
             ClusterDefinition(name="ares", ssh_host="ares")
         ),
         "containment_mode": "linux_systemd_scope",
