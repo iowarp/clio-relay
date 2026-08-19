@@ -954,7 +954,25 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_remote_json_value` (call the monkeypatched `run_remote_clio`) and
     # `_owned_json` / `_validate_owned_job_status` (owned-session-specific,
     # not generic coercion) stayed for exactly that reason.
-    "src/clio_relay/mcp_server.py": 4606,
+    #
+    # split/mcp-server-w3 slice 3 (#231): -453 net lines -- the 43-branch
+    # `_call_tool` dispatcher (the "tool catalog + dispatcher" row's
+    # dispatcher half) moves to mcp_dispatch.py. It calls ~30 business-logic
+    # functions that stay in mcp_server.py (several directly monkeypatched
+    # by tests at `mcp_server_module.<name>`; all of them unimportable at
+    # module scope regardless, since mcp_server.py imports `_call_tool` from
+    # mcp_dispatch.py, which would otherwise be a load-order cycle) -- every
+    # such call goes through a function-scope back-reference
+    # (`_mcp_server.<name>(...)`, imported inside `_call_tool`'s own body
+    # via `from clio_relay import mcp_server as _mcp_server`) so
+    # mcp_server.py's live module namespace, including anything a test has
+    # monkeypatched, is what actually resolves at call time. The #264
+    # relay_list_artifacts/relay_read_artifact cluster-routing dispatch
+    # bodies move with the rest of `_call_tool`, calling
+    # `_mcp_server._job_target`/`_mcp_server._route_revision` (still
+    # resident) the same way relay_artifact_lineage's existing
+    # `_mcp_server._used_artifacts_tool`/`_used_by_tool` calls already do.
+    "src/clio_relay/mcp_server.py": 4153,
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
