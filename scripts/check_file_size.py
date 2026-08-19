@@ -515,7 +515,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # and a WARNING log call at each site. No deletion offsets it -- this is
     # genuinely new structure the owner ruling requires, not a fixable
     # regression. A justified, minimal ratchet-up.
-    "src/clio_relay/remote_mcp.py": 5377,
+    # #231 slice 1 (design doc §4.5/§5): the JSON/JSON-Schema validation
+    # primitives (_validate_json_schema, _require_bounded_json_structure,
+    # _require_finite_json, _bounded_diagnostic, _reject_nonfinite_json_constant,
+    # _NonFiniteJsonError, _JsonSchemaInstanceValidator, the composed/flat
+    # schema-key sets, the per-dialect validator map, and their three bound
+    # constants) moved to the new remote_mcp_schema_validation.py (172 lines,
+    # under DEFAULT_MAX_LINES -- no baseline entry needed). Private helpers
+    # with no external callers, so remote_mcp.py imports them directly rather
+    # than re-exporting. 5377 -> 5255.
+    "src/clio_relay/remote_mcp.py": 5255,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to

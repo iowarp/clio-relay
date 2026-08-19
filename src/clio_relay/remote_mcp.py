@@ -18,25 +18,15 @@ import math
 import os
 import re
 import time
-from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 from filelock import FileLock
-from jsonschema import (
-    Draft3Validator,
-    Draft4Validator,
-    Draft6Validator,
-    Draft7Validator,
-    Draft201909Validator,
-    Draft202012Validator,
-)
-from jsonschema.exceptions import SchemaError
-from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
@@ -64,6 +54,24 @@ from clio_relay.models import (
     McpOperation,
 )
 
+# JSON / JSON-Schema validation primitives moved to
+# remote_mcp_schema_validation.py (#231; design doc §4.5/§5). Imported
+# directly -- these are private helpers with no external callers, so no
+# re-export under the old name is needed here.
+from clio_relay.remote_mcp_schema_validation import (
+    _COMPOSED_SCHEMA_KEYS,
+    _FLAT_SCHEMA_KEYS,
+    _JSON_SCHEMA_VALIDATORS,
+    MAX_REMOTE_MCP_JSON_DEPTH,
+    _bounded_diagnostic,
+    _JsonSchemaInstanceValidator,
+    _NonFiniteJsonError,
+    _reject_nonfinite_json_constant,
+    _require_bounded_json_structure,
+    _require_finite_json,
+    _validate_json_schema,
+)
+
 if TYPE_CHECKING:
     from clio_relay.core_queue import ClioCoreQueue
     from clio_relay.validation_report import LiveValidationReport, ValidationResource
@@ -80,9 +88,10 @@ MAX_REMOTE_MCP_TOOLS_PER_SERVER = 2_048
 MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_PROVENANCE_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES = 1024 * 1024
-MAX_REMOTE_MCP_JSON_DEPTH = 64
-MAX_REMOTE_MCP_JSON_NODES = 100_000
-MAX_REMOTE_MCP_DIAGNOSTIC_CHARS = 4_096
+# MAX_REMOTE_MCP_JSON_DEPTH, MAX_REMOTE_MCP_JSON_NODES, and
+# MAX_REMOTE_MCP_DIAGNOSTIC_CHARS moved to remote_mcp_schema_validation.py
+# (imported above); kept here as bare names via that import for the
+# call sites below that still reference them directly.
 MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS = 8
 MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL = 64
 MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS = 64
@@ -270,55 +279,6 @@ CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
         CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
     ]
 )
-_COMPOSED_SCHEMA_KEYS = {
-    "$dynamicRef",
-    "$recursiveRef",
-    "$ref",
-    "allOf",
-    "anyOf",
-    "else",
-    "if",
-    "oneOf",
-    "not",
-    "then",
-}
-_FLAT_SCHEMA_KEYS = {
-    "$comment",
-    "$defs",
-    "$id",
-    "$schema",
-    "additionalProperties",
-    "default",
-    "definitions",
-    "deprecated",
-    "description",
-    "examples",
-    "properties",
-    "readOnly",
-    "required",
-    "title",
-    "type",
-    "writeOnly",
-}
-_JSON_SCHEMA_VALIDATORS = {
-    str(validator.META_SCHEMA.get("$id") or validator.META_SCHEMA.get("id")).rstrip("#"): validator
-    for validator in (
-        Draft3Validator,
-        Draft4Validator,
-        Draft6Validator,
-        Draft7Validator,
-        Draft201909Validator,
-        Draft202012Validator,
-    )
-}
-_JSON_SCHEMA_VALIDATORS.update(
-    {
-        dialect.replace("http://", "https://", 1): validator
-        for dialect, validator in tuple(_JSON_SCHEMA_VALIDATORS.items())
-        if dialect.startswith("http://")
-    }
-)
-
 VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
     "idempotency_key": {
         "type": "string",
@@ -367,18 +327,6 @@ VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
     },
 }
 VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS = frozenset(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS)
-
-
-class _NonFiniteJsonError(ValueError):
-    """Non-standard NaN or infinity token in a purported JSON artifact."""
-
-
-class _JsonSchemaInstanceValidator(Protocol):
-    """Typed subset of a jsonschema validator used for instance checks."""
-
-    def iter_errors(self, instance: object) -> Iterable[JsonSchemaValidationError]:
-        """Yield every schema violation observed in one JSON-compatible instance."""
-        ...
 
 
 _SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9_]+")
@@ -5146,76 +5094,6 @@ def _relocate_legacy_local_references(
                 nested_resource=nested_resource,
                 root=False,
             )
-
-
-def _validate_json_schema(schema: JSON, *, label: str) -> None:
-    """Reject malformed or unsupported JSON Schema contracts at ingestion."""
-    _require_bounded_json_structure(schema, label=label)
-    declared_dialect = schema.get("$schema")
-    if isinstance(declared_dialect, str):
-        normalized_dialect = declared_dialect.rstrip("#")
-        validator = _JSON_SCHEMA_VALIDATORS.get(normalized_dialect)
-        if validator is None:
-            raise ValueError(f"remote MCP {label} declares an unsupported JSON Schema dialect")
-    else:
-        validator = Draft202012Validator
-    try:
-        validator.check_schema(schema)
-    except RecursionError as exc:
-        raise ValueError(
-            f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_DEPTH} nesting levels"
-        ) from exc
-    except SchemaError as exc:
-        raise ValueError(
-            f"remote MCP {label} is not valid JSON Schema: " + _bounded_diagnostic(exc.message)
-        ) from exc
-
-
-def _require_bounded_json_structure(value: object, *, label: str) -> None:
-    """Bound untrusted JSON before recursive validators or transformations run."""
-    stack: list[tuple[object, int]] = [(value, 0)]
-    node_count = 0
-    while stack:
-        current, depth = stack.pop()
-        node_count += 1
-        if node_count > MAX_REMOTE_MCP_JSON_NODES:
-            raise ValueError(f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_NODES} JSON nodes")
-        if depth > MAX_REMOTE_MCP_JSON_DEPTH:
-            raise ValueError(
-                f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_DEPTH} nesting levels"
-            )
-        if isinstance(current, dict):
-            stack.extend((item, depth + 1) for item in cast(dict[object, object], current).values())
-        elif isinstance(current, list):
-            stack.extend((item, depth + 1) for item in cast(list[object], current))
-
-
-def _require_finite_json(value: object, *, label: str) -> None:
-    """Reject non-finite numbers that cannot round-trip through strict JSON."""
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, float) and not math.isfinite(current):
-            raise ValueError(f"remote MCP {label} contains a non-finite JSON number")
-        if isinstance(current, dict):
-            stack.extend(cast(dict[object, object], current).values())
-        elif isinstance(current, list):
-            stack.extend(cast(list[object], current))
-
-
-def _bounded_diagnostic(value: object) -> str:
-    """Render an untrusted diagnostic without allowing unbounded error output."""
-    rendered = value if isinstance(value, str) else repr(value)
-    if len(rendered) <= MAX_REMOTE_MCP_DIAGNOSTIC_CHARS:
-        return rendered
-    return rendered[:MAX_REMOTE_MCP_DIAGNOSTIC_CHARS] + "... [truncated]"
-
-
-def _reject_nonfinite_json_constant(value: str) -> None:
-    """Reject NaN and infinity tokens accepted by Python's permissive decoder."""
-    raise _NonFiniteJsonError(
-        f"remote MCP discovery artifact contains non-finite JSON token: {value}"
-    )
 
 
 def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:

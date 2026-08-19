@@ -24,7 +24,7 @@ from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.cli as relay_cli
-from clio_relay import remote_cli, remote_mcp
+from clio_relay import remote_cli, remote_mcp, remote_mcp_schema_validation
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -1123,7 +1123,11 @@ def test_remote_mcp_discovery_json_node_count_is_bounded(
     artifact = json.loads(_discovery_artifact(registration, tools=[_tool("inspect")]))
     artifact["server_info"] = {"wide": list(range(200))}
     payload = json.dumps(artifact).encode()
-    monkeypatch.setattr(remote_mcp, "MAX_REMOTE_MCP_JSON_NODES", 100)
+    # MAX_REMOTE_MCP_JSON_NODES is read inside _require_bounded_json_structure,
+    # which now lives in remote_mcp_schema_validation.py (#231) -- patch the
+    # module the guard actually reads its bound from, not remote_mcp's
+    # re-export (moved-symbol patch seam, design doc §4.6).
+    monkeypatch.setattr(remote_mcp_schema_validation, "MAX_REMOTE_MCP_JSON_NODES", 100)
 
     with pytest.raises(ValueError, match="100 JSON nodes"):
         _entry_from_payload(registration, payload)
@@ -1138,7 +1142,8 @@ def test_remote_mcp_protocol_error_diagnostic_is_bounded() -> None:
     with pytest.raises(ValueError) as error:
         _entry_from_payload(registration, payload)
 
-    assert len(str(error.value)) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS + 100
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert len(str(error.value)) <= max_chars + 100
     assert str(error.value).endswith("... [truncated]")
 
 
@@ -4194,7 +4199,8 @@ def test_spack_structured_result_bounds_output_schema_error_evidence() -> None:
     schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
     errors = cast(list[str], schema_evidence["validation_errors"])
     assert len(errors) == remote_mcp.MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS
-    assert all(len(error) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS for error in errors)
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert all(len(error) <= max_chars for error in errors)
     assert schema_evidence["validation_errors_truncated"] is True
 
 
