@@ -97,7 +97,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # real .dynstr (CPython 3.12.13 as shipped by uv) spans two contiguous
     # segments, so the old form found zero candidates and refused every staged
     # upgrade as "ambiguous". Mostly the comments recording that layout.
-    "src/clio_relay/bootstrap.py": 8896,
+    # clio-relay#247/#254: -629 net lines -- receipt-shape/JARVIS-repository-
+    # provenance validation (`_validate_bootstrap_receipt` and its four
+    # helpers) moved to the new owner module bootstrap_receipt_validation.py,
+    # offsetting the #247 state-aware forward-recovery dispatch (delegates to
+    # the new bootstrap_recovery.py) and the #254 jarvis-venv staging guard
+    # and promotion wiring (delegates to the new bootstrap_jarvis_staging.py).
+    # A net ratchet-down even after both fixes' own new call sites.
+    "src/clio_relay/bootstrap.py": 8356,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     "src/clio_relay/bootstrap_journal.py": 1534,
