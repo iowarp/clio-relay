@@ -5,6 +5,15 @@ the ``monitor_app`` commands' extraction into
 ``src/clio_relay/cli_monitor.py``, per ground rule 3 (§2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
+
+**Autouse-fixture parity.** ``test_cli.py`` defines its own module-scoped
+``autouse=True`` ``_default_cli_mode`` fixture (env-var defaults every CLI
+invocation there relies on). None of the commands this file exercises reach
+cluster-passthrough logic, so it is not strictly required today, but it is
+reproduced anyway (the env-var half only, the same precedent
+``tests/test_cli_relay_host.py``'s own ``_default_cli_mode`` established)
+so a future test added here does not silently lose the default -- the trap
+``tests/test_cli_worker.py``'s docstring documents hitting for real.
 """
 
 from __future__ import annotations
@@ -12,12 +21,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 from clio_relay.cli import app
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
+
+
+@pytest.fixture(autouse=True)
+def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mirror ``test_cli.py``'s own autouse fixture's env-var half only."""
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv(
+        "CLIO_RELAY_INSTALL_RECEIPT",
+        str(tmp_path / "relay-state" / "install-receipt.json"),
+    )
 
 
 def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

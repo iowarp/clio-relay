@@ -12,14 +12,25 @@ only caller). It now patches ``cli_api.uvicorn.run``, the module that
 actually calls it post-extraction. Every other patch target
 (``installation_module``, ``session_lifecycle``) already targeted the real
 owner module directly and is unchanged.
+
+**Autouse-fixture parity.** ``test_cli.py`` defines its own module-scoped
+``autouse=True`` ``_default_cli_mode`` fixture (env-var defaults every CLI
+invocation there relies on). The test below never reaches
+cluster-passthrough logic, so it does not strictly need the default, but the
+fixture is reproduced anyway (the env-var half only, the same precedent
+``tests/test_cli_relay_host.py``'s own ``_default_cli_mode`` established)
+so a future test added here does not silently lose it -- the trap
+``tests/test_cli_worker.py``'s docstring documents hitting for real.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
@@ -32,6 +43,18 @@ from tests.test_cli import (
     _installation_identity,
     _session_api_release_identity,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mirror ``test_cli.py``'s own autouse fixture's env-var half only."""
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv(
+        "CLIO_RELAY_INSTALL_RECEIPT",
+        str(tmp_path / "relay-state" / "install-receipt.json"),
+    )
 
 
 def test_cli_api_start_verifies_process_bound_release_identity(

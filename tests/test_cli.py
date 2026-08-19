@@ -1828,31 +1828,6 @@ def test_cli_queue_validation_writes_canonical_report(
     assert report["cleanup"]["cancel_scheduler_jobs"] is False
 
 
-def test_cli_worker_status_reports_registered_capacity(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    queue.register_endpoint(
-        EndpointRegistration(
-            role=EndpointRole.WORKER,
-            cluster="test-cluster",
-            hostname="node",
-            pid=123,
-            metadata={"concurrency": 3},
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["worker", "status", "--cluster", "test-cluster"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["worker_count"] == 1
-    assert payload["configured_concurrency"] == 3
-
-
 def test_cli_job_submit_can_request_exclusive_scheduler(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

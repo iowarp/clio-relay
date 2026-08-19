@@ -45,6 +45,7 @@ import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
 import clio_relay.cli_storage as cli_storage
 import clio_relay.cli_support as cli_support
+import clio_relay.cli_worker as cli_worker
 import clio_relay.cluster_config as cluster_config
 import clio_relay.core_queue as core_queue
 import clio_relay.deployment as deployment
@@ -175,7 +176,6 @@ from clio_relay.queue_management import (
     diagnose_job,
     discover_stale_jobs,
     list_queue_jobs,
-    worker_status,
 )
 from clio_relay.relay_host import FrpcConfig
 from clio_relay.relay_ops import cancel_job as request_cancel_job
@@ -792,7 +792,6 @@ cluster_app = typer.Typer(no_args_is_help=True)
 session_app = typer.Typer(no_args_is_help=True)
 gateway_app = typer.Typer(no_args_is_help=True)
 queue_app = typer.Typer(no_args_is_help=True)
-worker_app = typer.Typer(no_args_is_help=True)
 scheduler_app = typer.Typer(no_args_is_help=True)
 remote_mcp_app = typer.Typer(no_args_is_help=True)
 release_app = typer.Typer(no_args_is_help=True)
@@ -807,7 +806,7 @@ app.add_typer(cli_api.api_app, name="api")
 app.add_typer(session_app, name="session")
 app.add_typer(gateway_app, name="gateway")
 app.add_typer(queue_app, name="queue")
-app.add_typer(worker_app, name="worker")
+app.add_typer(cli_worker.worker_app, name="worker")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(remote_mcp_app, name="remote-mcp")
 app.add_typer(release_app, name="release")
@@ -8624,23 +8623,6 @@ def queue_validate(
                 artifact=validation_artifact,
             )
         raise
-
-
-@worker_app.command("status")
-def worker_status_command(
-    cluster: Annotated[
-        str | None,
-        typer.Option(help="Configured cluster to inspect over SSH, or local filter in local mode."),
-    ] = None,
-) -> None:
-    """Show registered worker capacity and leases."""
-    args = ["worker", "status"]
-    if cluster is not None:
-        args.extend(["--cluster", cluster])
-    if _try_remote_cluster_passthrough(cluster, args):
-        return
-    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
-    typer.echo(json.dumps(worker_status(queue, cluster=cluster), indent=2))
 
 
 @scheduler_app.command("status")
