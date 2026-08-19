@@ -226,6 +226,8 @@ USER_MCP_TOOL_NAMES = {
     "relay_storage_status",
     "relay_bind_jarvis_runtime",
     "relay_artifact_lineage",
+    "relay_list_artifacts",
+    "relay_read_artifact",
 }
 _REMOTE_JOB_FOLLOWUP_TOOL_NAMES = frozenset(
     {
