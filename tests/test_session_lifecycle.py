@@ -24,10 +24,12 @@ import clio_relay.session_process_scope as session_process_scope
 import clio_relay.session_recovery_attempt_status as session_recovery_attempt_status
 import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
 import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_remote_scripts as session_remote_scripts
 import clio_relay.session_start_attempt_validation as session_start_attempt_validation
 import clio_relay.session_start_wait as session_start_wait
 import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
+import clio_relay.session_wire_models as session_wire_models
 from clio_relay import __version__
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -2269,7 +2271,7 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
     monkeypatch: MonkeyPatch,
 ) -> None:
     definition, release, plan = _durable_start_plan()
-    rejection = session_lifecycle.OwnedSessionStartRejection(
+    rejection = session_wire_models.OwnedSessionStartRejection(
         cluster=plan.cluster,
         session_id=plan.session_id,
         start_operation_id=plan.start_operation_id,
@@ -2329,7 +2331,7 @@ def test_unstructured_ssh_nonzero_is_ambiguous_not_terminal(
         session_remote_command._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         match="without an exact structured response",
     ):
-        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true\n",
         )
@@ -4160,7 +4162,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
     assert len(" ".join(command).encode("utf-8")) < 64 * 1024
     assert observed["stdout_limit"] == 1024 * 1024
     with pytest.raises(RelayError, match="stdin exceeds"):
-        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true",
             input_bytes=b"oversized",
@@ -4362,7 +4364,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
         scripts.append(script)
         return _durable_start_receipt(plan).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     receipt = start_remote_session(
         cluster="ares",
@@ -4413,7 +4415,7 @@ def test_start_remote_session_rejects_legacy_key_value_output(monkeypatch: Monke
         )
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_remote_scripts,
         "_ssh_script",
         fake_ssh,
     )
@@ -4449,7 +4451,7 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
         expected_api_release_identity_sha256=release.sha256(),
     )
     scripts = (
-        session_lifecycle._start_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._start_script(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             definition=definition,
             session_id="session-pinned",
@@ -4461,29 +4463,29 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
             replace=False,
             expected_cluster_route_revision=plan.cluster_route_revision,
         ),
-        session_lifecycle._owned_status_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_status_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             cluster="ares",
             session_id="session-pinned",
         ),
-        session_lifecycle._owned_start_status_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_start_status_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             selector=plan.status_selector,
         ),
-        session_lifecycle._owned_identity_challenge_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_identity_challenge_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             cluster="ares",
             session_id="session-pinned",
             session_generation_id="generation-pinned",
             nonce="1" * 64,
         ),
-        session_lifecycle._owned_cleanup_finalize_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_cleanup_finalize_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
         ),
-        session_lifecycle._owned_cleanup_report_read_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_cleanup_report_read_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
         ),
-        session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             session_id="session-pinned",
             expected_session_generation_id="generation-pinned",
@@ -4519,7 +4521,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
         scripts.append(script)
         return _durable_start_receipt(plan, outcome="already_running").model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="ares",
@@ -4569,7 +4571,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
         scripts.append(script)
         return _durable_start_receipt(plan).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="alpha",
@@ -4596,7 +4598,7 @@ def test_start_remote_session_rejects_registry_over_configuration_limit(
         del args, kwargs
         pytest.fail("oversized session authority must fail before SSH")
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", unexpected_run)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", unexpected_run)
     registration = RemoteMcpServerConfig(
         command="science-mcp",
         args=["x" * 4_000 for _ in range(256)],
@@ -4629,7 +4631,7 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
         scripts.append(script)
         return json.dumps({"session_id": "session-1", "running": True})
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     status = status_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4666,7 +4668,7 @@ def test_status_remote_session_marks_pre_start_cleanup_probe_explicitly(
             errors=["owned session transition is not currently observable"],
         ).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     status = status_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4699,7 +4701,7 @@ def test_remote_session_start_status_uses_cluster_environment(
         scripts.append(script)
         return expected.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     observed = session_lifecycle.status_remote_session_start(
         definition=definition,
@@ -4737,7 +4739,7 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
         scripts.append(script)
         return json.dumps(expected)
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     observed = challenge_remote_session_identity(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4765,7 +4767,7 @@ def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) ->
     def timed_out(
         *_args: object, **_kwargs: object
     ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        raise session_lifecycle._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "bounded command timed out after 120 seconds"
         )
 
@@ -4802,7 +4804,7 @@ def test_absent_relay_executable_is_typed_rather_than_ambiguous(
     monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError) as captured:
-        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(
                 name="ares",
                 ssh_host="ares",
@@ -4937,7 +4939,7 @@ def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch
     monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError) as captured:
-        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(
                 name="ares",
                 ssh_host="ares",
@@ -4956,7 +4958,7 @@ def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch
 def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> None:
     """The transport deadline must be discriminable by type, never by message text."""
     assert issubclass(
-        session_lifecycle._BoundedCommandTimeout,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_command._BoundedCommandTimeout,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         RelayError,
     )
 
@@ -4967,12 +4969,12 @@ def test_typed_bounded_timeout_routes_to_the_session_deadline(monkeypatch: Monke
     def timed_out(
         *_args: object, **_kwargs: object
     ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        raise session_lifecycle._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     monkeypatch.setattr(session_remote_command, "_run_bounded_command", timed_out)
 
     with pytest.raises(session_remote_command._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true",
         )
@@ -4995,7 +4997,7 @@ def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
     monkeypatch.setattr(session_remote_command, "_run_bounded_command", failed)
 
     with pytest.raises(RelayError) as captured:
-        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true",
         )
@@ -5279,7 +5281,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
             }
         )
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     report = teardown_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -5312,7 +5314,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
 
 
 def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
-    script = session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    script = session_remote_scripts._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         session_id="session-1",
         expected_session_generation_id="generation-1",
@@ -5351,7 +5353,7 @@ def test_start_watch_is_one_bounded_server_side_wait_not_a_redial_loop(
         timeouts.append(timeout_seconds)
         return ready.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     result = session_lifecycle.watch_remote_session_start(
         definition=definition,
@@ -5383,7 +5385,7 @@ def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch
         scripts.append(script)
         return pending.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     result = session_lifecycle.watch_remote_session_start(
         definition=definition,
@@ -5455,7 +5457,7 @@ def test_default_cli_start_watch_costs_exactly_one_remote_command(
         scripts.append(script)
         return pending.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     result = session_lifecycle.watch_remote_session_start(
         definition=definition,

@@ -67,11 +67,15 @@ from clio_relay.validation_report import SoftwareIdentity, ValidationResource
 # session_recovery_cleanup_receipt.py / session_recovery_cleaned_receipt.py,
 # which import it directly from session_wire_models -- ruff's F401 confirmed
 # it, same reasoning as RemoteSession above.
+#
+# OwnedSessionStartRejection stopped being re-exported in the same rework:
+# its only session_lifecycle.py consumer, _ssh_script's rejection-response
+# parsing, moved to session_remote_scripts.py, which imports it directly
+# from session_wire_models.
 _MOVED_SYMBOLS = [
     "SessionApiReleaseIdentity",
     "OwnedSessionInputPolicy",
     "OwnedSessionStartRequest",
-    "OwnedSessionStartRejection",
     "OwnedSessionStartStatusSelector",
     "OwnedSessionStartRetrySelector",
     "OwnedSessionTeardownRequest",

@@ -614,7 +614,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # back into by anything in this module. cli.py's only touch is a
     # one-line import repoint for the bare-imported
     # wait_owned_session_start_status. 4230 -> 4125.
-    "src/clio_relay/session_lifecycle.py": 4125,
+    # split/session-lifecycle slice H: the cluster-local SSH script generators
+    # for every owned-session subcommand plus the two SSH transport wrappers
+    # (_ssh_script, _ssh_stdin_command) and the dead-executable-pin refusal
+    # they share moved to the new session_remote_scripts.py owner (372
+    # lines) -- a pure, one-directional dependent of session_remote_command.py;
+    # nothing calls back into it. Two wire models (OwnedSessionStartRejection,
+    # already-noted OwnedSessionCleanupTarget's sibling) stopped being
+    # re-exported since their only session_lifecycle.py consumer moved;
+    # cli.py's only touch is a one-line import repoint for the bare-imported
+    # OwnedSessionStartRejection. 4125 -> 3801.
+    "src/clio_relay/session_lifecycle.py": 3801,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
