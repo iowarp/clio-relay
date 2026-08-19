@@ -624,7 +624,34 @@ RATCHET_BASELINE: dict[str, int] = {
     # re-exported since their only session_lifecycle.py consumer moved;
     # cli.py's only touch is a one-line import repoint for the bare-imported
     # OwnedSessionStartRejection. 4125 -> 3801.
-    "src/clio_relay/session_lifecycle.py": 3801,
+    # split\session-lifecycle slice I: the remote start planning/status/query/
+    # watch/challenge cluster (plan_remote_session_start,
+    # status_remote_session_start, _owned_session_start_result,
+    # _session_start_result_from_status, query_remote_session_start,
+    # watch_remote_session_start, challenge_remote_session_identity, plus the
+    # three module-level wait/timeout-margin constants) moved to the new
+    # session_start_query.py owner (409 lines) -- a one-directional dependent
+    # on session_remote_scripts.py, session_remote_command.py, and
+    # inspect_owned_session_recovery_status (still resident); nothing calls
+    # back into it. This slice hit the cli.py ratchet: repointing cli.py's
+    # bare imports for plan_remote_session_start, query_remote_session_start,
+    # watch_remote_session_start (moved here), wait_owned_session_start_status
+    # (session_start_wait.py, slice G) and cleanup_connectors_cover_gateways
+    # (session_lifecycle_report.py, slice D) to their real new homes is a net
+    # +2 LOC there (five single-purpose `from module import name` statements
+    # cannot collapse into fewer lines than the names removed from the old
+    # consolidated block) and would regress cli.py's own 18849 baseline.
+    # cli.py is another agent's active split-in-progress territory with its
+    # own ratchet, so instead of touching it, session_lifecycle.py re-exports
+    # those five names (plus OwnedSessionStartRejection, already-noted from
+    # slice H) under a clearly-commented "cli.py compatibility re-exports"
+    # header -- the one deliberate compatibility-shim exception in this
+    # split, scoped to cli.py's bare imports only; every other consumer
+    # (this module's own internal calls, tests, transport_probe.py) is
+    # repointed to the real owner module, and the shim is deleted the moment
+    # cli.py's own split lands and can absorb the one-line repoint itself.
+    # 3801 -> 3461.
+    "src/clio_relay/session_lifecycle.py": 3461,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

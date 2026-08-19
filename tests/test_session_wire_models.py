@@ -72,12 +72,16 @@ from clio_relay.validation_report import SoftwareIdentity, ValidationResource
 # its only session_lifecycle.py consumer, _ssh_script's rejection-response
 # parsing, moved to session_remote_scripts.py, which imports it directly
 # from session_wire_models.
+#
+# OwnedSessionStartStatusSelector and OwnedSessionStartRetrySelector stopped
+# being re-exported once plan_remote_session_start, status_remote_session_start,
+# query_remote_session_start, and watch_remote_session_start (their only
+# session_lifecycle.py consumers) moved to session_start_query.py, which
+# imports both directly from session_wire_models.
 _MOVED_SYMBOLS = [
     "SessionApiReleaseIdentity",
     "OwnedSessionInputPolicy",
     "OwnedSessionStartRequest",
-    "OwnedSessionStartStatusSelector",
-    "OwnedSessionStartRetrySelector",
     "OwnedSessionTeardownRequest",
     "OwnedSessionIdentityChallengeRequest",
     "CleanupResource",

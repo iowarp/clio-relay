@@ -43,6 +43,7 @@ import clio_relay.service_runtime as service_runtime
 import clio_relay.session_api as session_api
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_lifecycle_report as session_lifecycle_report
+import clio_relay.session_start_query as session_start_query
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
@@ -4585,7 +4586,7 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
             start_input_policy=plan.input_policy,
             start_expected_api_release_identity_sha256=release.sha256(),
         )
-        return session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             plan=plan,
             status=status,
             transport_deadline_exceeded=True,

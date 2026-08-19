@@ -26,6 +26,7 @@ import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_r
 import clio_relay.session_remote_command as session_remote_command
 import clio_relay.session_remote_scripts as session_remote_scripts
 import clio_relay.session_start_attempt_validation as session_start_attempt_validation
+import clio_relay.session_start_query as session_start_query
 import clio_relay.session_start_wait as session_start_wait
 import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
@@ -53,7 +54,6 @@ from clio_relay.session_lifecycle import (
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
-    challenge_remote_session_identity,
     detach_remote_session,
     execute_owned_session_cleanup_finalize,
     execute_owned_session_cleanup_report_read,
@@ -70,6 +70,7 @@ from clio_relay.session_lifecycle_report import (
     SESSION_SCHEDULER_CANCELED_CHECK_ID,
     SESSION_WORKER_CHECK_ID,
 )
+from clio_relay.session_start_query import challenge_remote_session_identity
 from clio_relay.session_wire_models import OwnedSessionCleanupTarget
 
 
@@ -698,7 +699,7 @@ def _durable_start_plan() -> tuple[
 ]:
     definition = ClusterDefinition(name="ares", ssh_host="ares")
     release = _api_release_identity()
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-start",
@@ -2014,7 +2015,7 @@ def test_durable_start_deadline_observes_late_ready_transition(
         return _durable_start_status(plan, state="ready")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         ready_status,
     )
@@ -2046,7 +2047,7 @@ def test_typed_start_receipt_must_bind_exact_remote_port(
         raise RelayError("status unavailable")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         unavailable,
     )
@@ -2077,7 +2078,7 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
         observations += 1
         return _durable_start_status(plan, state="starting")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", observe)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", observe)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -2100,12 +2101,12 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
     definition, _release, plan = _durable_start_plan()
     observations = iter(
         (
-            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 plan=plan,
                 status=_durable_start_status(plan, state="starting"),
                 transport_deadline_exceeded=False,
             ),
-            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 plan=plan,
                 status=_durable_start_status(plan, state="ready"),
                 transport_deadline_exceeded=False,
@@ -2114,7 +2115,7 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
     )
     sleeps: list[float] = []
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=10.0,
@@ -2130,14 +2131,14 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
 
 def test_start_watch_detaches_with_exact_unusable_handle() -> None:
     definition, _release, plan = _durable_start_plan()
-    pending = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    pending = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=_durable_start_status(plan, state="starting"),
         transport_deadline_exceeded=False,
     )
     moments = iter((0.0, 2.0))
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=1.0,
@@ -2250,7 +2251,7 @@ def test_durable_start_status_transport_failure_is_ambiguous(
     def unavailable(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise RelayError("status transport unavailable")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unavailable)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", unavailable)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -2287,7 +2288,7 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
     def locked(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise RelayError("owned session transition lock is held")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", locked)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", locked)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -2351,7 +2352,7 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
         return _durable_start_status(plan, state="failed")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         failed_status,
     )
@@ -2376,7 +2377,7 @@ def test_completed_ready_operation_stays_terminal_after_api_exit() -> None:
         update={"leader_process_state": "absent", "running": False}
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -2400,7 +2401,7 @@ def test_completed_ready_operation_reports_api_down_when_only_child_remains() ->
         }
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -2415,7 +2416,7 @@ def test_completed_ready_operation_reports_api_down_when_only_child_remains() ->
 def test_superseded_start_selector_is_terminal_not_current() -> None:
     _definition, _release, plan = _durable_start_plan()
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=_durable_start_status(plan, state="not_current"),
         transport_deadline_exceeded=False,
@@ -2433,7 +2434,7 @@ def test_start_selector_intent_drift_is_terminally_refused() -> None:
         update={"remote_api_port": plan.remote_api_port + 1}
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -4350,7 +4351,7 @@ def test_scheduler_cancellation_evidence_accepts_a_linked_gateway_cleanup() -> N
 def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyPatch) -> None:
     scripts: list[str] = []
     definition = ClusterDefinition(name="ares", ssh_host="ares")
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-1",
@@ -4440,7 +4441,7 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
         relay_executable=pinned,
     )
     release = _api_release_identity()
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-pinned",
@@ -4507,7 +4508,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
 ) -> None:
     scripts: list[str] = []
     definition = ClusterDefinition(name="ares", ssh_host="ares")
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-1",
@@ -4557,7 +4558,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
         ssh_host="alpha",
         remote_mcp_servers={"science": registration},
     )
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="alpha",
         definition=definition,
         session_id="session-1",
@@ -4703,7 +4704,7 @@ def test_remote_session_start_status_uses_cluster_environment(
 
     monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    observed = session_lifecycle.status_remote_session_start(
+    observed = session_start_query.status_remote_session_start(
         definition=definition,
         selector=plan.status_selector,
     )
@@ -4840,7 +4841,7 @@ def test_durable_start_resolves_transport_ambiguity_instead_of_escaping(
     def ready_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         return _durable_start_status(plan, state="ready")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", ready_status)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", ready_status)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -4875,7 +4876,7 @@ def test_durable_start_never_launders_a_dead_pointer_into_starting(
     def unexpected_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise AssertionError("a dead pointer must not be polled as a live session")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unexpected_status)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", unexpected_status)
 
     with pytest.raises(RemoteExecutableMissingError):
         session_lifecycle.start_remote_session_durable(
@@ -4917,7 +4918,7 @@ def test_poll_path_never_launders_a_dead_pointer_into_starting(
     monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
 
     with pytest.raises(RemoteExecutableMissingError):
-        session_lifecycle.query_remote_session_start(definition=definition, plan=plan)
+        session_start_query.query_remote_session_start(definition=definition, plan=plan)
 
 
 def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch) -> None:
@@ -5355,7 +5356,7 @@ def test_start_watch_is_one_bounded_server_side_wait_not_a_redial_loop(
 
     monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=45.0,
@@ -5387,7 +5388,7 @@ def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch
 
     monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=600.0,
@@ -5398,7 +5399,8 @@ def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch
     assert result.watch_deadline_exceeded is True
     assert len(scripts) == 1
     assert (
-        f"--wait-seconds {session_lifecycle.MAX_REMOTE_SESSION_START_WAIT_SECONDS:g}" in scripts[0]
+        f"--wait-seconds {session_start_query.MAX_REMOTE_SESSION_START_WAIT_SECONDS:g}"
+        in scripts[0]
     )
 
 
@@ -5459,7 +5461,7 @@ def test_default_cli_start_watch_costs_exactly_one_remote_command(
 
     monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=120.0,
