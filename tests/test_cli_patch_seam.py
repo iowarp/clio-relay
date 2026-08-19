@@ -78,6 +78,8 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_monitor": _SRC_ROOT / "cli_monitor.py",
     "cli_agent": _SRC_ROOT / "cli_agent.py",
     "cli_api": _SRC_ROOT / "cli_api.py",
+    "cli_worker": _SRC_ROOT / "cli_worker.py",
+    "cli_release": _SRC_ROOT / "cli_release.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -115,7 +117,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli"),
     ("session_lifecycle", "read_remote_session_cleanup_report", "cli"),
     ("session_lifecycle", "inspect_owned_session_recovery_status", "cli"),
-    ("release_validation", "run_local_release_validation", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_release with the
+    # release command-group extraction (run_local_release_validation's only
+    # cli.py call site was release_validate_local).
+    ("release_validation", "run_local_release_validation", "cli_release"),
     # R8(ii): moved caller cli -> cli_relay_host with the relay-host extraction.
     ("transport_probe", "run_frp_http_probe", "cli_relay_host"),
     ("core_queue", "ClioCoreQueue", "cli"),

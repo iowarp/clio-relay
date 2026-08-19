@@ -43,6 +43,7 @@ import clio_relay.cli_agent as cli_agent
 import clio_relay.cli_api as cli_api
 import clio_relay.cli_monitor as cli_monitor
 import clio_relay.cli_relay_host as cli_relay_host
+import clio_relay.cli_release as cli_release
 import clio_relay.cli_storage as cli_storage
 import clio_relay.cli_support as cli_support
 import clio_relay.cli_worker as cli_worker
@@ -62,7 +63,6 @@ import clio_relay.mcp_stdio_validation as mcp_stdio_validation
 import clio_relay.owner_session_admission as owner_session_admission
 import clio_relay.queue_validation as queue_validation
 import clio_relay.relay_ops as relay_ops
-import clio_relay.release_validation as release_validation
 import clio_relay.remote_cli as remote_cli
 import clio_relay.remote_mcp as remote_mcp
 import clio_relay.scheduler_providers as scheduler_providers
@@ -185,8 +185,6 @@ from clio_relay.relay_ops import (
     read_artifact_bytes,
     read_job_log,
 )
-from clio_relay.release_pins import render_preflight, run_preflight
-from clio_relay.release_validation import LocalReleaseValidationOptions
 from clio_relay.remote_cli import stage_jarvis_yaml, staged_remote_cluster_registry
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
@@ -250,13 +248,10 @@ from clio_relay.validation_report import (
     ValidationStatus,
     default_report_path,
     durably_ensure_validation_directory,
-    evaluate_release_gate,
-    load_release_gate_policy,
     load_validation_report,
     new_live_validation_report,
     redact_sensitive_values,
     sha256_file,
-    write_release_gate_result,
 )
 from clio_relay.worker_concurrency import parse_kind_concurrency_options
 
@@ -794,7 +789,6 @@ gateway_app = typer.Typer(no_args_is_help=True)
 queue_app = typer.Typer(no_args_is_help=True)
 scheduler_app = typer.Typer(no_args_is_help=True)
 remote_mcp_app = typer.Typer(no_args_is_help=True)
-release_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
@@ -809,7 +803,7 @@ app.add_typer(queue_app, name="queue")
 app.add_typer(cli_worker.worker_app, name="worker")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(remote_mcp_app, name="remote-mcp")
-app.add_typer(release_app, name="release")
+app.add_typer(cli_release.release_app, name="release")
 app.add_typer(cli_storage.storage_app, name="storage")
 
 
@@ -878,157 +872,6 @@ def init(
         f"initialized core={settings.core_dir} spool={settings.spool_dir} "
         f"clusters={','.join(sorted(registry.clusters))}"
     )
-
-
-@release_app.command("validate-local")
-@_acceptance_report_command
-def release_validate_local(
-    project_root: Annotated[
-        Path,
-        typer.Option(help="Clean source checkout to validate."),
-    ] = Path("."),
-    report: Annotated[
-        Path | None,
-        typer.Option(help="JSON report path. Defaults under .clio-relay/validation-reports."),
-    ] = None,
-    markdown_report: Annotated[
-        Path | None,
-        typer.Option(help="Optional human-readable Markdown rendering."),
-    ] = None,
-    artifact_dir: Annotated[
-        Path | None,
-        typer.Option(help="Optional empty output directory for wheel and sdist artifacts."),
-    ] = None,
-    prebuilt_artifact_dir: Annotated[
-        Path | None,
-        typer.Option(
-            help=(
-                "Reuse an exact build-once wheel, sdist, and SHA256SUMS directory; "
-                "never build artifacts in this validation run."
-            )
-        ),
-    ] = None,
-) -> None:
-    """Run the complete local release gate and persist evidence on failure."""
-    report_path = report or default_report_path("local")
-    seed_report = new_live_validation_report(
-        scenario="local-release",
-        cluster="local",
-    )
-    validation_report_module.write_validation_report(seed_report, report_path)
-
-    def _run() -> None:
-        try:
-            result = release_validation.run_local_release_validation(
-                LocalReleaseValidationOptions(
-                    project_root=project_root,
-                    report_path=report_path,
-                    markdown_report_path=markdown_report,
-                    artifact_dir=artifact_dir,
-                    prebuilt_artifact_dir=prebuilt_artifact_dir,
-                    report_id=seed_report.report_id,
-                )
-            )
-            current_report = _load_current_acceptance_report(
-                report_path,
-                expected_report_id=seed_report.report_id,
-            )
-            if current_report is None or result.report_id != seed_report.report_id:
-                raise RelayError(
-                    "local release validation did not persist the current invocation report"
-                )
-        except BaseException as exc:
-            current_report = _load_current_acceptance_report(
-                report_path,
-                expected_report_id=seed_report.report_id,
-            )
-            _write_failed_acceptance_report(
-                path=report_path,
-                scenario="local-release",
-                cluster="local",
-                check_id="local-release.completed",
-                summary="complete local release gate",
-                error=exc,
-                launcher=None,
-                install_source=None,
-                artifact=None,
-                partial_report=current_report or seed_report,
-            )
-            typer.echo(f"validation.report={report_path.resolve()}")
-            raise
-        typer.echo(f"validation.status={result.status.value}")
-        typer.echo(f"validation.report={report_path.resolve()}")
-
-    _run_or_exit(_run)
-
-
-@release_app.command("gate")
-def release_gate(
-    policy: Annotated[Path, typer.Option(help="Machine-readable 1.0 release policy.")],
-    report: Annotated[
-        list[Path] | None,
-        typer.Option(help="Validation JSON report. Repeat for multiple reports."),
-    ] = None,
-    report_dir: Annotated[
-        Path | None,
-        typer.Option(help="Directory containing validation JSON reports."),
-    ] = None,
-    output: Annotated[
-        Path | None,
-        typer.Option(help="Optional JSON path for the gate decision."),
-    ] = None,
-    expected_artifact_sha256: Annotated[
-        str | None,
-        typer.Option(
-            help=(
-                "SHA-256 independently computed from the immutable candidate wheel. "
-                "Every non-local report used by the gate must match it."
-            )
-        ),
-    ] = None,
-) -> None:
-    """Reject a release unless every policy requirement has released-artifact evidence."""
-
-    def _run() -> None:
-        report_paths = list(report or [])
-        if report_dir is not None:
-            report_paths.extend(sorted(report_dir.glob("*.json")))
-        unique_paths = list(dict.fromkeys(path.resolve() for path in report_paths))
-        if not unique_paths:
-            raise ConfigurationError("release gate requires --report or --report-dir")
-        gate_policy = load_release_gate_policy(policy)
-        reports = [load_validation_report(path) for path in unique_paths]
-        result = evaluate_release_gate(
-            gate_policy,
-            reports,
-            expected_artifact_sha256=expected_artifact_sha256,
-        )
-        if output is not None:
-            write_release_gate_result(result, output)
-        typer.echo(result.model_dump_json(indent=2))
-        if not result.passed:
-            raise typer.Exit(code=1)
-
-    _run_or_exit(_run)
-
-
-@release_app.command("preflight")
-def release_preflight(
-    project_root: Annotated[
-        Path,
-        typer.Option(help="Clean source checkout to check."),
-    ] = Path("."),
-) -> None:
-    """Verify every release-identity pin agrees (clio-relay#198's fast local check)."""
-
-    def _run() -> None:
-        result = run_preflight(project_root)
-        for line in render_preflight(result):
-            typer.echo(line)
-        if not result.passed:
-            raise typer.Exit(code=1)
-
-    _run_or_exit(_run)
 
 
 @endpoint_app.command("start")

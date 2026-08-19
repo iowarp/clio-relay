@@ -6030,38 +6030,6 @@ def test_failed_acceptance_report_overwrites_passed_partial_and_is_idempotent(
     assert json.loads(report_path.read_text(encoding="utf-8")) == failed_once
 
 
-def test_release_validate_local_replaces_stale_success_on_preflight_failure(
-    tmp_path: Path,
-) -> None:
-    report_path = tmp_path / "local-release.json"
-    stale_report_id = _write_passing_validation_report(
-        report_path,
-        scenario="local-release",
-        cluster="local",
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "release",
-            "validate-local",
-            "--project-root",
-            str(tmp_path / "missing-checkout"),
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    current = LiveValidationReport.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert current.report_id != stale_report_id
-    assert current.scenario == "local-release"
-    assert current.cluster == "local"
-    assert current.status.value == "failed"
-    assert current.checks[-1].check_id == "local-release.completed"
-    assert "has no pyproject.toml" in (current.error or "")
-
-
 def test_live_test_replaces_stale_success_when_secret_resolution_fails(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
