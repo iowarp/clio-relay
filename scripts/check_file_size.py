@@ -946,7 +946,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # authorization call sites and re-exports two of them so `cli.py` /
     # `fastmcp_server.py` / `mcp_stdio_validation.py` keep importing from
     # `clio_relay.mcp_server` unchanged.
-    "src/clio_relay/mcp_server.py": 4866,
+    #
+    # split/mcp-server-w3 slice 2 (#231): the ~25 pure MCP tool-argument
+    # coercion/validation helpers left in the file once the catalog moved
+    # move to mcp_arguments.py. None of them call an imported name any test
+    # monkeypatches (confirmed by grep before the move); `_remote_json` /
+    # `_remote_json_value` (call the monkeypatched `run_remote_clio`) and
+    # `_owned_json` / `_validate_owned_job_status` (owned-session-specific,
+    # not generic coercion) stayed for exactly that reason.
+    "src/clio_relay/mcp_server.py": 4606,
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
