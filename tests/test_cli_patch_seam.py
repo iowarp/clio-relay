@@ -81,6 +81,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_worker": _SRC_ROOT / "cli_worker.py",
     "cli_release": _SRC_ROOT / "cli_release.py",
     "cli_endpoint": _SRC_ROOT / "cli_endpoint.py",
+    "cli_scheduler": _SRC_ROOT / "cli_scheduler.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -161,14 +162,18 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("deployment", "restart_endpoint_user_service_over_ssh", "cli"),
     ("relay_ops", "job_status", "cli"),
     ("cluster_config", "acquire_private_configuration_windows_parent_guard", "cli"),
-    ("scheduler_providers", "allocation_connector_provider_for_scheduler", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_scheduler with the
+    # scheduler command-group extraction (every call site was inside it).
+    ("scheduler_providers", "allocation_connector_provider_for_scheduler", "cli_scheduler"),
     ("bootstrap_acceptance", "bootstrap_reuse_acceptance_evidence", "cli"),
     ("remote_mcp", "build_remote_mcp_acceptance_report", "cli"),
     ("jarvis_mcp", "jarvis_mcp_server", "cli"),
     ("remote_cli", "remove_remote_file", "cli"),
     ("queue_validation", "run_queue_management_validation", "cli"),
     ("remote_cli", "run_remote_shell", "cli"),
-    ("scheduler_validation", "run_scheduler_lifecycle_validation", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_scheduler (its only
+    # call site was scheduler_validate_lifecycle).
+    ("scheduler_validation", "run_scheduler_lifecycle_validation", "cli_scheduler"),
     ("remote_cli", "write_remote_file", "cli"),
 )
 

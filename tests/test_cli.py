@@ -5131,32 +5131,6 @@ def test_cli_jarvis_mcp_preflight_failure_writes_canonical_report(
     assert report["checks"][-1]["check_id"] == "jarvis-mcp.preflight"
 
 
-def test_cli_scheduler_preflight_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
-    report_path = tmp_path / "scheduler-preflight-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "validate-lifecycle",
-            "--cluster",
-            "missing",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code != 0
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "scheduler.preflight"
-
-
 @pytest.mark.parametrize(
     ("command", "report_option", "check_id"),
     [
@@ -6926,56 +6900,6 @@ def test_scheduler_phase_batch_uses_one_remote_command(
         ("slurm", "101"): ("completed", None),
         ("slurm", "102"): ("running", None),
     }
-
-
-def test_scheduler_status_batch_command_returns_each_exact_identity(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="configured-target", scheduler_provider="slurm")
-
-    def poll(scheduler_job_id: str) -> SchedulerStatus:
-        return SchedulerStatus(
-            scheduler="slurm",
-            scheduler_job_id=scheduler_job_id,
-            phase=(
-                SchedulerPhase.COMPLETED if scheduler_job_id == "101" else SchedulerPhase.RUNNING
-            ),
-            record_found=True,
-            active_record_found=scheduler_job_id != "101",
-        )
-
-    scheduler = SimpleNamespace(poll=poll)
-
-    def resolve_provider(_provider: str) -> Any:
-        return scheduler
-
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", resolve_provider)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "status-batch",
-            "--cluster",
-            "configured-target",
-            "--provider",
-            "slurm",
-            "--scheduler-job-id",
-            "101",
-            "--scheduler-job-id",
-            "102",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["schema_version"] == "clio-relay.scheduler-status-batch.v1"
-    assert [status["scheduler_job_id"] for status in payload["statuses"]] == [
-        "101",
-        "102",
-    ]
 
 
 @pytest.mark.parametrize(
