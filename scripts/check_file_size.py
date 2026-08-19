@@ -524,7 +524,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # under DEFAULT_MAX_LINES -- no baseline entry needed). Private helpers
     # with no external callers, so remote_mcp.py imports them directly rather
     # than re-exporting. 5377 -> 5255.
-    "src/clio_relay/remote_mcp.py": 5255,
+    # #231 slice 2: RemoteMcpToolSchema, RemoteMcpDiscoveryProvenance,
+    # is_remote_mcp_control_query, _parse_remote_tool, and the identity/
+    # verification helpers (_is_sha256, _server_artifact_verified,
+    # _immutable_remote_mcp_install_verified, _stable_digest) moved to the new
+    # remote_mcp_tool_schema.py (222 lines, under DEFAULT_MAX_LINES). The
+    # first three are re-exported under their original names (external
+    # importers across several modules and tests); the rest are private with
+    # no callers outside remote_mcp.py. 5255 -> 5099.
+    "src/clio_relay/remote_mcp.py": 5099,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to

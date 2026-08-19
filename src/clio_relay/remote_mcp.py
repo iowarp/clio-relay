@@ -72,6 +72,25 @@ from clio_relay.remote_mcp_schema_validation import (
     _validate_json_schema,
 )
 
+# Tool schema, discovery provenance, and identity-verification primitives
+# moved to remote_mcp_tool_schema.py (#231; design doc §4.5/§5).
+# RemoteMcpToolSchema, RemoteMcpDiscoveryProvenance, and
+# is_remote_mcp_control_query are re-exported under their original names --
+# several other modules and tests import them directly from
+# clio_relay.remote_mcp. The rest are private helpers with no callers
+# outside remote_mcp.py, imported directly with no re-export needed.
+from clio_relay.remote_mcp_tool_schema import (
+    REMOTE_MCP_CACHE_SOURCE,
+    RemoteMcpDiscoveryProvenance,
+    RemoteMcpToolSchema,
+    _immutable_remote_mcp_install_verified,
+    _is_sha256,
+    _parse_remote_tool,
+    _server_artifact_verified,
+    _stable_digest,
+    is_remote_mcp_control_query,
+)
+
 if TYPE_CHECKING:
     from clio_relay.core_queue import ClioCoreQueue
     from clio_relay.validation_report import LiveValidationReport, ValidationResource
@@ -80,13 +99,14 @@ JSON = dict[str, Any]
 MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 600
 REMOTE_MCP_CACHE_ENV = "CLIO_RELAY_REMOTE_MCP_CACHE"
 REMOTE_MCP_CACHE_VERSION = 1
-REMOTE_MCP_CACHE_SOURCE = "durable_relay_mcp_tools_list"
+# REMOTE_MCP_CACHE_SOURCE, MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES, and
+# MAX_REMOTE_MCP_PROVENANCE_BYTES moved to remote_mcp_tool_schema.py
+# (imported above) -- REMOTE_MCP_CACHE_SOURCE is read here too (the catalog
+# freshness check below), so it is imported rather than duplicated.
 MAX_REMOTE_MCP_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REMOTE_MCP_DISCOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_REMOTE_MCP_CACHE_ENTRIES = 1_024
 MAX_REMOTE_MCP_TOOLS_PER_SERVER = 2_048
-MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES = 1024 * 1024
-MAX_REMOTE_MCP_PROVENANCE_BYTES = 1024 * 1024
 MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES = 1024 * 1024
 # MAX_REMOTE_MCP_JSON_DEPTH, MAX_REMOTE_MCP_JSON_NODES, and
 # MAX_REMOTE_MCP_DIAGNOSTIC_CHARS moved to remote_mcp_schema_validation.py
@@ -464,102 +484,6 @@ def virtual_jarvis_job_output_schema(
             "maxItems": 4_096,
         }
     return output_schema
-
-
-class RemoteMcpToolSchema(BaseModel):
-    """Validated tool contract returned by a remote MCP ``tools/list`` call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(max_length=512)
-    title: str | None = Field(default=None, max_length=4_096)
-    description: str | None = Field(default=None, max_length=65_536)
-    input_schema: JSON
-    output_schema: JSON | None = None
-    annotations: JSON | None = None
-
-    @field_validator("name")
-    @classmethod
-    def _name_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("remote MCP tool name must not be blank")
-        return value
-
-    @model_validator(mode="after")
-    def _schema_must_be_bounded(self) -> RemoteMcpToolSchema:
-        _require_bounded_json_structure(self.input_schema, label="inputSchema")
-        _require_finite_json(self.input_schema, label="inputSchema")
-        _validate_json_schema(self.input_schema, label="inputSchema")
-        if self.output_schema is not None:
-            _require_bounded_json_structure(self.output_schema, label="outputSchema")
-            _require_finite_json(self.output_schema, label="outputSchema")
-            _validate_json_schema(self.output_schema, label="outputSchema")
-        if self.annotations is not None:
-            _require_bounded_json_structure(self.annotations, label="annotations")
-            _require_finite_json(self.annotations, label="annotations")
-        payload = json.dumps(
-            self.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES:
-            raise ValueError(
-                f"remote MCP tool schema exceeds {MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES} bytes"
-            )
-        return self
-
-
-def is_remote_mcp_control_query(tool: RemoteMcpToolSchema) -> bool:
-    """Return whether discovery explicitly classifies a tool as a safe query.
-
-    MCP annotations are advisory server claims, so this predicate is only one
-    input to admission. Callers must additionally bind the invocation to the
-    registered route and exact discovered server artifact before assigning the
-    reserved control-query class.
-    """
-    annotations = tool.annotations
-    return bool(
-        annotations is not None
-        and annotations.get("readOnlyHint") is True
-        and annotations.get("destructiveHint") is False
-    )
-
-
-class RemoteMcpDiscoveryProvenance(BaseModel):
-    """Durable evidence associated with one cached remote discovery."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    source: str = REMOTE_MCP_CACHE_SOURCE
-    discovery_job_id: str
-    artifact_id: str
-    artifact_sha256: str
-    protocol_version: str | None = None
-    server_info: JSON = Field(default_factory=dict)
-    server_artifact: JSON = Field(default_factory=dict)
-
-    @field_validator("artifact_sha256")
-    @classmethod
-    def _artifact_digest_must_be_sha256(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
-            raise ValueError("remote MCP discovery artifact SHA-256 must be 64 hex characters")
-        return normalized
-
-    @model_validator(mode="after")
-    def _provenance_must_be_bounded(self) -> RemoteMcpDiscoveryProvenance:
-        _require_bounded_json_structure(self.server_info, label="server_info")
-        _require_bounded_json_structure(self.server_artifact, label="server_artifact")
-        payload = json.dumps(
-            self.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_REMOTE_MCP_PROVENANCE_BYTES:
-            raise ValueError(
-                f"remote MCP provenance exceeds {MAX_REMOTE_MCP_PROVENANCE_BYTES} bytes"
-            )
-        return self
 
 
 class RemoteMcpSchemaCacheEntry(BaseModel):
@@ -5096,38 +5020,6 @@ def _relocate_legacy_local_references(
             )
 
 
-def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:
-    if not isinstance(value, dict):
-        raise ValueError("remote MCP tools/list entries must be objects")
-    tool = cast(JSON, value)
-    name = tool.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("remote MCP tool name must be a non-empty string")
-    input_schema = tool.get("inputSchema")
-    if not isinstance(input_schema, dict):
-        raise ValueError(f"remote MCP tool {name} inputSchema must be an object")
-    title = tool.get("title")
-    description = tool.get("description")
-    output_schema = tool.get("outputSchema")
-    annotations = tool.get("annotations")
-    if title is not None and not isinstance(title, str):
-        raise ValueError(f"remote MCP tool {name} title must be a string")
-    if description is not None and not isinstance(description, str):
-        raise ValueError(f"remote MCP tool {name} description must be a string")
-    if output_schema is not None and not isinstance(output_schema, dict):
-        raise ValueError(f"remote MCP tool {name} outputSchema must be an object")
-    if annotations is not None and not isinstance(annotations, dict):
-        raise ValueError(f"remote MCP tool {name} annotations must be an object")
-    return RemoteMcpToolSchema(
-        name=name,
-        title=title,
-        description=description,
-        input_schema=cast(JSON, input_schema),
-        output_schema=cast(JSON | None, output_schema),
-        annotations=cast(JSON | None, annotations),
-    )
-
-
 def _assign_aliases(
     grouped: dict[str, list[_Candidate]],
     *,
@@ -5205,51 +5097,3 @@ def _safe_name(value: str) -> str:
     if normalized:
         return normalized
     return f"unnamed_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:10]}"
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value.lower())
-    )
-
-
-def _server_artifact_verified(server_artifact: JSON) -> bool:
-    return (
-        server_artifact.get("verified") is True
-        and server_artifact.get("server_process_artifact_verified") is True
-        and isinstance(server_artifact.get("executable"), dict)
-    )
-
-
-def _immutable_remote_mcp_install_verified(server_artifact: JSON) -> bool:
-    """Accept immutable wheel launches and wheel-backed persistent uv tools."""
-    install_source = server_artifact.get("install_source")
-    if install_source == "wheel":
-        return True
-    if install_source != "uv-tool":
-        return False
-    install_spec = server_artifact.get("install_spec")
-    python_runtime = server_artifact.get("python_distribution_runtime")
-    if (
-        not isinstance(install_spec, str)
-        or not install_spec.lower().endswith(".whl")
-        or not isinstance(python_runtime, dict)
-        or cast(JSON, python_runtime).get("runtime_closure_verified") is not True
-    ):
-        return False
-    if server_artifact.get("nested_launcher") is not True:
-        return True
-    nested_runtime = server_artifact.get("nested_runtime")
-    return (
-        isinstance(nested_runtime, dict)
-        and cast(JSON, nested_runtime).get("persistent_tool") is True
-        and cast(JSON, nested_runtime).get("locked_runtime_verified") is True
-    )
-
-
-def _stable_digest(value: JSON) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    ).hexdigest()

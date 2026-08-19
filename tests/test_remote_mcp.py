@@ -59,7 +59,6 @@ from clio_relay.remote_mcp import (
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
     MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
-    MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES,
     MAX_REMOTE_MCP_TOOLS_PER_SERVER,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
@@ -80,6 +79,7 @@ from clio_relay.remote_mcp import (
     is_remote_mcp_control_query,
     remote_mcp_server_artifact_digest,
 )
+from clio_relay.remote_mcp_tool_schema import MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES
 from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
