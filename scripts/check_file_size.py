@@ -582,7 +582,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # remote_session_*/execute_owned_session_* entry point), matching the
     # existing session_wire_models.py precedent; the private sidecar
     # helpers are called module-qualified. 6708 -> 6005.
-    "src/clio_relay/session_lifecycle.py": 6005,
+    # split/session-lifecycle slice E: the durable start-attempt journal
+    # validator (every schema generation v1-v3), its retry-selector wrapper,
+    # the legacy identity-match check, the v1-to-current migration writer,
+    # and the shared atomic attempt-journal writer moved to the new
+    # session_start_attempt_validation.py owner (413 lines) -- a
+    # dependency-free leaf relative to the rest of the split, extracted
+    # ahead of the recovery-inspection cluster (a later slice) specifically
+    # because that cluster depends on it and depends on nothing it
+    # exports, avoiding a cycle. The API child startup/readiness substrate
+    # (release-identity lookup, registry validation, port pre-check,
+    # token selection, health polling, redacted log tail, startup-receipt
+    # wait) moved to the new session_api_readiness.py owner (305 lines).
+    # 6005 -> 5369.
+    "src/clio_relay/session_lifecycle.py": 5369,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

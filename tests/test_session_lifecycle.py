@@ -16,11 +16,13 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
+import clio_relay.session_api_readiness as session_api_readiness
 import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_lifecycle_report as session_lifecycle_report
 import clio_relay.session_process_scope as session_process_scope
 import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_start_attempt_validation as session_start_attempt_validation
 import clio_relay.session_startup_receipt as session_startup_receipt
 import clio_relay.session_transaction as session_transaction
 from clio_relay import __version__
@@ -110,7 +112,7 @@ def test_session_start_release_identity_uses_verified_relay_receipt(
     )
 
     assert (
-        session_lifecycle._current_session_api_release_identity()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._current_session_api_release_identity()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         == expected
     )
 
@@ -495,7 +497,7 @@ def _failed_start_fixture(
     registry_path = transaction.path / f"cluster-registry-{generation}.json"
     registry_path.write_bytes(registry_payload)
     owner_token = "c" * 64
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity={
@@ -937,7 +939,7 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
         "containment_broker_pid": None,
         "containment_broker_start_identity": None,
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=attempt_identity,
@@ -1145,11 +1147,11 @@ def test_start_persists_candidate_before_core_admission(
 ) -> None:
     request = _owned_session_start_request()
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
 
     def effective_user_id() -> int:
         return tmp_path.stat().st_uid
@@ -1255,13 +1257,13 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
             "containment_broker_pid": broker_pid,
             "containment_broker_start_identity": broker_start,
         }
-        session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             operation="start",
             identity=identity,
         )
 
-        recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        recovered = session_start_attempt_validation._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256="b" * 64,
@@ -1311,7 +1313,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         "containment_broker_pid": None,
         "containment_broker_start_identity": None,
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
@@ -1323,7 +1325,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1336,7 +1338,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         mutation_attempted = True
         raise AssertionError("distinct operation reached start mutation")
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
     monkeypatch.setattr(session_process_scope, "_terminate_recorded_session_scope", refuse_mutation)
 
     with pytest.raises(RelayError, match="prior owned-session start attempt identity is invalid"):
@@ -1388,7 +1390,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         "containment_broker_pid": 4322,
         "containment_broker_start_identity": "linux-proc:1",
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
@@ -1401,7 +1403,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1437,7 +1439,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         mutation_attempted = True
         raise AssertionError("completed operation reached generation mutation")
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
     monkeypatch.setattr(ClioCoreQueue, "prepare_owner_session_start", refuse_mutation)
 
     with pytest.raises(RelayError, match="already completed; use a fresh operation id"):
@@ -1492,14 +1494,14 @@ def test_legacy_start_attempt_migrates_only_to_caller_planned_v2_operation(
     )
 
     with pytest.raises(RelayError, match="identity is invalid"):
-        session_lifecycle._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster=request.cluster,
             session_id=request.session_id,
             start_operation_id=request.start_operation_id,
         )
 
-    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrated = session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=_api_release_identity().sha256(),
@@ -1556,13 +1558,13 @@ def test_legacy_old_release_replacement_requires_exact_identity_proof(
     current_release_sha256 = _api_release_identity().sha256()
 
     with pytest.raises(RelayError, match="release identity changed"):
-        session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256=current_release_sha256,
         )
 
-    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrated = session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=current_release_sha256,
@@ -1600,7 +1602,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         lambda: current_release,
     )
@@ -1648,7 +1650,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
         )
 
     monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
     base_interpreter = tmp_path / "uv-python" / "python3.12"
     base_interpreter.parent.mkdir(parents=True)
     base_interpreter.write_bytes(b"test interpreter")
@@ -1709,8 +1711,8 @@ def test_executor_replaces_exact_legacy_old_release_session(
             start_ticks="999999",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.125))
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_startup_receipt", receipt)
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_ready", _fixed_api_readiness(0.125))
 
     start_receipt = execute_owned_session_start(
         request,
@@ -1764,7 +1766,7 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1790,7 +1792,7 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         nonlocal mutation_attempted
         mutation_attempted = True
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
 
     with pytest.raises(
         RelayError,
@@ -1901,13 +1903,13 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         lambda: current_release,
     )
     effective_uid = getattr(os, "geteuid", lambda: 0)()
     monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
-    migrate = session_lifecycle._migrate_legacy_start_attempt  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrate = session_start_attempt_validation._migrate_legacy_start_attempt  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     class MigrationCrash(RuntimeError):
         """Simulated process loss immediately after the durable v2 write."""
@@ -1929,7 +1931,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         raise MigrationCrash
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_attempt_validation,
         "_migrate_legacy_start_attempt",
         migrate_then_crash,
     )
@@ -1962,8 +1964,8 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     assert status.start_state == "starting"
     assert status.start_retryable is True
 
-    monkeypatch.setattr(session_lifecycle, "_migrate_legacy_start_attempt", migrate)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_start_attempt_validation, "_migrate_legacy_start_attempt", migrate)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
 
     class ReplacementResumed(RuntimeError):
         """The retry reached replacement admission instead of terminal refusal."""
@@ -2157,7 +2159,7 @@ def test_owned_api_startup_diagnostic_keeps_oversized_redacted_tail(tmp_path: Pa
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token, frp_token),
     )
@@ -2182,7 +2184,7 @@ def test_owned_api_startup_diagnostic_redacts_secret_crossing_tail_boundary(
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token,),
     )
@@ -2204,7 +2206,7 @@ def test_owned_api_startup_diagnostic_discards_unknown_bearer_crossing_tail_boun
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(),
     )
@@ -2220,7 +2222,7 @@ def test_owned_api_startup_diagnostic_fails_closed_for_non_utf8_secret(
     transaction = _FakeSessionTransaction(tmp_path)
     (tmp_path / "api.log").write_bytes(b"startup failed\n")
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=("credential-\udcff-value",),
     )
@@ -2467,17 +2469,17 @@ def test_api_readiness_rejects_wrong_auth_policy(monkeypatch: MonkeyPatch) -> No
         del data, timeout, cafile, capath, cadefault, context
         return Response()
 
-    monkeypatch.setattr(session_lifecycle.time, "monotonic", lambda: next(moments))
-    monkeypatch.setattr(session_lifecycle.time, "sleep", ignore_sleep)
+    monkeypatch.setattr(session_api_readiness.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(session_api_readiness.time, "sleep", ignore_sleep)
     monkeypatch.setattr(
-        session_lifecycle.urllib.request,
+        session_api_readiness.urllib.request,
         "urlopen",
         open_response,
     )
     process = cast(subprocess.Popen[bytes], SimpleNamespace(poll=lambda: None))
 
     with pytest.raises(RelayError, match="did not become ready"):
-        session_lifecycle._wait_for_api_ready(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._wait_for_api_ready(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             process=process,
             port=18765,
             require_token=True,
@@ -2488,13 +2490,13 @@ def test_no_require_token_suppresses_ambient_api_token(monkeypatch: MonkeyPatch)
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "ambient-token")
 
     assert (
-        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             require_token=False
         )
         is None
     )
     assert (
-        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             require_token=True
         )
         == "ambient-token"
@@ -2560,7 +2562,7 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
             "containment_broker_start_identity"
         ],
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=attempt_identity,
@@ -2579,8 +2581,8 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
         receipt_checks += 1
         return process_identity
 
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", verify_receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.25))
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_startup_receipt", verify_receipt)
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
     start_receipt = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

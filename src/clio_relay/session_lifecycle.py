@@ -8,27 +8,25 @@ import json
 import logging
 import math
 import os
-import re
 import secrets
 import shlex
-import socket
 import stat
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import uuid4
 
+import clio_relay.session_api_readiness as session_api_readiness
 import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle_report as session_lifecycle_report
 import clio_relay.session_process_scope as session_process_scope
 import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_start_attempt_validation as session_start_attempt_validation
 import clio_relay.session_startup_receipt as session_startup_receipt
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -261,7 +259,7 @@ def _inspect_owned_session_start_attempt_status(
     from clio_relay.core_queue import ClioCoreQueue
 
     try:
-        current_attempt = _validated_start_attempt(
+        current_attempt = session_start_attempt_validation._validated_start_attempt(
             transaction,
             cluster=cluster,
             session_id=session_id,
@@ -290,7 +288,7 @@ def _inspect_owned_session_start_attempt_status(
             ],
         )
     try:
-        attempt = _validated_start_attempt(
+        attempt = session_start_attempt_validation._validated_start_attempt(
             transaction,
             cluster=cluster,
             session_id=session_id,
@@ -547,7 +545,7 @@ def _inspect_owned_session_failed_cleaned_receipt(
     queue = ClioCoreQueue(core_dir)
     errors: list[str] = []
     try:
-        attempt = _validated_start_attempt(
+        attempt = session_start_attempt_validation._validated_start_attempt(
             transaction,
             cluster=cluster,
             session_id=session_id,
@@ -1529,7 +1527,7 @@ def inspect_owned_session_recovery_status(
             start_expected_release_sha256 = (
                 attempt_status.start_expected_api_release_identity_sha256
             )
-            bound_attempt = _validated_start_attempt(
+            bound_attempt = session_start_attempt_validation._validated_start_attempt(
                 transaction,
                 cluster=cluster,
                 session_id=session_id,
@@ -2233,642 +2231,6 @@ def _read_owned_session_document(
     return {str(key): value for key, value in cast(dict[object, object], raw).items()}, payload
 
 
-def _current_session_api_release_identity() -> SessionApiReleaseIdentity:
-    """Return the exact locally installed release identity for an API child."""
-    from clio_relay.installation import verified_session_api_install_receipt
-    from clio_relay.session_install_identity import release_identity_from_receipt
-
-    receipt = verified_session_api_install_receipt()
-    return release_identity_from_receipt(receipt)
-
-
-def _validated_start_registry(
-    request: OwnedSessionStartRequest,
-) -> tuple[ClusterRegistry, bytes]:
-    """Validate one exact request-carried cluster registry and its route identity."""
-    try:
-        registry = ClusterRegistry.model_validate(request.cluster_registry)
-    except ValueError as exc:
-        raise RelayError(f"owned session cluster registry is invalid: {exc}") from exc
-    payload = json.dumps(
-        registry.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    if len(payload) > MAX_CLUSTER_REGISTRY_BYTES:
-        raise RelayError("owned session cluster registry exceeds its byte limit")
-    if hashlib.sha256(payload).hexdigest() != request.cluster_registry_sha256:
-        raise RelayError("owned session cluster registry digest does not match its payload")
-    if set(registry.clusters) != {request.cluster}:
-        raise RelayError("owned session cluster registry does not contain one exact cluster")
-    definition = registry.clusters[request.cluster]
-    if (
-        definition.name != request.cluster
-        or cluster_route_revision(definition) != request.cluster_route_revision
-    ):
-        raise RelayError("owned session cluster route identity does not match its registry")
-    return registry, payload
-
-
-def _write_session_attempt(
-    transaction: _OwnedSessionTransaction,
-    *,
-    operation: Literal["start", "teardown"],
-    identity: dict[str, object],
-    error: str | None = None,
-) -> None:
-    """Write one atomic, resumable owner-session attempt record."""
-    document = {
-        "schema_version": (
-            "clio-relay.owner-session-attempt.v3"
-            if operation == "start"
-            else "clio-relay.owner-session-attempt.v1"
-        ),
-        "operation": operation,
-        **identity,
-        "observed_at": datetime.now(UTC).isoformat(),
-        "error": error[:MAX_SESSION_START_ERROR_CHARS] if error is not None else None,
-    }
-    transaction.atomic_write(
-        f"{operation}-attempt.json",
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-    )
-
-
-def _assert_remote_port_available(port: int) -> None:
-    """Fail before core admission changes when the requested loopback port is busy."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            listener.bind(("127.0.0.1", port))
-        except OSError as exc:
-            raise RelayError(f"remote API port is already occupied: {port}") from exc
-
-
-def _owned_session_api_token(*, require_token: bool) -> str | None:
-    """Select the child API token while honoring an explicit auth-disabled plan."""
-    ambient_token = os.environ.get("CLIO_RELAY_API_TOKEN")
-    if require_token and not ambient_token:
-        raise RelayError("owned session API token is required but unavailable")
-    return ambient_token if require_token else None
-
-
-def _wait_for_api_ready(
-    *,
-    process: subprocess.Popen[bytes],
-    port: int,
-    require_token: bool,
-) -> float:
-    """Wait boundedly for an API child to report the exact planned auth policy."""
-    started = time.monotonic()
-    deadline = started + _REMOTE_API_READINESS_TIMEOUT_SECONDS
-    url = f"http://127.0.0.1:{port}/healthz"
-    last_error = "API did not become ready"
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RelayError("owned API process exited before readiness")
-        try:
-            with urllib.request.urlopen(url, timeout=0.25) as response:
-                response_bytes = response.read(_MAX_API_HEALTH_RESPONSE_BYTES + 1)
-                if len(response_bytes) > _MAX_API_HEALTH_RESPONSE_BYTES:
-                    raise RelayError("owned API health response exceeded its byte limit")
-                payload = cast(object, json.loads(response_bytes))
-                if (
-                    response.status == 200
-                    and isinstance(payload, dict)
-                    and cast(dict[str, object], payload).get("ok") is True
-                    and cast(dict[str, object], payload).get("auth") is require_token
-                ):
-                    return time.monotonic() - started
-                last_error = f"unexpected health response: {payload!r}"
-        except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            last_error = str(exc)
-        time.sleep(0.1)
-    raise RelayError(
-        "owned API did not become ready within "
-        f"{_REMOTE_API_READINESS_TIMEOUT_SECONDS:g} seconds: {last_error}"
-    )
-
-
-def _owned_api_startup_log_detail(
-    transaction: _OwnedSessionTransaction,
-    *,
-    secret_values: Iterable[str],
-) -> str:
-    """Return one bounded credential-redacted API startup diagnostic."""
-    redaction_values = tuple(
-        sorted(
-            {value for value in secret_values if len(value) >= 4},
-            key=len,
-            reverse=True,
-        )
-    )
-    try:
-        maximum_secret_bytes = max(
-            (len(value.encode("utf-8")) for value in redaction_values),
-            default=0,
-        )
-    except UnicodeEncodeError:
-        return ""
-    # Read enough overlap to include the beginning of every known secret whose
-    # suffix could otherwise land in the retained diagnostic.  If an
-    # unexpectedly enormous environment credential makes that impossible
-    # within the owned-document bound, fail closed instead of returning a log
-    # fragment that may contain an unrecognizable middle of the credential.
-    if maximum_secret_bytes > (_MAX_OWNED_SESSION_DOCUMENT_BYTES - MAX_SESSION_START_ERROR_CHARS):
-        return ""
-    read_limit = MAX_SESSION_START_ERROR_CHARS + maximum_secret_bytes
-    try:
-        payload = transaction.read_tail(
-            "api.log",
-            maximum_bytes=read_limit,
-            required=False,
-        )
-    except RelayError:
-        return ""
-    if not payload:
-        return ""
-    # A bounded tail can begin in an unknown credential that is not available
-    # through ``secret_values``.  Discard its first partial log line before
-    # decoding; retaining that fragment could expose the credential's suffix
-    # without its identifying assignment or Authorization prefix.  Equality is
-    # treated as truncated deliberately: dropping one complete line for an
-    # exactly-sized log is safer than guessing whether the transaction saw the
-    # whole file.
-    if len(payload) == read_limit:
-        _partial, separator, payload = payload.partition(b"\n")
-        if not separator:
-            return ""
-    detail = payload.decode("utf-8", errors="replace").strip()
-    for value in redaction_values:
-        detail = detail.replace(value, "<redacted>")
-    # Redact the complete Authorization value before generic assignments.  A
-    # whitespace-delimited assignment rule would consume only ``Bearer`` and
-    # leave the actual credential visible as its next token.
-    detail = re.sub(
-        r"(?im)(\bauthorization['\"]?\s*:\s*)[^\r\n,;]+",
-        r"\1<redacted>",
-        detail,
-    )
-    sensitive_assignment = re.compile(
-        r"(?i)(\b[a-z0-9_.-]*(?:token|secret|password|credential|api[_-]?key)"
-        r"[a-z0-9_.-]*['\"]?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
-    )
-    detail = sensitive_assignment.sub(r"\1<redacted>", detail)
-    return detail[-MAX_SESSION_START_ERROR_CHARS:]
-
-
-def _wait_for_api_startup_receipt(
-    *,
-    transaction: _OwnedSessionTransaction,
-    process: subprocess.Popen[Any],
-    receipt_name: str,
-    owner_token: str,
-    expected: dict[str, object],
-    proc_root: Path,
-) -> _OwnedGenerationProcess:
-    """Wait for and verify the API child's signed cgroup-bound startup receipt."""
-    from clio_relay.process_containment import recorded_linux_systemd_scope_process_ids
-
-    expected_keys = {
-        "schema_version",
-        "cluster",
-        "session_id",
-        "session_generation_id",
-        "api_pid",
-        "api_pgid",
-        "process_start_ticks",
-        "api_release_identity_sha256",
-        "cluster_registry_path",
-        "cluster_registry_sha256",
-        "cluster_route_revision",
-        "systemd_unit",
-        "systemd_cgroup_path",
-        "systemd_invocation_id",
-        "systemd_description",
-        "observed_at",
-        "hmac_sha256",
-    }
-    deadline = time.monotonic() + _REMOTE_API_READINESS_TIMEOUT_SECONDS
-    last_error = "startup receipt did not materialize"
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RelayError("owned API containment exited before startup receipt")
-        try:
-            document = transaction.read_json(receipt_name, required=False)
-            if document is None:
-                time.sleep(0.05)
-                continue
-            observed_at = document.get("observed_at")
-            parsed_observed_at = (
-                datetime.fromisoformat(observed_at) if isinstance(observed_at, str) else None
-            )
-            api_pid = document.get("api_pid")
-            api_pgid = document.get("api_pgid")
-            process_start = document.get("process_start_ticks")
-            signature = document.get("hmac_sha256")
-            exact_expected = all(document.get(key) == value for key, value in expected.items())
-            if not (
-                set(document) == expected_keys
-                and document.get("schema_version") == "clio-relay.owner-session-api-startup.v1"
-                and exact_expected
-                and isinstance(api_pid, int)
-                and not isinstance(api_pid, bool)
-                and api_pid > 1
-                and isinstance(api_pgid, int)
-                and not isinstance(api_pgid, bool)
-                and api_pgid > 0
-                and isinstance(process_start, str)
-                and process_start.isdigit()
-                and parsed_observed_at is not None
-                and parsed_observed_at.tzinfo is not None
-                and isinstance(signature, str)
-                and hmac.compare_digest(
-                    signature,
-                    session_startup_receipt._startup_receipt_signature(
-                        document, owner_token=owner_token
-                    ),
-                )
-            ):
-                raise RelayError("owned API startup receipt identity is invalid")
-            process_identity = session_process_scope._read_proc_identity(
-                proc_root=proc_root, pid=api_pid
-            )
-            if (
-                process_identity.process_group_id != api_pgid
-                or process_identity.start_ticks != process_start
-                or not session_process_scope._is_clio_relay_api_leader(
-                    proc_root=proc_root, pid=api_pid
-                )
-            ):
-                raise RelayError("owned API startup receipt process identity changed")
-            pids = recorded_linux_systemd_scope_process_ids(
-                unit=cast(str, expected["systemd_unit"]),
-                cgroup_path=cast(str, expected["systemd_cgroup_path"]),
-                invocation_id=cast(str, expected["systemd_invocation_id"]),
-                description=cast(str, expected["systemd_description"]),
-            )
-            if api_pid not in pids:
-                raise RelayError("owned API startup receipt leader is outside its exact cgroup")
-            return process_identity
-        except (OSError, RelayError, ValueError) as exc:
-            last_error = str(exc)
-            time.sleep(0.05)
-    raise RelayError(f"owned API startup receipt was not verified: {last_error}")
-
-
-def _validated_start_attempt(
-    transaction: _OwnedSessionTransaction,
-    *,
-    cluster: str,
-    session_id: str,
-    start_operation_id: str | None = None,
-    cluster_registry_sha256: str | None = None,
-    cluster_route_revision_value: str | None = None,
-    remote_api_port: int | None = None,
-    replace: bool | None = None,
-    require_token: bool | None = None,
-    input_policy: OwnedSessionInputPolicy | None = None,
-    expected_api_release_identity_sha256: str | None = None,
-    allow_legacy: bool = False,
-) -> dict[str, object] | None:
-    """Return one structurally exact start journal matching optional selectors."""
-    attempt = transaction.read_json("start-attempt.json", required=False)
-    if attempt is None:
-        return None
-    expected_keys = {
-        "schema_version",
-        "operation",
-        "cluster",
-        "session_id",
-        "start_operation_id",
-        "session_generation_id",
-        "owner_token",
-        "owner_token_sha256",
-        "api_release_identity_sha256",
-        "expected_api_release_identity_sha256",
-        "cluster_registry_path",
-        "cluster_registry_sha256",
-        "cluster_route_revision",
-        "remote_api_port",
-        "replace",
-        "require_token",
-        "input_policy",
-        "start_phase",
-        "systemd_unit",
-        "systemd_description",
-        "systemd_cgroup_path",
-        "systemd_invocation_id",
-        "containment_broker_pid",
-        "containment_broker_start_identity",
-        "observed_at",
-        "error",
-    }
-    pre_policy_keys = expected_keys - {"input_policy"}
-    legacy_keys = pre_policy_keys - {
-        "start_operation_id",
-        "expected_api_release_identity_sha256",
-        "replace",
-        "require_token",
-    }
-    legacy = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v1"
-    pre_policy = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v2"
-    current = attempt.get("schema_version") == "clio-relay.owner-session-attempt.v3"
-    raw_input_policy = attempt.get("input_policy")
-    try:
-        recorded_input_policy = (
-            OwnedSessionInputPolicy.model_validate(raw_input_policy) if current else None
-        )
-    except ValueError:
-        recorded_input_policy = None
-    generation = attempt.get("session_generation_id")
-    operation_id = attempt.get("start_operation_id")
-    observed_at = attempt.get("observed_at")
-    try:
-        validated_generation = (
-            validate_durable_record_id(generation) if isinstance(generation, str) else None
-        )
-        validated_operation_id = (
-            validate_durable_record_id(operation_id) if isinstance(operation_id, str) else None
-        )
-        parsed_observed_at = (
-            datetime.fromisoformat(observed_at) if isinstance(observed_at, str) else None
-        )
-    except ValueError:
-        validated_generation = None
-        validated_operation_id = None
-        parsed_observed_at = None
-    registry_path = attempt.get("cluster_registry_path")
-    owner_token = attempt.get("owner_token")
-    owner_token_sha256 = attempt.get("owner_token_sha256")
-    start_phase = attempt.get("start_phase")
-    systemd_unit = attempt.get("systemd_unit")
-    systemd_description = attempt.get("systemd_description")
-    cgroup_path = attempt.get("systemd_cgroup_path")
-    invocation_id = attempt.get("systemd_invocation_id")
-    broker_pid = attempt.get("containment_broker_pid")
-    broker_start = attempt.get("containment_broker_start_identity")
-    expected_registry_path = (
-        transaction.path / f"cluster-registry-{validated_generation}.json"
-        if validated_generation is not None
-        else None
-    )
-    if not (
-        set(attempt)
-        == (legacy_keys if legacy else pre_policy_keys if pre_policy else expected_keys)
-        and (current or pre_policy or (allow_legacy and legacy))
-        and attempt.get("operation") == "start"
-        and attempt.get("cluster") == cluster
-        and attempt.get("session_id") == session_id
-        and (
-            (not legacy and validated_operation_id is not None)
-            or (legacy and validated_operation_id is None)
-        )
-        and (
-            start_operation_id is None
-            or (not legacy and validated_operation_id == start_operation_id)
-        )
-        and validated_generation is not None
-        and isinstance(owner_token, str)
-        and len(owner_token) == 64
-        and all(character in "0123456789abcdef" for character in owner_token)
-        and owner_token_sha256 == hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
-        and isinstance(attempt.get("api_release_identity_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", cast(str, attempt.get("api_release_identity_sha256")))
-        is not None
-        and (
-            legacy
-            or (
-                attempt.get("expected_api_release_identity_sha256") is None
-                or (
-                    isinstance(attempt.get("expected_api_release_identity_sha256"), str)
-                    and re.fullmatch(
-                        r"[0-9a-f]{64}",
-                        cast(str, attempt.get("expected_api_release_identity_sha256")),
-                    )
-                    is not None
-                )
-            )
-        )
-        and (
-            expected_api_release_identity_sha256 is None
-            or (
-                not legacy
-                and attempt.get("expected_api_release_identity_sha256")
-                == expected_api_release_identity_sha256
-            )
-        )
-        and registry_path == str(expected_registry_path)
-        and isinstance(attempt.get("cluster_registry_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", cast(str, attempt.get("cluster_registry_sha256")))
-        is not None
-        and (
-            cluster_registry_sha256 is None
-            or attempt.get("cluster_registry_sha256") == cluster_registry_sha256
-        )
-        and isinstance(attempt.get("cluster_route_revision"), str)
-        and bool(attempt.get("cluster_route_revision"))
-        and (
-            cluster_route_revision_value is None
-            or attempt.get("cluster_route_revision") == cluster_route_revision_value
-        )
-        and isinstance(attempt.get("remote_api_port"), int)
-        and not isinstance(attempt.get("remote_api_port"), bool)
-        and 0 < cast(int, attempt.get("remote_api_port")) <= 65_535
-        and (remote_api_port is None or attempt.get("remote_api_port") == remote_api_port)
-        and (legacy or isinstance(attempt.get("replace"), bool))
-        and (replace is None or (not legacy and attempt.get("replace") is replace))
-        and (legacy or isinstance(attempt.get("require_token"), bool))
-        and (
-            require_token is None or (not legacy and attempt.get("require_token") is require_token)
-        )
-        and (not current or recorded_input_policy is not None)
-        and (input_policy is None or (current and recorded_input_policy == input_policy))
-        and start_phase in {"pending", "admitted", "scope_bound", "contained"}
-        and systemd_unit == f"clio-relay-session-{validated_generation}.scope"
-        and isinstance(systemd_description, str)
-        and systemd_description.startswith(
-            f"clio-relay-owned-session:{session_id}:{validated_generation}:"
-        )
-        and (
-            (
-                start_phase in {"pending", "admitted"}
-                and cgroup_path is None
-                and invocation_id is None
-                and broker_pid is None
-                and broker_start is None
-            )
-            or (
-                start_phase in {"scope_bound", "contained"}
-                and isinstance(cgroup_path, str)
-                and bool(cgroup_path)
-                and isinstance(invocation_id, str)
-                and len(invocation_id) == 32
-                and all(character in "0123456789abcdef" for character in invocation_id)
-                and (
-                    (start_phase == "scope_bound" and broker_pid is None and broker_start is None)
-                    or (
-                        start_phase == "contained"
-                        and isinstance(broker_pid, int)
-                        and not isinstance(broker_pid, bool)
-                        and broker_pid > 1
-                        and isinstance(broker_start, str)
-                        and bool(broker_start)
-                    )
-                )
-            )
-        )
-        and parsed_observed_at is not None
-        and parsed_observed_at.tzinfo is not None
-        and (
-            attempt.get("error") is None
-            or (
-                isinstance(attempt.get("error"), str)
-                and len(cast(str, attempt.get("error"))) <= MAX_SESSION_START_ERROR_CHARS
-            )
-        )
-    ):
-        raise RelayError("prior owned-session start attempt identity is invalid")
-    return attempt
-
-
-def _validated_resumable_start_attempt(
-    transaction: _OwnedSessionTransaction,
-    *,
-    request: OwnedSessionStartRequest,
-    release_identity_sha256: str,
-) -> dict[str, object] | None:
-    """Return the exact prior start attempt selected by a retry request."""
-    expected_release_sha256 = (
-        request.expected_api_release_identity.sha256()
-        if request.expected_api_release_identity is not None
-        else None
-    )
-    attempt = _validated_start_attempt(
-        transaction,
-        cluster=request.cluster,
-        session_id=request.session_id,
-        start_operation_id=request.start_operation_id,
-        cluster_registry_sha256=request.cluster_registry_sha256,
-        cluster_route_revision_value=request.cluster_route_revision,
-        remote_api_port=request.remote_api_port,
-        replace=request.replace,
-        require_token=request.require_token,
-        input_policy=request.input_policy,
-        expected_api_release_identity_sha256=expected_release_sha256,
-    )
-    if attempt is not None and (
-        attempt.get("expected_api_release_identity_sha256") != expected_release_sha256
-        or attempt.get("api_release_identity_sha256") != release_identity_sha256
-    ):
-        raise RelayError("prior owned-session start release identity changed")
-    return attempt
-
-
-def _legacy_start_attempt_matches_metadata(
-    *,
-    attempt: dict[str, object],
-    metadata: dict[str, object],
-) -> bool:
-    """Return whether a v1 start journal names the exact committed generation."""
-    identity_fields = (
-        "cluster",
-        "session_id",
-        "session_generation_id",
-        "owner_token",
-        "api_release_identity_sha256",
-        "cluster_registry_path",
-        "cluster_registry_sha256",
-        "cluster_route_revision",
-        "remote_api_port",
-        "systemd_unit",
-        "systemd_description",
-        "systemd_cgroup_path",
-        "systemd_invocation_id",
-        "containment_broker_pid",
-        "containment_broker_start_identity",
-    )
-    owner_token = metadata.get("owner_token")
-    return bool(
-        attempt.get("start_phase") == "contained"
-        and all(attempt.get(field) == metadata.get(field) for field in identity_fields)
-        and isinstance(owner_token, str)
-        and attempt.get("owner_token_sha256")
-        == hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
-    )
-
-
-def _migrate_legacy_start_attempt(
-    transaction: _OwnedSessionTransaction,
-    *,
-    request: OwnedSessionStartRequest,
-    release_identity_sha256: str,
-    replacement_identity_verified: bool = False,
-) -> dict[str, object] | None:
-    """Bind a valid pre-v2 attempt to a caller-supplied planned operation.
-
-    Version 1 did not contain an operation selector or the complete request
-    policy, so it is never exposed as a queryable start.  A new planned request
-    may adopt its exact generation only after every identity v1 did record has
-    matched; a failed legacy attempt additionally requires explicit replacement.
-    """
-    attempt = _validated_start_attempt(
-        transaction,
-        cluster=request.cluster,
-        session_id=request.session_id,
-        cluster_registry_sha256=request.cluster_registry_sha256,
-        cluster_route_revision_value=request.cluster_route_revision,
-        remote_api_port=request.remote_api_port,
-        allow_legacy=True,
-    )
-    if attempt is None or attempt.get("schema_version") == "clio-relay.owner-session-attempt.v3":
-        return attempt
-    release_changed = attempt.get("api_release_identity_sha256") != release_identity_sha256
-    if release_changed and not (request.replace and replacement_identity_verified):
-        raise RelayError("legacy owned-session start release identity changed")
-    if attempt.get("error") is not None and not request.replace:
-        raise RelayError("a failed legacy owned-session start requires --replace")
-    identity = {
-        key: value
-        for key, value in attempt.items()
-        if key not in {"schema_version", "operation", "observed_at", "error"}
-    }
-    identity.update(
-        {
-            "start_operation_id": request.start_operation_id,
-            "api_release_identity_sha256": release_identity_sha256,
-            "expected_api_release_identity_sha256": (
-                request.expected_api_release_identity.sha256()
-                if request.expected_api_release_identity is not None
-                else None
-            ),
-            "replace": request.replace,
-            "require_token": request.require_token,
-            "input_policy": request.input_policy.model_dump(mode="json"),
-        }
-    )
-    _write_session_attempt(transaction, operation="start", identity=identity)
-    return _validated_resumable_start_attempt(
-        transaction,
-        request=request,
-        release_identity_sha256=release_identity_sha256,
-    )
-
-
-def _owned_api_requires_token(*, proc_root: Path, pid: int) -> bool:
-    """Read the exact verified API leader argv and return its auth policy."""
-    try:
-        arguments = session_process_scope._read_bounded_proc_bytes(
-            proc_root / str(pid) / "cmdline",
-            maximum_bytes=_MAX_PROC_RECORD_BYTES,
-        ).split(bytes([0]))
-    except (FileNotFoundError, ProcessLookupError) as exc:
-        raise RelayError("owned API leader disappeared during auth verification") from exc
-    if not session_process_scope._is_clio_relay_api_leader(proc_root=proc_root, pid=pid):
-        raise RelayError("owned API auth policy cannot be tied to the verified leader")
-    return b"--require-token" in arguments
-
-
 class _RecoveredStartProbe:
     """Minimal process observation used while adopting an exact persistent scope."""
 
@@ -2909,7 +2271,7 @@ def _promote_resumable_contained_start(
     }
     probe = cast(subprocess.Popen[Any], _RecoveredStartProbe())
     try:
-        process_identity = _wait_for_api_startup_receipt(
+        process_identity = session_api_readiness._wait_for_api_startup_receipt(
             transaction=transaction,
             process=probe,
             receipt_name=receipt_name,
@@ -2917,12 +2279,12 @@ def _promote_resumable_contained_start(
             expected=expected_receipt,
             proc_root=proc_root,
         )
-        ready_seconds = _wait_for_api_ready(
+        ready_seconds = session_api_readiness._wait_for_api_ready(
             process=cast(subprocess.Popen[bytes], probe),
             port=request.remote_api_port,
             require_token=request.require_token,
         )
-        final_process_identity = _wait_for_api_startup_receipt(
+        final_process_identity = session_api_readiness._wait_for_api_startup_receipt(
             transaction=transaction,
             process=probe,
             receipt_name=receipt_name,
@@ -3088,8 +2450,8 @@ def execute_owned_session_start(
         session_id=request.session_id,
         remote_api_port=request.remote_api_port,
     )
-    _, registry_payload = _validated_start_registry(request)
-    release_identity = _current_session_api_release_identity()
+    _, registry_payload = session_api_readiness._validated_start_registry(request)
+    release_identity = session_api_readiness._current_session_api_release_identity()
     if (
         request.expected_api_release_identity is not None
         and release_identity != request.expected_api_release_identity
@@ -3101,7 +2463,7 @@ def execute_owned_session_start(
             request.expected_api_release_identity,
         ):
             raise RelayError("session API installation changed after compatibility verification")
-    api_token = _owned_session_api_token(require_token=request.require_token)
+    api_token = session_api_readiness._owned_session_api_token(require_token=request.require_token)
     settings_core_dir = RelaySettings.from_env().core_dir if core_dir is None else core_dir
     queue = ClioCoreQueue(settings_core_dir)
     get_effective_uid = cast(Callable[[], int] | None, getattr(os, "geteuid", None))
@@ -3126,7 +2488,7 @@ def execute_owned_session_start(
             }
         )
         if legacy_migrated:
-            legacy_attempt = _validated_start_attempt(
+            legacy_attempt = session_start_attempt_validation._validated_start_attempt(
                 transaction,
                 cluster=request.cluster,
                 session_id=request.session_id,
@@ -3163,7 +2525,7 @@ def execute_owned_session_start(
                     and legacy_status.api_release_identity is not None
                     and legacy_status.api_release_identity.sha256()
                     == legacy_attempt.get("api_release_identity_sha256")
-                    and _legacy_start_attempt_matches_metadata(
+                    and session_start_attempt_validation._legacy_start_attempt_matches_metadata(
                         attempt=legacy_attempt,
                         metadata=existing,
                     )
@@ -3183,7 +2545,7 @@ def execute_owned_session_start(
                             "use --replace"
                         )
                     if (
-                        _owned_api_requires_token(
+                        session_start_attempt_validation._owned_api_requires_token(
                             proc_root=proc_root,
                             pid=legacy_status.api_pid,
                         )
@@ -3247,14 +2609,14 @@ def execute_owned_session_start(
                 raise RelayError(
                     "legacy contained start requires --replace because v1 did not bind auth policy"
                 )
-            prior_attempt = _migrate_legacy_start_attempt(
+            prior_attempt = session_start_attempt_validation._migrate_legacy_start_attempt(
                 transaction,
                 request=request,
                 release_identity_sha256=release_identity.sha256(),
                 replacement_identity_verified=replacement_identity_verified,
             )
         else:
-            prior_attempt = _validated_start_attempt(
+            prior_attempt = session_start_attempt_validation._validated_start_attempt(
                 transaction,
                 cluster=request.cluster,
                 session_id=request.session_id,
@@ -3264,10 +2626,12 @@ def execute_owned_session_start(
             prior_attempt is not None
             and prior_attempt.get("start_operation_id") == request.start_operation_id
         ):
-            exact_prior_attempt = _validated_resumable_start_attempt(
-                transaction,
-                request=request,
-                release_identity_sha256=release_identity.sha256(),
+            exact_prior_attempt = (
+                session_start_attempt_validation._validated_resumable_start_attempt(
+                    transaction,
+                    request=request,
+                    release_identity_sha256=release_identity.sha256(),
+                )
             )
         if (
             existing is None
@@ -3305,14 +2669,14 @@ def execute_owned_session_start(
                     ),
                 }
             )
-            _write_session_attempt(
+            session_start_attempt_validation._write_session_attempt(
                 transaction,
                 operation="start",
                 identity=replacement_attempt,
             )
         resumable_attempt = (
             exact_prior_attempt
-            or _validated_resumable_start_attempt(
+            or session_start_attempt_validation._validated_resumable_start_attempt(
                 transaction,
                 request=request,
                 release_identity_sha256=release_identity.sha256(),
@@ -3397,7 +2761,7 @@ def execute_owned_session_start(
                             "existing owned session token policy is not proven; use --replace"
                         )
                     existing_owner_token = cast(str, existing["owner_token"])
-                    _write_session_attempt(
+                    session_start_attempt_validation._write_session_attempt(
                         transaction,
                         operation="start",
                         identity={
@@ -3497,7 +2861,7 @@ def execute_owned_session_start(
                             "systemd_invocation_id": adopted_scope["systemd_invocation_id"],
                         }
                     )
-                    _write_session_attempt(
+                    session_start_attempt_validation._write_session_attempt(
                         transaction,
                         operation="start",
                         identity={
@@ -3552,7 +2916,7 @@ def execute_owned_session_start(
                         "containment_broker_start_identity": None,
                     }
                 )
-                _write_session_attempt(
+                session_start_attempt_validation._write_session_attempt(
                     transaction,
                     operation="start",
                     identity={
@@ -3562,7 +2926,7 @@ def execute_owned_session_start(
                     },
                 )
 
-        _assert_remote_port_available(request.remote_api_port)
+        session_api_readiness._assert_remote_port_available(request.remote_api_port)
         release_sha256 = release_identity.sha256()
         expected_release_sha256 = (
             request.expected_api_release_identity.sha256()
@@ -3605,7 +2969,7 @@ def execute_owned_session_start(
                     "containment_broker_pid": None,
                     "containment_broker_start_identity": None,
                 }
-                _write_session_attempt(
+                session_start_attempt_validation._write_session_attempt(
                     transaction,
                     operation="start",
                     identity=attempt_identity,
@@ -3642,7 +3006,7 @@ def execute_owned_session_start(
                 raise RelayError("core selected an unrecorded owned-session generation")
             if attempt_identity["start_phase"] != "contained":
                 attempt_identity["start_phase"] = "admitted"
-                _write_session_attempt(
+                session_start_attempt_validation._write_session_attempt(
                     transaction,
                     operation="start",
                     identity=attempt_identity,
@@ -3687,7 +3051,7 @@ def execute_owned_session_start(
                 "containment_broker_pid": None,
                 "containment_broker_start_identity": None,
             }
-            _write_session_attempt(
+            session_start_attempt_validation._write_session_attempt(
                 transaction,
                 operation="start",
                 identity=attempt_identity,
@@ -3799,7 +3163,7 @@ def execute_owned_session_start(
                         "containment_broker_start_identity": broker_start,
                     }
                 )
-                _write_session_attempt(
+                session_start_attempt_validation._write_session_attempt(
                     transaction,
                     operation="start",
                     identity=attempt_identity,
@@ -3861,7 +3225,7 @@ def execute_owned_session_start(
                 "systemd_invocation_id": containment_identity["systemd_invocation_id"],
                 "systemd_description": containment_identity["systemd_description"],
             }
-            process_identity = _wait_for_api_startup_receipt(
+            process_identity = session_api_readiness._wait_for_api_startup_receipt(
                 transaction=transaction,
                 process=process,
                 receipt_name=receipt_name,
@@ -3869,7 +3233,7 @@ def execute_owned_session_start(
                 expected=expected_receipt,
                 proc_root=proc_root,
             )
-            ready_seconds = _wait_for_api_ready(
+            ready_seconds = session_api_readiness._wait_for_api_ready(
                 process=cast(subprocess.Popen[bytes], process),
                 port=request.remote_api_port,
                 require_token=request.require_token,
@@ -3933,7 +3297,7 @@ def execute_owned_session_start(
             )
         except BaseException as exc:
             if not metadata_committed:
-                startup_detail = _owned_api_startup_log_detail(
+                startup_detail = session_api_readiness._owned_api_startup_log_detail(
                     transaction,
                     secret_values=startup_secret_values,
                 )
@@ -3967,7 +3331,7 @@ def execute_owned_session_start(
                 if startup_detail:
                     cleanup_detail = f"{cleanup_detail}; api_log={startup_detail}"
                 with suppress(RelayError):
-                    _write_session_attempt(
+                    session_start_attempt_validation._write_session_attempt(
                         transaction,
                         operation="start",
                         identity=attempt_identity,
@@ -4163,7 +3527,7 @@ def _execute_owned_failed_start_teardown(
     proc_root: Path,
 ) -> SessionLifecycleReport:
     """Close an admitted start that failed before API metadata was committed."""
-    attempt = _validated_start_attempt(
+    attempt = session_start_attempt_validation._validated_start_attempt(
         transaction,
         cluster=request.cluster,
         session_id=request.session_id,
@@ -4731,7 +4095,7 @@ def execute_owned_session_teardown(
         except BaseException as exc:
             if not receipt_committed:
                 with suppress(RelayError):
-                    _write_session_attempt(
+                    session_start_attempt_validation._write_session_attempt(
                         transaction,
                         operation="teardown",
                         identity=attempt_identity,
