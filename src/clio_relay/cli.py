@@ -121,8 +121,6 @@ from clio_relay.models import (
     RelayJob,
     SchedulerPhase,
     SchedulerStatus,
-    artifact_use_payload,
-    validate_artifact_use_collection,
 )
 from clio_relay.owner_session_admission import (
     assert_no_unscoped_desktop_admission_state as _assert_no_unscoped_desktop_admission_state,
@@ -4841,18 +4839,20 @@ def _bounded_cleanup_public_json(value: object) -> str | None:
     )
 
 
+# #231 cli.py decomposition, shared-plumbing relocation pass: this symbol's
+# real body moved to cli_support.py -- see that module's own docstring. A
+# thin forwarder, not a bare object re-binding, for the same F3/F4 reason
+# every other forwarder below carries: re-reading `cli_support.<symbol>` on
+# every call keeps both `monkeypatch.setattr(cli_support, ...)` and the
+# pre-existing `monkeypatch.setattr(cli, ...)` patch points effective.
 def _managed_queue_from_env() -> StorageManagedQueue:
-    """Open the production queue with durable storage reconciliation enabled."""
-    return storage_runtime.storage_managed_queue(RelaySettings.from_env())
+    return cli_support._managed_queue_from_env()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def _submit_managed_job(job: RelayJob) -> RelayJob:
-    """Submit through storage admission and emit stable JSON on refusal."""
-    try:
-        return _managed_queue_from_env().submit_job(job)
-    except StorageAdmissionError as exc:
-        _echo_storage_admission_error(exc)
-        raise typer.Exit(code=1) from exc
+    return cli_support._submit_managed_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        job
+    )
 
 
 # F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): a bare object re-binding
@@ -4870,24 +4870,13 @@ def _echo_storage_admission_error(error: StorageAdmissionError) -> None:
 
 
 def _json_object(value: str) -> dict[str, object]:
-    source = Path(value[1:]).read_text(encoding="utf-8-sig") if value.startswith("@") else value
-    try:
-        loaded = cast(object, json.loads(source))
-    except JSONDecodeError as exc:
-        raise typer.BadParameter(f"value must be valid JSON: {exc.msg}") from exc
-    if not isinstance(loaded, dict):
-        raise typer.BadParameter("value must be a JSON object")
-    return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
+    return cli_support._json_object(value)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def _json_text_from_option(source: str, source_file: Path | None) -> str:
-    if source_file is None:
-        return source
-    if source != "{}":
-        raise typer.BadParameter("use either the JSON value option or the JSON file option")
-    if not source_file.exists():
-        raise typer.BadParameter(f"JSON file does not exist: {source_file}")
-    return source_file.read_text(encoding="utf-8-sig")
+    return cli_support._json_text_from_option(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        source, source_file
+    )
 
 
 @dataclass(frozen=True)
@@ -11116,71 +11105,32 @@ def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
     )
 
 
+# #231 cli.py decomposition, shared-plumbing relocation pass: these four
+# symbols' real bodies moved to cli_support.py -- see that module's own
+# docstring. Thin forwarders, not bare object re-bindings, for the same
+# F3/F4 reason every other forwarder in this file carries.
 def _environment_references(items: list[str] | None) -> dict[str, str]:
-    """Parse repeatable CHILD=SOURCE environment references without reading values."""
-    references: dict[str, str] = {}
-    for item in items or []:
-        child_name, separator, source_name = item.partition("=")
-        if not separator or not child_name or not source_name:
-            raise typer.BadParameter("--env-from entries must use CHILD=SOURCE")
-        if child_name in references:
-            raise typer.BadParameter(f"--env-from child name is repeated: {child_name}")
-        references[child_name] = source_name
-    return references
+    return cli_support._environment_references(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        items
+    )
 
 
 def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
-    """Parse legacy shorthand or canonical JSON artifact dependency bindings."""
-    refs: list[ArtifactUse] = []
-    for item in items or []:
-        try:
-            if item.lstrip().startswith("{"):
-                refs.append(ArtifactUse.model_validate_json(item))
-            else:
-                artifact_id, separator, sha256 = item.partition("=")
-                if not separator or not artifact_id or not sha256:
-                    raise ValueError(
-                        "dependency must use ARTIFACT_ID=SHA256 or a canonical JSON object"
-                    )
-                refs.append(ArtifactUse(artifact_id=artifact_id, sha256=sha256))
-        except ValueError as exc:
-            raise typer.BadParameter(
-                str(exc),
-                param_hint="--used-artifact",
-            ) from exc
-    artifact_ids = [ref.artifact_id for ref in refs]
-    if len(artifact_ids) != len(set(artifact_ids)):
-        raise typer.BadParameter(
-            "--used-artifact values must have unique artifact IDs",
-            param_hint="--used-artifact",
-        )
-    canonical = sorted(refs, key=lambda ref: ref.artifact_id)
-    try:
-        validate_artifact_use_collection(canonical)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--used-artifact") from exc
-    return canonical
+    return cli_support._artifact_use_refs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        items
+    )
 
 
 def _artifact_use_cli_value(ref: ArtifactUse) -> str:
-    """Render legacy shorthand or canonical JSON for one CLI dependency."""
-    if ref.provenance is None:
-        return f"{ref.artifact_id}={ref.sha256}"
-    return json.dumps(
-        artifact_use_payload(ref),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
+    return cli_support._artifact_use_cli_value(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ref
     )
 
 
 def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
-    """Return a stable suffix only when a submission has artifact dependencies."""
-    if not refs:
-        return ""
-    payload = [artifact_use_payload(ref) for ref in refs]
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return f":uses-{hashlib.sha256(encoded).hexdigest()}"
+    return cli_support._artifact_use_idempotency_suffix(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        refs
+    )
 
 
 # F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare

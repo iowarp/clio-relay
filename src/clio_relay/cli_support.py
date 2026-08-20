@@ -29,6 +29,29 @@ The new ``cli_relay_host.py`` module reaches these through ``cli.py``'s
 existing re-export (``import clio_relay.cli as cli``, then
 ``cli._require_cluster(...)``), which is why the alias must keep the same
 name cli.py always exposed it under.
+
+**#231 cli.py decomposition, shared-plumbing relocation pass.** SS5's
+target-owner-map row for this module also names ``_json_object``,
+``_managed_queue_from_env``, and the artifact-use helpers -- left in cli.py
+through R8(ii) because cli.py's own top-level command bodies (``mcp-call``,
+``jarvis-mcp-call``, ``jarvis-mcp-refresh``, ``jarvis-mcp-validate``) were
+still their heaviest resident callers at the time, the same "cli.py is
+still the primary user" argument R8(ii) used for the five helpers above.
+The jarvis-mcp command-group extraction moved every one of those bodies out
+of cli.py, so the argument no longer holds: ``_submit_managed_job``,
+``_artifact_use_refs``, and ``_artifact_use_cli_value`` now have zero
+remaining cli.py-*internal* callers (only the external ``cli.<symbol>``
+call sites the already-extracted ``cli_agent.py``/``cli_job.py``/
+``cli_job_records.py``/``cli_gateway.py``/``cli_monitor.py``/``cli_queue.py``/
+``cli_queue_maintenance.py`` reach through cli.py's forwarder), while
+``_managed_queue_from_env``, ``_json_object``, ``_json_text_from_option``,
+and ``_environment_references`` still have one or two -- session start/
+teardown for the queue opener, the still-unsequenced remote-mcp validation
+command for the JSON parsers and the env-from parser. Both cases get the
+identical treatment already established above: real body here, thin
+forwarder in cli.py under the original name, so neither cli.py's own
+remaining callers nor any external module's existing ``cli.<symbol>`` call
+site needs to change.
 """
 
 # The five collaborator entry points below (`_acceptance_report_command`,
@@ -45,19 +68,29 @@ name cli.py always exposed it under.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Callable
 from contextlib import suppress
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, cast
 
 import typer
 from pydantic import ValidationError
 
+import clio_relay.storage_runtime as storage_runtime
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
+from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.storage_runtime import StorageAdmissionError
+from clio_relay.models import (
+    ArtifactUse,
+    RelayJob,
+    artifact_use_payload,
+    validate_artifact_use_collection,
+)
+from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (
     LiveValidationReport,
     ValidationRecorder,
@@ -186,3 +219,105 @@ def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
         f"{label} is required; pass it explicitly, set {env_name}, "
         f"or add {env_name} to .clio-relay/secrets.json"
     )
+
+
+def _managed_queue_from_env() -> StorageManagedQueue:
+    """Open the production queue with durable storage reconciliation enabled."""
+    return storage_runtime.storage_managed_queue(RelaySettings.from_env())
+
+
+def _submit_managed_job(job: RelayJob) -> RelayJob:
+    """Submit through storage admission and emit stable JSON on refusal."""
+    try:
+        return _managed_queue_from_env().submit_job(job)
+    except StorageAdmissionError as exc:
+        _echo_storage_admission_error(exc)
+        raise typer.Exit(code=1) from exc
+
+
+def _json_object(value: str) -> dict[str, object]:
+    source = Path(value[1:]).read_text(encoding="utf-8-sig") if value.startswith("@") else value
+    try:
+        loaded = cast(object, json.loads(source))
+    except JSONDecodeError as exc:
+        raise typer.BadParameter(f"value must be valid JSON: {exc.msg}") from exc
+    if not isinstance(loaded, dict):
+        raise typer.BadParameter("value must be a JSON object")
+    return {str(key): item for key, item in cast(dict[object, object], loaded).items()}
+
+
+def _json_text_from_option(source: str, source_file: Path | None) -> str:
+    if source_file is None:
+        return source
+    if source != "{}":
+        raise typer.BadParameter("use either the JSON value option or the JSON file option")
+    if not source_file.exists():
+        raise typer.BadParameter(f"JSON file does not exist: {source_file}")
+    return source_file.read_text(encoding="utf-8-sig")
+
+
+def _environment_references(items: list[str] | None) -> dict[str, str]:
+    """Parse repeatable CHILD=SOURCE environment references without reading values."""
+    references: dict[str, str] = {}
+    for item in items or []:
+        child_name, separator, source_name = item.partition("=")
+        if not separator or not child_name or not source_name:
+            raise typer.BadParameter("--env-from entries must use CHILD=SOURCE")
+        if child_name in references:
+            raise typer.BadParameter(f"--env-from child name is repeated: {child_name}")
+        references[child_name] = source_name
+    return references
+
+
+def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
+    """Parse legacy shorthand or canonical JSON artifact dependency bindings."""
+    refs: list[ArtifactUse] = []
+    for item in items or []:
+        try:
+            if item.lstrip().startswith("{"):
+                refs.append(ArtifactUse.model_validate_json(item))
+            else:
+                artifact_id, separator, sha256 = item.partition("=")
+                if not separator or not artifact_id or not sha256:
+                    raise ValueError(
+                        "dependency must use ARTIFACT_ID=SHA256 or a canonical JSON object"
+                    )
+                refs.append(ArtifactUse(artifact_id=artifact_id, sha256=sha256))
+        except ValueError as exc:
+            raise typer.BadParameter(
+                str(exc),
+                param_hint="--used-artifact",
+            ) from exc
+    artifact_ids = [ref.artifact_id for ref in refs]
+    if len(artifact_ids) != len(set(artifact_ids)):
+        raise typer.BadParameter(
+            "--used-artifact values must have unique artifact IDs",
+            param_hint="--used-artifact",
+        )
+    canonical = sorted(refs, key=lambda ref: ref.artifact_id)
+    try:
+        validate_artifact_use_collection(canonical)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--used-artifact") from exc
+    return canonical
+
+
+def _artifact_use_cli_value(ref: ArtifactUse) -> str:
+    """Render legacy shorthand or canonical JSON for one CLI dependency."""
+    if ref.provenance is None:
+        return f"{ref.artifact_id}={ref.sha256}"
+    return json.dumps(
+        artifact_use_payload(ref),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
+    """Return a stable suffix only when a submission has artifact dependencies."""
+    if not refs:
+        return ""
+    payload = [artifact_use_payload(ref) for ref in refs]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f":uses-{hashlib.sha256(encoded).hexdigest()}"

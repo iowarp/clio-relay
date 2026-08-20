@@ -204,7 +204,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # ~2,450-line JARVIS execution-query engine these commands call stays
     # cli.py-resident (unsequenced future work, see cli_jarvis_mcp.py's own
     # docstring): -1004 net lines.
-    "src/clio_relay/cli.py": 11193,
+    # #231 cli.py decomposition: shared-plumbing relocation pass --
+    # _managed_queue_from_env/_submit_managed_job/_json_object/
+    # _json_text_from_option/_environment_references/_artifact_use_refs/
+    # _artifact_use_cli_value/_artifact_use_idempotency_suffix real bodies
+    # moved to cli_support.py, cli.py keeps each as a thin forwarder under
+    # its original name: -50 net lines.
+    "src/clio_relay/cli.py": 11143,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
