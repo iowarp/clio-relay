@@ -1031,7 +1031,112 @@ RATCHET_BASELINE: dict[str, int] = {
     # lineage's shape) account for the added lines, offset by deleting the
     # now-dead local-only _read_model_artifact_bytes. A justified, minimal
     # ratchet-up: 6098 -> 6107.
-    "src/clio_relay/mcp_server.py": 6107,
+    #
+    # split/mcp-server-w3 slice 1 (#231, fresh split off current develop --
+    # see this file's own docstring/history above for why the #264 routing
+    # fix is folded in rather than reapplied on top of stale wave-1 code):
+    # the tool catalog concern (doc's "mcp_server.py's tool catalog +
+    # dispatcher" owner-module row) moves to mcp_tool_catalog.py, itself a
+    # thin assembler over four tool-domain leaf modules
+    # (mcp_tool_catalog_job_lifecycle.py / _monitoring.py /
+    # _queue_retention.py / _gateway_session.py -- the real seam split the
+    # ~1,100-line `_all_tool_definitions` needed once extracted on its own,
+    # since a single ~1,270-line catalog module would itself have
+    # re-exceeded the 800-line cap). The #264 relay_list_artifacts/
+    # relay_read_artifact cluster/route_revision schema properties move with
+    # their tool definitions into mcp_tool_catalog_monitoring.py rather than
+    # being lost. mcp_server.py imports the moved names
+    # (`_all_tool_definitions`, `_authorized_static_tool_names`,
+    # `static_mcp_tool_names`, `MAX_AGENT_LOG_READ_BYTES`,
+    # `USER_MCP_TOOL_NAMES`) back for its own remaining catalog/
+    # authorization call sites and re-exports two of them so `cli.py` /
+    # `fastmcp_server.py` / `mcp_stdio_validation.py` keep importing from
+    # `clio_relay.mcp_server` unchanged.
+    #
+    # split/mcp-server-w3 slice 2 (#231): the ~25 pure MCP tool-argument
+    # coercion/validation helpers left in the file once the catalog moved
+    # move to mcp_arguments.py. None of them call an imported name any test
+    # monkeypatches (confirmed by grep before the move); `_remote_json` /
+    # `_remote_json_value` (call the monkeypatched `run_remote_clio`) and
+    # `_owned_json` / `_validate_owned_job_status` (owned-session-specific,
+    # not generic coercion) stayed for exactly that reason.
+    #
+    # split/mcp-server-w3 slice 3 (#231): -453 net lines -- the 43-branch
+    # `_call_tool` dispatcher (the "tool catalog + dispatcher" row's
+    # dispatcher half) moves to mcp_dispatch.py. It calls ~30 business-logic
+    # functions that stay in mcp_server.py (several directly monkeypatched
+    # by tests at `mcp_server_module.<name>`; all of them unimportable at
+    # module scope regardless, since mcp_server.py imports `_call_tool` from
+    # mcp_dispatch.py, which would otherwise be a load-order cycle) -- every
+    # such call goes through a function-scope back-reference
+    # (`_mcp_server.<name>(...)`, imported inside `_call_tool`'s own body
+    # via `from clio_relay import mcp_server as _mcp_server`) so
+    # mcp_server.py's live module namespace, including anything a test has
+    # monkeypatched, is what actually resolves at call time. The #264
+    # relay_list_artifacts/relay_read_artifact cluster-routing dispatch
+    # bodies move with the rest of `_call_tool`, calling
+    # `_mcp_server._job_target`/`_mcp_server._route_revision` (still
+    # resident) the same way relay_artifact_lineage's existing
+    # `_mcp_server._used_artifacts_tool`/`_used_by_tool` calls already do.
+    #
+    # split/mcp-server-w3 slice 4 (#231): the remote-MCP-catalog resolution /
+    # MCP-profile-normalization cluster (`_remote_mcp_catalog`,
+    # `_configured_cluster_names`, `_tool_definitions_and_remote_catalog`,
+    # `_bound_virtual_jarvis_clusters`, `_normalize_profile`,
+    # `_mcp_profile_from_env`, `_require_compatible_remote_mcp_catalog`,
+    # `_route_revision`, `_validated_route_revision`) moves to
+    # mcp_remote_catalog.py. A clean leaf (none call back into an
+    # mcp_server.py-only business function) but two of its own functions
+    # (`_remote_mcp_catalog`, `_configured_cluster_names`) are directly
+    # monkeypatched by tests, and `_route_revision` alone has 30+ bare call
+    # sites in functions that stay in mcp_server.py (including mcp_dispatch.py's
+    # `_mcp_server._route_revision` calls in the #264 artifact-routing dispatch
+    # bodies, which keep resolving through this re-export unchanged) --
+    # mcp_server.py re-exports every moved name, and
+    # `_tool_definitions_and_remote_catalog`'s own internal calls to the two
+    # monkeypatched names go through the same `_mcp_server.<name>`
+    # function-scope back-reference the slice-3 dispatcher uses, not a bare
+    # same-module call, which would resolve through mcp_remote_catalog's own
+    # globals and silently miss every test patch. A third re-export
+    # ("is_virtual_jarvis_tool as is_virtual_jarvis_tool") was needed for the
+    # same reason: tests/test_mcp_server.py reads
+    # mcp_server_module.is_virtual_jarvis_tool directly (not a monkeypatch, a
+    # plain attribute access), and it lost its only bare in-file caller
+    # (`_tool_definitions_and_remote_catalog`) to this same slice.
+    #
+    # split/mcp-server-w3 slice 5 (#231): the relay-queue MCP tools
+    # (_queue_cancel_tool, _queue_list_tool, _queue_diagnose_tool,
+    # _queue_stale_tool, _queue_cleanup_stale_tool, _worker_status_tool,
+    # plus their two purely-internal helpers _queue_tool_target /
+    # _queue_route_result) move to mcp_queue_tools.py. Two names on their
+    # remote branch (`should_execute_on_cluster`, `OwnedSessionApiClient`)
+    # are directly monkeypatched by tests, and three more (`_owned_json`,
+    # `_remote_json`, `_validate_owned_job_status`) stay defined in
+    # mcp_server.py itself -- both go through the `_mcp_server.<name>`
+    # function-scope back-reference established in slices 3/4.
+    # `_queue_tool_target`/`_queue_route_result` use neither, so the six
+    # tool functions' calls into them stay bare, same-module references.
+    # mcp_server.py re-exports the six dispatcher-reached tool functions
+    # (mcp_dispatch.py's `_call_tool` reaches them only through the
+    # `_mcp_server.<name>` back-reference too); the two internal helpers
+    # need no re-export since nothing outside this module calls them.
+    #
+    # split/mcp-server-w3 slice 6 (#231): the gateway-session / monitor-rule /
+    # progress MCP tools (_monitor_rule_from_arguments, _record_progress,
+    # _record_task_event, _create_gateway_session, _bind_jarvis_runtime,
+    # _jarvis_runtime_binding_selectors, _update_gateway_session,
+    # _reject_generic_gateway_runtime_fields, _required_environment_secret)
+    # move to mcp_gateway_tools.py. Two names `_bind_jarvis_runtime` calls are
+    # directly monkeypatched by tests (`_remote_cluster_definition`, which
+    # also stays defined in mcp_server.py since many other functions call it
+    # too, and `resolve_jarvis_service_runtime`, imported from
+    # clio_relay.jarvis_service_runtime everywhere else but reached here
+    # through the back-reference specifically because of the monkeypatch) --
+    # both go through the `_mcp_server.<name>` function-scope back-reference.
+    # mcp_server.py re-exports both of the dispatcher/monkeypatch-reached
+    # names it needs (resolve_jarvis_service_runtime plus the six tool
+    # functions mcp_dispatch.py's `_call_tool` reaches only through its own
+    # back-reference).
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
@@ -1100,7 +1205,86 @@ RATCHET_BASELINE: dict[str, int] = {
     # ratchet-up note described.) (NOTE: split/mcp-stdio-validation-w2 also
     # forked before models-w2/process-containment-w2/queue-management-w2/
     # queue-validation-w2 landed and still carried their stale 2299/2678/
-    # 1671/1546 entries; omitted for the same reason as above.)
+    # 1671/1546 entries; omitted for the same reason as above.) (NOTE:
+    # split/mcp-server-w3 also forked after all four of those w2 branches had
+    # already landed on develop, so it never carried their stale entries in
+    # the first place -- no reintroduction to omit.)
+    #
+    # split/mcp-server-w3 slice 7 (#231): the MCP result-verification/
+    # artifact-completion cluster (the largest, most interconnected cluster
+    # split so far) splits along its natural seam into mcp_remote_transport.py
+    # (paged remote/owned-session JSON fetching and collection completion:
+    # _remote_json, _remote_json_value, _owned_json, _validate_owned_job_status,
+    # _complete_local_artifacts, _complete_remote_collection,
+    # _complete_owned_collection, _validate_complete_collection_page,
+    # _remote_job_logs, _owned_job_logs) and mcp_result_verification.py (MCP
+    # result decoding/verification and terminal-evidence shaping:
+    # _VerifiedMcpResult, _verified_mcp_result, _owned_mcp_result_is_required,
+    # _verified_owned_mcp_result, _verified_local_mcp_result,
+    # _decode_verified_mcp_result, _mcp_result_artifact, _bounded_mcp_result,
+    # _restore_jarvis_service_authorization_descriptors,
+    # _jarvis_service_runtime_items, _mcp_tool_result_failed,
+    # _public_mcp_result_artifact, _attach_terminal_mcp_evidence,
+    # _render_remote_mcp_context). Fresh split off current develop: the #264
+    # fix already deleted the dead _read_model_artifact_bytes helper (its only
+    # caller, the old inline relay_read_artifact dispatch body, was replaced by
+    # artifact_routing.read_artifact in slice 3), so it is not part of this
+    # cluster and mcp_server.py carries no matching re-export for it -- wave-1's
+    # own history for this slice lists it among the moved names because that
+    # branch forked before #264 landed; it is correctly absent here.
+    # Five bare calls inside the cluster need the `_mcp_server.<name>`
+    # function-scope back-reference instead of a same-module bare call:
+    # `_remote_json_value` -> `run_remote_clio`;
+    # `_complete_remote_collection`/`_remote_job_logs`/`_verified_mcp_result` ->
+    # `_remote_json`; `_verified_local_mcp_result` -> `_complete_local_artifacts`
+    # -- splitting the cluster into two modules did not change any of these,
+    # since the target is monkeypatched either way. mcp_server.py re-exports
+    # `_bounded_mcp_result`/`_decode_verified_mcp_result` (read directly off
+    # mcp_server_module by tests, not monkeypatched, just no longer called bare
+    # in this file) alongside the rest of the cluster's dispatcher-reached
+    # names.
+    #
+    # split/mcp-server-w3 slice 8 (#231): the job status/artifact-lineage/
+    # cancel/observe/wait cluster, the most heavily interconnected cluster
+    # split so far, moves out. A single module would have measured over the
+    # 800-line ratchet cap, so it splits along its own seam:
+    # mcp_job_status.py (read-only status/lineage: _job_target,
+    # _require_local_job_cluster, _status_job, _used_artifacts_tool,
+    # _used_by_tool) and mcp_job_lifecycle.py (mutating/bounded-
+    # reconciliation: _cancel_job, _observe_job, _observe_remote_pattern,
+    # _wait_job, _observed_remote_wait_job, _relay_job_from_wait_document,
+    # _job_logs, _event_match_candidates, _bounded_observe_value,
+    # _append_bounded_observe_matches). mcp_job_lifecycle.py calls two
+    # mcp_job_status.py names bare (_job_target, _require_local_job_cluster)
+    # -- neither is monkeypatched, so that is a plain one-directional leaf
+    # import, not a back-reference. mcp_dispatch.py's #264 artifact-routing
+    # dispatch bodies (slice 3) follow the same rule: they now import
+    # `_job_target` directly from `clio_relay.mcp_job_status` instead of
+    # reaching it through `_mcp_server.<name>` -- `_job_target` moved out from
+    # under the back-reference wave-1's own tree never needed (it predates
+    # #264), so the dispatch bodies are repointed to the plain leaf import
+    # here rather than carrying a now-broken `_mcp_server._job_target`
+    # attribute lookup forward.
+    #
+    # split/mcp-server-w3 slice 9 (#231, final slice -- completes the
+    # decomposition): the submission cluster (_submit_jarvis_job,
+    # _submit_jarvis_pipeline, _submit_remote_agent, _submit_mcp_call,
+    # _submit_jarvis_mcp_call, plus their shared idempotency/staging/input-
+    # binding helpers) moves out, split along its own seam into
+    # mcp_submission_agent.py (jarvis/pipeline/remote-agent job submission),
+    # mcp_submission_mcp_call.py (mcp_call/jarvis_mcp_call submission and the
+    # virtual-JARVIS routing it shares with them), and
+    # mcp_submission_result.py (the owned/local result-binding tail every
+    # submission path funnels through). mcp_server.py is now 708 lines --
+    # under DEFAULT_MAX_LINES -- entry removed per this script's own
+    # documented convention: "remove the entry once the file is under
+    # DEFAULT_MAX_LINES". What remains resident is the module docstring,
+    # imports/re-exports (every name any test monkeypatches or reads off
+    # mcp_server_module, plus the two names other modules still import from
+    # clio_relay.mcp_server), `_serialize_tool_result`, and a handful of
+    # thin public wrappers (`serialize_mcp_tool_result`,
+    # `mcp_tool_result_failed`, `serve_stdio`) -- the facade the whole
+    # split/mcp-server-w3 campaign was built toward.
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
