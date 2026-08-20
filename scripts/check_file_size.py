@@ -608,16 +608,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # contract as FAILED. A ratchet-up for a one-line real bug fix, not
     # accretion.
     "src/clio_relay/jarvis_mcp_validation.py": 2672,
-    # #231 R6 review fixes: +11 net lines -- F5, `_load_source` checks
-    # is_delivery_refusal on the source envelope FIRST and raises the
-    # refusal's own message/code, instead of the generic "is not a base64
-    # envelope" that misdescribes why the artifact is unavailable. A
-    # justified, minimal ratchet-up.
-    # #231 R6-fix review, A2: +2 net lines -- the message extraction now
-    # delegates to `bounded_payload.describe_delivery_refusal`; the
-    # multi-line f-string it feeds grew by one line in exchange. A
-    # justified, minimal ratchet-up.
-    "src/clio_relay/jarvis_service_runtime.py": 1171,
+    # split/jarvis-service-runtime-w2: the wire/data models (14 Pydantic
+    # classes plus the canonical digest/path/UTF-8 validation primitives
+    # their field validators are built on) moved to the new
+    # jarvis_service_runtime_models.py (390 lines); the source-job/MCP-result
+    # provenance checks and ready-service selection/package-identity checks
+    # moved to the new jarvis_service_runtime_validation.py (231 lines).
+    # What stays resident is only the cluster that reads/re-verifies the
+    # durable relay queue and resolves a private JARVIS authority bearer --
+    # every function reachable from one of the six externally-patched
+    # collaborators this module's own test suite targets by module attribute
+    # (`monkeypatch.setattr(jarvis_service_runtime, "read_artifact_bytes",
+    # ...)` and five more: `should_execute_on_cluster`, `run_remote_clio`,
+    # `run_remote_jarvis_runtime_authority`, `OwnedSessionApiClient`,
+    # `JarvisCdProvider`), since a bare-name call only observes a patch on
+    # the module its own global namespace resolves through -- moving one of
+    # those functions to an owner module would silently break the patch, not
+    # just move it. 1171 -> 550, under the 800-line default cap -- entry
+    # removed per ground rule 5 -- ratchet down.
     # #231 R6 review fixes: +20 net lines -- F5, both `_verify_completed_
     # job`'s inline artifact/provenance checks and the new shared
     # `_delivery_refusal_error` helper now recognize a T2 refusal by its
