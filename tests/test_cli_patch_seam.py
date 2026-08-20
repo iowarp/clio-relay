@@ -101,6 +101,16 @@ _GUARDED_CALLERS: dict[str, Path] = {
     # now call directly, replacing "cli" as the entries' `caller` below.
     "cli_session_start": _SRC_ROOT / "cli_session_start.py",
     "cli_session_teardown": _SRC_ROOT / "cli_session_teardown.py",
+    # split/cli-session-teardown-w3: cli_session_teardown.py's own further
+    # decomposition into a facade plus phase-owner modules. Each guarded
+    # here so a future edit to any of them cannot silently reintroduce a
+    # bare import of an audited collaborator.
+    "cli_session_teardown_state": _SRC_ROOT / "cli_session_teardown_state.py",
+    "cli_session_teardown_recovery": _SRC_ROOT / "cli_session_teardown_recovery.py",
+    "cli_session_teardown_jobs": _SRC_ROOT / "cli_session_teardown_jobs.py",
+    "cli_session_teardown_finalize": _SRC_ROOT / "cli_session_teardown_finalize.py",
+    "cli_session_teardown_report": _SRC_ROOT / "cli_session_teardown_report.py",
+    "cli_session_teardown_action": _SRC_ROOT / "cli_session_teardown_action.py",
     "cli_owned_session_recovery": _SRC_ROOT / "cli_owned_session_recovery.py",
     "cli_jarvis_execution_run": _SRC_ROOT / "cli_jarvis_execution_run.py",
     "cli_jarvis_pending_report": _SRC_ROOT / "cli_jarvis_pending_report.py",
@@ -124,7 +134,10 @@ _GUARDED_CALLERS: dict[str, Path] = {
 # reintroduces the same coupling).
 AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("session_lifecycle", "status_remote_session", "cli_session"),
-    ("session_lifecycle", "teardown_remote_session", "cli_session_teardown"),
+    # split/cli-session-teardown-w3: moved caller cli_session_teardown ->
+    # cli_session_teardown_finalize with the coordinator-call/closure phase
+    # extraction (teardown_remote_session's only call site).
+    ("session_lifecycle", "teardown_remote_session", "cli_session_teardown_finalize"),
     ("remote_cli", "run_remote_clio", "cli"),
     ("remote_cli", "should_execute_on_cluster", "cli"),
     ("mcp_stdio_validation", "run_packaged_mcp_stdio_session", "cli_jarvis_execution_run"),
@@ -161,8 +174,11 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # with the installation/receipt command-group extraction (bootstrap_
     # inspect's own serialization lock; its only cli.py call site).
     ("bootstrap_reconcile", "bootstrap_invocation_lock", "cli_installation_receipt"),
-    ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli_session_teardown"),
-    ("session_lifecycle", "read_remote_session_cleanup_report", "cli_session_teardown"),
+    # split/cli-session-teardown-w3: moved caller cli_session_teardown ->
+    # cli_session_teardown_state with _persist_verified_cleanup_report_
+    # before_closure's extraction (its only call site for each).
+    ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli_session_teardown_state"),
+    ("session_lifecycle", "read_remote_session_cleanup_report", "cli_session_teardown_state"),
     ("session_lifecycle", "inspect_owned_session_recovery_status", "cli_owned_session_recovery"),
     # #231 cli.py decomposition: moved caller cli -> cli_release with the
     # release command-group extraction (run_local_release_validation's only
