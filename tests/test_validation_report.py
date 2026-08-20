@@ -25,6 +25,7 @@ import pytest
 from pydantic import ValidationError
 from pytest import MonkeyPatch
 
+from clio_relay import artifact_identity_verification as artifact_identity_verification_module
 from clio_relay import validation_report as validation_report_module
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import GatewaySession, GatewaySessionState
@@ -478,8 +479,8 @@ def test_released_https_wheel_binds_url_sha_record_and_uv_tool(
         build_opener,
     )
     monkeypatch.setattr(
-        validation_report_module,
-        "_url_host_resolves_publicly",
+        artifact_identity_verification_module,
+        "url_host_resolves_publicly",
         publicly_resolved,
     )
 
@@ -706,7 +707,7 @@ def test_release_wheel_fetch_rejects_private_dns_and_unsafe_redirects(
         assert type is socket.SOCK_STREAM
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
 
-    monkeypatch.setattr(validation_report_module.socket, "getaddrinfo", private_dns)
+    monkeypatch.setattr(artifact_identity_verification_module.socket, "getaddrinfo", private_dns)
 
     assert validation_report_module._is_official_release_wheel_url(source_url) is True  # pyright: ignore[reportPrivateUsage]
     assert validation_report_module._url_host_resolves_publicly(source_url) is False  # pyright: ignore[reportPrivateUsage]

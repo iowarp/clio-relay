@@ -606,7 +606,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # (external HTTP/MCP/public-records callers); the private helpers were
     # internal-only, so validation_recorder.py and the three still-inline
     # call sites here import directly from redaction.py. 4336 -> 4211.
-    "src/clio_relay/validation_report.py": 4211,
+    # #231 split/validation-report S5: artifact-identity verification (wheel/
+    # PyPI/VCS-commit provenance binding a claimed artifact_sha256 to the
+    # bytes this process loaded) moved to artifact_identity_verification.py
+    # (563 lines -- over the 150-500 sweet spot but under the 800 cap; one
+    # coherent concern, not split further). Every top-level entry point
+    # test_validation_report.py exercises directly (not just the ones this
+    # module's own remaining code still calls) is re-exported under its
+    # original private name -- three via `public_name as _old_name` plus a
+    # forced-keep lint suppression comment (ruff's unused-import exemption
+    # only recognizes a literal `X as X` self-import, not a rename) since a
+    # genuinely unused rename import is otherwise pruned silently. 4211 ->
+    # 3751.
+    "src/clio_relay/validation_report.py": 3751,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
