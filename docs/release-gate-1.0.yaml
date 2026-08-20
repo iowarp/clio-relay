@@ -128,9 +128,9 @@ requirements:
                 record_schema: jarvis.execution.record.v1
                 progress_schema: jarvis.execution.progress.v1
                 operations: [jarvis_get_execution, jarvis_run]
-                contract_id: clio-kit-jarvis-user-v3.7
+                contract_id: clio-kit-jarvis-user-v3.7.1
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: d34761523f39e75b144a0567eb368c3cb51c199ea40da0010aaf572afdd2cec4
+                contract_sha256: ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849
             jarvis-cd:
               distribution: jarvis_cd
               distribution_version: "1.8.0"
@@ -317,9 +317,9 @@ requirements:
                 operations:
                   - jarvis_get_execution
                   - jarvis_run
-                contract_id: clio-kit-jarvis-user-v3.7
+                contract_id: clio-kit-jarvis-user-v3.7.1
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: d34761523f39e75b144a0567eb368c3cb51c199ea40da0010aaf572afdd2cec4
+                contract_sha256: ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849
             jarvis-cd:
               distribution: jarvis_cd
               distribution_version: "1.8.0"
@@ -1106,7 +1106,7 @@ requirements:
     evidence_group_resource_kind: gateway_session
 
   - requirement_id: ares-secure-jarvis-runtime
-    description: exercise the authenticated JARVIS v3.7 handoff and relay-core browser, reconnect, and preserve-by-default lifecycle on the Ares release-evidence target; UI-adapter acceptance is separate
+    description: exercise the authenticated JARVIS v3.7.1 handoff and relay-core browser, reconnect, and preserve-by-default lifecycle on the Ares release-evidence target; UI-adapter acceptance is separate
     cluster: ares
     scenarios:
       - secure-runtime

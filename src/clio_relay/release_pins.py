@@ -408,9 +408,12 @@ def sweep_incompleteness(root: Path) -> tuple[UnregisteredHit, ...]:
 
 
 #: The CURRENT canonical contract revision only. Sites pinning an OLDER
-#: revision (v3.1-v3.6) are a deliberate, permanent multi-version
-#: compatibility surface -- not #198's concern, and not swept here.
-_CURRENT_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-v3\.7\b")
+#: revision (v3.1-v3.7) are a deliberate, permanent multi-version
+#: compatibility surface -- not #198's concern, and not swept here. Update
+#: this literal (never widen it to a general vX.Y[.Z] wildcard) each time
+#: "current" advances -- exactly the same discipline every other pin site
+#: in this registry already follows.
+_CURRENT_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-v3\.7\.1\b")
 #: Files naming a v3.7 path or literal as registry metadata or test-fixture
 #: sample data, not an unowned duplicate pin: this module and its
 #: companion data table (their own docstrings/row data), and this sweep's

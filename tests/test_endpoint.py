@@ -3136,7 +3136,7 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),
@@ -5959,7 +5959,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
+                expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
                 expected_jarvis_cd_lock_binding=(
                     None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
                 ),

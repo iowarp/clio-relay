@@ -140,12 +140,19 @@ def _row(
 
 # Shared patterns -- one compiled object per shape, reused across rows.
 #: The JARVIS MCP user contract id/filename, in any of its surface forms:
-#: `clio-kit-jarvis-user-vX.Y`, bare `jarvis-user-vX.Y.json`, and the
-#: RST-backtick-quoted docstring form -- all share this one capture.
-_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-(v[0-9]+\.[0-9]+)")
-#: A bare `vX.Y` token with no surrounding contract-name context (doc §7's
-#: two frozen "v3.6" sites: a description sentence and a stable check-id).
-_BARE_V = re.compile(r"\b(v[0-9]+\.[0-9]+)\b")
+#: `clio-kit-jarvis-user-vX.Y` or the patch-level `vX.Y.Z` (owner doctrine:
+#: contract versioning is patch-level -- v3.7.1 for a small additive change),
+#: bare `jarvis-user-vX.Y[.Z].json`, and the RST-backtick-quoted docstring
+#: form -- all share this one capture. The patch segment is OPTIONAL so
+#: every existing vX.Y revision (v3.1-v3.7) still matches unchanged.
+_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)")
+#: A bare `vX.Y[.Z]` token with no surrounding contract-name context (doc
+#: §7's two frozen "v3.6" sites: a description sentence and a stable
+#: check-id). The optional patch segment mirrors ``_CONTRACT`` above --
+#: without it, a bare `v3.7.1` token is truncated to `v3.7` on read (the
+#: trailing `\b` is satisfied at the `7`/`.` boundary regardless of what
+#: follows).
+_BARE_V = re.compile(r"\b(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)\b")
 #: A lowercase SHA-256 hex digest, wherever it appears on the line.
 _HEX = re.compile(r"([0-9a-f]{64})")
 
@@ -381,7 +388,7 @@ PINSITES: tuple[PinSite, ...] = (
         line=68,
         pattern=re.compile(
             r'^_QUERY_CONTRACTS = \("clio-kit-jarvis-user-v3\.6", '
-            r'"clio-kit-jarvis-user-(v[0-9]+\.[0-9]+)"\)$'
+            r'"clio-kit-jarvis-user-(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)"\)$'
         ),
         value_group="jarvis_contract_id",
     ),

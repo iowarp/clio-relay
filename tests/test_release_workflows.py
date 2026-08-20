@@ -365,9 +365,9 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         "fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91"
     )
     native_execution = clio_kit_component["native_execution"]
-    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.7"
+    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.7.1"
     assert native_execution["contract_sha256"] == (
-        "d34761523f39e75b144a0567eb368c3cb51c199ea40da0010aaf572afdd2cec4"
+        "ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.8.0"

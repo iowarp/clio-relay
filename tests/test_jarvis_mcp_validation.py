@@ -2097,7 +2097,7 @@ def _remote_tool(
 def _bundled_wire_meta() -> dict[str, object]:
     """Per-tool ``_meta`` exactly as the bundled wire contract ships it.
 
-    clio-kit-jarvis-user-v3.7 added a top-level ``_meta`` to every wire tool;
+    clio-kit-jarvis-user-v3.7.1 added a top-level ``_meta`` to every wire tool;
     the wire digest covers it, so a reconstruction that drops it is unfaithful.
     """
     import json as _json
