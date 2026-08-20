@@ -22,7 +22,9 @@ from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
 from clio_relay import (
+    endpoint_execution_lifecycle,
     endpoint_execution_sidecar_cleanup,
+    endpoint_jarvis_dispatch,
     endpoint_jarvis_recovery,
     endpoint_runtime_sidecar_anchor,
     endpoint_sidecar_types,
@@ -216,7 +218,11 @@ def test_recovered_jarvis_run_result_nulls_stale_stream_truncation_records(
         def _always_trusted(_job: RelayJob, _document: object) -> tuple[bool, str]:
             return True, "test"
 
-        monkeypatch.setattr(endpoint_module, "_trusted_jarvis_mcp_result", _always_trusted)
+        # endpoint_jarvis_dispatch.py owns _write_recovered_jarvis_run_result
+        # (and its _trusted_jarvis_mcp_result call) now (clio-relay#231
+        # endpoint split); a bare-name call only observes a patch on the
+        # module its own globals resolve through.
+        monkeypatch.setattr(endpoint_jarvis_dispatch, "_trusted_jarvis_mcp_result", _always_trusted)
 
         cast(Any, worker)._write_recovered_jarvis_run_result(
             job,
@@ -655,7 +661,11 @@ def test_pending_execution_cleanup_processes_truncated_batches_automatically(
         )
         task_ids.append(task.task_id)
 
-    monkeypatch.setattr(endpoint_module, "EXECUTION_CLEANUP_SCAN_LIMIT", 2)
+    # endpoint_execution_lifecycle.py owns EXECUTION_CLEANUP_SCAN_LIMIT's real
+    # call sites now (clio-relay#231 endpoint split); patching endpoint_module
+    # only touches the facade's re-exported copy, not what
+    # _reconcile_pending_execution_cleanup actually reads.
+    monkeypatch.setattr(endpoint_execution_lifecycle, "EXECUTION_CLEANUP_SCAN_LIMIT", 2)
     endpoint = EndpointWorker(
         role=EndpointRole.WORKER,
         settings=settings,
@@ -5212,8 +5222,12 @@ def test_worker_retries_transient_scheduler_cancel_failure_with_backoff(
     assert worker.run_once() is None
     assert scheduler.canceled == ["retry-123"]
 
+    # endpoint_scheduler_cancel_actions.py owns _cancel_scheduler_jobs' real
+    # utc_now() call sites now (clio-relay#231 endpoint split); patching
+    # clio_relay.endpoint only touches the facade's re-exported copy, not
+    # what the retry-backoff logic actually reads.
     monkeypatch.setattr(
-        "clio_relay.endpoint.utc_now",
+        "clio_relay.endpoint_scheduler_cancel_actions.utc_now",
         lambda: failed[-1].created_at + timedelta(seconds=3),
     )
     assert worker.run_once() is None
@@ -5339,8 +5353,11 @@ def test_scheduler_cancel_acceptance_remains_pending_until_terminal_confirmation
         scheduler_job_id="confirm-123",
         phase=SchedulerPhase.CANCELED,
     )
+    # endpoint_scheduler_cancel_actions.py owns
+    # _confirm_scheduler_cancellation's real utc_now() call sites now
+    # (clio-relay#231 endpoint split).
     monkeypatch.setattr(
-        "clio_relay.endpoint.utc_now",
+        "clio_relay.endpoint_scheduler_cancel_actions.utc_now",
         lambda: cast(datetime, pending.dispositions[0].next_attempt_at) + timedelta(seconds=1),
     )
     assert worker.run_once() is None

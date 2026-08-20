@@ -691,7 +691,54 @@ RATCHET_BASELINE: dict[str, int] = {
     # one thin `_watch_deferred_jarvis_execution` method. A justified,
     # minimal ratchet-up (5915 -> 5991), mirroring #259's own precedent
     # immediately above.
-    "src/clio_relay/endpoint.py": 5991,
+    #
+    # #231 endpoint split, slice 10 (finishes the decomposition): the
+    # entire 5,555-line `EndpointWorker` class body moves out to 17 new
+    # `endpoint_*.py` owner modules, one per cohesive concern, each a
+    # ``*Mixin`` class -- the same composed-mixin pattern
+    # `core_queue.py`/`ClioCoreQueue` already established for exactly this
+    # "one class, too many methods" shape (core-queue-split-2026-08.md).
+    # `endpoint.py` now defines only lifecycle
+    # (`__init__`/`close`/`__del__`/`_require_open_queue_identity`/
+    # `register`) and composes `class EndpointWorker(ServeLoopMixin,
+    # JobExecutionMixin, ExecutionOutputMixin, ProgressIngestMixin,
+    # RuntimeSidecarFailureMixin, RuntimeMetadataIngestMixin,
+    # JarvisRecoveryQueryMixin, JarvisRecoveryBookkeepingMixin,
+    # JarvisDispatchMixin, RuntimeMetadataPersistMixin,
+    # SchedulerSubmissionMixin, SchedulerSubmissionReconcileMixin,
+    # ExecutionLifecycleMixin, ExecutionCleanupActionsMixin,
+    # SchedulerCancelMixin, SchedulerCancelActionsMixin,
+    # ResultFinalizationMixin)`; every mixin method's `self.foo()` resolves
+    # a sibling mixin's method through the ordinary MRO, exactly as if
+    # every method still lived in one file. `SchedulerSubmissionUnresolved
+    # Error` moves to the pre-existing pure-leaf `endpoint_sidecar_types.py`
+    # (raised/caught across seven of the new mixins; a leaf is the only
+    # home that keeps them acyclic). Two typed deviations, both because a
+    # bare-name read only observes a monkeypatch on the module its own
+    # globals resolve through (the same rule slice 6's `jarvis_mcp_command`
+    # note above already established): `EXECUTION_CLEANUP_SCAN_LIMIT`
+    # moves to `endpoint_execution_lifecycle.py` with its only two call
+    # sites (`tests/test_endpoint.py` repointed to patch that module
+    # directly); `_write_recovered_jarvis_run_result`'s
+    # `_trusted_jarvis_mcp_result` call now resolves in
+    # `endpoint_jarvis_dispatch.py`'s own globals (that one test repointed
+    # too). Every other name the original file's ~230-line import block
+    # carried -- constants, private helpers, `sys`/`secrets` -- is
+    # re-exported verbatim under its original name (the `X as X`
+    # self-alias idiom ruff/pyflakes recognizes as an intentional
+    # re-export, so F401 never strips it) precisely because
+    # `tests/test_jarvis_execution_recovery_guards.py` still does `from
+    # clio_relay.endpoint import (EndpointWorker,
+    # _close_recovery_directory_anchor, ...)` and several other test files
+    # read `endpoint_module.<name>` directly (not only via monkeypatch) --
+    # the same "forward every existing access, change nothing else"
+    # contract slice 1's note above already committed to. `endpoint.py` is
+    # now 633 lines, under DEFAULT_MAX_LINES -- entry removed per ground
+    # rule 5. The 17 new owner modules (155-736 lines each;
+    # `endpoint_job_execution.py` at 736, `_run_job_impl` alone, is this
+    # split's one sweet-spot exception -- its own docstring explains why)
+    # are all comfortably under the cap too, so none needs a baseline entry
+    # of its own.
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
