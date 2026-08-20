@@ -762,9 +762,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # now-dead local-only _read_model_artifact_bytes. A justified, minimal
     # ratchet-up: 6098 -> 6107.
     "src/clio_relay/mcp_server.py": 6107,
-    # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
-    # timeout message and log its bounded diagnostic once server-side.
-    "src/clio_relay/mcp_stdio_validation.py": 1285,
+    # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
+    # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
+    # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
+    # assembly/facade over its six owner modules --
+    # mcp_stdio_validation_executable.py, mcp_stdio_validation_process_io.py,
+    # mcp_stdio_validation_process.py, mcp_stdio_validation_contract.py,
+    # mcp_stdio_validation_jarvis_contract.py, mcp_stdio_validation_
+    # support.py), comfortably under DEFAULT_MAX_LINES with no baseline
+    # entry needed.
     # split/models-w2 (#231): models.py's own ratchet-baseline entry and its
     # v3.6/v3.7 history comment are removed here: the file is now a
     # re-export facade (~170 lines, well under DEFAULT_MAX_LINES) over eleven
@@ -821,7 +827,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # net-lines ratchet-up note for the pre-split queue_validation.py=1546
     # entry; both omitted for the same reason as above -- the file this
     # merge integrates is the split's facade, not the pre-split module the
-    # ratchet-up note described.)
+    # ratchet-up note described.) (NOTE: split/mcp-stdio-validation-w2 also
+    # forked before models-w2/process-containment-w2/queue-management-w2/
+    # queue-validation-w2 landed and still carried their stale 2299/2678/
+    # 1671/1546 entries; omitted for the same reason as above.)
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
