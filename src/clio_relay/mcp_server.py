@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from clio_relay import __version__
+from clio_relay import __version__, artifact_routing
 from clio_relay.bounded_payload import (
     build_delivery_refusal,
     is_delivery_refusal,
@@ -1212,11 +1212,17 @@ def _all_tool_definitions(
         },
         {
             "name": "relay_list_artifacts",
-            "description": "List one stable page of artifact references indexed for a job.",
+            "description": (
+                "List one stable page of artifact references indexed for a job. Pass the "
+                "cluster and route_revision from that job's own submission receipt to list "
+                "artifacts for a job that ran on a configured remote cluster."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
+                    "cluster": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -1226,6 +1232,10 @@ def _all_tool_definitions(
                     },
                 },
                 "required": ["job_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -1301,12 +1311,22 @@ def _all_tool_definitions(
             "name": "relay_read_artifact",
             "description": (
                 "Read a model-readable file artifact payload as base64. Internal protocol and "
-                "credential-bearing artifacts are intentionally unavailable through this tool."
+                "credential-bearing artifacts are intentionally unavailable through this tool. "
+                "Pass the cluster and route_revision from the artifact's owning job's submission "
+                "receipt to read an artifact registered on a configured remote cluster."
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"artifact_id": durable_record_id_json_schema()},
+                "properties": {
+                    "artifact_id": durable_record_id_json_schema(),
+                    "cluster": {"type": "string"},
+                    "route_revision": cluster_route_revision_json_schema(),
+                },
                 "required": ["artifact_id"],
+                "dependentRequired": {
+                    "cluster": ["route_revision"],
+                    "route_revision": ["cluster"],
+                },
                 "additionalProperties": False,
             },
         },
@@ -2088,21 +2108,16 @@ def _call_tool(
             limit=_job_log_limit(arguments),
         )
     elif name == "relay_list_artifacts":
-        cursor = _response_page_cursor(arguments)
-        limit = _response_page_limit(arguments)
-        artifacts, next_cursor, total = queue.list_artifacts_page(
-            _required_durable_record_id(arguments, "job_id"),
-            cursor=cursor,
-            limit=limit,
+        list_artifacts_target = _job_target(arguments)
+        result = artifact_routing.list_artifacts(
+            arguments,
+            queue=queue,
+            settings=settings,
+            target=list_artifacts_target,
         )
-        result = _record_page(
-            "artifacts",
-            [artifact.model_dump(mode="json") for artifact in artifacts],
-            cursor=cursor,
-            limit=limit,
-            next_cursor=next_cursor,
-            total=total,
-        )
+        if list_artifacts_target is not None:
+            result["cluster"] = list_artifacts_target.name
+            result["route_revision"] = _route_revision(list_artifacts_target)
     elif name == "relay_artifact_lineage":
         has_job = arguments.get("job_id") is not None
         has_artifact = arguments.get("artifact_id") is not None
@@ -2114,10 +2129,16 @@ def _call_tool(
             else _used_by_tool(arguments, queue=queue, settings=settings)
         )
     elif name == "relay_read_artifact":
-        result = _read_model_artifact_bytes(
-            queue,
-            _required_durable_record_id(arguments, "artifact_id"),
+        read_artifact_target = _job_target(arguments)
+        result = artifact_routing.read_artifact(
+            arguments,
+            queue=queue,
+            settings=settings,
+            target=read_artifact_target,
         )
+        if read_artifact_target is not None:
+            result["cluster"] = read_artifact_target.name
+            result["route_revision"] = _route_revision(read_artifact_target)
     elif name == "relay_record_progress":
         result = _record_progress(arguments, queue=queue)
     elif name == "relay_list_progress":
@@ -3676,18 +3697,6 @@ def _mcp_tool_result_failed(result: JSON) -> bool:
     ):
         return True
     return is_delivery_refusal_failed(typed_result)
-
-
-def _read_model_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, object]:
-    """Read one public artifact without exposing internal protocol capabilities."""
-
-    artifact = queue.get_artifact(artifact_id)
-    if artifact.kind == "mcp_result" or artifact.metadata.get("model_readable") is False:
-        raise ValueError(
-            "artifact is internal protocol evidence and is not model-readable; use relay_wait "
-            "for its bounded public result"
-        )
-    return read_artifact_bytes(queue, artifact_id)
 
 
 def _public_mcp_result_artifact(artifact: JSON) -> JSON:
