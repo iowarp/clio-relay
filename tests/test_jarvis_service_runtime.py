@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import clio_relay.cli as cli_module
+import clio_relay.cli_jarvis_mcp as cli_jarvis_mcp
 import clio_relay.http_api as http_api_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
@@ -897,7 +897,13 @@ def test_hidden_relay_authority_command_emits_one_private_json_document(
         captured.update(kwargs)
         return authority
 
-    monkeypatch.setattr(cli_module, "resolve_local_jarvis_service_runtime_authority", resolve_local)
+    # #231 cli.py decomposition: jarvis_runtime_authority (and its
+    # resolve_local_jarvis_service_runtime_authority import) moved to
+    # cli_jarvis_mcp.py -- patch it there, not on cli.py, which no longer
+    # binds this name at all.
+    monkeypatch.setattr(
+        cli_jarvis_mcp, "resolve_local_jarvis_service_runtime_authority", resolve_local
+    )
     monkeypatch.setenv("CLIO_RELAY_JARVIS_BIN", "/released/bin/jarvis")
     digest = authority.token_sha256
     result = CliRunner().invoke(

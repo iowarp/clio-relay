@@ -241,7 +241,36 @@ RATCHET_BASELINE: dict[str, int] = {
     # remote presence observation, so a pin is only rewritten when proven
     # absent and a valid custom pin survives bootstrap. The observation itself
     # lives in cluster_probe.pinned_runtime_present.
-    "src/clio_relay/cli.py": 18849,
+    # #231 cli.py decomposition: doctor/live-test top-level command-module
+    # extraction (cli_diagnostics.py, 452 lines): -348 net lines.
+    # #231 cli.py decomposition: init/install-frp top-level command-module
+    # extraction (cli_init.py, 87 lines): -31 net lines.
+    # #231 cli.py decomposition: installation-write-receipt/installation-info/
+    # bootstrap-inspect top-level command-module extraction
+    # (cli_installation_receipt.py, 446 lines): -346 net lines.
+    # #231 cli.py decomposition: jarvis-mcp top-level command-group extraction
+    # -- the thin command layer only (jarvis-runtime-authority/mcp-call/
+    # jarvis-mcp-call/jarvis-mcp-refresh/mcp-server into cli_jarvis_mcp.py,
+    # 662 lines; jarvis-mcp-validate alone into cli_jarvis_mcp_validate.py,
+    # 538 lines, since combined they would exceed the 800-line cap). The
+    # ~2,450-line JARVIS execution-query engine these commands call stays
+    # cli.py-resident (unsequenced future work, see cli_jarvis_mcp.py's own
+    # docstring): -1004 net lines.
+    # #231 cli.py decomposition: shared-plumbing relocation pass --
+    # _managed_queue_from_env/_submit_managed_job/_json_object/
+    # _json_text_from_option/_environment_references/_artifact_use_refs/
+    # _artifact_use_cli_value/_artifact_use_idempotency_suffix real bodies
+    # moved to cli_support.py, cli.py keeps each as a thin forwarder under
+    # its original name: -50 net lines.
+    # #231 cli.py decomposition: remote_mcp_app extraction -- the register/
+    # unregister/list/reload/refresh command layer plus its exclusive cache
+    # helpers into cli_remote_mcp.py (557 lines), remote-mcp-validate's
+    # thin command body into cli_remote_mcp_validate.py (402 lines), and the
+    # ~780-line spack-configuration validation engine it drives into the new
+    # real owner module remote_mcp_validation.py. cli.py keeps only the
+    # shared discovery/artifact-reading helpers still used by the resident
+    # JARVIS execution-query engine: -1464 net lines.
+    "src/clio_relay/cli.py": 9679,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
