@@ -3158,7 +3158,9 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 server=command[0],
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
+                expected_registered_contract=(
+                    "clio-kit-jarvis-user-v3.7.1" if registered else None
+                ),
                 expected_jarvis_cd_lock_binding=(
                     None
                     if registered
@@ -5983,7 +5985,9 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 server=command[0],
                 server_args=server_args,
                 expected_server_artifact_digest=digest,
-                expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
+                expected_registered_contract=(
+                    "clio-kit-jarvis-user-v3.7.1" if registered else None
+                ),
                 expected_jarvis_cd_lock_binding=(
                     None
                     if registered
@@ -6016,33 +6020,112 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
         ) -> subprocess.CompletedProcess[str]:
             del command, env, credential_payload, on_stderr, should_cancel
             del on_poll, timeout_seconds, on_timeout
-            assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
                 on_start(700)
-            if on_stdout is not None:
-                on_stdout("Submitted batch job stdout-wrong\n")
-            assert isinstance(job.spec, McpCallSpec)
-            execution_id = cast(str, job.spec.arguments["execution_id"])
-            (cwd / "mcp-result.json").write_text(
-                json.dumps(
-                    _native_mcp_result_document(
-                        command=mcp_server_command,
-                        digest=digest,
-                        pipeline_id="runtime-test",
-                        execution_id=execution_id,
-                        server_artifact=server_artifact,
-                        arguments=job.spec.arguments,
-                        expected_registered_contract=job.spec.expected_registered_contract,
-                        mode="scheduler",
-                        scheduler_provider="test-scheduler",
-                        scheduler_native_id="structured-42",
-                        cluster="research-cluster",
-                    )
-                ),
-                encoding="utf-8",
+            if process_label == "endpoint MCP operation":
+                if on_stdout is not None:
+                    on_stdout("Submitted batch job stdout-wrong\n")
+                assert isinstance(job.spec, McpCallSpec)
+                execution_id = cast(str, job.spec.arguments["execution_id"])
+                (cwd / "mcp-result.json").write_text(
+                    json.dumps(
+                        _native_mcp_result_document(
+                            command=mcp_server_command,
+                            digest=digest,
+                            pipeline_id="runtime-test",
+                            execution_id=execution_id,
+                            server_artifact=server_artifact,
+                            arguments=job.spec.arguments,
+                            expected_registered_contract=job.spec.expected_registered_contract,
+                            mode="scheduler",
+                            scheduler_provider="test-scheduler",
+                            scheduler_native_id="structured-42",
+                            cluster="research-cluster",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
+            # #266: the "submitted" record above is now non-terminal, so the
+            # relay worker keeps watching via jarvis_get_execution. Answer
+            # every poll with the SAME structured result, patched terminal
+            # (completed) on its scheduler-owned execution -- this keeps
+            # verifying "prefers structured jarvis mcp runtime metadata"
+            # (package provenance, scheduler_job_ids) at the run's REAL
+            # terminal instead of its now-intermediate dispatch snapshot.
+            assert process_label == "jarvis execution watch query"
+            params = cast(
+                dict[str, object],
+                json.loads((cwd / "params.json").read_text(encoding="utf-8")),
             )
-            return subprocess.CompletedProcess(["endpoint-mcp-runner"], 0, "", "")
+            query_spec = McpCallSpec.model_validate(params)
+            execution_id = cast(str, query_spec.arguments["execution_id"])
+            include_artifacts = "artifacts" in query_spec.arguments
+            base_document = _native_mcp_result_document(
+                command=mcp_server_command,
+                digest=digest,
+                pipeline_id="runtime-test",
+                execution_id=execution_id,
+                server_artifact=server_artifact,
+                arguments=query_spec.arguments,
+                expected_registered_contract=query_spec.expected_registered_contract,
+                mode="scheduler",
+                scheduler_provider="test-scheduler",
+                scheduler_native_id="structured-42",
+                cluster="research-cluster",
+            )
+            structured = cast(dict[str, Any], base_document["structured_result"])
+            record = cast(dict[str, Any], structured["execution_record"])
+            record["state"] = "completed"
+            record["terminal"] = True
+            record["return_code"] = 0
+            progress = cast(dict[str, Any], structured["progress"])
+            progress["execution_state"] = "completed"
+            progress["terminal"] = True
+            runtime = cast(dict[str, Any], structured["runtime_metadata"])
+            runtime["scheduler_phase"] = "completed"
+            runtime["terminal"] = {
+                **cast(dict[str, Any], runtime["terminal"]),
+                "state": "completed",
+                "terminal": True,
+                "returncode": 0,
+                "finished_at": record["updated_at"],
+            }
+            structured["artifact_page"] = (
+                {"artifacts": [], "terminal": True} if include_artifacts else None
+            )
+            structured["service_runtimes"] = None
+            document: dict[str, object] = {
+                **base_document,
+                "tool": "jarvis_get_execution",
+                "server": query_spec.server,
+                "server_args": query_spec.server_args,
+                "expected_server_artifact_digest": query_spec.expected_server_artifact_digest,
+                "expected_registered_contract": query_spec.expected_registered_contract,
+                "expected_jarvis_cd_lock_binding": query_spec.expected_jarvis_cd_lock_binding,
+                "observed_server_artifact_digest": query_spec.expected_server_artifact_digest,
+                "arguments": query_spec.arguments,
+                "env_from": query_spec.env_from,
+                "stderr": "",
+            }
+            if not include_artifacts:
+                document["result_validation"] = {
+                    "schema_version": "clio-relay.jarvis-execution-query-validation.v1",
+                    "pipeline_id": "runtime-test",
+                    "execution_id": execution_id,
+                    "include_progress": True,
+                    "progress_included": True,
+                    "include_service_runtimes": False,
+                    "service_runtimes_included": False,
+                    "service_runtime_count": 0,
+                    "artifacts_requested": False,
+                    "artifact_filters": {},
+                    "returned_artifact_count": 0,
+                    "next_cursor_present": False,
+                }
+            (cwd / "mcp-result.json").write_text(json.dumps(document), encoding="utf-8")
+            return subprocess.CompletedProcess(["jarvis-get-execution"], 0, "", "")
 
     scheduler = FakeSchedulerProvider(
         SchedulerStatus(
@@ -6074,7 +6157,10 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
     assert task.metadata["scheduler_job_ids"] == ["structured-42"]
     assert runtime["scheduler_job_id"] == "structured-42"
     assert runtime["packages"][0]["name"] == "builtin.paraview"
-    assert runtime["terminal"]["state"] == "submitted"
+    # #266: the job now watches a scheduler-deferred submission to its REAL
+    # terminal rather than going terminal on the "submitted" dispatch.
+    assert runtime["terminal"]["state"] == "completed"
+    assert runtime["terminal"]["terminal"] is True
     artifact_kinds = {artifact.kind for artifact in queue.list_artifacts(job.job_id)}
     assert "runtime_metadata" in artifact_kinds
     provenance = json.loads(

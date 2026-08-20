@@ -47,7 +47,7 @@ from fastmcp.server.dependencies import get_context
 from fastmcp.tools import ToolResult
 from fastmcp_tasks.models import GetTaskResult
 
-from clio_relay import door_error_adapters, door_errors
+from clio_relay import door_error_adapters, door_errors, execution_watch
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
@@ -446,7 +446,7 @@ class RelayMcpRuntime:
             status, _ = _relay_state_projection(job.state.value)
             return GetTaskResult(
                 status=status,
-                status_message=f"Relay job is {job.state.value}",
+                status_message=execution_watch.execution_phase_status_message_for_job(job),
                 last_updated_at=job.updated_at.isoformat(),
                 **{key: value for key, value in common.items() if key != "last_updated_at"},
             )

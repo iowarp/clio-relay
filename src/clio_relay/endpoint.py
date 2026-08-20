@@ -22,7 +22,7 @@ from typing import Any, cast
 
 from filelock import FileLock, Timeout
 
-from clio_relay import process_containment
+from clio_relay import execution_watch, process_containment
 from clio_relay.bootstrap_reconcile import resolve_receipt_bound_jarvis_python
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
@@ -1180,6 +1180,16 @@ class EndpointWorker:
                 package_progress_provider=package_log_progress_adapter,
                 source_authority=PackageProgressSourceAuthority.PACKAGE_LOG,
             )
+        # #266: watch a scheduler-deferred jarvis_run to real terminal,
+        # BEFORE the one-and-only ingest below ever reads mcp-result.json.
+        # A synchronous/already-terminal dispatch returns None unchanged.
+        execution_watch_resolution = self._watch_deferred_jarvis_execution(
+            job,
+            spool=spool,
+            console_tailer=console_tailer,
+            lease=lease,
+            last_renewed_at=last_renewed_at,
+        )
         mcp_runtime_outcome = self._ingest_mcp_runtime_metadata(
             job,
             task_id=task.task_id,
@@ -1259,17 +1269,21 @@ class EndpointWorker:
             )
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
         self._append_optional_result_artifacts(job, spool, console_tailer=console_tailer)
-        if dispatch_recovered:
-            effective_returncode = 0
-        elif dispatch_refusal is not None and result.returncode == 0:
-            # A recorded refusal is the run's answer. It stays the terminal
-            # outcome even if the transport that carried it exited cleanly.
-            effective_returncode = 1
-        else:
-            effective_returncode = result.returncode
+        # #266: fold a resolved watch into the pre-#266 outcome logic --
+        # see execution_watch.resolve_execution_outcome's own docstring for
+        # why a resolved watch always wins over a pending cancellation.
+        outcome = execution_watch.resolve_execution_outcome(
+            dispatch_recovered=dispatch_recovered,
+            watch_resolution=execution_watch_resolution,
+            dispatch_refusal_present=dispatch_refusal is not None,
+            transport_returncode=result.returncode,
+            cancellation_requested=self._job_cancellation_requested(job.job_id),
+        )
+        effective_returncode = outcome.effective_returncode
+        cancellation_honored = outcome.cancellation_honored
         terminal_state = (
             JobState.CANCELED
-            if self._job_cancellation_requested(job.job_id)
+            if cancellation_honored
             else JobState.SUCCEEDED
             if effective_returncode == 0
             else JobState.FAILED
@@ -1285,7 +1299,7 @@ class EndpointWorker:
             runtime_metadata=runtime_metadata_state[0],
         )
         self._check_runtime_storage(job, spool, force_job_scan=True)
-        if self._job_cancellation_requested(job.job_id):
+        if cancellation_honored:
             self.queue.update_task_state(
                 task.task_id,
                 JobState.CANCELED,
@@ -1325,9 +1339,12 @@ class EndpointWorker:
                 ),
             )
             return
+        watch_failure = outcome.watch_failure
         failure_metadata: dict[str, object] = {"returncode": effective_returncode}
         if dispatch_refusal is not None:
             failure_metadata["jarvis_dispatch_refusal"] = dispatch_refusal.as_payload()
+        if watch_failure is not None:
+            failure_metadata["execution_watch_failure"] = watch_failure
         self.queue.update_task_state(
             task.task_id,
             JobState.FAILED,
@@ -1340,6 +1357,8 @@ class EndpointWorker:
             message=(
                 "JARVIS run failed"
                 if dispatch_refusal is not None
+                else "JARVIS execution ended in failure"
+                if watch_failure is not None
                 else "Endpoint MCP operation failed"
                 if endpoint_mcp_call
                 else "JARVIS-CD run failed"
@@ -1347,6 +1366,8 @@ class EndpointWorker:
             error=(
                 bounded_error_detail(dispatch_refusal.as_error_detail())
                 if dispatch_refusal is not None
+                else bounded_error_detail(execution_watch.execution_watch_error_text(watch_failure))
+                if watch_failure is not None
                 else f"exit code {effective_returncode}"
             ),
         )
@@ -3414,6 +3435,61 @@ class EndpointWorker:
                 "execution_id": structured.get("execution_id"),
                 "source_result_sha256": recovery_result_sha256,
             },
+        )
+
+    def _watch_deferred_jarvis_execution(
+        self,
+        job: RelayJob,
+        *,
+        spool: JobSpool,
+        console_tailer: ConsoleLiveTailer | None,
+        lease: Lease,
+        last_renewed_at: list[float],
+    ) -> execution_watch.ExecutionWatchResolution | None:
+        """#266: keep a scheduler-deferred ``jarvis_run`` job watching to real terminal.
+
+        Called once, before ``_ingest_mcp_runtime_metadata`` ever reads
+        ``mcp-result.json``. Detection and the poll loop itself both live
+        in ``execution_watch`` (the owner module; endpoint.py may not
+        regrow past its ratchet, #774/#775) -- ``None`` here means today's
+        fast path applies unchanged and the file is left untouched.
+        """
+        if not isinstance(job.spec, McpCallSpec) or job.spec.tool != "jarvis_run":
+            return None
+        result_path = spool.path / "mcp-result.json"
+        storage_result_path = internal_filesystem_path(result_path)
+        if not storage_result_path.is_file():
+            return None
+        try:
+            document = json.loads(storage_result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        deferred = execution_watch.deferred_jarvis_execution_from_document(job, document)
+        if deferred is None:
+            return None
+
+        def write_terminal_result(query_document: dict[str, object], sha256: str) -> None:
+            self._write_recovered_jarvis_run_result(
+                job,
+                query_document=query_document,
+                spool=spool,
+                recovery_result_sha256=sha256,
+            )
+
+        return execution_watch.run_execution_watch(
+            job,
+            base_spec=job.spec,
+            deferred=deferred,
+            queue=self.queue,
+            provider=self.provider,
+            watch_dir=spool.path / ".execution-watch",
+            console_tailer=console_tailer,
+            poll_interval_seconds=self.settings.execution_watch_poll_interval_seconds,
+            ceiling_seconds=self.settings.execution_watch_ceiling_seconds,
+            renew_lease=lambda: self._renew_lease_if_needed(lease, last_renewed_at),
+            is_cancellation_requested=lambda: self._job_cancellation_requested(job.job_id),
+            write_terminal_result=write_terminal_result,
+            now=utc_now,
         )
 
     def _validated_recovered_jarvis_dispatch(
