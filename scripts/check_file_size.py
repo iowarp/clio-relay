@@ -948,7 +948,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # import lines (CQ15 §10.7 precedent: retarget a moved-symbol import to
     # its real new owner, never a facade re-export).
     "src/clio_relay/retention.py": 952,
-    "src/clio_relay/runtime_metadata.py": 1749,
+    # split/runtime-metadata-w2: runtime_metadata.py becomes a 113-line
+    # assembly/facade only (re-exports, no logic) after its nine concerns --
+    # schema/state vocabulary (runtime_metadata_types.py), the normalized
+    # JarvisRuntimeMetadata document (runtime_metadata_core_model.py), loose
+    # payload coercion (runtime_metadata_coercion.py), strict native field
+    # validators (runtime_metadata_native_validators.py), the exact native
+    # JARVIS document family + clio-kit projection
+    # (runtime_metadata_native_documents.py), merge/lifecycle-regression
+    # guards (runtime_metadata_merge.py), native-document normalization
+    # (runtime_metadata_native_normalize.py), MCP-result/legacy compatibility
+    # decoding (runtime_metadata_mcp_normalize.py), and the authenticated
+    # sidecar record codec (runtime_metadata_sidecar.py) -- each its own
+    # owner module, all comfortably under DEFAULT_MAX_LINES. Entry removed
+    # per ground rule 5 -- ratchet down.
     "src/clio_relay/scheduler_providers.py": 1153,
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
