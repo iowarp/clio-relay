@@ -30,7 +30,6 @@ import clio_relay.mcp_stdio_validation as mcp_stdio_validation
 import clio_relay.remote_cli as remote_cli
 import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.session_lifecycle as session_lifecycle
-import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
 from clio_relay.cli import app
@@ -6036,48 +6035,6 @@ def test_owned_runtime_cleanup_rescans_for_late_exact_generation_gateway(
     assert len(reports) == 2
     assert states == {"gateway-1": "closed", "gateway-2": "closed"}
     assert list_calls >= 5
-
-
-def test_cli_init_creates_empty_cluster_registry(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-
-    result = CliRunner().invoke(app, ["init"])
-
-    assert result.exit_code == 0
-    assert "clusters=" in result.output
-    assert "ares" not in result.output
-    registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
-    assert registry.clusters == {}
-
-
-def test_cli_init_threads_explicit_legacy_output_migration_authorization(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    observed: list[bool] = []
-
-    def capture_authorization(
-        _settings: object,
-        *,
-        migrate_legacy_output: bool = False,
-    ) -> object:
-        observed.append(migrate_legacy_output)
-        return object()
-
-    monkeypatch.setattr(storage_runtime, "storage_managed_queue", capture_authorization)
-
-    result = CliRunner().invoke(app, ["init", "--migrate-legacy-output"])
-
-    assert result.exit_code == 0
-    assert observed == [True]
 
 
 def test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix(

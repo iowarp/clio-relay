@@ -42,6 +42,7 @@ import clio_relay.cli_diagnostics as cli_diagnostics
 import clio_relay.cli_endpoint as cli_endpoint
 import clio_relay.cli_gateway as cli_gateway
 import clio_relay.cli_gateway_runtime as cli_gateway_runtime  # noqa: F401 -- registers gateway_app's runtime commands
+import clio_relay.cli_init as cli_init
 import clio_relay.cli_job as cli_job
 import clio_relay.cli_job_records as cli_job_records  # noqa: F401 -- registers job_app's records commands
 import clio_relay.cli_monitor as cli_monitor
@@ -72,7 +73,6 @@ import clio_relay.service_runtime as service_runtime
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report_module
-from clio_relay.bootstrap import install_local_frp
 from clio_relay.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.bounded_process import BoundedProcessError
@@ -753,6 +753,8 @@ app.add_typer(cli_storage.storage_app, name="storage")
 # applies the registration itself -- one line per command, ground rule 2.
 app.command("doctor")(cli_diagnostics.doctor)
 app.command("live-test")(cli_diagnostics.live_test)
+app.command()(cli_init.init)
+app.command("install-frp")(cli_init.install_frp)
 
 
 @app.callback()
@@ -798,28 +800,6 @@ def jarvis_runtime_authority(
         )
 
     _run_or_exit(action)
-
-
-@app.command()
-def init(
-    migrate_legacy_output: Annotated[
-        bool,
-        typer.Option(
-            help=(
-                "Authorize migration of exact oversized v0.9 output events after every "
-                "queue writer has been stopped and verified inactive."
-            )
-        ),
-    ] = False,
-) -> None:
-    """Initialize local queue, spool, and cluster registry files."""
-    settings = RelaySettings.from_env()
-    storage_runtime.storage_managed_queue(settings, migrate_legacy_output=migrate_legacy_output)
-    registry = ClusterRegistry.load(default_registry_path())
-    typer.echo(
-        f"initialized core={settings.core_dir} spool={settings.spool_dir} "
-        f"clusters={','.join(sorted(registry.clusters))}"
-    )
 
 
 @app.command("installation-write-receipt")
@@ -4942,17 +4922,6 @@ def session_teardown(
         _run_or_exit(locked_action)
     finally:
         _release_cleanup_evidence_lock(evidence_lock)
-
-
-@app.command("install-frp")
-def install_frp(
-    destination: Annotated[
-        Path,
-        typer.Option(help="Directory for frpc/frps binaries."),
-    ] = Path(".tools/frp/bin"),
-) -> None:
-    """Download and install frp for the local desktop."""
-    _run_or_exit(lambda: typer.echo(f"frpc={install_local_frp(destination)}"))
 
 
 @app.command("mcp-call")

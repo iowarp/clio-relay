@@ -191,7 +191,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # lives in cluster_probe.pinned_runtime_present.
     # #231 cli.py decomposition: doctor/live-test top-level command-module
     # extraction (cli_diagnostics.py, 452 lines): -348 net lines.
-    "src/clio_relay/cli.py": 12574,
+    # #231 cli.py decomposition: init/install-frp top-level command-module
+    # extraction (cli_init.py, 87 lines): -31 net lines.
+    "src/clio_relay/cli.py": 12543,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
