@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from clio_relay.console_stream import (
+    CONSOLE_STDERR_STREAM,
     CONSOLE_STREAM,
     ConsoleLiveTailer,
 )
@@ -179,7 +180,8 @@ class ProgressIngestMixin:
         job: RelayJob,
         console_tailer: ConsoleLiveTailer | None,
     ) -> None:
-        """Advance one #259 live-tail increment; never raises into the job."""
+        """Advance one #259 live-tail increment (stdout AND stderr); never
+        raises into the job."""
         if console_tailer is None:
             return
         step = console_tailer.poll()
@@ -189,6 +191,14 @@ class ProgressIngestMixin:
                 f"console.{step.reason}",
                 step.message or "console live-tail reason",
                 payload={"stream": CONSOLE_STREAM, "reason": step.reason},
+            )
+        stderr_step = console_tailer.poll_stderr()
+        if stderr_step.reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                f"console_stderr.{stderr_step.reason}",
+                stderr_step.message or "console_stderr live-tail reason",
+                payload={"stream": CONSOLE_STDERR_STREAM, "reason": stderr_step.reason},
             )
 
     def _poll_running_job(

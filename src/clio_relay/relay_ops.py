@@ -265,8 +265,9 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
 #: wrong for e.g. an oversized ``mcp_result`` artifact, which the log
 #: endpoint has no path to serve at all. ``console`` (#259) joined
 #: ``stdout``/``stderr`` here for the same reason it joined them in
-#: :data:`clio_relay.spool.LOG_STREAM_NAMES`.
-_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr", "console"})
+#: :data:`clio_relay.spool.LOG_STREAM_NAMES`; ``console_stderr`` (#259
+#: residual) joined for the identical reason.
+_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr", "console", "console_stderr"})
 
 
 def _artifact_content_too_large_refusal(artifact: JSON, artifact_id: str) -> JSON:

@@ -35,7 +35,7 @@ from clio_relay.models import ProgressRecord
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import read_artifact_bytes, read_job_log
-from clio_relay.spool import LogStreamName
+from clio_relay.spool import LOG_STREAM_NAMES, LogStreamName
 
 
 def register_artifact_routes(
@@ -54,10 +54,10 @@ def register_artifact_routes(
         limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
     ) -> dict[str, object]:
         try:
-            if stream_name not in {"stdout", "stderr", "console"}:
+            if stream_name not in LOG_STREAM_NAMES:
                 raise door_errors.http_problem(
                     "log_stream_invalid",
-                    message="stream must be stdout, stderr, or console",
+                    message=f"stream must be one of: {', '.join(LOG_STREAM_NAMES)}",
                 )
             return _public_payload(
                 read_job_log(
