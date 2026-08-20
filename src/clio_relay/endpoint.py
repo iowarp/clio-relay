@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-import yaml
 from filelock import FileLock, Timeout
 
 from clio_relay import process_containment
@@ -81,6 +80,23 @@ from clio_relay.endpoint_runtime_sidecar_anchor import (
     _precreate_runtime_sidecar,
     _runtime_sidecar_anchor_from_metadata,
 )
+from clio_relay.endpoint_scheduler_metadata import (
+    _durable_scheduler_submission_intent,
+    _job_subprocess_env,
+    _job_timeout_seconds,
+    _native_runtime_created_at,
+    _native_runtime_execution_mode,
+    _owned_scheduler_job_ids_from_metadata,
+    _runtime_metadata_exact_marker_reconciliation,
+    _runtime_metadata_is_mcp_transport_wrapper,
+    _runtime_metadata_is_native,
+    _runtime_sidecar_channel_failed,
+    _scheduler_job_ids_from_metadata,
+    _task_direct_execution_pinned,
+    _task_id_for_scheduler_job,
+    _task_scheduler_status,
+    _task_scheduler_submission_refused,
+)
 from clio_relay.endpoint_sidecar_types import (
     AGENT_RESULT_MAX_BYTES,
     EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS,
@@ -93,7 +109,6 @@ from clio_relay.endpoint_sidecar_types import (
     MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS,
     MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS,
     MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA,
-    OUTPUT_EVENT_MAX_BYTES,
     PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES,
     PACKAGE_PROGRESS_LOG_READ_BYTES,
     PROGRESS_SIDECAR_MAX_RECORD_BYTES,
@@ -107,6 +122,23 @@ from clio_relay.endpoint_sidecar_types import (
     _RecoveryDirectoryAnchor,
     _RuntimeSidecarAnchor,
 )
+from clio_relay.endpoint_worker_environment import (
+    _bounded_output_event_chunks,
+    _configured_scheduler_provider_name,
+    _extract_scheduler_job_id,
+    _file_summary,
+    _jarvis_pipeline_name,
+    _normalized_scheduler_status,
+    _optional_float,
+    _optional_metadata,
+    _optional_str,
+    _scheduler_name_from_job,
+    _scheduler_name_from_yaml,
+    _scheduler_status_is_not_found,
+    _validate_scheduler_launch_provider,
+    _worker_installation_snapshot,
+    _worker_process_identity,
+)
 from clio_relay.endpoint_worker_lanes import (
     quarantine_relay_error,
     run_worker_lane_iteration,
@@ -117,7 +149,6 @@ from clio_relay.filesystem_paths import (
     logical_filesystem_text,
 )
 from clio_relay.identifiers import filesystem_key
-from clio_relay.installation import installation_info
 from clio_relay.jarvis_dispatch_failure import (
     JARVIS_DISPATCH_REFUSAL_RESOLUTION,
     JarvisDispatchRefusal,
@@ -5782,535 +5813,3 @@ class EndpointWorker:
             yield
         finally:
             lock.release()
-
-
-def _worker_installation_snapshot() -> dict[str, object]:
-    """Capture the package/receipt identity loaded by this worker process."""
-    try:
-        return installation_info()
-    except ConfigurationError as exc:
-        return {
-            "schema_version": "clio-relay.installation-info.unverified",
-            "receipt_matches_install": False,
-            "error": str(exc),
-        }
-
-
-def _worker_process_identity() -> dict[str, object] | None:
-    """Return exact Linux process-generation evidence for durable endpoint records."""
-    if os.name != "posix" or not hasattr(os, "getuid"):
-        return None
-    try:
-        boot_id = (
-            Path("/proc/sys/kernel/random/boot_id")
-            .read_text(
-                encoding="ascii",
-            )
-            .strip()
-        )
-        raw_stat = Path("/proc/self/stat").read_bytes()
-    except OSError:
-        return None
-    if not boot_id or len(boot_id) > 128 or len(raw_stat) > 4096:
-        return None
-    closing_parenthesis = raw_stat.rfind(b")")
-    fields = raw_stat[closing_parenthesis + 1 :].split()
-    if closing_parenthesis < 0 or len(fields) <= 19:
-        return None
-    try:
-        start_ticks = int(fields[19])
-    except ValueError:
-        return None
-    return {
-        "schema_version": "clio-relay.process-identity.v1",
-        "boot_id": boot_id,
-        "start_ticks": start_ticks,
-        "uid": os.getuid(),
-        "pid": os.getpid(),
-    }
-
-
-def bootstrap_cluster_environment(settings: RelaySettings) -> None:
-    """Create endpoint directories and verify required executables are configured."""
-    internal_filesystem_path(settings.core_dir, force_extended=True).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-    internal_filesystem_path(settings.spool_dir, force_extended=True).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-    queue = storage_managed_queue(settings)
-    queue.storage_runtime.ensure_new_intake_allowed()
-    provider = JarvisCdProvider(
-        jarvis_bin=settings.jarvis_bin,
-        agent_bin=settings.agent_bin,
-        agent_adapter=settings.agent_adapter,
-        agent_args=settings.agent_args,
-    )
-    provider.require_available()
-    if settings.frps_addr is None or settings.frp_token is None:
-        raise ConfigurationError("CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN are required")
-
-
-def _bounded_output_event_chunks(text: str) -> list[str]:
-    """Split persisted output into queue events with a strict UTF-8 byte bound."""
-    if text == "":
-        return []
-    payload = text.encode("utf-8")
-    chunks: list[str] = []
-    offset = 0
-    while offset < len(payload):
-        end = min(offset + OUTPUT_EVENT_MAX_BYTES, len(payload))
-        while end > offset:
-            try:
-                chunk = payload[offset:end].decode("utf-8")
-            except UnicodeDecodeError as exc:
-                end = offset + exc.start
-                continue
-            chunks.append(chunk)
-            offset = end
-            break
-        else:
-            raise RuntimeError("could not split valid UTF-8 output into bounded events")
-    return chunks
-
-
-def _file_summary(path: Path) -> dict[str, object]:
-    storage_path = internal_filesystem_path(path)
-    if not storage_path.exists():
-        return {"path": str(path), "exists": False}
-    return {
-        "path": str(path),
-        "exists": True,
-        "size_bytes": storage_path.stat().st_size,
-        "sha256": hashlib.sha256(storage_path.read_bytes()).hexdigest(),
-    }
-
-
-def _extract_scheduler_job_id(line: str) -> str | None:
-    explicit = re.search(r"\bscheduler_job_id=(?P<job_id>[A-Za-z0-9_.-]+)\b", line)
-    if explicit is not None:
-        return explicit.group("job_id")
-    submitted = re.search(r"\bSubmitted batch job (?P<job_id>[A-Za-z0-9_.-]+)\b", line)
-    if submitted is not None:
-        return submitted.group("job_id")
-    return None
-
-
-def _scheduler_status_is_not_found(status: SchedulerStatus) -> bool:
-    """Recognize a provider's exact-job not-found terminal observation."""
-    return status.phase is SchedulerPhase.UNKNOWN and status.record_found is False
-
-
-_SCHEDULER_STATUS_TEXT_FIELDS = (
-    "raw_state",
-    "reason",
-    "partition",
-    "qos",
-    "user",
-    "memory",
-    "submit_time",
-    "eligible_time",
-    "start_time",
-    "elapsed",
-    "time_limit",
-    "queue_position_scope",
-    "queue_position_note",
-)
-
-
-def _normalized_scheduler_status(
-    status: SchedulerStatus,
-    *,
-    expected_scheduler: str,
-    expected_scheduler_job_id: str,
-) -> SchedulerStatus:
-    """Bind provider status to the requested identity and bound all durable text."""
-    if (
-        status.scheduler != expected_scheduler
-        or status.scheduler_job_id != expected_scheduler_job_id
-    ):
-        detail = bounded_error_detail(
-            "scheduler provider returned mismatched identity: "
-            f"expected scheduler={expected_scheduler!r} "
-            f"job_id={expected_scheduler_job_id!r}; "
-            f"observed scheduler={status.scheduler!r} job_id={status.scheduler_job_id!r}"
-        )
-        return SchedulerStatus(
-            scheduler=expected_scheduler,
-            scheduler_job_id=expected_scheduler_job_id,
-            phase=SchedulerPhase.UNKNOWN,
-            reason="scheduler provider response identity mismatch",
-            queue_position_note=detail,
-            observed_at=status.observed_at,
-        )
-    payload = status.model_dump(mode="python")
-    for field_name in _SCHEDULER_STATUS_TEXT_FIELDS:
-        value = payload.get(field_name)
-        if isinstance(value, str):
-            payload[field_name] = bounded_error_detail(value)
-    return SchedulerStatus.model_validate(payload)
-
-
-def _configured_scheduler_provider_name(provider: SchedulerProvider | None) -> str:
-    raw_name = "external" if provider is None else provider.name
-    normalized = raw_name.strip().lower().replace("_", "-")
-    if normalized in {"none", "unmanaged"}:
-        return "external"
-    if not normalized:
-        raise ConfigurationError("configured worker scheduler provider must be non-empty")
-    return normalized
-
-
-def _validate_scheduler_launch_provider(*, requested: str | None, configured: str) -> None:
-    if requested is None:
-        return
-    normalized_requested = requested.strip().lower().replace("_", "-")
-    if normalized_requested in {"none", "unmanaged"}:
-        normalized_requested = "external"
-    if not normalized_requested:
-        raise ConfigurationError("JARVIS scheduler provider must be non-empty")
-    if normalized_requested != configured:
-        raise ConfigurationError(
-            "JARVIS pipeline scheduler provider does not match the configured worker provider: "
-            f"{normalized_requested} != {configured}; no JARVIS execution was launched"
-        )
-    if normalized_requested != "slurm":
-        raise ConfigurationError(
-            "clio-relay 1.0 supports scheduled JARVIS execution only through slurm; "
-            f"requested {normalized_requested}; no JARVIS execution was launched"
-        )
-
-
-def _scheduler_name_from_job(job: RelayJob) -> str | None:
-    if not isinstance(job.spec, JarvisRunSpec):
-        return None
-    if job.spec.pipeline_yaml is not None:
-        return _scheduler_name_from_yaml(job.spec.pipeline_yaml)
-    if job.spec.pipeline_path is not None:
-        try:
-            pipeline_yaml = internal_filesystem_path(Path(job.spec.pipeline_path)).read_text(
-                encoding="utf-8"
-            )
-        except OSError:
-            return None
-        return _scheduler_name_from_yaml(pipeline_yaml)
-    return None
-
-
-def _jarvis_pipeline_name(job: RelayJob) -> str | None:
-    if job.kind == JobKind.JARVIS and isinstance(job.spec, JarvisRunSpec):
-        return job.spec.pipeline_name
-    return None
-
-
-def _scheduler_name_from_yaml(pipeline_yaml: str) -> str | None:
-    try:
-        loaded = yaml.safe_load(pipeline_yaml)
-    except yaml.YAMLError:
-        return None
-    return _scheduler_name_from_document(loaded)
-
-
-def _scheduler_name_from_document(document: object) -> str | None:
-    if not isinstance(document, dict):
-        return None
-    typed = cast(dict[str, object], document)
-    scheduler = typed.get("scheduler")
-    if isinstance(scheduler, dict):
-        typed_scheduler = cast(dict[str, object], scheduler)
-        name = typed_scheduler.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    config = typed.get("config")
-    if isinstance(config, dict):
-        config_scheduler = _scheduler_name_from_document(cast(dict[str, object], config))
-        if config_scheduler is not None:
-            return config_scheduler
-    experiments = typed.get("experiments")
-    if isinstance(experiments, list):
-        for experiment in cast(list[object], experiments):
-            experiment_scheduler = _scheduler_name_from_document(experiment)
-            if experiment_scheduler is not None:
-                return experiment_scheduler
-    return None
-
-
-def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) and value != "" else None
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError("numeric progress fields cannot be booleans")
-    if isinstance(value, int | float):
-        return float(value)
-    if isinstance(value, str) and value != "":
-        return float(value)
-    raise ValueError("progress numeric field must be a number")
-
-
-def _optional_metadata(value: object) -> dict[str, object]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError("progress metadata must be an object")
-    typed = cast(dict[object, object], value)
-    return {str(key): item for key, item in typed.items()}
-
-
-def _job_timeout_seconds(job: RelayJob) -> int | None:
-    if isinstance(job.spec, (JarvisRunSpec, RemoteAgentTaskSpec, McpCallSpec)):
-        return job.spec.timeout_seconds
-    return None
-
-
-def _scheduler_job_ids_from_metadata(metadata: dict[str, Any]) -> list[str]:
-    stored = metadata.get("scheduler_job_ids")
-    if not isinstance(stored, list):
-        return []
-    ids: list[str] = []
-    for item in cast(list[object], stored):
-        if isinstance(item, str) and item not in ids:
-            ids.append(item)
-    return ids
-
-
-def _owned_scheduler_job_ids_from_metadata(
-    metadata: dict[str, Any],
-    *,
-    relay_job_id: str,
-    task_id: str | None = None,
-) -> list[str]:
-    records = metadata.get("scheduler_job_ownership")
-    if not isinstance(records, list):
-        return []
-    owned: list[str] = []
-    for item in cast(list[object], records):
-        if not isinstance(item, dict):
-            continue
-        record = cast(dict[str, object], item)
-        scheduler_job_id = record.get("scheduler_job_id")
-        runtime_source = record.get("runtime_metadata_source")
-        expected_proofs = {
-            RuntimeMetadataSource.JARVIS_MCP.value: {"owned_jarvis_run_mcp_result"},
-            RuntimeMetadataSource.JARVIS_SIDECAR.value: {
-                "authenticated_runtime_sidecar",
-                "exact_scheduler_marker_reconciliation",
-            },
-            RuntimeMetadataSource.RELAY_RECONCILIATION.value: {
-                "exact_scheduler_marker_reconciliation"
-            },
-        }.get(runtime_source if isinstance(runtime_source, str) else "", set())
-        if (
-            not isinstance(scheduler_job_id, str)
-            or not scheduler_job_id
-            or not isinstance(record.get("scheduler_provider"), str)
-            or not record.get("scheduler_provider")
-            or not isinstance(record.get("execution_id"), str)
-            or not record.get("execution_id")
-            or record.get("ownership_verified") is not True
-            or record.get("relay_job_id") != relay_job_id
-            or (task_id is not None and record.get("task_id") != task_id)
-            or record.get("proof") not in expected_proofs
-        ):
-            continue
-        if scheduler_job_id not in owned:
-            owned.append(scheduler_job_id)
-    return owned
-
-
-def _runtime_metadata_exact_marker_reconciliation(
-    metadata: JarvisRuntimeMetadata,
-) -> dict[str, Any] | None:
-    raw = metadata.details.get("scheduler_marker_reconciliation")
-    if not isinstance(raw, dict):
-        return None
-    reconciliation = cast(dict[str, Any], raw)
-    if (
-        reconciliation.get("schema_version") != "clio-relay.scheduler-marker-reconciliation.v1"
-        or reconciliation.get("provider") != metadata.scheduler_provider
-        or reconciliation.get("scheduler_job_id") != metadata.scheduler_job_id
-        or reconciliation.get("match_count") != 1
-        or not isinstance(reconciliation.get("marker"), str)
-        or not cast(str, reconciliation["marker"]).startswith("clio-relay-")
-    ):
-        return None
-    return reconciliation
-
-
-def _runtime_metadata_is_native(metadata: JarvisRuntimeMetadata) -> bool:
-    """Return whether exact JARVIS handle, record, and progress documents were validated."""
-    producer_contract = metadata.details.get("producer_contract")
-    native_execution = metadata.details.get("native_execution")
-    return (
-        isinstance(producer_contract, dict)
-        and cast(dict[str, object], producer_contract).get("contract_kind") == "native_execution"
-        and isinstance(native_execution, dict)
-    )
-
-
-def _native_runtime_execution_mode(metadata: JarvisRuntimeMetadata) -> str:
-    """Return the matching mode from validated native handle and record documents."""
-    raw = metadata.details.get("native_execution")
-    if not isinstance(raw, dict):
-        raise RelayError("native JARVIS runtime metadata omitted execution documents")
-    native = cast(dict[str, object], raw)
-    handle = native.get("execution_handle")
-    record = native.get("execution_record")
-    if not isinstance(handle, dict) or not isinstance(record, dict):
-        raise RelayError("native JARVIS runtime metadata omitted handle or record")
-    handle_mode = cast(dict[str, object], handle).get("mode")
-    record_mode = cast(dict[str, object], record).get("mode")
-    if handle_mode not in {"direct", "scheduler"} or record_mode != handle_mode:
-        raise RelayError("native JARVIS execution mode was inconsistent")
-    return cast(str, handle_mode)
-
-
-def _native_runtime_created_at(metadata: JarvisRuntimeMetadata) -> datetime:
-    """Return the authenticated native record creation time."""
-    raw = metadata.details.get("native_execution")
-    if not isinstance(raw, dict):
-        raise RelayError("native JARVIS runtime metadata omitted execution documents")
-    record = cast(dict[str, object], raw).get("execution_record")
-    if not isinstance(record, dict):
-        raise RelayError("native JARVIS runtime metadata omitted its execution record")
-    raw_created_at = cast(dict[str, object], record).get("created_at")
-    if not isinstance(raw_created_at, str):
-        raise RelayError("native JARVIS execution record omitted created_at")
-    created_at = _recovery_timestamp(raw_created_at)
-    if created_at is None:
-        raise RelayError("native JARVIS execution record created_at is invalid")
-    return created_at
-
-
-def _runtime_metadata_is_mcp_transport_wrapper(metadata: JarvisRuntimeMetadata) -> bool:
-    """Return whether metadata describes the direct wrapper around one MCP call."""
-    if (
-        metadata.source is not RuntimeMetadataSource.JARVIS_SIDECAR
-        or metadata.scheduler_provider is not None
-        or metadata.scheduler_job_id is not None
-    ):
-        return False
-    native_execution = metadata.details.get("native_execution")
-    if isinstance(native_execution, dict):
-        handle = cast(dict[str, object], native_execution).get("execution_handle")
-        record = cast(dict[str, object], native_execution).get("execution_record")
-        return (
-            isinstance(handle, dict)
-            and cast(dict[str, object], handle).get("mode") == "direct"
-            and isinstance(record, dict)
-            and cast(dict[str, object], record).get("submitted") is False
-        )
-    nested_details = metadata.details.get("details")
-    return metadata.details.get("execution_mode") == "direct" or (
-        isinstance(nested_details, dict)
-        and cast(dict[str, object], nested_details).get("execution_mode") == "direct"
-    )
-
-
-def _task_direct_execution_pinned(task: RelayTask) -> bool:
-    raw_sidecars = task.metadata.get("execution_sidecars")
-    return (
-        not _runtime_sidecar_channel_failed(task)
-        and isinstance(raw_sidecars, dict)
-        and cast(dict[str, object], raw_sidecars).get("scheduler_expected_resolved") is False
-    )
-
-
-def _task_scheduler_submission_refused(task: RelayTask) -> bool:
-    raw_sidecars = task.metadata.get("execution_sidecars")
-    return (
-        not _runtime_sidecar_channel_failed(task)
-        and isinstance(raw_sidecars, dict)
-        and cast(dict[str, object], raw_sidecars).get("scheduler_submission_refused") is True
-    )
-
-
-def _runtime_sidecar_channel_failed(task: RelayTask) -> bool:
-    """Return whether runtime authority is durably latched failed closed."""
-    raw_channel = task.metadata.get("runtime_sidecar_channel")
-    return (
-        isinstance(raw_channel, dict)
-        and cast(dict[str, object], raw_channel).get("schema_version")
-        == RUNTIME_SIDECAR_CHANNEL_SCHEMA
-        and cast(dict[str, object], raw_channel).get("state") == "failed_closed"
-    )
-
-
-def _durable_scheduler_submission_intent(task: RelayTask) -> dict[str, Any]:
-    raw_sidecars = task.metadata.get("execution_sidecars")
-    if not isinstance(raw_sidecars, dict):
-        raise RelayError(f"scheduler submission intent is missing for task {task.task_id}")
-    raw_intent = cast(dict[str, object], raw_sidecars).get("scheduler_submission_intent")
-    if not isinstance(raw_intent, dict):
-        raise RelayError(f"scheduler submission intent is missing for task {task.task_id}")
-    intent = cast(dict[str, Any], raw_intent)
-    if (
-        set(intent)
-        != {
-            "schema_version",
-            "execution_id",
-            "marker",
-            "created_at",
-            "scheduler_user",
-            "scheduler_expected",
-            "direct_proof_sha256",
-        }
-        or intent.get("schema_version") != "clio-relay.scheduler-submission-intent.v1"
-        or any(
-            not isinstance(intent.get(field), str) or not intent[field]
-            for field in ("execution_id", "marker", "created_at", "scheduler_user")
-        )
-        or not cast(str, intent["execution_id"]).startswith("jarvis_")
-        or not cast(str, intent["marker"]).startswith("clio-relay-")
-        or intent.get("scheduler_expected") not in {True, False, "unknown"}
-        or not isinstance(intent.get("direct_proof_sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", cast(str, intent["direct_proof_sha256"]))
-    ):
-        raise RelayError(f"scheduler submission intent is invalid for task {task.task_id}")
-    try:
-        created_at = datetime.fromisoformat(cast(str, intent["created_at"]))
-    except ValueError as exc:
-        raise RelayError(f"scheduler submission intent time is invalid for {task.task_id}") from exc
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise RelayError(f"scheduler submission intent time is naive for {task.task_id}")
-    return intent
-
-
-def _task_id_for_scheduler_job(tasks: list[RelayTask], scheduler_job_id: str) -> str | None:
-    for task in tasks:
-        if scheduler_job_id in _scheduler_job_ids_from_metadata(task.metadata):
-            return task.task_id
-    return None
-
-
-def _task_scheduler_status(
-    tasks: list[RelayTask],
-    task_id: str,
-    scheduler_job_id: str,
-) -> dict[str, Any] | None:
-    for task in tasks:
-        if task.task_id != task_id:
-            continue
-        stored = task.metadata.get("scheduler_status")
-        if not isinstance(stored, dict):
-            return None
-        typed = cast(dict[str, Any], stored)
-        if typed.get("scheduler_job_id") != scheduler_job_id:
-            return None
-        return typed
-    return None
-
-
-@contextmanager
-def _job_subprocess_env(
-    values: dict[str, str],
-    *,
-    inherit_parent: bool = True,
-) -> Generator[dict[str, str], None, None]:
-    """Yield an isolated child environment without mutating threaded process state."""
-    yield {**os.environ, **values} if inherit_parent else dict(values)

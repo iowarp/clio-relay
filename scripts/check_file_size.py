@@ -422,7 +422,26 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_normalized_provider_distribution` has no remaining `EndpointWorker`
     # call site (its only caller, `_trusted_mcp_progress_metadata`, moved
     # with it); no test referenced it directly. Net: 6763 -> 6316.
-    "src/clio_relay/endpoint.py": 6316,
+    # #231 endpoint split, slice 9: -501 net lines -- the ENTIRE remaining
+    # module-level function tail (everything after `EndpointWorker`) moves
+    # out, split along its last real seam: worker-environment identity +
+    # scheduler-naming/status normalization + bounded coercion helpers
+    # (`endpoint_worker_environment.py`, 330 lines) and durable job/task/
+    # runtime-metadata classification predicates
+    # (`endpoint_scheduler_metadata.py`, 292 lines). endpoint.py is now
+    # exactly `EndpointWorker` (plus its module-scope constants/imports) --
+    # the assembly the doc's own inventory named as the file's largest
+    # single concern, still unsequenced there. `bootstrap_cluster_
+    # environment` (a public, non-underscore name) has zero remaining
+    # callers anywhere in the repository (verified by a full-tree grep
+    # before the move, not just endpoint.py) and drops out of endpoint.py's
+    # forward import entirely -- preserved as-is per this campaign's scope
+    # (decomposition, not dead-code removal); `_scheduler_name_from_document`
+    # similarly has no remaining `EndpointWorker` call site (only its
+    # recursive self-calls and its one caller, `_scheduler_name_from_yaml`,
+    # which moved with it). No test referenced either directly. Net:
+    # 6316 -> 5815.
+    "src/clio_relay/endpoint.py": 5815,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
