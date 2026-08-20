@@ -428,20 +428,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # justified, minimal ratchet-up.
     "src/clio_relay/http_api.py": 3267,
     "src/clio_relay/input_staging.py": 814,
-    # clio-relay#242: -12 net lines -- `_run_json_probe`/`_mcp_contract_digest`
-    # move to the new contract_gate.py owner module (single owner for every
-    # contract-identity probe/digest, reused by the per-surface bootstrap
-    # enumeration), offsetting the new InstallReceipt contract_surfaces/
-    # contract_degradations fields and the typed use-time refusal in
-    # verify_remote_clio_kit_native_execution_component. A ratchet-down.
-    # clio-relay#242 dev-mode course correction: +5 net lines --
-    # `verify_remote_clio_kit_native_execution_component`'s below-pin jarvis
-    # refusal now delegates to `contract_gate.require_surface_contract`
-    # (dev-mode aware) instead of raising `contract_surface_unavailable`
-    # inline, and returns the worker's unverified runtime identity when dev
-    # mode defers rather than falling into the generic "omitted" error. A
-    # justified, minimal ratchet-up.
-    "src/clio_relay/installation.py": 3711,
+    # installation.py's own ratchet-baseline entry and history comment were
+    # removed here (iowarp/clio-relay#231 split/installation): the file is
+    # now 409 lines (an assembly/facade over its owner modules --
+    # distribution_source_identity.py, installation_receipt_models.py,
+    # native_jarvis_contract.py, persistent_uv_tool_probe.py,
+    # python_distribution_probe.py, wheel_record_closure.py,
+    # component_runtime_identity.py, component_verification_remote.py,
+    # worker_runtime_verification.py), comfortably under DEFAULT_MAX_LINES
+    # with no baseline entry needed.
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
     # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s

@@ -249,7 +249,7 @@ PINSITES: tuple[PinSite, ...] = (
     ),
     _row(
         "jc.installation",
-        "src/clio_relay/installation.py",
+        "src/clio_relay/native_jarvis_contract.py",
         _JC,
         _LN,
         "CLIO_KIT_JARVIS_CONTRACT_ID",
@@ -259,7 +259,11 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new require_surface_contract import pushed this
         # unchanged constant from line 60 to line 61.
-        line=61,
+        # clio-relay#231 installation split: the constant's sole canonical
+        # definition moved from installation.py:61 to the owner module
+        # native_jarvis_contract.py (installation.py now only re-imports the
+        # name, which carries no assignable value for this pin to read).
+        line=37,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),

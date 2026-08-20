@@ -70,7 +70,10 @@ def kit_pin_sites(
             # bootstrap.py edit above the placeholder; it should become a
             # content-anchored search-window site (the placeholder string is
             # unique in the file) -- tracked with the pin-registry follow-ups.
-            line=7437,
+            # Fourth drift (#231 wave-1 merge train): the #247/#254/#257
+            # bootstrap extractions REMOVED lines above the placeholder,
+            # 7437 -> 6906 (pre-existing red on develop, healed here).
+            line=6906,
             placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
             mutable=False,
         ),
