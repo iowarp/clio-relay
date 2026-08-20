@@ -31,6 +31,7 @@ import clio_relay.service_runtime as service_runtime
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_primitives as service_runtime_primitives
+import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import cli as relay_cli
@@ -6683,7 +6684,7 @@ def test_local_health_probe_rejects_non_2xx_and_wrong_runtime_identity(
 
     transport = httpx.MockTransport(lambda _request: httpx.Response(status_code, content=body))
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6705,7 +6706,7 @@ def test_local_health_probe_accepts_exact_2xx_runtime_identity(
 
     transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=b"runtime-nonce"))
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6734,7 +6735,7 @@ def test_jarvis_v2_health_accepts_opaque_body_only_after_anonymous_401_and_beare
 
     transport = httpx.MockTransport(protected_health)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6763,7 +6764,7 @@ def test_jarvis_v2_health_rejects_an_unprotected_endpoint(
 
     transport = httpx.MockTransport(unprotected_health)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6793,7 +6794,7 @@ def test_legacy_jarvis_v1_health_accepts_anonymous_opaque_2xx(
 
     transport = httpx.MockTransport(legacy_health)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6826,7 +6827,7 @@ def test_browser_health_accepts_opaque_2xx_with_exact_null_origin_cors(
 
     transport = httpx.MockTransport(browser_health)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6853,7 +6854,7 @@ def test_browser_health_rejects_wildcard_cors(
         )
     )
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6888,7 +6889,7 @@ def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_an
 
     transport = httpx.MockTransport(echo_bearer)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_readiness,
         "_new_readiness_http_client",
         _mock_http_client_factory(transport),
     )
@@ -6950,12 +6951,12 @@ def test_local_readiness_responses_enforce_fixed_chunked_and_compressed_limits(
                 return client
 
             monkeypatch.setattr(
-                service_runtime,
+                service_runtime_readiness,
                 "_new_readiness_http_client",
                 client_factory,
             )
             with pytest.raises(ValueError, match="decompressed limit"):
-                service_runtime._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                service_runtime_readiness._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     "http://readiness.invalid/state",
                     headers=None,
                     maximum_bytes=maximum,
@@ -7022,7 +7023,7 @@ def test_local_readiness_response_has_one_absolute_slow_drip_deadline() -> None:
     try:
         deadline = started_at + 0.2
         with pytest.raises(httpx.TimeoutException, match="total monotonic deadline"):
-            service_runtime._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            service_runtime_readiness._read_bounded_http_response(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 f"http://127.0.0.1:{port}/state",
                 headers=None,
                 maximum_bytes=2048,

@@ -564,7 +564,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # (CommandRunner protocol default implementation) plus its stdin-delivery
     # helper moved to the new service_runtime_command_runner.py (154 lines).
     # 7866 -> 7740.
-    "src/clio_relay/service_runtime.py": 7740,
+    # #231 service-runtime split, slice 6: the absolute-deadline bounded HTTP
+    # readiness reader plus loopback-port and browser-attachment-support
+    # helpers moved to the new service_runtime_readiness.py (242 lines).
+    # 7740 -> 7537.
+    "src/clio_relay/service_runtime.py": 7537,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
