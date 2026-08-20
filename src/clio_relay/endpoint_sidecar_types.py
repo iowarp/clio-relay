@@ -20,6 +20,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from clio_relay.errors import RelayError
+
+
+class SchedulerSubmissionUnresolvedError(RelayError):
+    """An armed scheduler intent could not yet be resolved to zero or one owned job.
+
+    Raised across ``EndpointWorker``'s (``endpoint.py``, still the composed
+    facade) execution-ownership/scheduler-submission/JARVIS-recovery mixins.
+    It lives on this pure-leaf module -- not on any one of them -- because
+    every one of those owner modules raises or catches it, and a leaf is the
+    only home that keeps them acyclic (iowarp/clio-relay#231, endpoint split
+    slice 10). Not part of any test's ``monkeypatch.setattr`` surface, so no
+    module-attribute indirection is needed for it the way ``endpoint_
+    execution_lifecycle.py``'s ``EXECUTION_CLEANUP_SCAN_LIMIT`` requires.
+    """
+
 
 @dataclass
 class _PackageProgressLogState:

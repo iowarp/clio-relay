@@ -52,7 +52,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # process_containment_windows.py, mirrored here byte-identical to
     # src/clio_relay.
     "jarvis-packages/clio_relay/clio_relay/process_containment_windows.py": 4,
-    "src/clio_relay/endpoint.py": 2,
     "src/clio_relay/process_containment_windows.py": 4,
     "src/clio_relay/validation_report.py": 1,
 }

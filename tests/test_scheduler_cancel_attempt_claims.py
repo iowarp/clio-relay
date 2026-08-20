@@ -645,7 +645,9 @@ def test_recovered_canceled_confirmation_survives_late_unknown_without_worker_er
         scheduler_job_id=scheduler_job_id,
     )
     clock = [datetime(2026, 7, 14, 16, 0, tzinfo=UTC)]
-    monkeypatch.setattr("clio_relay.endpoint.utc_now", lambda: clock[0])
+    # endpoint_scheduler_cancel_actions.py owns the worker-side confirmation
+    # poll's real utc_now() call sites now (clio-relay#231 endpoint split).
+    monkeypatch.setattr("clio_relay.endpoint_scheduler_cancel_actions.utc_now", lambda: clock[0])
     _accept_scheduler_cancellation_without_polling(
         setup_queue,
         job,
