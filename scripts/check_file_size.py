@@ -588,7 +588,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # left in this file's own body -- only endpoint.py and
     # jarvis_service_runtime.py import it directly -- so it is re-exported
     # via qualified assignment instead. 4171 -> 3839.
-    "src/clio_relay/remote_mcp.py": 3839,
+    # #231 slice 7: the agent-facing JSON-Schema builder cluster
+    # (cluster_route_revision_json_schema, VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
+    # jarvis_service_runtime_handoff_json_schema, virtual_jarvis_job_output_schema)
+    # moved to the new remote_mcp_wire_schemas.py (172 lines, under
+    # DEFAULT_MAX_LINES). All four are re-exported -- mcp_server.py,
+    # jarvis_mcp.py, jarvis_mcp_validation.py, and tests import them
+    # directly. VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA and
+    # virtual_jarvis_job_output_schema have a real local reader too
+    # (VirtualRemoteMcpTool.definition), so they use a plain `from ...
+    # import`; cluster_route_revision_json_schema and
+    # jarvis_service_runtime_handoff_json_schema have no reader left in
+    # this file's own body (both calls moved into the new module's own
+    # definitions), so they are re-exported via qualified assignment
+    # instead. virtual_jarvis_job_output_schema imports
+    # CLIO_KIT_JARVIS_USER_TOOL_NAMES (a contract-pin constant still here)
+    # at function scope, the proven idiom for the load-order circular
+    # import a module-scope import back would create. 3839 -> 3728.
+    "src/clio_relay/remote_mcp.py": 3728,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to

@@ -55,7 +55,19 @@ from jsonschema import Draft202012Validator
 # it directly -- so it is re-exported via qualified assignment instead
 # (ruff's unused-import check has no equivalent for a plain module-level
 # assignment, unlike the `from ... import` it kept stripping as dead).
-from clio_relay import remote_mcp_acceptance_models, remote_mcp_cache
+# Agent-facing JSON-Schema builders for remote MCP job receipts/handoffs
+# moved to remote_mcp_wire_schemas.py (#231; design doc §4.5/§5). All four
+# names are re-exported under their original names -- mcp_server.py,
+# jarvis_mcp.py, jarvis_mcp_validation.py, and tests import them directly
+# from clio_relay.remote_mcp. VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA and
+# virtual_jarvis_job_output_schema have a real local reader too
+# (VirtualRemoteMcpTool.definition), so they use a plain `from ... import`.
+# cluster_route_revision_json_schema and jarvis_service_runtime_handoff_json_schema
+# have no reader left in this file's own body (both calls moved into
+# remote_mcp_wire_schemas.py's own definitions), so they are re-exported via
+# qualified assignment instead (ruff's unused-import check has no
+# equivalent for a plain module-level assignment).
+from clio_relay import remote_mcp_acceptance_models, remote_mcp_cache, remote_mcp_wire_schemas
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -65,7 +77,6 @@ from clio_relay.cluster_config import (
     default_registry_path,
 )
 from clio_relay.errors import NotFoundError, RelayError
-from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.models import (
     REGISTERED_JARVIS_USER_CONTRACT,
     JobKind,
@@ -160,6 +171,10 @@ from clio_relay.remote_mcp_tool_schema import (
     _stable_digest,
     is_remote_mcp_control_query,
 )
+from clio_relay.remote_mcp_wire_schemas import (
+    VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
+    virtual_jarvis_job_output_schema,
+)
 
 if TYPE_CHECKING:
     from clio_relay.core_queue import ClioCoreQueue
@@ -176,6 +191,14 @@ MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 600
 # is read here too (the catalog freshness check below), so it is imported
 # rather than duplicated.
 MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES = 1024 * 1024
+# cluster_route_revision_json_schema / jarvis_service_runtime_handoff_json_schema
+# re-export (see comment on the remote_mcp_wire_schemas import above) --
+# qualified assignment, not `from ... import`, since this file's own body
+# has no reader for either any more.
+cluster_route_revision_json_schema = remote_mcp_wire_schemas.cluster_route_revision_json_schema
+jarvis_service_runtime_handoff_json_schema = (
+    remote_mcp_wire_schemas.jarvis_service_runtime_handoff_json_schema
+)
 # remote_mcp_server_artifact_binding_verified re-export (see comment on the
 # remote_mcp_cache import above) -- qualified assignment, not `from ...
 # import`, since this file's own body has no reader for it any more.
@@ -392,140 +415,6 @@ CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
         CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
     ]
 )
-
-
-def cluster_route_revision_json_schema() -> JSON:
-    """Return the agent-facing schema for an opaque cluster route revision."""
-
-    return {
-        "type": "string",
-        "pattern": "^[0-9a-f]{64}$",
-        "description": (
-            "Opaque cluster-route revision copied exactly from a relay job receipt. "
-            "This is not a scientific-dataset catalog revision."
-        ),
-    }
-
-
-VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
-    "type": "object",
-    "properties": {
-        "cluster": {"type": "string"},
-        "job_id": {"type": "string"},
-        "state": {
-            "type": "string",
-            "enum": ["queued", "leased", "running", "succeeded", "failed", "canceled"],
-        },
-        "kind": {"type": "string", "const": "mcp_call"},
-        "terminal": {"type": "boolean"},
-        "remote": {"type": "boolean"},
-        "route_revision": cluster_route_revision_json_schema(),
-        "catalog_revision": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$",
-            "description": (
-                "Opaque revision of the locally advertised remote-MCP tool catalog; "
-                "this is not a scientific-dataset catalog revision."
-            ),
-        },
-        "last_error": {"type": ["string", "null"]},
-        "observation": {
-            "type": "object",
-            "properties": {
-                "outcome": {
-                    "type": "string",
-                    "enum": ["terminal", "observation_unknown"],
-                },
-                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
-                "scheduler_action": {"type": "string", "const": "none"},
-                "relay_action": {"type": "string", "const": "none"},
-            },
-            "required": [
-                "outcome",
-                "timeout_seconds",
-                "scheduler_action",
-                "relay_action",
-            ],
-            "additionalProperties": False,
-            "description": (
-                "Result of the bounded observation requested by this call. "
-                "observation_unknown preserves the durable job for later observation."
-            ),
-        },
-        "mcp_result": {"type": "object"},
-        "mcp_result_artifact": {"type": "object"},
-        "logs": {"type": "object"},
-    },
-    "required": [
-        "cluster",
-        "job_id",
-        "state",
-        "kind",
-        "terminal",
-        "route_revision",
-        "catalog_revision",
-    ],
-    "additionalProperties": False,
-}
-
-
-def jarvis_service_runtime_handoff_json_schema(
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact agent-facing JARVIS service handoff schema."""
-    return {
-        "type": "object",
-        "properties": {
-            "cluster": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256,
-                **({"enum": sorted(clusters)} if clusters is not None else {}),
-            },
-            "source_job_id": durable_record_id_json_schema(),
-            "source_artifact_id": durable_record_id_json_schema(),
-            "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
-            "service_instance_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512,
-            },
-        },
-        "required": [
-            "cluster",
-            "source_job_id",
-            "source_artifact_id",
-            "package_id",
-            "package_name",
-            "service_instance_id",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def virtual_jarvis_job_output_schema(
-    remote_tool: str,
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact relay job receipt schema for one verified JARVIS tool."""
-    if remote_tool not in CLIO_KIT_JARVIS_USER_TOOL_NAMES:
-        raise ValueError(f"unknown virtual JARVIS tool: {remote_tool}")
-    output_schema = deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
-    if remote_tool == "jarvis_get_execution":
-        output_properties = cast(JSON, output_schema["properties"])
-        output_properties["service_runtime_bindings"] = {
-            "type": "array",
-            "description": (
-                "Ready-service handoffs derived from the verified durable MCP result. "
-                "Pass one item unchanged as relay_bind_jarvis_runtime.binding."
-            ),
-            "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
-            "maxItems": 4_096,
-        }
-    return output_schema
 
 
 @dataclass(frozen=True)
