@@ -142,7 +142,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231: -236 net lines -- release_identity.py becomes the owner for
     # resolving/verifying a live GitHub release's identity and gating
     # persistent mutations on protected main/tag/governance/release state.
-    "src/clio_relay/ci_validation.py": 2183,
+    # #231: -440 net lines -- candidate_provenance.py becomes the owner for
+    # the pre-tag receipt chain: sealing a merge-queue candidate build (one
+    # build + six matrix-report validations, incl. the complementary
+    # POSIX/Windows platform-marked-test partition proof) and binding a
+    # protected release tag to that tested tree via its merged pull request.
+    "src/clio_relay/ci_validation.py": 1743,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
