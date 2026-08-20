@@ -46,9 +46,14 @@ from typing import NamedTuple
 # to the repository root, forward slashes.
 RATCHET_BASELINE: dict[str, int] = {
     "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 2,
-    "jarvis-packages/clio_relay/clio_relay/process_containment.py": 4,
+    # process_containment.py split iowarp/clio-relay#231: the facade has zero
+    # class-in-function violations; the 4 nested ctypes.Structure classes
+    # (Windows Job Object accounting/limit structs) moved verbatim into
+    # process_containment_windows.py, mirrored here byte-identical to
+    # src/clio_relay.
+    "jarvis-packages/clio_relay/clio_relay/process_containment_windows.py": 4,
     "src/clio_relay/endpoint.py": 2,
-    "src/clio_relay/process_containment.py": 4,
+    "src/clio_relay/process_containment_windows.py": 4,
     "src/clio_relay/validation_report.py": 1,
 }
 

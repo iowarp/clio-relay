@@ -55,7 +55,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # ledger names as never having existed before R6, not a fixable
     # regression. A justified, minimal ratchet-up.
     "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5782,
-    "jarvis-packages/clio_relay/clio_relay/process_containment.py": 2678,
+    # process_containment.py split iowarp/clio-relay#231: the facade is now
+    # 197 lines with the implementation moved into fifteen
+    # process_containment_*.py owner modules (mirrored here byte-identical
+    # to src/clio_relay, per the isolated-runtime-mirror test), so this
+    # entry is removed rather than ratcheted down.
     # #158: +17 net lines -- the preflight script now travels on STDIN instead
     # of in argv. Some ssh clients silently truncate a long command-line
     # argument (the MSYS2 OpenSSH in Git for Windows drops everything past
@@ -681,7 +685,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 2: +3 lines retain v3.6 as a handle-first execution
     # contract while v3.7 remains the current input-staging contract.
     "src/clio_relay/models.py": 2299,
-    "src/clio_relay/process_containment.py": 2678,
     "src/clio_relay/queue_management.py": 1671,
     # +11 net lines -- the first live worker_status() read raced a
     # just-registered fleet's own background slot heartbeats
