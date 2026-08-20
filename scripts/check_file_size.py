@@ -528,7 +528,22 @@ RATCHET_BASELINE: dict[str, int] = {
     # already-decomposed EndpointWorker facade rather than the pre-split
     # 8843-line monolith develop's history describes. A justified,
     # minimal ratchet-up.
-    "src/clio_relay/endpoint.py": 5915,
+    # clio-relay#266: the job IS the run -- a scheduler-deferred jarvis_run
+    # must stay `working` until JARVIS's own execution record reaches
+    # terminal, instead of going terminal on the seconds-lived dispatch
+    # response. All new logic (detection, the poll loop, phase mapping,
+    # ceiling/cancel-refusal handling, terminal-outcome folding) lives in
+    # the new owner module execution_watch.py -- nothing here duplicates
+    # it. What remains is the irreducible call-site wiring
+    # `_run_job_impl`'s existing terminal-state branching requires: the
+    # detection call before the one ingest of mcp-result.json, folding a
+    # resolved watch into the existing effective_returncode/
+    # cancellation/failure-metadata decisions (each already threads ~10
+    # local closures no free function outside this method can reach), and
+    # one thin `_watch_deferred_jarvis_execution` method. A justified,
+    # minimal ratchet-up (5915 -> 5991), mirroring #259's own precedent
+    # immediately above.
+    "src/clio_relay/endpoint.py": 5991,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else

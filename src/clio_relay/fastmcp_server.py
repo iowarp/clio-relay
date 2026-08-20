@@ -44,7 +44,7 @@ from mcp_types.jsonrpc import HEADER_MISMATCH
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import PrivateAttr
 
-from clio_relay import __version__, door_error_adapters, door_errors
+from clio_relay import __version__, door_error_adapters, door_errors, execution_watch
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
@@ -626,7 +626,7 @@ class RelayMcpRuntime:
             status, _ = _relay_state_projection(job.state.value)
             return GetTaskResult(
                 status=status,
-                status_message=f"Relay job is {job.state.value}",
+                status_message=execution_watch.execution_phase_status_message_for_job(job),
                 last_updated_at=job.updated_at.isoformat(),
                 **{key: value for key, value in common.items() if key != "last_updated_at"},
             )

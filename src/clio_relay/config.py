@@ -11,6 +11,10 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from clio_relay.execution_watch import (
+    DEFAULT_EXECUTION_WATCH_CEILING_SECONDS,
+    DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS,
+)
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.spool import (
     DEFAULT_MAX_LOG_BYTES_PER_JOB,
@@ -154,6 +158,15 @@ class RelaySettings(BaseModel):
         le=MAX_INPUT_TOTAL_MAX_BYTES,
     )
     input_file_max_count: int = Field(default=DEFAULT_INPUT_FILE_MAX_COUNT, ge=1, le=1_000)
+    execution_watch_poll_interval_seconds: float = Field(
+        default=DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS,
+        gt=0,
+        le=300,
+    )
+    execution_watch_ceiling_seconds: int = Field(
+        default=DEFAULT_EXECUTION_WATCH_CEILING_SECONDS,
+        ge=1,
+    )
 
     @model_validator(mode="after")
     def validate_owner_session_identity(self) -> Self:
@@ -345,6 +358,14 @@ class RelaySettings(BaseModel):
             input_file_max_count=_positive_int_env(
                 "CLIO_RELAY_INPUT_FILE_MAX_COUNT",
                 DEFAULT_INPUT_FILE_MAX_COUNT,
+            ),
+            execution_watch_poll_interval_seconds=_positive_float_env(
+                "CLIO_RELAY_EXECUTION_WATCH_POLL_INTERVAL_SECONDS",
+                DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS,
+            ),
+            execution_watch_ceiling_seconds=_positive_int_env(
+                "CLIO_RELAY_EXECUTION_WATCH_CEILING_SECONDS",
+                DEFAULT_EXECUTION_WATCH_CEILING_SECONDS,
             ),
         )
 
