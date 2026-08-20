@@ -549,9 +549,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # builds an authored, actionable message naming the conflicting
     # task_id and the `tasks/get` query verb. A justified, minimal
     # ratchet-up for a real bug fix, not accretion.
-    # Pattern observation errors are converted to typed MCP errors at the
-    # native FastMCP boundary; the measured post-change count is 1267.
-    "src/clio_relay/fastmcp_server.py": 1267,
+    # #231 fastmcp_server.py split (split/fastmcp-server-w2): the file (1179
+    # measured lines, baseline stale at 1267) is now an assembly/facade only
+    # (172 lines -- re-exports + RelayBearerTokenVerifier +
+    # create_fastmcp_server/run_fastmcp_stdio/run_fastmcp_http) over six new
+    # owner modules: mcp_task_projection.py (status/timing constants + the
+    # relay state-map projection), mcp_agent_input_guard.py (the
+    # post-admission agent input elicitation guard), mcp_session_state_
+    # codec.py (the compatibility MCP session state (de)serializer),
+    # mcp_task_runtime.py (RelayMcpRuntime, 592 lines -- above the 150-500
+    # sweet spot; its own docstring documents why it stays one class/module),
+    # mcp_tool_provider.py (RelayTool/RelayToolProvider), and
+    # mcp_tasks_extension.py (RelayTasksExtension). Entry removed per ground
+    # rule 5 -- comfortably under DEFAULT_MAX_LINES, no baseline entry
+    # needed.
     # #231 R3: +24 net lines (door_errors import + the ONE global
     # Exception-handler function + its registration) -- deliberately not
     # offset by deleting any of the 107 existing HTTPException sites, which
