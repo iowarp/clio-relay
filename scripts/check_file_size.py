@@ -151,7 +151,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # and job identity: selecting the sole successful merge-queue ci.yml run
     # for a commit, and building/verifying the CI status receipt that binds
     # it to the already-sealed candidate build and tag binding.
-    "src/clio_relay/ci_validation.py": 1512,
+    # #231: -395 net lines -- actions_artifact.py becomes the owner for
+    # binding a GitHub Actions artifact to its exact trusted workflow run
+    # (candidate/tag-binding/tag-payload/promotion kinds) and safely
+    # extracting its archive under payload_policy's name/size policy,
+    # including binding an extracted candidate payload back to its sealed
+    # build receipt.
+    "src/clio_relay/ci_validation.py": 1117,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared

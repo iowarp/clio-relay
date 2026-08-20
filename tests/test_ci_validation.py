@@ -11,6 +11,11 @@ from typing import cast
 
 import pytest
 
+from clio_relay.actions_artifact import (
+    MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
+    build_actions_artifact_manifest,
+    verify_actions_artifact_archive,
+)
 from clio_relay.branch_protection import (
     GITHUB_ACTIONS_APP_ID,
     MAIN_REVIEW_POLICY,
@@ -22,6 +27,11 @@ from clio_relay.branch_protection import (
     verify_live_repository_governance,
     verify_repository_governance,
 )
+from clio_relay.candidate_provenance import (
+    REQUIRED_MATRIX_JOBS,
+    build_candidate_build_receipt,
+    build_tag_binding,
+)
 from clio_relay.ci_run_status import (
     REQUIRED_CI_JOBS,
     build_ci_status,
@@ -29,7 +39,6 @@ from clio_relay.ci_run_status import (
     verify_ci_status,
 )
 from clio_relay.ci_validation import (
-    MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
     MAX_DISTRIBUTION_BYTES,
     MAX_FIXED_JSON_BYTES,
     MAX_MANIFEST_BYTES,
@@ -40,16 +49,11 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_ASSETS,
     MAX_VALIDATION_REPORT_BYTES,
     REQUIRED_ENVIRONMENTS,
-    REQUIRED_MATRIX_JOBS,
     ProvenanceError,
-    build_actions_artifact_manifest,
-    build_candidate_build_receipt,
     build_exact_release_asset_inventory,
     build_staged_release_asset_plan,
-    build_tag_binding,
     build_validation_report_asset_manifest,
     validate_release_acceptance_matrix,
-    verify_actions_artifact_archive,
     verify_downloaded_validation_report_assets,
     verify_exact_release_asset_inventory,
     write_candidate_checksum_manifest,
