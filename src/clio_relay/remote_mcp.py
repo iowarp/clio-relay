@@ -53,7 +53,6 @@ from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_re
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
-    RemoteMcpProfile,
     RemoteMcpServerConfig,
     cluster_route_revision,
     default_registry_path,
@@ -86,6 +85,17 @@ from clio_relay.remote_mcp_acceptance_models import (
     RemoteMcpStructuredResultExpectation,
     _is_canonical_absolute_posix_path,
     _is_canonical_relative_posix_path,
+)
+
+# Virtual tool alias assignment/collision-resolution moved to
+# remote_mcp_aliasing.py (#231; design doc §4.5/§5). None of these have a
+# caller outside remote_mcp.py's own catalog-assembly code, so they are
+# imported directly with no re-export needed.
+from clio_relay.remote_mcp_aliasing import (
+    MAX_VIRTUAL_REMOTE_MCP_CANDIDATES,
+    _assign_aliases,
+    _profile_allows,
+    _safe_name,
 )
 
 # JSON / JSON-Schema validation primitives moved to
@@ -163,9 +173,12 @@ MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS = (
 MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES = (
     remote_mcp_acceptance_models.MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES
 )
-MAX_VIRTUAL_REMOTE_MCP_CANDIDATES = 10_000
+# MAX_VIRTUAL_REMOTE_MCP_CANDIDATES and MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+# moved to remote_mcp_aliasing.py (imported below). Only the former is read
+# here too (the catalog-assembly candidate-limit check), so only it is
+# imported back; the latter has no reader left outside the moved alias
+# functions themselves.
 MAX_REMOTE_MCP_CATALOG_ISSUES = 10_000
-MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
 MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
 
 logger = logging.getLogger(__name__)
@@ -393,9 +406,6 @@ VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
     },
 }
 VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS = frozenset(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS)
-
-
-_SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9_]+")
 
 
 def cluster_route_revision_json_schema() -> JSON:
@@ -4364,82 +4374,3 @@ def _relocate_legacy_local_references(
                 nested_resource=nested_resource,
                 root=False,
             )
-
-
-def _assign_aliases(
-    grouped: dict[str, list[_Candidate]],
-    *,
-    reserved_names: set[str],
-) -> dict[str, str]:
-    bases: dict[str, list[str]] = {}
-    for identity, candidates in grouped.items():
-        base = _bounded_base_alias(candidates[0].base_alias)
-        bases.setdefault(base, []).append(identity)
-    all_bases = set(bases)
-    assigned: dict[str, str] = {}
-    used = set(reserved_names)
-    for base, identities in sorted(bases.items()):
-        sorted_identities = sorted(identities)
-        if len(sorted_identities) == 1 and base not in used:
-            identity = sorted_identities[0]
-            assigned[identity] = base
-            used.add(base)
-            continue
-        for identity in sorted_identities:
-            alias = _collision_alias(
-                base,
-                identity,
-                blocked=used | all_bases,
-            )
-            assigned[identity] = alias
-            used.add(alias)
-    return assigned
-
-
-def _collision_alias(base: str, identity: str, *, blocked: set[str]) -> str:
-    maximum_suffix_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len("remote_")
-    for length in range(10, min(len(identity), maximum_suffix_length) + 1):
-        candidate = _alias_with_suffix(base, identity[:length])
-        if candidate not in blocked:
-            return candidate
-    for nonce in range(1, len(blocked) + MAX_VIRTUAL_REMOTE_MCP_CANDIDATES + 2):
-        suffix = hashlib.sha256(f"{identity}\0{nonce}".encode("ascii")).hexdigest()[
-            :maximum_suffix_length
-        ]
-        candidate = f"remote_{suffix}"
-        if candidate not in blocked:
-            return candidate
-    raise ValueError("could not assign a unique bounded remote MCP alias")
-
-
-def _bounded_base_alias(base: str) -> str:
-    """Bound one readable generated alias to the MCP interoperability limit."""
-    if len(base) <= MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH:
-        return base
-    suffix = hashlib.sha256(base.encode("utf-8")).hexdigest()[:10]
-    return _alias_with_suffix(base, suffix)
-
-
-def _alias_with_suffix(base: str, suffix: str) -> str:
-    """Append a stable suffix without exceeding the MCP tool-name limit."""
-    head_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len(suffix) - 1
-    if head_length < 1:
-        raise ValueError("remote MCP alias suffix leaves no readable prefix")
-    head = base[:head_length].rstrip("_")
-    if not head:
-        head = "remote"[:head_length]
-    return f"{head}_{suffix}"
-
-
-def _profile_allows(profiles: list[RemoteMcpProfile], profile: str) -> bool:
-    if profile == "all":
-        return True
-    normalized = "user" if profile in {"", "agent", "user"} else profile
-    return normalized in profiles
-
-
-def _safe_name(value: str) -> str:
-    normalized = _SAFE_NAME_PATTERN.sub("_", value.strip().lower()).strip("_")
-    if normalized:
-        return normalized
-    return f"unnamed_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:10]}"

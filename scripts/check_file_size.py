@@ -555,7 +555,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # families) stay here -- design doc §4.5 names that cluster as needing
     # reordering, a separate future slice, not a contiguous cut alongside
     # the models.
-    "src/clio_relay/remote_mcp.py": 4445,
+    # #231 slice 4: the virtual-tool alias assignment/collision-resolution
+    # cluster (_assign_aliases, _collision_alias, _bounded_base_alias,
+    # _alias_with_suffix, _profile_allows, _safe_name, the compiled
+    # _SAFE_NAME_PATTERN, and the two bound alias constants) moved to the
+    # new remote_mcp_aliasing.py (122 lines, under DEFAULT_MAX_LINES). None
+    # have a caller outside remote_mcp.py's own catalog-assembly code
+    # (confirmed by grep), so no re-export is needed -- only
+    # MAX_VIRTUAL_REMOTE_MCP_CANDIDATES is imported back (the
+    # catalog-assembly candidate-limit check still reads it). 4445 -> 4376.
+    "src/clio_relay/remote_mcp.py": 4376,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to

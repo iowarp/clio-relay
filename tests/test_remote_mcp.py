@@ -24,7 +24,7 @@ from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.cli as relay_cli
-from clio_relay import remote_cli, remote_mcp, remote_mcp_schema_validation
+from clio_relay import remote_cli, remote_mcp, remote_mcp_aliasing, remote_mcp_schema_validation
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -1857,7 +1857,8 @@ def test_catalog_aliases_remain_interoperable_for_long_remote_names() -> None:
     assert sorted(first.tools) == sorted(second.tools)
     assert len(first.tools) == 2
     assert all(
-        len(alias) <= remote_mcp.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH for alias in first.tools
+        len(alias) <= remote_mcp_aliasing.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+        for alias in first.tools
     )
     assert all(re.fullmatch(r"[a-z0-9_]+", alias) is not None for alias in first.tools)
 
