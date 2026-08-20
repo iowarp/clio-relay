@@ -1021,7 +1021,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # sidecar record codec (runtime_metadata_sidecar.py) -- each its own
     # owner module, all comfortably under DEFAULT_MAX_LINES. Entry removed
     # per ground rule 5 -- ratchet down.
-    "src/clio_relay/scheduler_providers.py": 1153,
+    # scheduler_providers.py (1153 lines) split into a package: protocols.py,
+    # external.py, slurm_provider.py, slurm_connector.py (the
+    # _SlurmConnectorMixin), slurm_connector_launcher.py, slurm_status.py,
+    # validation.py, command.py, registry.py, and constants.py, assembled by
+    # scheduler_providers/__init__.py (169 lines, a re-export-only facade --
+    # every prior `clio_relay.scheduler_providers.X` import and monkeypatch
+    # target, including the ones dotted-string-patched by test_scheduler_
+    # status.py, keeps resolving unchanged). Every new file is under
+    # DEFAULT_MAX_LINES; entry removed per ground rule 5 -- ratchet down.
+    # (NOTE: this branch forked before runtime-metadata-w2 landed and still
+    # carried its stale "runtime_metadata.py": 1749 entry; omitted for the
+    # same reason as the other stale-fork-point merges in this train.)
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
     # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
