@@ -612,7 +612,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # mixin plus the not-yet-extracted jarvis-bind and browser clusters)
     # moved to service_runtime_readiness.py, which every caller already
     # imports, rather than being duplicated three times. 5613 -> 4873.
-    "src/clio_relay/service_runtime.py": 4873,
+    # #231 service-runtime split, slice 12: the JARVIS-bound runtime binding
+    # cluster (bind_verified_jarvis_runtime, its identity/policy helpers,
+    # _validate_jarvis_binding_session, _resume_jarvis_binding_locked,
+    # _jarvis_connector_start_intent, _rollback_jarvis_binding, plus the two
+    # schema constants that move with their only callers) moved to the new
+    # service_runtime_jarvis_bind.py (768 lines, at the sweet-spot cap -- one
+    # cohesive state machine, documented in the module docstring rather than
+    # force-split) as `_ServiceRuntimeJarvisBindMixin`. 4873 -> 4169.
+    "src/clio_relay/service_runtime.py": 4169,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new

@@ -256,7 +256,11 @@ def test_subprocess_runner_terminates_process_group_when_private_input_delivery_
     def fake_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
         return process
 
-    monkeypatch.setattr(service_runtime.subprocess, "Popen", fake_popen)
+    # #231 class-mixin split: service_runtime.py no longer imports subprocess
+    # for itself (its only prior use moved to service_runtime_jarvis_bind.py);
+    # SubprocessCommandRunner.popen (the code under test) lives in
+    # service_runtime_command_runner.py, so patch subprocess there.
+    monkeypatch.setattr(service_runtime_command_runner.subprocess, "Popen", fake_popen)
     terminated: list[int] = []
     monkeypatch.setattr(
         service_runtime_primitives,
