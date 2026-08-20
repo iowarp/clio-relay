@@ -590,7 +590,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # for the existing public/monkeypatch surface -- one name per line so
     # ruff's F401 does not prune a name this module no longer references
     # internally. 5458 -> 4924.
-    "src/clio_relay/validation_report.py": 4924,
+    # #231 split/validation-report S2: ValidationRecorder + the seeded-report
+    # factory (new_live_validation_report/_validation_evidence_trust) moved
+    # to validation_recorder.py (517 lines), same re-export treatment.
+    # 4924 -> 4480.
+    # #231 split/validation-report S3: acceptance-line fact classification
+    # (line_proves_success/acceptance_scope + the fact-value catalogs) moved
+    # to acceptance_facts.py (160 lines). No re-export needed -- the only
+    # internal caller (validation_recorder.py) now imports it directly.
+    # 4480 -> 4336.
+    "src/clio_relay/validation_report.py": 4336,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
