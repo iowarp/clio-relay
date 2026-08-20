@@ -1122,7 +1122,30 @@ RATCHET_BASELINE: dict[str, int] = {
     # CLIO_KIT_JARVIS_USER_TOOL_NAMES (a contract-pin constant still here)
     # at function scope, the proven idiom for the load-order circular
     # import a module-scope import back would create. 3839 -> 3728.
-    "src/clio_relay/remote_mcp.py": 3728,
+    # #231 slices 8-19 (finish/remote-mcp): the remaining ~3,300-line
+    # validator-family body (design doc §4.5's deferred row) -- the virtual
+    # catalog data model, admission resolution, catalog assembly, the
+    # canonical acceptance-report builder, the fresh-install Spack
+    # transition report and its per-phase checks, the shared bounded-
+    # evidence primitives, the structured-result and scientific-catalog
+    # result checks, the per-operation Spack result validators, the
+    # declared semantic-contract checks, and the packaged stdio evidence
+    # extraction -- moved to twelve new owner modules
+    # (remote_mcp_catalog_models.py 293, remote_mcp_admission.py 353,
+    # remote_mcp_catalog_build.py 461, remote_mcp_acceptance_report.py 429,
+    # remote_mcp_spack_transition_report.py 401,
+    # remote_mcp_spack_transition_checks.py 568,
+    # remote_mcp_acceptance_evidence.py 111, remote_mcp_structured_result.py
+    # 220, remote_mcp_scientific_catalog_result.py 284,
+    # remote_mcp_spack_result_validation.py 206, remote_mcp_contract_checks.py
+    # 507, remote_mcp_stdio_evidence.py 177 -- all under DEFAULT_MAX_LINES).
+    # The three CLIO_KIT_*/contract-identity constant families (and the
+    # four release_pin_sites.py LINE sites that hardcode their exact
+    # position in THIS file) are left untouched at their original lines --
+    # only content from the first extracted class onward moved, so no pin
+    # site needed a line-number update. remote_mcp.py is now 500 lines (a
+    # pure facade + the still-resident constants), comfortably under
+    # DEFAULT_MAX_LINES -- entry removed per ground rule 5.
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
