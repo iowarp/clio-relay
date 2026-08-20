@@ -30,6 +30,7 @@ import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
+import clio_relay.service_runtime_connector_step_scripts as service_runtime_connector_step_scripts
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
@@ -6925,7 +6926,7 @@ def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_an
 
 
 def test_remote_health_probe_requires_2xx_and_exact_runtime_identity() -> None:
-    script = service_runtime._remote_http_probe_script(  # pyright: ignore[reportPrivateUsage]
+    script = service_runtime_connector_step_scripts._remote_http_probe_script(  # pyright: ignore[reportPrivateUsage]
         "compute-01",
         18777,
         "/healthz",

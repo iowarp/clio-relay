@@ -573,7 +573,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # (reserve/capture/verify one exact submission through a durable,
     # race-safe sidecar) moved to the new
     # service_runtime_submission_scripts.py (627 lines). 7537 -> 6948.
-    "src/clio_relay/service_runtime.py": 6948,
+    # #231 service-runtime split, slice 8: the SSH-delivered embedded
+    # shell/Python script generators for the scheduler-allocation
+    # connector-step lifecycle (step status/cancel/reconcile, remote HTTP
+    # health probe, connector discovery/status by durable identity sidecar)
+    # moved to the new service_runtime_connector_step_scripts.py (448
+    # lines). This closes out the module-level function extractions named
+    # in the concern inventory; service_runtime.py is now imports + module
+    # constants + the ServiceRuntimeSupervisor class only. 6948 -> 6523.
+    "src/clio_relay/service_runtime.py": 6523,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
