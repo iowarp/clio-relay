@@ -810,7 +810,9 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
         configured_probe,
     )
     monkeypatch.setattr("clio_relay.live_acceptance._wait_for_success", forbidden_batch_call)
-    monkeypatch.setattr("clio_relay.live_acceptance._verify_completed_job", forbidden_batch_call)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_job_verification._verify_completed_job", forbidden_batch_call
+    )
     monkeypatch.setattr(
         "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
         verify_secure_runtime,
