@@ -26,6 +26,7 @@ from typer.testing import CliRunner
 import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
 import clio_relay.cli_installation_receipt as cli_installation_receipt
@@ -2329,7 +2330,10 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
     path_type = type(current)
     original_lstat = path_type.lstat
     original_readlink = os.readlink
-    original_is_directory_alias = bootstrap_reconcile._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # proven_active_generation_mismatch (the direct caller here) now lives in
+    # bootstrap_reconcile_inspection.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_is_directory_alias = bootstrap_reconcile_inspection._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     raw_target = str(active)
     simulate_current_race = False
     current_lstat_calls = 0
@@ -2382,13 +2386,13 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
         return path == generations or original_is_directory_alias(path)
 
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         aliased_generations,
     )
     assert proven_active_generation_mismatch(desired, home=tmp_path) is None
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         original_is_directory_alias,
     )
