@@ -60,7 +60,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # src/clio_relay.
     "jarvis-packages/clio_relay/clio_relay/process_containment_windows.py": 4,
     "src/clio_relay/process_containment_windows.py": 4,
-    "src/clio_relay/validation_report.py": 1,
+    # validation_report.py's entry dropped (ratchet-down): its nested class was
+    # extracted by the #231 decomposition and the guard's own advisory demanded
+    # the removal in the same change.
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

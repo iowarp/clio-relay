@@ -39,6 +39,7 @@ from __future__ import annotations
 import ctypes
 import os
 from contextlib import suppress
+from ctypes import wintypes
 from pathlib import Path
 
 from clio_relay.endpoint_runtime_sidecar_anchor import (
@@ -261,25 +262,39 @@ def _open_windows_cleanup_handle(
     return int(raw_handle)
 
 
+class _ByHandleFileInformation(ctypes.Structure):
+    """``BY_HANDLE_FILE_INFORMATION`` layout (fixed; wintypes imports cross-platform)."""
+
+    _fields_ = [
+        ("file_attributes", wintypes.DWORD),
+        ("creation_time", wintypes.FILETIME),
+        ("last_access_time", wintypes.FILETIME),
+        ("last_write_time", wintypes.FILETIME),
+        ("volume_serial_number", wintypes.DWORD),
+        ("file_size_high", wintypes.DWORD),
+        ("file_size_low", wintypes.DWORD),
+        ("number_of_links", wintypes.DWORD),
+        ("file_index_high", wintypes.DWORD),
+        ("file_index_low", wintypes.DWORD),
+    ]
+
+
+class _FileRenameInformationLayout(ctypes.Structure):
+    """``FILE_RENAME_INFO`` layout head; the flexible ``FileName`` tail is
+    buffer-built from field offsets at the call site (fixed layout here)."""
+
+    _fields_ = [
+        ("replace_if_exists", wintypes.BOOLEAN),
+        ("root_directory", wintypes.HANDLE),
+        ("file_name_length", wintypes.DWORD),
+        ("file_name", wintypes.WCHAR * 1),
+    ]
+
+
 def _windows_handle_information(handle: int, path: Path) -> tuple[int, int]:
     """Return attributes and stable file identity for an already-open Windows handle."""
     if os.name != "nt":
         raise RuntimeError("Windows cleanup handle inspection requires Windows")
-    from ctypes import wintypes
-
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("file_attributes", wintypes.DWORD),
-            ("creation_time", wintypes.FILETIME),
-            ("last_access_time", wintypes.FILETIME),
-            ("last_write_time", wintypes.FILETIME),
-            ("volume_serial_number", wintypes.DWORD),
-            ("file_size_high", wintypes.DWORD),
-            ("file_size_low", wintypes.DWORD),
-            ("number_of_links", wintypes.DWORD),
-            ("file_index_high", wintypes.DWORD),
-            ("file_index_low", wintypes.DWORD),
-        ]
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetFileInformationByHandle.argtypes = [
@@ -305,20 +320,11 @@ def _mark_windows_handle_for_rename(
     """Apply no-replace FileRenameInfo to an exact open sidecar handle."""
     if os.name != "nt":
         raise RuntimeError("Windows handle rename requires Windows")
-    from ctypes import wintypes
 
     quarantine_text = str(internal_filesystem_path(quarantine))
     quarantine_bytes = quarantine_text.encode("utf-16-le")
     if not quarantine_bytes or "\x00" in quarantine_text:
         raise ConfigurationError(f"invalid execution sidecar quarantine name: {quarantine}")
-
-    class _FileRenameInformationLayout(ctypes.Structure):
-        _fields_ = [
-            ("replace_if_exists", wintypes.BOOLEAN),
-            ("root_directory", wintypes.HANDLE),
-            ("file_name_length", wintypes.DWORD),
-            ("file_name", wintypes.WCHAR * 1),
-        ]
 
     # FILE_RENAME_INFORMATION ends in a flexible WCHAR array. Windows accepts
     # FileNameLength as the exact non-NUL UTF-16 payload length, but the input
