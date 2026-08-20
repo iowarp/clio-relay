@@ -1171,7 +1171,22 @@ RATCHET_BASELINE: dict[str, int] = {
     # symmetry with append_stdout/append_stderr. A justified, minimal
     # ratchet-up.
     "src/clio_relay/spool.py": 1000,
-    "src/clio_relay/storage_policy.py": 1826,
+    # split/storage-policy-w2: storage_policy.py's own ratchet-baseline entry
+    # (1826) is removed here. The wire types/limits/error vocabulary moved to
+    # storage_policy_types.py (280 lines), the ledger content codec to
+    # storage_ledger_codec.py (215 lines), the filesystem-identity and
+    # durable-I/O primitives built on it to storage_file_io.py (256 lines),
+    # and StoragePolicy's reservation-CRUD/status-health surfaces to the
+    # StorageReservationLedgerMixin/StorageSnapshotMixin mixins
+    # (storage_reservation_ledger.py, 457 lines; storage_snapshot.py, 230
+    # lines) it composes. ``scan_tree``, ``_scandir_verified``, and
+    # ``_replace_file`` -- each individually monkeypatched by name in the test
+    # suite via ``storage_module.<name>`` -- plus every caller that reaches one
+    # of them by bare (non-``self.``) name (``StoragePolicy._stable_tree_
+    # snapshot``, ``StoragePolicy.check_runtime_job``, ``StoragePolicy.
+    # _write_ledger``) stay resident on the facade, which is now 511 lines
+    # (an assembly + re-export surface, comfortably under the 800-line
+    # default cap): no baseline entry needed.
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
     # while exposing only StorageDecision.message, never its serialized
     # exception payload.
