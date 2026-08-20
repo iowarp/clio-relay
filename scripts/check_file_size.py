@@ -620,7 +620,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # service_runtime_jarvis_bind.py (768 lines, at the sweet-spot cap -- one
     # cohesive state machine, documented in the module docstring rather than
     # force-split) as `_ServiceRuntimeJarvisBindMixin`. 4873 -> 4169.
-    "src/clio_relay/service_runtime.py": 4169,
+    # #231 service-runtime split, slice 13: the browser sandbox attach/detach
+    # cluster (browser_attach, browser_detach, their serialized
+    # implementations, the shared _revoke_browser_attachment revocation, and
+    # _revoke_browser_for_runtime_cleanup) moved to the new
+    # service_runtime_browser.py (465 lines) as `_ServiceRuntimeBrowserMixin`.
+    # 4169 -> 3749.
+    "src/clio_relay/service_runtime.py": 3749,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
