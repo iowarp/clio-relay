@@ -651,7 +651,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # artifact_identity_verification.py for is_official_github_release_wheel
     # in S7) are re-pointed at their real owner modules directly instead of
     # hopping through this file. 2482 -> 1534.
-    "src/clio_relay/validation_report.py": 1534,
+    # #231 split/validation-report S9: the durable validation directory --
+    # over 1000 lines, a real three-way seam split. validation_directory_
+    # windows.py (314 lines) pins/verifies/creates directories through a
+    # raw CreateFileW handle (Windows has no O_NOFOLLOW/dir_fd equivalent);
+    # validation_writer_lock.py (317 lines) is the cross-platform parent-
+    # wide writer lock plus its stale-.pending sweep, built on the windows
+    # primitives; durable_validation_write.py (537 lines) is the top-level
+    # orchestration (durably_ensure_validation_directory + the atomic
+    # text-replace pair) built on both. validation_report.py is now under
+    # DEFAULT_MAX_LINES -- entry removed. 1534 -> 505.
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

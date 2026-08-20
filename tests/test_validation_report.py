@@ -26,9 +26,11 @@ from pydantic import ValidationError
 from pytest import MonkeyPatch
 
 from clio_relay import artifact_identity_verification as artifact_identity_verification_module
+from clio_relay import durable_validation_write as durable_validation_write_module
 from clio_relay import process_ancestry as process_ancestry_module
 from clio_relay import uv_tool_receipt as uv_tool_receipt_module
 from clio_relay import validation_report as validation_report_module
+from clio_relay import validation_writer_lock as validation_writer_lock_module
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import GatewaySession, GatewaySessionState
 from clio_relay.remote_mcp import (
@@ -123,7 +125,7 @@ def test_validation_writer_refuses_a_concurrent_writer_without_corruption(
     entered = Event()
     release = Event()
     thread_errors: list[BaseException] = []
-    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original = durable_validation_write_module.atomic_write_text_locked
 
     def blocking_writer(
         path: Path,
@@ -136,11 +138,13 @@ def test_validation_writer_refuses_a_concurrent_writer_without_corruption(
             raise AssertionError("concurrent validation writer test timed out")
         original(path, text, writer_lock=writer_lock)  # pyright: ignore[reportArgumentType]
 
-    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocking_writer)
+    monkeypatch.setattr(
+        durable_validation_write_module, "atomic_write_text_locked", blocking_writer
+    )
 
     def first_writer() -> None:
         try:
-            validation_report_module._atomic_write_text(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            durable_validation_write_module.atomic_write_text(
                 target,
                 "first",
             )
@@ -216,7 +220,7 @@ def test_windows_validation_lock_guard_blocks_parent_swap_before_lock_open(
     parent.mkdir(mode=0o700)
     displaced = tmp_path / "displaced-reports"
     rename_errors: list[OSError] = []
-    original = validation_report_module._open_windows_validation_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original = validation_writer_lock_module.open_windows_validation_directory
 
     def try_swap_after_pin(*args: object, **kwargs: object) -> object:
         anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
@@ -228,21 +232,17 @@ def test_windows_validation_lock_guard_blocks_parent_swap_before_lock_open(
         return anchor
 
     monkeypatch.setattr(
-        validation_report_module,
-        "_open_windows_validation_directory",
+        validation_writer_lock_module,
+        "open_windows_validation_directory",
         try_swap_after_pin,
     )
-    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        parent
-    )
+    writer_lock = validation_writer_lock_module.acquire_validation_writer_lock(parent)
     try:
         assert rename_errors
         assert not displaced.exists()
         assert {path.name for path in parent.iterdir()} == {writer_lock.path.name}
     finally:
-        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            writer_lock
-        )
+        validation_writer_lock_module.release_validation_writer_lock(writer_lock)
 
 
 def test_windows_validation_lock_swap_before_guard_creation_leaves_replacement_empty(
@@ -254,7 +254,7 @@ def test_windows_validation_lock_swap_before_guard_creation_leaves_replacement_e
     parent = tmp_path / "reports"
     parent.mkdir(mode=0o700)
     displaced = tmp_path / "displaced-before-guard"
-    original = validation_report_module.acquire_private_configuration_windows_parent_guard
+    original = validation_writer_lock_module.acquire_private_configuration_windows_parent_guard
 
     def swap_then_guard(path: Path) -> tuple[Path, object]:
         path.rename(displaced)
@@ -263,12 +263,12 @@ def test_windows_validation_lock_swap_before_guard_creation_leaves_replacement_e
         return guard_path, handle
 
     monkeypatch.setattr(
-        validation_report_module,
+        validation_writer_lock_module,
         "acquire_private_configuration_windows_parent_guard",
         swap_then_guard,
     )
     with pytest.raises((OSError, ConfigurationError), match="changed|path"):
-        validation_report_module._acquire_validation_writer_lock(parent)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        validation_writer_lock_module.acquire_validation_writer_lock(parent)
 
     assert list(parent.iterdir()) == []
     assert list(displaced.iterdir()) == []
@@ -1483,7 +1483,7 @@ def test_atomic_report_writer_refuses_concurrent_same_parent_writer(
     entered = Event()
     release = Event()
     failures: list[BaseException] = []
-    original = validation_report_module._atomic_write_text_locked  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original = durable_validation_write_module.atomic_write_text_locked
 
     def blocked_writer(*args: object, **kwargs: object) -> None:
         entered.set()
@@ -1491,7 +1491,7 @@ def test_atomic_report_writer_refuses_concurrent_same_parent_writer(
             raise TimeoutError("test writer was not released")
         original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
-    monkeypatch.setattr(validation_report_module, "_atomic_write_text_locked", blocked_writer)
+    monkeypatch.setattr(durable_validation_write_module, "atomic_write_text_locked", blocked_writer)
 
     def first_writer() -> None:
         try:
@@ -1529,7 +1529,7 @@ def test_validation_directory_creation_is_bound_to_pinned_ancestor(
     requested = trusted / "a" / "b"
 
     if os.name == "posix":
-        original = validation_report_module._create_posix_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        original = durable_validation_write_module.create_posix_validation_directory_child
         swapped = False
 
         def swap_then_create(parent_fd: int, child_name: str) -> int:
@@ -1541,8 +1541,8 @@ def test_validation_directory_creation_is_bound_to_pinned_ancestor(
             return original(parent_fd, child_name)
 
         monkeypatch.setattr(
-            validation_report_module,
-            "_create_posix_validation_directory_child",
+            durable_validation_write_module,
+            "create_posix_validation_directory_child",
             swap_then_create,
         )
         with pytest.raises(OSError, match="changed"):
@@ -1551,7 +1551,7 @@ def test_validation_directory_creation_is_bound_to_pinned_ancestor(
         assert (displaced / "a").is_dir()
         return
 
-    original_windows = validation_report_module._create_windows_validation_directory_child  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_windows = durable_validation_write_module.create_windows_validation_directory_child
     rename_errors: list[OSError] = []
 
     def try_swap_then_create(parent: object, child_name: str) -> object:
@@ -1562,8 +1562,8 @@ def test_validation_directory_creation_is_bound_to_pinned_ancestor(
         return original_windows(parent, child_name)  # pyright: ignore[reportArgumentType]
 
     monkeypatch.setattr(
-        validation_report_module,
-        "_create_windows_validation_directory_child",
+        durable_validation_write_module,
+        "create_windows_validation_directory_child",
         try_swap_then_create,
     )
     with pytest.raises(OSError, match="changed|find the file"):
