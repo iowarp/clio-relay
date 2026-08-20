@@ -21,7 +21,13 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
-from clio_relay import endpoint_runtime_sidecar_anchor, process_containment, queue_artifacts
+from clio_relay import (
+    endpoint_runtime_sidecar_anchor,
+    endpoint_sidecar_types,
+    endpoint_windows_sidecar_handles,
+    process_containment,
+    queue_artifacts,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -1381,7 +1387,7 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
 ) -> None:
     private = cast(Any, endpoint_module)
     if os.name == "nt":
-        assert private._WINDOWS_FILE_RENAME_INFO == 3
+        assert endpoint_sidecar_types._WINDOWS_FILE_RENAME_INFO == 3
         return
     spool = tmp_path / "spool" / "job"
     spool.mkdir(parents=True)
@@ -1461,26 +1467,26 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
             calls.append(("closed", handle))
 
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_open_windows_cleanup_handle",
             fake_open_windows_cleanup_handle,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_windows_handle_information",
             fake_windows_handle_information,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_quarantine_windows_sidecar_by_handle",
             fake_quarantine_windows_sidecar_by_handle,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_close_windows_cleanup_handle",
             fake_close_windows_cleanup_handle,
         )
-        cast(Any, endpoint_module)._remove_execution_sidecars_windows(
+        cast(Any, endpoint_windows_sidecar_handles)._remove_execution_sidecars_windows(
             [progress],
             spool_path=spool,
             expected_spool_identity=(os.stat(spool).st_dev, os.stat(spool).st_ino),
@@ -1489,7 +1495,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
         assert calls == [(progress.name, 41), ("closed", 41)]
         return
 
-    original_quarantine = private._quarantine_windows_sidecar_by_handle
+    original_quarantine = endpoint_windows_sidecar_handles._quarantine_windows_sidecar_by_handle
     moved_spool = spool.with_name("job-replaced")
     replacement_attempts: list[OSError] = []
 
@@ -1514,7 +1520,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
         )
 
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_windows_sidecar_handles,
         "_quarantine_windows_sidecar_by_handle",
         adversarial_quarantine,
     )
@@ -1557,7 +1563,7 @@ def test_windows_repeated_quarantine_creates_only_exact_directory_entries(
 ) -> None:
     private = cast(Any, endpoint_module)
     if os.name != "nt":
-        assert private._WINDOWS_FILE_RENAME_INFO == 3
+        assert endpoint_sidecar_types._WINDOWS_FILE_RENAME_INFO == 3
         return
     spool = tmp_path / "spool"
     spool.mkdir()

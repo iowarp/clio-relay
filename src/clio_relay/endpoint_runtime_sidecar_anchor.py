@@ -12,17 +12,27 @@ if it were the original private channel. Four related primitives:
 - ``_precreate_runtime_sidecar`` / ``_open_owned_sidecar`` create and later
   reopen the sidecar file, each immediately re-validating what they got.
 
+Also owns ``_execution_sidecar_quarantine_name`` -- a pure function of one
+anchor's identity (no execution-cleanup state), and the reason
+``endpoint_windows_sidecar_handles.py``'s ``_remove_execution_sidecars_windows``
+can depend on this module without creating a cycle back to the still-
+co-resident execution-sidecar cleanup orchestration in ``endpoint.py``.
+
 Depends only on ``endpoint_sidecar_types.py`` (the ``_RuntimeSidecarAnchor``
 dataclass) and ``endpoint_progress_log_io.py`` (``_progress_log_identity``,
 used by ``_open_owned_sidecar`` to detect a swap between stat and open) --
 both leaves themselves, so this module stays acyclic. The Windows-handle
 primitives (``endpoint_windows_sidecar_handles.py``) and the execution-
-sidecar cleanup primitives import ``_validate_runtime_sidecar_stat`` and
-``_runtime_sidecar_anchor_from_metadata`` from here in turn.
+sidecar cleanup primitives import ``_validate_runtime_sidecar_stat``,
+``_runtime_sidecar_anchor_from_metadata``, and
+``_execution_sidecar_quarantine_name`` from here in turn.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
 import stat as stat_module
 from pathlib import Path
@@ -32,6 +42,23 @@ from clio_relay.endpoint_progress_log_io import _progress_log_identity
 from clio_relay.endpoint_sidecar_types import _RuntimeSidecarAnchor
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
+
+
+def _execution_sidecar_quarantine_name(anchor: _RuntimeSidecarAnchor) -> str:
+    """Return a bounded deterministic retention name for one exact sidecar inode."""
+    digest = hashlib.sha256(
+        json.dumps(
+            anchor.as_metadata(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    # Keep the target no longer than the shortest generated runtime sidecar
+    # name. This preserves all 256 identity bits while avoiding a rename that
+    # crosses the legacy Windows MAX_PATH boundary after the source was
+    # successfully created in the same spool directory.
+    return f".q1-{token}"
 
 
 def _runtime_sidecar_anchor(

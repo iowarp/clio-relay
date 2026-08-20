@@ -343,7 +343,21 @@ RATCHET_BASELINE: dict[str, int] = {
     # _precreate_runtime_sidecar, _open_owned_sidecar) moves to the new owner
     # module `endpoint_runtime_sidecar_anchor.py` (183 lines). Net:
     # 8590 -> 8447.
-    "src/clio_relay/endpoint.py": 8447,
+    # #231 endpoint split, slice 4: -339 net lines -- the Windows ctypes
+    # sidecar-handle primitives (_open_windows_cleanup_handle,
+    # _windows_handle_information, _mark_windows_handle_for_rename,
+    # _close_windows_cleanup_handle, _validate_windows_sidecar_handle,
+    # _quarantine_windows_sidecar_by_handle, _remove_execution_sidecars_
+    # windows) move to the new owner module
+    # `endpoint_windows_sidecar_handles.py` (387 lines). The one function that
+    # would otherwise create a cycle between this module and the still-
+    # co-resident execution-sidecar cleanup orchestration,
+    # _execution_sidecar_quarantine_name (a pure function of one anchor, no
+    # cleanup state), relocates to `endpoint_runtime_sidecar_anchor.py`
+    # instead (183 -> 210 lines there) -- both windows-handles and the still-
+    # co-resident orchestration depend on it from that one leaf, and neither
+    # depends on the other. Net: 8447 -> 8108.
+    "src/clio_relay/endpoint.py": 8108,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
