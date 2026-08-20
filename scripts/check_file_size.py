@@ -111,7 +111,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # #158: +6 net lines -- the receipt binds that activation evidence was
     # recorded, rather than equating the activated digest with the packaged
     # source digest, which JARVIS's normalization makes legitimately unequal.
-    "src/clio_relay/bootstrap_reconcile.py": 4468,
+    # 2026-08-19 (+21, justified): the receipt-verification gates in
+    # resolve_receipt_bound_jarvis_python now DEFER under dev mode loudly
+    # instead of crash-looping a hand-deployed worker (the un-deferred
+    # execution_runtime_verified check restarted the ares worker every ~10s;
+    # #250 family). Ratchets back with the #255 bootstrap decomposition.
+    "src/clio_relay/bootstrap_reconcile.py": 4490,
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.
