@@ -625,7 +625,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # under the 800 cap; one coherent concern). Only its entry point has a
     # caller left in this file (gate evaluation); no inner binding helper is
     # tested directly, so nothing else needed re-export. 3751 -> 3174.
-    "src/clio_relay/validation_report.py": 3174,
+    # #231 split/validation-report S7: install-source-detection primitives --
+    # over 800 lines combined, a real three-way seam split (ground rule per
+    # the split recipe). regular_file_identity.py (92 lines) is the shared
+    # snapshot-verified-read leaf both other modules and this file's own
+    # remaining _detect_launcher_receipt/detect_install_source depend on;
+    # process_ancestry.py (226 lines) walks the OS parent chain for the
+    # launching uv executable; uv_tool_receipt.py (474 lines) binds the
+    # install-once uv-tool receipt + installed-RECORD closure. Every symbol
+    # this file's own remaining orchestration still calls, plus the two uv
+    # receipt functions test_validation_report.py exercises directly, are
+    # re-exported. 3174 -> 2482.
+    "src/clio_relay/validation_report.py": 2482,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

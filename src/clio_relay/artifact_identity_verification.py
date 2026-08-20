@@ -20,11 +20,9 @@ Embedded/checkout build identity (:func:`embedded_build_info` /
 (:func:`classify_install_source` / :func:`is_official_github_release_wheel`)
 live here too since both feed the same provenance picture. The install-source
 *detection* orchestration (still in :mod:`clio_relay.validation_report`, not
-yet extracted) calls into this module; :func:`direct_wheel_bytes` calls back
-into it for the shared regular-file identity primitives
-(``_regular_file_identity`` / ``_read_open_regular_file``) via a
-function-scoped import -- the proven idiom for a concern not yet extracted to
-its own owner module.
+yet extracted) calls into this module; :func:`_direct_wheel_bytes` reads the
+shared regular-file identity primitives from
+:mod:`clio_relay.regular_file_identity`.
 """
 
 from __future__ import annotations
@@ -50,6 +48,7 @@ from typing import Any, cast
 
 from clio_relay import __version__
 from clio_relay.redaction import redact_url
+from clio_relay.regular_file_identity import read_open_regular_file, regular_file_identity
 from clio_relay.validation_limits import MAX_DISTRIBUTION_WHEEL_BYTES
 from clio_relay.validation_schema import InstallSourceKind
 
@@ -217,8 +216,6 @@ def _wheel_url_matches_install(
 
 def _direct_wheel_bytes(direct_url: dict[str, Any] | None) -> bytes | None:
     """Read one bounded wheel from its exact local-file or clean HTTPS URL."""
-    from clio_relay.validation_report import _read_open_regular_file, _regular_file_identity
-
     if direct_url is None:
         return None
     raw_url = direct_url.get("url")
@@ -231,10 +228,10 @@ def _direct_wheel_bytes(direct_url: dict[str, Any] | None) -> bytes | None:
         path = _local_wheel_archive_path(direct_url)
         if path is None:
             return None
-        identity = _regular_file_identity(path)
+        identity = regular_file_identity(path)
         if identity is None or identity[2] > MAX_DISTRIBUTION_WHEEL_BYTES:
             return None
-        return _read_open_regular_file(
+        return read_open_regular_file(
             path,
             identity,
             maximum_bytes=MAX_DISTRIBUTION_WHEEL_BYTES,

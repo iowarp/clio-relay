@@ -26,6 +26,8 @@ from pydantic import ValidationError
 from pytest import MonkeyPatch
 
 from clio_relay import artifact_identity_verification as artifact_identity_verification_module
+from clio_relay import process_ancestry as process_ancestry_module
+from clio_relay import uv_tool_receipt as uv_tool_receipt_module
 from clio_relay import validation_report as validation_report_module
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import GatewaySession, GatewaySessionState
@@ -474,7 +476,7 @@ def test_released_https_wheel_binds_url_sha_record_and_uv_tool(
         verified_launcher,
     )
     monkeypatch.setattr(
-        validation_report_module.urllib.request,
+        artifact_identity_verification_module.urllib.request,
         "build_opener",
         build_opener,
     )
@@ -712,8 +714,8 @@ def test_release_wheel_fetch_rejects_private_dns_and_unsafe_redirects(
     assert validation_report_module._is_official_release_wheel_url(source_url) is True  # pyright: ignore[reportPrivateUsage]
     assert validation_report_module._url_host_resolves_publicly(source_url) is False  # pyright: ignore[reportPrivateUsage]
     handler = validation_report_module._ReleaseWheelRedirectHandler()  # pyright: ignore[reportPrivateUsage]
-    request = validation_report_module.urllib.request.Request(source_url)
-    with pytest.raises(validation_report_module.urllib.error.HTTPError):
+    request = artifact_identity_verification_module.urllib.request.Request(source_url)
+    with pytest.raises(artifact_identity_verification_module.urllib.error.HTTPError):
         handler.redirect_request(
             request,
             None,
@@ -896,35 +898,35 @@ def test_persistent_uv_tool_scopes_launcher_discovery_and_fails_closed(
         monkeypatch.delenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", raising=False)
     monkeypatch.chdir(stale_launcher.parent)
     monkeypatch.setattr(
-        validation_report_module.shutil,
+        uv_tool_receipt_module.shutil,
         "which",
         find_executable,
     )
-    monkeypatch.setattr(validation_report_module.sys, "prefix", str(environment))
-    monkeypatch.setattr(validation_report_module.sys, "base_prefix", str(base_prefix))
-    monkeypatch.setattr(validation_report_module.sys, "executable", str(interpreter))
+    monkeypatch.setattr(uv_tool_receipt_module.sys, "prefix", str(environment))
+    monkeypatch.setattr(uv_tool_receipt_module.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(uv_tool_receipt_module.sys, "executable", str(interpreter))
     monkeypatch.setattr(
-        validation_report_module,
-        "_uv_executable_identity",
+        uv_tool_receipt_module,
+        "uv_executable_identity",
         uv_identity,
     )
     monkeypatch.setattr(
-        validation_report_module,
-        "_uv_tool_dir",
+        uv_tool_receipt_module,
+        "uv_tool_dir",
         uv_tool_directory,
     )
     monkeypatch.setattr(
-        validation_report_module,
-        "_pyvenv_uv_version",
+        uv_tool_receipt_module,
+        "pyvenv_uv_version_marker",
         pyvenv_version,
     )
     monkeypatch.setattr(
-        validation_report_module,
-        "_installed_record_identity",
+        uv_tool_receipt_module,
+        "installed_record_identity",
         record_identity,
     )
 
-    verified, receipt = validation_report_module._detect_persistent_uv_tool_receipt(  # pyright: ignore[reportPrivateUsage]
+    verified, receipt = uv_tool_receipt_module.detect_persistent_uv_tool_receipt(
         detected_kind=InstallSourceKind.WHEEL,
         package_path=str(package),
         distribution=cast(metadata.Distribution, Distribution()),
@@ -955,7 +957,7 @@ def test_uv_launcher_identity_hashes_exact_regular_executable(
     def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess([str(executable), "--version"], 0, "uv 0.11.28\n", "")
 
-    monkeypatch.setattr(validation_report_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(process_ancestry_module.subprocess, "run", fake_run)
 
     verified, version, digest = _uv_executable_identity(str(executable))
 
@@ -975,7 +977,7 @@ def test_uv_launcher_identity_rejects_executable_replaced_during_probe(
         executable.write_bytes(b"substituted executable")
         return subprocess.CompletedProcess([str(executable), "--version"], 0, "uv 0.11.28\n", "")
 
-    monkeypatch.setattr(validation_report_module.subprocess, "run", replacing_run)
+    monkeypatch.setattr(process_ancestry_module.subprocess, "run", replacing_run)
 
     assert _uv_executable_identity(str(executable)) == (
         False,

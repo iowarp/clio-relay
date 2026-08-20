@@ -17,12 +17,13 @@ The logic that *constructs*, *records into*, *evaluates*, or *durably
 writes* these types stays in their own owner modules (recorder, gate
 evaluation, install-source detection, the durable validation directory) and
 imports the types from here. Two validators below reach back for a small
-classification helper that is not yet extracted to its own owner module
-(``_is_official_github_release_wheel``, ``_normalized_hostname``); those
-imports are function-scoped to avoid a load-order circular import (the
-proven idiom -- see the module docstring precedent in
-:mod:`clio_relay.session_wire_models`), and get re-pointed at each helper's
-real owner module as it is extracted.
+classification helper: :func:`~clio_relay.artifact_identity_verification.
+is_official_github_release_wheel` (its real owner) and
+``_normalized_hostname`` (not yet extracted to its own owner module, still
+:mod:`clio_relay.validation_report`); both imports are function-scoped to
+avoid a load-order circular import (the proven idiom -- see the module
+docstring precedent in :mod:`clio_relay.session_wire_models`), and each gets
+re-pointed at its real owner module as that concern is extracted.
 """
 
 from __future__ import annotations
@@ -204,11 +205,11 @@ class InstallSource(BaseModel):
     @model_validator(mode="after")
     def released_source_requires_verified_artifact_identity(self) -> InstallSource:
         """Reject internally inconsistent released-artifact claims."""
-        from clio_relay.validation_report import _is_official_github_release_wheel
+        from clio_relay.artifact_identity_verification import is_official_github_release_wheel
 
         released_source = self.kind is InstallSourceKind.PYPI or (
             self.kind is InstallSourceKind.WHEEL
-            and _is_official_github_release_wheel(self.direct_url, self.distribution_version)
+            and is_official_github_release_wheel(self.direct_url, self.distribution_version)
         )
         if self.released_artifact and not (
             self.kind is self.detected_kind
