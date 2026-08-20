@@ -102,15 +102,32 @@ def run_pyright_json(repo_root: Path) -> dict[str, Any]:
     and reported through :func:`_print_report`'s small, bounded summary,
     sidesteps that failure mode entirely regardless of how many diagnostics
     pyright reports.
+
+    Invocation is DIRECT (``sys.executable -m pyright``), never a nested
+    ``uv run``: this script already executes inside the project environment
+    (release_validation launches it via ``uv run --no-sync``), and adding a
+    third uv layer wedged CI's validate-local for its full 60-minute job
+    timeout (job 96602335205, 2026-08-20 — an orphaned uv child at teardown,
+    zero output for an hour). The timeout is a generous typed runaway
+    backstop for the ONE pyright exchange, never a tuning knob: expiry is a
+    loud failure naming the bound, not a silent cancel.
     """
-    completed = subprocess.run(
-        ["uv", "run", "--no-sync", "pyright", "--outputjson"],
-        cwd=repo_root,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pyright", "--outputjson"],
+            cwd=repo_root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=1500,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "pyright --outputjson exceeded the 1500s runaway backstop for a "
+            "single full-repo pass (normal passes complete in minutes); the "
+            "check environment is wedged, not merely slow"
+        ) from exc
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
