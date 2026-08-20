@@ -275,7 +275,12 @@ def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
             timeout_seconds=timeout_seconds,
         )
 
-    monkeypatch.setattr(http_api_module, "observe_until_terminal", observe)
+    # split/http-api-w3 (iowarp/clio-relay#231): `wait` moved to
+    # http_api_routes_events.py, the only remaining caller of
+    # observe_until_terminal -- the patch target follows the move.
+    import clio_relay.http_api_routes_events as http_api_routes_events_module
+
+    monkeypatch.setattr(http_api_routes_events_module, "observe_until_terminal", observe)
     response = cast(Any, TestClient(create_app(settings))).post(
         f"/jobs/{job.job_id}/wait",
         params={"timeout_seconds": 0.25, "poll_seconds": 0.05},
@@ -892,13 +897,18 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
         "storage_managed_queue",
         submission_queue,
     )
+    # split/http-api-w3 (iowarp/clio-relay#231): submit_mcp_call (and its
+    # resolve_registered_remote_mcp_admission/default_registry_path calls)
+    # moved to http_api_routes_jobs.py -- the patch targets follow the move.
+    import clio_relay.http_api_routes_jobs as http_api_routes_jobs_module
+
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "resolve_registered_remote_mcp_admission",
         resolve_admission,
     )
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "default_registry_path",
         lambda: tmp_path / "missing-clusters.json",
     )
@@ -2143,7 +2153,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         pytest.fail("owned API must not consult its cluster-local cache")
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         fail_on_cluster_cache,
     )
     client = cast(
@@ -2239,7 +2249,7 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
         return expected_digest
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -2339,8 +2349,8 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         )
         return ["mcp-server", "jarvis"]
 
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server", fake_server)
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server_args", fake_server_args)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", fake_server)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server_args", fake_server_args)
     client = cast(
         Any,
         TestClient(
@@ -2406,7 +2416,7 @@ def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict
     ) -> str:
         raise ValueError("receipt-bound clio-kit runtime identity did not verify")
 
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server", failing_server)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", failing_server)
     client = cast(
         Any,
         TestClient(
@@ -2455,7 +2465,12 @@ def _write_home_anchored_receipt_and_patch_expanduser(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", fake_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
     return "$HOME/deployment-p5run2/install-receipt.json"
 
 
@@ -2498,7 +2513,12 @@ def _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", fake_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
     return "$HOME/deployment-p5run2/install-receipt.json"
 
 
@@ -2517,7 +2537,9 @@ def test_owned_jarvis_mcp_submission_home_expansion_failure_surfaces_typed_not_5
     def homeless_expanduser(value: str) -> str:
         return "" if value == "~" else value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", homeless_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): see the comment on the
+    # fake_expanduser patch sites above.
+    monkeypatch.setattr(os.path, "expanduser", homeless_expanduser)
 
     definition = ClusterDefinition(
         name="test-cluster",

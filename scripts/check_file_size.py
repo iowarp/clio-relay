@@ -808,7 +808,48 @@ RATCHET_BASELINE: dict[str, int] = {
     # (refresh-discovery guidance; the at-fault idempotency_key plus the
     # retry-with-a-new-key move) instead of only the raw invariant text. A
     # justified, minimal ratchet-up.
-    "src/clio_relay/http_api.py": 3267,
+    #
+    # split/http-api-w3 (iowarp/clio-relay#231): http_api.py's ~1900-line
+    # create_app() (every route body as a nested closure over queue/resolved/
+    # owner_session_cluster) is now a 165-line facade. The seven owned-
+    # resource/admission closures (ensure_intake_open/owns_job/
+    # require_owned_job/require_owned_task/require_owned_artifact/
+    # submit_owned/require_owned_gateway) become methods on the new
+    # RelayApiContext (http_api_context.py, 342 lines -- also takes the
+    # owned-session cluster-authority binder, its only caller), the same
+    # "closures -> composed object" shape endpoint.py's own slice-10 mixin
+    # split already established. Every route body moves, in original
+    # declaration order, into six owner modules: http_api_routes_session.py
+    # (291), http_api_routes_jobs.py (450), http_api_routes_events.py (306),
+    # http_api_routes_artifacts.py (223), http_api_routes_gateway.py (192),
+    # http_api_routes_queue.py (402) -- each a single
+    # register_*_routes(app, ctx, ...) function. The remaining concerns each
+    # take their own leaf owner: http_api_middleware.py (196,
+    # InputArtifactBodyLimitMiddleware), http_api_redaction.py (63, the
+    # _public_record/_public_payload/_public_model_page family),
+    # http_api_queue_paging.py (157, owner-session-scoped /queue paging),
+    # http_api_models.py (327, every HTTP request Pydantic model),
+    # http_api_error_handlers.py (103, the four global exception handlers --
+    # its module logger is deliberately constructed from the hardcoded name
+    # "clio_relay.http_api", not __name__, so
+    # tests/test_door_errors.py's caplog assertions keep observing the
+    # identical Logger object regardless of which file calls
+    # logger.exception(...)), http_api_auth.py (162, the bearer-token/
+    # owner-session-header dependency factories), http_api_streaming.py
+    # (112, the SSE/WebSocket payload generators). Every name external code
+    # or tests reached through clio_relay.http_api (create_app, the
+    # module-level app, InputArtifactBodyLimitMiddleware,
+    # JarvisMcpCallSubmitRequest, OWNER_SESSION_ID_HEADER,
+    # SESSION_GENERATION_ID_HEADER, the door_errors module reference) stays
+    # importable from the facade under its original name.
+    # tests/test_door_errors.py's three AST-based structural counts (107
+    # door_errors.http_problem raise sites, 56 exc=-only sites, 15
+    # middleware refusal sites, the 5 session-binding course-correction
+    # sites) now scan across the full split module set instead of the one
+    # file, since the code they count moved with the routes -- same value,
+    # same call sites, different file. Comfortably under DEFAULT_MAX_LINES
+    # -- entry removed per this script's own ground rule 5 ("remove the
+    # entry once the file is under DEFAULT_MAX_LINES").
     "src/clio_relay/input_staging.py": 814,
     # installation.py's own ratchet-baseline entry and history comment were
     # removed here (iowarp/clio-relay#231 split/installation): the file is
