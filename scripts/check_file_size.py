@@ -647,7 +647,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # attach, _attach_serialized -- moved to the new service_runtime_attach.py
     # (353 lines) as `_ServiceRuntimeAttachMixin`. It calls back into the
     # detach mixin's resumability predicates via `self`. 2596 -> 2292.
-    "src/clio_relay/service_runtime.py": 2292,
+    # #231 service-runtime split, slice 17: ownership-intent reconciliation --
+    # the crash-recovery core _reconcile_ownership_intents (recovers
+    # scheduler submission and connector identities written before a hard
+    # exit by consulting each durable intent's SSH-observed sidecar),
+    # _reconcile_allocation_connector_intent, the two identity-binding
+    # validators it calls, _connector_records_match, and
+    # _local_connector_intent -- moved to the new
+    # service_runtime_reconciliation.py (732 lines) as
+    # `_ServiceRuntimeReconciliationMixin`. 2292 -> 1614.
+    "src/clio_relay/service_runtime.py": 1614,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
