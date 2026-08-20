@@ -28,13 +28,13 @@ from typing import Any, cast
 
 from clio_relay._mcp_call_runner_facade import facade as _facade
 from clio_relay.bounded_file_io import (
-    _bounded_regular_file_snapshot,
-    _record_bound_sha256,
-    _urlsafe_sha256_digest,
+    bounded_regular_file_snapshot,
+    record_bound_sha256,
+    urlsafe_sha256_digest,
 )
 from clio_relay.clio_kit_wheel_archive import (
-    _read_bounded_zip_member,
     _zip_member_is_regular,
+    read_bounded_zip_member,
 )
 from clio_relay.constants import (
     CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
@@ -60,7 +60,7 @@ def _persistent_tool_launcher_shebang(payload: bytes, *, executable_name: str) -
                 raise ValueError("Windows persistent tool launcher has no unique __main__.py")
             if candidates[0].flag_bits & 0x1:
                 raise ValueError("Windows persistent tool launcher script is encrypted")
-            script = _read_bounded_zip_member(
+            script = read_bounded_zip_member(
                 archive,
                 candidates[0].filename,
                 max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
@@ -126,7 +126,7 @@ def _external_python_console_distribution_identity(
         "server_lock_paths": {},
         "error": None,
     }
-    launcher_snapshot = _bounded_regular_file_snapshot(
+    launcher_snapshot = bounded_regular_file_snapshot(
         executable,
         max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
     )
@@ -344,7 +344,7 @@ print(json.dumps({"matches": matches}, sort_keys=True))
     except OSError as exc:
         evidence["error"] = f"persistent tool RECORD-owned launcher is unavailable: {exc}"
         return evidence
-    console_script_snapshot = _bounded_regular_file_snapshot(
+    console_script_snapshot = bounded_regular_file_snapshot(
         console_script,
         max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
     )
@@ -364,11 +364,11 @@ print(json.dumps({"matches": matches}, sort_keys=True))
         )
         return evidence
     closure = _verify_external_distribution_record_closure(cast(list[object], raw_files))
-    launcher_after = _bounded_regular_file_snapshot(
+    launcher_after = bounded_regular_file_snapshot(
         executable,
         max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
     )
-    console_script_after = _bounded_regular_file_snapshot(
+    console_script_after = bounded_regular_file_snapshot(
         console_script,
         max_bytes=PYTHON_TOOL_IDENTITY_MAX_BYTES,
     )
@@ -454,8 +454,8 @@ def _verify_external_distribution_record_closure(
         if total_bytes > PYTHON_DISTRIBUTION_MAX_BYTES:
             failure["error"] = "persistent tool RECORD byte total exceeded its limit"
             return failure
-        actual = _record_bound_sha256(member_path, expected_size=size)
-        expected = _urlsafe_sha256_digest(cast(str, member["hash_value"]))
+        actual = record_bound_sha256(member_path, expected_size=size)
+        expected = urlsafe_sha256_digest(cast(str, member["hash_value"]))
         if actual is None or expected is None or not hmac.compare_digest(actual, expected):
             failure["error"] = f"persistent tool distribution file hash mismatch: {name}"
             return failure
@@ -467,7 +467,7 @@ def _verify_external_distribution_record_closure(
         record_size = record_paths[0].lstat().st_size
     except OSError:
         record_size = -1
-    record_sha256 = _record_bound_sha256(record_paths[0], expected_size=record_size)
+    record_sha256 = record_bound_sha256(record_paths[0], expected_size=record_size)
     if record_sha256 is None:
         failure["error"] = "persistent tool RECORD file was missing"
         return failure

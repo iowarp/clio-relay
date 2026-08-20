@@ -21,15 +21,15 @@ from pathlib import Path
 from typing import Any, cast
 
 from clio_relay._mcp_call_runner_facade import facade as _facade
-from clio_relay.bounded_file_io import _bounded_regular_file_bytes, _is_sha256_text
+from clio_relay.bounded_file_io import bounded_regular_file_bytes, is_sha256_text
 from clio_relay.clio_kit_wheel_archive import (
     CLIO_KIT_WHEEL_MAX_PROJECT_BYTES,
-    _bounded_zip_member_chunks,
-    _clio_kit_runtime_project_members,
-    _read_bounded_zip_member,
-    _validated_wheel_members,
-    _verified_wheel_archive,
     _zip_member_is_regular,
+    bounded_zip_member_chunks,
+    clio_kit_runtime_project_members,
+    read_bounded_zip_member,
+    validated_wheel_members,
+    verified_wheel_archive,
 )
 from clio_relay.constants import (
     _CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY,
@@ -113,11 +113,11 @@ def _installed_clio_kit_runtime_identity(
         return evidence
     source_path = Path(source_value)
     lock_path = Path(lock_value)
-    source = _bounded_regular_file_bytes(
+    source = bounded_regular_file_bytes(
         source_path,
         max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
     )
-    lock = _bounded_regular_file_bytes(
+    lock = bounded_regular_file_bytes(
         lock_path,
         max_bytes=CLIO_KIT_LOCK_MAX_BYTES,
     )
@@ -155,7 +155,7 @@ def _installed_clio_kit_runtime_identity(
         contract_source_verified
         and uv_identity is not None
         and isinstance(project_sha256, str)
-        and _is_sha256_text(project_sha256)
+        and is_sha256_text(project_sha256)
         and isinstance(runtime_file_count, int)
         and not isinstance(runtime_file_count, bool)
         and runtime_file_count > 0
@@ -214,12 +214,12 @@ def _locked_clio_kit_runtime_identity(
         evidence["error"] = "nested clio-kit runtime requires an exact wheel file"
         return evidence
     try:
-        with _verified_wheel_archive(wheel_path, install_artifact) as wheel:
-            members = _validated_wheel_members(wheel)
+        with verified_wheel_archive(wheel_path, install_artifact) as wheel:
+            members = validated_wheel_members(wheel)
             launcher = members.get("clio_kit/__init__.py")
             if launcher is None or not _zip_member_is_regular(launcher):
                 raise ValueError("clio-kit wheel has no unique launcher source")
-            launcher_source = _read_bounded_zip_member(
+            launcher_source = read_bounded_zip_member(
                 wheel,
                 launcher.filename,
                 max_bytes=CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
@@ -247,7 +247,7 @@ def _locked_clio_kit_runtime_identity(
                 raise ValueError("clio-kit wheel has no unique embedded server lock")
             lock_name = lock_names[0]
             prefix = lock_name[: -len("uv.lock")]
-            inputs = _clio_kit_runtime_project_members(
+            inputs = clio_kit_runtime_project_members(
                 members,
                 prefix=prefix,
                 server_name=server_name,
@@ -266,7 +266,7 @@ def _locked_clio_kit_runtime_identity(
                 digest.update(encoded)
                 content_digest = hashlib.sha256()
                 content_length = 0
-                for chunk in _bounded_zip_member_chunks(
+                for chunk in bounded_zip_member_chunks(
                     wheel,
                     member.filename,
                     max_bytes=CLIO_KIT_WHEEL_MAX_PROJECT_BYTES,
@@ -280,7 +280,7 @@ def _locked_clio_kit_runtime_identity(
                 digest.update(content_digest.digest())
                 if relative == "uv.lock":
                     lock_sha256 = content_digest.hexdigest()
-                    lock_content = _read_bounded_zip_member(
+                    lock_content = read_bounded_zip_member(
                         wheel,
                         member.filename,
                         max_bytes=CLIO_KIT_LOCK_MAX_BYTES,

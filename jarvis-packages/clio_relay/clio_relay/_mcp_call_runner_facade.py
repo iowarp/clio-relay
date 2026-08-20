@@ -31,7 +31,7 @@ production caller) is holding" is the module's own ``globals()`` dict: for an
 executing module, ``globals()`` *is* ``module.__dict__`` -- the same object
 ``setattr(module, name, value)`` (what ``monkeypatch.setattr`` does) mutates.
 So ``runner.py`` registers its own ``globals()`` here, once, right after its
-imports (``_register(globals())``); every owner module then reads through the
+imports (``register(globals())``); every owner module then reads through the
 returned proxy at *call time*, never at import time, so a later monkeypatch on
 the registered dict is always visible. This module has zero dependencies on
 any other ``clio_relay`` module and lives at the ``clio_relay`` top level (not
@@ -47,7 +47,7 @@ from typing import Any
 _active_namespace: dict[str, Any] | None = None
 
 
-def _register(namespace: dict[str, Any]) -> None:
+def register(namespace: dict[str, Any]) -> None:
     """Record the live ``globals()`` of the currently executing runner facade."""
     global _active_namespace
     _active_namespace = namespace
@@ -63,7 +63,7 @@ class _FacadeProxy:
             raise RuntimeError(
                 "clio_relay.mcp_call.runner has not registered itself with "
                 "_mcp_call_runner_facade yet -- it must import this module and "
-                "call _register(globals()) before any owner module can reach "
+                "call register(globals()) before any owner module can reach "
                 "back through the facade"
             )
         try:
