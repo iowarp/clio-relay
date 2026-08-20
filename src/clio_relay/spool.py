@@ -31,6 +31,13 @@ LOG_CAPTURE_LOCK_TIMEOUT_SECONDS = 10
 INPUT_ARTIFACT_LOCK_TIMEOUT_SECONDS = 10
 ARTIFACT_OWNERSHIP_SCHEMA = "clio-relay.owned-artifact.v1"
 
+#: The job log-stream vocabulary. ``console`` (clio-relay#259) carries
+#: APPLICATION output for jarvis-backed mcp_call jobs -- distinct from
+#: ``stdout``/``stderr``, which for those jobs carry the MCP jsonrpc wire of
+#: the launched server subprocess, never application output.
+LogStreamName = Literal["stdout", "stderr", "console"]
+LOG_STREAM_NAMES: tuple[LogStreamName, ...] = ("stdout", "stderr", "console")
+
 
 class _StreamCaptureState(TypedDict):
     observed_bytes: int
@@ -49,7 +56,7 @@ class _LogCaptureState(TypedDict):
 
 
 class _PendingCaptureState(TypedDict):
-    stream: Literal["stdout", "stderr"]
+    stream: LogStreamName
     before_persisted_bytes: int
     observed_bytes: int
     accepted_bytes: int
@@ -60,7 +67,7 @@ class _PendingCaptureState(TypedDict):
 class LogAppendResult:
     """Describe the durable portion of one streamed output chunk."""
 
-    stream: Literal["stdout", "stderr"]
+    stream: LogStreamName
     accepted_text: str
     observed_bytes: int
     accepted_bytes: int
@@ -123,7 +130,7 @@ class JobSpool:
             self.job.model_dump_json(indent=2),
             encoding="utf-8",
         )
-        for name in ("events.jsonl", "stdout.log", "stderr.log", "artifacts.jsonl"):
+        for name in ("events.jsonl", "stdout.log", "stderr.log", "console.log", "artifacts.jsonl"):
             target = self._storage_path / name
             if not target.exists():
                 target.write_text("", encoding="utf-8")
@@ -257,9 +264,18 @@ class JobSpool:
         """Append standard error within the configured durable byte quotas."""
         return self.append_log("stderr", text)
 
+    def append_console(self, text: str) -> LogAppendResult:
+        """Append application console output within the durable byte quotas.
+
+        clio-relay#259: distinct from ``stdout``/``stderr``, which for a
+        jarvis-backed mcp_call job carry the MCP jsonrpc wire rather than
+        application output.
+        """
+        return self.append_log("console", text)
+
     def append_log(
         self,
-        stream_name: Literal["stdout", "stderr"],
+        stream_name: LogStreamName,
         text: str,
     ) -> LogAppendResult:
         """Append output atomically while enforcing stream and whole-job quotas."""
@@ -314,7 +330,7 @@ class JobSpool:
 
     def mark_truncation_event_recorded(
         self,
-        stream_name: Literal["stdout", "stderr"],
+        stream_name: LogStreamName,
     ) -> None:
         """Durably acknowledge the queue event describing a truncated stream."""
         with self._capture_lock():
@@ -326,7 +342,7 @@ class JobSpool:
             self._write_capture_state_unlocked(state)
 
     def capture_summary(self) -> dict[str, Any]:
-        """Return durable byte accounting for both captured output streams."""
+        """Return durable byte accounting for all captured output streams."""
         with self._capture_lock():
             state = self._load_capture_state_unlocked()
         stream_states = state["streams"]
@@ -344,7 +360,7 @@ class JobSpool:
 
     def read_log(
         self,
-        stream_name: Literal["stdout", "stderr"],
+        stream_name: LogStreamName,
         *,
         offset: int = 0,
         limit: int = 65536,
@@ -393,7 +409,7 @@ class JobSpool:
         storage_capture_path = self._storage_path / self.log_capture_path.name
         if not storage_capture_path.exists():
             streams: dict[str, _StreamCaptureState] = {}
-            for name in ("stdout", "stderr"):
+            for name in LOG_STREAM_NAMES:
                 path = self._storage_path / f"{name}.log"
                 persisted_bytes = _owned_log_size(path) if path.exists() else 0
                 if persisted_bytes > self.max_log_bytes_per_stream:
@@ -437,7 +453,7 @@ class JobSpool:
                 f"limits recorded in {self.log_capture_path}"
             )
         self._recover_pending_capture_unlocked(state)
-        for name in ("stdout", "stderr"):
+        for name in LOG_STREAM_NAMES:
             path = self._storage_path / f"{name}.log"
             actual_size = _owned_log_size(path) if path.exists() else 0
             if actual_size != state["streams"][name]["persisted_bytes"]:
@@ -536,6 +552,26 @@ def _open_owned_log(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def read_external_log_range(path: Path, *, offset: int, limit: int) -> tuple[str, int, bool]:
+    """Read a bounded byte range from a growing, externally owned log file.
+
+    Same shape as :meth:`JobSpool.read_log`, and reuses the same regular-file
+    / no-follow-symlink / not-hardlinked safety bar (:func:`_open_owned_log`)
+    -- but for a log file this process does not itself own, e.g. a JARVIS
+    execution's ``stdout.log`` (clio-relay#259's ``console`` stream).
+    """
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    with _open_owned_log(path, mode="rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        stream.seek(offset)
+        chunk = stream.read(limit)
+    next_offset = offset + len(chunk)
+    return chunk.decode("utf-8", errors="replace"), next_offset, next_offset >= size
 
 
 def _validate_owned_log_stat(file_stat: os.stat_result, *, path: Path) -> None:
@@ -875,10 +911,10 @@ def _validate_capture_state(raw: object, *, path: Path) -> _LogCaptureState:
         or not isinstance(raw_streams, dict)
     ):
         raise RuntimeError(f"invalid log capture quota state: {path}")
-    if set(cast(dict[object, object], raw_streams)) != {"stdout", "stderr"}:
+    if set(cast(dict[object, object], raw_streams)) != set(LOG_STREAM_NAMES):
         raise RuntimeError(f"log capture state has unexpected streams: {path}")
     streams: dict[str, _StreamCaptureState] = {}
-    for name in ("stdout", "stderr"):
+    for name in LOG_STREAM_NAMES:
         raw_stream = cast(dict[object, object], raw_streams).get(name)
         if not isinstance(raw_stream, dict):
             raise RuntimeError(f"missing {name} log capture state: {path}")
@@ -923,9 +959,9 @@ def _validate_capture_state(raw: object, *, path: Path) -> _LogCaptureState:
         raise RuntimeError(f"invalid pending log capture state: {path}")
     pending = cast(dict[str, object], raw_pending)
     stream_name = pending.get("stream")
-    if stream_name not in {"stdout", "stderr"}:
+    if stream_name not in LOG_STREAM_NAMES:
         raise RuntimeError(f"invalid pending log capture stream: {path}")
-    typed_stream = cast(Literal["stdout", "stderr"], stream_name)
+    typed_stream: LogStreamName = stream_name
     pending_integers: dict[str, int] = {}
     for field in (
         "before_persisted_bytes",

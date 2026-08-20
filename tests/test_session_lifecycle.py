@@ -16,36 +16,46 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.installation as installation_module
+import clio_relay.session_api_readiness as session_api_readiness
+import clio_relay.session_cleanup_execution as session_cleanup_execution
+import clio_relay.session_cleanup_targets as session_cleanup_targets
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_lifecycle_report as session_lifecycle_report
+import clio_relay.session_process_scope as session_process_scope
+import clio_relay.session_recovery_attempt_status as session_recovery_attempt_status
+import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
+import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_remote_scripts as session_remote_scripts
+import clio_relay.session_start_attempt_validation as session_start_attempt_validation
+import clio_relay.session_start_execution as session_start_execution
+import clio_relay.session_start_query as session_start_query
+import clio_relay.session_start_wait as session_start_wait
+import clio_relay.session_startup_receipt as session_startup_receipt
+import clio_relay.session_transaction as session_transaction
+import clio_relay.session_wire_models as session_wire_models
 from clio_relay import __version__
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterDefinition,
     ClusterRegistry,
     RemoteMcpServerConfig,
+    cluster_route_revision,
 )
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import RelayError, RemoteExecutableMissingError
 from clio_relay.installation import InstallReceipt
 from clio_relay.session_lifecycle import (
-    SESSION_CONNECTORS_CHECK_ID,
-    SESSION_GATEWAY_CHECK_ID,
-    SESSION_SCHEDULER_CANCELED_CHECK_ID,
-    SESSION_WORKER_CHECK_ID,
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
-    OwnedSessionCleanupTarget,
     OwnedSessionInputPolicy,
     OwnedSessionRecoveryStatus,
     OwnedSessionStartPlan,
     OwnedSessionStartRequest,
     OwnedSessionTeardownRequest,
-    RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
-    challenge_remote_session_identity,
     detach_remote_session,
     execute_owned_session_cleanup_finalize,
     execute_owned_session_cleanup_report_read,
@@ -56,6 +66,14 @@ from clio_relay.session_lifecycle import (
     status_remote_session,
     teardown_remote_session,
 )
+from clio_relay.session_lifecycle_report import (
+    SESSION_CONNECTORS_CHECK_ID,
+    SESSION_GATEWAY_CHECK_ID,
+    SESSION_SCHEDULER_CANCELED_CHECK_ID,
+    SESSION_WORKER_CHECK_ID,
+)
+from clio_relay.session_start_query import challenge_remote_session_identity
+from clio_relay.session_wire_models import OwnedSessionCleanupTarget, RemoteSessionStateEvidence
 
 
 def _api_release_identity() -> SessionApiReleaseIdentity:
@@ -102,7 +120,7 @@ def test_session_start_release_identity_uses_verified_relay_receipt(
     )
 
     assert (
-        session_lifecycle._current_session_api_release_identity()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._current_session_api_release_identity()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         == expected
     )
 
@@ -333,7 +351,7 @@ def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
         for process_id in process_ids:
             try:
                 processes.append(
-                    session_lifecycle._read_proc_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                    session_process_scope._read_proc_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                         proc_root=proc_root,
                         pid=process_id,
                     )
@@ -343,7 +361,7 @@ def use_fake_recorded_scope(monkeypatch: MonkeyPatch) -> None:
         return processes
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_process_scope,
         "_recorded_scope_processes",
         recorded_scope_processes,
     )
@@ -388,14 +406,14 @@ def _owned_session_recovery_fixture(
         "api_release_identity_sha256": release.sha256(),
         "cluster_registry_path": str(registry_path),
         "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "cluster_route_revision": cluster_route_revision(definition),
         "systemd_unit": systemd_unit,
         "systemd_cgroup_path": systemd_cgroup_path,
         "systemd_invocation_id": systemd_invocation_id,
         "systemd_description": systemd_description,
         "observed_at": datetime.now(UTC).isoformat(),
     }
-    receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    receipt["hmac_sha256"] = session_startup_receipt._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt,
         owner_token=owner_token,
     )
@@ -413,7 +431,7 @@ def _owned_session_recovery_fixture(
         "api_release_identity_sha256": release.sha256(),
         "cluster_registry_path": str(registry_path),
         "cluster_registry_sha256": session_lifecycle.hashlib.sha256(registry_bytes).hexdigest(),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(definition),
+        "cluster_route_revision": cluster_route_revision(definition),
         "cluster_authority_verified": True,
         "process_start_ticks": "123456",
         "containment_mode": "linux_systemd_scope",
@@ -460,7 +478,7 @@ def _owned_session_start_request() -> OwnedSessionStartRequest:
         require_token=False,
         cluster_registry=registry.model_dump(mode="json"),
         cluster_registry_sha256=session_lifecycle.hashlib.sha256(payload).hexdigest(),
-        cluster_route_revision=session_lifecycle.cluster_route_revision(definition),
+        cluster_route_revision=cluster_route_revision(definition),
     )
 
 
@@ -487,8 +505,8 @@ def _failed_start_fixture(
     registry_path = transaction.path / f"cluster-registry-{generation}.json"
     registry_path.write_bytes(registry_payload)
     owner_token = "c" * 64
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity={
             "cluster": request.cluster,
@@ -683,7 +701,7 @@ def _durable_start_plan() -> tuple[
 ]:
     definition = ClusterDefinition(name="ares", ssh_host="ares")
     release = _api_release_identity()
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-start",
@@ -807,6 +825,180 @@ def test_dead_owned_session_recovery_requires_metadata_registry_and_core(
     assert status.errors == []
 
 
+def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_change(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#217: cluster_route_revision()'s canonicalization can change between relay
+    releases. A session minted under a prior version records the OLD algorithm's
+    digest in metadata.json; the currently-installed package recomputes a
+    DIFFERENT digest from the byte-identical, tamper-clean frozen snapshot. That
+    divergence is a version-skew artifact, not evidence of tampering, and must
+    never refuse recovery/teardown of an otherwise byte-proven session.
+    """
+    home, session_dir, proc_root, queue = _owned_session_recovery_fixture(tmp_path)
+    metadata_path = session_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    recorded_route_revision = metadata["cluster_route_revision"]
+    # Simulate an algorithm change: the installed package now recomputes a
+    # different digest for the exact same (tamper-clean) frozen snapshot bytes.
+    assert isinstance(recorded_route_revision, str)
+    skewed_route_revision = "f" * 64
+    assert skewed_route_revision != recorded_route_revision
+
+    def _skewed_route_revision(_definition: ClusterDefinition) -> str:
+        return skewed_route_revision
+
+    monkeypatch.setattr(session_lifecycle, "cluster_route_revision", _skewed_route_revision)
+
+    caplog.set_level("WARNING", logger="clio_relay.session_lifecycle")
+    status = inspect_owned_session_recovery_status(
+        cluster="ares",
+        session_id="session-1",
+        core_dir=queue.root,
+        home=home,
+        proc_root=proc_root,
+    )
+
+    assert status.metadata_verified is True
+    assert status.cluster_registry_verified is True
+    assert not any("cluster registry" in error for error in status.errors)
+    assert status.recovery_verified is True
+    # clio-relay#217 rework: a sabotage pass found deleting the warning
+    # block entirely leaves this test green (nothing above pins its
+    # existence) -- assert the typed skew warning was actually emitted,
+    # naming the session, cluster, and both diverging digests.
+    assert "cluster_route_revision_algorithm_skew" in caplog.text
+    assert "session-1" in caplog.text
+    assert "ares" in caplog.text
+    assert recorded_route_revision in caplog.text
+    assert skewed_route_revision in caplog.text
+
+
+def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algorithm_change(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """clio-relay#217 rework: the SAME snapshot-trust relaxation the test above
+    proves for the post-metadata recovery path must ALSO hold for the
+    pre-metadata start-attempt path (``_inspect_owned_session_start_attempt_status``,
+    reached when ``metadata.json`` does not exist yet -- an in-flight or
+    interrupted ``session start``). This path reads the identical frozen
+    per-generation ``cluster-registry-{generation}.json`` snapshot and, before
+    this rework, ALSO required a fresh ``cluster_route_revision()`` recompute
+    to match the value recorded in ``start-attempt.json``, stranding
+    ``session start --replace`` the exact same way across a relay upgrade
+    with no recovery path other than hand-editing the session directory.
+    """
+    generation = "generation-pending-start"
+    # `home` is unused here: unlike the public `inspect_owned_session_recovery_status`
+    # dispatcher, `_inspect_owned_session_start_attempt_status` (called directly
+    # below) has no `home` parameter -- it only ever sees a caller-supplied
+    # `transaction`.
+    _custom_home, session_dir, proc_root, queue = _owned_session_recovery_fixture(
+        tmp_path,
+        session_id="session-start",
+        generation_id=generation,
+    )
+    recovered_metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
+    registry_path = session_dir / f"cluster-registry-{generation}.json"
+    registry_bytes = registry_path.read_bytes()
+    recorded_route_revision = recovered_metadata["cluster_route_revision"]
+    assert isinstance(recorded_route_revision, str)
+    request = _owned_session_start_request().model_copy(
+        update={
+            "remote_api_port": 8765,
+            "cluster_registry": json.loads(registry_bytes),
+            "cluster_registry_sha256": recovered_metadata["cluster_registry_sha256"],
+            "cluster_route_revision": recorded_route_revision,
+        }
+    )
+    release = _api_release_identity()
+    (session_dir / "metadata.json").unlink()
+    transaction = _FakeSessionTransaction(session_dir, session_id=request.session_id)
+    attempt_identity: dict[str, object] = {
+        "cluster": request.cluster,
+        "session_id": request.session_id,
+        "start_operation_id": request.start_operation_id,
+        "session_generation_id": generation,
+        "owner_token": recovered_metadata["owner_token"],
+        "owner_token_sha256": session_lifecycle.hashlib.sha256(
+            cast(str, recovered_metadata["owner_token"]).encode()
+        ).hexdigest(),
+        "api_release_identity_sha256": release.sha256(),
+        "expected_api_release_identity_sha256": None,
+        "cluster_registry_path": str(registry_path),
+        "cluster_registry_sha256": request.cluster_registry_sha256,
+        "cluster_route_revision": request.cluster_route_revision,
+        "remote_api_port": request.remote_api_port,
+        "replace": request.replace,
+        "require_token": request.require_token,
+        "input_policy": request.input_policy.model_dump(mode="json"),
+        "start_phase": "pending",
+        "systemd_unit": recovered_metadata["systemd_unit"],
+        "systemd_description": recovered_metadata["systemd_description"],
+        # _validated_start_attempt requires these unset for "pending"/
+        # "admitted" -- only "scope_bound"/"contained" carry a recorded
+        # scope/containment identity.
+        "systemd_cgroup_path": None,
+        "systemd_invocation_id": None,
+        "containment_broker_pid": None,
+        "containment_broker_start_identity": None,
+    }
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        operation="start",
+        identity=attempt_identity,
+    )
+
+    containment = importlib.import_module("clio_relay.process_containment")
+    monkeypatch.setattr(containment, "adopt_linux_systemd_scope_identity", _no_adopted_scope)
+
+    # Simulate an algorithm change: the installed package now recomputes a
+    # different digest for the exact same (tamper-clean) frozen snapshot bytes.
+    skewed_route_revision = "f" * 64
+    assert skewed_route_revision != recorded_route_revision
+
+    def _skewed_route_revision(_definition: ClusterDefinition) -> str:
+        return skewed_route_revision
+
+    monkeypatch.setattr(
+        session_recovery_attempt_status, "cluster_route_revision", _skewed_route_revision
+    )
+
+    # This exercises `_inspect_owned_session_start_attempt_status` directly
+    # (not the public `inspect_owned_session_recovery_status` dispatcher):
+    # `_FakeSessionTransaction.read_json` asserts rather than raising
+    # `RelayError` on a missing required `metadata.json` (unlike the real
+    # transaction), so it cannot drive the dispatcher's `except RelayError`
+    # fallback into the pre-metadata path -- the same direct-call pattern
+    # `test_contained_start_crash_is_promoted_only_after_full_identity_recheck`
+    # already uses for a sibling private function.
+    caplog.set_level("WARNING", logger="clio_relay.session_recovery_attempt_status")
+    status = session_recovery_attempt_status._inspect_owned_session_start_attempt_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster=request.cluster,
+        session_id=request.session_id,
+        core_dir=queue.root,
+        proc_root=proc_root,
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        metadata_error="owned session metadata is unavailable",
+    )
+
+    assert status is not None
+    assert status.metadata_verified is False
+    assert status.cluster_registry_verified is True
+    assert not any("registry identity is invalid" in error for error in status.errors)
+    # clio-relay#217 rework sabotage check: the warning block must actually
+    # run, not merely leave the boolean unaffected.
+    assert "cluster_route_revision_algorithm_skew" in caplog.text
+    assert "session-start" in caplog.text
+    assert "ares" in caplog.text
+    assert recorded_route_revision in caplog.text
+    assert skewed_route_revision in caplog.text
+
+
 def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -826,8 +1018,8 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         _no_adopted_scope,
     )
 
-    report = session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report = session_cleanup_execution._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
         proc_root=proc_root,
@@ -845,12 +1037,12 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
     }
     assert "owner_token" not in receipt
     assert report.resources[0].metadata["failed_start"] is True
-    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=receipt,
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
     assert status.recovery_verified is True
@@ -876,12 +1068,12 @@ def test_failed_pre_metadata_start_teardown_persists_exact_idempotent_receipt(
         request.session_id,
         session_generation_id=generation,
     )
-    closed = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    closed = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=cast(dict[str, object], transaction.read_json("metadata.json")),
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
     assert closed.recovery_verified is True
@@ -905,8 +1097,8 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
         expected_session_generation_id="generation-failed-start",
         expected_cleanup_operation_id="cleanup_failed_start",
     )
-    session_lifecycle._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_cleanup_execution._execute_owned_failed_start_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=teardown,
         queue=queue,
         proc_root=proc_root,
@@ -914,12 +1106,12 @@ def test_failed_cleaned_receipt_rejects_job_membership_drift(
     receipt = cast(dict[str, object], transaction.read_json("metadata.json"))
     receipt["owned_relay_job_ids"] = ["job-not-observed"]
 
-    status = session_lifecycle._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = session_recovery_cleaned_receipt._inspect_owned_session_failed_cleaned_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
         document=receipt,
         core_dir=queue.root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         proc_root=proc_root,
     )
 
@@ -950,7 +1142,7 @@ def test_owned_session_recovery_accepts_canonical_home_transaction(
         core_dir=queue.root,
         home=home_alias,
         proc_root=proc_root,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     )
 
     assert status.metadata_verified is True
@@ -965,11 +1157,11 @@ def test_start_persists_candidate_before_core_admission(
 ) -> None:
     request = _owned_session_start_request()
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
 
     def effective_user_id() -> int:
         return tmp_path.stat().st_uid
@@ -1075,14 +1267,14 @@ def test_start_attempt_accepts_every_durable_crash_boundary(
             "containment_broker_pid": broker_pid,
             "containment_broker_start_identity": broker_start,
         }
-        session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             operation="start",
             identity=identity,
         )
 
-        recovered = session_lifecycle._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        recovered = session_start_attempt_validation._validated_resumable_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256="b" * 64,
         )
@@ -1131,8 +1323,8 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         "containment_broker_pid": None,
         "containment_broker_start_identity": None,
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
     )
@@ -1143,7 +1335,7 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1156,8 +1348,8 @@ def test_distinct_operation_cannot_overwrite_nonterminal_start_transition(
         mutation_attempted = True
         raise AssertionError("distinct operation reached start mutation")
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
-    monkeypatch.setattr(session_lifecycle, "_terminate_recorded_session_scope", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_process_scope, "_terminate_recorded_session_scope", refuse_mutation)
 
     with pytest.raises(RelayError, match="prior owned-session start attempt identity is invalid"):
         execute_owned_session_start(
@@ -1208,8 +1400,8 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         "containment_broker_pid": 4322,
         "containment_broker_start_identity": "linux-proc:1",
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=identity,
     )
@@ -1221,7 +1413,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1257,7 +1449,7 @@ def test_same_completed_operation_cannot_create_a_second_generation(
         mutation_attempted = True
         raise AssertionError("completed operation reached generation mutation")
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
     monkeypatch.setattr(ClioCoreQueue, "prepare_owner_session_start", refuse_mutation)
 
     with pytest.raises(RelayError, match="already completed; use a fresh operation id"):
@@ -1312,15 +1504,15 @@ def test_legacy_start_attempt_migrates_only_to_caller_planned_v2_operation(
     )
 
     with pytest.raises(RelayError, match="identity is invalid"):
-        session_lifecycle._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._validated_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster=request.cluster,
             session_id=request.session_id,
             start_operation_id=request.start_operation_id,
         )
 
-    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrated = session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=_api_release_identity().sha256(),
     )
@@ -1376,14 +1568,14 @@ def test_legacy_old_release_replacement_requires_exact_identity_proof(
     current_release_sha256 = _api_release_identity().sha256()
 
     with pytest.raises(RelayError, match="release identity changed"):
-        session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             request=request,
             release_identity_sha256=current_release_sha256,
         )
 
-    migrated = session_lifecycle._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrated = session_start_attempt_validation._migrate_legacy_start_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         request=request,
         release_identity_sha256=current_release_sha256,
         replacement_identity_verified=True,
@@ -1420,7 +1612,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         lambda: current_release,
     )
@@ -1468,7 +1660,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
         )
 
     monkeypatch.setattr(session_lifecycle, "inspect_owned_session_recovery_status", inspect)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
     base_interpreter = tmp_path / "uv-python" / "python3.12"
     base_interpreter.parent.mkdir(parents=True)
     base_interpreter.write_bytes(b"test interpreter")
@@ -1479,7 +1671,7 @@ def test_executor_replaces_exact_legacy_old_release_session(
     else:
         provider_interpreter.symlink_to(base_interpreter)
         assert provider_interpreter.absolute() != provider_interpreter.resolve(strict=True)
-    monkeypatch.setattr(session_lifecycle.sys, "executable", str(provider_interpreter))
+    monkeypatch.setattr(session_start_execution.sys, "executable", str(provider_interpreter))
     containment_module = importlib.import_module("clio_relay.process_containment")
     monkeypatch.setattr(
         containment_module,
@@ -1523,14 +1715,14 @@ def test_executor_replaces_exact_legacy_old_release_session(
 
     def receipt(**kwargs: object) -> object:
         transaction.atomic_write(cast(str, kwargs["receipt_name"]), b"{}")
-        return session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_process_scope._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             pid=7001,
             process_group_id=7001,
             start_ticks="999999",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.125))
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_startup_receipt", receipt)
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_ready", _fixed_api_readiness(0.125))
 
     start_receipt = execute_owned_session_start(
         request,
@@ -1584,7 +1776,7 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         _api_release_identity,
     )
@@ -1610,7 +1802,7 @@ def test_executor_refuses_mismatched_legacy_journal_without_mutation(
         nonlocal mutation_attempted
         mutation_attempted = True
 
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", refuse_mutation)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", refuse_mutation)
 
     with pytest.raises(
         RelayError,
@@ -1662,7 +1854,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     receipt = cast(dict[str, object], raw_receipt)
     receipt["api_release_identity_sha256"] = old_release.sha256()
     receipt["cluster_registry_sha256"] = registry_sha256
-    receipt["hmac_sha256"] = session_lifecycle._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    receipt["hmac_sha256"] = session_startup_receipt._startup_receipt_signature(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         receipt,
         owner_token=owner_token,
     )
@@ -1721,19 +1913,19 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         _fake_transaction_opener(transaction),
     )
     monkeypatch.setattr(
-        session_lifecycle,
+        session_api_readiness,
         "_current_session_api_release_identity",
         lambda: current_release,
     )
     effective_uid = getattr(os, "geteuid", lambda: 0)()
     monkeypatch.setattr(os, "geteuid", lambda: effective_uid, raising=False)
-    migrate = session_lifecycle._migrate_legacy_start_attempt  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    migrate = session_start_attempt_validation._migrate_legacy_start_attempt  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     class MigrationCrash(RuntimeError):
         """Simulated process loss immediately after the durable v2 write."""
 
     def migrate_then_crash(
-        selected_transaction: session_lifecycle._OwnedSessionTransaction,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        selected_transaction: session_transaction._OwnedSessionTransaction,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         *,
         request: OwnedSessionStartRequest,
         release_identity_sha256: str,
@@ -1749,7 +1941,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         raise MigrationCrash
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_attempt_validation,
         "_migrate_legacy_start_attempt",
         migrate_then_crash,
     )
@@ -1773,7 +1965,7 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
         home=home,
         proc_root=proc_root,
         effective_uid=effective_uid,
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         expected_start_operation_id=request.start_operation_id,
         expected_cluster_route_revision=request.cluster_route_revision,
     )
@@ -1782,8 +1974,8 @@ def test_old_release_migration_crash_retries_same_replacement_with_real_inspecti
     assert status.start_state == "starting"
     assert status.start_retryable is True
 
-    monkeypatch.setattr(session_lifecycle, "_migrate_legacy_start_attempt", migrate)
-    monkeypatch.setattr(session_lifecycle, "_assert_remote_port_available", _ignore_remote_port)
+    monkeypatch.setattr(session_start_attempt_validation, "_migrate_legacy_start_attempt", migrate)
+    monkeypatch.setattr(session_api_readiness, "_assert_remote_port_available", _ignore_remote_port)
 
     class ReplacementResumed(RuntimeError):
         """The retry reached replacement admission instead of terminal refusal."""
@@ -1817,7 +2009,7 @@ def test_durable_start_deadline_observes_late_ready_transition(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -1825,7 +2017,7 @@ def test_durable_start_deadline_observes_late_ready_transition(
         return _durable_start_status(plan, state="ready")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         ready_status,
     )
@@ -1857,7 +2049,7 @@ def test_typed_start_receipt_must_bind_exact_remote_port(
         raise RelayError("status unavailable")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         unavailable,
     )
@@ -1879,7 +2071,7 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
     observations = 0
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -1888,7 +2080,7 @@ def test_durable_start_keeps_verified_transition_pending_without_aggregate_timeo
         observations += 1
         return _durable_start_status(plan, state="starting")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", observe)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", observe)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -1911,12 +2103,12 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
     definition, _release, plan = _durable_start_plan()
     observations = iter(
         (
-            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 plan=plan,
                 status=_durable_start_status(plan, state="starting"),
                 transport_deadline_exceeded=False,
             ),
-            session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 plan=plan,
                 status=_durable_start_status(plan, state="ready"),
                 transport_deadline_exceeded=False,
@@ -1925,7 +2117,7 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
     )
     sleeps: list[float] = []
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=10.0,
@@ -1941,14 +2133,14 @@ def test_start_watch_returns_only_after_ready_and_marks_result_usable() -> None:
 
 def test_start_watch_detaches_with_exact_unusable_handle() -> None:
     definition, _release, plan = _durable_start_plan()
-    pending = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    pending = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=_durable_start_status(plan, state="starting"),
         transport_deadline_exceeded=False,
     )
     moments = iter((0.0, 2.0))
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=1.0,
@@ -1977,8 +2169,8 @@ def test_owned_api_startup_diagnostic_keeps_oversized_redacted_tail(tmp_path: Pa
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token, frp_token),
     )
 
@@ -2002,8 +2194,8 @@ def test_owned_api_startup_diagnostic_redacts_secret_crossing_tail_boundary(
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(api_token,),
     )
 
@@ -2024,8 +2216,8 @@ def test_owned_api_startup_diagnostic_discards_unknown_bearer_crossing_tail_boun
         encoding="utf-8",
     )
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=(),
     )
 
@@ -2040,8 +2232,8 @@ def test_owned_api_startup_diagnostic_fails_closed_for_non_utf8_secret(
     transaction = _FakeSessionTransaction(tmp_path)
     (tmp_path / "api.log").write_bytes(b"startup failed\n")
 
-    detail = session_lifecycle._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    detail = session_api_readiness._owned_api_startup_log_detail(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         secret_values=("credential-\udcff-value",),
     )
 
@@ -2054,14 +2246,14 @@ def test_durable_start_status_transport_failure_is_ambiguous(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
     def unavailable(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise RelayError("status transport unavailable")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", unavailable)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", unavailable)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -2082,7 +2274,7 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
     monkeypatch: MonkeyPatch,
 ) -> None:
     definition, release, plan = _durable_start_plan()
-    rejection = session_lifecycle.OwnedSessionStartRejection(
+    rejection = session_wire_models.OwnedSessionStartRejection(
         cluster=plan.cluster,
         session_id=plan.session_id,
         start_operation_id=plan.start_operation_id,
@@ -2091,14 +2283,14 @@ def test_exact_start_rejection_during_lock_contention_is_not_terminal(
     )
 
     def rejected(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandRejected(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             rejection
         )
 
     def locked(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raise RelayError("owned session transition lock is held")
 
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", locked)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", locked)
 
     result = session_lifecycle.start_remote_session_durable(
         definition=definition,
@@ -2124,25 +2316,25 @@ def test_unstructured_ssh_nonzero_is_ambiguous_not_terminal(
         stdout_limit: int,
         stderr_limit: int,
         environment: dict[str, str] | None = None,
-    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         del input_bytes, timeout_seconds, stdout_limit, stderr_limit, environment
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=255,
             stdout=b"",
             stderr=b"connection reset after remote acceptance",
         )
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_remote_command,
         "_run_bounded_command",
         connection_reset,
     )
 
     with pytest.raises(
-        session_lifecycle._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_command._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         match="without an exact structured response",
     ):
-        session_lifecycle._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true\n",
         )
@@ -2154,7 +2346,7 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
     definition, release, plan = _durable_start_plan()
 
     def deadline(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -2162,7 +2354,7 @@ def test_durable_start_projects_terminal_failure_and_stops_retrying(
         return _durable_start_status(plan, state="failed")
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_start_query,
         "status_remote_session_start",
         failed_status,
     )
@@ -2187,7 +2379,7 @@ def test_completed_ready_operation_stays_terminal_after_api_exit() -> None:
         update={"leader_process_state": "absent", "running": False}
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -2211,7 +2403,7 @@ def test_completed_ready_operation_reports_api_down_when_only_child_remains() ->
         }
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -2226,7 +2418,7 @@ def test_completed_ready_operation_reports_api_down_when_only_child_remains() ->
 def test_superseded_start_selector_is_terminal_not_current() -> None:
     _definition, _release, plan = _durable_start_plan()
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=_durable_start_status(plan, state="not_current"),
         transport_deadline_exceeded=False,
@@ -2244,7 +2436,7 @@ def test_start_selector_intent_drift_is_terminally_refused() -> None:
         update={"remote_api_port": plan.remote_api_port + 1}
     )
 
-    result = session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         plan=plan,
         status=status,
         transport_deadline_exceeded=False,
@@ -2287,17 +2479,17 @@ def test_api_readiness_rejects_wrong_auth_policy(monkeypatch: MonkeyPatch) -> No
         del data, timeout, cafile, capath, cadefault, context
         return Response()
 
-    monkeypatch.setattr(session_lifecycle.time, "monotonic", lambda: next(moments))
-    monkeypatch.setattr(session_lifecycle.time, "sleep", ignore_sleep)
+    monkeypatch.setattr(session_api_readiness.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(session_api_readiness.time, "sleep", ignore_sleep)
     monkeypatch.setattr(
-        session_lifecycle.urllib.request,
+        session_api_readiness.urllib.request,
         "urlopen",
         open_response,
     )
     process = cast(subprocess.Popen[bytes], SimpleNamespace(poll=lambda: None))
 
     with pytest.raises(RelayError, match="did not become ready"):
-        session_lifecycle._wait_for_api_ready(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._wait_for_api_ready(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             process=process,
             port=18765,
             require_token=True,
@@ -2308,13 +2500,13 @@ def test_no_require_token_suppresses_ambient_api_token(monkeypatch: MonkeyPatch)
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "ambient-token")
 
     assert (
-        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             require_token=False
         )
         is None
     )
     assert (
-        session_lifecycle._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_api_readiness._owned_session_api_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             require_token=True
         )
         == "ambient-token"
@@ -2380,14 +2572,14 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
             "containment_broker_start_identity"
         ],
     }
-    session_lifecycle._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_start_attempt_validation._write_session_attempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         operation="start",
         identity=attempt_identity,
     )
     attempt = transaction.read_json("start-attempt.json")
     assert attempt is not None
-    process_identity = session_lifecycle._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    process_identity = session_process_scope._OwnedGenerationProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pid=4321,
         process_group_id=4321,
         start_ticks="123456",
@@ -2399,11 +2591,11 @@ def test_contained_start_crash_is_promoted_only_after_full_identity_recheck(
         receipt_checks += 1
         return process_identity
 
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_startup_receipt", verify_receipt)
-    monkeypatch.setattr(session_lifecycle, "_wait_for_api_ready", _fixed_api_readiness(0.25))
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_startup_receipt", verify_receipt)
+    monkeypatch.setattr(session_api_readiness, "_wait_for_api_ready", _fixed_api_readiness(0.25))
 
-    start_receipt = session_lifecycle._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        transaction=cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    start_receipt = session_start_execution._promote_resumable_contained_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        transaction=cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         attempt=attempt,
         request=request,
         release_identity=release,
@@ -2747,7 +2939,7 @@ def test_cleanup_receipt_supports_idempotent_pending_retry(tmp_path: Path) -> No
             for target in targets
             if target.name == "cluster-registry-generation-1.json"
         ),
-        "cluster_route_revision": session_lifecycle.cluster_route_revision(
+        "cluster_route_revision": cluster_route_revision(
             ClusterDefinition(name="ares", ssh_host="ares")
         ),
         "containment_mode": "linux_systemd_scope",
@@ -2812,16 +3004,16 @@ def test_cleanup_deletes_oversized_api_log_by_pinned_inode(tmp_path: Path) -> No
         log.truncate(20 * 1024 * 1024)
 
     with _FakeSessionTransaction(session_dir, session_id="session-1") as transaction:
-        target = session_lifecycle._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        target = session_cleanup_targets._capture_cleanup_target(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             name="api.log",
             maximum_bytes=None,
         )
         assert target.identity_mode == "inode"
         assert target.sha256 is None
         assert target.size == 20 * 1024 * 1024
-        session_lifecycle._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cast(session_lifecycle._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_cleanup_targets._delete_cleanup_targets(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cast(session_transaction._OwnedSessionTransaction, transaction),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             [target],
         )
 
@@ -2902,7 +3094,7 @@ def test_owned_session_read_revalidates_descriptor_and_path_after_read(
     monkeypatch.setattr(os, "stat", stat_file)
     monkeypatch.setattr(os, "read", read_file)
     monkeypatch.setattr(os, "close", close_file)
-    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    transaction = session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,
         sessions_fd=-1,
@@ -2910,7 +3102,7 @@ def test_owned_session_read_revalidates_descriptor_and_path_after_read(
         lock_fd=-1,
         uid=1000,
         _fcntl=cast(
-            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             SimpleNamespace(),
         ),
     )
@@ -3036,7 +3228,7 @@ def test_cleanup_report_finalization_is_immutable_and_idempotent(
     def inspect(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         raw_reference = transaction.document.get("coordinator_report_ref")
         reference = (
-            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            session_wire_models.OwnedSessionCleanupReportReference.model_validate(raw_reference)
             if isinstance(raw_reference, dict)
             else None
         )
@@ -3280,7 +3472,7 @@ def test_cleanup_report_read_server_boundary_rejects_drift(
     expected_error: str,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
@@ -3389,7 +3581,7 @@ def test_legacy_inline_cleanup_report_migration_recovers_after_metadata_write_fa
         assert document is not None
         raw_reference = document.get("coordinator_report_ref")
         reference = (
-            session_lifecycle.OwnedSessionCleanupReportReference.model_validate(raw_reference)
+            session_wire_models.OwnedSessionCleanupReportReference.model_validate(raw_reference)
             if isinstance(raw_reference, dict)
             else None
         )
@@ -3432,7 +3624,7 @@ def test_legacy_inline_cleanup_report_migration_recovers_after_metadata_write_fa
             home=tmp_path,
             core_dir=tmp_path / "core",
         )
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     assert (tmp_path / reference.name).read_bytes() == payload
@@ -3457,7 +3649,7 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
     tmp_path: Path,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     if os.name != "posix":
@@ -3481,11 +3673,11 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
         return
 
     fcntl = cast(
-        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         importlib.import_module("fcntl"),
     )
 
-    def transaction_for(path: Path) -> session_lifecycle._OwnedSessionTransaction:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def transaction_for(path: Path) -> session_transaction._OwnedSessionTransaction:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         path.mkdir(mode=0o700)
         path.chmod(0o700)
         directory_fd = os.open(
@@ -3496,7 +3688,7 @@ def test_immutable_sidecar_publication_recovers_and_rejects_hostile_links(
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         lock_path.chmod(0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session_id="session-1",
             path=path,
             sessions_fd=os.dup(directory_fd),
@@ -3619,17 +3811,17 @@ def test_cleanup_report_retention_prunes_one_old_generation_and_preserves_curren
             "cleanup_operation_id": "cleanup-sidecar-2",
         }
     )
-    old_reference, old_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    old_reference, old_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         old_report
     )
-    current_reference, current_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    current_reference, current_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         current_report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
     (tmp_path / old_reference.name).write_bytes(old_payload)
     (tmp_path / current_reference.name).write_bytes(current_payload)
 
-    session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         transaction,  # pyright: ignore[reportArgumentType]
         preserve_names={
             current_reference.name,
@@ -3652,13 +3844,13 @@ def test_cleanup_report_retention_refuses_ambiguous_old_candidates(
             "cleanup_operation_id": "cleanup-current",
         }
     )
-    current_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    current_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         current
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
     if mutation == "pending":
         old = _cleanup_sidecar_report()
-        old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        old_reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             old
         )
         (tmp_path / f".{old_reference.name}.pending").write_bytes(payload)
@@ -3671,14 +3863,14 @@ def test_cleanup_report_retention_refuses_ambiguous_old_candidates(
                     "cleanup_operation_id": f"cleanup-old-{index}",
                 }
             )
-            old_reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            old_reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 old
             )
             (tmp_path / old_reference.name).write_bytes(payload)
         expected = "multiple unreferenced"
 
     with pytest.raises(RelayError, match=expected):
-        session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             transaction,  # pyright: ignore[reportArgumentType]
             preserve_names={
                 current_reference.name,
@@ -3715,7 +3907,7 @@ def test_cleanup_report_candidate_scan_is_bounded_and_strict(
         return FakeScan()
 
     monkeypatch.setattr(os, "scandir", scan_directory)
-    transaction = session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    transaction = session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=tmp_path,
         sessions_fd=-1,
@@ -3723,7 +3915,7 @@ def test_cleanup_report_candidate_scan_is_bounded_and_strict(
         lock_fd=-1,
         uid=0,
         _fcntl=cast(
-            session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             SimpleNamespace(),
         ),
     )
@@ -3739,7 +3931,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
     mutation: str,
 ) -> None:
     report = _cleanup_sidecar_report()
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     preserved_report = report.model_copy(
@@ -3748,7 +3940,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
             "cleanup_operation_id": "cleanup-preserved",
         }
     )
-    preserved_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    preserved_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         preserved_report
     )
     if os.name != "posix":
@@ -3765,7 +3957,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
 
         monkeypatch.setattr(transaction, "stat_regular", refuse_hostile)
         with pytest.raises(RelayError, match="owner-private regular"):
-            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 transaction,  # pyright: ignore[reportArgumentType]
                 preserve_names={preserved_reference.name},
             )
@@ -3780,11 +3972,11 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
     lock_path = directory / "transition.lock"
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     fcntl = cast(
-        session_lifecycle._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_transaction._FcntlModule,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         importlib.import_module("fcntl"),
     )
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    with session_lifecycle._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    with session_transaction._OwnedSessionTransaction(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="session-1",
         path=directory,
         sessions_fd=os.dup(directory_fd),
@@ -3804,7 +3996,7 @@ def test_cleanup_report_retention_refuses_hostile_old_links(
             candidate.chmod(0o600)
             os.link(candidate, tmp_path / "retention-outside-hardlink")
         with pytest.raises(RelayError, match="owner-private regular"):
-            session_lifecycle._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            session_lifecycle_report._prune_unreferenced_cleanup_report_sidecars(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 transaction,
                 preserve_names={preserved_reference.name},
             )
@@ -3837,7 +4029,7 @@ def test_coordinator_report_sidecar_rejects_identity_drift(
             "cancel_scheduler_jobs": False,
         },
     )
-    reference, payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     transaction = _FakeSessionTransaction(tmp_path, session_id="session-1")
@@ -3873,7 +4065,7 @@ def test_coordinator_report_sidecar_rejects_identity_drift(
         )
 
     with pytest.raises(RelayError, match=expected_error):
-        session_lifecycle._read_coordinator_report_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_lifecycle_report._read_coordinator_report_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             transaction,  # pyright: ignore[reportArgumentType]
             selected_reference,
             expected_session_generation_id="generation-1",
@@ -3909,7 +4101,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
             )
         ],
     )
-    reference, report_payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, report_payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     assert len(report_payload) > 1024 * 1024
@@ -3938,7 +4130,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
         stdout_limit: int,
         stderr_limit: int,
         environment: dict[str, str] | None = None,
-    ) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observed.update(
             command=command,
             input_bytes=input_bytes,
@@ -3947,13 +4139,13 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
             stderr_limit=stderr_limit,
             environment=environment,
         )
-        return session_lifecycle._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             returncode=0,
             stdout=status_payload,
             stderr=b"",
         )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", run_bounded)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", run_bounded)
     finalized = session_lifecycle.finalize_remote_session_cleanup_report(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
@@ -3973,7 +4165,7 @@ def test_large_cleanup_finalize_uses_separate_bounded_ssh_stdin(
     assert len(" ".join(command).encode("utf-8")) < 64 * 1024
     assert observed["stdout_limit"] == 1024 * 1024
     with pytest.raises(RelayError, match="stdin exceeds"):
-        session_lifecycle._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "true",
             input_bytes=b"oversized",
@@ -4161,7 +4353,7 @@ def test_scheduler_cancellation_evidence_accepts_a_linked_gateway_cleanup() -> N
 def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyPatch) -> None:
     scripts: list[str] = []
     definition = ClusterDefinition(name="ares", ssh_host="ares")
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-1",
@@ -4175,7 +4367,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
         scripts.append(script)
         return _durable_start_receipt(plan).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     receipt = start_remote_session(
         cluster="ares",
@@ -4226,7 +4418,7 @@ def test_start_remote_session_rejects_legacy_key_value_output(monkeypatch: Monke
         )
 
     monkeypatch.setattr(
-        session_lifecycle,
+        session_remote_scripts,
         "_ssh_script",
         fake_ssh,
     )
@@ -4251,7 +4443,7 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
         relay_executable=pinned,
     )
     release = _api_release_identity()
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-pinned",
@@ -4262,7 +4454,7 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
         expected_api_release_identity_sha256=release.sha256(),
     )
     scripts = (
-        session_lifecycle._start_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._start_script(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             definition=definition,
             session_id="session-pinned",
@@ -4274,29 +4466,29 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
             replace=False,
             expected_cluster_route_revision=plan.cluster_route_revision,
         ),
-        session_lifecycle._owned_status_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_status_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             cluster="ares",
             session_id="session-pinned",
         ),
-        session_lifecycle._owned_start_status_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_start_status_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             selector=plan.status_selector,
         ),
-        session_lifecycle._owned_identity_challenge_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_identity_challenge_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             cluster="ares",
             session_id="session-pinned",
             session_generation_id="generation-pinned",
             nonce="1" * 64,
         ),
-        session_lifecycle._owned_cleanup_finalize_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_cleanup_finalize_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
         ),
-        session_lifecycle._owned_cleanup_report_read_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_cleanup_report_read_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
         ),
-        session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]
+        session_remote_scripts._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]
             definition=definition,
             session_id="session-pinned",
             expected_session_generation_id="generation-pinned",
@@ -4318,7 +4510,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
 ) -> None:
     scripts: list[str] = []
     definition = ClusterDefinition(name="ares", ssh_host="ares")
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="ares",
         definition=definition,
         session_id="session-1",
@@ -4332,7 +4524,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
         scripts.append(script)
         return _durable_start_receipt(plan, outcome="already_running").model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="ares",
@@ -4368,7 +4560,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
         ssh_host="alpha",
         remote_mcp_servers={"science": registration},
     )
-    plan = session_lifecycle.plan_remote_session_start(
+    plan = session_start_query.plan_remote_session_start(
         cluster="alpha",
         definition=definition,
         session_id="session-1",
@@ -4382,7 +4574,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
         scripts.append(script)
         return _durable_start_receipt(plan).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     start_remote_session(
         cluster="alpha",
@@ -4409,7 +4601,7 @@ def test_start_remote_session_rejects_registry_over_configuration_limit(
         del args, kwargs
         pytest.fail("oversized session authority must fail before SSH")
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", unexpected_run)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", unexpected_run)
     registration = RemoteMcpServerConfig(
         command="science-mcp",
         args=["x" * 4_000 for _ in range(256)],
@@ -4442,7 +4634,7 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
         scripts.append(script)
         return json.dumps({"session_id": "session-1", "running": True})
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     status = status_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4479,7 +4671,7 @@ def test_status_remote_session_marks_pre_start_cleanup_probe_explicitly(
             errors=["owned session transition is not currently observable"],
         ).model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     status = status_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4512,9 +4704,9 @@ def test_remote_session_start_status_uses_cluster_environment(
         scripts.append(script)
         return expected.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    observed = session_lifecycle.status_remote_session_start(
+    observed = session_start_query.status_remote_session_start(
         definition=definition,
         selector=plan.status_selector,
     )
@@ -4550,7 +4742,7 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
         scripts.append(script)
         return json.dumps(expected)
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     observed = challenge_remote_session_identity(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4575,16 +4767,248 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
 
 def test_remote_session_command_timeout_is_reported(monkeypatch: MonkeyPatch) -> None:
-    def timed_out(*_args: object, **_kwargs: object) -> session_lifecycle._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        raise RelayError("bounded command timed out after 120 seconds")
+    def timed_out(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._BoundedCommandTimeout(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "bounded command timed out after 120 seconds"
+        )
 
-    monkeypatch.setattr(session_lifecycle, "_run_bounded_command", timed_out)
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", timed_out)
 
     with pytest.raises(RelayError, match="timed out after 120 seconds"):
         status_remote_session(
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             session_id="session-1",
         )
+
+
+def test_absent_relay_executable_is_typed_rather_than_ambiguous(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Exit 127 proves the command never ran -- that is NOT transport ambiguity.
+
+    clio-relay#158: a dead relay_executable pointer surfaced as
+    _RemoteSessionCommandAmbiguous, which means "we cannot tell whether the
+    remote transition happened". Shell status 127 proves nothing executed, so
+    there is no durable ambiguity to preserve -- and reporting one sends the
+    caller to poll a session that was never started.
+    """
+
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert not isinstance(
+        captured.value,
+        session_remote_command._RemoteSessionCommandAmbiguous,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
+
+
+def test_durable_start_resolves_transport_ambiguity_instead_of_escaping(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An ambiguous transport must be RESOLVED against durable state, not raised.
+
+    _RemoteSessionCommandAmbiguous was raised by the transport but never
+    handled by start_remote_session_durable, so it escaped as a bare
+    RelayError -- discarding the durable start the caller may well have
+    created.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def ambiguous(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise session_remote_command._RemoteSessionCommandAmbiguous(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            "transport ended without an exact structured response"
+        )
+
+    def ready_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return _durable_start_status(plan, state="ready")
+
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", ready_status)
+
+    result = session_lifecycle.start_remote_session_durable(
+        definition=definition,
+        plan=plan,
+        api_token=None,
+        expected_api_release_identity=release,
+        starter=ambiguous,
+    )
+
+    assert result.state == "ready"
+
+
+def test_durable_start_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A broken deployment must stay typed, never become a retryable 'starting'.
+
+    query_remote_session_start converts any RelayError from the status probe
+    into start_state="starting", retryable=True. If a missing executable
+    reached that path it would be reported as a session that is merely still
+    coming up -- the exact silent degradation the no-silent-fallback rule
+    forbids, since every retry hits the same dead pointer.
+    """
+    definition, release, plan = _durable_start_plan()
+
+    def missing(**_kwargs: object) -> session_lifecycle.OwnedSessionStartReceipt:
+        raise RemoteExecutableMissingError(
+            "configured relay_executable is absent on the remote host",
+            exit_status=127,
+        )
+
+    def unexpected_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        raise AssertionError("a dead pointer must not be polled as a live session")
+
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", unexpected_status)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_lifecycle.start_remote_session_durable(
+            definition=definition,
+            plan=plan,
+            api_token=None,
+            expected_api_release_identity=release,
+            starter=missing,
+        )
+
+
+def test_poll_path_never_launders_a_dead_pointer_into_starting(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The REAL poll path must not turn a dead pin into a retryable 'starting'.
+
+    Review F2: status_remote_session_start catches only the deadline, so the
+    typed RemoteExecutableMissingError raised by _ssh_script fell through to
+    query_remote_session_start's blanket ``except RelayError``, which rewrites
+    ANY failure as start_state="starting", start_retryable=True. That
+    reproduces the exact retry-forever bug the typed-127 work claims to remove:
+    every retry re-executes the same missing binary.
+
+    Drives the real _ssh_script (via the bounded-command seam), NOT a
+    monkeypatched status function -- the earlier durable-start test stubbed
+    status_remote_session_start and so could never see this.
+    """
+    definition, _release, plan = _durable_start_plan()
+
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError):
+        session_start_query.query_remote_session_start(definition=definition, plan=plan)
+
+
+def test_stdin_command_types_an_absent_relay_executable(monkeypatch: MonkeyPatch) -> None:
+    """Review F3: the stdin transport needs the same typed 127 discrimination.
+
+    Its cleanup/report callers otherwise still receive an untyped RelayError
+    carrying a raw shell blob when the pin is dead.
+    """
+
+    def not_found(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_remote_command._BoundedCommandResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            returncode=127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", not_found)
+
+    with pytest.raises(RemoteExecutableMissingError) as captured:
+        session_remote_scripts._ssh_stdin_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                relay_executable="/srv/generations/gone/bin/clio-relay",
+            ),
+            "true",
+            input_bytes=b"{}",
+            input_limit=1024,
+            stdout_limit=1024,
+        )
+
+    assert captured.value.reason == "relay_executable_missing"
+    assert captured.value.exit_status == 127
+
+
+def test_bounded_command_timeout_is_a_typed_exception_not_a_prose_message() -> None:
+    """The transport deadline must be discriminable by type, never by message text."""
+    assert issubclass(
+        session_remote_command._BoundedCommandTimeout,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        RelayError,
+    )
+
+
+def test_typed_bounded_timeout_routes_to_the_session_deadline(monkeypatch: MonkeyPatch) -> None:
+    """A real transport deadline reaches _RemoteSessionCommandDeadline by TYPE."""
+
+    def timed_out(
+        *_args: object, **_kwargs: object
+    ) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._BoundedCommandTimeout("deadline reached")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", timed_out)
+
+    with pytest.raises(session_remote_command._RemoteSessionCommandDeadline):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+
+def test_non_timeout_failure_whose_prose_says_timed_out_is_not_a_deadline(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Prose must never decide control flow (clio-relay#158 root fix).
+
+    A remote failure that merely MENTIONS a timeout -- e.g. the cluster
+    reporting that some upstream job timed out -- is not a local transport
+    deadline. Classifying it as one routes into the deadline RETRY path,
+    which re-drives a command that already failed for an unrelated reason.
+    """
+
+    def failed(*_args: object, **_kwargs: object) -> session_remote_command._BoundedCommandResult:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise RelayError("remote refused the request: an upstream job timed out earlier")
+
+    monkeypatch.setattr(session_remote_command, "_run_bounded_command", failed)
+
+    with pytest.raises(RelayError) as captured:
+        session_remote_scripts._ssh_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            ClusterDefinition(name="ares", ssh_host="ares"),
+            "true",
+        )
+
+    assert not isinstance(
+        captured.value,
+        session_remote_command._RemoteSessionCommandDeadline,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
 
 def test_detach_remote_session_retains_verified_remote_api(monkeypatch: MonkeyPatch) -> None:
@@ -4860,7 +5284,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
             }
         )
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
     report = teardown_remote_session(
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
@@ -4893,7 +5317,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
 
 
 def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
-    script = session_lifecycle._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    script = session_remote_scripts._owned_teardown_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         session_id="session-1",
         expected_session_generation_id="generation-1",
@@ -4932,9 +5356,9 @@ def test_start_watch_is_one_bounded_server_side_wait_not_a_redial_loop(
         timeouts.append(timeout_seconds)
         return ready.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=45.0,
@@ -4964,9 +5388,9 @@ def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch
         scripts.append(script)
         return pending.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=600.0,
@@ -4977,7 +5401,8 @@ def test_start_watch_bounds_the_remote_wait_it_asks_for(monkeypatch: MonkeyPatch
     assert result.watch_deadline_exceeded is True
     assert len(scripts) == 1
     assert (
-        f"--wait-seconds {session_lifecycle.MAX_REMOTE_SESSION_START_WAIT_SECONDS:g}" in scripts[0]
+        f"--wait-seconds {session_start_query.MAX_REMOTE_SESSION_START_WAIT_SECONDS:g}"
+        in scripts[0]
     )
 
 
@@ -5001,7 +5426,7 @@ def test_owned_session_start_status_wait_returns_on_the_first_terminal_observati
             start_attempt_verified=True,
         )
 
-    status = session_lifecycle.wait_owned_session_start_status(
+    status = session_start_wait.wait_owned_session_start_status(
         cluster="ares",
         session_id="session-start",
         start_operation_id="start_test",
@@ -5036,9 +5461,9 @@ def test_default_cli_start_watch_costs_exactly_one_remote_command(
         scripts.append(script)
         return pending.model_dump_json()
 
-    monkeypatch.setattr(session_lifecycle, "_ssh_script", fake_ssh)
+    monkeypatch.setattr(session_remote_scripts, "_ssh_script", fake_ssh)
 
-    result = session_lifecycle.watch_remote_session_start(
+    result = session_start_query.watch_remote_session_start(
         definition=definition,
         plan=plan,
         timeout_seconds=120.0,

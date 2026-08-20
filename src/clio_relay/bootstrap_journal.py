@@ -17,7 +17,7 @@ import stat
 import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -88,7 +88,7 @@ def create_journal(
         target = Path(item["path"])
         if _entry_exists_without_following(target):
             raise BootstrapJournalError(f"bootstrap-owned path already exists: {target}")
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     value: dict[str, Any] = {
         "schema_version": BOOTSTRAP_TRANSACTION_SCHEMA,
         "invocation_id": invocation_id,
@@ -150,7 +150,7 @@ def advance_journal(
         value["state"] = state
         if state == "migration_started":
             value["irreversible_boundary"] = True
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -178,7 +178,7 @@ def record_phase(path: Path, phase: str, identity: str) -> dict[str, Any]:
             raise BootstrapJournalError(f"bootstrap phase identity changed: {phase}")
         phases[phase] = identity
         value["phase_identities"] = phases
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -232,7 +232,7 @@ def record_owned_path(path: Path, owned_name: str) -> dict[str, Any]:
             raise BootstrapJournalError(f"bootstrap owned path identity changed: {owned_name}")
         item["identity"] = observed
         value["owned_paths"] = owned
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             parent_descriptor,
@@ -403,7 +403,7 @@ def _create_and_record_owned_path(
                     raise BootstrapJournalError(f"bootstrap owned path kind changed: {target}")
                 item["identity"] = observed
                 value["owned_paths"] = owned
-                value["updated_at"] = datetime.now(UTC).isoformat()
+                value["updated_at"] = datetime.now(timezone.utc).isoformat()
                 _validate_journal(value)
                 _atomic_json_at(
                     journal_fd,
@@ -489,7 +489,7 @@ def discard_full_transaction(path: Path, *, home: Path) -> dict[str, Any]:
                 )
         value["recovered_from"] = value["state"]
         value["state"] = "recovered"
-        value["updated_at"] = datetime.now(UTC).isoformat()
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
         _validate_journal(value)
         _atomic_json_at(
             journal_fd,
@@ -729,12 +729,49 @@ def _normalized_absolute(path: Path, description: str) -> Path:
     return path
 
 
+def _default_site_prefix() -> Path:
+    """Return the site-owned prefix whose layout the cluster operator controls."""
+    return Path(os.path.expanduser("~"))
+
+
+def _resolve_site_prefix(path: Path, prefix: Path) -> Path:
+    """Resolve symlinks in the SITE prefix only, never in the owned subtree.
+
+    A cluster may legitimately place home directories behind a symlink -- on
+    ares ``/home`` is itself a link to ``/mnt/common/`` -- and refusing that
+    made first-install bootstrap impossible there (#158). That layout is the
+    operator's, so it is resolved once here.
+
+    Everything below the prefix is bootstrap-OWNED and is deliberately left
+    unresolved, so the O_NOFOLLOW walk still sees it component by component.
+    Resolving the whole parent chain instead would launder a swap: an owned
+    intermediate directory replaced by a symlink BETWEEN two journal actions
+    would be silently followed on the next call, because ``realpath`` would
+    quietly resolve it before the walk ever looked.
+    """
+    try:
+        remainder = path.relative_to(prefix)
+    except ValueError:
+        return path
+    resolved_prefix = Path(os.path.realpath(str(prefix)))
+    if remainder == Path("."):
+        return _normalized_absolute(resolved_prefix, "bootstrap directory")
+    return _normalized_absolute(resolved_prefix / remainder, "bootstrap directory")
+
+
 @contextmanager
-def _open_absolute_directory(path: Path, *, create: bool = False) -> Generator[int]:
+def _open_absolute_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    site_prefix: Path | None = None,
+) -> Generator[int]:
     """Open an absolute directory chain without following any symbolic link."""
     normalized = _normalized_absolute(path, "bootstrap directory")
     if os.name == "nt":
         raise BootstrapJournalError("descriptor-pinned traversal requires POSIX")
+    prefix = _default_site_prefix() if site_prefix is None else site_prefix
+    normalized = _resolve_site_prefix(normalized, prefix)
     flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     descriptor = os.open(os.sep, flags)
     try:

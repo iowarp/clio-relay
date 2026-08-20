@@ -21,6 +21,8 @@ from typing import Any, BinaryIO, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from clio_relay.browser_gateway_errors import OverloadedRequestHandler, browser_gateway_error
+
 CAPABILITY_ENV = "CLIO_RELAY_BROWSER_CAPABILITY"
 UPSTREAM_AUTHORIZATION_ENV = "CLIO_RELAY_BROWSER_UPSTREAM_AUTHORIZATION"
 BROWSER_GATEWAY_CONFIG_SCHEMA = "clio-relay.browser-gateway-config.v1"
@@ -272,51 +274,6 @@ class _AbsoluteSocketDeadline:
             self._request_socket.shutdown(socket.SHUT_RDWR)
 
 
-class _OverloadedRequestHandler(BaseHTTPRequestHandler):
-    """Parse one rejected request before returning a deterministic HTTP 503."""
-
-    protocol_version = "HTTP/1.1"
-    server_version = "clio-relay-browser-gateway/1"
-    sys_version = ""
-
-    def do_GET(self) -> None:  # noqa: N802
-        """Reject an overloaded GET with a complete close-delimited response."""
-        self._reject()
-
-    def do_POST(self) -> None:  # noqa: N802
-        """Reject an overloaded POST with a complete close-delimited response."""
-        self._reject()
-
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        """Reject an overloaded preflight with a complete HTTP response."""
-        self._reject()
-
-    def do_HEAD(self) -> None:  # noqa: N802
-        """Reject an overloaded HEAD without writing a response body."""
-        self._reject()
-
-    def _reject(self) -> None:
-        payload = b'{"error":"browser attachment request capacity exhausted"}'
-        self.close_connection = True
-        self.send_response(503)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "null")
-        self.send_header("Vary", "Origin")
-        self.send_header("Retry-After", "1")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if self.command != "HEAD":
-            with suppress(BrokenPipeError, ConnectionResetError, OSError):
-                self.wfile.write(payload)
-                self.wfile.flush()
-
-    def log_message(self, format: str, *args: object) -> None:
-        """Avoid attacker-controlled request text in overload logs."""
-        del format, args
-
-
 class CapabilityProxyServer(ThreadingHTTPServer):
     """Threaded loopback server with immutable attachment configuration."""
 
@@ -449,13 +406,24 @@ class CapabilityProxyServer(ThreadingHTTPServer):
         try:
             request_socket.settimeout(BROWSER_OVERLOAD_IO_TIMEOUT_SECONDS)
             with suppress(BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
-                _OverloadedRequestHandler(request_socket, client_address, self)
+                OverloadedRequestHandler(request_socket, client_address, self)
         finally:
             deadline.complete()
             try:
                 self.shutdown_request(request_socket)
             finally:
                 self._overload_slots.release()
+
+
+class _RequestBodyTooLargeError(ValueError):
+    """A declared/actual request body exceeded ``MAX_REQUEST_BODY_BYTES``.
+
+    A distinct type (not a message match) so ``_error_from_exception`` can
+    route this one condition to ``door_errors.REASONS["payload_too_large"]``
+    while ``_request_body``'s other three failures (chunked encoding, a
+    malformed ``Content-Length``, a body that ended early) stay the
+    catch-all ``configuration_error`` (#231 R3 re-review, F7+F14).
+    """
 
 
 class CapabilityProxyHandler(BaseHTTPRequestHandler):
@@ -499,6 +467,10 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         """Proxy an authenticated bounded command request."""
         self._proxy_request()
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        """Return the typed method refusal for an unsupported request."""
+        self._proxy_request()
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         """Answer only valid capability-bearing sandbox preflight requests."""
         target = self._authorize()
@@ -507,17 +479,19 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         try:
             self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         requested_method = self.headers.get("Access-Control-Request-Method")
         if requested_method not in {"GET", "POST"}:
-            self._error(403, "requested method is not allowed")
+            self._error("browser_preflight_refused", "requested method is not allowed")
             return
         if requested_method == "POST" and urllib.parse.urlsplit(target).path != (
             self.capability_server.config.command_path
         ):
-            self._error(403, "POST is allowed only for the command endpoint")
+            self._error(
+                "browser_preflight_refused", "POST is allowed only for the command endpoint"
+            )
             return
         requested_headers = {
             item.strip().casefold()
@@ -525,7 +499,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
             if item.strip()
         }
         if not requested_headers.issubset(_ALLOWED_REQUEST_HEADERS):
-            self._error(403, "requested headers are not allowed")
+            self._error("browser_preflight_refused", "requested headers are not allowed")
             return
         self.send_response(204)
         self._cors_headers()
@@ -542,23 +516,23 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         config = self.capability_server.config
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path not in config.allowed_paths:
-            self._error(404, "attachment path is not available")
+            self._error("browser_attachment_not_found", "attachment path is not available")
             return None
         if self.headers.get_all("Origin", failobj=[]) != ["null"]:
-            self._error(403, "browser attachment requires Origin: null")
+            self._error("browser_origin_refused", "browser attachment requires Origin: null")
             return None
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         supplied = query.pop(_CAPABILITY_QUERY_KEY, [])
         if len(supplied) != 1 or not hmac.compare_digest(
             supplied[0], self.capability_server.capability
         ):
-            self._error(401, "browser capability is invalid")
+            self._error("browser_capability_refused", "browser capability is invalid")
             return None
         if Path(config.revocation_path).exists():
-            self._error(401, "browser capability is revoked")
+            self._error("browser_capability_refused", "browser capability is revoked")
             return None
         if time.time() >= parse_utc_timestamp(config.expires_at, "expires_at").timestamp():
-            self._error(401, "browser capability is expired")
+            self._error("browser_capability_refused", "browser capability is expired")
             return None
         encoded_query = urllib.parse.urlencode(query, doseq=True)
         return parsed.path + (f"?{encoded_query}" if encoded_query else "")
@@ -568,17 +542,19 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         if target is None:
             return
         if self.command not in self._SUPPORTED_METHODS - {"OPTIONS"}:
-            self._error(405, "method is not allowed")
+            self._error("browser_method_not_allowed", "method is not allowed")
             return
         if self.command == "POST" and urllib.parse.urlsplit(target).path != (
             self.capability_server.config.command_path
         ):
-            self._error(405, "POST is allowed only for the command endpoint")
+            self._error(
+                "browser_method_not_allowed", "POST is allowed only for the command endpoint"
+            )
             return
         try:
             body = self._request_body()
         except ValueError as exc:
-            self._error(413, str(exc))
+            self._error_from_exception(exc)
             return
         self._mark_request_input_complete()
         config = self.capability_server.config
@@ -651,7 +627,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             elif not self.wfile.closed:
                 with suppress(BrokenPipeError, ConnectionResetError, OSError):
-                    self._error(502, "upstream service is unavailable")
+                    self._error("browser_upstream_unavailable", "upstream service is unavailable")
         finally:
             if response is not None:
                 with suppress(OSError):
@@ -669,7 +645,14 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ValueError("request Content-Length is invalid") from exc
         if length < 0 or length > MAX_REQUEST_BODY_BYTES:
-            raise ValueError("request body exceeds the browser gateway limit")
+            # A distinct exception TYPE (F7+F14, opus review), not a message
+            # match: this is the one _request_body failure that is a
+            # well-known HTTP concept (413) in its own right, not a generic
+            # protocol-validation mistake -- _error_from_exception routes it
+            # to door_errors.REASONS["payload_too_large"] instead of the
+            # blanket configuration_error the other three conditions here
+            # still use.
+            raise _RequestBodyTooLargeError("request body exceeds the browser gateway limit")
         body = self.rfile.read(length)
         if len(body) != length:
             deadline = self._request_input_deadline
@@ -689,16 +672,60 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
 
-    def _error(self, status: int, message: str) -> None:
-        payload = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+    def _write_response(self, status: int, content_type: str, payload: bytes) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             with suppress(BrokenPipeError, ConnectionResetError, OSError):
                 self.wfile.write(payload)
+
+    def _error(self, reason: str, message: str) -> None:
+        status_code, document = browser_gateway_error(reason, message)
+        self._error_document(status_code, document)
+
+    def _error_document(self, status: int, document: dict[str, object]) -> None:
+        """Write a door_errors-owned RFC 7807 document (doc §6.2's fourth adapter).
+
+        The document's fields sit at the top level, never under an ad-hoc
+        ``"error"`` key.
+        """
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self._write_response(status, "application/problem+json", payload)
+
+    def _error_from_exception(self, exc: ValueError) -> None:
+        """Route a caught request-body-validation ``ValueError`` through door_errors (#231 R3).
+
+        Local import: a module-level ``from clio_relay import door_errors``
+        here creates a real import cycle (browser_gateway -> door_errors ->
+        storage_runtime -> core_queue -> browser_gateway, since core_queue
+        already imports ``BrowserAttachmentRecord`` from this module) --
+        confirmed by triggering it, not merely suspected.
+
+        A ``_RequestBodyTooLargeError`` (the oversize branch specifically,
+        F7+F14 opus review) is a well-known HTTP concept in its own right
+        and routes to the dedicated ``payload_too_large`` reason (413).
+        ``_request_body``'s other three failures (chunked encoding, a
+        malformed ``Content-Length``, a body that ended early) are generic
+        protocol-level mistakes, not a distinct domain reason this module's
+        frozen ``REASONS`` table names on their own -- ``configuration_error``
+        (400, "client-schema mismatches") is the closest table-sanctioned
+        fit for those, chosen over inventing three more unregistered reasons
+        for this one file.
+        """
+        from clio_relay import door_error_adapters, door_errors
+
+        is_oversized = isinstance(exc, _RequestBodyTooLargeError)
+        reason = "payload_too_large" if is_oversized else "configuration_error"
+        fault = door_errors.classify(
+            exc,
+            reason=reason,
+            message=("request body exceeds the browser gateway limit" if is_oversized else None),
+        )
+        status, document = door_error_adapters.as_browser_gateway_error(fault)
+        self._error_document(status, document)
 
     def log_message(self, format: str, *args: object) -> None:
         """Emit bounded process-log entries without logging capability-bearing URLs."""

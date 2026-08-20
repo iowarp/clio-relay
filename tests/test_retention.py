@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 import clio_relay.retention as retention_module
+from clio_relay import door_error_adapters, door_errors
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
@@ -151,6 +152,41 @@ def test_outer_retention_recovers_rename_before_receipt_checkpoint(
     assert (spool_root / ".retention" / "quarantine" / plan.receipt_id).is_dir()
 
     _finish_retention(TerminalRetentionCoordinator(queue, spool_root), job.job_id)
+
+
+def test_invalid_retention_receipt_keeps_validation_detail_off_public_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Foreign receipt bytes are logged once but never enter the conflict message."""
+    job_id = "job-invalid-receipt"
+    spool_root = tmp_path / "spool"
+    coordinator = TerminalRetentionCoordinator(cast(ClioCoreQueue, object()), spool_root)
+    private = cast(Any, coordinator)
+    receipt_path = private._receipt_path(job_id)
+    receipt_path.parent.mkdir(parents=True)
+    distinctive = "foreign-receipt-value-6f238b"
+    receipt_path.write_text(
+        f'{{"foreign_receipt_field":"{distinctive}"}}',
+        encoding="utf-8",
+    )
+
+    with (
+        caplog.at_level("WARNING", logger="clio_relay.retention"),
+        pytest.raises(QueueConflictError) as captured,
+    ):
+        private._read_receipt_optional(job_id)
+
+    assert str(captured.value) == f"retention receipt failed validation: {receipt_path}"
+    assert distinctive not in str(captured.value)
+    assert caplog.text.count(distinctive) == 1
+    fault = door_errors.classify(
+        door_errors.public_message_error(captured.value),
+        reason="retention_conflict",
+    )
+    document = door_error_adapters.as_http_problem(fault)
+    assert document["detail"] == str(captured.value)
+    assert distinctive not in document["detail"]
 
 
 def test_outer_retention_fails_closed_on_source_swap_before_anchored_rename(

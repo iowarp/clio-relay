@@ -24,8 +24,15 @@ import pytest
 from typer.testing import CliRunner
 
 import clio_relay.bootstrap as bootstrap
+import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
+import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
+import clio_relay.cli_installation_receipt as cli_installation_receipt
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.core_queue as core_queue
+import clio_relay.installation as installation
 from clio_relay import __version__
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
@@ -1418,7 +1425,13 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SSH receives one quoted command whose Bash payload retains its line boundaries."""
+    """SSH receives the Bash payload on STDIN with its line boundaries intact.
+
+    The payload used to ride in argv as one quoted argument. That is unsafe at
+    this size: some ssh clients silently truncate a long command-line argument
+    (clio-relay#158), so the structure asserted here must reach the remote over
+    stdin instead.
+    """
     identity = bootstrap.bootstrap_relay_identity(
         source_root=tmp_path / "release",
         relay_wheel=None,
@@ -1439,9 +1452,17 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
         jarvis_resource_graph_profile="ares",
     )
     observed: list[list[str]] = []
+    delivered: list[bytes] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1462,10 +1483,11 @@ def test_bootstrap_preflight_quotes_its_multiline_remote_command(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    assert observed[0][:2] == ["ssh", "ares"]
-    assert len(observed[0]) == 3
-    ssh_remote_command = " ".join(observed[0][2:])
-    remote_argv = shlex.split(ssh_remote_command, posix=True)
+    # Nothing script-sized may ride in argv, whatever its quoting.
+    assert observed[0] == ["ssh", "ares", "bash", "-s"]
+    assert len(delivered) == 1
+    remote_command = delivered[0].decode("utf-8")
+    remote_argv = shlex.split(remote_command, posix=True)
     exec_index = remote_argv.index("exec")
     assert remote_argv[:4] == ["if", "[", "-n", "${BASH_VERSION-}"]
     assert remote_argv[exec_index : exec_index + 3] == ["exec", "bash", "-c"]
@@ -1669,8 +1691,17 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     )
     observed: list[list[str]] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    delivered: list[bytes] = []
+
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1691,7 +1722,9 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    remote_script = observed[0][-1]
+    # The script rides on stdin, not in argv (#158).
+    assert len(delivered) == 1
+    remote_script = delivered[0].decode("utf-8")
     classifier = remote_script.index('relay.get("persistent_tool")')
     old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" bootstrap-inspect')
     assert classifier < old_relay
@@ -1801,8 +1834,17 @@ def test_preflight_allows_only_exact_repairable_queue_permission_report(
     )
     observed: list[list[str]] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    delivered: list[bytes] = []
+
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
         observed.append(command)
+        if input_bytes is not None:
+            delivered.append(input_bytes)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -1823,7 +1865,9 @@ def test_preflight_allows_only_exact_repairable_queue_permission_report(
 
     assert result.action == "payload_required"
     assert len(observed) == 1
-    remote_script = observed[0][-1]
+    # The script rides on stdin, not in argv (#158).
+    assert len(delivered) == 1
+    remote_script = delivered[0].decode("utf-8")
     execution_driver = r"""
 import base64
 import json
@@ -2053,12 +2097,12 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     monkeypatch.setattr(bootstrap, "_validate_relay_bootstrap_wheel", poison)
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "cli_test"})())
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "missing-source")
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "missing-source")
 
     def remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
         return {"verified": True}
 
-    monkeypatch.setattr(cli, "_remote_target_identity", remote_target_identity)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2123,7 +2167,7 @@ def test_public_release_bootstrap_requires_artifact_digest(
             )
         }
     ).save(tmp_path / ".clio-relay/clusters.json")
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "installed-package")
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "installed-package")
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     result = CliRunner().invoke(
@@ -2228,12 +2272,12 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
     def invocation_lock(**_kwargs: object) -> nullcontext[Path]:
         return nullcontext(tmp_path / "bootstrap.lock")
 
-    monkeypatch.setattr(cli, "installation_info", installation_info)
-    monkeypatch.setattr(cli, "ClioCoreQueue", ReadyQueue)
-    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", inspect)
-    monkeypatch.setattr(cli, "run_bounded_process", systemctl)
-    monkeypatch.setattr(cli, "worker_runtime_info", worker_info)
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(installation, "installation_info", installation_info)
+    monkeypatch.setattr(core_queue, "ClioCoreQueue", ReadyQueue)
+    monkeypatch.setattr(bootstrap_reconcile, "inspect_exact_bootstrap_noop", inspect)
+    monkeypatch.setattr(bounded_process, "run_bounded_process", systemctl)
+    monkeypatch.setattr(installation, "worker_runtime_info", worker_info)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2287,7 +2331,10 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
     path_type = type(current)
     original_lstat = path_type.lstat
     original_readlink = os.readlink
-    original_is_directory_alias = bootstrap_reconcile._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # proven_active_generation_mismatch (the direct caller here) now lives in
+    # bootstrap_reconcile_inspection.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_is_directory_alias = bootstrap_reconcile_inspection._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     raw_target = str(active)
     simulate_current_race = False
     current_lstat_calls = 0
@@ -2340,13 +2387,13 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
         return path == generations or original_is_directory_alias(path)
 
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         aliased_generations,
     )
     assert proven_active_generation_mismatch(desired, home=tmp_path) is None
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         original_is_directory_alias,
     )
@@ -2397,18 +2444,18 @@ def test_payload_free_inspector_short_circuits_proven_generation_mismatch(
     def mismatched_generation(_desired: BootstrapDesiredState) -> str:
         return "b" * 64
 
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
     monkeypatch.setattr(
-        cli,
+        bootstrap_reconcile,
         "proven_active_generation_mismatch",
         mismatched_generation,
     )
-    monkeypatch.setattr(cli, "installation_info", unexpected)
-    monkeypatch.setattr(cli, "ClioCoreQueue", unexpected)
-    monkeypatch.setattr(cli, "run_bounded_process", unexpected)
-    monkeypatch.setattr(cli, "worker_runtime_info", unexpected)
-    monkeypatch.setattr(cli, "inspect_exact_bootstrap_noop", unexpected)
-    monkeypatch.setattr(cli, "write_bootstrap_receipt", unexpected)
+    monkeypatch.setattr(installation, "installation_info", unexpected)
+    monkeypatch.setattr(core_queue, "ClioCoreQueue", unexpected)
+    monkeypatch.setattr(bounded_process, "run_bounded_process", unexpected)
+    monkeypatch.setattr(installation, "worker_runtime_info", unexpected)
+    monkeypatch.setattr(bootstrap_reconcile, "inspect_exact_bootstrap_noop", unexpected)
+    monkeypatch.setattr(bootstrap_reconcile, "write_bootstrap_receipt", unexpected)
     arguments = [
         "bootstrap-inspect",
         "--invocation-id",
@@ -2471,9 +2518,11 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
     def matching_generation(_desired: BootstrapDesiredState) -> None:
         return None
 
-    monkeypatch.setattr(cli, "bootstrap_invocation_lock", invocation_lock)
-    monkeypatch.setattr(cli, "proven_active_generation_mismatch", matching_generation)
-    monkeypatch.setattr(cli, "installation_info", deep_inspection)
+    monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
+    monkeypatch.setattr(
+        bootstrap_reconcile, "proven_active_generation_mismatch", matching_generation
+    )
+    monkeypatch.setattr(installation, "installation_info", deep_inspection)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2491,9 +2540,13 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
 
 
 def test_bootstrap_inspection_deadlines_match_acceptance_contract() -> None:
-    assert 0 < cli.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < 30
+    """#231 cli.py decomposition: both deadlines moved to cli_installation_receipt.py
+    alongside bootstrap_inspect, their only caller."""
+    assert 0 < cli_installation_receipt.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < 30
     assert (
-        cli.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < cli.BOOTSTRAP_REPAIR_DEADLINE_SECONDS < 60
+        cli_installation_receipt.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS
+        < cli_installation_receipt.BOOTSTRAP_REPAIR_DEADLINE_SECONDS
+        < 60
     )
 
 
@@ -2623,7 +2676,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         payload_transfer_bytes=1,
     )
 
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2642,7 +2695,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "/home/operator/custom/builtin",
     ]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             invalid_builtin_addition,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2664,7 +2717,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         cleanup_binding = cast(dict[str, object], cleanup_preservation["repositories"])
         cleanup_update = cast(dict[str, object], cleanup_binding["repositories"])
         cleanup_update["removed_previous_managed_repos"] = [relay_builtin_path]
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             builtin_cleanup,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2685,7 +2738,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     }.items():
         evidence = cast(dict[str, object], relay_components[name])
         evidence["action"] = action
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         relay_only,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2699,7 +2752,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     relay_binding = cast(dict[str, object], relay_preservation["repositories"])
     relay_binding["target"] = "/operator/unrelated-repository"
     with pytest.raises(RelayError, match="repository binding is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             invalid_relay_binding,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2715,7 +2768,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     update = cast(dict[str, object], binding["repositories"])
     update["after_sha256"] = "0" * 64
     with pytest.raises(RelayError, match="hashes do not bind"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             tampered,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2731,7 +2784,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     update = cast(dict[str, object], binding["repositories"])
     update["removed_previous_managed_repos"] = ["/operator/unrelated-repository"]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             unauthorized_removal,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2749,7 +2802,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "/home/operator/.local/share/clio-relay/operator-venv/lib/python3.12/site-packages/builtin"
     ]
     with pytest.raises(RelayError, match="repository migration is invalid"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             lookalike_removal,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2763,7 +2816,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     preservation = cast(dict[str, object], replaced_link["jarvis_preservation"])
     binding = cast(dict[str, object], preservation["repositories"])
     binding["link_action"] = "retargeted"
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         replaced_link,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2777,7 +2830,7 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
     generation = cast(dict[str, object], unproven_retarget["generation"])
     generation["previous"] = "unproven"
     with pytest.raises(RelayError, match="did not preserve existing JARVIS state"):
-        bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        bootstrap_receipt_validation.validate_bootstrap_receipt(
             unproven_retarget,
             bootstrap_profile="linux-user",
             relay_install_spec=desired.relay_install_spec,
@@ -2892,7 +2945,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
         payload_transfer_bytes=1,
     )
 
-    bootstrap._validate_bootstrap_receipt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
@@ -2905,12 +2958,50 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
     assert isinstance(service, dict)
     assert service["pending_install"] is True
 
-    with pytest.raises(ValueError, match="packaged source digest"):
+    # JARVIS normalizes the graph while activating it (expands ${USER}, fills
+    # derived fields), so the activated digest legitimately differs from the
+    # packaged source digest. Requiring equality here failed every fresh
+    # bootstrap on a real cluster (#158); a differing source digest must now be
+    # accepted, because that is what a correct activation actually looks like.
+    accepted = make_bootstrap_receipt(
+        invocation_id="bootstrap_normalized_builtin",
+        desired=desired,
+        outcome="full",
+        inspection=inspection,
+        started_at=datetime.now(UTC),
+        transaction=None,
+        previous_generation=None,
+        active_generation=desired.fingerprint,
+        components=components,
+        jarvis_init_action="initialized",
+        jarvis_init_duration_seconds=1.0,
+        jarvis_graph_action="loaded",
+        jarvis_graph_duration_seconds=1.0,
+        jarvis_builtin_result={
+            **loaded_builtin_result,
+            "source_sha256": "e" * 64,
+        },
+    )
+    accepted_graph = accepted["jarvis_resource_graph"]
+    assert isinstance(accepted_graph, dict)
+    accepted_builtin = accepted_graph["builtin_result"]
+    assert isinstance(accepted_builtin, dict)
+    assert accepted_builtin["source_sha256"] == "e" * 64
+
+    # What the receipt DOES require is that activation evidence was recorded.
+    graphless = inspection.model_copy(
+        update={
+            "jarvis_state": inspection.jarvis_state.model_copy(
+                update={"resource_graph_sha256": None}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="activated resource graph digest"):
         make_bootstrap_receipt(
-            invocation_id="bootstrap_mismatched_builtin",
+            invocation_id="bootstrap_unrecorded_activation",
             desired=desired,
             outcome="full",
-            inspection=inspection,
+            inspection=graphless,
             started_at=datetime.now(UTC),
             transaction=None,
             previous_generation=None,
@@ -2920,10 +3011,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
             jarvis_init_duration_seconds=1.0,
             jarvis_graph_action="loaded",
             jarvis_graph_duration_seconds=1.0,
-            jarvis_builtin_result={
-                **loaded_builtin_result,
-                "source_sha256": "e" * 64,
-            },
+            jarvis_builtin_result=loaded_builtin_result,
         )
 
     unavailable: dict[str, object] = {
@@ -3281,7 +3369,12 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert 'unset "$bootstrap_environment_name"' in provider_function
     assert activation < finish < verify < activated < migration
     assert "bootstrap_candidate_action finish-activation" in recovery
-    assert "phase_identities" in recovery
+    # #247: state-aware recovery reads `phase_identities.prepared_manifest`
+    # through the new `recovery-prepared-manifest` candidate action (owned by
+    # bootstrap_recovery.require_phase_identity) rather than an inline
+    # heredoc, so it can name the exact missing key on a prior-build journal.
+    assert "bootstrap_candidate_action recovery-prepared-manifest prepared_manifest" in recovery
+    assert "recovery_needs_staged_identity" in recovery
     assert "sha256sum --check --strict -" in recovery
     assert "WORKER_LIFETIME_GUARD_FD=8" in recovery
     assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in recovery

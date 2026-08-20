@@ -351,8 +351,8 @@
                 "type": "string"
               },
               "contract": {
-                "const": "clio-kit-jarvis-user-v3.6",
-                "default": "clio-kit-jarvis-user-v3.6",
+                "const": "clio-kit-jarvis-user-v3.7.1",
+                "default": "clio-kit-jarvis-user-v3.7.1",
                 "type": "string"
               },
               "expected_server_artifact_digest": {

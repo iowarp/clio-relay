@@ -10,12 +10,14 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 from urllib.parse import unquote, urlparse
 
+from clio_relay.bounded_payload import JSON, build_delivery_refusal
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_execution_artifacts import EXECUTION_OUTPUT_OWNERSHIP_SCHEMA
 from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
@@ -37,6 +39,7 @@ from clio_relay.scheduler_status import relay_queue_status
 from clio_relay.spool import (
     ARTIFACT_OWNERSHIP_SCHEMA,
     JobSpool,
+    LogStreamName,
     OwnedFileSizeLimitError,
     read_owned_regular_file_bytes,
 )
@@ -177,11 +180,11 @@ def read_job_log(
     settings: RelaySettings,
     job: RelayJob,
     *,
-    stream_name: Literal["stdout", "stderr"],
+    stream_name: LogStreamName,
     offset: int = 0,
     limit: int = 65536,
 ) -> dict[str, object]:
-    """Read a cursor range from a job stdout/stderr log."""
+    """Read a cursor range from a job stdout/stderr/console log."""
     text, next_offset, eof = JobSpool(settings.spool_dir, job).read_log(
         stream_name,
         offset=offset,
@@ -198,7 +201,14 @@ def read_job_log(
 
 
 def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, object]:
-    """Read an artifact payload referenced by clio-core artifact metadata."""
+    """Read an artifact payload referenced by clio-core artifact metadata.
+
+    Content over :data:`MAX_ARTIFACT_CONTENT_BYTES` never comes back as a
+    partial body (doc §6.4, T2): the durable artifact reference is kept as
+    evidence in the returned document's ``artifact`` field, but ``data`` is
+    withheld and :func:`~clio_relay.bounded_payload.is_delivery_refusal`
+    identifies the document as a refusal rather than a delivered payload.
+    """
     artifact = queue.get_artifact(artifact_id)
     path = _artifact_file_path(artifact.uri)
     owned_root_uri = artifact.metadata.get("owned_root_uri")
@@ -206,14 +216,18 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     if owned_root_uri is None and ownership_schema is None:
         owned_root = queue.root.parent / "spool" / artifact.job_id
     elif (
-        ownership_schema == ARTIFACT_OWNERSHIP_SCHEMA
+        ownership_schema
+        in {
+            ARTIFACT_OWNERSHIP_SCHEMA,
+            EXECUTION_OUTPUT_OWNERSHIP_SCHEMA,
+        }
         and isinstance(owned_root_uri, str)
         and owned_root_uri
     ):
         owned_root = _artifact_file_path(owned_root_uri)
     else:
         raise RelayError(f"artifact has invalid owned-root metadata: {artifact_id}")
-    if owned_root.name != artifact.job_id:
+    if ownership_schema != EXECUTION_OUTPUT_OWNERSHIP_SCHEMA and owned_root.name != artifact.job_id:
         raise RelayError(
             f"artifact owned-root metadata does not name its durable job: {artifact_id}"
         )
@@ -223,11 +237,8 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
             owned_root=owned_root,
             max_bytes=MAX_ARTIFACT_CONTENT_BYTES,
         )
-    except OwnedFileSizeLimitError as exc:
-        raise RelayError(
-            f"artifact content exceeds the {MAX_ARTIFACT_CONTENT_BYTES}-byte transfer limit: "
-            f"{artifact_id}; use the cursor-based log endpoint for job logs"
-        ) from exc
+    except OwnedFileSizeLimitError:
+        return _artifact_content_too_large_refusal(artifact.model_dump(mode="json"), artifact_id)
     except RuntimeError as exc:
         raise RelayError(f"artifact backing file is unsafe: {artifact_id}: {exc}") from exc
     data = snapshot.data
@@ -245,6 +256,44 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
         "encoding": "base64",
         "data": base64.b64encode(data).decode("ascii"),
     }
+
+
+#: Artifact kinds the cursor-based log endpoint (:func:`read_job_log`, keyed
+#: on :data:`clio_relay.spool.LogStreamName`) actually serves. F10 (#231 R6
+#: review): the refusal below used to point every over-budget artifact at
+#: that endpoint regardless of kind -- correct for a log stream, actively
+#: wrong for e.g. an oversized ``mcp_result`` artifact, which the log
+#: endpoint has no path to serve at all. ``console`` (#259) joined
+#: ``stdout``/``stderr`` here for the same reason it joined them in
+#: :data:`clio_relay.spool.LOG_STREAM_NAMES`.
+_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr", "console"})
+
+
+def _artifact_content_too_large_refusal(artifact: JSON, artifact_id: str) -> JSON:
+    """Build the T2 refusal :func:`read_artifact_bytes` returns over budget.
+
+    Reading an artifact has no remote side effects of its own (unlike an MCP
+    tool call, mirrored by :data:`clio_relay.bounded_payload.
+    DELIVERY_FAILURE_SCHEMA_VERSION`'s originating precedent) -- the durable
+    file itself is untouched either way, so
+    ``remote_side_effects_may_have_occurred`` is always ``False`` here.
+    """
+    kind = artifact.get("kind")
+    remediation = (
+        "use the cursor-based log endpoint for job logs"
+        if kind in _CURSOR_LOG_SERVED_KINDS
+        else "the full content remains available only through durable operator evidence"
+    )
+    refusal = build_delivery_refusal(
+        code="artifact_content_too_large",
+        message=(
+            f"artifact content exceeds the {MAX_ARTIFACT_CONTENT_BYTES}-byte transfer limit: "
+            f"{artifact_id}; {remediation}"
+        ),
+        max_bytes=MAX_ARTIFACT_CONTENT_BYTES,
+        remote_side_effects_may_have_occurred=False,
+    )
+    return {"artifact": artifact, **refusal}
 
 
 def cancel_job(

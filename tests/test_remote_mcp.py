@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
 import stat
+import sys
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -18,11 +20,18 @@ from click import unstyle
 from jsonschema import Draft4Validator, Draft201909Validator, Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
-from pytest import MonkeyPatch
+from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli as relay_cli
-from clio_relay import remote_mcp
+import clio_relay.cli_remote_mcp as cli_remote_mcp
+import clio_relay.remote_mcp_validation as remote_mcp_validation
+from clio_relay import (
+    remote_cli,
+    remote_mcp,
+    remote_mcp_aliasing,
+    remote_mcp_cache,
+    remote_mcp_schema_validation,
+)
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -53,12 +62,6 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.remote_mcp import (
-    MAX_REMOTE_MCP_CACHE_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
-    MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES,
-    MAX_REMOTE_MCP_TOOLS_PER_SERVER,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
     RemoteMcpAcceptanceReport,
@@ -78,10 +81,31 @@ from clio_relay.remote_mcp import (
     is_remote_mcp_control_query,
     remote_mcp_server_artifact_digest,
 )
+from clio_relay.remote_mcp_acceptance_models import (
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+)
+from clio_relay.remote_mcp_cache import MAX_REMOTE_MCP_CACHE_BYTES, MAX_REMOTE_MCP_TOOLS_PER_SERVER
+from clio_relay.remote_mcp_tool_schema import MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES
 from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def packaged_relay_executable(monkeypatch: MonkeyPatch) -> Path:
+    """Bind stdio validation to this test environment's packaged relay."""
+    executable_name = "clio-relay.exe" if os.name == "nt" else "clio-relay"
+    executable = Path(sys.executable).with_name(executable_name).resolve()
+    if not executable.is_file():
+        raise ConfigurationError(
+            "remote MCP CLI validation requires the clio-relay console script adjacent to "
+            f"the active Python interpreter; expected {executable}"
+        )
+    monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
+    return executable
 
 
 class _SchemaValidator(Protocol):
@@ -117,8 +141,8 @@ def test_control_query_classification_requires_explicit_safe_annotations(
 @pytest.mark.parametrize(
     ("contract_id", "artifact_name"),
     [
+        ("clio-kit-jarvis-user-v3.7.1", "jarvis-user-v3.7.1.json"),
         ("clio-kit-jarvis-user-v3.6", "jarvis-user-v3.6.json"),
-        ("clio-kit-jarvis-user-v3.5", "jarvis-user-v3.5.json"),
     ],
 )
 def test_registered_jarvis_contract_accepts_current_and_frozen_legacy(
@@ -457,8 +481,13 @@ def test_remote_mcp_registration_is_deny_by_default_and_validated() -> None:
         command="clio-kit",
         contract="clio-kit-spack-user-v2",
     )
+    v2_3_spack_registration = RemoteMcpServerConfig(
+        command="clio-kit",
+        contract="clio-kit-spack-user-v2.3",
+    )
     assert current_spack_registration.contract == "clio-kit-spack-user-v2.1"
     assert legacy_spack_registration.contract == "clio-kit-spack-user-v2"
+    assert v2_3_spack_registration.contract == "clio-kit-spack-user-v2.3"
 
     with pytest.raises(ValidationError, match="exact names or '\\*' only"):
         RemoteMcpServerConfig(command="science-mcp", allow_tools=["inspect*"])
@@ -822,7 +851,7 @@ def test_scientific_catalog_result_rejects_overdeep_content_without_traversing()
     dataset_id = "deep-water-impact-2018-yb31-first5"
     structured = _scientific_catalog_describe_result(dataset_id)
     nested: dict[str, object] = {"leaf": True}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"child": nested}
     descriptor = cast(dict[str, object], structured["dataset_descriptor"])
     descriptor["unsafe_test_nesting"] = nested
@@ -990,7 +1019,7 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     entry = _entry(registration, cluster="alpha", server_name="science")
     path = tmp_path / "remote-mcp-cache.json"
     attempts = 0
-    original_replace = remote_mcp.os.replace
+    original_replace = remote_mcp_cache.os.replace
 
     def sharing_once(
         source: str | os.PathLike[str],
@@ -1005,8 +1034,8 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     def no_sleep(_seconds: float) -> None:
         return
 
-    monkeypatch.setattr(remote_mcp.os, "replace", sharing_once)
-    monkeypatch.setattr(remote_mcp.time, "sleep", no_sleep)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", sharing_once)
+    monkeypatch.setattr(remote_mcp_cache.time, "sleep", no_sleep)
 
     RemoteMcpSchemaCache.update_entry(path, entry)
 
@@ -1029,7 +1058,7 @@ def test_remote_mcp_cache_preserves_old_file_when_replace_fails(
         del source, target
         raise OSError("simulated replacement failure")
 
-    monkeypatch.setattr(remote_mcp.os, "replace", fail_replace)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", fail_replace)
 
     with pytest.raises(OSError, match="simulated replacement failure"):
         RemoteMcpSchemaCache.update_entry(path, replacement)
@@ -1076,7 +1105,7 @@ def test_remote_mcp_discovery_and_schema_sizes_are_bounded() -> None:
 
 def test_remote_mcp_schema_depth_is_bounded_before_recursive_validation() -> None:
     nested: dict[str, object] = {"type": "object"}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"allOf": [nested]}
 
     with pytest.raises(ValidationError, match="nesting levels"):
@@ -1102,7 +1131,11 @@ def test_remote_mcp_discovery_json_node_count_is_bounded(
     artifact = json.loads(_discovery_artifact(registration, tools=[_tool("inspect")]))
     artifact["server_info"] = {"wide": list(range(200))}
     payload = json.dumps(artifact).encode()
-    monkeypatch.setattr(remote_mcp, "MAX_REMOTE_MCP_JSON_NODES", 100)
+    # MAX_REMOTE_MCP_JSON_NODES is read inside _require_bounded_json_structure,
+    # which now lives in remote_mcp_schema_validation.py (#231) -- patch the
+    # module the guard actually reads its bound from, not remote_mcp's
+    # re-export (moved-symbol patch seam, design doc §4.6).
+    monkeypatch.setattr(remote_mcp_schema_validation, "MAX_REMOTE_MCP_JSON_NODES", 100)
 
     with pytest.raises(ValueError, match="100 JSON nodes"):
         _entry_from_payload(registration, payload)
@@ -1117,7 +1150,8 @@ def test_remote_mcp_protocol_error_diagnostic_is_bounded() -> None:
     with pytest.raises(ValueError) as error:
         _entry_from_payload(registration, payload)
 
-    assert len(str(error.value)) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS + 100
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert len(str(error.value)) <= max_chars + 100
     assert str(error.value).endswith("... [truncated]")
 
 
@@ -1383,9 +1417,9 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
     contract_artifact = cast(
         dict[str, object],
         json.loads(
-            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.6.json").read_text(
-                encoding="utf-8"
-            )
+            (
+                Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json"
+            ).read_text(encoding="utf-8")
         ),
     )
     tools = cast(list[dict[str, object]], contract_artifact["tools"])
@@ -1402,7 +1436,7 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
         namespace="jarvis-demo",
         allow_tools=tool_names,
         profiles=["user"],
-        contract="clio-kit-jarvis-user-v3.6",
+        contract="clio-kit-jarvis-user-v3.7.1",
     )
     registry = ClusterRegistry(
         clusters={
@@ -1829,7 +1863,8 @@ def test_catalog_aliases_remain_interoperable_for_long_remote_names() -> None:
     assert sorted(first.tools) == sorted(second.tools)
     assert len(first.tools) == 2
     assert all(
-        len(alias) <= remote_mcp.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH for alias in first.tools
+        len(alias) <= remote_mcp_aliasing.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+        for alias in first.tools
     )
     assert all(re.fullmatch(r"[a-z0-9_]+", alias) is not None for alias in first.tools)
 
@@ -3226,7 +3261,7 @@ def test_cli_refresh_ingests_only_terminal_discovery_artifact(
         queue.append_artifact(spool.artifact_for(result_path, kind="mcp_result"))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="discovery complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", complete_discovery)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", complete_discovery)
 
     result = CliRunner().invoke(
         app,
@@ -3335,8 +3370,8 @@ def test_cli_remote_refresh_stages_exact_registry_for_tools_list_and_cleans_it(
 
     monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
     monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
-    monkeypatch.setattr(relay_cli, "run_remote_clio", run_remote)
-    monkeypatch.setattr(relay_cli, "_read_remote_mcp_result_artifact", read_artifact)
+    monkeypatch.setattr(remote_cli, "run_remote_clio", run_remote)
+    monkeypatch.setattr(cli_remote_mcp, "_read_remote_mcp_result_artifact", read_artifact)
 
     result = CliRunner().invoke(
         app,
@@ -4173,7 +4208,8 @@ def test_spack_structured_result_bounds_output_schema_error_evidence() -> None:
     schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
     errors = cast(list[str], schema_evidence["validation_errors"])
     assert len(errors) == remote_mcp.MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS
-    assert all(len(error) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS for error in errors)
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert all(len(error) <= max_chars for error in errors)
     assert schema_evidence["validation_errors_truncated"] is True
 
 
@@ -4984,7 +5020,7 @@ def test_cli_fresh_spack_preflight_resolves_every_alias_before_dispatch(
     def load_catalog(_profile: str) -> Any:
         return catalog
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     dispatched = False
 
     def reject_dispatch(**_kwargs: object) -> None:
@@ -4992,7 +5028,9 @@ def test_cli_fresh_spack_preflight_resolves_every_alias_before_dispatch(
         dispatched = True
         raise AssertionError("preflight failure must precede dispatch")
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", reject_dispatch)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", reject_dispatch
+    )
     report_path = tmp_path / "validation" / "fresh-preflight.json"
 
     result = CliRunner().invoke(
@@ -5023,7 +5061,7 @@ def test_cli_fresh_spack_runs_ordered_transition_and_emits_combined_report(
     def load_catalog(_profile: str) -> Any:
         return _fake_spack_validation_catalog()
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     spec = "zlib@1.3.1"
     dag_hash = "a" * 32
     store_root = "/scratch/acceptance/spack-store"
@@ -5068,8 +5106,12 @@ def test_cli_fresh_spack_runs_ordered_transition_and_emits_combined_report(
             manifest_sha256="6" * 64,
         )
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", execute)
-    monkeypatch.setattr("clio_relay.cli._collect_spack_configuration_observation", observe)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", execute
+    )
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.collect_spack_configuration_observation", observe
+    )
     output_path = tmp_path / "validation" / "fresh-transition.json"
 
     result = CliRunner().invoke(
@@ -5116,7 +5158,7 @@ def test_cli_fresh_spack_refuses_install_when_preinstall_is_not_absent(
     def load_catalog(_profile: str) -> Any:
         return _fake_spack_validation_catalog()
 
-    monkeypatch.setattr("clio_relay.cli.load_registered_remote_mcp_catalog", load_catalog)
+    monkeypatch.setattr("clio_relay.mcp_server.load_registered_remote_mcp_catalog", load_catalog)
     calls: list[str] = []
 
     def execute(**kwargs: object) -> Any:
@@ -5144,8 +5186,12 @@ def test_cli_fresh_spack_refuses_install_when_preinstall_is_not_absent(
         observed = True
         raise AssertionError("configuration observation must follow proven absence")
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", execute)
-    monkeypatch.setattr("clio_relay.cli._collect_spack_configuration_observation", observe)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", execute
+    )
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.collect_spack_configuration_observation", observe
+    )
     report_path = tmp_path / "validation" / "fresh-refused.json"
 
     result = CliRunner().invoke(
@@ -5182,8 +5228,10 @@ def test_remote_spack_configuration_observation_uses_bounded_bash_command(
         observed_timeout.append(timeout_context.get())
         return json.dumps(payload)
 
-    monkeypatch.setattr("clio_relay.cli.run_remote_shell", run_shell)
-    collect_remote = relay_cli.__dict__["_collect_remote_spack_configuration_observation"]
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
+    collect_remote = remote_mcp_validation.__dict__[
+        "_collect_remote_spack_configuration_observation"
+    ]
     observation = collect_remote(
         definition=ClusterDefinition(name="alpha", ssh_host="ares"),
         phase="preinstall",
@@ -5192,14 +5240,16 @@ def test_remote_spack_configuration_observation_uses_bounded_bash_command(
     )
 
     assert observation.manifest_sha256 == expected_sha256
-    assert observed_timeout == [relay_cli.SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS]
+    assert observed_timeout == [
+        remote_mcp_validation.SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS
+    ]
     assert len(commands) == 1
     assert commands[0].startswith("python3 -c ")
     assert "powershell" not in commands[0].lower()
     assert "cmd.exe" not in commands[0].lower()
     assert shlex.quote(manifest_path) in commands[0]
-    assert commands[0].endswith(f" {relay_cli.MAX_SPACK_CONFIGURATION_TREE_ENTRIES}")
-    observer_script = relay_cli.__dict__["_remote_spack_configuration_observer_script"]
+    assert commands[0].endswith(f" {remote_mcp_validation.MAX_SPACK_CONFIGURATION_TREE_ENTRIES}")
+    observer_script = remote_mcp_validation.__dict__["_remote_spack_configuration_observer_script"]
     observer_source = observer_script()
     compile(observer_source, "<observer>", "exec")
     assert "O_NOFOLLOW" in observer_source
@@ -5215,7 +5265,9 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    require_exact_tree = relay_cli.__dict__["_require_exact_spack_configuration_component_set"]
+    require_exact_tree = remote_mcp_validation.__dict__[
+        "_require_exact_spack_configuration_component_set"
+    ]
     wrapper = tmp_path / "bin" / "spack"
     configuration = tmp_path / "config" / "config.yaml"
     wrapper.parent.mkdir()
@@ -5248,7 +5300,7 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
 
     extra.unlink()
     with monkeypatch.context() as bound_patch:
-        bound_patch.setattr(relay_cli, "MAX_SPACK_CONFIGURATION_TREE_ENTRIES", 2)
+        bound_patch.setattr(remote_mcp_validation, "MAX_SPACK_CONFIGURATION_TREE_ENTRIES", 2)
         with pytest.raises(RelayError, match="entry count exceeded"):
             require_exact_tree(tmp_path, declarations)
 
@@ -5256,7 +5308,7 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
 def test_local_spack_configuration_observation_is_real_and_nofollow(
     tmp_path: Path,
 ) -> None:
-    collect_local = relay_cli.__dict__["_collect_local_spack_configuration_observation"]
+    collect_local = remote_mcp_validation.__dict__["_collect_local_spack_configuration_observation"]
     if os.name == "nt":
         with pytest.raises(RelayError, match="requires a POSIX host"):
             collect_local(
@@ -5304,7 +5356,7 @@ def test_remote_spack_configuration_observation_fails_closed(
     case: str,
 ) -> None:
     output = (
-        "x" * (relay_cli.MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES + 1)
+        "x" * (remote_mcp_validation.MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES + 1)
         if case == "oversized"
         else json.dumps(
             {
@@ -5329,8 +5381,8 @@ def test_remote_spack_configuration_observation_fails_closed(
     def run_shell(_definition: ClusterDefinition, _script: str) -> str:
         return output
 
-    monkeypatch.setattr("clio_relay.cli.run_remote_shell", run_shell)
-    collect = relay_cli.__dict__["_collect_spack_configuration_observation"]
+    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
+    collect = remote_mcp_validation.collect_spack_configuration_observation
 
     with pytest.raises(RelayError):
         collect(
@@ -5363,9 +5415,71 @@ def test_remote_spack_configuration_observation_fails_closed(
 def test_spack_configuration_manifest_parser_rejects_unsafe_input(
     manifest: bytes,
 ) -> None:
-    parse_manifest = relay_cli.__dict__["_parse_spack_configuration_manifest"]
+    parse_manifest = remote_mcp_validation.__dict__["_parse_spack_configuration_manifest"]
     with pytest.raises(RelayError):
         parse_manifest(manifest)
+
+
+def _unverified_server_artifact_registration_and_entry() -> tuple[RemoteMcpServerConfig, Any]:
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=["--from", "/opt/wheels/science.whl", "science-mcp"],
+        allow_tools=["*"],
+        profiles=["user"],
+    )
+    unverified_artifact = {**_server_artifact(registration), "verified": False}
+    payload = _discovery_artifact(
+        registration,
+        tools=[_tool("inspect", required=["path"])],
+        server_artifact=unverified_artifact,
+    )
+    entry = _entry_from_payload(registration, payload)
+    return registration, entry
+
+
+def test_unverified_server_artifact_withholds_the_server_in_enforcing_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Enforcing mode (dev mode off, the default): unchanged."""
+    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
+    registration, entry = _unverified_server_artifact_registration_and_entry()
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.tools == {}
+    assert len(catalog.issues) == 1
+    assert catalog.issues[0].enforcement == "enforced"
+    assert "unverified" in catalog.issues[0].reason
+
+
+def test_unverified_server_artifact_dev_mode_defers_loudly_and_serves(
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """clio-relay#242 course correction: this dev-mode bypass predates this
+    change but was SILENT (no recorded issue, no log) -- the no-silent-
+    fallback doctrine requires it be loud too. It must now record a
+    deferred-enforcement issue and log a WARNING, in addition to serving."""
+    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
+    registration, entry = _unverified_server_artifact_registration_and_entry()
+    with caplog.at_level(logging.WARNING, logger=remote_mcp.__name__):
+        catalog = build_virtual_remote_mcp_catalog(
+            ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})}),
+            RemoteMcpSchemaCache(entries=[entry]),
+            profile="user",
+            now=NOW,
+        )
+    assert catalog.tools != {}
+    assert len(catalog.issues) == 1
+    assert catalog.issues[0].enforcement == "deferred_dev_mode"
+    assert "unverified" in catalog.issues[0].reason
+    assert any(
+        "deferred_dev_mode" in record.message and "science" in record.message
+        for record in caplog.records
+    )
 
 
 def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
@@ -5403,6 +5517,306 @@ def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
     assert catalog.tools == {}
     assert len(catalog.issues) == 1
     assert "declared contract" in catalog.issues[0].reason
+    assert catalog.issues[0].enforcement == "enforced"
+
+
+def _drifted_jarvis_registration_and_entry() -> tuple[RemoteMcpServerConfig, Any]:
+    """Build a jarvis registration whose LIVE server answers with the exact
+    declared tool NAMES but a mutated schema -- a digest-only drift, the
+    live shape of the "declared contract ... failed: ...drifted" failure
+    the ares run hit (clio-relay#242)."""
+    current_id = remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ID
+    artifact_name = remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ARTIFACT_BY_ID[current_id]
+    artifact = cast(
+        dict[str, object],
+        json.loads(
+            (Path(remote_mcp.__file__).with_name("_contracts") / artifact_name).read_text(
+                encoding="utf-8"
+            )
+        ),
+    )
+    tools = cast(list[dict[str, object]], artifact["tools"])
+    drifted_tools = deepcopy(tools)
+    drifted_tools[0]["description"] = "drifted description"
+    tool_names = [cast(str, tool["name"]) for tool in drifted_tools]
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=["--from", "/opt/wheels/clio-kit.whl", "clio-kit", "mcp-server", "jarvis"],
+        allow_tools=tool_names,
+        profiles=["user"],
+        contract=cast(Any, current_id),
+    )
+    entry = _entry(
+        registration,
+        cluster="alpha",
+        server_name="jarvis",
+        tools=drifted_tools,
+    )
+    return registration, entry
+
+
+def test_declared_jarvis_contract_fails_closed_before_catalog_exposure_in_enforcing_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Enforcing mode (dev mode off, the default) withholds jarvis exactly as
+    before this file learned about dev mode -- byte-identical behavior."""
+    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
+    registration, entry = _drifted_jarvis_registration_and_entry()
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"jarvis": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    assert catalog.tools == {}
+    contract_issues = [issue for issue in catalog.issues if "declared contract" in issue.reason]
+    assert len(contract_issues) == 1
+    assert contract_issues[0].enforcement == "enforced"
+
+
+def test_declared_jarvis_contract_dev_mode_defers_and_serves_the_drifted_tools(
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """clio-relay#242 owner ruling: dev mode is LOUD AND NON-BLOCKING -- an
+    agent must be able to deploy and run WITH jarvis under no security
+    enforcement of sha/version/contract. The exact live ares failure
+    (jarvis withheld from the remote MCP catalog on a declared-contract
+    drift) now serves the drifted tools instead, with the same reason
+    recorded loudly (enforcement="deferred_dev_mode") and logged at WARNING.
+    """
+    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
+    registration, entry = _drifted_jarvis_registration_and_entry()
+    with caplog.at_level(logging.WARNING, logger=remote_mcp.__name__):
+        catalog = build_virtual_remote_mcp_catalog(
+            ClusterRegistry(clusters={"alpha": _cluster("alpha", {"jarvis": registration})}),
+            RemoteMcpSchemaCache(entries=[entry]),
+            profile="user",
+            now=NOW,
+        )
+
+    assert catalog.tools != {}
+    assert any(alias.startswith("remote_jarvis_") for alias in catalog.tools)
+    contract_issues = [issue for issue in catalog.issues if "declared contract" in issue.reason]
+    assert len(contract_issues) == 1
+    assert contract_issues[0].enforcement == "deferred_dev_mode"
+    assert any(
+        "deferred_dev_mode" in record.message and "jarvis" in record.message
+        for record in caplog.records
+    )
+
+
+def _spack_v2_3_registration(**overrides: object) -> RemoteMcpServerConfig:
+    defaults: dict[str, object] = {
+        "command": "uvx",
+        "args": [
+            "--from",
+            "/opt/clio/clio_kit-2.8.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        "profiles": ["user"],
+    }
+    defaults.update(overrides)
+    return RemoteMcpServerConfig(**cast(Any, defaults))
+
+
+def test_spack_v2_3_declared_registration_requires_the_exact_five_tool_set(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2.3-declared registration must expose exactly the audited 5-tool surface."""
+    v2_3_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES)
+    ]
+    registration = _spack_v2_3_registration(
+        allow_tools=sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES),
+        contract="clio-kit-spack-user-v2.3",
+    )
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=v2_3_tools)
+    exact_digest = remote_mcp.remote_mcp_schema_digest(list(entry.tools))
+    monkeypatch.setitem(
+        remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
+        "clio-kit-spack-user-v2.3",
+        exact_digest,
+    )
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is True
+    assert check.evidence["remote_tool_names"] == sorted(
+        remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES
+    )
+    assert check.evidence["live_contract_drifted"] is False
+    assert check.evidence["contract_drift_notice"] is None
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.issues == ()
+    assert {
+        "remote_software_spack_find",
+        "remote_software_spack_locate",
+        "remote_software_spack_install",
+        "remote_software_spack_search",
+        "remote_software_spack_info",
+    } <= set(catalog.tools)
+
+
+def test_spack_v2_3_declared_registration_fails_closed_on_only_the_legacy_three_tools() -> None:
+    """A v2.3 declaration is exact -- it does not tolerate a downgraded 3-tool live server."""
+    registration = _spack_v2_3_registration(
+        allow_tools=sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES),
+        contract="clio-kit-spack-user-v2.3",
+    )
+    legacy_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=legacy_tools)
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is False
+    assert check.evidence["remote_tool_names"] == sorted(
+        remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES
+    )
+
+
+def test_spack_v2_1_declared_registration_accepts_forward_compatible_v2_3_live_server(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """THE SABOTAGE: today's exact-name-equality behavior drops the entire spack
+    registration once the live server (kit 2.8.0, contract v2.3) answers 5 tools
+    against a v2.1-declared registration. This must now be accepted as a
+    forward-compatible subset: the declared 3 tools keep serving, unaudited
+    extras stay hidden, and a typed drift notice names the live contract --
+    the registration must never be silently dropped.
+    """
+    legacy_names = sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/clio/clio_kit-2.8.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        allow_tools=legacy_names,
+        profiles=["user"],
+        contract="clio-kit-spack-user-v2.1",
+    )
+    v2_3_tools = [
+        _spack_tool(name) for name in sorted(remote_mcp.CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES)
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=v2_3_tools)
+    live_digest = remote_mcp.remote_mcp_schema_digest(list(entry.tools))
+    monkeypatch.setitem(
+        remote_mcp.CLIO_KIT_SPACK_USER_CONTRACT_SHA256_BY_ID,
+        "clio-kit-spack-user-v2.3",
+        live_digest,
+    )
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+    assert check.passed is True, check.evidence
+    assert check.evidence["live_contract_drifted"] is True
+    assert check.evidence["live_matched_contract_id"] == "clio-kit-spack-user-v2.3"
+    assert check.evidence["live_tool_names_beyond_declared"] == ["spack_info", "spack_search"]
+    notice = check.evidence["contract_drift_notice"]
+    assert isinstance(notice, str)
+    assert "clio-kit-spack-user-v2.1" in notice
+    assert "clio-kit-spack-user-v2.3" in notice
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    # The registration must NEVER be silently dropped: the declared subset
+    # keeps serving, and the catalog carries exactly one typed, non-fatal
+    # notice -- not a fatal "declared contract ... failed" issue.
+    assert {
+        "remote_software_spack_find",
+        "remote_software_spack_locate",
+        "remote_software_spack_install",
+    } <= set(catalog.tools)
+    assert "remote_software_spack_search" not in catalog.tools
+    assert "remote_software_spack_info" not in catalog.tools
+    assert len(catalog.issues) == 1
+    # A fatal drop reads "declared contract '...' failed: ...";  the notice
+    # must NOT use that fatal wording even though it also names the contract.
+    assert "failed:" not in catalog.issues[0].reason
+    assert "clio-kit-spack-user-v2.3" in catalog.issues[0].reason
+
+
+def test_spack_v2_1_declared_registration_still_fails_closed_on_unaudited_drift() -> None:
+    """A live superset must match a KNOWN audited contract digest -- not any superset.
+
+    An extra tool that isn't part of any audited contract (v2, v2.1, or v2.3)
+    must still fail closed, proving the forward-compatible path is not a blind
+    "newer is fine" acceptance.
+    """
+    legacy_names = sorted(remote_mcp.CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES)
+    registration = RemoteMcpServerConfig(
+        command="uvx",
+        args=[
+            "--from",
+            "/opt/clio/clio_kit-2.3.0-py3-none-any.whl",
+            "clio-kit",
+            "mcp-server",
+            "spack",
+        ],
+        allow_tools=legacy_names,
+        profiles=["user"],
+        contract="clio-kit-spack-user-v2.1",
+    )
+    unaudited_tools = [
+        *(_spack_tool(name) for name in legacy_names),
+        _spack_tool("spack_load"),
+    ]
+    entry = _entry(registration, cluster="alpha", server_name="software", tools=unaudited_tools)
+
+    check = remote_mcp._spack_user_contract_check(  # pyright: ignore[reportPrivateUsage]
+        entry, registration
+    )
+
+    assert check.passed is False
+    assert check.evidence["live_contract_drifted"] is True
+    assert check.evidence["live_matched_contract_id"] is None
+
+    catalog = build_virtual_remote_mcp_catalog(
+        ClusterRegistry(clusters={"alpha": _cluster("alpha", {"software": registration})}),
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+    assert catalog.tools == {}
+    assert len(catalog.issues) == 1
+    assert "declared contract" in catalog.issues[0].reason
+
+
+def test_unknown_declared_spack_contract_still_raises() -> None:
+    """A contract id this relay build has never audited must still fail loudly."""
+    fake_registration = SimpleNamespace(
+        contract="clio-kit-spack-user-v2.9",
+        profiles=["user"],
+        allow_tools=["spack_find"],
+    )
+    with pytest.raises(ValueError, match="unsupported remote MCP semantic contract"):
+        remote_mcp._declared_contract_check(  # pyright: ignore[reportPrivateUsage]
+            None, cast(Any, fake_registration)
+        )
 
 
 @pytest.mark.parametrize(
@@ -5439,10 +5853,12 @@ def test_declared_spack_contract_fails_closed_before_catalog_exposure() -> None:
 def test_cli_validate_calls_virtual_alias_and_writes_report(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    packaged_relay_executable: Path,
     remote_schema: dict[str, object] | None,
     arguments_json: str,
     expected_remote_arguments: dict[str, object],
 ) -> None:
+    del packaged_relay_executable
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -5521,7 +5937,7 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
             queue.append_artifact(spool.artifact_for(path, kind=kind))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="call complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", complete_virtual_call)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", complete_virtual_call)
     output_path = tmp_path / "validation" / "remote-mcp.json"
 
     result = CliRunner().invoke(
@@ -5566,9 +5982,11 @@ def test_cli_validate_calls_virtual_alias_and_writes_report(
 def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    packaged_relay_executable: Path,
     complete: bool,
 ) -> None:
     """CLI validation waits on the queued call and projects catalog semantics."""
+    del packaged_relay_executable
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -5666,7 +6084,7 @@ def test_cli_validate_catalog_waits_and_projects_automatic_assertion(
             queue.append_artifact(spool.artifact_for(path, kind=kind))
         return queue.update_job_state(job_id, JobState.SUCCEEDED, message="call complete")
 
-    monkeypatch.setattr("clio_relay.cli.wait_for_terminal", finish_or_leave_queued)
+    monkeypatch.setattr("clio_relay.relay_ops.wait_for_terminal", finish_or_leave_queued)
     output_path = tmp_path / "validation" / "catalog-domain.json"
     canonical_path = tmp_path / "validation" / "catalog-live.json"
 
@@ -6405,13 +6823,23 @@ def _scientific_catalog_tool(
     }
 
 
+_SPACK_TOOL_REQUIRED_PROPERTY = {
+    "spack_find": None,
+    "spack_locate": "spec",
+    "spack_install": "spec",
+    "spack_search": "query",
+    "spack_info": "package",
+}
+
+
 def _spack_tool(name: str) -> dict[str, object]:
     """Return one representative schema from the audited Spack MCP surface."""
     read_only = name != "spack_install"
-    required = ["spec"] if name in {"spack_locate", "spack_install"} else []
+    required_property = _SPACK_TOOL_REQUIRED_PROPERTY.get(name)
+    required = [required_property] if required_property is not None else []
     properties: dict[str, object] = {}
-    if "spec" in required:
-        properties["spec"] = {"type": "string"}
+    if required_property is not None:
+        properties[required_property] = {"type": "string"}
     tool: dict[str, object] = {
         "name": name,
         "description": f"Audited {name} operation.",

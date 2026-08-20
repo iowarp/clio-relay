@@ -5,7 +5,11 @@ import subprocess
 from pytest import MonkeyPatch, raises
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import ObservationTimeoutError, RelayError
+from clio_relay.errors import (
+    ObservationTimeoutError,
+    RelayError,
+    RemoteExecutableMissingError,
+)
 from clio_relay.remote_cli import (
     remote_command_timeout,
     remote_env,
@@ -167,3 +171,106 @@ def test_bounded_remote_command_timeout_is_translated(monkeypatch: MonkeyPatch) 
         remote_command_timeout(12),
     ):
         run_remote_shell(definition, "true")
+
+
+def test_run_remote_shell_surfaces_a_delivery_refusal_by_its_own_message(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A1 (#231 R6-fix review): a remote CLI guard (e.g. ``job read-artifact``)
+
+    exits non-zero *after* printing a T2 delivery-refusal document (doc
+    §6.4) to stdout -- ``run_remote_shell`` must recognize it and surface
+    its own typed code/message, not the generic "remote command failed:
+    <raw blob>" a blanket non-zero-exit check would otherwise report.
+    Exercised through the real ``subprocess.run`` seam (the exact pattern
+    ``test_bounded_remote_command_timeout_is_translated`` uses above), not
+    by calling a helper in isolation.
+    """
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    refusal = (
+        b'{"content_truncated": true, "result_available": false, "delivery": '
+        b'{"schema_version": "clio-relay.mcp-result-delivery.v1", "status": "failed", '
+        b'"code": "artifact_content_too_large", "max_inline_bytes": 16777216, '
+        b'"private_evidence_preserved": true, '
+        b'"remote_side_effects_may_have_occurred": false, '
+        b'"message": "artifact content exceeds the 16777216-byte transfer limit"}}'
+    )
+
+    def fake_run(
+        command: list[str], *, capture_output: bool, check: bool
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 1, stdout=refusal, stderr=b"")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    with raises(
+        RelayError,
+        match=r"remote command refused delivery \(artifact_content_too_large\): "
+        r"artifact content exceeds the 16777216-byte transfer limit",
+    ):
+        run_remote_shell(definition, "clio-relay job read-artifact a1")
+
+
+def test_run_remote_shell_falls_back_to_the_generic_error_for_a_non_refusal_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A real command failure (not a delivery refusal) still reports the raw blob."""
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+
+    def fake_run(
+        command: list[str], *, capture_output: bool, check: bool
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"it broke")
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    with raises(RelayError, match="remote command failed: it broke") as captured:
+        run_remote_shell(definition, "some-command")
+
+    assert captured.value.exit_status == 1
+    assert not isinstance(captured.value, RemoteExecutableMissingError)
+
+
+def test_absent_remote_relay_executable_is_a_typed_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A dead relay_executable pointer must be typed, not a raw shell blob.
+
+    clio-relay#158: when a cluster's registered relay_executable no longer
+    exists on the host (its generation was garbage-collected), every session
+    command died with the generic "remote command failed: <raw stderr>".
+    The operator could not tell a broken deployment apart from a genuine
+    remote error, and nothing could dispatch to repair.
+    """
+    definition = ClusterDefinition(
+        name="ares",
+        ssh_host="ares-login",
+        relay_executable="/srv/generations/gone/bin/clio-relay",
+    )
+
+    def fake_run(
+        command: list[str], *, capture_output: bool, check: bool
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        return subprocess.CompletedProcess(
+            command,
+            127,
+            stdout=b"",
+            stderr=b"bash: line 1: /srv/generations/gone/bin/clio-relay: No such file or directory",
+        )
+
+    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
+
+    with raises(RemoteExecutableMissingError) as captured:
+        run_remote_clio(definition, ["endpoint", "worker-info"])
+
+    assert captured.value.exit_status == 127
+    assert captured.value.reason == "relay_executable_missing"
+    # The operator must be told WHICH pointer is dead and how to repair it.
+    assert "/srv/generations/gone/bin/clio-relay" in str(captured.value)
+    assert "cluster bootstrap" in str(captured.value)

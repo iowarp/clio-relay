@@ -14,7 +14,8 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from clio_relay import bootstrap, cli
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
+from clio_relay import bootstrap, bootstrap_receipt_validation, cli
 from clio_relay.bootstrap import (
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
@@ -1189,9 +1190,14 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         command: list[str],
         *,
         timeout_seconds: float | None = None,
+        **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         del timeout_seconds
-        if command[0] == "ssh" and "bootstrap-inspect" in command[-1]:
+        # The preflight delivers its script on stdin, so it is identified by
+        # its argv shape rather than by script content in argv (#158). This
+        # branch must precede the script-file branch below, which would
+        # otherwise also match on its trailing "bash".
+        if command[0] == "ssh" and command[-2:] == ["bash", "-s"]:
             stdout = "bootstrap_preflight_unsupported=not_installed\n"
         elif command[0] == "ssh" and command[-2].endswith("bash"):
             stdout = "bootstrap_receipt_json=" + json.dumps(receipt) + "\n"
@@ -1212,7 +1218,9 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         fake_render_linux_user_bootstrap_script,
     )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
-    monkeypatch.setattr(bootstrap, "_validate_bootstrap_receipt", validate_receipt)
+    monkeypatch.setattr(
+        bootstrap_receipt_validation, "validate_bootstrap_receipt", validate_receipt
+    )
     monkeypatch.setattr(
         bootstrap,
         "_verify_persistent_bootstrap_receipt",
@@ -1280,9 +1288,11 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
     def fake_remote_target_identity(_definition: ClusterDefinition) -> dict[str, Any]:
         return {"verified": True}
 
-    monkeypatch.setattr(cli, "package_source_root", lambda: tmp_path / "package")
-    monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
+    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
 
     result = CliRunner().invoke(
         cli.app,

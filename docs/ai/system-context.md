@@ -108,7 +108,7 @@ return the nullable record.
 ## remote MCP inputs
 
 Transparent local-file staging is enabled only for an immutable registered
-`clio-kit-jarvis-user-v3.6` route and a package setting whose description carries
+`clio-kit-jarvis-user-v3.7.1` route and a package setting whose description carries
 the exact closed `jarvis.configuration-input-binding.v1` local-regular-file
 declaration. A successful package description on the same connection precedes
 add-step configuration; both description and add-step use their bounded

@@ -19,6 +19,14 @@ import pytest
 import yaml
 
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile_module
+import clio_relay.bootstrap_reconcile_activation_paths as bootstrap_reconcile_activation_paths
+import clio_relay.bootstrap_reconcile_generation_staging as bootstrap_reconcile_generation_staging
+import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
+import clio_relay.bootstrap_reconcile_planning as bootstrap_reconcile_planning
+import clio_relay.bootstrap_reconcile_planning_support as bootstrap_reconcile_planning_support
+import clio_relay.bootstrap_reconcile_readiness as bootstrap_reconcile_readiness
+import clio_relay.bootstrap_reconcile_repository as bootstrap_reconcile_repository
+from clio_relay import bootstrap_reconcile_jarvis_wrapper_binding
 from clio_relay.bootstrap_reconcile import (
     BootstrapActivationPath,
     BootstrapDesiredState,
@@ -245,7 +253,7 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
         return desired.fingerprint, str(generation.resolve())
 
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile._inspect_active_generation",
+        "clio_relay.bootstrap_reconcile_inspection._inspect_active_generation",
         inspect_active_generation,
     )
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -269,9 +277,13 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
 
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
+    # inspect_exact_bootstrap_noop now lives in bootstrap_reconcile_inspection.py
+    # and _verify_uv (its collaborator) in bootstrap_reconcile_readiness.py
+    # (iowarp/clio-relay#255) -- patch each owner module's own imported copy,
+    # not the facade's inert re-export.
+    monkeypatch.setattr(bootstrap_reconcile_inspection, "installation_info", read_installation)
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_readiness,
         "run_bounded_process",
         run_identity,
     )
@@ -427,7 +439,9 @@ def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["uv", "--version"], 0, "uv 0.11.28\n", "")
 
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
+    # inspect_exact_bootstrap_noop now lives in bootstrap_reconcile_inspection.py
+    # (iowarp/clio-relay#255).
+    monkeypatch.setattr(bootstrap_reconcile_inspection, "installation_info", read_installation)
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -543,8 +557,11 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
                 ),
             }
 
+        # plan_bootstrap_reconcile (the caller) now lives in
+        # bootstrap_reconcile_planning.py; patch ITS imported copy of the
+        # collaborator, not the defining module's (iowarp/clio-relay#255).
         monkeypatch.setattr(
-            bootstrap_reconcile_module,
+            bootstrap_reconcile_planning,
             "_capture_reconcile_activation_paths",
             captured_activation_paths,
         )
@@ -609,7 +626,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
                 raise ConfigurationError("candidate RECORD closure changed")
 
         monkeypatch.setattr(
-            bootstrap_reconcile_module,
+            bootstrap_reconcile_planning,
             "_verify_bootstrap_replacement_provider",
             verify_replacement,
         )
@@ -655,7 +672,13 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     def read_installation(_path: Path | None = None) -> dict[str, object]:
         return info
 
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
+    # plan_bootstrap_reconcile (the caller) now lives in
+    # bootstrap_reconcile_planning.py, _verify_uv (which calls
+    # run_bounded_process) in bootstrap_reconcile_readiness.py, and
+    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # bootstrap_reconcile_planning_support.py -- patch each collaborator on
+    # its own caller's module (iowarp/clio-relay#255).
+    monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[:2] != [str(bin_dir / "uv"), "--version"]:
@@ -677,12 +700,13 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
         raise AssertionError(command)  # pragma: no cover
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_readiness,
         "run_bounded_process",
         identity_command,
     )
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile._bounded_subprocess",
+        bootstrap_reconcile_planning_support,
+        "_bounded_subprocess",
         bounded_identity,
     )
 
@@ -1095,7 +1119,12 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     def read_installation(_path: Path | None = None) -> dict[str, object]:
         return info
 
-    monkeypatch.setattr("clio_relay.bootstrap_reconcile.installation_info", read_installation)
+    # plan_bootstrap_reconcile (the caller) now lives in
+    # bootstrap_reconcile_planning.py, _verify_uv (which calls
+    # run_bounded_process) in bootstrap_reconcile_readiness.py, and
+    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # bootstrap_reconcile_planning_support.py (iowarp/clio-relay#255).
+    monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
 
     def identity_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command[:2] == [str(bin_dir / "uv"), "--version"]
@@ -1115,9 +1144,10 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
             )
         raise AssertionError(command)  # pragma: no cover
 
-    monkeypatch.setattr(bootstrap_reconcile_module, "run_bounded_process", identity_command)
+    monkeypatch.setattr(bootstrap_reconcile_readiness, "run_bounded_process", identity_command)
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile._bounded_subprocess",
+        bootstrap_reconcile_planning_support,
+        "_bounded_subprocess",
         bounded_identity,
     )
 
@@ -1144,7 +1174,9 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     assert plan.activation_paths["relay_launcher"].before is not None
     assert plan.activation_paths["jarvis_launcher"].before is not None
 
-    read_regular = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # plan_bootstrap_reconcile (the caller) reads this via its own imported
+    # copy in bootstrap_reconcile_planning.py (iowarp/clio-relay#255).
+    read_regular = bootstrap_reconcile_planning._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     swapped = False
 
     def swap_launcher_after_read(
@@ -1162,13 +1194,13 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         return payload, identity
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_planning,
         "_read_regular_bounded_with_identity",
         swap_launcher_after_read,
     )
     raced = plan_bootstrap_reconcile(desired, home=tmp_path)
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_planning,
         "_read_regular_bounded_with_identity",
         read_regular,
     )
@@ -1462,7 +1494,10 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
     managed_repo = tmp_path / "relay/clio_relay"
     managed_repo.parent.mkdir(parents=True)
     operator_update = b"repos:\n  - /operator/concurrent\n"
-    original_read = bootstrap_reconcile_module._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # reconcile_managed_jarvis_repository (the caller) now lives in
+    # bootstrap_reconcile_repository.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_read = bootstrap_reconcile_repository._read_regular_bounded_with_identity  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     call_count = 0
 
     def mutate_before_compare(
@@ -1477,7 +1512,7 @@ def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
         return original_read(path, maximum=maximum)
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_repository,
         "_read_regular_bounded_with_identity",
         mutate_before_compare,
     )
@@ -1539,7 +1574,10 @@ def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
     repos_file.write_text("repos:\n  - /operator/original\n", encoding="utf-8")
     operator_update = b"repos:\n  - /operator/concurrent\n"
     managed = tmp_path / "clio_relay"
-    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # reconcile_managed_jarvis_repository (the caller) now lives in
+    # bootstrap_reconcile_repository.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_exchange = bootstrap_reconcile_repository._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     exchanged = False
 
     def raced_exchange(left: Path, right: Path) -> None:
@@ -1557,7 +1595,7 @@ def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
             raise RuntimeError("crash after atomic exchange")
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_repository,
         "_atomic_exchange_paths",
         raced_exchange,
     )
@@ -1570,7 +1608,7 @@ def test_managed_repo_atomic_exchange_preserves_or_recovers_racing_state(
                 exchange_identity="b" * 64,
             )
         monkeypatch.setattr(
-            bootstrap_reconcile_module,
+            bootstrap_reconcile_repository,
             "_atomic_exchange_paths",
             original_exchange,
         )
@@ -1615,7 +1653,10 @@ def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
     target.write_bytes(b"new")
     target.chmod(0o755)
     operator_update = b"operator-concurrent"
-    original_exchange = bootstrap_reconcile_module._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # _reconcile_activation_symlink (the caller) now lives in
+    # bootstrap_reconcile_activation_paths.py; patch its own imported copy of
+    # the collaborator (iowarp/clio-relay#255).
+    original_exchange = bootstrap_reconcile_activation_paths._atomic_exchange_paths  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     simulated_links: dict[Path, Path] = {}
     if os.name == "nt":
         real_is_symlink = Path.is_symlink
@@ -1685,7 +1726,7 @@ def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
             raise RuntimeError("crash after atomic exchange")
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_activation_paths,
         "_atomic_exchange_paths",
         raced_exchange,
     )
@@ -1700,7 +1741,7 @@ def test_stable_link_atomic_exchange_preserves_or_recovers_racing_state(
                 exchange_identity="c" * 64,
             )
         monkeypatch.setattr(
-            bootstrap_reconcile_module,
+            bootstrap_reconcile_activation_paths,
             "_atomic_exchange_paths",
             original_exchange,
         )
@@ -1923,13 +1964,17 @@ def test_finish_staged_activation_rejects_manifest_tamper_before_mutation(
     def unexpected_mutation(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("tampered manifest reached activation")
 
+    # finish_staged_activation (the caller) now lives in
+    # bootstrap_reconcile_generation_staging.py; patch its own imported
+    # copies of both collaborators so this guard still proves neither is
+    # ever reached (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "reconcile_staged_activation_links",
         unexpected_mutation,
     )
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "reconcile_managed_jarvis_repository",
         unexpected_mutation,
     )
@@ -2097,18 +2142,21 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         del path, label
         return expected
 
+    # finish_staged_activation (the caller) now lives in
+    # bootstrap_reconcile_generation_staging.py; patch its own imported
+    # copies of every collaborator (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "inspect_prepared_generation",
         simulated_inspection,
     )
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "reconcile_staged_activation_links",
         simulated_links,
     )
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "_verify_stable_symlink",
         simulated_stable_link,
     )
@@ -2153,7 +2201,7 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         return evidence
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_generation_staging,
         "reconcile_managed_jarvis_repository",
         crashable_reconcile,
     )
@@ -2207,7 +2255,10 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
     original_lstat = Path.lstat
     original_readlink = os.readlink
     original_resolve = Path.resolve
-    original_verify = bootstrap_reconcile_module._verify_stable_symlink  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # repair_managed_jarvis_binding (the caller) now lives in
+    # bootstrap_reconcile_repository.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_verify = bootstrap_reconcile_repository._verify_stable_symlink  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     managed_identity = original_lstat(expected)
 
     def simulated_resolve(path: Path, strict: bool = False) -> Path:
@@ -2240,7 +2291,7 @@ def test_managed_repo_repair_refuses_unproven_broken_link(
     monkeypatch.setattr(Path, "lstat", simulated_lstat)
     monkeypatch.setattr(Path, "resolve", simulated_resolve)
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_repository,
         "_verify_stable_symlink",
         simulated_verify,
     )
@@ -2498,8 +2549,10 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     def read_installation(_path: Path | None = None) -> dict[str, object]:
         return installation
 
+    # inspect_prepared_generation (the caller) now lives in
+    # bootstrap_reconcile_generation_staging.py (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile.installation_info",
+        "clio_relay.bootstrap_reconcile_generation_staging.installation_info",
         read_installation,
     )
 
@@ -2725,10 +2778,17 @@ def test_managed_jarvis_interpreter_is_bound_to_receipt_and_lexical_home(
         assert lexical_home == tmp_path / "home-alias"
         return True
 
-    monkeypatch.setattr(bootstrap_reconcile_module, "_verify_stable_symlink", verify_stable)
-    monkeypatch.setattr(bootstrap_reconcile_module, "installation_info", read_installation)
+    # resolve_receipt_bound_jarvis_python (the caller) now lives in
+    # bootstrap_reconcile_jarvis_wrapper_binding.py; patch its own imported/
+    # co-resident copies of every collaborator (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_jarvis_wrapper_binding, "_verify_stable_symlink", verify_stable
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_jarvis_wrapper_binding, "installation_info", read_installation
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_jarvis_wrapper_binding,
         "_relay_managed_jarvis_launcher_selected",
         classify_launcher,
     )
@@ -2824,8 +2884,10 @@ def test_managed_jarvis_interpreter_fails_closed_on_unverified_runtime(
     def read_installation(_path: Path | None = None) -> dict[str, object]:
         return installation
 
+    # resolve_receipt_bound_jarvis_python (the caller) now lives in
+    # bootstrap_reconcile_jarvis_wrapper_binding.py (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_jarvis_wrapper_binding,
         "installation_info",
         read_installation,
     )
@@ -2834,7 +2896,7 @@ def test_managed_jarvis_interpreter_fails_closed_on_unverified_runtime(
         return lexical_home == tmp_path
 
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_jarvis_wrapper_binding,
         "_relay_managed_jarvis_launcher_selected",
         classify_launcher,
     )
@@ -2865,9 +2927,13 @@ def test_managed_jarvis_interpreter_requires_relay_execution_packages(
     def classify_launcher(_path: Path, *, lexical_home: Path) -> bool:
         return lexical_home == tmp_path
 
-    monkeypatch.setattr(bootstrap_reconcile_module, "installation_info", read_installation)
+    # resolve_receipt_bound_jarvis_python (the caller) now lives in
+    # bootstrap_reconcile_jarvis_wrapper_binding.py (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        bootstrap_reconcile_module,
+        bootstrap_reconcile_jarvis_wrapper_binding, "installation_info", read_installation
+    )
+    monkeypatch.setattr(
+        bootstrap_reconcile_jarvis_wrapper_binding,
         "_relay_managed_jarvis_launcher_selected",
         classify_launcher,
     )

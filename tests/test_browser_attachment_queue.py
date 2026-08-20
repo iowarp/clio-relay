@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import clio_relay.service_runtime as service_runtime
+import clio_relay.service_runtime_readiness as service_runtime_readiness
 from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -247,7 +247,7 @@ def test_parallel_revocation_marker_writes_use_unique_staging_files(tmp_path: Pa
 
     def revoke() -> None:
         barrier.wait()
-        service_runtime._write_browser_revocation_marker(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_readiness._write_browser_revocation_marker(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             marker,
             "browser-a",
         )

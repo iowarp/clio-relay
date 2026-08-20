@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
+from clio_relay import queue_layout, queue_store_read
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
@@ -34,6 +34,18 @@ def test_stale_recovery_uses_exact_scheduler_indexes_without_global_task_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Recovery must never fall back to an unbounded ``read_many`` scan.
+
+    CQ20 deleted the facade's ``_read_many`` classmethod: it had zero real
+    callers left anywhere in the codebase (recovery uses ``scan_job_leases``'s
+    exact per-job index, not a global scan; every other reader that still
+    needs an unbounded read -- e.g. ``list_leases`` -- already calls ``queue_
+    store_read.read_many`` module-qualified directly, bypassing the facade
+    wrapper entirely). Patching the dead facade classmethod was a seam that
+    could never fire; patching the real shared primitive is the module the
+    design doc's own preservation rule (§4) points at -- "patch the module
+    containing the real call expression."
+    """
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(_job("indexed-scheduler-recovery"))
     lease = queue.acquire_next_job("worker", cluster="ares", ttl_seconds=-1)
@@ -49,7 +61,7 @@ def test_stale_recovery_uses_exact_scheduler_indexes_without_global_task_scan(
     def forbid_global_read(*_args: object, **_kwargs: object) -> list[object]:
         raise AssertionError("global task scan attempted")
 
-    monkeypatch.setattr(queue, "_read_many", forbid_global_read)
+    monkeypatch.setattr(queue_store_read, "read_many", forbid_global_read)
     assert queue.recover_stale_job(job.job_id, cluster="ares") is None
     assert queue.recover_stale_jobs(cluster="ares") == []
 
@@ -71,7 +83,7 @@ def test_gateway_reverse_indexes_refuse_cardinality_overflow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(core_queue_module, "MAX_GATEWAY_INDEX_RECORDS", 2)
+    monkeypatch.setattr(queue_layout, "MAX_GATEWAY_INDEX_RECORDS", 2)
     queue = ClioCoreQueue(tmp_path)
     job = queue.submit_job(_job("gateway-index-bound"))
     for index in range(3):

@@ -30,6 +30,7 @@ from clio_relay.live_acceptance import (
     _browser_json_observation,  # pyright: ignore[reportPrivateUsage]
     _browser_sse_observation,  # pyright: ignore[reportPrivateUsage]
     _BrowserHttpRequestError,  # pyright: ignore[reportPrivateUsage]
+    _decode_artifact_text,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_adapter,  # pyright: ignore[reportPrivateUsage]
     _expected_progress_package,  # pyright: ignore[reportPrivateUsage]
     _find_agent_child_job,  # pyright: ignore[reportPrivateUsage]
@@ -37,6 +38,7 @@ from clio_relay.live_acceptance import (
     _native_progress_attestation,  # pyright: ignore[reportPrivateUsage]
     _packaged_mcp_acceptance_evidence,  # pyright: ignore[reportPrivateUsage]
     _progress_attestation_identity,  # pyright: ignore[reportPrivateUsage]
+    _remote_shell,  # pyright: ignore[reportPrivateUsage]
     _require_secure_runtime_control_capacity,  # pyright: ignore[reportPrivateUsage]
     _runtime_metadata_from_job_status,  # pyright: ignore[reportPrivateUsage]
     _secure_runtime_probe_config,  # pyright: ignore[reportPrivateUsage]
@@ -277,7 +279,7 @@ def test_transport_http_client_sends_exact_owned_session_binding(
         captured.update({name.lower(): value for name, value in request.header_items()})
         return _HttpResponse()
 
-    monkeypatch.setattr("clio_relay.live_acceptance.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.urllib.request.urlopen", urlopen)
 
     assert _http_json(
         "http://127.0.0.1:18000",
@@ -302,6 +304,89 @@ def test_transport_http_client_sends_exact_owned_session_binding(
             owner_session_id="desktop-session-1",
             timeout_seconds=5,
         )
+
+
+def test_decode_artifact_text_reports_a_delivery_refusal_by_its_own_message(
+    tmp_path: Path,
+) -> None:
+    """F5 (#231 R6 review): a T2 refusal (doc §6.4) is not a "not base64
+    encoded" envelope -- ``_decode_artifact_text`` must report the
+    refusal's own ``delivery.message``/``code`` instead of the generic,
+    misleading base64 complaint.
+    """
+    del tmp_path
+    payload = {
+        "artifact": {"artifact_id": "a"},
+        "content_truncated": True,
+        "result_available": False,
+        "delivery": {
+            "schema_version": "clio-relay.mcp-result-delivery.v1",
+            "status": "failed",
+            "code": "artifact_content_too_large",
+            "max_inline_bytes": 16 * 1_048_576,
+            "private_evidence_preserved": True,
+            "remote_side_effects_may_have_occurred": False,
+            "message": "artifact content exceeds the 16777216-byte transfer limit",
+        },
+    }
+
+    with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
+        _decode_artifact_text(payload)
+
+
+def test_decode_artifact_text_still_rejects_a_genuinely_malformed_envelope() -> None:
+    """Sabotage twin: a payload that is merely missing base64 fields (not a
+    typed refusal) must still raise the original, distinct complaint --
+    the F5 fix must not swallow every non-base64 payload as a refusal.
+    """
+    with pytest.raises(RelayError, match="not base64 encoded"):
+        _decode_artifact_text({"encoding": "raw"})
+
+
+def test_remote_shell_surfaces_a_delivery_refusal_by_its_own_message() -> None:
+    """A1 (#231 R6-fix review): a remote CLI guard exits non-zero *after*
+
+    printing a T2 delivery-refusal document (doc §6.4) to stdout --
+    ``_remote_shell`` must recognize it and surface its own typed code/
+    message, not the generic "remote command failed: <raw blob>" a
+    blanket non-zero-exit check would otherwise report. Exercised through
+    the real ``_remote_shell`` entry point with a fake failing runner, not
+    by calling the message-extraction helper in isolation.
+    """
+    refusal = (
+        b'{"content_truncated": true, "result_available": false, "delivery": '
+        b'{"schema_version": "clio-relay.mcp-result-delivery.v1", "status": "failed", '
+        b'"code": "artifact_content_too_large", "max_inline_bytes": 16777216, '
+        b'"private_evidence_preserved": true, '
+        b'"remote_side_effects_may_have_occurred": false, '
+        b'"message": "artifact content exceeds the 16777216-byte transfer limit"}}'
+    )
+
+    def fake_runner(
+        command: list[str], *, input: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return subprocess.CompletedProcess(command, 1, stdout=refusal, stderr=b"")
+
+    with pytest.raises(
+        RelayError,
+        match=r"remote command refused delivery \(artifact_content_too_large\): "
+        r"artifact content exceeds the 16777216-byte transfer limit",
+    ):
+        _remote_shell("ares-login", "clio-relay job read-artifact a1", runner=fake_runner)
+
+
+def test_remote_shell_falls_back_to_the_generic_error_for_a_non_refusal_failure() -> None:
+    """A real command failure (not a delivery refusal) still reports the raw blob."""
+
+    def fake_runner(
+        command: list[str], *, input: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        del input
+        return subprocess.CompletedProcess(command, 127, stdout=b"", stderr=b"command not found")
+
+    with pytest.raises(RelayError, match="remote command failed: command not found"):
+        _remote_shell("ares-login", "not-a-real-command", runner=fake_runner)
 
 
 def test_live_acceptance_requires_configured_workload() -> None:
@@ -724,10 +809,12 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
         "clio_relay.live_acceptance._secure_runtime_probe_config",
         configured_probe,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance._wait_for_success", forbidden_batch_call)
-    monkeypatch.setattr("clio_relay.live_acceptance._verify_completed_job", forbidden_batch_call)
+    monkeypatch.setattr("clio_relay.live_acceptance_wait._wait_for_success", forbidden_batch_call)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        "clio_relay.live_acceptance_job_verification._verify_completed_job", forbidden_batch_call
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime._verify_secure_runtime_acceptance",
         verify_secure_runtime,
     )
 
@@ -865,7 +952,7 @@ def test_secure_runtime_query_pending_report_resumes_exact_execution(
         configured_probe,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        "clio_relay.live_acceptance_secure_runtime._verify_secure_runtime_acceptance",
         verify_secure_runtime,
     )
     definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
@@ -1186,7 +1273,6 @@ def test_live_acceptance_rejects_invalid_explicit_progress_adapter(adapter: str)
 
 
 def test_live_acceptance_accepts_durable_progress_after_terminal_observation() -> None:
-
     def fake_runner(
         command: list[str],
         *,
@@ -1333,7 +1419,6 @@ def test_native_jarvis_progress_requires_trusted_matching_nonterminal_documents(
 
 
 def test_live_acceptance_rejects_package_progress_before_running_event() -> None:
-
     def fake_runner(
         command: list[str],
         *,
@@ -1447,7 +1532,7 @@ def test_live_acceptance_verifies_transport_when_enabled(
         raise AssertionError(f"unexpected command: {command}")
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     lines = run_live_acceptance(
         LiveAcceptanceOptions(
@@ -1545,7 +1630,7 @@ def test_live_acceptance_report_records_exact_transport_cleanup_resources(
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     run_live_acceptance(
         LiveAcceptanceOptions(
@@ -1623,7 +1708,7 @@ def test_live_acceptance_report_preserves_partial_transport_cleanup(
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     with pytest.raises(RelayError, match="structured residual resources"):
         run_live_acceptance(
@@ -1693,7 +1778,7 @@ def test_live_acceptance_report_ingests_cleanup_evidence_attached_to_probe_failu
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     with pytest.raises(RelayError, match="failed during cleanup"):
         run_live_acceptance(
@@ -1733,7 +1818,7 @@ def test_live_acceptance_rejects_transport_without_verified_cleanup(
         fake_cluster_doctor,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_http_probe",
         fake_transport,
     )
 
@@ -1789,7 +1874,7 @@ def test_live_acceptance_verifies_direct_transport_when_enabled(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -1844,7 +1929,7 @@ def test_live_acceptance_verifies_configured_direct_transport(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -1889,7 +1974,7 @@ def test_live_acceptance_rejects_direct_transport_fallback_unless_allowed(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -1925,7 +2010,7 @@ def test_live_acceptance_requires_full_direct_xtcp_evidence(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -3291,7 +3376,7 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
 
@@ -3309,8 +3394,12 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
     def managed_queue(_settings: object) -> EmptyGatewayQueue:
         return EmptyGatewayQueue()
 
-    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
-    monkeypatch.setattr("clio_relay.live_acceptance.ServiceRuntimeSupervisor", _SecureSupervisor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.storage_managed_queue", managed_queue
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.ServiceRuntimeSupervisor", _SecureSupervisor
+    )
     _SecureSupervisor.reset(ready_session)
 
     json_calls: list[tuple[str, str]] = []
@@ -3451,18 +3540,22 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         assert proxy_stopped is True
         revoked_urls.append(url)
 
-    monkeypatch.setattr("clio_relay.live_acceptance._browser_json_observation", browser_json)
-    monkeypatch.setattr("clio_relay.live_acceptance._browser_sse_observation", browser_sse)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._wait_for_changed_sse_event",
+        "clio_relay.live_acceptance_browser_evidence._browser_json_observation", browser_json
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_browser_evidence._browser_sse_observation", browser_sse
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime._wait_for_changed_sse_event",
         changed_sse,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._wait_for_changed_browser_state",
+        "clio_relay.live_acceptance_secure_runtime._wait_for_changed_browser_state",
         changed_state,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._assert_browser_capability_revoked",
+        "clio_relay.live_acceptance_secure_runtime._assert_browser_capability_revoked",
         revoke,
     )
 
@@ -3638,11 +3731,11 @@ def test_secure_runtime_ready_binding_wait_is_bounded(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
-    monkeypatch.setattr("clio_relay.live_acceptance.time.sleep", sleep)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.monotonic", monotonic)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.sleep", sleep)
     recorder = ValidationRecorder(
         new_live_validation_report(
             scenario="secure-runtime-readiness-timeout",
@@ -3798,10 +3891,10 @@ def test_secure_runtime_late_ready_binding_fails_deadline(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.monotonic", monotonic)
     recorder = ValidationRecorder(
         new_live_validation_report(
             scenario="secure-runtime-late-ready",
@@ -4015,12 +4108,14 @@ def test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown(
 
     FailingCleanupSupervisor.reset(session)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.ServiceRuntimeSupervisor",
+        "clio_relay.live_acceptance_secure_runtime.storage_managed_queue", managed_queue
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.ServiceRuntimeSupervisor",
         FailingCleanupSupervisor,
     )
     recorder = ValidationRecorder(

@@ -5,16 +5,19 @@ import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic import BaseModel
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay.core_queue import (
-    RECORD_FAMILY_MAX_BYTES,
-    ClioCoreQueue,
-    _purge_tree_batch,  # pyright: ignore[reportPrivateUsage]
+from clio_relay import (
+    queue_gc_storage,
+    queue_layout,
+    queue_owner_session_records,
+    queue_store_write,
 )
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
     ArtifactRef,
@@ -177,7 +180,7 @@ def test_terminal_gc_resumes_after_every_phase_and_never_reexecutes_idempotency(
             injected = True
             raise RuntimeError(f"fault after {phase.value}")
 
-    monkeypatch.setattr(queue, "_after_gc_checkpoint", fail_after_checkpoint)
+    monkeypatch.setattr(queue_gc_storage, "after_gc_checkpoint", fail_after_checkpoint)
     with pytest.raises(RuntimeError, match=f"fault after {fault_phase.value}"):
         for _ in range(1_000):
             queue.collect_terminal_job(
@@ -194,7 +197,7 @@ def test_terminal_gc_resumes_after_every_phase_and_never_reexecutes_idempotency(
     def accept_checkpoint(_phase: JobGcPhase) -> None:
         return
 
-    monkeypatch.setattr(queue, "_after_gc_checkpoint", accept_checkpoint)
+    monkeypatch.setattr(queue_gc_storage, "after_gc_checkpoint", accept_checkpoint)
     _finish_gc(queue, job.job_id)
 
     tombstone = queue.get_job_tombstone(job.job_id)
@@ -741,7 +744,7 @@ def test_gc_purge_is_iterative_and_detects_directory_swap_races(
     (leaf / "record.json").write_text("{}", encoding="utf-8")
     complete = False
     for _ in range(depth + 2):
-        _removed, complete = _purge_tree_batch(deep_root, limit=100)
+        _removed, complete = queue_gc_storage.purge_tree_batch(deep_root, limit=100)
         if complete:
             break
     assert complete is True
@@ -768,7 +771,7 @@ def test_gc_purge_is_iterative_and_detects_directory_swap_races(
 
     monkeypatch.setattr(os, "scandir", _SwapAfterScan)
     with pytest.raises(QueueConflictError, match="changed during traversal"):
-        _purge_tree_batch(race_root, limit=1)
+        queue_gc_storage.purge_tree_batch(race_root, limit=1)
     assert (moved_root / "record.json").is_file()
 
 
@@ -801,10 +804,10 @@ def test_gc_windows_delete_does_not_retry_a_replaced_path(
         original_unlink(path, missing_ok=missing_ok)
 
     with monkeypatch.context() as patch:
-        patch.setattr(core_queue_module.os, "name", "nt")
+        patch.setattr(queue_gc_storage.os, "name", "nt")
         patch.setattr(Path, "unlink", swap_then_unlink)
         with pytest.raises(QueueConflictError, match="could not remove quarantined path"):
-            core_queue_module._remove_gc_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue_gc_storage._remove_gc_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 root,
                 candidate,
                 root_stat=root_stat,
@@ -930,10 +933,17 @@ def test_owner_session_closure_recovers_if_history_directory_disappears(
         owner_session_id,
         session_generation_id=generation_id,
     )
-    original_write = cast(Any, queue)._write
+    # CQ10 moved owner-session closure persistence into queue_owner_session_records,
+    # which funnels durable writes through its own `queue_store_write` reference
+    # (verified by test_core_queue_split_architecture.py::
+    # test_cq10_owner_session_closure_uses_the_records_write_lookup) rather than
+    # through the generic ClioCoreQueue._write seam this test used pre-move. Patch
+    # the write-model lookup at its current owner so the injected failure still
+    # lands on the real closure-write call.
+    original_write_model = queue_store_write.write_model
     attempts = 0
 
-    def remove_history_directory_once(path: Path, record: object) -> None:
+    def remove_history_directory_once(storage_root: Path, path: Path, record: BaseModel) -> None:
         nonlocal attempts
         if path == closure_path and attempts == 0:
             attempts += 1
@@ -941,9 +951,12 @@ def test_owner_session_closure_recovers_if_history_directory_disappears(
             path.parent.rmdir()
             raise FileNotFoundError(2, "injected closure-directory removal", str(path))
         attempts += 1
-        original_write(path, record)
+        original_write_model(storage_root, path, record)
 
-    monkeypatch.setattr(queue, "_write", remove_history_directory_once)
+    isolated_store_write = SimpleNamespace(
+        **{**vars(queue_store_write), "write_model": remove_history_directory_once}
+    )
+    monkeypatch.setattr(queue_owner_session_records, "queue_store_write", isolated_store_write)
 
     closure = queue.set_owner_session_closed(
         owner_session_id,
@@ -1049,7 +1062,7 @@ def test_legacy_unversioned_jobs_require_exact_immutable_closure_coverage(
 
 def test_core_record_caps_reject_oversized_writes_and_forged_reads(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
-    oversized = "x" * (RECORD_FAMILY_MAX_BYTES["jobs"] + 1)
+    oversized = "x" * (queue_layout.RECORD_FAMILY_MAX_BYTES["jobs"] + 1)
     with pytest.raises(QueueConflictError, match="jobs record exceeds"):
         queue.submit_job(_intent("oversized-write", metadata={"oversized": oversized}))
 
@@ -1057,7 +1070,7 @@ def test_core_record_caps_reject_oversized_writes_and_forged_reads(tmp_path: Pat
     del intent
     job_path = tmp_path / "jobs" / f"{job.job_id}.json"
     with job_path.open("wb") as stream:
-        stream.write(b"{" + b" " * RECORD_FAMILY_MAX_BYTES["jobs"] + b"}")
+        stream.write(b"{" + b" " * queue_layout.RECORD_FAMILY_MAX_BYTES["jobs"] + b"}")
     with pytest.raises(QueueConflictError, match="jobs record exceeds"):
         queue.get_job(job.job_id)
 

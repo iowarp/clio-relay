@@ -20,6 +20,7 @@ from pytest import MonkeyPatch
 
 from clio_relay import __version__
 from clio_relay import mcp_stdio_validation as mcp_stdio_validation_module
+from clio_relay import mcp_stdio_validation_process as mcp_stdio_validation_process_module
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ObservationTimeoutError, RelayError
@@ -319,7 +320,7 @@ sys.stdout.buffer.flush()
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
     monkeypatch.setenv("MCP_TEST_TOKEN", "top-secret-value")
-    monkeypatch.setattr(mcp_stdio_validation_module, "_MAX_STDOUT_BYTES", 1_024)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_MAX_STDOUT_BYTES", 1_024)
 
     with pytest.raises(RelayError, match="stdout byte limit") as captured:
         run_packaged_mcp_stdio_session(
@@ -362,7 +363,7 @@ sys.stderr.buffer.flush()
 """.lstrip(),
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
-    monkeypatch.setattr(mcp_stdio_validation_module, "_MAX_STDERR_BYTES", 1_024)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_MAX_STDERR_BYTES", 1_024)
 
     with pytest.raises(RelayError, match="stderr byte limit") as captured:
         run_packaged_mcp_stdio_session(
@@ -412,6 +413,70 @@ time.sleep(10)
     assert not marker.exists()
 
 
+def test_packaged_stdio_timeout_keeps_child_stderr_off_public_error(
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A marked final-phase timeout logs foreign stderr once without serving it."""
+    private = cast(Any, mcp_stdio_validation_module)
+    process = SimpleNamespace(
+        pid=8125,
+        stdout=BytesIO(b""),
+        stderr=BytesIO(b"foreign-timeout-diagnostic-82d7c1"),
+        returncode=None,
+        poll=lambda: None,
+    )
+    clock_calls = 0
+
+    def clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return 0.0 if clock_calls == 1 else 2.0
+
+    def spawn(
+        _command: list[str],
+        *,
+        on_ready: Any,
+        **_kwargs: object,
+    ) -> object:
+        on_ready(process.pid, {"mode": "windows_job_object", "enforceable": True})
+        return process
+
+    def ignore_process(_process: object) -> None:
+        return None
+
+    def capture_pipe(stream: BytesIO, capture: Any, activity: Any) -> None:
+        capture.append(stream.read())
+        activity.set()
+
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "monotonic", clock)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_capture_pipe", capture_pipe)
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "_terminate_bounded_process", ignore_process
+    )
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "release_owned_process", ignore_process
+    )
+
+    with (
+        caplog.at_level("WARNING", logger="clio_relay.mcp_stdio_validation"),
+        pytest.raises(ObservationTimeoutError) as captured,
+    ):
+        private._run_bounded_process(
+            ("clio-relay", "mcp-server"),
+            session_input=b"{}\n",
+            timeout_seconds=1.0,
+            extra_environment=None,
+        )
+
+    assert str(captured.value) == (
+        "packaged clio-relay mcp-server timed out during stdio validation after 1 seconds"
+    )
+    assert "foreign-timeout-diagnostic-82d7c1" not in str(captured.value)
+    assert caplog.text.count("foreign-timeout-diagnostic-82d7c1") == 1
+
+
 def test_packaged_stdio_rejects_root_that_becomes_terminal_after_deadline(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -444,16 +509,23 @@ def test_packaged_stdio_rejects_root_that_becomes_terminal_after_deadline(
         )
         return process
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "monotonic", clock)
-    monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "monotonic", clock)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", spawn)
 
     def ignore_process(_process: object) -> None:
         return None
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "_terminate_bounded_process", ignore_process)
-    monkeypatch.setattr(mcp_stdio_validation_module, "release_owned_process", ignore_process)
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "_terminate_bounded_process", ignore_process
+    )
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "release_owned_process", ignore_process
+    )
 
-    with pytest.raises(RelayError, match="total wall-clock deadline"):
+    with pytest.raises(
+        ObservationTimeoutError,
+        match="timed out during stdio validation after 1 seconds",
+    ):
         private._run_bounded_process(
             ("clio-relay",),
             session_input=b"{}\n",
@@ -932,7 +1004,7 @@ def test_packaged_stdio_surfaces_safe_failed_startup_cleanup_evidence(
             cause=RuntimeError("private startup detail"),
         )
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", fail_spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", fail_spawn)
     with pytest.raises(RelayError, match="cleanup_verified=False") as failure:
         run_packaged_mcp_stdio_session(profile="user", tool="jarvis_run", arguments={})
     assert "pid=8123" in str(failure.value)

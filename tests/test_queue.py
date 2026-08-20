@@ -7,12 +7,20 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from filelock import FileLock, Timeout
 
-import clio_relay.core_queue as core_queue_module
+from clio_relay import (
+    queue_idempotency,
+    queue_layout,
+    queue_legacy_audit,
+    queue_store_lock,
+    queue_store_read,
+    queue_store_write,
+)
 from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
@@ -44,6 +52,153 @@ class _SimulatedWindowsSharingViolation(PermissionError):
     """Portable WinError 32 fixture for cross-platform queue tests."""
 
     winerror = 32
+
+
+class _StoreLookupSabotage(RuntimeError):
+    """Prove a queue operation resolves its collaborator through the new owner."""
+
+
+def test_canonical_read_resolves_validation_through_store_read_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CQ20 note: the facade's ``_read_canonical_record`` forward is deleted
+    (its every real caller, all six inside ``queue_index_migration.py``, now
+    calls ``queue_store_read.read_canonical_record`` directly). This test now
+    exercises that real, module-qualified call site directly rather than a
+    dead facade shim -- design doc §4's own preservation rule.
+    """
+    queue = ClioCoreQueue(tmp_path)
+    endpoint = EndpointRegistration(
+        cluster="configured-target",
+        role=EndpointRole.DESKTOP,
+        hostname="desktop.example",
+        pid=42,
+    )
+    path = tmp_path / "endpoints" / f"{endpoint.endpoint_id}.json"
+    path.parent.mkdir()
+    path.write_text(endpoint.model_dump_json(), encoding="utf-8")
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _StoreLookupSabotage("queue_store_read canonical validation lookup engaged")
+
+    monkeypatch.setattr(
+        queue_store_read,
+        "queue_layout",
+        SimpleNamespace(
+            **{
+                **vars(queue_store_read.queue_layout),
+                "validate_canonical_access": sabotage,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        _StoreLookupSabotage,
+        match="queue_store_read canonical validation lookup engaged",
+    ):
+        queue_store_read.read_canonical_record(
+            queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path,
+            EndpointRegistration,
+        )
+
+
+def test_migrate_indexes_batch_resolves_canonical_read_through_store_read_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N16 (closing-round review): the test above proves ``queue_store_read.
+    read_canonical_record`` resolves its lookup module-qualified, but only by
+    calling that module function directly -- it never proves any real
+    production caller reaches it. ``migrate_indexes_batch`` (the public
+    entrypoint that owns all six real ``read_canonical_record`` call sites,
+    ``queue_index_migration.py``) is that production caller; this restores
+    the same sabotage through it.
+    """
+    for family in ("jobs", "tasks", "leases", "artifacts", "progress", "events"):
+        (tmp_path / family).mkdir(parents=True, exist_ok=True)
+    job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["echo", "legacy"]),
+        idempotency_key="legacy-migration-production-path",
+    )
+    (tmp_path / "jobs" / f"{job.job_id}.json").write_text(
+        job.model_dump_json(indent=2), encoding="utf-8"
+    )
+    queue = ClioCoreQueue(tmp_path)
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise _StoreLookupSabotage("queue_store_read canonical validation lookup engaged")
+
+    monkeypatch.setattr(
+        queue_store_read,
+        "queue_layout",
+        SimpleNamespace(
+            **{
+                **vars(queue_store_read.queue_layout),
+                "validate_canonical_access": sabotage,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        _StoreLookupSabotage,
+        match="queue_store_read canonical validation lookup engaged",
+    ):
+        queue.migrate_indexes_batch(batch_size=1)
+
+
+def test_atomic_write_resolves_private_file_through_store_write_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ClioCoreQueue(tmp_path)
+
+    def create_test_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+
+    def accept_test_path(_path: Path, *, directory: bool) -> None:
+        del directory
+
+    # queue_legacy_audit.cluster_config and queue_store_write.cluster_config
+    # are the same module object (clio_relay.cluster_config); patching it once
+    # through either owner reference covers both real call sites.
+    monkeypatch.setattr(
+        queue_legacy_audit.cluster_config,
+        "ensure_private_configuration_directory",
+        create_test_directory,
+    )
+    monkeypatch.setattr(
+        queue_store_write.cluster_config,
+        "ensure_private_configuration_path",
+        accept_test_path,
+    )
+
+    def sabotage(_path: Path) -> None:
+        raise _StoreLookupSabotage("queue_store_write private atomic-file lookup engaged")
+
+    monkeypatch.setattr(
+        queue_store_write.cluster_config,
+        "open_private_atomic_file",
+        sabotage,
+    )
+
+    with pytest.raises(
+        _StoreLookupSabotage,
+        match="queue_store_write private atomic-file lookup engaged",
+    ):
+        queue._write(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            tmp_path / "endpoints" / "endpoint-lookup.json",
+            EndpointRegistration(
+                endpoint_id="endpoint-lookup",
+                cluster="configured-target",
+                role=EndpointRole.DESKTOP,
+                hostname="desktop.example",
+                pid=42,
+            ),
+        )
 
 
 def _stat_with_link_count(value: os.stat_result, link_count: int) -> os.stat_result:
@@ -87,7 +242,10 @@ def test_operator_configured_long_core_root_supports_records_and_leases(
 
 def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path, lock_timeout_seconds=2)
-    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cast(
+        queue_store_lock.FairBoundedFileLock,
+        queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
     acquired: list[int] = []
     errors: list[BaseException] = []
     threads: list[threading.Thread] = []
@@ -136,7 +294,10 @@ def test_core_lock_admits_same_process_waiters_in_ticket_order(tmp_path: Path) -
 
 def test_core_lock_default_is_bounded_for_production_contention(tmp_path: Path) -> None:
     queue = ClioCoreQueue(tmp_path)
-    lock = queue._lock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cast(
+        queue_store_lock.FairBoundedFileLock,
+        queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    )
 
     assert DEFAULT_CORE_LOCK_TIMEOUT_SECONDS == 30.0
     assert lock.timeout == DEFAULT_CORE_LOCK_TIMEOUT_SECONDS
@@ -192,7 +353,7 @@ def test_durable_record_read_retries_wrapped_windows_sharing_denial(
     )
     task = queue.append_task(RelayTask(job_id=job.job_id, name="sharing-race"))
     task_path = queue.root / "tasks" / f"{task.task_id}.json"
-    original = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]
+    original = queue_store_read.read_bounded_record_bytes
     attempts = 0
 
     def transient_read(path: Path) -> bytes:
@@ -205,7 +366,7 @@ def test_durable_record_read_retries_wrapped_windows_sharing_denial(
                 raise QueueConflictError(f"cannot read durable record {path}: {exc}") from exc
         return original(path)
 
-    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", transient_read)
+    monkeypatch.setattr(queue_store_read, "read_bounded_record_bytes", transient_read)
 
     assert queue.get_task(task.task_id) == task
     assert attempts == 2
@@ -282,15 +443,19 @@ def test_lease_snapshot_readers_serialize_with_concurrent_release(
     release_finished = threading.Event()
     release_errors: list[BaseException] = []
     scan_thread_id = threading.get_ident()
-    original_read = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_read = queue_store_read.read_bounded_record_bytes
 
     def observe_index_read(path: Path) -> bytes:
         if (
             logical_filesystem_path(path) == observed_path
             and threading.get_ident() == scan_thread_id
         ):
+            locked = cast(
+                queue_store_lock.FairBoundedFileLock,
+                queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
             assert (
-                queue._lock._owner_thread_id == scan_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                locked._owner_thread_id == scan_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             )
             scan_reached_record.set()
             assert release_started.wait(timeout=5)
@@ -307,7 +472,7 @@ def test_lease_snapshot_readers_serialize_with_concurrent_release(
         finally:
             release_finished.set()
 
-    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", observe_index_read)
+    monkeypatch.setattr(queue_store_read, "read_bounded_record_bytes", observe_index_read)
     thread = threading.Thread(target=release, daemon=True)
     thread.start()
 
@@ -347,7 +512,7 @@ def test_task_snapshot_readers_hold_queue_lock(
     task = queue.append_task(RelayTask(job_id=job.job_id, name="locked-snapshot"))
     observed = threading.Event()
     reader_thread_id = threading.get_ident()
-    original_read = core_queue_module._read_bounded_record_bytes  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_read = queue_store_read.read_bounded_record_bytes
 
     def require_lock(path: Path) -> bytes:
         logical = logical_filesystem_path(path)
@@ -359,13 +524,17 @@ def test_task_snapshot_readers_hold_queue_lock(
         if (
             selected_task_record or selected_order_record
         ) and threading.get_ident() == reader_thread_id:
+            locked = cast(
+                queue_store_lock.FairBoundedFileLock,
+                queue._lock,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            )
             assert (
-                queue._lock._owner_thread_id == reader_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                locked._owner_thread_id == reader_thread_id  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             )
             observed.set()
         return original_read(path)
 
-    monkeypatch.setattr(core_queue_module, "_read_bounded_record_bytes", require_lock)
+    monkeypatch.setattr(queue_store_read, "read_bounded_record_bytes", require_lock)
     if reader == "list":
         tasks = queue.list_tasks(job.job_id)
     elif reader == "page":
@@ -399,6 +568,7 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
     indexed_path = queue.root / "leases_by_job" / job.job_id / f"{lease.lease_id}.json"
     original_unlink = Path.unlink
     attempts = 0
+    retry_delays: list[float] = []
 
     def blocked_unlink(path: Path, missing_ok: bool = False) -> None:
         nonlocal attempts
@@ -413,11 +583,13 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "unlink", blocked_unlink)
-        patch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+        patch.setattr(queue_store_write.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+        patch.setattr(queue_store_write.time, "sleep", retry_delays.append)
         with pytest.raises(PermissionError, match="persistent sharing violation"):
             queue.release_lease(lease.lease_id)
 
-    assert attempts == core_queue_module.ATOMIC_REPLACE_ATTEMPTS
+    assert attempts == queue_layout.ATOMIC_REPLACE_ATTEMPTS
+    assert retry_delays == [0.0] * (queue_layout.ATOMIC_REPLACE_ATTEMPTS - 1)
     assert indexed_path.is_file()
     assert len(list((queue.root / "transition_intents").glob("*.json"))) == 1
 
@@ -432,6 +604,37 @@ def test_release_lease_sharing_violation_exhaustion_replays_on_restart(
     assert list((reopened.root / "transition_intents").glob("*.json")) == []
 
 
+def test_unlink_retry_resolves_delay_through_the_layout_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CQ3 write retry seam reads the live ``queue_layout`` setting."""
+    path = tmp_path / "retry.json"
+    path.write_text("{}", encoding="utf-8")
+    attempts = 0
+    retry_delays: list[float] = []
+
+    def blocked_unlink(_path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        del missing_ok
+        attempts += 1
+        raise _SimulatedWindowsSharingViolation(
+            13,
+            "simulated persistent sharing violation",
+            str(path),
+        )
+
+    monkeypatch.setattr(Path, "unlink", blocked_unlink)
+    monkeypatch.setattr(queue_store_write.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(queue_store_write.time, "sleep", retry_delays.append)
+
+    with pytest.raises(PermissionError, match="persistent sharing violation"):
+        queue_store_write.unlink_durable_path(path)
+
+    assert attempts == queue_store_write.queue_layout.ATOMIC_REPLACE_ATTEMPTS
+    assert retry_delays == [0.0] * (attempts - 1)
+
+
 def test_durable_record_read_retries_identity_replacement_before_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -439,7 +642,7 @@ def test_durable_record_read_retries_identity_replacement_before_open(
     path = tmp_path / "tasks" / "replace-before-open.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"old generation")
-    original_open = core_queue_module.os.open
+    original_open = queue_store_read.os.open
     replacements = 0
 
     def replace_before_open(
@@ -459,12 +662,10 @@ def test_durable_record_read_retries_identity_replacement_before_open(
             return original_open(target, flags, mode)
         return original_open(target, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
-    monkeypatch.setattr(core_queue_module.os, "open", replace_before_open)
+    monkeypatch.setattr(queue_store_read.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(queue_store_read.os, "open", replace_before_open)
 
-    payload = core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path
-    )
+    payload = queue_store_read.read_bounded_record_bytes(path)
 
     assert payload == b"new generation"
     assert replacements == 1
@@ -477,9 +678,9 @@ def test_durable_record_read_retries_unlinked_descriptor_after_open(
     path = tmp_path / "tasks" / "replace-after-open.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"old generation")
-    original_open = core_queue_module.os.open
-    original_fstat = core_queue_module.os.fstat
-    original_read = core_queue_module.os.read
+    original_open = queue_store_read.os.open
+    original_fstat = queue_store_read.os.fstat
+    original_read = queue_store_read.os.read
     descriptor_generations: dict[int, int] = {}
     open_generation = 0
     unlinked_reported = False
@@ -526,14 +727,12 @@ def test_durable_record_read_retries_unlinked_descriptor_after_open(
         temporary.replace(path)
         replacement_written = True
 
-    monkeypatch.setattr(core_queue_module.os, "open", track_open)
-    monkeypatch.setattr(core_queue_module.os, "fstat", report_first_descriptor_unlinked)
-    monkeypatch.setattr(core_queue_module.os, "read", track_reads)
-    monkeypatch.setattr(core_queue_module.time, "sleep", install_replacement)
+    monkeypatch.setattr(queue_store_read.os, "open", track_open)
+    monkeypatch.setattr(queue_store_read.os, "fstat", report_first_descriptor_unlinked)
+    monkeypatch.setattr(queue_store_read.os, "read", track_reads)
+    monkeypatch.setattr(queue_store_read.time, "sleep", install_replacement)
 
-    payload = core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path
-    )
+    payload = queue_store_read.read_bounded_record_bytes(path)
 
     assert payload == b"new generation"
     assert open_generation == 2
@@ -548,7 +747,7 @@ def test_durable_record_read_retries_path_disappearance_after_open(
     path = tmp_path / "tasks" / "disappearing-after-open.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"stable generation")
-    original_lstat = core_queue_module.os.lstat
+    original_lstat = queue_store_read.os.lstat
     path_observations = 0
 
     def disappear_once(
@@ -565,12 +764,10 @@ def test_durable_record_read_retries_path_disappearance_after_open(
             return original_lstat(target)
         return original_lstat(target, dir_fd=dir_fd)
 
-    monkeypatch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
-    monkeypatch.setattr(core_queue_module.os, "lstat", disappear_once)
+    monkeypatch.setattr(queue_store_read.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(queue_store_read.os, "lstat", disappear_once)
 
-    payload = core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path
-    )
+    payload = queue_store_read.read_bounded_record_bytes(path)
 
     assert payload == b"stable generation"
     assert path_observations >= 5
@@ -583,9 +780,9 @@ def test_durable_record_read_discards_generation_replaced_during_read(
     path = tmp_path / "tasks" / "replace-during-read.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"x" * 196_608)
-    original_open = core_queue_module.os.open
-    original_fstat = core_queue_module.os.fstat
-    original_read = core_queue_module.os.read
+    original_open = queue_store_read.os.open
+    original_fstat = queue_store_read.os.fstat
+    original_read = queue_store_read.os.read
     descriptor_generations: dict[int, int] = {}
     open_generation = 0
     obsolete_reads = 0
@@ -632,14 +829,12 @@ def test_durable_record_read_discards_generation_replaced_during_read(
         temporary.replace(path)
         replacement_written = True
 
-    monkeypatch.setattr(core_queue_module.os, "open", track_open)
-    monkeypatch.setattr(core_queue_module.os, "read", replace_while_reading)
-    monkeypatch.setattr(core_queue_module.os, "fstat", report_during_read_unlink)
-    monkeypatch.setattr(core_queue_module.time, "sleep", install_replacement)
+    monkeypatch.setattr(queue_store_read.os, "open", track_open)
+    monkeypatch.setattr(queue_store_read.os, "read", replace_while_reading)
+    monkeypatch.setattr(queue_store_read.os, "fstat", report_during_read_unlink)
+    monkeypatch.setattr(queue_store_read.time, "sleep", install_replacement)
 
-    payload = core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path
-    )
+    payload = queue_store_read.read_bounded_record_bytes(path)
 
     assert payload == b"replacement generation"
     assert open_generation == 2
@@ -653,7 +848,7 @@ def test_durable_record_read_atomic_replacement_exhaustion_is_bounded(
     path = tmp_path / "tasks" / "never-stable.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"generation 0")
-    original_open = core_queue_module.os.open
+    original_open = queue_store_read.os.open
     replacements = 0
 
     def replace_every_time_before_open(
@@ -673,14 +868,12 @@ def test_durable_record_read_atomic_replacement_exhaustion_is_bounded(
             return original_open(target, flags, mode)
         return original_open(target, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(core_queue_module, "ATOMIC_REPLACE_ATTEMPTS", 3)
-    monkeypatch.setattr(core_queue_module, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
-    monkeypatch.setattr(core_queue_module.os, "open", replace_every_time_before_open)
+    monkeypatch.setattr(queue_store_read.queue_layout, "ATOMIC_REPLACE_ATTEMPTS", 3)
+    monkeypatch.setattr(queue_store_read.queue_layout, "ATOMIC_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(queue_store_read.os, "open", replace_every_time_before_open)
 
     with pytest.raises(QueueConflictError, match="did not stabilize after 3"):
-        core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            path
-        )
+        queue_store_read.read_bounded_record_bytes(path)
 
     assert replacements == 3
 
@@ -693,9 +886,7 @@ def test_durable_record_read_rejects_stable_hardlink_without_retry(tmp_path: Pat
     os.link(path, hardlink)
 
     with pytest.raises(QueueConflictError, match="must not be hard linked"):
-        core_queue_module._read_bounded_record_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            path
-        )
+        queue_store_read.read_bounded_record_bytes(path)
 
     assert os.lstat(path).st_nlink > 1
 
@@ -714,9 +905,7 @@ def test_concurrent_endpoint_heartbeat_replacement_is_not_a_false_hardlink(
         )
     )
     endpoint_path = queue.root / "endpoints" / f"{endpoint.endpoint_id}.json"
-    original_attempt = (
-        core_queue_module._read_bounded_record_bytes_once  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    )
+    original_attempt = queue_store_read.read_bounded_record_bytes_once
     reader_thread = threading.current_thread()
     reader_waiting = threading.Event()
     heartbeat_done = threading.Event()
@@ -735,9 +924,7 @@ def test_concurrent_endpoint_heartbeat_replacement_is_not_a_false_hardlink(
             reader_waiting.set()
             if not heartbeat_done.wait(timeout=2):
                 raise AssertionError("concurrent heartbeat did not complete")
-            raise core_queue_module._TransientRecordReplacement(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                f"injected endpoint replacement: {path}"
-            )
+            raise queue_layout.TransientRecordReplacement(f"injected endpoint replacement: {path}")
         return original_attempt(path, limit=limit)
 
     def heartbeat() -> None:
@@ -755,8 +942,8 @@ def test_concurrent_endpoint_heartbeat_replacement_is_not_a_false_hardlink(
             heartbeat_done.set()
 
     monkeypatch.setattr(
-        core_queue_module,
-        "_read_bounded_record_bytes_once",
+        queue_store_read,
+        "read_bounded_record_bytes_once",
         coordinate_replacement,
     )
     worker = threading.Thread(target=heartbeat, name="concurrent-endpoint-heartbeat")
@@ -800,7 +987,7 @@ def test_atomic_writes_stage_outside_canonical_record_directories(
         )
     )
 
-    expected_staging = logical_filesystem_path(queue.root / core_queue_module.WRITE_STAGING_FAMILY)
+    expected_staging = logical_filesystem_path(queue.root / queue_layout.WRITE_STAGING_FAMILY)
     assert replacements
     assert all(
         logical_filesystem_path(source.parent) == expected_staging for source, _ in replacements
@@ -818,7 +1005,7 @@ def test_atomic_write_rejects_cross_filesystem_staging(
     """A cross-device move must fail instead of weakening atomic replacement."""
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    original_lstat = core_queue_module.os.lstat
+    original_lstat = queue_store_write.os.lstat
     endpoint_directory = logical_filesystem_path(queue.root / "endpoints")
 
     def report_foreign_endpoint_device(path: os.PathLike[str] | str) -> os.stat_result:
@@ -827,7 +1014,7 @@ def test_atomic_write_rejects_cross_filesystem_staging(
             return _stat_with_device(observed, observed.st_dev + 1)
         return observed
 
-    monkeypatch.setattr(core_queue_module.os, "lstat", report_foreign_endpoint_device)
+    monkeypatch.setattr(queue_store_write.os, "lstat", report_foreign_endpoint_device)
 
     with pytest.raises(QueueConflictError, match="crosses filesystems"):
         queue.register_endpoint(
@@ -844,7 +1031,7 @@ def test_initialize_removes_bounded_atomic_write_crash_leftovers(tmp_path: Path)
     """A new queue owner removes only structurally valid abandoned staged files."""
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    staging = queue.root / core_queue_module.WRITE_STAGING_FAMILY
+    staging = queue.root / queue_layout.WRITE_STAGING_FAMILY
     leftover = staging / f"{'a' * 32}.tmp"
     leftover.write_bytes(b"abandoned")
 
@@ -858,7 +1045,7 @@ def test_initialize_rejects_unsafe_atomic_write_staging_entries(tmp_path: Path) 
     """Cleanup must fail closed rather than unlinking unowned staging content."""
     queue = ClioCoreQueue(tmp_path)
     queue.initialize()
-    unsafe = queue.root / core_queue_module.WRITE_STAGING_FAMILY / "operator-note.txt"
+    unsafe = queue.root / queue_layout.WRITE_STAGING_FAMILY / "operator-note.txt"
     unsafe.write_text("keep", encoding="utf-8")
 
     with pytest.raises(QueueConflictError, match="contains an unsafe entry"):
@@ -876,7 +1063,7 @@ def test_atomic_write_syncs_source_and_destination_directories(
     queue.initialize()
     synced: list[Path] = []
 
-    monkeypatch.setattr(queue, "_fsync_write_directory", synced.append)
+    monkeypatch.setattr(queue_store_write, "fsync_write_directory", synced.append)
     queue.register_endpoint(
         EndpointRegistration(
             role=EndpointRole.WORKER,
@@ -887,7 +1074,7 @@ def test_atomic_write_syncs_source_and_destination_directories(
     )
 
     storage_root = internal_filesystem_path(queue.root, force_extended=True)
-    assert storage_root / core_queue_module.WRITE_STAGING_FAMILY in synced
+    assert storage_root / queue_layout.WRITE_STAGING_FAMILY in synced
     assert storage_root / "endpoints" in synced
 
 
@@ -1171,7 +1358,7 @@ def test_null_jarvis_binding_preserves_pre_upgrade_mcp_submission_digest() -> No
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
-    observed = core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job
     )
 
@@ -1198,9 +1385,9 @@ def test_control_query_admission_changes_mcp_submission_digest() -> None:
         }
     )
 
-    assert core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         workload
-    ) != core_queue_module._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) != queue_idempotency._job_idempotency_digest(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         control
     )
 

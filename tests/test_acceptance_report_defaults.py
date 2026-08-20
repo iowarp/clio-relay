@@ -14,7 +14,32 @@ import pytest
 from typer import Typer
 from typer.testing import CliRunner
 
-from clio_relay import cli
+import clio_relay.bootstrap as bootstrap
+import clio_relay.cli_cleanup_report as cli_cleanup_report
+import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+import clio_relay.cli_jarvis_dispatch as cli_jarvis_dispatch
+import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
+import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
+import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
+import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.cli_session_teardown as cli_session_teardown
+import clio_relay.frp_check as frp_check
+import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
+import clio_relay.live_acceptance as live_acceptance
+import clio_relay.mcp_server as mcp_server
+import clio_relay.mcp_stdio_validation as mcp_stdio_validation
+import clio_relay.queue_validation as queue_validation
+import clio_relay.relay_ops as relay_ops
+import clio_relay.release_validation as release_validation
+import clio_relay.remote_cli as remote_cli
+import clio_relay.remote_mcp as remote_mcp
+import clio_relay.scheduler_providers as scheduler_providers
+import clio_relay.scheduler_validation as scheduler_validation
+import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.transport_probe as transport_probe
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -954,37 +979,47 @@ def _install_success_fakes(
             write_validation_report(report, options.report_path)
             return report
 
-        monkeypatch.setattr(cli, "run_local_release_validation", run_local)
+        monkeypatch.setattr(release_validation, "run_local_release_validation", run_local)
         return
     if case.name == "relay-host-test-frpc-connection":
-        monkeypatch.setattr(cli, "run_frpc_connection_check", _successful_frpc_probe)
+        monkeypatch.setattr(frp_check, "run_frpc_connection_check", _successful_frpc_probe)
         return
     if case.name == "relay-host-test-http-transport":
-        monkeypatch.setattr(cli, "run_frp_http_probe", _successful_http_probe)
+        monkeypatch.setattr(transport_probe, "run_frp_http_probe", _successful_http_probe)
         return
     if case.name == "relay-host-test-direct-transport":
-        monkeypatch.setattr(cli, "run_frp_direct_http_probe", _successful_direct_probe)
+        monkeypatch.setattr(transport_probe, "run_frp_direct_http_probe", _successful_direct_probe)
         return
     if case.name == "relay-host-test-ssh-transport":
-        monkeypatch.setattr(cli, "run_ssh_forward_http_probe", _successful_ssh_probe)
+        monkeypatch.setattr(transport_probe, "run_ssh_forward_http_probe", _successful_ssh_probe)
         return
     if case.name == "remote-mcp-validate":
-        monkeypatch.setattr(cli, "load_registered_remote_mcp_catalog", _load_remote_mcp_catalog)
-        monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", _packaged_mcp_session)
-        monkeypatch.setattr(cli, "_mcp_response_job_id", _relay_job_id)
-        monkeypatch.setattr(cli, "wait_for_terminal", _wait_for_terminal)
-        monkeypatch.setattr(cli, "get_job_status", _terminal_job_status)
-        monkeypatch.setattr(cli, "_complete_local_artifact_records", _empty_artifacts)
-        monkeypatch.setattr(cli, "_read_local_json_artifact_kind", _empty_json_artifact)
         monkeypatch.setattr(
-            cli,
+            mcp_server, "load_registered_remote_mcp_catalog", _load_remote_mcp_catalog
+        )
+        monkeypatch.setattr(
+            mcp_stdio_validation, "run_packaged_mcp_stdio_session", _packaged_mcp_session
+        )
+        monkeypatch.setattr(cli_jarvis_artifact_io, "_mcp_response_job_id", _relay_job_id)
+        monkeypatch.setattr(relay_ops, "wait_for_terminal", _wait_for_terminal)
+        monkeypatch.setattr(relay_ops, "job_status", _terminal_job_status)
+        monkeypatch.setattr(
+            cli_remote_collection_pagination, "_complete_local_artifact_records", _empty_artifacts
+        )
+        monkeypatch.setattr(
+            cli_jarvis_artifact_io, "_read_local_json_artifact_kind", _empty_json_artifact
+        )
+        monkeypatch.setattr(
+            remote_mcp,
             "build_remote_mcp_acceptance_report",
             _remote_acceptance_result,
         )
         return
     if case.name == "cluster-bootstrap":
-        monkeypatch.setattr(cli, "bootstrap_cluster_over_ssh", _successful_bootstrap)
-        monkeypatch.setattr(cli, "_remote_target_identity", _verified_target_identity)
+        monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", _successful_bootstrap)
+        monkeypatch.setattr(
+            cli_remote_worker_probe, "_remote_target_identity", _verified_target_identity
+        )
         return
     if case.name in {"session-detach", "session-teardown"}:
         _activate_owner_session(root / "core")
@@ -992,10 +1027,12 @@ def _install_success_fakes(
         def execute_locally(_definition: ClusterDefinition) -> bool:
             return False
 
-        monkeypatch.setattr(cli, "should_execute_on_cluster", execute_locally)
-        monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _empty_runtime_cleanup)
+        monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
+        monkeypatch.setattr(
+            cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _empty_runtime_cleanup
+        )
         if case.name == "session-detach":
-            monkeypatch.setattr(cli, "detach_remote_session", _detached_session)
+            monkeypatch.setattr(session_lifecycle, "detach_remote_session", _detached_session)
         else:
             finalized_status: list[OwnedSessionRecoveryStatus] = []
 
@@ -1053,40 +1090,42 @@ def _install_success_fakes(
             def mark_closed(**_kwargs: object) -> None:
                 return None
 
-            monkeypatch.setattr(cli, "status_remote_session", _owned_session_status)
-            monkeypatch.setattr(cli, "teardown_remote_session", _torn_down_session)
+            monkeypatch.setattr(session_lifecycle, "status_remote_session", _owned_session_status)
+            monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _torn_down_session)
             monkeypatch.setattr(
-                cli,
+                cli_session_teardown,
                 "_persist_verified_cleanup_report_before_closure",
                 persist_cleanup_report,
             )
-            monkeypatch.setattr(cli, "_mark_owner_session_closed", mark_closed)
             monkeypatch.setattr(
-                cli,
+                cli_owned_session_recovery, "_mark_owner_session_closed", mark_closed
+            )
+            monkeypatch.setattr(
+                cli_owned_session_recovery,
                 "_owned_session_recovery_status",
                 closed_recovery_status,
             )
             monkeypatch.setattr(
-                cli,
+                cli_cleanup_report,
                 "_verified_finalized_cleanup_report",
                 verified_cleanup_report,
             )
         return
     if case.name == "queue-validate":
         monkeypatch.setattr(
-            cli,
+            scheduler_providers,
             "validation_provider_for_scheduler",
             _unused_validation_provider,
         )
         monkeypatch.setattr(
-            cli,
+            queue_validation,
             "run_queue_management_validation",
             _successful_queue_validation,
         )
         return
     if case.name == "scheduler-validate-lifecycle":
         monkeypatch.setattr(
-            cli,
+            scheduler_validation,
             "run_scheduler_lifecycle_validation",
             _successful_scheduler_validation,
         )
@@ -1109,35 +1148,39 @@ def _install_success_fakes(
         return
     if case.name == "jarvis-mcp-validate":
         monkeypatch.setattr(
-            cli,
+            cli_jarvis_remote_contract,
             "_run_jarvis_remote_contract_discovery",
             _jarvis_contract_discovery,
         )
         monkeypatch.setattr(
-            cli,
+            cli_jarvis_remote_contract,
             "_persist_jarvis_remote_contract_discovery",
             _persist_jarvis_contract,
         )
-        monkeypatch.setattr(cli, "run_packaged_mcp_stdio_session", _packaged_mcp_session)
-        monkeypatch.setattr(cli, "_mcp_response_job_id", _relay_job_id)
-        monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", _complete_jarvis_dispatch)
         monkeypatch.setattr(
-            cli,
+            mcp_stdio_validation, "run_packaged_mcp_stdio_session", _packaged_mcp_session
+        )
+        monkeypatch.setattr(cli_jarvis_artifact_io, "_mcp_response_job_id", _relay_job_id)
+        monkeypatch.setattr(
+            cli_jarvis_dispatch, "_complete_jarvis_run_dispatch", _complete_jarvis_dispatch
+        )
+        monkeypatch.setattr(
+            cli_jarvis_dispatch,
             "_jarvis_execution_retry_selector_from_runtime_metadata",
             _jarvis_retry_selector,
         )
         monkeypatch.setattr(
-            cli,
+            cli_jarvis_execution_run,
             "_run_post_run_jarvis_execution_query",
             _post_run_jarvis_query,
         )
         monkeypatch.setattr(
-            cli,
+            cli_jarvis_package_search,
             "_run_jarvis_package_search_query",
             _jarvis_package_search,
         )
         monkeypatch.setattr(
-            cli,
+            jarvis_mcp_validation,
             "build_jarvis_mcp_validation_report",
             _successful_jarvis_validation,
         )
@@ -1155,7 +1198,7 @@ def _install_success_fakes(
             write_validation_report(report, report_path)
             return [f"validation.report={report_path.resolve()}"]
 
-        monkeypatch.setattr(cli, "run_live_acceptance", run_live)
+        monkeypatch.setattr(live_acceptance, "run_live_acceptance", run_live)
         return
     raise AssertionError(f"success fake is missing for acceptance command: {case.name}")
 
@@ -1208,7 +1251,7 @@ def test_every_acceptance_command_writes_default_preflight_failure_report(
         def fail_local(_options: LocalReleaseValidationOptions) -> LiveValidationReport:
             raise RelayError("release checkout preflight failed")
 
-        monkeypatch.setattr(cli, "run_local_release_validation", fail_local)
+        monkeypatch.setattr(release_validation, "run_local_release_validation", fail_local)
 
     result = CliRunner().invoke(app, list(case.failure_command))
 
@@ -1233,7 +1276,7 @@ def test_live_test_writes_default_report_when_backend_fails_before_persisting(
     def fail_live(_options: LiveAcceptanceOptions) -> list[str]:
         raise RelayError("live acceptance backend failed before writing its report")
 
-    monkeypatch.setattr(cli, "run_live_acceptance", fail_live)
+    monkeypatch.setattr(live_acceptance, "run_live_acceptance", fail_live)
 
     result = CliRunner().invoke(app, ["live-test", "--cluster", "test-cluster"])
 
@@ -1260,7 +1303,7 @@ def test_frpc_connection_writes_distinct_default_reports_on_success(
     def successful_probe(**_kwargs: object) -> list[str]:
         return ["frpc stayed connected until timeout", "login to server success"]
 
-    monkeypatch.setattr(cli, "run_frpc_connection_check", successful_probe)
+    monkeypatch.setattr(frp_check, "run_frpc_connection_check", successful_probe)
     command = [
         "relay-host",
         "test-frpc-connection",
@@ -1305,7 +1348,7 @@ def test_frpc_connection_writes_default_failure_report(
     def failed_probe(**_kwargs: object) -> list[str]:
         raise RelayError("frpc exited before the connection interval")
 
-    monkeypatch.setattr(cli, "run_frpc_connection_check", failed_probe)
+    monkeypatch.setattr(frp_check, "run_frpc_connection_check", failed_probe)
 
     result = CliRunner().invoke(
         app,

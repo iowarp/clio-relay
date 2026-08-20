@@ -11,17 +11,19 @@ from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
 import clio_relay.endpoint as endpoint_module
 import clio_relay.storage_runtime as storage_runtime_module
+from clio_relay import queue_legacy_audit, queue_startup, worker_lifetime_lock
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import EndpointRole, JarvisRunSpec, JobKind, RelayEvent, RelayJob
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.storage_runtime import storage_managed_queue
 from clio_relay.worker_lifetime_lock import (
     WORKER_LIFETIME_GUARD_FD_ENV,
@@ -230,11 +232,10 @@ def test_migration_rejects_alias_retarget_after_exclusive_acquisition(
             alias_parent.symlink_to(second_parent, target_is_directory=True)
             yield locked_core
 
-    monkeypatch.setattr(
-        core_queue_module,
-        "exclusive_migration_lifetime",
-        retargeting_guard,
+    isolated_worker_lifetime_lock = SimpleNamespace(
+        **{**vars(worker_lifetime_lock), "exclusive_migration_lifetime": retargeting_guard}
     )
+    monkeypatch.setattr(queue_startup, "worker_lifetime_lock", isolated_worker_lifetime_lock)
 
     with pytest.raises(ConfigurationError, match="does not match its core lifetime lock"):
         queue.initialize(migrate_legacy_output=True)
@@ -497,7 +498,7 @@ def test_authoritative_migration_api_enters_exclusive_lifetime_guard(
     root = tmp_path / "core"
     root.mkdir()
     guarded = False
-    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_audit = queue_legacy_audit.audit_before_initialization
 
     def guarded_audit(self: ClioCoreQueue) -> Any:
         nonlocal guarded
@@ -512,8 +513,8 @@ def test_authoritative_migration_api_enters_exclusive_lifetime_guard(
         return original_audit(self)
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         guarded_audit,
     )
 
@@ -810,7 +811,7 @@ def test_locked_initialization_never_writes_replacement_root_after_path_swap(
     core_dir = tmp_path / "core"
     displaced_core = tmp_path / "displaced-core"
     core_dir.mkdir()
-    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_audit = queue_legacy_audit.audit_before_initialization
     swapped = False
 
     def swap_during_audit(queue: ClioCoreQueue) -> object:
@@ -825,8 +826,8 @@ def test_locked_initialization_never_writes_replacement_root_after_path_swap(
         return result
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         swap_during_audit,
     )
 

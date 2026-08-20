@@ -7,7 +7,8 @@ from typing import cast
 from pytest import MonkeyPatch, raises
 
 import clio_relay.core_queue as core_queue_module
-import clio_relay.queue_management as queue_management_module
+import clio_relay.queue_admission_simulation as queue_admission_simulation_module
+import clio_relay.queue_layout as queue_layout_module
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.models import (
@@ -365,8 +366,21 @@ def test_diagnosis_models_predecessor_consuming_last_global_lease_slot(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
+    # Post-CQ15: the real admission-capacity comparisons
+    # (queue_lease_admission.acquire_next_job/_lease_job_unlocked et al.)
+    # read queue_layout.MAX_LIVE_LEASE_RECORDS module-qualified, not a
+    # locally rebound facade constant -- core_queue_module's own re-export
+    # only still affects code that remains facade-resident (design §4:
+    # patch the module containing the real read, not a dead facade copy).
+    # split/queue-management-w2: the predecessor-admission simulation
+    # formerly in queue_management.py (the module this comment used to
+    # patch) moved to queue_admission_simulation.py -- that is where
+    # MAX_LIVE_LEASE_RECORDS is read now, so that is what gets patched.
+    # queue_management.py no longer imports the name at all (same design
+    # §4 rule: no dead facade copy left behind to patch by mistake).
+    monkeypatch.setattr(queue_layout_module, "MAX_LIVE_LEASE_RECORDS", 2)
     monkeypatch.setattr(core_queue_module, "MAX_LIVE_LEASE_RECORDS", 2)
-    monkeypatch.setattr(queue_management_module, "MAX_LIVE_LEASE_RECORDS", 2)
+    monkeypatch.setattr(queue_admission_simulation_module, "MAX_LIVE_LEASE_RECORDS", 2)
     queue = ClioCoreQueue(tmp_path / "core")
     external = queue.submit_job(
         RelayJob(

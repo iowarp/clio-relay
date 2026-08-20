@@ -9,8 +9,10 @@ from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
+from clio_relay import door_errors as door_errors_module
 from clio_relay import http_api as http_api_module
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -21,9 +23,20 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.dev_mode import DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError
 from clio_relay.http_api import create_app
-from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
+from clio_relay.installation import (
+    INSTALL_RECEIPT_PATH_ENV,
+    ComponentArtifactIdentity,
+    write_install_receipt,
+)
+from clio_relay.jarvis_mcp import (
+    JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON,
+    JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY,
+    JARVIS_MCP_PINNED_LAUNCHER_UNVERIFIED_REASON,
+    jarvis_cd_lock_binding_expectation,
+)
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
@@ -52,7 +65,7 @@ from clio_relay.models import (
     TaskTimelineEvent,
     utc_now,
 )
-from clio_relay.relay_ops import job_wait_result
+from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES, job_wait_result
 from clio_relay.remote_mcp import (
     MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
     cache_entry_from_discovery_artifact,
@@ -128,6 +141,111 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert [response.status_code for response in invalid_log_responses] == [422, 422, 422]
 
 
+def test_get_log_serves_console_stream_like_stdout_and_stderr(tmp_path: Path) -> None:
+    """#259: the door route accepts and serves ``console`` exactly like the
+    other two log streams -- same offset/limit/eof envelope shape, and a
+    stream nothing has written yet reads back empty with ``eof`` rather than
+    404ing or 500ing (point 2c: non-jarvis mcp_call jobs never write console,
+    and must never fail the read)."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-console",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    empty_response = client.get(f"/jobs/{job.job_id}/logs/console")
+    assert empty_response.status_code == 200
+    assert empty_response.json() == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "text": "",
+    }
+
+    console_path = spool / "console.log"
+    console_path.write_bytes(b"thermo: step 0 temp 300.0\n")
+
+    log_response = client.get(f"/jobs/{job.job_id}/logs/console", params={"limit": 6})
+    invalid_stream_response = client.get(f"/jobs/{job.job_id}/logs/bogus-stream")
+
+    assert log_response.status_code == 200
+    body = log_response.json()
+    assert body["stream"] == "console"
+    assert body["text"] == "thermo"
+    assert body["eof"] is False
+    assert body["next_offset"] == 6
+
+    tail_response = client.get(
+        f"/jobs/{job.job_id}/logs/console",
+        params={"offset": body["next_offset"]},
+    )
+    assert tail_response.status_code == 200
+    assert tail_response.json()["text"] == ": step 0 temp 300.0\n"
+    assert tail_response.json()["eof"] is True
+
+    assert invalid_stream_response.status_code == 400
+    assert invalid_stream_response.json()["reason"] == "log_stream_invalid"
+    assert "console" in invalid_stream_response.json()["detail"]
+
+
+def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
+    tmp_path: Path,
+) -> None:
+    """F2 (#231 R6 review): GET /artifacts/{id}/content used to answer 200
+    for an over-budget read, its body merely SAYING ``result_available:
+    false`` -- a client checking only the status code would treat that as
+    success. Routes through door_errors' existing ``payload_too_large``
+    door (413) instead, the refusal document riding along as the envelope's
+    extension data.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-oversized-artifact",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    oversized_path = spool / "large.bin"
+    with oversized_path.open("wb") as stream:
+        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=oversized_path.as_uri(),
+            kind="stdout",
+            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/artifacts/{artifact.artifact_id}/content")
+
+    assert response.status_code == 413
+    document = response.json()
+    assert document["schema_version"] == door_errors_module.SCHEMA_VERSION
+    assert document["reason"] == "payload_too_large"
+    assert document["status"] == 413
+    assert document["result_available"] is False
+    assert document["delivery"]["code"] == "artifact_content_too_large"
+    assert document["artifact"]["artifact_id"] == artifact.artifact_id
+    assert "data" not in document
+
+
 def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -157,7 +275,12 @@ def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
             timeout_seconds=timeout_seconds,
         )
 
-    monkeypatch.setattr(http_api_module, "observe_until_terminal", observe)
+    # split/http-api-w3 (iowarp/clio-relay#231): `wait` moved to
+    # http_api_routes_events.py, the only remaining caller of
+    # observe_until_terminal -- the patch target follows the move.
+    import clio_relay.http_api_routes_events as http_api_routes_events_module
+
+    monkeypatch.setattr(http_api_routes_events_module, "observe_until_terminal", observe)
     response = cast(Any, TestClient(create_app(settings))).post(
         f"/jobs/{job.job_id}/wait",
         params={"timeout_seconds": 0.25, "poll_seconds": 0.05},
@@ -345,6 +468,109 @@ def test_http_websocket_limits_reject_huge_values_before_accept_or_queue_reads(
         with pytest.raises(WebSocketDisconnect) as caught, client.websocket_connect(path):
             pass
         assert caught.value.code == 1008
+        assert caught.value.reason == "websocket_page_limit_invalid"
+
+
+def test_http_websocket_refusal_classes_have_registered_close_reasons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain_settings = RelaySettings(
+        core_dir=tmp_path / "plain-core",
+        spool_dir=tmp_path / "plain-spool",
+    )
+    plain_client = cast(Any, TestClient(create_app(plain_settings)))
+    authenticated_client = cast(
+        Any,
+        TestClient(
+            create_app(
+                RelaySettings(
+                    core_dir=tmp_path / "auth-core",
+                    spool_dir=tmp_path / "auth-spool",
+                    api_token="api-token",
+                )
+            )
+        ),
+    )
+
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    owned_settings = RelaySettings(
+        core_dir=tmp_path / "owned-core",
+        spool_dir=tmp_path / "owned-spool",
+        api_token="api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    owned_queue = ClioCoreQueue(owned_settings.core_dir)
+    unowned_job = owned_queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
+            idempotency_key="websocket-unowned-job",
+        )
+    )
+    owned_client = cast(Any, TestClient(create_app(owned_settings)))
+    owner_headers = {
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+
+    cases: tuple[tuple[Any, str, dict[str, str], str], ...] = (
+        (
+            authenticated_client,
+            "/jobs/missing-job/monitor/ws",
+            {},
+            "websocket_authentication_failed",
+        ),
+        (
+            owned_client,
+            "/jobs/missing-job/monitor/ws?token=api-token",
+            {},
+            "websocket_session_binding_failed",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?limit=1000000000000",
+            {},
+            "websocket_page_limit_invalid",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?poll_seconds=0",
+            {},
+            "websocket_poll_interval_invalid",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws?cursor=0",
+            {},
+            "websocket_cursor_invalid",
+        ),
+        (
+            owned_client,
+            f"/jobs/{unowned_job.job_id}/monitor/ws?token=api-token",
+            owner_headers,
+            "websocket_resource_ownership_refused",
+        ),
+        (
+            plain_client,
+            "/jobs/missing-job/monitor/ws",
+            {},
+            "websocket_resource_not_found",
+        ),
+    )
+
+    for client, path, headers, expected_reason in cases:
+        with (
+            pytest.raises(WebSocketDisconnect) as caught,
+            client.websocket_connect(path, headers=headers),
+        ):
+            pass
+        assert caught.value.code == 1008
+        assert caught.value.reason == expected_reason
 
 
 def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
@@ -376,7 +602,16 @@ def test_http_api_enforces_configured_token(tmp_path: Path) -> None:
 
 
 def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        spool_max_log_bytes_per_stream=50,
+        spool_max_log_bytes_per_job=100,
+        storage_minimum_free_bytes=0,
+        storage_max_job_reservation_bytes=1_000,
+        storage_job_core_allowance_bytes=20,
+        storage_job_result_allowance_bytes=30,
+    )
     queue = ClioCoreQueue(settings.core_dir)
     client = cast(Any, TestClient(create_app(settings)))
     prompt_path = tmp_path / "prompt.md"
@@ -471,6 +706,76 @@ def test_http_typed_submit_endpoints_create_real_jobs(tmp_path: Path) -> None:
     assert jarvis_mcp.spec.arguments == {"target": "packages"}
 
 
+def test_mcp_submission_conflict_names_the_refresh_move(tmp_path: Path) -> None:
+    """clio-relay#242 actionability audit (R9 doctrine).
+
+    Live case: the ares agent's spack_find hit a non-retryable
+    ``mcp_submission_conflict`` with no way to tell retry from
+    refresh-and-resubmit apart. A ``registered semantic contract`` submitted
+    with no configured cluster route is the simplest way to reach this
+    reason -- the wire message must name the concrete fix (call tools/list
+    to refresh), not just echo the raw mismatch.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.post(
+        "/jobs/mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "server": "remote-server",
+            "expected_registered_contract": "clio-kit-spack-user-v2",
+            "tool": "spack_find",
+            "idempotency_key": "mcp-submission-conflict",
+        },
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == "mcp_submission_conflict"
+    assert "tools/list" in body["detail"]
+    assert "not retryable" in body["detail"]
+
+
+def test_job_submission_conflict_names_the_idempotency_key_move(tmp_path: Path) -> None:
+    """clio-relay#242 actionability audit (R9 doctrine): a reused
+    idempotency_key with a different payload must tell the agent the exact
+    key at fault and that a fresh key is the way to submit a new request."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    client = cast(Any, TestClient(create_app(settings)))
+    identity_headers = {
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+    first = client.post(
+        "/jobs/jarvis",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "pipeline_yaml": "name: first\npkgs: []\n",
+            "idempotency_key": "reused-key",
+        },
+    )
+    assert first.status_code == 200
+
+    response = client.post(
+        "/jobs/jarvis",
+        headers=identity_headers,
+        json={
+            "cluster": "test-cluster",
+            "pipeline_yaml": "name: different\npkgs: []\n",
+            "idempotency_key": "reused-key",
+        },
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == "job_submission_conflict"
+    assert "reused-key" in body["detail"]
+    assert "not retryable" in body["detail"]
+    assert "new idempotency_key" in body["detail"]
+
+
 def test_http_remote_agent_submission_requires_typed_owner_session_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -536,10 +841,15 @@ def test_http_remote_agent_submission_requires_typed_owner_session_identity(
 
     assert response.status_code == 422
     assert jarvis_response.status_code == 422
-    assert jarvis_response.json()["detail"]["code"] == "owner_session_identity_required"
-    assert jarvis_response.json()["detail"]["job_kind"] == "jarvis"
+    assert jarvis_response.json()["reason"] == "owner_session_identity_refused"
+    assert jarvis_response.json()["code"] == "owner_session_identity_required"
+    assert jarvis_response.json()["job_kind"] == "jarvis"
     assert identity_without_bearer.status_code == 401
-    assert response.json()["detail"] == {
+    assert response.json()["reason"] == "owner_session_identity_refused"
+    assert {
+        key: response.json()[key]
+        for key in ("schema", "code", "job_kind", "required_headers", "message")
+    } == {
         "schema": "clio-relay.owner-session-identity-error.v1",
         "code": "owner_session_identity_required",
         "job_kind": "remote_agent",
@@ -587,13 +897,18 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
         "storage_managed_queue",
         submission_queue,
     )
+    # split/http-api-w3 (iowarp/clio-relay#231): submit_mcp_call (and its
+    # resolve_registered_remote_mcp_admission/default_registry_path calls)
+    # moved to http_api_routes_jobs.py -- the patch targets follow the move.
+    import clio_relay.http_api_routes_jobs as http_api_routes_jobs_module
+
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "resolve_registered_remote_mcp_admission",
         resolve_admission,
     )
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "default_registry_path",
         lambda: tmp_path / "missing-clusters.json",
     )
@@ -673,7 +988,8 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
     assert jobs[3].owner_session_id is None
     assert jobs[3].owner_session_generation_id is None
     assert incomplete_mcp.status_code == 422
-    assert incomplete_mcp.json()["detail"]["code"] == "owner_session_identity_incomplete"
+    assert incomplete_mcp.json()["reason"] == "owner_session_identity_refused"
+    assert incomplete_mcp.json()["code"] == "owner_session_identity_incomplete"
 
 
 def test_http_mcp_admission_is_server_owned_and_raw_bypass_is_closed(
@@ -1207,6 +1523,24 @@ def test_owned_session_api_allows_explicit_unauthenticated_loopback_session(
     assert response.json() == {"ok": True, "auth": False}
 
 
+def test_owned_session_api_reports_missing_server_generation_identity(
+    tmp_path: Path,
+) -> None:
+    app = create_app(RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"))
+
+    @app.get("/__missing_server_generation")
+    def missing_server_generation() -> None:  # pyright: ignore[reportUnusedFunction]
+        raise door_errors_module.http_problem(
+            "session_generation_identity_unavailable",
+            "relay session has no exact generation identity",
+        )
+
+    response = cast(Any, TestClient(app)).get("/__missing_server_generation")
+
+    assert response.status_code == 409
+    assert response.json()["reason"] == "session_generation_identity_unavailable"
+
+
 def test_owned_session_api_fails_closed_without_exact_process_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1560,7 +1894,35 @@ def test_owned_session_identity_challenge_is_public_and_exact(
         generation_id="generation-1",
         nonce=nonce,
     )
-    assert client.get("/session-identity", params={"nonce": "not-a-nonce"}).status_code == 422
+    invalid_nonce = client.get("/session-identity", params={"nonce": "not-a-nonce"})
+    assert invalid_nonce.status_code == 422
+    assert invalid_nonce.json()["reason"] == "request_validation_failed"
+    assert invalid_nonce.json()["status"] == 422
+    assert invalid_nonce.json()["detail"] == "Request validation failed."
+
+
+def test_framework_http_errors_are_owner_rendered_without_status_drift(tmp_path: Path) -> None:
+    app = create_app(RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"))
+
+    @app.get("/__framework_teapot")
+    def framework_teapot() -> None:  # pyright: ignore[reportUnusedFunction]
+        raise StarletteHTTPException(status_code=418, detail="framework internals")
+
+    client = cast(Any, TestClient(app))
+    responses = (
+        (client.get("/__missing_route"), 404, "route_not_found"),
+        (client.post("/healthz"), 405, "method_not_allowed"),
+        (client.get("/__framework_teapot"), 418, "framework_http_error"),
+    )
+
+    for response, expected_status, expected_reason in responses:
+        assert response.status_code == expected_status
+        assert response.headers["content-type"].startswith("application/problem+json")
+        document = response.json()
+        assert document["schema_version"] == "clio-relay.error.v1"
+        assert document["status"] == expected_status
+        assert document["reason"] == expected_reason
+        assert "framework internals" not in document["detail"]
 
 
 def test_owned_session_api_stamps_jobs_and_gateways_with_server_ownership(
@@ -1719,10 +2081,15 @@ def test_session_job_submission_rejects_missing_and_stale_identity(
     )
 
     assert missing.status_code == 409
+    assert missing.json()["reason"] == "session_binding_headers_required"
     assert stale.status_code == 409
+    assert stale.json()["reason"] == "session_binding_identity_mismatch"
     assert wrong_session.status_code == 409
+    assert wrong_session.json()["reason"] == "session_binding_identity_mismatch"
     assert missing_gateway.status_code == 409
+    assert missing_gateway.json()["reason"] == "session_binding_headers_required"
     assert stale_gateway.status_code == 409
+    assert stale_gateway.json()["reason"] == "session_binding_identity_mismatch"
     assert wrong_cluster_gateway.status_code == 409
     assert queue.list_jobs() == []
     assert queue.list_gateway_sessions() == []
@@ -1734,19 +2101,16 @@ def test_session_job_submission_rejects_missing_and_stale_identity(
         core_dir=tmp_path / "unbound-core",
         spool_dir=tmp_path / "unbound-spool",
         api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
     )
-    unbound = cast(Any, TestClient(create_app(unbound_settings))).post(
-        "/jobs/jarvis-pipeline",
-        headers={
-            **authorization,
-            OWNER_SESSION_ID_HEADER: "desktop-session-1",
-            SESSION_GENERATION_ID_HEADER: "generation-1",
-        },
-        json=payload,
-    )
-    assert unbound.status_code == 200
-    assert unbound.json()["owner_session_id"] == "desktop-session-1"
-    assert unbound.json()["owner_session_generation_id"] == "generation-1"
+    with pytest.raises(
+        ConfigurationError,
+        match="owned relay session API requires process-bound cluster authority",
+    ):
+        create_app(unbound_settings)
 
 
 def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cache(
@@ -1789,7 +2153,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         pytest.fail("owned API must not consult its cluster-local cache")
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         fail_on_cluster_cache,
     )
     client = cast(
@@ -1885,7 +2249,7 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
         return expected_digest
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -1918,6 +2282,736 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
     assert isinstance(job.spec, McpCallSpec)
     assert job.spec.expected_server_artifact_digest == expected_digest
     assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
+
+
+def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#228: the pinned route must resolve its launcher from the CLUSTER's own
+    registered relay_install_receipt/dev_mode -- never this process's ambient
+    current installation, which a multi-tenant host may share with an
+    unrelated, version-skewed deployment.
+    """
+    pinned_receipt_remote_path = "/home/operator/deployment-p5run2/install-receipt.json"
+    pinned_receipt = Path(pinned_receipt_remote_path).expanduser()
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt_remote_path,
+        dev_mode=True,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    observed: list[dict[str, object]] = []
+
+    def fake_server(
+        *,
+        receipt_path: Path | None = None,
+        cluster: str | None = None,
+        dev_mode: bool | None = None,
+        findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
+    ) -> str:
+        observed.append(
+            {"fn": "server", "receipt_path": receipt_path, "cluster": cluster, "dev_mode": dev_mode}
+        )
+        return "clio-kit"
+
+    def fake_server_args(
+        *,
+        receipt_path: Path | None = None,
+        cluster: str | None = None,
+        dev_mode: bool | None = None,
+        registered_command: list[str] | None = None,
+    ) -> list[str]:
+        observed.append(
+            {
+                "fn": "server_args",
+                "receipt_path": receipt_path,
+                "cluster": cluster,
+                "dev_mode": dev_mode,
+            }
+        )
+        return ["mcp-server", "jarvis"]
+
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", fake_server)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server_args", fake_server_args)
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "pinned-receipt",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(observed) == 2
+    for call in observed:
+        assert call["receipt_path"] == pinned_receipt
+        assert call["cluster"] == "test-cluster"
+        assert call["dev_mode"] is True
+
+
+def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#228: an unhandled launcher-verification ValueError must not escape as
+    a bare 500 -- it must surface as a typed 409 the caller can act on.
+    """
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+
+    def failing_server(
+        *,
+        receipt_path: Path | None = None,
+        cluster: str | None = None,
+        dev_mode: bool | None = None,
+        findings: VerificationFindings | None = None,
+        registered_command: list[str] | None = None,
+    ) -> str:
+        raise ValueError("receipt-bound clio-kit runtime identity did not verify")
+
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", failing_server)
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "launcher-failure",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "did not verify" in response.json()["detail"]
+
+
+def _write_home_anchored_receipt_and_patch_expanduser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Write a minimal receipt under a fake home and route expanduser() to it.
+
+    Returns the ``$HOME/``-anchored ``relay_install_receipt`` value to
+    register on a :class:`ClusterDefinition` -- ``ClusterDefinition``
+    requires an absolute POSIX path or a ``$HOME/``-anchored one, so a raw
+    local tmp_path (a Windows path in CI) cannot be registered directly.
+    """
+    fake_home = tmp_path / "home" / "operator"
+    receipt_path = fake_home / "deployment-p5run2" / "install-receipt.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    write_install_receipt(install_spec="checkout", path=receipt_path)
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
+    return "$HOME/deployment-p5run2/install-receipt.json"
+
+
+def _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    launcher: str,
+) -> str:
+    """Write a receipt whose clio-kit component has a constructible launcher
+    command but cannot verify (no runtime_artifact_path/persistent_tool/
+    locked_server_runtime), so ``jarvis_mcp_runtime_identity`` returns this
+    exact ``launcher`` command alongside ``artifact_identity_verified=False``.
+
+    This is the shape #228 rework round 2 exists for: a PINNED receipt that
+    LOADS and names a real launcher, but whose deeper identity cannot be
+    verified. dev mode must relax the VERIFICATION only -- it must use this
+    receipt's OWN launcher command, never silently substitute
+    DEFAULT_JARVIS_MCP_COMMAND (the box-global default, a foreign tenant's
+    binary on a multi-tenant host).
+    """
+    fake_home = tmp_path / "home" / "operator"
+    receipt_path = fake_home / "deployment-p5run2" / "install-receipt.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    write_install_receipt(
+        install_spec="checkout",
+        path=receipt_path,
+        component_artifacts={
+            "clio-kit": ComponentArtifactIdentity(
+                distribution="clio-kit",
+                install_spec="clio-kit==2.7.2",
+                requested_source="pypi",
+                runtime_command=[launcher, "mcp-server", "jarvis"],
+            )
+        },
+    )
+
+    def fake_expanduser(value: str) -> str:
+        if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return value
+
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
+    return "$HOME/deployment-p5run2/install-receipt.json"
+
+
+def test_owned_jarvis_mcp_submission_home_expansion_failure_surfaces_typed_not_500(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: expand_remote_value_on_host() raises
+    ConfigurationError (not ValueError) when HOME expansion is requested but
+    the executing account has no home directory. Before this round, that
+    call sat OUTSIDE the try/except that only caught ValueError, so this
+    specific failure escaped as a bare unhandled 500 -- the exact defect
+    class #228 exists to eliminate everywhere else in this route.
+    """
+
+    def homeless_expanduser(value: str) -> str:
+        return "" if value == "~" else value
+
+    # split/http-api-w3 (iowarp/clio-relay#231): see the comment on the
+    # fake_expanduser patch sites above.
+    monkeypatch.setattr(os.path, "expanduser", homeless_expanduser)
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt="$HOME/deployment-p5run2/install-receipt.json",
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "home-expansion-failure",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "requires a home directory to expand" in response.json()["detail"]
+
+
+def test_owned_jarvis_mcp_submission_expands_home_anchored_pinned_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: a ``$HOME/``-anchored ``relay_install_receipt``
+    pin must be expanded against this process's own home before resolution.
+
+    ``Path.expanduser()`` only expands a leading ``~`` and leaves a literal
+    ``$HOME/`` prefix untouched, so a ``$HOME/``-anchored pin previously
+    resolved to a path that can never exist on disk -- and because a missing
+    EXPLICIT pin fell through to the silent box-global default launcher
+    (fixed separately in this rework), the wrong, unpinned launcher ran with
+    a bare 200, indistinguishable from a correctly pinned success. Unlike
+    the threading tests above, ``jarvis_mcp_server``/``jarvis_mcp_server_args``
+    are deliberately left UNMOCKED here so real resolution -- including the
+    $HOME expansion -- runs end to end against a receipt written at the
+    expanded location.
+    """
+    # A minimal, loadable receipt with no clio-kit component: real
+    # resolution must find this exact file (proving the $HOME expansion
+    # reached the right path) and refuse typed on its known verification
+    # gap, never silently fall back to the box default launcher.
+    pinned_receipt = _write_home_anchored_receipt_and_patch_expanduser(tmp_path, monkeypatch)
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "home-anchored-receipt",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "no clio-kit component artifact" in response.json()["detail"]
+
+
+def test_owned_jarvis_mcp_submission_cluster_dev_mode_downgrades_launcher_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: a cluster ``dev_mode: true`` pin must
+    actually take the dev-mode downgrade path end to end (200) -- and the
+    downgrade must relax VERIFICATION only, never SUBSTITUTE a different
+    binary. The submitted job's spec.server/spec.server_args must be the
+    PINNED receipt's own (unverified) launcher, never
+    DEFAULT_JARVIS_MCP_COMMAND (the box-global default -- on a multi-tenant
+    host, a foreign tenant's binary). An earlier version of this test
+    asserted only status_code == 200, which is equally true of the
+    box-global substitution defect this round fixes -- asserting only that
+    certifies the bug, not the fix.
+    """
+    pinned_receipt = _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
+        tmp_path, monkeypatch, launcher="pinned-clio-kit"
+    )
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt,
+        dev_mode=True,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "cluster-dev-mode-true",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    spec = response.json()["spec"]
+    assert spec["server"] == "pinned-clio-kit"
+    assert spec["server_args"] == ["mcp-server", "jarvis"]
+
+
+def test_owned_jarvis_mcp_submission_host_dev_mode_env_survives_cluster_dev_mode_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework: cluster ``dev_mode: false`` must defer to the
+    host's ``CLIO_RELAY_DEV_MODE`` switch, never mask it.
+
+    clio-relay#211's contract is "either is sufficient": CLIO_RELAY_DEV_MODE=1
+    on the host running this session API process must still downgrade
+    verification even when the owned session's cluster never opted in.
+    Before this rework, the caller passed the cluster's ``dev_mode`` value
+    (``False``, not ``None``) straight through, which overrode the host env
+    and forced production (raising) behavior regardless -- exactly the ares
+    failure mode: a pinned route that fails when the caller believed
+    CLIO_RELAY_DEV_MODE=1 should have downgraded it.
+
+    Round 2: the downgrade must also relax VERIFICATION only, never
+    SUBSTITUTE a different binary -- asserts the PINNED launcher, not just
+    200, for the same reason as the sibling test above.
+    """
+    pinned_receipt = _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
+        tmp_path, monkeypatch, launcher="pinned-clio-kit"
+    )
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt,
+        dev_mode=False,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "host-dev-mode-env",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    spec = response.json()["spec"]
+    assert spec["server"] == "pinned-clio-kit"
+    assert spec["server_args"] == ["mcp-server", "jarvis"]
+
+
+def test_owned_jarvis_mcp_submission_dev_mode_downgrade_reason_lands_in_job_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: a dev-mode-downgraded pinned launcher
+    resolution must attach a typed, queryable reason to the DURABLE job
+    record -- the same "never a silent downgrade" contract
+    VerificationFindings/DEV_MODE_BANNER already establishes for every other
+    dev-mode-gated check in this codebase (installation_info(),
+    worker_runtime_info(), ...). Before this round, jarvis_mcp_command()
+    recorded the reason into an internally-constructed VerificationFindings
+    that http_api never passed in or read -- so the downgrade genuinely
+    happened but left no trace anywhere the caller could see it.
+    """
+    pinned_receipt = _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
+        tmp_path, monkeypatch, launcher="pinned-clio-kit"
+    )
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt,
+        dev_mode=True,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "dev-mode-downgrade-reason",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    downgrade = response.json()["metadata"][JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY]
+    assert downgrade["reason"] == JARVIS_MCP_PINNED_LAUNCHER_UNVERIFIED_REASON
+    assert downgrade["cluster"] == "test-cluster"
+    assert downgrade["dev_mode_warnings"]
+    assert any("wheel is missing" in warning for warning in downgrade["dev_mode_warnings"])
+
+
+def test_owned_jarvis_mcp_submission_dev_mode_never_substitutes_when_no_command_constructible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2 (design ruling): "If the pinned receipt
+    loads but no launcher path can be constructed from it: typed refusal,
+    never the default command." A receipt with NO clio-kit component at all
+    has no launcher to fall back to even in dev mode -- unlike the sibling
+    tests above (which have a component with a constructible command), this
+    must stay a typed 409, not a 200 with the box-global default.
+    """
+    pinned_receipt = _write_home_anchored_receipt_and_patch_expanduser(tmp_path, monkeypatch)
+    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
+
+    definition = ClusterDefinition(
+        name="test-cluster",
+        ssh_host="test-cluster",
+        relay_install_receipt=pinned_receipt,
+        dev_mode=True,
+    )
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "dev-mode-no-command",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "no valid clio-kit runtime command" in response.json()["detail"]
+
+
+def test_owned_jarvis_mcp_submission_ambient_dev_mode_downgrade_reason_lands_in_job_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#228 rework round 2: the AMBIENT (no cluster-scoped pin)
+    case keeps its historical behavior -- falling back to
+    DEFAULT_JARVIS_MCP_COMMAND on a dev-mode-downgraded verification
+    failure -- untouched, but its downgrade reason must ALSO reach the
+    durable job record (tagged distinctly from the pinned-route reason
+    above), since it goes through the identical shared findings mechanism.
+    """
+    ambient_receipt_path = tmp_path / "ambient-current" / "install-receipt.json"
+    ambient_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    write_install_receipt(install_spec="checkout", path=ambient_receipt_path)
+    monkeypatch.setenv(INSTALL_RECEIPT_PATH_ENV, str(ambient_receipt_path))
+    monkeypatch.setenv(DEV_MODE_ENV, "1")
+
+    # No relay_install_receipt registered on the cluster: pinned_receipt_path
+    # resolves to None, so resolution falls through to the ambient path.
+    definition = ClusterDefinition(name="test-cluster", ssh_host="test-cluster")
+    _bind_owned_session_cluster_authority(monkeypatch, tmp_path, definition=definition)
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="test-cluster",
+        session_owner_token="o" * 32,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    queue.prepare_owner_session_start(
+        "desktop-session-1",
+        recorded_generation_id=None,
+        candidate_generation_id="generation-1",
+    )
+    client = cast(
+        Any,
+        TestClient(
+            create_app(settings),
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/jobs/jarvis-mcp-call",
+        json={
+            "cluster": "test-cluster",
+            "tool": "jarvis_get_execution",
+            "arguments": {"pipeline_id": "pipeline", "execution_id": "execution-1"},
+            "idempotency_key": "ambient-dev-mode-downgrade-reason",
+            "expected_server_artifact_digest": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    spec = response.json()["spec"]
+    # Ambient path keeps its historical fallback -- unchanged.
+    assert spec["server"] == "clio-kit"
+    assert spec["server_args"] == ["mcp-server", "jarvis"]
+    downgrade = response.json()["metadata"][JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY]
+    assert downgrade["reason"] == JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON
+    assert downgrade["cluster"] == "test-cluster"
+    assert downgrade["dev_mode_warnings"]
 
 
 def test_owned_session_submission_race_with_quiesce_returns_conflict(
@@ -2175,14 +3269,15 @@ def test_owned_session_api_filters_jobs_redacts_capabilities_and_quiesces_intake
         spec=JarvisRunSpec(command=["true"]),
         idempotency_key="rejected-after-quiesce",
     )
-    assert client.post("/jobs", json=new_job.model_dump(mode="json")).status_code == 409
-    assert (
-        client.post(
-            "/gateway-sessions",
-            json={"cluster": "test-cluster", "name": "rejected-after-quiesce"},
-        ).status_code
-        == 409
+    rejected_job = client.post("/jobs", json=new_job.model_dump(mode="json"))
+    rejected_gateway = client.post(
+        "/gateway-sessions",
+        json={"cluster": "test-cluster", "name": "rejected-after-quiesce"},
     )
+    assert rejected_job.status_code == 409
+    assert rejected_job.json()["reason"] == "session_intake_closed"
+    assert rejected_gateway.status_code == 409
+    assert rejected_gateway.json()["reason"] == "session_intake_closed"
 
 
 def test_http_job_status_includes_relay_queue_and_scheduler(tmp_path: Path) -> None:

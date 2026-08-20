@@ -287,7 +287,7 @@ workspace. Absolute paths are accepted only when the verified file remains
 inside it.
 
 Both JARVIS doors stage through the same plane. A registered route reaches it
-through its `clio-kit-jarvis-user-v3.6` registration; the built-in `jarvis_*`
+through its `clio-kit-jarvis-user-v3.7.1` registration; the built-in `jarvis_*`
 tools reach it through the relay's own pinned clio-kit release, whose contract
 digest and JARVIS-CD lock take the place of a registration revision in the
 staged route identity. The built-in door engages staging only when the JARVIS
@@ -298,7 +298,7 @@ Staging is schema-driven, not filename-driven. It is enabled only when all of
 these statements are true:
 
 - the door is the built-in JARVIS route, or a registration declares exactly
-  `contract: clio-kit-jarvis-user-v3.6` and its immutable server artifact and
+  `contract: clio-kit-jarvis-user-v3.7.1` and its immutable server artifact and
   discovered schemas match that contract;
 - the same route first completes
   `jarvis_describe(target="package", package_name=...,
@@ -434,7 +434,7 @@ that returns the handle, never for workload completion. Use
 an explicit `idempotency_key` only when retry de-duplication is intentional; an
 identical second `jarvis_run` is otherwise a new execution.
 
-The released clio-kit 2.7.2 artifact carries the pinned six-tool JARVIS v3.6
+The released clio-kit 2.7.2 artifact carries the pinned six-tool JARVIS v3.7.1
 contract.
 Bootstrap
 downloads and hashes the exact coordinated wheel, installs it once with
@@ -469,18 +469,18 @@ selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel bootstrap installs by default is
-`clio_kit-2.7.2-py3-none-any.whl` with SHA-256
-`8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5`.
-Its canonical contract is `clio-kit-jarvis-user-v3.6`. The relay's own
+`clio_kit-2.10.2-py3-none-any.whl` with SHA-256
+`315640571cd49d458c946c03676b0bd50216ebcf0c3d9974988dea2090d5ec0d`.
+Its canonical contract is `clio-kit-jarvis-user-v3.7.1`. The relay's own
 vendored certification snapshot of that contract (used to cross-check the
-bundled `_contracts/jarvis-user-v3.6.json` copy against a known-good
+bundled `_contracts/jarvis-user-v3.7.1.json` copy against a known-good
 clio-kit release, independent of which wheel bootstrap installs) is
 re-certified against the same clio-kit 2.7.2 build: contract SHA-256
-`a326af259e50b57b19b7aa1d209720d5a71e57d7c2e64979596c4fc21850bdda`,
+`ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849`,
 canonical tools-wire SHA-256
-`0f912b4dfa7135448834f915984ca413f77b73ef53b0f758594006cd7551cd35`, and
+`b17ab5c0f19afbac934e464641668d250beac176b6cfde06c1ce9b50f50d0b6c`, and
 bundled contract artifact SHA-256
-`08c86eda618ec83109fa3c86fe28eccfd44c1ed0e647b93bcb0a82e470fd0d5e`.
+`3c22d89d1bbc4acda49dc6e324566224de38e01a1c80c3879c66305678adfdbe`.
 (clio-kit 2.7.2 added a `title` key to every user-profile tool, which shifts
 all three digests from the pre-2.7.2 values; clio-relay#199.)
 The nested runtime lock is bound to the public

@@ -29,16 +29,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.7.2"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.10.2"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
+    "315640571cd49d458c946c03676b0bd50216ebcf0c3d9974988dea2090d5ec0d"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.7.1"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -49,6 +49,27 @@ JARVIS_MCP_SPACK_COMMAND_ENV = "JARVIS_MCP_SPACK_COMMAND"
 VIRTUAL_JARVIS_PREFIX = "jarvis_"
 JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 
+#: RelayJob.metadata key a dev-mode-downgraded PINNED launcher resolution is
+#: recorded under (clio-relay#228 rework). dev mode relaxes VERIFICATION of a
+#: pinned receipt -- it must never SUBSTITUTE a different binary -- so when a
+#: pinned receipt's identity fails to verify and dev mode is on, the pinned
+#: receipt's OWN (unverified) launcher is still used and this typed reason is
+#: attached to the durable job spec, exactly the "never a silent downgrade"
+#: contract clio_relay.dev_mode.VerificationFindings already establishes for
+#: every other dev-mode-gated check.
+JARVIS_MCP_LAUNCHER_DOWNGRADE_METADATA_KEY = "jarvis_mcp_launcher_downgrade"
+
+#: Typed reason recorded when a PINNED launcher's identity failed to verify
+#: but dev mode downgraded the failure to a warning and used the pinned
+#: receipt's own launcher anyway (never the box-global default).
+JARVIS_MCP_PINNED_LAUNCHER_UNVERIFIED_REASON = "jarvis_mcp_pinned_launcher_identity_unverified"
+
+#: Typed reason recorded when an AMBIENT (no cluster-scoped pin) launcher's
+#: identity failed to verify but dev mode downgraded the failure to a
+#: warning and fell back to :data:`DEFAULT_JARVIS_MCP_COMMAND`, its
+#: historical, unchanged behavior.
+JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON = "jarvis_mcp_ambient_launcher_identity_unverified"
+
 JSON = dict[str, Any]
 
 # CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 / CLIO_KIT_JARVIS_USER_WIRE_SHA256 are
@@ -56,7 +77,7 @@ JSON = dict[str, Any]
 # modules carried independent duplicate literals for the same clio-kit
 # contract digest until clio-relay#199 consolidated them to remote_mcp's
 # CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID as the sole source of truth.
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.6.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",
@@ -214,37 +235,107 @@ _VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES = _load_bundled_jarvis_user_c
 
 def jarvis_mcp_command(
     *,
+    receipt_path: Path | None = None,
+    cluster: str | None = None,
     dev_mode: bool | None = None,
     findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
 ) -> list[str]:
     """Return the command used on the cluster to launch the JARVIS MCP server.
+
+    ``receipt_path`` pins resolution to one exact install receipt -- normally
+    the CLUSTER's own registered ``relay_install_receipt`` (clio-relay#205's
+    per-cluster pin) -- instead of this PROCESS's ambient current installation
+    (:func:`clio_relay.installation.default_install_receipt_path`, which
+    resolves through the box-global ``current`` symlink). A multi-tenant host
+    running more than one relay deployment must never let one deployment's
+    JARVIS MCP launcher resolve through another's shared box-global state
+    (clio-relay#228); omit it only where no cluster-scoped pin is available.
+
+    A ``receipt_path`` explicitly passed by the caller is an EXPLICIT pin: if
+    it does not exist or cannot be loaded, resolution raises a typed
+    ``ValueError`` naming ``cluster`` when given (matching
+    :func:`clio_relay.installation.worker_runtime_info`'s "cluster {cluster}
+    pinned install receipt could not be loaded" refusal) rather than
+    silently falling back to :data:`DEFAULT_JARVIS_MCP_COMMAND` -- that
+    fallback is reserved for the OMITTED (ambient, no cluster-scoped pin
+    available) case only, exactly as before clio-relay#228 (clio-relay#228
+    rework). Silently running the box-global default launcher in place of an
+    unloadable explicit pin is the exact wrong-tenant hazard this fix exists
+    to kill.
 
     ``dev_mode`` defaults to :func:`clio_relay.dev_mode.dev_mode_enabled` (the
     ``CLIO_RELAY_DEV_MODE`` environment switch) when omitted, so every
     existing caller honors the environment switch for free (clio-relay#211).
     When the receipt-bound clio-kit contract/digest identity does not
-    verify, dev mode records the exact production error on ``findings`` and
-    falls back to :data:`DEFAULT_JARVIS_MCP_COMMAND` -- the same fallback
-    already used when no receipt exists at all -- instead of raising and
-    blocking the worker's JARVIS MCP server from starting at all.
+    verify, dev mode records the exact production error on ``findings``.
+
+    dev mode relaxes VERIFICATION of a receipt -- it must NEVER substitute a
+    different binary for a PINNED (explicit ``receipt_path``) route
+    (clio-relay#228 rework). So on a pinned route, an unverified identity
+    still resolves to the PINNED receipt's own (unverified) launcher command
+    when one can be constructed from it; only when the receipt carries no
+    constructible launcher at all (e.g. no clio-kit component artifact) does
+    it raise the same typed refusal a failed OMITTED-path receipt already
+    would. The OMITTED (ambient, no cluster-scoped pin) case keeps its
+    historical behavior exactly: falls back to
+    :data:`DEFAULT_JARVIS_MCP_COMMAND` -- the same fallback already used
+    when no receipt exists at all -- instead of raising and blocking the
+    worker's JARVIS MCP server from starting at all.
     """
     resolved_dev_mode = dev_mode_enabled() if dev_mode is None else dev_mode
     findings = findings if findings is not None else VerificationFindings()
     configured = os.environ.get(JARVIS_MCP_COMMAND_ENV)
     if configured is not None and configured.strip():
         return _decode_command(configured)
+    from clio_relay.errors import ConfigurationError
     from clio_relay.installation import default_install_receipt_path, load_install_receipt
 
-    receipt_path = default_install_receipt_path()
-    if not receipt_path.exists():
-        return list(DEFAULT_JARVIS_MCP_COMMAND)
-    receipt = load_install_receipt(receipt_path)
+    explicit_receipt_path = receipt_path is not None
+    resolved_receipt_path = (
+        receipt_path if receipt_path is not None else default_install_receipt_path()
+    )
+    if explicit_receipt_path:
+        try:
+            receipt = load_install_receipt(resolved_receipt_path)
+        except ConfigurationError as exc:
+            prefix = f"cluster {cluster} " if cluster else ""
+            raise ValueError(f"{prefix}pinned install receipt could not be loaded: {exc}") from exc
+    else:
+        if not resolved_receipt_path.exists():
+            return list(DEFAULT_JARVIS_MCP_COMMAND)
+        receipt = load_install_receipt(resolved_receipt_path)
     identity = jarvis_mcp_runtime_identity(receipt)
     if identity.get("artifact_identity_verified") is not True:
         reason = identity.get("error") or "receipt-bound clio-kit runtime identity did not verify"
         if not resolved_dev_mode:
             raise ValueError(str(reason))
         findings.record(str(reason))
+        if explicit_receipt_path:
+            # clio-relay#228 rework: dev mode relaxes VERIFICATION only. A
+            # PINNED route must never have its launcher silently SUBSTITUTED
+            # for the box-global default -- that is the exact wrong-tenant
+            # hazard #228 exists to kill, and returning
+            # DEFAULT_JARVIS_MCP_COMMAND here would recreate it on every
+            # multi-tenant host with dev mode on. Use the pinned receipt's
+            # own (unverified) launcher command when one is constructible;
+            # fall through to the same typed refusal below otherwise.
+            unverified_command = identity.get("command")
+            if isinstance(unverified_command, list) and all(
+                isinstance(item, str) for item in cast(list[object], unverified_command)
+            ):
+                return cast(list[str], unverified_command)
+            if registered_command:
+                # Dev channel: the receipt carries no kit component (e.g. a
+                # relay-only --self re-mint) but the cluster REGISTRATION
+                # names the exact kit launcher — the same source the queue
+                # lane trusts. Still never the box-global default.
+                findings.record(
+                    "pinned receipt has no clio-kit runtime command; using the "
+                    "cluster-registered jarvis command"
+                )
+                return list(registered_command)
+            raise ValueError("pinned install receipt has no valid clio-kit runtime command")
         return list(DEFAULT_JARVIS_MCP_COMMAND)
     command = identity.get("command")
     if not isinstance(command, list):
@@ -559,14 +650,40 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def jarvis_mcp_server() -> str:
+def jarvis_mcp_server(
+    *,
+    receipt_path: Path | None = None,
+    cluster: str | None = None,
+    dev_mode: bool | None = None,
+    findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
+) -> str:
     """Return the executable component of the JARVIS MCP command."""
-    return jarvis_mcp_command()[0]
+    return jarvis_mcp_command(
+        receipt_path=receipt_path,
+        cluster=cluster,
+        dev_mode=dev_mode,
+        findings=findings,
+        registered_command=registered_command,
+    )[0]
 
 
-def jarvis_mcp_server_args() -> list[str]:
+def jarvis_mcp_server_args(
+    *,
+    receipt_path: Path | None = None,
+    cluster: str | None = None,
+    dev_mode: bool | None = None,
+    findings: VerificationFindings | None = None,
+    registered_command: list[str] | None = None,
+) -> list[str]:
     """Return the argument component of the JARVIS MCP command."""
-    return jarvis_mcp_command()[1:]
+    return jarvis_mcp_command(
+        receipt_path=receipt_path,
+        cluster=cluster,
+        dev_mode=dev_mode,
+        findings=findings,
+        registered_command=registered_command,
+    )[1:]
 
 
 def is_virtual_jarvis_control_query(remote_tool: str) -> bool:
@@ -720,10 +837,13 @@ def jarvis_mcp_artifact_binding_from_entry(
         raise ValueError("JARVIS MCP discovery does not contain the exact user tool set")
     server_artifact = entry.provenance.server_artifact
     if not jarvis_mcp_server_artifact_verified(server_artifact):
-        raise ValueError(
-            "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
-            "unverified; run jarvis-mcp-refresh"
-        )
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise ValueError(
+                "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
+                "unverified; run jarvis-mcp-refresh"
+            )
     return remote_mcp_server_artifact_digest(server_artifact)
 
 

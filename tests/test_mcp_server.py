@@ -15,6 +15,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from clio_relay import mcp_server as mcp_server_module
+from clio_relay import relay_ops as relay_ops_module
+from clio_relay.bounded_payload import build_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -311,6 +313,8 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "relay_storage_status",
         "relay_bind_jarvis_runtime",
         "relay_artifact_lineage",
+        "relay_list_artifacts",
+        "relay_read_artifact",
         "jarvis_create_pipeline",
         "jarvis_describe",
         "jarvis_add_step",
@@ -441,8 +445,11 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "artifact_id",
         "page_size",
         "cursor",
+        "content_max_bytes",
     }
     assert artifact_query["properties"]["page_size"]["maximum"] == 100
+    content_max_bytes = artifact_query["properties"]["content_max_bytes"]["anyOf"][0]
+    assert content_max_bytes == {"type": "integer", "minimum": 1, "maximum": 65536}
     assert query_tool["outputSchema"]["properties"]["kind"] == {
         "type": "string",
         "const": "mcp_call",
@@ -472,6 +479,18 @@ def test_mcp_lists_relay_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     for name in ("relay_observe", "relay_wait"):
         log_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
         assert log_tool["inputSchema"]["properties"]["log_limit"]["maximum"] == 32_768
+    observe_tool = next(
+        tool for tool in response["result"]["tools"] if tool["name"] == "relay_observe"
+    )
+    assert observe_tool["inputSchema"]["properties"]["until_pattern"]["maxLength"] == 512
+    assert observe_tool["inputSchema"]["properties"]["pattern_scope"]["items"]["enum"] == [
+        "stdout",
+        "stderr",
+        "progress",
+        "events",
+    ]
+    assert "whichever happens first" in observe_tool["description"]
+    assert "matched=false" in observe_tool["description"]
     for name in ("relay_status", "relay_cancel", "relay_observe", "relay_wait"):
         followup_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == name)
         description = followup_tool["description"]
@@ -3129,6 +3148,367 @@ def test_waited_owned_jarvis_call_returns_bounded_artifact_bound_failure(
     ]
 
 
+def _owned_jarvis_success_scenario(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    idempotency_key: str,
+    admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD,
+) -> tuple[RelaySettings, RelayJob]:
+    """Shared setup for the D16/D14/D15 owned-collection regression tests below."""
+
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    registry_path = tmp_path / "clusters.json"
+    ClusterRegistry(clusters={"ares": definition}).save(registry_path)
+    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
+    _bind_virtual_jarvis_catalog(monkeypatch, cluster="ares")
+
+    def artifact_binding(_cluster: str) -> str:
+        return "a" * 64
+
+    monkeypatch.setattr(
+        "clio_relay.mcp_server.jarvis_mcp_artifact_binding",
+        artifact_binding,
+    )
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        remote_cluster="ares",
+    )
+    queued = RelayJob(
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="clio-kit",
+            server_args=["mcp-server", "jarvis"],
+            expected_server_artifact_digest="a" * 64,
+            tool="jarvis_run",
+            arguments={"pipeline_id": "simulation"},
+            admission_class=admission_class,
+        ),
+        idempotency_key=idempotency_key,
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+    return settings, queued
+
+
+def _call_jarvis_run(
+    queue: ClioCoreQueue,
+    settings: RelaySettings,
+) -> dict[str, Any]:
+    session = McpSessionState()
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "jarvis_run",
+                "arguments": {
+                    "cluster": "ares",
+                    "pipeline_id": "simulation",
+                    "wait_for_terminal": True,
+                    "wait_timeout_seconds": 600,
+                },
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+        session=session,
+    )
+    assert response is not None
+    return response
+
+
+def test_owned_artifact_pagination_rejects_a_page_that_understates_its_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D16 -- FALSE POSITIVE, verified by both the review and the
+    implementer: the audit's static read compared only each paginator's own
+    post-loop ``if len(records) != total: raise`` line and found
+    ``_complete_owned_collection`` alone lacking one. On the real code, all
+    three siblings -- ``_complete_owned_collection`` included -- already
+    call the SAME shared ``_validate_complete_collection_page`` helper
+    inside their loop, whose ``next_cursor is None and collected_count +
+    page_count != total`` check is mathematically identical to the
+    post-loop check and fires first (its own message: "... ended before its
+    declared total"). So a truncated owned-session page was never actually
+    silently accepted -- this test proves that directly, against the real
+    code, and it passes.
+
+    An earlier revision of this batch added a redundant post-loop
+    ``if len(records) != total: raise`` line to ``_complete_owned_collection``
+    for structural symmetry with its two siblings; a fix round removed it
+    again (it was provably dead -- unreachable behind the in-loop check
+    above -- and its message could never be emitted, only mislead a future
+    reader grepping for it) and replaced it with a comment pointing back
+    here. The live D14/D15 gap in the D16->D14->D15 chain is closed by the
+    sibling test below, which DOES fail red against the pre-batch code."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path, monkeypatch, idempotency_key="owned-artifact-page-truncated"
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+
+    class TruncatingOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> TruncatingOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # Claims to be the last page (next_cursor=None) but total
+                # says 2 records exist while this page returned 0 -- a page
+                # that understated its own total, the D16 scenario.
+                return {
+                    "artifacts": [],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 2,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        TruncatingOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "ended before its declared total" in response["error"]["message"]
+
+
+def test_owned_jarvis_success_with_no_mcp_result_artifact_fails_loud_not_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILING-FIRST (D14/D15): a SUCCEEDED MCP_CALL job whose artifact listing
+    is complete (unlike the D16 case above) but carries no ``kind=mcp_result``
+    record must not produce a bounded receipt with ``isError`` left ``False``
+    and no ``mcp_result`` key at all -- a missing payload indistinguishable
+    from a real success (relay#215's underlying symptom class, and D17's
+    structural gap made visible). ``_verified_owned_mcp_result``'s
+    ``require_result=True`` path (set because this job is a succeeded
+    MCP_CALL) must raise a typed, loud reason instead of the bare ``None``
+    it used to return."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path, monkeypatch, idempotency_key="owned-jarvis-missing-mcp-result"
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+
+    class NoResultArtifactOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> NoResultArtifactOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # A COMPLETE page (total matches the collected count -- D16's
+                # check is satisfied) that simply has no mcp_result-kind
+                # artifact among what the job actually produced.
+                return {
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact_stdout_only",
+                            "job_id": queued.job_id,
+                            "kind": "stdout",
+                            "size_bytes": 0,
+                            "sha256": "0" * 64,
+                            "created_at": "2026-07-16T12:38:30Z",
+                        }
+                    ],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        NoResultArtifactOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "no mcp_result artifact was found" in response["error"]["message"]
+    assert queued.job_id in response["error"]["message"]
+
+
+def test_owned_control_query_success_with_no_mcp_result_artifact_fails_loud_not_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2 (review): ``_owned_mcp_result_is_required`` used to exempt
+    ``CONTROL_QUERY``-class jobs from this exact guard on the theory that
+    they are answered outside the ordinary spooled worker/artifact
+    pipeline -- false against live evidence (a live CONTROL_QUERY
+    ``jarvis_describe`` job carries its own ``mcp_result`` artifact just
+    like any WORKLOAD job), and it silently exempted exactly the two
+    curated read operations (``jarvis_describe``/``jarvis_get_execution``)
+    that make up 8 of 11 live-captured task records. This is the sibling of
+    ``test_owned_jarvis_success_with_no_mcp_result_artifact_fails_loud_not_silent``
+    above with ``admission_class=CONTROL_QUERY``: before the exclusion was
+    removed, this exact scenario would have returned a bounded receipt with
+    ``isError`` left ``False`` and no ``mcp_result`` key -- a silent wrong
+    answer. It must now raise the identical typed, loud reason."""
+
+    settings, queued = _owned_jarvis_success_scenario(
+        tmp_path,
+        monkeypatch,
+        idempotency_key="owned-control-query-missing-mcp-result",
+        admission_class=McpAdmissionClass.CONTROL_QUERY,
+    )
+    terminal = queued.model_copy(update={"state": JobState.SUCCEEDED})
+    assert isinstance(terminal.spec, McpCallSpec)
+    assert terminal.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
+
+    class NoResultArtifactOwnedSessionApiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> NoResultArtifactOwnedSessionApiClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del query, body, response_timeout_seconds
+            if path == f"/jobs/{queued.job_id}/wait":
+                return {
+                    **terminal.model_dump(mode="json"),
+                    "observation": {
+                        "outcome": "terminal",
+                        "timeout_seconds": 600,
+                        "scheduler_action": "none",
+                        "relay_action": "none",
+                    },
+                }
+            if path == f"/jobs/{queued.job_id}/artifacts":
+                # A COMPLETE page (D16's check is satisfied) with no
+                # mcp_result-kind artifact -- same shape as the WORKLOAD
+                # sibling above, just on a CONTROL_QUERY job.
+                return {
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact_stdout_only",
+                            "job_id": queued.job_id,
+                            "kind": "stdout",
+                            "size_bytes": 0,
+                            "sha256": "0" * 64,
+                            "created_at": "2026-07-16T12:38:30Z",
+                        }
+                    ],
+                    "cursor": 1,
+                    "limit": 500,
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            raise AssertionError(f"unexpected owned request: {method} {path}")
+
+    def submit_owned(**_kwargs: object) -> RelayJob:
+        return queued
+
+    monkeypatch.setattr(mcp_server_module, "submit_owned_session_job", submit_owned)
+    monkeypatch.setattr(
+        mcp_server_module,
+        "OwnedSessionApiClient",
+        NoResultArtifactOwnedSessionApiClient,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = _call_jarvis_run(queue, settings)
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    assert "no mcp_result artifact was found" in response["error"]["message"]
+    assert queued.job_id in response["error"]["message"]
+
+
 def test_direct_remote_waited_mcp_submission_returns_artifact_bound_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3423,6 +3803,173 @@ def test_oversized_terminal_mcp_result_sets_tool_error_and_preserves_job_evidenc
     assert parsed.document["structured_result"] == {"application_payload": secret}
 
 
+def test_verified_local_mcp_result_surfaces_an_oversized_artifact_as_a_typed_refusal(
+    tmp_path: Path,
+) -> None:
+    """T2 (doc §6.4): when the durable ``mcp_result`` artifact itself exceeds
+    ``relay_ops.MAX_ARTIFACT_CONTENT_BYTES`` (16 MiB), ``read_artifact_bytes``
+    now returns a typed delivery-refusal document instead of raising (R6,
+    #231). ``_verified_local_mcp_result`` must surface that refusal as-is --
+    not fall into ``_decode_verified_mcp_result``, which expects a base64
+    envelope and would otherwise misreport this as a generic malformed-
+    artifact ``ValueError`` (an internal_error on the wire, losing the typed
+    signal entirely).
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = queue.submit_job(
+        RelayJob(
+            cluster="local",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(server="science-mcp", tool="inspect"),
+            idempotency_key="oversized-local-mcp-result",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    artifact_path = owned_root / "mcp-result.json"
+    with artifact_path.open("wb") as stream:
+        stream.truncate(relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=artifact_path.as_uri(),
+            kind="mcp_result",
+            size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+
+    verified = mcp_server_module._verified_local_mcp_result(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        queue, job.job_id
+    )
+
+    assert verified is not None
+    assert verified.document == verified.public
+    assert is_delivery_refusal(verified.document)
+    assert verified.document["artifact"]["artifact_id"] == artifact.artifact_id
+    delivery = verified.document["delivery"]
+    assert delivery["code"] == "artifact_content_too_large"
+    assert delivery["private_evidence_preserved"] is True
+    assert delivery["remote_side_effects_may_have_occurred"] is False
+
+
+def test_mcp_tool_result_failed_recognizes_any_typed_delivery_refusal_not_one_named_code(
+    tmp_path: Path,
+) -> None:
+    """F1 (#231 R6 review, HIGH): ``_mcp_tool_result_failed`` used to key its
+    delivery-refusal branch on ``code == MCP_RESULT_INLINE_LIMIT_CODE``
+    only. An ``artifact_content_too_large`` refusal (``relay_ops.py``'s
+    ``read_artifact_bytes``, doc §6.4/§6.5) carries a DIFFERENT code and
+    fell through to ``False`` -- a SUCCESS ``CallToolResult`` whose body
+    says ``result_available: false``. The fix discriminates on
+    ``is_delivery_refusal`` plus ``delivery.status``, not a single code.
+    """
+    del tmp_path
+    refusal = build_delivery_refusal(
+        code="artifact_content_too_large",
+        message="artifact content exceeds the transfer limit",
+        max_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES,
+        remote_side_effects_may_have_occurred=False,
+    )
+    mcp_result: dict[str, Any] = {"artifact": {"artifact_id": "a"}, **refusal}
+
+    assert mcp_server_module._mcp_tool_result_failed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        {"mcp_result": mcp_result}
+    )
+
+
+def test_oversized_artifact_read_refusal_sets_tool_error_not_a_silent_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 (#231 R6 review, HIGH): the integration-level twin of the unit test
+    above, mirroring ``test_oversized_terminal_mcp_result_sets_tool_error_
+    and_preserves_job_evidence``'s shape for the OTHER T2 refusal code --
+    the durable ``mcp_result`` artifact itself (not its inline JSON body)
+    exceeded the transfer limit. Before the F1 fix, ``relay_wait`` reported
+    ``isError: False`` here even though ``result_available`` was ``false``.
+    """
+    refusal = build_delivery_refusal(
+        code="artifact_content_too_large",
+        message="artifact content exceeds the transfer limit",
+        max_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES,
+        remote_side_effects_may_have_occurred=False,
+    )
+    document: dict[str, Any] = {
+        "artifact": {"artifact_id": "artifact_oversized_mcp_result_source"},
+        **refusal,
+    }
+    source_job = RelayJob(
+        job_id="job_oversized_artifact_source",
+        cluster="ares",
+        kind=JobKind.MCP_CALL,
+        state=JobState.SUCCEEDED,
+        spec=McpCallSpec(server="science-mcp", tool="science_inspect"),
+        idempotency_key="oversized-artifact-fixture",
+    )
+    dummy_payload = b"placeholder"
+    artifact = ArtifactRef(
+        artifact_id="artifact_oversized_mcp_result_source",
+        job_id=source_job.job_id,
+        uri=(tmp_path / "private-mcp-result.json").as_uri(),
+        kind="mcp_result",
+        size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        sha256=hashlib.sha256(dummy_payload).hexdigest(),
+    )
+    receipt: dict[str, Any] = {
+        "cluster": "ares",
+        "job_id": source_job.job_id,
+        "state": "succeeded",
+        "kind": "mcp_call",
+        "terminal": True,
+        "remote": True,
+        "route_revision": "a" * 64,
+    }
+    parsed = mcp_server_module._VerifiedMcpResult(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        document=document,
+        public=document,
+    )
+    mcp_server_module._attach_terminal_mcp_evidence(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        receipt,
+        source_job=source_job,
+        last_error=None,
+        artifacts=[artifact.model_dump(mode="json")],
+        parsed_result=parsed,
+    )
+
+    def waited_result(
+        _arguments: dict[str, Any],
+        *,
+        queue: ClioCoreQueue,
+        settings: RelaySettings,
+    ) -> dict[str, Any]:
+        del queue, settings
+        return receipt
+
+    monkeypatch.setattr(mcp_server_module, "_wait_job", waited_result)
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_wait",
+                "arguments": {"job_id": source_job.job_id},
+            },
+        },
+        queue=ClioCoreQueue(tmp_path / "core"),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
+        profile="user",
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    public_receipt = cast(dict[str, Any], tool_result["structuredContent"])
+    delivery = cast(dict[str, Any], public_receipt["mcp_result"])["delivery"]
+    assert delivery["status"] == "failed"
+    assert delivery["code"] == "artifact_content_too_large"
+
+
 def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3596,6 +4143,35 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     assert submitted.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
     terminal = submitted.model_copy(update={"state": JobState.SUCCEEDED})
     requests: list[tuple[str, str]] = []
+    # A real SUCCEEDED MCP_CALL job always has a durable mcp_result artifact
+    # (D14/D15/D17: the worker writes it unconditionally before marking the
+    # job succeeded) -- reflect that in this fixture so the relay_wait
+    # followup's now-loud require_result guard sees the artifact a real
+    # dispatch would produce, instead of the empty page this fixture
+    # previously stood in for it with.
+    result_payload = json.dumps(
+        {
+            "operation": "tools/call",
+            "tool": "inspect",
+            "returncode": 0,
+            "timed_out": False,
+            "protocol_error": None,
+            "structured_result": {"dataset": "asteroid2018"},
+            "protocol_result": {"isError": False},
+            "protocol_version": "2024-11-05",
+            "server_info": {"name": "science"},
+            "result_validation": None,
+        },
+        sort_keys=True,
+    ).encode()
+    result_artifact = {
+        "artifact_id": "artifact_science_inspect_result",
+        "job_id": submitted.job_id,
+        "kind": "mcp_result",
+        "size_bytes": len(result_payload),
+        "sha256": hashlib.sha256(result_payload).hexdigest(),
+        "created_at": "2026-07-16T12:38:30Z",
+    }
 
     class FakeOwnedSessionApiClient:
         def __init__(self, **_kwargs: object) -> None:
@@ -3643,11 +4219,17 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
                 }
             if path == f"/jobs/{submitted.job_id}/artifacts":
                 return {
-                    "artifacts": [],
+                    "artifacts": [result_artifact],
                     "cursor": 1,
                     "limit": 500,
                     "next_cursor": None,
-                    "total": 0,
+                    "total": 1,
+                }
+            if path == f"/artifacts/{result_artifact['artifact_id']}/content":
+                return {
+                    "artifact": result_artifact,
+                    "encoding": "base64",
+                    "data": base64.b64encode(result_payload).decode("ascii"),
                 }
             raise AssertionError(f"unexpected owned session request: {method} {path}")
 
@@ -3685,6 +4267,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         ("POST", f"/jobs/{submitted.job_id}/wait"),
         ("GET", f"/jobs/{submitted.job_id}/status"),
         ("GET", f"/jobs/{submitted.job_id}/artifacts"),
+        ("GET", f"/artifacts/{result_artifact['artifact_id']}/content"),
     ]
 
     ClusterRegistry(
@@ -3707,7 +4290,7 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
     )
     assert stale is not None
     assert "cluster route changed" in stale["error"]["message"]
-    assert len(requests) == 6
+    assert len(requests) == 7
 
 
 def test_registered_remote_mcp_ssh_forwarding_carries_evidence_not_lane(
@@ -5320,6 +5903,61 @@ def test_mcp_reads_logs_and_artifacts(tmp_path: Path) -> None:
     serialized_error = json.dumps(internal_content_response, sort_keys=True)
     assert "not model-readable" in serialized_error
     assert bearer not in serialized_error
+
+
+def test_relay_read_artifact_over_budget_sets_is_error_not_a_silent_success(
+    tmp_path: Path,
+) -> None:
+    """F5 (#231 R6 review): ``relay_read_artifact``'s OWN result document can
+    be a T2 refusal directly (doc §6.4) -- not only nested under a job
+    status's ``mcp_result`` (the F1 scenario). ``_mcp_tool_result_failed``
+    must recognize this top-level shape too, or the tool answers
+    ``isError: false`` while its body says ``result_available: false``.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="oversized-relay-read-artifact",
+        )
+    )
+    owned_root = tmp_path / "spool" / job.job_id
+    owned_root.mkdir(parents=True)
+    oversized_path = owned_root / "large.bin"
+    with oversized_path.open("wb") as stream:
+        stream.truncate(relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1)
+    artifact = queue.append_artifact(
+        ArtifactRef(
+            job_id=job.job_id,
+            uri=oversized_path.as_uri(),
+            kind="stdout",
+            size_bytes=relay_ops_module.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        )
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_read_artifact",
+                "arguments": {"artifact_id": artifact.artifact_id},
+            },
+        },
+        queue=queue,
+        settings=settings,
+    )
+
+    assert response is not None and "error" not in response, response
+    tool_result = cast(dict[str, Any], response["result"])
+    assert tool_result["isError"] is True
+    structured = cast(dict[str, Any], tool_result["structuredContent"])
+    assert structured["result_available"] is False
+    assert structured["delivery"]["code"] == "artifact_content_too_large"
 
 
 def test_mcp_cancels_job(tmp_path: Path) -> None:

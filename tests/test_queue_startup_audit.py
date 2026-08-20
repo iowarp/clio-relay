@@ -5,15 +5,26 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
 
-import clio_relay.core_queue as core_queue_module
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay import (
+    queue_legacy_audit,
+    queue_legacy_output_audit,
+    queue_startup,
+    worker_lifetime_lock,
+)
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.worker_lifetime_lock import WorkerLifetimeLock, WorkerLifetimeLockUnavailable
+from clio_relay.queue_store_lock import LegacyQueueStateError
+from clio_relay.worker_lifetime_lock import (
+    LockedCoreIdentity,
+    WorkerLifetimeLock,
+    WorkerLifetimeLockUnavailable,
+)
 
 
 def _job(identity: str) -> RelayJob:
@@ -49,8 +60,8 @@ def test_indexed_era_fresh_process_startup_does_not_scan_record_history(
         queue.submit_job(_job(f"job_indexed_{index}"))
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         _refuse_history_scan,
     )
     monkeypatch.setattr(
@@ -64,11 +75,11 @@ def test_indexed_era_fresh_process_startup_does_not_scan_record_history(
         _refuse_history_scan,
     )
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_iter_legacy_event_paths",
+        queue_legacy_output_audit.queue_legacy_output_codec,
+        "iter_legacy_event_paths",
         _refuse_history_scan,
     )
-    monkeypatch.setattr(core_queue_module, "MAX_BOUNDED_SCAN_RECORDS", 1)
+    monkeypatch.setattr(queue_legacy_audit.queue_layout, "MAX_BOUNDED_SCAN_RECORDS", 1)
 
     reopened = ClioCoreQueue(root)
     reopened.initialize()
@@ -95,11 +106,10 @@ def test_sealed_startup_never_upgrades_shared_writer_ownership(
     """A healthy seal retains the bounded shared-writer startup path."""
     root = tmp_path / "core"
     ClioCoreQueue(root).initialize()
-    monkeypatch.setattr(
-        core_queue_module,
-        "exclusive_migration_lifetime",
-        _refuse_history_scan,
+    isolated_worker_lifetime_lock = SimpleNamespace(
+        **{**vars(worker_lifetime_lock), "exclusive_migration_lifetime": _refuse_history_scan}
     )
+    monkeypatch.setattr(queue_startup, "worker_lifetime_lock", isolated_worker_lifetime_lock)
 
     ClioCoreQueue(root).initialize()
 
@@ -122,14 +132,55 @@ def test_missing_seal_is_written_once_while_exclusive_writer_ownership_is_active
         sealed_phases.append(phase)
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(observe_seal),
     )
 
     ClioCoreQueue(root).initialize()
 
     assert sealed_phases == ["marker"]
+
+
+def test_reentrant_initialize_dispatch_honors_a_subclass_override(
+    tmp_path: Path,
+) -> None:
+    """Both re-entrant ``initialize`` call sites must virtually dispatch
+    through the runtime type, not call the bare module function directly
+    (F4, closing-round review). A fresh root's missing-seal path re-enters
+    ``initialize`` twice more internally (once with ``locked_core`` set from
+    ``_initialize_with_exclusive_lifetime``, once more from
+    ``_initialize_under_locked_core``); a de-virtualized re-entry would
+    silently skip a subclass override exactly as it silently skipped
+    ``StorageManagedQueue.initialize``'s closed-guard and forced
+    ``allow_exclusive_seal=False`` in production."""
+    calls: list[LockedCoreIdentity | None] = []
+
+    class _OverridingQueue(ClioCoreQueue):
+        def initialize(
+            self,
+            *,
+            migrate_legacy_output: bool = False,
+            locked_core: LockedCoreIdentity | None = None,
+            allow_exclusive_seal: bool = True,
+        ) -> None:
+            calls.append(locked_core)
+            super().initialize(
+                migrate_legacy_output=migrate_legacy_output,
+                locked_core=locked_core,
+                allow_exclusive_seal=allow_exclusive_seal,
+            )
+
+    queue = _OverridingQueue(tmp_path / "core")
+    queue.initialize()
+
+    # entries: outer call (locked_core=None), the exclusive-lifetime
+    # re-entry (locked_core set), and the locked-core re-entry (locked_core
+    # cleared again once the swapped root is authoritative).
+    assert len(calls) == 3
+    assert calls[0] is None
+    assert calls[1] is not None
+    assert calls[2] is None
 
 
 def test_sealed_startup_refuses_malformed_index_state_without_repair_or_glob(
@@ -241,7 +292,7 @@ def test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock(
     queue = ClioCoreQueue(root)
     queue.submit_job(_job("job_single_audit"))
     _audit_marker(root).unlink()
-    original_audit = ClioCoreQueue._audit_legacy_state_before_initialization  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_audit = queue_legacy_audit.audit_before_initialization
     lock_observations: list[bool] = []
 
     def observe_audit(candidate: ClioCoreQueue) -> object:
@@ -249,8 +300,8 @@ def test_missing_seal_runs_exactly_one_full_audit_under_the_queue_lock(
         return original_audit(candidate)
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         observe_audit,
     )
 
@@ -270,7 +321,7 @@ def test_missing_seal_repair_fails_closed_at_the_scan_bound(
         queue.submit_job(_job(f"job_repair_bound_{index}"))
     marker = _audit_marker(root)
     marker.unlink()
-    monkeypatch.setattr(core_queue_module, "MAX_BOUNDED_SCAN_RECORDS", 2)
+    monkeypatch.setattr(queue_legacy_audit.queue_layout, "MAX_BOUNDED_SCAN_RECORDS", 2)
 
     with pytest.raises(LegacyQueueStateError, match="bounded legacy audit limit"):
         ClioCoreQueue(root).initialize()
@@ -290,8 +341,8 @@ def test_crash_after_durable_seal_recovers_without_reauditing_history(
             raise RuntimeError("simulated post-seal crash")
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(crash_after_marker),
     )
     with pytest.raises(RuntimeError, match="post-seal crash"):
@@ -301,13 +352,13 @@ def test_crash_after_durable_seal_recovers_without_reauditing_history(
     assert json.loads(marker.read_bytes()) == ClioCoreQueue._legacy_record_audit_marker()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_after_legacy_record_audit_phase",
+        queue_legacy_audit,
+        "after_audit_phase",
         staticmethod(_no_audit_fault),
     )
     monkeypatch.setattr(
-        ClioCoreQueue,
-        "_audit_legacy_state_before_initialization",
+        queue_legacy_audit,
+        "audit_before_initialization",
         _refuse_history_scan,
     )
     ClioCoreQueue(root).initialize()

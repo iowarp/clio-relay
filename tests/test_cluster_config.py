@@ -12,7 +12,13 @@ from typing import Any
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import cluster_config
+from clio_relay import (
+    cluster_config,
+    cluster_config_io,
+    cluster_config_registry,
+    cluster_config_windows_paths,
+    cluster_config_windows_primitives,
+)
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     MAX_CONFIGURED_CLUSTERS,
@@ -233,21 +239,23 @@ def test_windows_atomic_create_captures_error_before_freeing_descriptor(
         return path
 
     monkeypatch.setattr(cluster_config.os, "name", "nt")
-    monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_load_windows_library", load_library)
     monkeypatch.setattr(
-        cluster_config,
+        cluster_config_windows_paths,
         "_build_private_windows_security_descriptor",
         build_descriptor,
     )
-    monkeypatch.setattr(cluster_config, "_current_windows_user_sid", current_user_sid)
     monkeypatch.setattr(
-        cluster_config,
+        cluster_config_windows_primitives, "_current_windows_user_sid", current_user_sid
+    )
+    monkeypatch.setattr(
+        cluster_config_windows_paths,
         "internal_filesystem_path",
         identity_internal_path,
     )
-    monkeypatch.setattr(cluster_config, "_windows_last_error", last_error)
-    monkeypatch.setattr(cluster_config, "_free_windows_local", free_descriptor)
-    monkeypatch.setattr(cluster_config, "_windows_error", windows_error)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_windows_last_error", last_error)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_free_windows_local", free_descriptor)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_windows_error", windows_error)
 
     with pytest.raises(PermissionError, match="simulated access denial"):
         open_private_atomic_file(tmp_path / "private.tmp")
@@ -298,7 +306,7 @@ def test_windows_private_descriptor_retries_transient_open_denial(
         ) -> int:
             information = ctypes.cast(
                 raw_information,
-                ctypes.POINTER(cluster_config._WindowsFileInformation),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                ctypes.POINTER(cluster_config_windows_primitives._WindowsFileInformation),  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ).contents
             information.attributes = 0
             information.number_of_links = before.st_nlink
@@ -326,15 +334,15 @@ def test_windows_private_descriptor_retries_transient_open_denial(
     def open_os_file_handle(_handle: int, _flags: int) -> int:
         return os.open(path, os.O_RDONLY)
 
-    monkeypatch.setattr(cluster_config, "_load_windows_library", load_library)
-    monkeypatch.setattr(cluster_config, "_windows_last_error", lambda: 5)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_load_windows_library", load_library)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_windows_last_error", lambda: 5)
     monkeypatch.setattr(
-        cluster_config,
+        cluster_config_windows_paths,
         "ensure_private_configuration_windows_handle",
         accept_private_acl,
     )
     monkeypatch.setattr(
-        cluster_config,
+        cluster_config_windows_primitives,
         "_open_windows_os_file_handle",
         open_os_file_handle,
     )
@@ -342,10 +350,11 @@ def test_windows_private_descriptor_retries_transient_open_denial(
     descriptor = cluster_config.open_private_configuration_windows_descriptor(path)
     os.close(descriptor)
 
+    write_owner = cluster_config_windows_primitives._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert transient_create.attempts == 3
-    assert transient_create.requested_access[0] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert not transient_create.requested_access[1] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert transient_create.requested_access[2] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert transient_create.requested_access[0] & write_owner
+    assert not transient_create.requested_access[1] & write_owner
+    assert transient_create.requested_access[2] & write_owner
 
 
 def test_configuration_directory_is_created_with_private_protection(tmp_path: Path) -> None:
@@ -408,11 +417,13 @@ def test_windows_nested_configuration_creation_retains_hardened_handles(
         return kernel32
 
     monkeypatch.setattr(cluster_config.os, "name", "nt")
-    monkeypatch.setattr(cluster_config, "_load_windows_library", load_kernel32)
-    monkeypatch.setattr(cluster_config, "_create_private_windows_directory", create)
-    monkeypatch.setattr(cluster_config, "_open_windows_configuration_handle", open_handle)
-    monkeypatch.setattr(cluster_config, "_set_private_windows_acl", harden)
-    monkeypatch.setattr(cluster_config, "_close_windows_handle", close)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_load_windows_library", load_kernel32)
+    monkeypatch.setattr(cluster_config_windows_paths, "_create_private_windows_directory", create)
+    monkeypatch.setattr(
+        cluster_config_windows_paths, "_open_windows_configuration_handle", open_handle
+    )
+    monkeypatch.setattr(cluster_config_windows_paths, "_set_private_windows_acl", harden)
+    monkeypatch.setattr(cluster_config_windows_primitives, "_close_windows_handle", close)
 
     ensure_private_configuration_directory(path)
 
@@ -465,31 +476,31 @@ def test_windows_configuration_open_only_requests_owner_change_when_needed(
         del directory, kernel32, path
 
     monkeypatch.setattr(
-        cluster_config,
+        cluster_config_windows_paths,
         "_validate_windows_configuration_handle",
         accept_handle,
     )
 
-    cluster_config._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cluster_config_windows_paths._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tmp_path,
         directory=True,
         kernel32=kernel32,
     )
-    cluster_config._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cluster_config_windows_paths._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tmp_path,
         directory=True,
         kernel32=kernel32,
         write_owner=True,
     )
 
-    assert requested_access[0] & cluster_config._WINDOWS_WRITE_DAC  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert not requested_access[0] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert requested_access[1] & cluster_config._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert requested_access[0] & cluster_config_windows_primitives._WINDOWS_WRITE_DAC  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert not requested_access[0] & cluster_config_windows_primitives._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert requested_access[1] & cluster_config_windows_primitives._WINDOWS_WRITE_OWNER  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert (
         requested_share_modes
         == [
-            cluster_config._WINDOWS_FILE_SHARE_READ  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            | cluster_config._WINDOWS_FILE_SHARE_WRITE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cluster_config_windows_primitives._WINDOWS_FILE_SHARE_READ  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            | cluster_config_windows_primitives._WINDOWS_FILE_SHARE_WRITE,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ]
         * 2
     )
@@ -552,19 +563,19 @@ def test_windows_configuration_hardening_allows_an_existing_writer(tmp_path: Pat
 def test_windows_configuration_owner_must_match_current_user(tmp_path: Path) -> None:
     path = tmp_path / "configuration.json"
 
-    cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cluster_config_windows_primitives._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         owner_sid="S-1-5-21-current",
         user_sid="S-1-5-21-current",
         path=path,
     )
-    cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cluster_config_windows_primitives._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         owner_sid="S-1-5-32-544",
         user_sid="S-1-5-21-current",
         default_owner_sid="S-1-5-32-544",
         path=path,
     )
     with pytest.raises(ConfigurationError, match="not owned by this user"):
-        cluster_config._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cluster_config_windows_primitives._require_current_windows_owner(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             owner_sid="S-1-5-21-foreign",
             user_sid="S-1-5-21-current",
             default_owner_sid="S-1-5-32-544",
@@ -646,7 +657,7 @@ def test_cluster_registry_mutation_revalidates_registration_limits(
         }
     )
     original.save(path)
-    monkeypatch.setattr(cluster_config, "MAX_REMOTE_MCP_REGISTRATIONS", 1)
+    monkeypatch.setattr(cluster_config_registry, "MAX_REMOTE_MCP_REGISTRATIONS", 1)
 
     def exceed_limit(registry: ClusterRegistry) -> None:
         registry.clusters["alpha"].remote_mcp_servers["second"] = registration
@@ -663,7 +674,7 @@ def test_cluster_registry_save_revalidates_in_place_model_mutation(
 ) -> None:
     path = tmp_path / "clusters.json"
     registry = _registry("alpha")
-    monkeypatch.setattr(cluster_config, "MAX_REMOTE_MCP_REGISTRATIONS", 0)
+    monkeypatch.setattr(cluster_config_registry, "MAX_REMOTE_MCP_REGISTRATIONS", 0)
     registry.clusters["alpha"].remote_mcp_servers["science"] = RemoteMcpServerConfig(
         command="science-mcp"
     )
@@ -694,7 +705,7 @@ def test_stable_configuration_read_retries_version_change(
     def no_sleep(_seconds: float) -> None:
         return
 
-    monkeypatch.setattr(cluster_config, "_stat_version", one_changed_version)
+    monkeypatch.setattr(cluster_config_io, "_stat_version", one_changed_version)
     monkeypatch.setattr(cluster_config.time, "sleep", no_sleep)
 
     assert ClusterRegistry.load(path) == registry
@@ -729,7 +740,7 @@ def test_cluster_registry_and_remote_mcp_cardinality_are_bounded(
             args=[f"argument-{index}" for index in range(MAX_REMOTE_MCP_ARGS + 1)],
         )
 
-    monkeypatch.setattr(cluster_config, "MAX_REMOTE_MCP_REGISTRATIONS", 1)
+    monkeypatch.setattr(cluster_config_registry, "MAX_REMOTE_MCP_REGISTRATIONS", 1)
     registration = RemoteMcpServerConfig(command="science-mcp")
     with pytest.raises(ValueError, match="more than 1 remote MCP registrations"):
         ClusterRegistry(

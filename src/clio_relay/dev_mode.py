@@ -103,7 +103,7 @@ def enforce(
     """
     if condition:
         return
-    if dev_mode:
+    if dev_mode or dev_mode_enabled():
         findings.record(message)
         return
     raise ConfigurationError(message)

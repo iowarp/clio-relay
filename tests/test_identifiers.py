@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from clio_relay import core_queue as core_queue_module
 from clio_relay import mcp_server as mcp_server_module
+from clio_relay import queue_gateway_indexes, queue_layout, queue_store_read
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue, LegacyQueueStateError
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.identifiers import (
     DURABLE_RECORD_ID_MAX_BYTES,
@@ -43,6 +43,7 @@ from clio_relay.models import (
     SchedulerCancelPending,
     TaskTimelineEvent,
 )
+from clio_relay.queue_store_lock import LegacyQueueStateError
 from clio_relay.session_lifecycle import RemoteSessionStateEvidence, SessionLifecycleReport
 from clio_relay.validation_report import CleanupEvidence
 
@@ -175,12 +176,7 @@ def test_every_canonical_scan_model_has_a_filename_identity_contract(
     identity_field: str,
 ) -> None:
     """Canonical bulk readers cannot silently omit filename/content identity checks."""
-    assert (
-        core_queue_module._record_identity_field(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            model
-        )
-        == identity_field
-    )
+    assert queue_layout.record_identity_field(model) == identity_field
 
 
 def test_canonical_scan_layouts_bind_filename_to_record_identity(tmp_path: Path) -> None:
@@ -225,7 +221,11 @@ def test_canonical_scan_layouts_bind_filename_to_record_identity(tmp_path: Path)
     assert [item.job_id for item in active] == [job.job_id]
     assert [item.lease_id for item in job_leases] == [lease.lease_id]
     assert [item.job_id for item in due] == [pending.job_id]
-    cluster_token = core_queue_module._stable_ref_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # Pre-existing (pre-CQ20) drift, fixed in-campaign: CQ16 (ledger §11.5)
+    # moved ``_stable_ref_token`` from the facade to ``queue_gateway_indexes``
+    # but this call site was never updated, leaving it broken since CQ16
+    # landed (confirmed failing identically on the unmodified CQ19 tip).
+    cluster_token = queue_gateway_indexes._stable_ref_token(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "Target:GPU"
     )
     assert (
@@ -568,6 +568,80 @@ def test_runtime_canonical_read_rejects_filename_content_identity_mismatch(
 
     with pytest.raises(QueueConflictError, match="canonical job identity mismatch"):
         queue.get_job("job_first")
+
+
+def test_runtime_canonical_read_delegates_to_the_layout_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical read resolves validation through the CQ2 owner seam."""
+
+    class CanonicalAccessSabotage(RuntimeError):
+        pass
+
+    queue = ClioCoreQueue(tmp_path / "core")
+    job = RelayJob(
+        job_id="job_layout_owner",
+        cluster="target",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="layout-owner",
+    )
+    path = queue.root / "jobs" / f"{job.job_id}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(job.model_dump_json(), encoding="utf-8")
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise CanonicalAccessSabotage
+
+    monkeypatch.setattr(queue_layout, "validate_canonical_access", sabotage)
+
+    with pytest.raises(CanonicalAccessSabotage):
+        # CQ20: the facade's ``_read_canonical_record`` forward is deleted;
+        # every real caller now calls this module-qualified directly.
+        queue_store_read.read_canonical_record(
+            queue._storage_root,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path,
+            RelayJob,
+        )
+
+
+def test_migrate_indexes_batch_delegates_canonical_read_to_the_layout_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N16 (closing-round review): the test above only proves the module
+    function ``queue_store_read.read_canonical_record`` resolves validation
+    through the CQ2 owner seam when called directly -- it never proves a
+    real production caller reaches it. ``migrate_indexes_batch`` owns all
+    six real ``read_canonical_record`` call sites (``queue_index_
+    migration.py``); this restores the same sabotage through it.
+    """
+
+    class CanonicalAccessSabotage(RuntimeError):
+        pass
+
+    for family in ("jobs", "tasks", "leases", "artifacts", "progress", "events"):
+        (tmp_path / "core" / family).mkdir(parents=True, exist_ok=True)
+    job = RelayJob(
+        job_id="job_migration_layout_owner",
+        cluster="target",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["true"]),
+        idempotency_key="migration-layout-owner",
+    )
+    (tmp_path / "core" / "jobs" / f"{job.job_id}.json").write_text(
+        job.model_dump_json(), encoding="utf-8"
+    )
+    queue = ClioCoreQueue(tmp_path / "core")
+
+    def sabotage(*_args: object, **_kwargs: object) -> None:
+        raise CanonicalAccessSabotage
+
+    monkeypatch.setattr(queue_layout, "validate_canonical_access", sabotage)
+
+    with pytest.raises(CanonicalAccessSabotage):
+        queue.migrate_indexes_batch(batch_size=1)
 
 
 def test_legacy_canonical_reparse_family_fails_before_writes(tmp_path: Path) -> None:

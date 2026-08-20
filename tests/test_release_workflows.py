@@ -302,7 +302,7 @@ def test_release_mutations_require_live_admin_read_immutability_governance() -> 
         assert "--method PUT" not in text
         assert "--method DELETE" not in text
 
-    source = (ROOT / "src" / "clio_relay" / "ci_validation.py").read_text(encoding="utf-8")
+    source = (ROOT / "src" / "clio_relay" / "branch_protection.py").read_text(encoding="utf-8")
     assert 'fetch_admin_json(f"repos/{repository}/immutable-releases")' in source
     assert '"enabled": True' in source
     assert '"enforced_by_owner": True' in source
@@ -365,9 +365,9 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
         "fe68111035be10fac8c291c1b5b802263524884f92eacd88123390dc3666ad91"
     )
     native_execution = clio_kit_component["native_execution"]
-    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.6"
+    assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.7.1"
     assert native_execution["contract_sha256"] == (
-        "055c6697dc9a25fb033c949db92c928aee8d5673f7b2e3a4d90a237f4f87a40d"
+        "ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.8.0"

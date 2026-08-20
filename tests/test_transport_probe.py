@@ -7,21 +7,27 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, cast
+from typing import IO, Any, cast
 
 import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_start_query as session_start_query
 import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.frp_link import FrpLinkConfig, HeldFrpVisitor
+from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
+    SessionLifecycleReport,
+)
+from clio_relay.session_wire_models import (
     OwnedSessionStartStatusSelector,
     RemoteSessionStateEvidence,
-    SessionLifecycleReport,
 )
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
@@ -523,11 +529,14 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
         allow_stcp_fallback=True,
     )
 
+    # #231 R4 opus review F2: the visitor-failure message is now always
+    # "<label>: <detail>" (a prefix, never a bare replacement of the label)
+    # so a reader always sees WHICH process failed, not just its raw output.
     assert lines[:4] == [
         "direct_transport.cluster=test-cluster",
         "direct_transport.mode=xtcp",
         "direct_transport.result=frp_stcp",
-        "direct_transport.xtcp_error=xtcp hole punching failed",
+        "direct_transport.xtcp_error=local frpc visitor failed: stderr: xtcp hole punching failed",
     ]
     assert "transport.healthz=ok" in lines
     assert any(
@@ -718,7 +727,7 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
 
     def deadline(**kwargs: object) -> list[str]:
         start_invocations.append(kwargs)
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -752,7 +761,7 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
         )
 
     monkeypatch.setattr(session_lifecycle, "start_remote_session", deadline)
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", fake_status)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", fake_status)
 
     with pytest.raises(RelayError, match=f"state={expected_state}") as raised:
         run_ssh_forward_http_probe(
@@ -899,3 +908,107 @@ class FakeProcess:
 class CapturingBytesIO(BytesIO):
     def close(self) -> None:
         pass
+
+
+class FakeFrpVisitorProcess:
+    """A ``FrpProcess``-shaped fake for directly constructing ``HeldFrpVisitor``.
+
+    Declared as ``IO[bytes] | None`` (not the inferred ``BytesIO``), matching
+    ``tests/test_frp_link.py``'s own ``FakeFrpProcess``: Protocol attributes are
+    checked invariantly, so a narrower declared type would make this fake
+    structurally incompatible with ``FrpProcess``.
+    """
+
+    def __init__(self, command: list[str]) -> None:
+        self.command = command
+        self.stdin: IO[bytes] | None = None
+        self.stdout: IO[bytes] | None = BytesIO()
+        self.stderr: IO[bytes] | None = BytesIO()
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        self.returncode = 0
+        return 0
+
+
+def test_finish_frp_probe_cleanup_omits_the_visitor_resource_when_none_was_ever_constructed(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#231 R5 opus review item R14: nothing was verified, so nothing is claimed.
+
+    ``visitor`` is ``None`` when ``HeldFrpVisitor`` construction/``establish()``
+    never even ran (#231 R4 opus review F9 moved both inside the try so a spawn
+    failure still reaches this cleanup instead of leaking the remote process).
+    Reporting a "frpc-visitor" ledger resource as
+    ``outcome=stopped, verified_after_operation=True`` in that case would be a
+    fabricated claim -- nothing was ever checked.
+    """
+    monkeypatch.setattr(transport_probe, "_cleanup_remote_probe", _verified_remote_cleanup)
+    remote = FakeProcess(["ssh", "test-host", "bash", "-s"])
+
+    lines = transport_probe._finish_frp_probe_cleanup(  # pyright: ignore[reportPrivateUsage]
+        cluster="test-cluster",
+        definition=_frp_cluster_definition(),
+        probe_id="probe-1",
+        visitor=None,
+        remote=cast(transport_probe.ManagedProcess, remote),
+        primary_error=None,
+    )
+
+    evidence_lines = [line for line in lines if line.startswith("transport.probe_evidence=")]
+    assert evidence_lines
+    evidence = parse_transport_probe_evidence(evidence_lines[0].partition("=")[2])
+    resource_ids = [resource.resource_id for resource in evidence.resources]
+    assert not any(resource_id.startswith("frpc-visitor:") for resource_id in resource_ids)
+    assert any(resource_id.startswith("ssh-probe-control:") for resource_id in resource_ids)
+
+
+def _fake_frpc_process_factory(command: list[str], **_kwargs: object) -> FakeFrpVisitorProcess:
+    return FakeFrpVisitorProcess(command)
+
+
+def test_finish_frp_probe_cleanup_reports_the_visitor_resource_when_one_was_constructed(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Sabotage twin: a real visitor still gets its own ledger entry, unchanged."""
+    monkeypatch.setattr(transport_probe, "_cleanup_remote_probe", _verified_remote_cleanup)
+    remote = FakeProcess(["ssh", "test-host", "bash", "-s"])
+    visitor = HeldFrpVisitor(
+        frpc_bin="frpc",
+        config=FrpLinkConfig(
+            server_addr="relay.example.test",
+            server_port=443,
+            protocol=FrpTransportProtocol.WSS,
+            token="frp-token",
+            secret_key="stcp-secret",
+            proxy_name="relay-http-test",
+        ),
+        local_bind_port=19_990,
+        process_factory=_fake_frpc_process_factory,
+    )
+    visitor.establish()
+
+    lines = transport_probe._finish_frp_probe_cleanup(  # pyright: ignore[reportPrivateUsage]
+        cluster="test-cluster",
+        definition=_frp_cluster_definition(),
+        probe_id="probe-2",
+        visitor=visitor,
+        remote=cast(transport_probe.ManagedProcess, remote),
+        primary_error=None,
+    )
+
+    evidence_lines = [line for line in lines if line.startswith("transport.probe_evidence=")]
+    assert evidence_lines
+    evidence = parse_transport_probe_evidence(evidence_lines[0].partition("=")[2])
+    resource_ids = [resource.resource_id for resource in evidence.resources]
+    assert any(resource_id.startswith("frpc-visitor:") for resource_id in resource_ids)
