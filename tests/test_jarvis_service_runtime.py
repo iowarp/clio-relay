@@ -26,6 +26,7 @@ import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
+import clio_relay.service_runtime_core as service_runtime_core_module
 import clio_relay.service_runtime_readiness as service_runtime_readiness_module
 import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
@@ -93,7 +94,7 @@ def _private_authority_resolver(  # pyright: ignore[reportUnusedFunction]
         return f"Bearer {'a' * 64}"
 
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_core_module,
         "resolve_jarvis_service_runtime_authorization",
         resolve_for_test,
     )

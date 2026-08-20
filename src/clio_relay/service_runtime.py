@@ -10,19 +10,16 @@ import secrets
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Literal, cast
 
 import httpx
-from filelock import FileLock
-from filelock import Timeout as FileLockTimeout
 
-from clio_relay import service_runtime_command_runner as _command_runner
 from clio_relay import service_runtime_connector_identity as _connector_identity
 from clio_relay import service_runtime_connector_step_scripts as _connector_step_scripts
+from clio_relay import service_runtime_core as _core
 from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_readiness as _readiness
 from clio_relay import service_runtime_results as _results
@@ -38,12 +35,6 @@ from clio_relay.browser_gateway import (
     BrowserGatewayBootstrap,
     BrowserGatewayConfig,
 )
-from clio_relay.cluster_config import (
-    ClusterDefinition,
-    ensure_private_configuration_directory,
-)
-from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     BrowserAttachmentIdentityConflictError,
     ConfigurationError,
@@ -51,7 +42,6 @@ from clio_relay.errors import (
     QueueConflictError,
     RelayError,
 )
-from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.frp_link import FrpLinkConfig, render_proxy_config, start_owned_frp_visitor
 from clio_relay.frp_remote_scripts import (
     remote_allocation_frpc_start_script as _remote_allocation_frpc_start_script,
@@ -67,7 +57,6 @@ from clio_relay.jarvis_service_runtime import (
     JARVIS_SERVICE_RUNTIME_SCHEMA_V2,
     JarvisServiceRuntimeBinding,
     VerifiedJarvisServiceRuntime,
-    resolve_jarvis_service_runtime_authorization,
     reverify_jarvis_service_runtime,
 )
 from clio_relay.models import (
@@ -102,52 +91,27 @@ _LOCAL_CONNECTOR_WRAPPER_CODE = (
     "raise SystemExit(child.wait())"
 )
 _MAX_LOCAL_HEALTH_BYTES = 64 * 1024
-_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS = 60.0
 _GATEWAY_DETACH_RESULT_SCHEMA = "clio-relay.gateway-detach-result.v1"
 _GATEWAY_TEARDOWN_POLICY_SCHEMA = "clio-relay.gateway-teardown-policy.v1"
 _GATEWAY_TEARDOWN_RESULT_SCHEMA = "clio-relay.gateway-teardown-result.v1"
 _JARVIS_BIND_IDENTITY_SCHEMA = "clio-relay.jarvis-bind-identity.v1"
 _JARVIS_BIND_POLICY_SCHEMA = "clio-relay.jarvis-bind-policy.v1"
-_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
 _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_POLL_SECONDS = 0.25
 _RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS = 5.0
 
 
-class ServiceRuntimeSupervisor:
-    """Start, bind, probe, and tear down scheduler-backed remote service sessions."""
+class ServiceRuntimeSupervisor(_core._ServiceRuntimeCoreMixin):
+    """Start, bind, probe, and tear down scheduler-backed remote service sessions.
 
-    def __init__(
-        self,
-        *,
-        settings: RelaySettings,
-        queue: ClioCoreQueue,
-        cluster: str,
-        definition: ClusterDefinition,
-        token: str,
-        secret_key: str,
-        runner: _types.CommandRunner | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self.settings = settings
-        self.queue = queue
-        self.cluster = cluster
-        self.definition = definition
-        self.token = token
-        self.secret_key = secret_key
-        self.runner = runner or _command_runner.SubprocessCommandRunner()
-        self.sleep = sleep
-
-    def _jarvis_runtime_authorization(
-        self,
-        verified: VerifiedJarvisServiceRuntime,
-    ) -> str | None:
-        """Resolve per operation; callers may stdin-transfer only to the owned memory proxy."""
-        return resolve_jarvis_service_runtime_authorization(
-            definition=self.definition,
-            settings=self.settings,
-            verified=verified,
-        )
+    Composed from owner-module mixins (#231 class-mixin split, §9): each
+    mixin owns one coherent slice of the state machine's methods; this class
+    is assembly only. See each mixin's own module docstring for its exact
+    method set. Mixins call each other freely through ``self`` -- Python's
+    MRO resolves ``self.other_method(...)`` to whichever mixin defines it
+    regardless of where the call originates, so no cross-mixin qualification
+    is needed or used.
+    """
 
     def start(
         self,
@@ -3046,16 +3010,6 @@ class ServiceRuntimeSupervisor:
             command_url=command_url,
         )
 
-    def _set_ownership_intent(
-        self,
-        session: GatewaySession,
-        role: str,
-        intent: dict[str, object],
-    ) -> GatewaySession:
-        """Durably record one resource intent before or after its side effect."""
-        gateway = self._gateway_with_ownership_intent(session, role, intent)
-        return self._update(session, gateway=gateway)
-
     def _prepare_detach_intent(self, session: GatewaySession) -> GatewaySession:
         """Persist or validate one detach operation before destructive cleanup."""
         raw_intent = session.gateway.get("detach_intent")
@@ -3272,68 +3226,6 @@ class ServiceRuntimeSupervisor:
             cancel_scheduler_job=cancel_scheduler_job,
         )
 
-    def _validate_gateway_transition_session(self, session: GatewaySession) -> None:
-        """Require one exact relay-owned session before and after lock acquisition."""
-        if session.cluster != self.cluster:
-            raise ConfigurationError(
-                f"gateway session {session.session_id} belongs to cluster {session.cluster}, "
-                f"not {self.cluster}"
-            )
-        if session.metadata.get("owner") != "clio-relay":
-            raise ConfigurationError(
-                f"gateway session {session.session_id} is not an owned clio-relay runtime"
-            )
-
-    def _gateway_transition_lock_path(self, session_id: str) -> Path:
-        """Return a private lock path keyed by the exact cluster and gateway session."""
-        directory = self.queue.root / ".gateway-transition-locks"
-        try:
-            ensure_private_configuration_directory(directory)
-        except (ConfigurationError, OSError) as exc:
-            raise RelayError(
-                "could not prepare the trusted gateway transition lock directory"
-            ) from exc
-        identity = hashlib.sha256(f"{self.cluster}\0{session_id}".encode()).hexdigest()
-        return directory / f"{identity}.lock"
-
-    def _acquire_gateway_transition_lock(self, session_id: str) -> FileLock:
-        """Acquire and return the exact bounded cross-process transition lock."""
-        lock_path = self._gateway_transition_lock_path(session_id)
-        lock = FileLock(
-            str(internal_filesystem_path(lock_path, force_extended=True)),
-            timeout=_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS,
-        )
-        try:
-            lock.acquire()
-        except FileLockTimeout as exc:
-            raise RelayError("timed out acquiring the gateway transition lock") from exc
-        except OSError as exc:
-            raise RelayError("could not acquire the gateway transition lock") from exc
-        return cast(FileLock, lock)
-
-    @contextmanager
-    def _gateway_transition_lock(self, session_id: str) -> Generator[None, None, None]:
-        """Hold the bounded cross-process lock for one gateway state transition."""
-        lock = self._acquire_gateway_transition_lock(session_id)
-        try:
-            yield
-        finally:
-            lock.release()
-
-    def _runtime_start_session_after_lock(self, session_id: str) -> GatewaySession:
-        """Reread and admit one newly created gateway before any runtime side effect."""
-        session = self.queue.get_gateway_session(session_id)
-        self._validate_gateway_transition_session(session)
-        if session.state is not GatewaySessionState.CREATED:
-            raise ConfigurationError(
-                f"gateway session {session_id} changed before runtime start acquired its lock"
-            )
-        if session.gateway.get("teardown_intent") is not None:
-            raise ConfigurationError(
-                f"gateway session {session_id} is committed to teardown and cannot start"
-            )
-        return session
-
     def _prepare_teardown_policy(
         self,
         session: GatewaySession,
@@ -3535,21 +3427,6 @@ class ServiceRuntimeSupervisor:
             resources=resources,
             errors=errors,
         )
-
-    def _gateway_with_ownership_intent(
-        self,
-        session: GatewaySession,
-        role: str,
-        intent: dict[str, object],
-        **gateway_updates: object,
-    ) -> dict[str, object]:
-        """Return a gateway payload containing an atomically paired intent update."""
-        gateway = dict(session.gateway)
-        intents = _primitives._object(gateway.get("ownership_intents", {}))
-        intents[role] = intent
-        gateway["ownership_intents"] = intents
-        gateway.update(gateway_updates)
-        return gateway
 
     def _local_connector_intent(self, session: GatewaySession) -> dict[str, object]:
         """Build the exact durable identity needed to rediscover a local connector."""
@@ -5734,107 +5611,3 @@ class ServiceRuntimeSupervisor:
                 break
             _readiness._sleep_before_deadline(self.sleep, poll_seconds, deadline)
         raise RelayError(f"local service health probe failed: {health_url}: {last_error}")
-
-    def _update(
-        self,
-        session: GatewaySession,
-        *,
-        state: GatewaySessionState | None = None,
-        metadata: dict[str, object] | None = None,
-        **updates: object,
-    ) -> GatewaySession:
-        return self.queue.update_gateway_session(
-            session.session_id,
-            state=state,
-            metadata=metadata,
-            expected_updated_at=session.updated_at,
-            **updates,
-        )
-
-    def _record_runtime_start_failure(
-        self,
-        *,
-        session_id: str,
-        error: BaseException,
-        cleanup_errors: Sequence[str],
-    ) -> None:
-        """Persist a start failure against the latest post-cleanup session revision."""
-
-        last_conflict: QueueConflictError | None = None
-        for _attempt in range(3):
-            current = self.queue.get_gateway_session(session_id)
-            if current.state is GatewaySessionState.READY:
-                return
-            target_state = (
-                GatewaySessionState.CLOSED
-                if current.state is GatewaySessionState.CLOSED
-                else GatewaySessionState.FAILED
-            )
-            try:
-                self.queue.update_gateway_session(
-                    session_id,
-                    state=target_state,
-                    expected_updated_at=current.updated_at,
-                    metadata={
-                        "failed_at": utc_now().isoformat(),
-                        "last_error": str(error),
-                        "cleanup_error": ("; ".join(dict.fromkeys(cleanup_errors)) or None),
-                    },
-                )
-                return
-            except QueueConflictError as exc:
-                last_conflict = exc
-        if last_conflict is not None:
-            raise last_conflict
-
-    def _record_attach_failure(
-        self,
-        *,
-        session_id: str,
-        error: BaseException,
-        cleanup_error: str | None,
-    ) -> None:
-        """Record an attach failure only while the same gateway remains mutable."""
-
-        if isinstance(error, QueueConflictError):
-            return
-        current = self.queue.get_gateway_session(session_id)
-        if (
-            current.state in {GatewaySessionState.READY, GatewaySessionState.CLOSED}
-            or current.gateway.get("teardown_intent") is not None
-        ):
-            return
-        try:
-            self.queue.update_gateway_session(
-                session_id,
-                state=GatewaySessionState.DEGRADED,
-                expected_updated_at=current.updated_at,
-                metadata={
-                    "attach_failed_at": utc_now().isoformat(),
-                    "attach_error": str(error),
-                    "attach_cleanup_error": cleanup_error,
-                },
-            )
-        except QueueConflictError:
-            return
-
-    def _ssh(self, script: str) -> str:
-        try:
-            result = self.runner.run(
-                ["ssh", self.definition.ssh_host, "bash", "-s"],
-                input_text=script,
-                timeout_seconds=_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise _types._AmbiguousRemoteSideEffectError(
-                "remote service runtime command timed out after "
-                f"{_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS:g} seconds"
-            ) from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            if result.returncode == 255:
-                raise _types._AmbiguousRemoteSideEffectError(
-                    f"remote service runtime transport failed: {detail}"
-                )
-            raise RelayError(f"remote service runtime command failed: {detail}")
-        return result.stdout

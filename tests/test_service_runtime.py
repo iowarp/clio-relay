@@ -31,6 +31,7 @@ import clio_relay.service_runtime as service_runtime
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_connector_step_scripts as service_runtime_connector_step_scripts
+import clio_relay.service_runtime_core as service_runtime_core
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
@@ -1466,7 +1467,9 @@ def _start_lifecycle_frp_runtime(
     for module_name in (
         "clio_relay.cluster_config",
         "clio_relay.worker_lifetime_lock",
-        "clio_relay.service_runtime",
+        # #231 class-mixin split: _gateway_transition_lock_path (the caller)
+        # lives in service_runtime_core.py now, not service_runtime.py.
+        "clio_relay.service_runtime_core",
     ):
         monkeypatch.setattr(
             f"{module_name}.ensure_private_configuration_directory",
@@ -1474,8 +1477,9 @@ def _start_lifecycle_frp_runtime(
             raising=False,
         )
     for module_name in (
-        # service_runtime never imports ensure_private_configuration_path -- it
-        # only uses ensure_private_configuration_directory (src/clio_relay/service_runtime.py).
+        # service_runtime_core never imports ensure_private_configuration_path
+        # -- it only uses ensure_private_configuration_directory
+        # (src/clio_relay/service_runtime_core.py).
         "clio_relay.cluster_config",
         "clio_relay.worker_lifetime_lock",
     ):
@@ -2264,12 +2268,12 @@ def test_runtime_teardown_lock_timeout_fails_closed_before_side_effects(
     lock_path = supervisor._gateway_transition_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id
     )
-    monkeypatch.setattr(service_runtime, "_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(service_runtime_core, "_GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS", 0.02)
     prior_runner_inputs = list(runner.inputs)
 
     with (
-        service_runtime.FileLock(
-            str(service_runtime.internal_filesystem_path(lock_path, force_extended=True))
+        service_runtime_core.FileLock(
+            str(service_runtime_core.internal_filesystem_path(lock_path, force_extended=True))
         ),
         pytest.raises(RelayError, match="timed out acquiring"),
     ):

@@ -591,7 +591,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # This was the last extractable module-level content -- everything
     # remaining is imports, module constants, and the
     # ServiceRuntimeSupervisor class itself. 6523 -> 5840.
-    "src/clio_relay/service_runtime.py": 5840,
+    # #231 service-runtime split, slice 10 (class-mixin split begins): the
+    # ServiceRuntimeSupervisor.__init__ construction, the per-gateway
+    # cross-process transition lock, durable-session update helpers, the
+    # shared SSH transport, JARVIS authorization resolution, and the two
+    # durable-failure recorders moved to the new
+    # service_runtime_core.py (282 lines) as `_ServiceRuntimeCoreMixin` --
+    # the first slice of the class body itself (module-level content is
+    # exhausted; from here every slice peels one mixin off
+    # ServiceRuntimeSupervisor, which now derives from the mixin as its
+    # first base). 5840 -> 5613.
+    "src/clio_relay/service_runtime.py": 5613,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
