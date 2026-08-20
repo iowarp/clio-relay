@@ -1159,7 +1159,26 @@ RATCHET_BASELINE: dict[str, int] = {
     # #264), so the dispatch bodies are repointed to the plain leaf import
     # here rather than carrying a now-broken `_mcp_server._job_target`
     # attribute lookup forward.
-    "src/clio_relay/mcp_server.py": 1832,
+    #
+    # split/mcp-server-w3 slice 9 (#231, final slice -- completes the
+    # decomposition): the submission cluster (_submit_jarvis_job,
+    # _submit_jarvis_pipeline, _submit_remote_agent, _submit_mcp_call,
+    # _submit_jarvis_mcp_call, plus their shared idempotency/staging/input-
+    # binding helpers) moves out, split along its own seam into
+    # mcp_submission_agent.py (jarvis/pipeline/remote-agent job submission),
+    # mcp_submission_mcp_call.py (mcp_call/jarvis_mcp_call submission and the
+    # virtual-JARVIS routing it shares with them), and
+    # mcp_submission_result.py (the owned/local result-binding tail every
+    # submission path funnels through). mcp_server.py is now 708 lines --
+    # under DEFAULT_MAX_LINES -- entry removed per this script's own
+    # documented convention: "remove the entry once the file is under
+    # DEFAULT_MAX_LINES". What remains resident is the module docstring,
+    # imports/re-exports (every name any test monkeypatches or reads off
+    # mcp_server_module, plus the two names other modules still import from
+    # clio_relay.mcp_server), `_serialize_tool_result`, and a handful of
+    # thin public wrappers (`serialize_mcp_tool_result`,
+    # `mcp_tool_result_failed`, `serve_stdio`) -- the facade the whole
+    # split/mcp-server-w3 campaign was built toward.
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
