@@ -568,7 +568,12 @@ RATCHET_BASELINE: dict[str, int] = {
     # readiness reader plus loopback-port and browser-attachment-support
     # helpers moved to the new service_runtime_readiness.py (242 lines).
     # 7740 -> 7537.
-    "src/clio_relay/service_runtime.py": 7537,
+    # #231 service-runtime split, slice 7: the SSH-delivered embedded
+    # shell/Python script generators for scheduler-submission tracking
+    # (reserve/capture/verify one exact submission through a durable,
+    # race-safe sidecar) moved to the new
+    # service_runtime_submission_scripts.py (627 lines). 7537 -> 6948.
+    "src/clio_relay/service_runtime.py": 6948,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
