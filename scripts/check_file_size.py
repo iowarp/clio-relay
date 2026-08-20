@@ -515,7 +515,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # recursive self-calls and its one caller, `_scheduler_name_from_yaml`,
     # which moved with it). No test referenced either directly. Net:
     # 6316 -> 5815.
-    "src/clio_relay/endpoint.py": 5815,
+    # clio-relay#259 (merged into this split's facade): the console log
+    # stream's wiring into the job-run method -- a per-job ConsoleLiveTailer
+    # local, the _wrap_poll/_tail_console_stream pair composing the #259 tail
+    # step onto the existing on_poll cadence without touching
+    # _poll_running_job's own body, the console.log artifact append alongside
+    # stdout/stderr, and _flush_terminal_console plus its console_tailer
+    # thread-through in _append_optional_result_artifacts /
+    # _append_spool_artifact_once. The bulk of the new logic (resolution,
+    # tailing, terminal flush) lives in the new owner module
+    # console_stream.py, not here -- this is glue only, landing on top of the
+    # already-decomposed EndpointWorker facade rather than the pre-split
+    # 8843-line monolith develop's history describes. A justified,
+    # minimal ratchet-up.
+    "src/clio_relay/endpoint.py": 5915,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
@@ -648,7 +661,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # 6098. The matching/long-poll mechanics live in the sub-800 observation
     # owner; the additional routed lines retain incremental remote log cursors
     # so long-running jobs do not rescan only the first log page.
-    "src/clio_relay/mcp_server.py": 6098,
+    # clio-relay#264: +9 net lines -- relay_list_artifacts/relay_read_artifact
+    # were the only two artifact-facing tools missing the cluster/
+    # route_revision routing every sibling job/artifact tool already has
+    # (relay_status, relay_cancel, relay_artifact_lineage, relay_wait), so a
+    # jarvis execution dispatched to a configured remote cluster always
+    # answered not-found for its own registered artifacts. Both dispatch
+    # bodies now resolve the caller's asserted cluster (the existing
+    # _job_target) and delegate the local/remote/owned fetch mechanics to
+    # the new sub-800 artifact_routing.py owner; two schema property blocks
+    # (cluster/route_revision + dependentRequired, matching relay_artifact_
+    # lineage's shape) account for the added lines, offset by deleting the
+    # now-dead local-only _read_model_artifact_bytes. A justified, minimal
+    # ratchet-up: 6098 -> 6107.
+    "src/clio_relay/mcp_server.py": 6107,
     # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
     # timeout message and log its bounded diagnostic once server-side.
     "src/clio_relay/mcp_stdio_validation.py": 1285,
@@ -1030,7 +1056,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # queue_management.py/queue_validation.py precedent of a ratcheted,
     # justified new-file cap above the 800-line default.
     "src/clio_relay/session_recovery_inspection.py": 838,
-    "src/clio_relay/spool.py": 964,
+    # session_lifecycle.py itself has no RATCHET_BASELINE entry here: the
+    # split above already took it under the 800-line default cap (582 lines).
+    # develop (pre-split) still carries its own "session_lifecycle.py": 7840
+    # baseline for the monolith this facade replaces -- that number describes
+    # a file that no longer exists on this branch, so it is dropped rather
+    # than resurrected; nothing it protected needed porting (the split's own
+    # accounting already covers session_lifecycle.py's real content).
+    # clio-relay#259: LOG_STREAM_NAMES/LogStreamName widened the job log-stream
+    # vocabulary from {stdout, stderr} to {stdout, stderr, console} in place
+    # (Literal pins at append_log/read_log/mark_truncation_event_recorded plus
+    # the capture-state loops and validator), and added append_console for
+    # symmetry with append_stdout/append_stderr. A justified, minimal
+    # ratchet-up.
+    "src/clio_relay/spool.py": 1000,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
     # while exposing only StorageDecision.message, never its serialized

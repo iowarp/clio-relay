@@ -26,6 +26,12 @@ from clio_relay import process_containment
 from clio_relay.bootstrap_reconcile import resolve_receipt_bound_jarvis_python
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
+from clio_relay.console_stream import (
+    CONSOLE_STREAM,
+    ConsoleLiveTailer,
+    console_tailer_for_mcp_call,
+    flush_terminal_console_from_path,
+)
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint_execution_sidecar_cleanup import (
     _close_runtime_sidecar_anchors,
@@ -764,8 +770,13 @@ class EndpointWorker:
         pipeline_name = None if endpoint_mcp_call else _jarvis_pipeline_name(job)
         configured_scheduler_provider = _configured_scheduler_provider_name(self.scheduler_provider)
         scheduler_name: str | None = None
+        # #259: only a jarvis_run mcp_call gets a live tailer (every other
+        # mcp_call tool has no application subprocess of its own); None
+        # otherwise, and the terminal console flush below tolerates that.
+        console_tailer: ConsoleLiveTailer | None = None
         if endpoint_mcp_call:
             assert isinstance(job.spec, McpCallSpec)
+            console_tailer = console_tailer_for_mcp_call(job.spec, spool=spool)
             yaml_text = None
             pipeline_path = spool.path / "mcp-request.json"
             _write_private_json_file(
@@ -1083,33 +1094,37 @@ class EndpointWorker:
                     scheduler_job_ids=scheduler_job_ids,
                     scheduler_cancel_attempted=scheduler_cancel_attempted,
                 ),
-                on_poll=lambda: self._poll_running_job(
-                    lease,
-                    last_renewed_at,
-                    job=job,
-                    task_id=task.task_id,
-                    progress_sidecar=progress_sidecar,
-                    progress_sidecar_offset=progress_sidecar_offset,
-                    progress_sidecar_record_count=progress_sidecar_record_count,
-                    progress_sidecar_sequence=progress_sidecar_sequence,
-                    progress_sidecar_token=progress_sidecar_token,
-                    progress_sidecar_anchor=progress_sidecar_anchor,
-                    progress_sidecar_failures=progress_sidecar_failures,
-                    scheduler_job_ids=scheduler_job_ids,
-                    package_progress_adapter=package_log_progress_adapter,
-                    package_progress_log_offsets=package_progress_log_offsets,
-                    runtime_sidecar=runtime_sidecar,
-                    runtime_sidecar_offset=runtime_sidecar_offset,
-                    runtime_sidecar_record_count=runtime_sidecar_record_count,
-                    runtime_sidecar_sequence=runtime_sidecar_sequence,
-                    runtime_sidecar_key=runtime_sidecar_key,
-                    runtime_sidecar_anchor=runtime_sidecar_anchor,
-                    runtime_sidecar_failures=runtime_sidecar_failures,
-                    runtime_metadata_state=runtime_metadata_state,
-                    runtime_metadata_digests=runtime_metadata_digests,
-                    spool=spool,
-                    ingest_progress_sidecar=progress_sidecar_enabled,
-                    ingest_runtime_sidecar=runtime_sidecar_enabled,
+                on_poll=self._wrap_poll(
+                    job,
+                    console_tailer,
+                    lambda: self._poll_running_job(
+                        lease,
+                        last_renewed_at,
+                        job=job,
+                        task_id=task.task_id,
+                        progress_sidecar=progress_sidecar,
+                        progress_sidecar_offset=progress_sidecar_offset,
+                        progress_sidecar_record_count=progress_sidecar_record_count,
+                        progress_sidecar_sequence=progress_sidecar_sequence,
+                        progress_sidecar_token=progress_sidecar_token,
+                        progress_sidecar_anchor=progress_sidecar_anchor,
+                        progress_sidecar_failures=progress_sidecar_failures,
+                        scheduler_job_ids=scheduler_job_ids,
+                        package_progress_adapter=package_log_progress_adapter,
+                        package_progress_log_offsets=package_progress_log_offsets,
+                        runtime_sidecar=runtime_sidecar,
+                        runtime_sidecar_offset=runtime_sidecar_offset,
+                        runtime_sidecar_record_count=runtime_sidecar_record_count,
+                        runtime_sidecar_sequence=runtime_sidecar_sequence,
+                        runtime_sidecar_key=runtime_sidecar_key,
+                        runtime_sidecar_anchor=runtime_sidecar_anchor,
+                        runtime_sidecar_failures=runtime_sidecar_failures,
+                        runtime_metadata_state=runtime_metadata_state,
+                        runtime_metadata_digests=runtime_metadata_digests,
+                        spool=spool,
+                        ingest_progress_sidecar=progress_sidecar_enabled,
+                        ingest_runtime_sidecar=runtime_sidecar_enabled,
+                    ),
                 ),
             )
         self._check_runtime_storage(job, spool, force_job_scan=True)
@@ -1234,8 +1249,16 @@ class EndpointWorker:
             )
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
+        if console_tailer is not None:
+            # #259: only a jarvis_run mcp_call ever writes console.log; every
+            # other job kind keeps the artifact list it already had (the log
+            # door itself still serves an empty console stream for them --
+            # JobSpool.read_log treats a missing file as empty+eof).
+            self.queue.append_artifact(
+                spool.artifact_for(spool.path / "console.log", kind="console")
+            )
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
-        self._append_optional_result_artifacts(job, spool)
+        self._append_optional_result_artifacts(job, spool, console_tailer=console_tailer)
         if dispatch_recovered:
             effective_returncode = 0
         elif dispatch_refusal is not None and result.returncode == 0:
@@ -1806,6 +1829,42 @@ class EndpointWorker:
                 else:
                     progress_sidecar_sequence[0] += 1
             progress_sidecar_offset[0] = handle.tell()
+
+    def _wrap_poll(
+        self,
+        job: RelayJob,
+        console_tailer: ConsoleLiveTailer | None,
+        inner: Callable[[], None],
+    ) -> Callable[[], None]:
+        """Compose the job's own poll step with the #259 console tail step.
+
+        ``inner`` (lease renewal, progress/runtime sidecar ingest, ...) is
+        unchanged; this only adds a best-effort console-tail increment on
+        the same cadence, self-throttled inside :class:`ConsoleLiveTailer`.
+        """
+
+        def _poll() -> None:
+            inner()
+            self._tail_console_stream(job, console_tailer)
+
+        return _poll
+
+    def _tail_console_stream(
+        self,
+        job: RelayJob,
+        console_tailer: ConsoleLiveTailer | None,
+    ) -> None:
+        """Advance one #259 live-tail increment; never raises into the job."""
+        if console_tailer is None:
+            return
+        step = console_tailer.poll()
+        if step.reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                f"console.{step.reason}",
+                step.message or "console live-tail reason",
+                payload={"stream": CONSOLE_STREAM, "reason": step.reason},
+            )
 
     def _poll_running_job(
         self,
@@ -3465,6 +3524,7 @@ class EndpointWorker:
         for kind, path in (
             ("stdout", spool.path / "stdout.log"),
             ("stderr", spool.path / "stderr.log"),
+            ("console", spool.path / "console.log"),
             ("log_capture", spool.log_capture_path),
             ("mcp_result", spool.path / "mcp-result.json"),
         ):
@@ -5642,7 +5702,44 @@ class EndpointWorker:
             return provider_for_scheduler(structured_name)
         return provider_for_scheduler(_scheduler_name_from_job(job))
 
-    def _append_optional_result_artifacts(self, job: RelayJob, spool: JobSpool) -> None:
+    def _flush_terminal_console(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        result_path: Path,
+        console_tailer: ConsoleLiveTailer | None,
+    ) -> None:
+        """Guarantee the console stream carries the application's full log.
+
+        The #259 terminal-flush half: the live tailer wired through
+        ``on_poll`` is a best-effort demo aid, but this call -- triggered
+        for every ``mcp_result`` artifact index, including worker-restart
+        recovery replay where no live tailer ever ran -- is the one that
+        must always succeed at making ``console`` complete, or report a
+        typed, non-fatal reason. It never fails the job.
+        """
+        if not (
+            job.kind is JobKind.MCP_CALL
+            and isinstance(job.spec, McpCallSpec)
+            and job.spec.tool == "jarvis_run"
+        ):
+            return
+        outcome = flush_terminal_console_from_path(spool, result_path, tailer=console_tailer)
+        if outcome.reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                f"console.{outcome.reason}",
+                outcome.message or "console terminal flush reason",
+                payload={"stream": CONSOLE_STREAM, "reason": outcome.reason},
+            )
+
+    def _append_optional_result_artifacts(
+        self,
+        job: RelayJob,
+        spool: JobSpool,
+        *,
+        console_tailer: ConsoleLiveTailer | None = None,
+    ) -> None:
         candidates = {
             "agent_result": spool.path / "agent-result.json",
             "agent_last_message": spool.path / "agent-last-message.txt",
@@ -5660,6 +5757,7 @@ class EndpointWorker:
                 path,
                 kind=kind,
                 candidate=candidate,
+                console_tailer=console_tailer,
             ):
                 self.queue.append_event(
                     job.job_id,
@@ -5737,11 +5835,13 @@ class EndpointWorker:
         *,
         kind: str,
         candidate: ArtifactRef | None = None,
+        console_tailer: ConsoleLiveTailer | None = None,
     ) -> bool:
         """Index one immutable spool artifact, tolerating restart replay."""
         candidate = candidate or spool.artifact_for(path, kind=kind)
         if kind == "mcp_result":
             ingest_jarvis_execution_outputs_from_path(self.queue, job, path, spool.path)
+            self._flush_terminal_console(job, spool, path, console_tailer)
         cursor: int | None = 1
         while cursor is not None:
             artifacts, cursor, _total = self.queue.list_artifacts_page(

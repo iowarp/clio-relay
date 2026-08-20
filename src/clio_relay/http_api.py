@@ -151,7 +151,7 @@ from clio_relay.remote_mcp import (
 from clio_relay.remote_values import expand_remote_value_on_host
 from clio_relay.retention import TerminalRetentionCoordinator
 from clio_relay.session_api import session_identity_document
-from clio_relay.spool import JobSpool
+from clio_relay.spool import JobSpool, LogStreamName
 from clio_relay.storage_runtime import StorageAdmissionError, storage_managed_queue
 from clio_relay.validation_report import redact_sensitive_values
 
@@ -2273,16 +2273,16 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
     ) -> dict[str, object]:
         try:
-            if stream_name not in {"stdout", "stderr"}:
+            if stream_name not in {"stdout", "stderr", "console"}:
                 raise door_errors.http_problem(
                     "log_stream_invalid",
-                    message="stream must be stdout or stderr",
+                    message="stream must be stdout, stderr, or console",
                 )
             return _public_payload(
                 read_job_log(
                     resolved,
                     require_owned_job(job_id),
-                    stream_name="stdout" if stream_name == "stdout" else "stderr",
+                    stream_name=cast(LogStreamName, stream_name),
                     offset=offset,
                     limit=limit,
                 )
