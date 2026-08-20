@@ -59,7 +59,7 @@ def kit_pin_sites(
         ),
         row(
             "kv.bootstrap_placeholder",
-            "src/clio_relay/bootstrap.py",
+            "src/clio_relay/bootstrap_script_provider_install.py",
             family,
             placeholder,
             "JARVIS_MCP_VERSION script placeholder (f-string interpolation of "
@@ -73,7 +73,13 @@ def kit_pin_sites(
             # Fourth drift (#231 wave-1 merge train): the #247/#254/#257
             # bootstrap extractions REMOVED lines above the placeholder,
             # 7437 -> 6906 (pre-existing red on develop, healed here).
-            line=6906,
+            # Fifth drift: the #231 decomposition wave finished extracting
+            # the embedded provider-install script out of bootstrap.py
+            # entirely, into bootstrap_script_provider_install.py -- this
+            # unchanged placeholder now lives at that module's line 380
+            # (pre-existing red on develop, healed here; still tracked for
+            # the content-anchored follow-up above).
+            line=380,
             placeholder="CLIO_KIT_JARVIS_MCP_VERSION",
             mutable=False,
         ),
