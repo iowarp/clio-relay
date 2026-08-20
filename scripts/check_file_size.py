@@ -372,7 +372,30 @@ RATCHET_BASELINE: dict[str, int] = {
     # directory_stat) dropped out of endpoint.py's forward import entirely;
     # no test referenced them directly, so no test re-pointing was needed.
     # Net: 8108 -> 7604.
-    "src/clio_relay/endpoint.py": 7604,
+    # #231 endpoint split, slice 6: -469 net lines -- JARVIS execution-
+    # recovery dispatch trust and orchestration (_trusted_jarvis_mcp_route
+    # and every function that calls it: intent build/validate, pending
+    # check, result-identity/trust checks, dispatch-refusal attribution and
+    # rendering, runtime-recovery-state restore, execution-query
+    # attestation validation) plus the MCP runner environment/command
+    # construction move to the new owner module
+    # `endpoint_jarvis_recovery.py` (553 lines). Every moved function still
+    # has a direct `EndpointWorker` call site, so all eleven stay forward-
+    # imported into endpoint.py under their original names; six collateral
+    # imports (jarvis_mcp_command, jarvis_cd_lock_binding_expectation,
+    # jarvis_mcp_server_artifact_binding_verified,
+    # remote_mcp_server_artifact_binding_verified, jarvis_dispatch_refusal,
+    # REGISTERED_JARVIS_EXECUTION_CONTRACTS) and MCP_RUNNER_BASE_ENV_NAMES
+    # drop out of endpoint.py's own imports entirely once their only
+    # remaining callers moved with the functions that used them.
+    # test_endpoint.py's and test_jarvis_execution_recovery_guards.py's
+    # `monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", ...)` /
+    # `endpoint_module.jarvis_cd_lock_binding_expectation()` sites (24 call
+    # sites total) re-point to the new module -- the internal call from
+    # `_trusted_jarvis_mcp_route` now resolves in
+    # `endpoint_jarvis_recovery`'s own globals, not endpoint.py's, so the
+    # old patch target went dead. Net: 7604 -> 7135.
+    "src/clio_relay/endpoint.py": 7135,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else

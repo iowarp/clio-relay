@@ -22,6 +22,7 @@ from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
 from clio_relay import (
+    endpoint_jarvis_recovery,
     endpoint_runtime_sidecar_anchor,
     endpoint_sidecar_types,
     endpoint_windows_sidecar_handles,
@@ -3129,7 +3130,7 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
 ) -> None:
     install_site_progress_plugin(monkeypatch)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3146,7 +3147,9 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 expected_server_artifact_digest=digest,
                 expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None
+                    if registered
+                    else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3248,7 +3251,7 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
 ) -> None:
     install_site_progress_plugin(monkeypatch)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3262,7 +3265,7 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3357,7 +3360,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
     monkeypatch: MonkeyPatch,
 ) -> None:
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3371,7 +3374,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3664,7 +3667,7 @@ def _native_mcp_result_document(
         "expected_jarvis_cd_lock_binding": (
             None
             if expected_registered_contract is not None
-            else endpoint_module.jarvis_cd_lock_binding_expectation()
+            else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
         ),
         "observed_server_artifact_digest": digest,
         "server_artifact": server_artifact,
@@ -5955,7 +5958,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
         server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_jarvis_recovery,
         "jarvis_mcp_command",
         lambda: command,
     )
@@ -5969,7 +5972,9 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 expected_server_artifact_digest=digest,
                 expected_registered_contract=("clio-kit-jarvis-user-v3.7" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None
+                    if registered
+                    else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "runtime-test"},
@@ -6082,7 +6087,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     idempotency_key = "native-direct-runtime"
     relay_job_id = "job_22222222222222222222222222222222"
     execution_id = deterministic_jarvis_execution_id(
@@ -6100,7 +6105,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={
@@ -6336,8 +6341,8 @@ def test_trusted_jarvis_mcp_result_requires_content_derived_server_digest(
     """Self-reported digests cannot substitute for the persisted artifact document."""
     command = ["clio-kit", "mcp-server", "jarvis"]
     claimed_digest = "f" * 64
-    expected_lock = endpoint_module.jarvis_cd_lock_binding_expectation()
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    expected_lock = endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6379,7 +6384,7 @@ def test_worker_refuses_builtin_semantics_without_jarvis_lock_marker(
 ) -> None:
     """A generic JARVIS call cannot unlock built-in progress/runtime handling."""
     command = ["clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6404,8 +6409,8 @@ def test_worker_refuses_result_with_mismatched_jarvis_lock_marker(
 ) -> None:
     """Built-in result evidence must carry the same lock marker as its job."""
     command = ["clio-kit", "mcp-server", "jarvis"]
-    expected = endpoint_module.jarvis_cd_lock_binding_expectation()
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    expected = endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6449,7 +6454,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
     ]
     digest = "d" * 64
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_jarvis_recovery,
         "jarvis_mcp_command",
         lambda: ["uvx", *server_args],
     )
@@ -6460,7 +6465,9 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
             server="uvx",
             server_args=server_args,
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_jarvis_cd_lock_binding=(
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments={"pipeline_id": "owned"},
         ),
@@ -6477,7 +6484,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
                 "env_from": {},
                 "expected_server_artifact_digest": digest,
                 "expected_jarvis_cd_lock_binding": (
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 "observed_server_artifact_digest": digest,
                 "operation": "tools/call",
@@ -6501,7 +6508,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
     command = ["clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     arguments = {"pipeline_id": "owned"}
     job = RelayJob(
         cluster="research-cluster",
@@ -6510,7 +6517,9 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             server=command[0],
             server_args=command[1:],
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_jarvis_cd_lock_binding=(
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments=arguments,
         ),
@@ -6525,7 +6534,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             "env_from": {},
             "expected_server_artifact_digest": digest,
             "expected_jarvis_cd_lock_binding": (
-                endpoint_module.jarvis_cd_lock_binding_expectation()
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
             ),
             "observed_server_artifact_digest": digest,
             "server_artifact": server_artifact,
