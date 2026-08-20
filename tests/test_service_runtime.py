@@ -47,6 +47,7 @@ from clio_relay.errors import (
     QueueConflictError,
     RelayError,
 )
+from clio_relay.frp_remote_scripts import remote_stop_script as _remote_stop_script
 from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
@@ -4200,7 +4201,10 @@ def test_remote_pidfd_helpers_fall_back_and_preserve_errno(
     )
     monkeypatch.setattr(service_runtime_connector_identity.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(service_runtime_connector_identity.ctypes, "CDLL", load_libc)
-    stop_script = service_runtime._remote_stop_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # #231 class-mixin split: remote_stop_script is no longer imported by
+    # service_runtime.py itself (its callers moved into the start/jarvis-bind/
+    # stop mixins); import the generator directly from its origin module.
+    stop_script = _remote_stop_script(
         session_id="gateway-fixture",
         pid=555,
     )

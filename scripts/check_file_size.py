@@ -626,7 +626,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # _revoke_browser_for_runtime_cleanup) moved to the new
     # service_runtime_browser.py (465 lines) as `_ServiceRuntimeBrowserMixin`.
     # 4169 -> 3749.
-    "src/clio_relay/service_runtime.py": 3749,
+    # #231 service-runtime split, slice 14: the teardown (stop) cluster --
+    # stop, _stop_serialized, and the teardown-policy quartet it exclusively
+    # calls (_prepare_teardown_intent, _prepare_teardown_policy,
+    # _validate_teardown_policy, _completed_teardown_result), pulled together
+    # from two non-adjacent spans since the quartet sits physically after the
+    # detach/attach cluster -- moved to the new service_runtime_stop.py (688
+    # lines) as `_ServiceRuntimeStopMixin`. The two teardown schema constants
+    # move with their only callers. 3749 -> 3107.
+    "src/clio_relay/service_runtime.py": 3107,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
