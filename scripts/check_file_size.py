@@ -108,9 +108,56 @@ RATCHET_BASELINE: dict[str, int] = {
     # whole-generation activation -- three extraction rounds moved 88% of
     # the growth into bootstrap_full_activation_staging.py; the residual
     # is dependency-free heredoc that cannot leave the renderer (same
-    # shape as the mcp_call/runner.py +28 precedent). Ratchets back with
-    # the #255 bootstrap decomposition.
-    "src/clio_relay/bootstrap.py": 8379,
+    # shape as the mcp_call/runner.py +28 precedent).
+    # #255: -7442 net lines -- the renderer decomposition. Pure-constant/
+    # embedded-source blocks move to bootstrap_constants.py,
+    # bootstrap_staged_provider_source.py, bootstrap_receipt_classifier_
+    # source.py, bootstrap_preparing_root_source.py,
+    # bootstrap_pinned_copy_sources.py, bootstrap_candidate_uv_install_
+    # source.py, and bootstrap_worker_proof_source.py (pure data, no
+    # bootstrap.py dependency, so every owner and bootstrap.py's own
+    # re-export both import them directly -- no circular import). The two
+    # ~2000/2600-line rendered-script bodies (_relay_only_reconcile_script,
+    # render_linux_user_bootstrap_script) are split into four/five
+    # sequential fragment functions each (bootstrap_reconcile_script_*.py,
+    # bootstrap_script_*.py); the outer wrapper functions stay resident and
+    # unchanged in shape (signature/docstring/setup), concatenating the
+    # fragments -- verified byte-identical against the pre-split renderer
+    # for representative inputs. bootstrap_worker_fence_script.py takes the
+    # pure-renderer worker-fence pair (no monkeypatch dependency).
+    # bootstrap_ssh_deploy.py takes _bootstrap_preflight_over_ssh and
+    # bootstrap_cluster_over_ssh (both monkeypatch TARGETS); every call
+    # site inside them that reaches a collaborator the test suite
+    # monkeypatches at the bootstrap.py facade (`_run`,
+    # `create_bootstrap_archive`, `render_linux_user_bootstrap_script`,
+    # `_verify_persistent_bootstrap_receipt`, `_validate_relay_bootstrap_
+    # wheel`, `uuid4`, `BootstrapPreflightResult`) or that simply still
+    # lives there (`bootstrap_relay_identity`, `_bootstrap_desired_state`,
+    # `_is_clio_relay_git_checkout`, `_sha256_regular_file`,
+    # `_validate_ssh_destination`, `_remaining_public_deadline`) is
+    # rewritten to a qualified, call-time `bootstrap.<name>(...)` lookup
+    # (the same forwarder idiom cli.py's R8(ii) decomposition established)
+    # instead of a bare/early-bound reference, so
+    # `monkeypatch.setattr(bootstrap, "X", ...)` in the existing test suite
+    # keeps reaching the real call site. bootstrap_frp_local_install.py
+    # takes the local (Windows) frp installer family the same way --
+    # `_install_frp_from_release_archive`/`_assert_frp_pair` are
+    # string-path monkeypatch targets
+    # (`monkeypatch.setattr("clio_relay.bootstrap.X", ...)`), so their
+    # call sites inside `install_local_frp` are qualified too; `platform`
+    # and `shutil` stay imported in bootstrap.py itself (unused in its own
+    # body now) purely because tests patch `clio_relay.bootstrap.platform.*`
+    # / `bootstrap.shutil.which` by that exact string path, and both are
+    # the same singleton module object every importer shares, so the
+    # patch is observed regardless of which file's code actually calls it.
+    # bootstrap.py is now 925 lines, an assembly over ~18 new owner
+    # modules plus the pre-existing bootstrap_journal.py/bootstrap_
+    # reconcile.py/bootstrap_recovery.py/bootstrap_jarvis_staging.py/
+    # bootstrap_receipt_validation.py/bootstrap_pin.py/bootstrap_full_
+    # activation_staging.py/bootstrap_acceptance.py/bootstrap_provider_
+    # build_info.py family -- still above DEFAULT_MAX_LINES (800), so the
+    # entry stays, ratcheted down from 8379.
+    "src/clio_relay/bootstrap.py": 925,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     "src/clio_relay/bootstrap_journal.py": 1534,
