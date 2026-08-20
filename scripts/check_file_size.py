@@ -643,7 +643,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # service_runtime_detach.py (564 lines) as `_ServiceRuntimeDetachMixin`.
     # The attach mixin calls back into this module's predicates via `self`.
     # 3107 -> 2596.
-    "src/clio_relay/service_runtime.py": 2596,
+    # #231 service-runtime split, slice 16: desktop-connector reattachment --
+    # attach, _attach_serialized -- moved to the new service_runtime_attach.py
+    # (353 lines) as `_ServiceRuntimeAttachMixin`. It calls back into the
+    # detach mixin's resumability predicates via `self`. 2596 -> 2292.
+    "src/clio_relay/service_runtime.py": 2292,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
