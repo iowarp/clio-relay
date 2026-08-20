@@ -331,7 +331,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # module-level helper functions now import these forward from the new
     # module by the same names, so every existing `endpoint.<name>` access
     # and monkeypatch target keeps resolving unchanged. Net: 8743 -> 8653.
-    "src/clio_relay/endpoint.py": 8653,
+    # #231 endpoint split, slice 2: -63 net lines -- the package-progress-log
+    # path/identity primitives (_progress_log_identity,
+    # _normalize_package_progress_log_path, _validated_native_subprocess_cwd,
+    # _render_progress_log_identity, _open_package_progress_log) move to the
+    # new leaf owner module `endpoint_progress_log_io.py` (94 lines). Net:
+    # 8653 -> 8590.
+    "src/clio_relay/endpoint.py": 8590,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
