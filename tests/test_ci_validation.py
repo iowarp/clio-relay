@@ -44,17 +44,19 @@ from clio_relay.ci_validation import (
     build_staged_release_asset_plan,
     build_tag_binding,
     build_validation_report_asset_manifest,
-    resolve_live_release,
     select_ci_run,
     validate_release_acceptance_matrix,
     verify_actions_artifact_archive,
     verify_ci_status,
     verify_downloaded_validation_report_assets,
     verify_exact_release_asset_inventory,
+    write_candidate_checksum_manifest,
+)
+from clio_relay.release_identity import (
+    resolve_live_release,
     verify_live_mutation_authority,
     verify_live_release_identity,
     verify_release_identity,
-    write_candidate_checksum_manifest,
 )
 
 REPOSITORY = "iowarp/clio-relay"
