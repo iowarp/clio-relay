@@ -413,7 +413,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_execution_sidecar_quarantine_name` calls and one `_rename_noreplace_
     # at` monkeypatch/direct-call pair re-point to the new modules per the
     # same rule slice 3/4/6 established. Net: 7135 -> 6763.
-    "src/clio_relay/endpoint.py": 6763,
+    # #231 endpoint split, slice 8: -447 net lines -- package-progress
+    # observation trust (bounded sidecar-record reading/checkpointing plus
+    # provider/MCP-bridge/native-HMAC notification cross-checks) moves to
+    # the new owner module `endpoint_progress_trust.py` (505 lines --
+    # slightly above the 150-500 sweet spot; the module's docstring
+    # documents why its two layers stay together). Only
+    # `_normalized_provider_distribution` has no remaining `EndpointWorker`
+    # call site (its only caller, `_trusted_mcp_progress_metadata`, moved
+    # with it); no test referenced it directly. Net: 6763 -> 6316.
+    "src/clio_relay/endpoint.py": 6316,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
