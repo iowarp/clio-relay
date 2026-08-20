@@ -147,7 +147,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # build + six matrix-report validations, incl. the complementary
     # POSIX/Windows platform-marked-test partition proof) and binding a
     # protected release tag to that tested tree via its merged pull request.
-    "src/clio_relay/ci_validation.py": 1743,
+    # #231: -231 net lines -- ci_run_status.py becomes the owner for CI run
+    # and job identity: selecting the sole successful merge-queue ci.yml run
+    # for a commit, and building/verifying the CI status receipt that binds
+    # it to the already-sealed candidate build and tag binding.
+    "src/clio_relay/ci_validation.py": 1512,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
