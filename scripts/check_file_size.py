@@ -972,7 +972,32 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_mcp_server._job_target`/`_mcp_server._route_revision` (still
     # resident) the same way relay_artifact_lineage's existing
     # `_mcp_server._used_artifacts_tool`/`_used_by_tool` calls already do.
-    "src/clio_relay/mcp_server.py": 4153,
+    #
+    # split/mcp-server-w3 slice 4 (#231): the remote-MCP-catalog resolution /
+    # MCP-profile-normalization cluster (`_remote_mcp_catalog`,
+    # `_configured_cluster_names`, `_tool_definitions_and_remote_catalog`,
+    # `_bound_virtual_jarvis_clusters`, `_normalize_profile`,
+    # `_mcp_profile_from_env`, `_require_compatible_remote_mcp_catalog`,
+    # `_route_revision`, `_validated_route_revision`) moves to
+    # mcp_remote_catalog.py. A clean leaf (none call back into an
+    # mcp_server.py-only business function) but two of its own functions
+    # (`_remote_mcp_catalog`, `_configured_cluster_names`) are directly
+    # monkeypatched by tests, and `_route_revision` alone has 30+ bare call
+    # sites in functions that stay in mcp_server.py (including mcp_dispatch.py's
+    # `_mcp_server._route_revision` calls in the #264 artifact-routing dispatch
+    # bodies, which keep resolving through this re-export unchanged) --
+    # mcp_server.py re-exports every moved name, and
+    # `_tool_definitions_and_remote_catalog`'s own internal calls to the two
+    # monkeypatched names go through the same `_mcp_server.<name>`
+    # function-scope back-reference the slice-3 dispatcher uses, not a bare
+    # same-module call, which would resolve through mcp_remote_catalog's own
+    # globals and silently miss every test patch. A third re-export
+    # ("is_virtual_jarvis_tool as is_virtual_jarvis_tool") was needed for the
+    # same reason: tests/test_mcp_server.py reads
+    # mcp_server_module.is_virtual_jarvis_tool directly (not a monkeypatch, a
+    # plain attribute access), and it lost its only bare in-file caller
+    # (`_tool_definitions_and_remote_catalog`) to this same slice.
+    "src/clio_relay/mcp_server.py": 4049,
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
