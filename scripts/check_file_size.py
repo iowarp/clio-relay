@@ -396,7 +396,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # inline, and returns the worker's unverified runtime identity when dev
     # mode defers rather than falling into the generic "omitted" error. A
     # justified, minimal ratchet-up.
-    "src/clio_relay/installation.py": 3027,
+    "src/clio_relay/installation.py": 2294,
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
     # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s
