@@ -1210,7 +1210,28 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R8(iii): wire-model import collapses from a 7-line multi-import
     # block to a single-line `from clio_relay.session_wire_models import
     # CleanupResource, OwnedSessionStartResult` -- ratchet down. 1795 -> 1794.
-    "src/clio_relay/transport_probe.py": 1794,
+    # split/transport-probe-w2 (#231): five owner modules --
+    # transport_probe_primitives.py (151: ManagedProcess protocol, probe
+    # callback aliases, small process/health/shell helpers),
+    # transport_probe_evidence.py (101: structured cleanup-evidence
+    # assembly), transport_probe_session_lifecycle.py (363: SSH-forward
+    # session start/detach/teardown verification),
+    # transport_probe_remote_script.py (159: the remote FRP bootstrap
+    # script), transport_probe_remote_cleanup_models.py (69: the remote
+    # cleanup payload's pydantic shape) and transport_probe_remote_cleanup.py
+    # (446: its token-verified stop-and-report logic). Five functions
+    # (run_frp_http_probe, run_frp_direct_http_probe,
+    # run_ssh_forward_http_probe, _run_frp_http_probe_with_proxy_type,
+    # _finish_frp_probe_cleanup) stay resident rather than moving with their
+    # concern: tests/test_transport_probe.py patches
+    # clio_relay.transport_probe._wait_for_healthz/_cleanup_remote_probe/
+    # teardown_remote_session/detach_remote_session directly and expects the
+    # probe orchestration to see the fake, which only holds while that call
+    # site's enclosing def resolves the bare name against this module's own
+    # namespace at call time -- moving the caller elsewhere silently
+    # un-patches those tests (transport_probe.py's own module docstring has
+    # the full explanation). 1794 -> 696, back under the 800-line default
+    # cap -- transport_probe.py graduates out of RATCHET_BASELINE.
     # #231 split/validation-report S1: the pydantic/StrEnum wire-model
     # catalog (LiveValidationReport, ReleaseGatePolicy, InstallSource, ...)
     # moved to validation_schema.py (650 lines) and the byte/count budget
