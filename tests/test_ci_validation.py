@@ -39,6 +39,11 @@ from clio_relay.ci_run_status import (
     verify_ci_status,
 )
 from clio_relay.ci_validation import (
+    REQUIRED_ENVIRONMENTS,
+    ProvenanceError,
+    write_candidate_checksum_manifest,
+)
+from clio_relay.provenance_primitives import (
     MAX_DISTRIBUTION_BYTES,
     MAX_FIXED_JSON_BYTES,
     MAX_MANIFEST_BYTES,
@@ -48,11 +53,6 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
     MAX_VALIDATION_REPORT_ASSETS,
     MAX_VALIDATION_REPORT_BYTES,
-    REQUIRED_ENVIRONMENTS,
-    ProvenanceError,
-    build_validation_report_asset_manifest,
-    verify_downloaded_validation_report_assets,
-    write_candidate_checksum_manifest,
 )
 from clio_relay.release_assets import (
     build_exact_release_asset_inventory,
@@ -65,6 +65,10 @@ from clio_relay.release_identity import (
     verify_live_mutation_authority,
     verify_live_release_identity,
     verify_release_identity,
+)
+from clio_relay.validation_report_assets import (
+    build_validation_report_asset_manifest,
+    verify_downloaded_validation_report_assets,
 )
 
 REPOSITORY = "iowarp/clio-relay"
