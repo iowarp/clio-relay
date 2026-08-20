@@ -104,7 +104,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # the new bootstrap_recovery.py) and the #254 jarvis-venv staging guard
     # and promotion wiring (delegates to the new bootstrap_jarvis_staging.py).
     # A net ratchet-down even after both fixes' own new call sites.
-    "src/clio_relay/bootstrap.py": 8356,
+    # 2026-08-19 (+23, justified; coordinator-approved): #257 staged
+    # whole-generation activation -- three extraction rounds moved 88% of
+    # the growth into bootstrap_full_activation_staging.py; the residual
+    # is dependency-free heredoc that cannot leave the renderer (same
+    # shape as the mcp_call/runner.py +28 precedent). Ratchets back with
+    # the #255 bootstrap decomposition.
+    "src/clio_relay/bootstrap.py": 8379,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     "src/clio_relay/bootstrap_journal.py": 1534,
