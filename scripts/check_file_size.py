@@ -1380,14 +1380,33 @@ RATCHET_BASELINE: dict[str, int] = {
     # publish_owned_session_api_startup_receipt) and cli.py's own
     # compatibility re-export block are what remain; full slice-by-slice
     # detail lives in the split/session-lifecycle branch history.
-    # split/session-lifecycle slice J (#231): execute_owned_session_start
-    # alone is ~910 lines of crash-recovery start logic (systemd containment,
-    # broker handoff, resumable-attempt promotion) that does not decompose
-    # along a clean second seam without restructuring the function itself --
-    # out of scope for a mechanical extraction slice. Matches the
-    # queue_management.py/queue_validation.py precedent of a ratcheted,
-    # justified new-file cap above the 800-line default.
-    "src/clio_relay/session_start_execution.py": 1190,
+    # split/session-start-execution-w3 (#231): session_start_execution.py's
+    # own ratchet-baseline entry and history comment (slice J: "does not
+    # decompose along a clean second seam without restructuring the function
+    # itself") are removed here. The file is now a 44-line facade -- the
+    # ``_OwnedSessionQueue``/``_RecoveredStartProbe``/
+    # ``_promote_resumable_contained_start`` cluster moved to the new
+    # session_start_promotion.py (187 lines), and
+    # ``execute_owned_session_identity_challenge`` moved to the new
+    # session_start_identity_challenge.py (99 lines) -- both comfortably
+    # under DEFAULT_MAX_LINES, no baseline entry needed. The still-
+    # irreducible ``execute_owned_session_start`` (the same ~910-line
+    # crash-recovery start body slice J already found does not decompose
+    # along a clean second seam without restructuring it) moves as one
+    # atomic, unsplit unit to the new session_start_execution_core.py, which
+    # carries its own baseline entry below. Comfortably under
+    # DEFAULT_MAX_LINES -- entry removed per ground rule 5.
+    # split/session-start-execution-w3 (#231): session_start_execution_core.py
+    # is a new file holding execute_owned_session_start verbatim, moved whole
+    # from session_start_execution.py above -- see that module's own
+    # docstring for why it does not decompose further (every local threads
+    # through the entire body across several early-return branches and two
+    # closures that read/mutate the enclosing scope; splitting it would be a
+    # semantic rewrite of security-sensitive crash-recovery code, not a
+    # mechanical extraction). Matches the cli_session_teardown.py /
+    # cli_owned_report_artifact.py precedent of a ratcheted, justified
+    # new-file cap above the 800-line default.
+    "src/clio_relay/session_start_execution_core.py": 980,
     # split/session-lifecycle slice J (#231): the failed-start teardown path
     # (_execute_owned_failed_start_teardown, 243 lines) plus
     # execute_owned_session_teardown (342 lines) and their three small
