@@ -48,8 +48,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.transport_probe as transport_probe
-from clio_relay import cli
 from clio_relay.cli import app
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
@@ -250,7 +250,9 @@ def test_cli_tests_http_transport_and_writes_canonical_report(
         )
 
     monkeypatch.setattr("clio_relay.transport_probe.run_frp_http_probe", fake_probe)
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", fake_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", fake_worker_identity
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
     report_path = tmp_path / "relay-transport.json"
@@ -402,7 +404,9 @@ def test_cli_transport_worker_identity_failure_fails_canonical_report(
         raise ConfigurationError("remote wheel hash does not match")
 
     monkeypatch.setattr(transport_probe, "run_frp_http_probe", fake_probe)
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", fail_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", fail_worker_identity
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
     report_path = tmp_path / "worker-mismatch.json"

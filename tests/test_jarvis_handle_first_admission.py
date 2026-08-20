@@ -285,7 +285,7 @@ def test_typed_http_jarvis_run_retry_replays_server_identity(
         return _SERVER_ARTIFACT_DIGEST
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -328,7 +328,7 @@ def test_typed_http_jarvis_run_rejects_caller_execution_identity(
         return _SERVER_ARTIFACT_DIGEST
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))

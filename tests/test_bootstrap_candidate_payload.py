@@ -46,10 +46,49 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
         "bootstrap_jarvis_staging.py",
         "bootstrap_provider_build_info.py",
         "bootstrap_reconcile.py",
+        # #231 split/bootstrap-reconcile-w2: bootstrap_reconcile.py's own
+        # owner modules must travel with the candidate too, or the facade's
+        # sibling imports can't resolve inside a standalone deployment.
+        "bootstrap_reconcile_activation_paths.py",
+        "bootstrap_reconcile_builtin_repos.py",
+        "bootstrap_reconcile_constants.py",
+        "bootstrap_reconcile_execution_identity.py",
+        "bootstrap_reconcile_generation_staging.py",
+        "bootstrap_reconcile_inspection.py",
+        "bootstrap_reconcile_jarvis_wrapper_binding.py",
+        "bootstrap_reconcile_locks.py",
+        "bootstrap_reconcile_models.py",
+        "bootstrap_reconcile_planning.py",
+        "bootstrap_reconcile_planning_support.py",
+        "bootstrap_reconcile_primitives.py",
+        "bootstrap_reconcile_readiness.py",
+        "bootstrap_reconcile_receipt.py",
+        "bootstrap_reconcile_replacement_provider.py",
+        "bootstrap_reconcile_repository.py",
+        "bootstrap_reconcile_transaction.py",
         "bootstrap_recovery.py",
         "bounded_process.py",
         "errors.py",
         "process_containment.py",
+        # #231 split/process-containment-w2: same reasoning -- the isolated
+        # containment-broker subprocess (process_containment_broker_script.py)
+        # resolves its own module_root from wherever `_spawn_broker` actually
+        # lives, with no namespace-package fallback available to it, so every
+        # sibling owner module must ship with the candidate.
+        "process_containment_broker.py",
+        "process_containment_broker_script.py",
+        "process_containment_environment.py",
+        "process_containment_popen.py",
+        "process_containment_posix.py",
+        "process_containment_recorded.py",
+        "process_containment_registry.py",
+        "process_containment_spawn.py",
+        "process_containment_systemd_core.py",
+        "process_containment_systemd_query.py",
+        "process_containment_systemd_scope.py",
+        "process_containment_termination.py",
+        "process_containment_types.py",
+        "process_containment_windows.py",
         "safe_archive.py",
     }
 
@@ -64,17 +103,7 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
     shutil.copytree(
         installed_package,
         legacy_root / "clio_relay",
-        ignore=shutil.ignore_patterns(
-            "__pycache__",
-            "bootstrap_full_activation_staging.py",
-            "bootstrap_jarvis_staging.py",
-            "bootstrap_reconcile.py",
-            "bootstrap_recovery.py",
-            "bounded_process.py",
-            "errors.py",
-            "process_containment.py",
-            "safe_archive.py",
-        ),
+        ignore=shutil.ignore_patterns("__pycache__", *sources),
     )
     probe = r"""
 import importlib.util

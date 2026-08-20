@@ -26,8 +26,11 @@ from typer.testing import CliRunner
 import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
 import clio_relay.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
+import clio_relay.cli_installation_receipt as cli_installation_receipt
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.core_queue as core_queue
 import clio_relay.installation as installation
 from clio_relay import __version__
@@ -2099,7 +2102,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     def remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
         return {"verified": True}
 
-    monkeypatch.setattr(cli, "_remote_target_identity", remote_target_identity)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2328,7 +2331,10 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
     path_type = type(current)
     original_lstat = path_type.lstat
     original_readlink = os.readlink
-    original_is_directory_alias = bootstrap_reconcile._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    # proven_active_generation_mismatch (the direct caller here) now lives in
+    # bootstrap_reconcile_inspection.py; patch its own imported copy of the
+    # collaborator (iowarp/clio-relay#255).
+    original_is_directory_alias = bootstrap_reconcile_inspection._path_is_directory_alias  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     raw_target = str(active)
     simulate_current_race = False
     current_lstat_calls = 0
@@ -2381,13 +2387,13 @@ def test_proven_active_generation_mismatch_requires_one_managed_generation(
         return path == generations or original_is_directory_alias(path)
 
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         aliased_generations,
     )
     assert proven_active_generation_mismatch(desired, home=tmp_path) is None
     monkeypatch.setattr(
-        bootstrap_reconcile,
+        bootstrap_reconcile_inspection,
         "_path_is_directory_alias",
         original_is_directory_alias,
     )
@@ -2534,9 +2540,13 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
 
 
 def test_bootstrap_inspection_deadlines_match_acceptance_contract() -> None:
-    assert 0 < cli.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < 30
+    """#231 cli.py decomposition: both deadlines moved to cli_installation_receipt.py
+    alongside bootstrap_inspect, their only caller."""
+    assert 0 < cli_installation_receipt.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < 30
     assert (
-        cli.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS < cli.BOOTSTRAP_REPAIR_DEADLINE_SECONDS < 60
+        cli_installation_receipt.BOOTSTRAP_EXACT_INSPECTION_DEADLINE_SECONDS
+        < cli_installation_receipt.BOOTSTRAP_REPAIR_DEADLINE_SECONDS
+        < 60
     )
 
 

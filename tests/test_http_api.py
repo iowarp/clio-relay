@@ -141,6 +141,63 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert [response.status_code for response in invalid_log_responses] == [422, 422, 422]
 
 
+def test_get_log_serves_console_stream_like_stdout_and_stderr(tmp_path: Path) -> None:
+    """#259: the door route accepts and serves ``console`` exactly like the
+    other two log streams -- same offset/limit/eof envelope shape, and a
+    stream nothing has written yet reads back empty with ``eof`` rather than
+    404ing or 500ing (point 2c: non-jarvis mcp_call jobs never write console,
+    and must never fail the read)."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-console",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    empty_response = client.get(f"/jobs/{job.job_id}/logs/console")
+    assert empty_response.status_code == 200
+    assert empty_response.json() == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "text": "",
+    }
+
+    console_path = spool / "console.log"
+    console_path.write_bytes(b"thermo: step 0 temp 300.0\n")
+
+    log_response = client.get(f"/jobs/{job.job_id}/logs/console", params={"limit": 6})
+    invalid_stream_response = client.get(f"/jobs/{job.job_id}/logs/bogus-stream")
+
+    assert log_response.status_code == 200
+    body = log_response.json()
+    assert body["stream"] == "console"
+    assert body["text"] == "thermo"
+    assert body["eof"] is False
+    assert body["next_offset"] == 6
+
+    tail_response = client.get(
+        f"/jobs/{job.job_id}/logs/console",
+        params={"offset": body["next_offset"]},
+    )
+    assert tail_response.status_code == 200
+    assert tail_response.json()["text"] == ": step 0 temp 300.0\n"
+    assert tail_response.json()["eof"] is True
+
+    assert invalid_stream_response.status_code == 400
+    assert invalid_stream_response.json()["reason"] == "log_stream_invalid"
+    assert "console" in invalid_stream_response.json()["detail"]
+
+
 def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
     tmp_path: Path,
 ) -> None:
@@ -218,7 +275,12 @@ def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
             timeout_seconds=timeout_seconds,
         )
 
-    monkeypatch.setattr(http_api_module, "observe_until_terminal", observe)
+    # split/http-api-w3 (iowarp/clio-relay#231): `wait` moved to
+    # http_api_routes_events.py, the only remaining caller of
+    # observe_until_terminal -- the patch target follows the move.
+    import clio_relay.http_api_routes_events as http_api_routes_events_module
+
+    monkeypatch.setattr(http_api_routes_events_module, "observe_until_terminal", observe)
     response = cast(Any, TestClient(create_app(settings))).post(
         f"/jobs/{job.job_id}/wait",
         params={"timeout_seconds": 0.25, "poll_seconds": 0.05},
@@ -835,13 +897,18 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
         "storage_managed_queue",
         submission_queue,
     )
+    # split/http-api-w3 (iowarp/clio-relay#231): submit_mcp_call (and its
+    # resolve_registered_remote_mcp_admission/default_registry_path calls)
+    # moved to http_api_routes_jobs.py -- the patch targets follow the move.
+    import clio_relay.http_api_routes_jobs as http_api_routes_jobs_module
+
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "resolve_registered_remote_mcp_admission",
         resolve_admission,
     )
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_jobs_module,
         "default_registry_path",
         lambda: tmp_path / "missing-clusters.json",
     )
@@ -2086,7 +2153,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         pytest.fail("owned API must not consult its cluster-local cache")
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         fail_on_cluster_cache,
     )
     client = cast(
@@ -2182,7 +2249,7 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
         return expected_digest
 
     monkeypatch.setattr(
-        "clio_relay.http_api.jarvis_mcp_artifact_binding",
+        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -2282,8 +2349,8 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         )
         return ["mcp-server", "jarvis"]
 
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server", fake_server)
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server_args", fake_server_args)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", fake_server)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server_args", fake_server_args)
     client = cast(
         Any,
         TestClient(
@@ -2349,7 +2416,7 @@ def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict
     ) -> str:
         raise ValueError("receipt-bound clio-kit runtime identity did not verify")
 
-    monkeypatch.setattr("clio_relay.http_api.jarvis_mcp_server", failing_server)
+    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", failing_server)
     client = cast(
         Any,
         TestClient(
@@ -2398,7 +2465,12 @@ def _write_home_anchored_receipt_and_patch_expanduser(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", fake_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
     return "$HOME/deployment-p5run2/install-receipt.json"
 
 
@@ -2441,7 +2513,12 @@ def _write_unverifiable_pinned_jarvis_receipt_and_patch_expanduser(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", fake_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): os.path is the same
+    # singleton module object regardless of which file's code calls
+    # os.path.expanduser(...) (now http_api_routes_jobs.py); patching it via
+    # this test's own `import os` is observed identically to patching it via
+    # http_api_module.os, which no longer imports os directly.
+    monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
     return "$HOME/deployment-p5run2/install-receipt.json"
 
 
@@ -2460,7 +2537,9 @@ def test_owned_jarvis_mcp_submission_home_expansion_failure_surfaces_typed_not_5
     def homeless_expanduser(value: str) -> str:
         return "" if value == "~" else value
 
-    monkeypatch.setattr(http_api_module.os.path, "expanduser", homeless_expanduser)
+    # split/http-api-w3 (iowarp/clio-relay#231): see the comment on the
+    # fake_expanduser patch sites above.
+    monkeypatch.setattr(os.path, "expanduser", homeless_expanduser)
 
     definition = ClusterDefinition(
         name="test-cluster",

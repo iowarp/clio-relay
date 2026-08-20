@@ -17,7 +17,7 @@ transport limit is misread as a malformed script. Measured on the real host:
 an 8117-byte command arrived intact, a 10117-byte command did not.
 
 Size of the payload must not be a function of argv, so the script travels over
-stdin -- the same shape ``session_lifecycle._ssh_script`` already uses.
+stdin -- the same shape ``session_remote_scripts._ssh_script`` already uses.
 """
 
 from __future__ import annotations

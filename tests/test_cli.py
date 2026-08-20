@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib
 import json
 import os
 import stat
@@ -23,32 +22,38 @@ from click import unstyle
 from filelock import FileLock
 from typer.testing import CliRunner
 
-import clio_relay.application_profiles as application_profiles
-import clio_relay.bootstrap as bootstrap
-import clio_relay.bootstrap_acceptance as bootstrap_acceptance
+import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
+import clio_relay.cli_cleanup_report as cli_cleanup_report
+import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
+import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
+import clio_relay.cli_jarvis_intent_checkpoint as cli_jarvis_intent_checkpoint
+import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
+import clio_relay.cli_jarvis_pending_report as cli_jarvis_pending_report
+import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
+import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
+import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.cli_owned_report_artifact as cli_owned_report_artifact
+import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
+import clio_relay.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
+import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.cli_session_start as cli_session_start
+import clio_relay.cli_session_teardown as cli_session_teardown
 import clio_relay.cluster_config as cluster_config
-import clio_relay.cluster_probe as cluster_probe
-import clio_relay.deployment as deployment
-import clio_relay.endpoint as endpoint
-import clio_relay.fastmcp_server as fastmcp_server
 import clio_relay.installation as installation_module
-import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
-import clio_relay.live_acceptance as live_acceptance
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
-import clio_relay.owner_session_admission as owner_session_admission
-import clio_relay.relay_ops as relay_ops
 import clio_relay.remote_cli as remote_cli
 import clio_relay.scheduler_providers as scheduler_providers
-import clio_relay.service_runtime as service_runtime
-import clio_relay.session_api as session_api
 import clio_relay.session_lifecycle as session_lifecycle
-import clio_relay.storage_runtime as storage_runtime
+import clio_relay.session_lifecycle_report as session_lifecycle_report
+import clio_relay.session_start_query as session_start_query
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
-from clio_relay.bootstrap_pin import (
-    BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
-    BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
-)
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -56,7 +61,6 @@ from clio_relay.cluster_config import (
     ClusterTargetIdentity,
     FrpTransportConfig,
     RemoteMcpServerConfig,
-    WorkerCapacityPolicy,
     cluster_route_revision,
 )
 from clio_relay.core_queue import ClioCoreQueue
@@ -67,7 +71,6 @@ from clio_relay.errors import (
     RelayError,
 )
 from clio_relay.installation import (
-    InstallReceipt,
     verify_remote_worker_info,
     write_self_install_receipt,
 )
@@ -79,9 +82,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
     jarvis_user_contract_titles,
 )
-from clio_relay.live_acceptance import LiveAcceptanceOptions
 from clio_relay.models import (
-    ArtifactRef,
     Cursor,
     EndpointRegistration,
     EndpointRole,
@@ -90,32 +91,26 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
-    JobWaitResult,
-    McpAdmissionClass,
     McpCallSpec,
-    McpOperation,
     OwnerSessionClosure,
     RelayJob,
     RelayTask,
     SchedulerPhase,
     SchedulerStatus,
 )
-from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES
-from clio_relay.remote_mcp import MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
 from clio_relay.runtime_metadata import RUNTIME_METADATA_SCHEMA
 from clio_relay.scheduler_providers import SchedulerProvider
 from clio_relay.service_runtime import (
-    ServiceRuntimePendingResult,
     ServiceRuntimeSupervisor,
 )
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
-    RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     session_lifecycle_report_sha256,
 )
+from clio_relay.session_wire_models import RemoteSessionStateEvidence
 from clio_relay.validation_report import (
     EvidenceReference,
     InstallSource,
@@ -129,13 +124,9 @@ from clio_relay.validation_report import (
     new_live_validation_report,
     write_validation_report,
 )
-from tests.queue_validation_fixtures import (
-    DeterministicQueueValidationProvider,
-    LiveWorkerFleet,
-)
 
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
-    cli._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_session_teardown._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 
 
@@ -185,7 +176,7 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         report: SessionLifecycleReport,
         **_kwargs: object,
     ) -> tuple[SessionLifecycleReport, OwnedSessionRecoveryStatus]:
-        reference, _payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        reference, _payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report
         )
         generation_id = report.session_generation_id
@@ -238,7 +229,7 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         finalized_statuses[report.session_id] = status
         return report, status
 
-    real_recovery_status = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    real_recovery_status = cli_owned_session_recovery._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def recover_preserved_report(**kwargs: object) -> OwnedSessionRecoveryStatus:
         session_id = cast(str, kwargs["session_id"])
@@ -291,11 +282,13 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         )
 
     monkeypatch.setattr(
-        cli,
+        cli_session_teardown,
         "_persist_verified_cleanup_report_before_closure",
         preserve_verified_report,
     )
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recover_preserved_report)
+    monkeypatch.setattr(
+        cli_owned_session_recovery, "_owned_session_recovery_status", recover_preserved_report
+    )
 
 
 def _write_test_cluster(
@@ -319,34 +312,6 @@ def _write_test_cluster(
             )
         }
     ).save(root / ".clio-relay" / "clusters.json")
-
-
-def test_cluster_add_persists_explicit_jarvis_graph_policy(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The operator-selected profile and build policy cross the CLI boundary unchanged."""
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "add",
-            "--name",
-            "ares",
-            "--ssh-host",
-            "ares-login",
-            "--jarvis-resource-graph-profile",
-            "ares",
-            "--allow-jarvis-resource-graph-build",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    definition = ClusterRegistry.load(tmp_path / ".clio-relay/clusters.json").clusters["ares"]
-    assert definition.jarvis_resource_graph_profile == "ares"
-    assert definition.allow_jarvis_resource_graph_build is True
 
 
 def _verified_jarvis_nested_runtime() -> dict[str, object]:
@@ -660,647 +625,6 @@ def test_cluster_scoped_desktop_admission_isolates_same_session_id(
     assert admitted.cluster == "cluster-b"
 
 
-def test_endpoint_worker_with_explicit_provider_does_not_require_remote_registry(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    class FakeWorker:
-        def register(self) -> None:
-            captured["registered"] = True
-
-        def run_once(self) -> None:
-            captured["ran_once"] = True
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        captured.update(kwargs)
-        return FakeWorker()
-
-    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
-        raise AssertionError(f"unexpected registry lookup for {cluster}")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "homelab",
-            "--scheduler-provider",
-            "external",
-            "--once",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["cluster"] == "homelab"
-    assert captured["registered"] is True
-    assert captured["ran_once"] is True
-    assert captured["closed"] is True
-    provider = cast(SchedulerProvider, captured["scheduler_provider"])
-    assert provider.name == "external"
-
-
-def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-    )
-
-    class FakeWorker:
-        def register(self) -> None:
-            captured["registered"] = True
-
-        def run_once(self) -> None:
-            captured["ran_once"] = True
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        captured.update(kwargs)
-        return FakeWorker()
-
-    def load_cluster(cluster: str) -> ClusterDefinition:
-        captured["registry_cluster"] = cluster
-        return definition
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "configured-cluster",
-            "--once",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert captured["registry_cluster"] == "configured-cluster"
-    assert captured["closed"] is True
-    provider = cast(SchedulerProvider, captured["scheduler_provider"])
-    assert provider.name == "slurm"
-
-
-def test_endpoint_start_defaults_control_query_concurrency_from_cluster_registry(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219: an unpinned worker must never silently start with zero control-query
-    capacity. Historically ``endpoint start`` had its own disconnected CLI
-    default of 0, independent of the cluster's registered WorkerCapacityPolicy
-    (whose own default is 1) -- a fresh deployment that never pins
-    --control-query-concurrency got a worker that accepts describe-class jobs
-    and never runs them, with no typed reason.
-    """
-    captured: dict[str, object] = {}
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-    )
-
-    class FakeWorker:
-        def register(self) -> None:
-            captured["registered"] = True
-
-        def run_once(self) -> None:
-            captured["ran_once"] = True
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        captured.update(kwargs)
-        return FakeWorker()
-
-    def load_cluster(cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
-
-    result = CliRunner().invoke(
-        app,
-        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["control_query_concurrency"] == 1
-    assert captured["concurrency"] == 3
-
-
-def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registered_cluster(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219: WorkerCapacityPolicy.control_query_concurrency requires >= 1, so an
-    operator cannot even pin 0 against a cluster resolved from the registry --
-    reusing that validation (the same one render-user-service relies on)
-    rejects it outright instead of silently starting a worker that will
-    never pick up a describe-class job.
-    """
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-    )
-
-    def _load_definition(_cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "configured-cluster",
-            "--control-query-concurrency",
-            "0",
-            "--once",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "control_query_concurrency" in result.output
-
-
-def test_endpoint_start_rejects_concurrency_one_against_a_registered_cluster(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219 rework: this is a DELIBERATE side effect of reusing
-    WorkerCapacityPolicy's own validation, pinned here rather than left as an
-    unstated regression risk. --concurrency 1 -- the CLI's own PRE-#219
-    default -- is now a typed refusal against a registered cluster, exactly
-    like --control-query-concurrency 0 above, over-determined by TWO of
-    WorkerCapacityPolicy's own invariants at once: its ``concurrency``
-    field requires >= 2, and even were that alone relaxed, its
-    ``_reserve_a_workload_slot`` model validator independently requires
-    ``control_query_concurrency < concurrency`` -- with the registry's
-    default control_query_concurrency of 1 inherited unpinned here,
-    concurrency=1 collides with it regardless.
-
-    LIVE FACT (resolved, verification round 2): the actual p5run2 worker
-    running on ares (PID 3261405) was started with
-    ``endpoint start --role worker --cluster ares-p5run2 --concurrency 4
-    --control-query-concurrency 1 --kind-concurrency jarvis=2
-    --kind-concurrency mcp_call=3 --scheduler-provider slurm`` -- no live
-    worker uses --concurrency 1, so this refusal matches how the flag is
-    actually operated in the accepted deployment, not merely how it once
-    defaulted.
-    """
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-    )
-
-    def _load_definition(_cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "configured-cluster",
-            "--concurrency",
-            "1",
-            "--once",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "concurrency" in result.output
-
-
-def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219 rework: an unpinned --kind-concurrency now INHERITS the cluster's
-    registered WorkerCapacityPolicy.kind_concurrency limits, not "no limits"
-    -- a real behavior change #219's own commit message never stated. Before
-    #219, omitting the flag always meant no per-kind limits regardless of any
-    cluster registration (``_kind_concurrency_options(None)`` == ``{}``,
-    applied unconditionally); now `_resolved_worker_capacity_policy` inherits
-    ``current.kind_concurrency`` from the registry whenever the CLI flag is
-    None and --clear-kind-concurrency was not passed. Pinned here so a future
-    change to that inheritance is a deliberate decision, not a silent drift.
-    """
-    captured: dict[str, object] = {}
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-        worker_capacity=WorkerCapacityPolicy(
-            concurrency=5,
-            control_query_concurrency=1,
-            kind_concurrency={JobKind.MCP_CALL: 2},
-        ),
-    )
-
-    class FakeWorker:
-        def register(self) -> None:
-            pass
-
-        def run_once(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        captured.update(kwargs)
-        return FakeWorker()
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-
-    def _load_definition(_cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(cli, "_require_cluster", _load_definition)
-
-    result = CliRunner().invoke(
-        app,
-        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["kind_concurrency"] == {JobKind.MCP_CALL: 2}
-
-
-def test_endpoint_start_warns_loudly_when_control_query_concurrency_is_explicitly_zero(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219: a worker started with an explicit --scheduler-provider bypasses
-    cluster-registry resolution (test_endpoint_worker_with_explicit_provider_
-    does_not_require_remote_registry) and so is not bound by
-    WorkerCapacityPolicy's >= 1 floor; 0 remains reachable there. It must
-    still surface a loud, typed warning rather than silently starting a
-    worker that will never pick up a describe-class job.
-    """
-
-    class FakeWorker:
-        def register(self) -> None:
-            pass
-
-        def run_once(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        return FakeWorker()
-
-    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
-        raise AssertionError(f"unexpected registry lookup for {cluster}")
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
-
-    zero = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "homelab",
-            "--scheduler-provider",
-            "external",
-            "--control-query-concurrency",
-            "0",
-            "--once",
-        ],
-    )
-    nonzero = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "homelab",
-            "--scheduler-provider",
-            "external",
-            "--control-query-concurrency",
-            "1",
-            "--concurrency",
-            "2",
-            "--once",
-        ],
-    )
-
-    assert zero.exit_code == 0, zero.output
-    assert "control_query_concurrency=0" in zero.output
-    assert "queue forever" in zero.output
-    assert nonzero.exit_code == 0, nonzero.output
-    assert "control_query_concurrency=0" not in nonzero.output
-
-
-def test_endpoint_worker_info_exposes_bounded_readiness_mode(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Bootstrap can request readiness without exporting detailed installation records."""
-    observed: dict[str, object] = {}
-
-    def worker_info(**kwargs: object) -> dict[str, object]:
-        observed.update(kwargs)
-        return {
-            "schema_version": "clio-relay.worker-readiness.v1",
-            "cluster": kwargs["cluster"],
-            "running": True,
-        }
-
-    monkeypatch.setattr(installation_module, "worker_runtime_info", worker_info)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "worker-info",
-            "--cluster",
-            "ares",
-            "--freshness-seconds",
-            "90",
-            "--readiness-only",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["schema_version"] == "clio-relay.worker-readiness.v1"
-    assert observed == {
-        "cluster": "ares",
-        "freshness_seconds": 90.0,
-        "readiness_only": True,
-        "pinned_install_receipt_path": None,
-        "dev_mode": False,
-    }
-
-
-def test_endpoint_worker_info_forwards_pinned_install_receipt_path(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """clio-relay#205: the CLI surface forwards the cluster's pinned receipt path."""
-    observed: dict[str, object] = {}
-
-    def worker_info(**kwargs: object) -> dict[str, object]:
-        observed.update(kwargs)
-        return {
-            "schema_version": "clio-relay.worker-runtime-info.v1",
-            "cluster": kwargs["cluster"],
-            "running": True,
-        }
-
-    monkeypatch.setattr(installation_module, "worker_runtime_info", worker_info)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "worker-info",
-            "--cluster",
-            "ares-p5run2",
-            "--pinned-install-receipt-path",
-            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert (
-        observed["pinned_install_receipt_path"]
-        == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
-    )
-
-
-def test_endpoint_worker_info_dev_mode_flag_resolves_env_and_cluster_pin(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """clio-relay#211: --dev-mode (cluster pin) combines with CLIO_RELAY_DEV_MODE either way."""
-    observed: list[bool] = []
-
-    def worker_info(**kwargs: object) -> dict[str, object]:
-        observed.append(cast(bool, kwargs["dev_mode"]))
-        return {
-            "schema_version": "clio-relay.worker-runtime-info.v1",
-            "cluster": kwargs["cluster"],
-            "running": True,
-        }
-
-    monkeypatch.setattr(installation_module, "worker_runtime_info", worker_info)
-    monkeypatch.delenv("CLIO_RELAY_DEV_MODE", raising=False)
-
-    off = CliRunner().invoke(app, ["endpoint", "worker-info", "--cluster", "ares"])
-    assert off.exit_code == 0, off.output
-
-    on_via_flag = CliRunner().invoke(
-        app, ["endpoint", "worker-info", "--cluster", "ares", "--dev-mode"]
-    )
-    assert on_via_flag.exit_code == 0, on_via_flag.output
-
-    monkeypatch.setenv("CLIO_RELAY_DEV_MODE", "1")
-    on_via_env = CliRunner().invoke(app, ["endpoint", "worker-info", "--cluster", "ares"])
-    assert on_via_env.exit_code == 0, on_via_env.output
-
-    assert observed == [False, True, True]
-
-
-def test_cluster_add_dev_mode_flag_persists_on_the_registry_entry(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """clio-relay#211: cluster add --dev-mode is the CLI path to pin a cluster's dev mode."""
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-
-    result = CliRunner().invoke(
-        app,
-        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login", "--dev-mode"],
-    )
-    assert result.exit_code == 0, result.output
-    definition = ClusterRegistry.load(registry_path).require("ares-p5run2")
-    assert definition.dev_mode is True
-
-    result = CliRunner().invoke(
-        app,
-        ["cluster", "add", "--name", "ares", "--ssh-host", "ares-login"],
-    )
-    assert result.exit_code == 0, result.output
-    assert ClusterRegistry.load(registry_path).require("ares").dev_mode is False
-
-
-def test_installation_write_receipt_forwards_components_from(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The CLI surface forwards --components-from to write_self_install_receipt."""
-    observed: dict[str, object] = {}
-    output_path = tmp_path / "generations" / "mixed" / "install-receipt.json"
-    source_path = tmp_path / "generation-install-receipt.json"
-
-    def write_receipt(path: Path, **kwargs: object) -> InstallReceipt:
-        observed["path"] = path
-        observed.update(kwargs)
-        return InstallReceipt(
-            installed_at=datetime.now(UTC),
-            install_spec="checkout",
-            requested_source="vcs",
-            distribution_version="0.0.0",
-            software=SoftwareIdentity(version="0.0.0"),
-        )
-
-    monkeypatch.setattr(installation_module, "write_self_install_receipt", write_receipt)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "installation-write-receipt",
-            "--self",
-            "--output",
-            str(output_path),
-            "--components-from",
-            str(source_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert observed["path"] == output_path
-    assert observed["components_from"] == source_path
-    assert observed["force"] is False
-
-
-def test_cli_lists_artifacts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    artifact_path = tmp_path / "stdout.log"
-    artifact_path.write_text("hello\n", encoding="utf-8")
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-artifacts",
-        )
-    )
-    artifact = queue.append_artifact(
-        ArtifactRef(job_id=job.job_id, uri=artifact_path.as_uri(), kind="stdout")
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "list-artifacts", job.job_id])
-
-    assert result.exit_code == 0
-    page = json.loads(result.output)
-    assert page["artifacts"][0]["artifact_id"] == artifact.artifact_id
-    assert page["artifacts"][0]["kind"] == "stdout"
-    assert page["cursor"] == 1
-    assert page["limit"] == 100
-    assert page["next_cursor"] is None
-    assert page["total"] == 1
-
-
-def test_cli_read_artifact_prints_document_and_exits_zero_on_a_normal_read(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-read-artifact-ok",
-        )
-    )
-    owned_root = tmp_path / "spool" / job.job_id
-    owned_root.mkdir(parents=True)
-    artifact_path = owned_root / "stdout.log"
-    artifact_path.write_text("hello\n", encoding="utf-8")
-    artifact = queue.append_artifact(
-        ArtifactRef(job_id=job.job_id, uri=artifact_path.as_uri(), kind="stdout")
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
-
-    assert result.exit_code == 0, result.output
-    document = json.loads(result.output)
-    assert document["artifact"]["artifact_id"] == artifact.artifact_id
-
-
-def test_cli_read_artifact_over_budget_prints_the_refusal_and_exits_nonzero(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """F6 (#231 R6 review): ``clio job read-artifact`` used to exit 0 while
-    printing a T2 refusal document (doc §6.4) -- a script checking only the
-    exit code would treat an over-budget read as success. It must exit 1.
-    """
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-read-artifact-oversized",
-        )
-    )
-    owned_root = tmp_path / "spool" / job.job_id
-    owned_root.mkdir(parents=True)
-    oversized_path = owned_root / "large.bin"
-    with oversized_path.open("wb") as stream:
-        stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
-    artifact = queue.append_artifact(
-        ArtifactRef(
-            job_id=job.job_id,
-            uri=oversized_path.as_uri(),
-            kind="stdout",
-            size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "read-artifact", artifact.artifact_id])
-
-    assert result.exit_code == 1, result.output
-    document = json.loads(result.output)
-    assert document["result_available"] is False
-    assert document["delivery"]["code"] == "artifact_content_too_large"
-
-
 def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message() -> None:
     """F5 (#231 R6 review): ``_decode_artifact_envelope`` (shared by
     ``_read_remote_mcp_result_artifact``, ``_read_remote_artifact_kind_bytes``,
@@ -1324,7 +648,7 @@ def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message(
     }
 
     with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
-        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_artifact_io._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             envelope
         )
 
@@ -1334,725 +658,9 @@ def test_decode_artifact_envelope_still_rejects_a_genuinely_malformed_envelope()
     refusal) must still raise the original, distinct complaint.
     """
     with pytest.raises(RelayError, match="must use base64 encoding"):
-        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_artifact_io._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             {"encoding": "raw"}
         )
-
-
-def test_cli_lists_tasks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-tasks",
-        )
-    )
-    task = queue.append_task(RelayTask(job_id=job.job_id, name="jarvis.execution"))
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "tasks", job.job_id])
-
-    assert result.exit_code == 0
-    page = json.loads(result.output)
-    assert page["tasks"][0]["task_id"] == task.task_id
-    assert page["tasks"][0]["name"] == "jarvis.execution"
-    assert page["cursor"] == 1
-    assert page["limit"] == 100
-    assert page["next_cursor"] is None
-    assert page["total"] == 1
-
-
-def test_cli_repairs_lease_operational_indexes(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(command=["true"]),
-            idempotency_key="cli-repair-lease-indexes",
-        )
-    )
-    lease = queue.acquire_job(job.job_id, "worker", cluster=job.cluster)
-    assert lease is not None
-    identity = queue._lease_index_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        lease,
-        job=queue.get_job(job.job_id),
-    )
-    endpoint_ref = queue._lease_endpoint_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    endpoint_ref.unlink()
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["queue", "repair-lease-indexes"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["complete"] is True
-    assert payload["record_count"] == 1
-    assert endpoint_ref.is_file()
-
-
-def test_cli_audits_lease_capacity_and_exits_nonzero_on_mismatch(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(command=["true"]),
-            idempotency_key="cli-audit-lease-capacity",
-        )
-    )
-    lease = queue.acquire_job(job.job_id, "worker", cluster=job.cluster)
-    assert lease is not None
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    valid = CliRunner().invoke(app, ["queue", "audit-lease-capacity"])
-
-    assert valid.exit_code == 0
-    report = json.loads(valid.output)
-    assert report["schema_version"] == "clio-relay.lease-capacity-audit.v1"
-    assert report["valid"] is True
-
-    aggregate_path = core_dir / "lease_capacity" / "aggregate.json"
-    aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
-    aggregate["document_sha256"] = "0" * 64
-    aggregate_path.write_text(json.dumps(aggregate), encoding="utf-8")
-
-    invalid = CliRunner().invoke(app, ["queue", "audit-lease-capacity"])
-
-    assert invalid.exit_code == 1
-    invalid_report = json.loads(invalid.output)
-    assert invalid_report["valid"] is False
-    assert invalid_report["mismatches"][0]["type"] == "audit_error"
-
-
-def test_cli_records_and_reads_task_events(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-task-events",
-        )
-    )
-    task = queue.append_task(RelayTask(job_id=job.job_id, name="remote-agent.discovery"))
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    record = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-task-event",
-            task.task_id,
-            "--event-type",
-            "dataset_found",
-            "--label",
-            "dataset",
-            "--summary",
-            "Found staged dataset",
-            "--status",
-            "succeeded",
-            "--path-ref",
-            "/mnt/common/datasets/example_001",
-        ],
-    )
-    read = CliRunner().invoke(app, ["job", "task-events", task.task_id])
-
-    assert record.exit_code == 0
-    assert read.exit_code == 0
-    payload = json.loads(read.output)
-    assert payload["events"][0]["event_type"] == "dataset_found"
-    assert payload["events"][0]["path_refs"] == ["/mnt/common/datasets/example_001"]
-
-
-def test_cli_job_watch_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-watch-zero-cursor",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "watch", job.job_id, "--cursor", "0"])
-
-    assert result.exit_code == 0
-    assert "job.queued" in result.output
-    assert "next_cursor=2" in result.output
-
-
-def test_cli_job_monitor_accepts_zero_cursor(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-monitor-zero-cursor",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "monitor", job.job_id, "--cursor", "0"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["events"][0]["event_type"] == "job.queued"
-    assert payload["next_cursor"] == 2
-
-
-def test_cli_gateway_session_lifecycle(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    gateway_json = tmp_path / "gateway.json"
-    gateway_json.write_text('{"strategy":"ssh_forward","remote_port":11111}', encoding="utf-8")
-    resources_json = tmp_path / "resources.json"
-    resources_json.write_text('{"nodes":1,"exclusive":true}', encoding="utf-8")
-
-    created = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "create",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "live-service-example",
-            "--gateway-json-file",
-            str(gateway_json),
-            "--resources-json-file",
-            str(resources_json),
-            "--stdout-uri",
-            "file:///tmp/stdout.log",
-            "--stderr-uri",
-            "file:///tmp/stderr.log",
-            "--log-uri",
-            "file:///tmp/service.log",
-            "--artifact",
-            "artifact://session/startup",
-        ],
-    )
-    assert created.exit_code == 0
-    session_id = json.loads(created.output)["session_id"]
-
-    updated = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "update",
-            session_id,
-            "--state",
-            "ready",
-            "--node",
-            "ares-comp-01",
-            "--gateway-json",
-            '{"strategy":"ssh_forward","local_port":5900}',
-            "--resources-json",
-            '{"nodes":2}',
-            "--stdout-uri",
-            "file:///tmp/updated-stdout.log",
-            "--log-uri",
-            "file:///tmp/updated.log",
-            "--artifact",
-            "artifact://session/updated",
-        ],
-    )
-    listed = CliRunner().invoke(app, ["gateway", "list", "--cluster", "test-cluster"])
-    closed = CliRunner().invoke(app, ["gateway", "close", session_id])
-
-    assert updated.exit_code == 0
-    assert listed.exit_code == 0
-    assert closed.exit_code == 0
-    assert json.loads(updated.output)["state"] == GatewaySessionState.READY.value
-    assert json.loads(created.output)["gateway"]["remote_port"] == 11111
-    assert json.loads(created.output)["requested_resources"]["exclusive"] is True
-    assert json.loads(created.output)["stdout_uri"] == "file:///tmp/stdout.log"
-    assert json.loads(created.output)["log_uris"] == ["file:///tmp/service.log"]
-    assert json.loads(created.output)["artifacts"] == ["artifact://session/startup"]
-    assert json.loads(updated.output)["requested_resources"] == {"nodes": 2}
-    assert json.loads(updated.output)["scheduler_job_id"] is None
-    assert json.loads(updated.output)["stdout_uri"] == "file:///tmp/updated-stdout.log"
-    assert json.loads(updated.output)["log_uris"] == ["file:///tmp/updated.log"]
-    assert json.loads(updated.output)["artifacts"] == ["artifact://session/updated"]
-    listed_page = json.loads(listed.output)
-    assert listed_page["gateway_sessions"][0]["session_id"] == session_id
-    assert listed_page["source_cursor"] == 1
-    assert listed_page["source_limit"] == 100
-    assert listed_page["source_next_cursor"] is None
-    assert listed_page["source_total"] == 1
-    assert json.loads(closed.output)["state"] == GatewaySessionState.CLOSED.value
-
-
-def test_cli_job_status_includes_relay_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-status",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["job", "status", job.job_id])
-
-    assert result.exit_code == 0
-    status = json.loads(result.output)
-    assert status["job"]["job_id"] == job.job_id
-    assert status["relay_queue"] == {"state": "queued", "jobs_ahead": 0, "position": 1}
-
-
-def test_cli_job_wait_returns_current_state_when_observation_expires(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_name="long-cli-run"),
-            idempotency_key="long-cli-run",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    observations: list[tuple[str, float, float]] = []
-
-    def observe(
-        selected_queue: ClioCoreQueue,
-        job_id: str,
-        *,
-        timeout_seconds: float,
-        poll_seconds: float,
-    ) -> JobWaitResult:
-        observations.append((job_id, timeout_seconds, poll_seconds))
-        return cli.job_wait_result(
-            selected_queue.get_job(job_id),
-            timeout_seconds=timeout_seconds,
-        )
-
-    monkeypatch.setattr(relay_ops, "observe_until_terminal", observe)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            job.job_id,
-            "--timeout-seconds",
-            "0.25",
-            "--poll-seconds",
-            "0.05",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == job.job_id
-    assert observed["state"] == "queued"
-    assert observed["observation"] == {
-        "outcome": "observation_unknown",
-        "timeout_seconds": 0.25,
-        "scheduler_action": "none",
-        "relay_action": "none",
-    }
-    assert observations == [(job.job_id, 0.25, 0.05)]
-    assert queue.get_job(job.job_id).state is JobState.QUEUED
-
-
-@pytest.mark.parametrize(
-    ("option", "value"),
-    [("--timeout-seconds", "inf"), ("--poll-seconds", "inf")],
-)
-def test_cli_job_wait_rejects_nonfinite_observation_bounds(
-    option: str,
-    value: str,
-) -> None:
-    result = CliRunner().invoke(
-        app,
-        ["job", "wait", "job_00000000000000000000000000000001", option, value],
-    )
-
-    assert result.exit_code != 0
-    assert "positive and finite" in result.output
-
-
-def test_cli_queue_management_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-queue-management",
-        )
-    )
-    queue.acquire_next_job("endpoint-1", cluster="test-cluster", ttl_seconds=-1)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    listed = runner.invoke(
-        app,
-        [
-            "queue",
-            "list",
-            "--cluster",
-            "test-cluster",
-            "--kind",
-            "jarvis",
-            "--limit",
-            "1",
-        ],
-    )
-    diagnosed = runner.invoke(
-        app,
-        ["queue", "diagnose", job.job_id, "--cluster", "test-cluster"],
-    )
-    stale = runner.invoke(
-        app,
-        [
-            "queue",
-            "stale",
-            "--cluster",
-            "test-cluster",
-            "--older-than",
-            "1h",
-        ],
-    )
-    cleanup = runner.invoke(
-        app,
-        [
-            "queue",
-            "cleanup-stale",
-            "--cluster",
-            "test-cluster",
-            "--no-dry-run",
-        ],
-    )
-    canceled = runner.invoke(
-        app,
-        ["queue", "cancel", job.job_id, "--cluster", "test-cluster"],
-    )
-
-    assert listed.exit_code == 0
-    assert diagnosed.exit_code == 0
-    assert stale.exit_code == 0
-    assert cleanup.exit_code == 0
-    assert canceled.exit_code == 0
-    assert json.loads(listed.output)["count"] == 1
-    assert json.loads(listed.output)["jobs"][0]["job"]["kind"] == "jarvis"
-    assert json.loads(diagnosed.output)["reason"] == "stale_lease"
-    assert json.loads(stale.output)["jobs"][0]["job"]["job_id"] == job.job_id
-    assert json.loads(cleanup.output)["recovered_count"] == 1
-    assert json.loads(canceled.output)["scheduler_policy"] == "relay-only"
-
-
-def test_cli_queue_validation_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, "test-cluster", scheduler_provider="slurm")
-    fleet = LiveWorkerFleet(tmp_path).start()
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(fleet.settings.core_dir))
-    report_path = tmp_path / "queue-validation.json"
-
-    def queue_validation_provider(_name: str | None) -> DeterministicQueueValidationProvider:
-        return fleet.scheduler
-
-    monkeypatch.setattr(
-        scheduler_providers, "validation_provider_for_scheduler", queue_validation_provider
-    )
-    try:
-        result = CliRunner().invoke(
-            app,
-            [
-                "queue",
-                "validate",
-                "--cluster",
-                "test-cluster",
-                "--older-than",
-                "1s",
-                "--scheduler-timeout-seconds",
-                "30",
-                "--scheduler-poll-seconds",
-                "0.02",
-                "--report",
-                str(report_path),
-            ],
-        )
-    finally:
-        fleet.close()
-
-    failure_report = (
-        report_path.read_text(encoding="utf-8") if report_path.exists() else "<report not written>"
-    )
-    assert result.exit_code == 0, (
-        f"output={result.output!r}\nexception={result.exception!r}\nreport={failure_report}"
-    )
-    assert "validation.status=passed" in result.output
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["scenario"] == "queue-management"
-    assert {check["check_id"] for check in report["checks"]} == {
-        "queue.kind-concurrency-parallel",
-        "queue.kind-concurrency-worker-enforced",
-        "queue.lease-capacity-audit-initial",
-        "queue.lease-capacity-audit-final",
-        "queue.list-bounded",
-        "queue.diagnose-specific-reason",
-        "queue.stale-dry-run",
-        "queue.stale-cleanup-executed",
-        "queue.cancel-running-worker-process",
-        "queue.scheduler-preserved-default",
-        "queue.worker-containment-enforced",
-    }
-    assert report["cleanup"]["cancel_scheduler_jobs"] is False
-
-
-def test_cli_worker_status_reports_registered_capacity(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    queue.register_endpoint(
-        EndpointRegistration(
-            role=EndpointRole.WORKER,
-            cluster="test-cluster",
-            hostname="node",
-            pid=123,
-            metadata={"concurrency": 3},
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(app, ["worker", "status", "--cluster", "test-cluster"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["worker_count"] == 1
-    assert payload["configured_concurrency"] == 3
-
-
-def test_cli_job_submit_can_request_exclusive_scheduler(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    yaml_path = tmp_path / "pipeline.yaml"
-    yaml_path.write_text("name: generic\npkgs: []\n", encoding="utf-8")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    _write_test_cluster(tmp_path, name="test-cluster", scheduler_provider="slurm")
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "test-cluster",
-            "--jarvis-yaml",
-            str(yaml_path),
-            "--exclusive",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).list_jobs()[0]
-    assert isinstance(job.spec, JarvisRunSpec)
-    assert "exclusive: true" in str(job.spec.pipeline_yaml)
-
-
-def test_cli_job_submit_pipeline_creates_named_jarvis_job(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit-pipeline",
-            "--cluster",
-            "ares",
-            "--pipeline-name",
-            "site_simulation_4node",
-            "--idempotency-key",
-            "named-pipeline",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
-    assert isinstance(job.spec, JarvisRunSpec)
-    assert job.spec.pipeline_name == "site_simulation_4node"
-    assert job.spec.pipeline_yaml is None
-
-
-def test_cli_creates_and_evaluates_monitor_rule(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-monitor",
-        )
-    )
-    queue.append_event(job.job_id, "stdout.delta", "step 25", payload={"text": "step 25\n"})
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    add_result = runner.invoke(
-        app,
-        [
-            "monitor",
-            "add-regex",
-            job.job_id,
-            "--pattern",
-            "step 25",
-            "--event-type",
-            "stdout.delta",
-        ],
-    )
-    run_result = runner.invoke(app, ["monitor", "run-once"])
-
-    assert add_result.exit_code == 0
-    assert json.loads(add_result.output)["job_id"] == job.job_id
-    assert run_result.exit_code == 0
-    assert json.loads(run_result.output)[0]["action"] == "emit_event"
-
-
-def test_cli_accepts_json_object_from_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    payload_path = tmp_path / "progress-payload.json"
-    payload_path.write_text(
-        json.dumps(
-            {
-                "label": "iteration",
-                "current_group": "step",
-                "total": 100,
-                "unit": "step",
-            }
-        ),
-        encoding="utf-8-sig",
-    )
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-json-file",
-        )
-    )
-    queue.append_event(job.job_id, "stdout.delta", "step 25", payload={"text": "step 25\n"})
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    add_result = runner.invoke(
-        app,
-        [
-            "monitor",
-            "add-regex",
-            job.job_id,
-            "--pattern",
-            r"step (?P<step>\d+)",
-            "--action",
-            "record_progress",
-            "--event-type",
-            "stdout.delta",
-            "--action-payload-json",
-            f"@{payload_path}",
-        ],
-    )
-    run_result = runner.invoke(app, ["monitor", "run-once"])
-
-    assert add_result.exit_code == 0
-    assert run_result.exit_code == 0
-    progress = ClioCoreQueue(core_dir).list_progress(job.job_id)
-    assert progress[0].label == "iteration"
-    assert progress[0].current == 25
-
-
-def test_cli_rejects_invalid_json_object() -> None:
-    result = CliRunner().invoke(
-        app,
-        [
-            "monitor",
-            "add-regex",
-            "job_abc",
-            "--pattern",
-            "step",
-            "--action-payload-json",
-            "{bad}",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "value must be valid JSON" in result.output
-    assert "Traceback" not in result.output
-
-
-def test_cli_record_progress_cannot_spoof_package_progress(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="test-cluster",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
-            idempotency_key="cli-record-progress",
-        )
-    )
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-progress",
-            job.job_id,
-            "--metadata-json",
-            '{"source":"jarvis_package","package_name":"site.simulation","run_id":"spoofed"}',
-        ],
-    )
-
-    assert result.exit_code == 0
-    progress = ClioCoreQueue(core_dir).list_progress(job.job_id)[0]
-    assert progress.metadata["source"] == "external_cli"
-    assert "package_name" not in progress.metadata
-    assert "run_id" not in progress.metadata
 
 
 def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -2102,7 +710,9 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_run_remote_clio)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
+        cli_session_start,
+        "_verify_session_start_worker_release_identity",
+        accept_worker_compatibility,
     )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -2201,7 +811,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
     report_sha256 = session_lifecycle_report_sha256(report)
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status_calls = 0
@@ -2301,7 +911,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
 
     if closed_admission_drift:
         with pytest.raises(RelayError, match="admission evidence"):
-            cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 definition=ClusterDefinition(name="ares", ssh_host="ares"),
                 cluster="ares",
                 session_id="session-1",
@@ -2310,7 +920,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
         assert local_mutations == 0
         return
 
-    cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
         session_id="session-1",
@@ -2351,7 +961,7 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         "cancel_scheduler_jobs": False,
     }
     report_sha256 = session_lifecycle_report_sha256(report)
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     finalized_status = OwnedSessionRecoveryStatus(
@@ -2448,7 +1058,7 @@ def test_finalized_cleanup_report_rejects_retry_identity_drift(
     report.cleanup_policy = policy
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status = OwnedSessionRecoveryStatus(
@@ -2511,7 +1121,7 @@ def test_finalized_cleanup_report_rejects_retry_identity_drift(
         )
 
     with pytest.raises(RelayError, match=expected_error):
-        cli._verified_finalized_cleanup_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_report._verified_finalized_cleanup_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             status,
             report=selected_report,
             cluster="ares",
@@ -2536,10 +1146,14 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", _fake_no_worker_observation
+    )
+    monkeypatch.setattr(
+        cli_session_teardown,
         "_persist_verified_cleanup_report_before_closure",
         _REAL_PERSIST_VERIFIED_CLEANUP_REPORT,
     )
@@ -2549,7 +1163,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     def finalize(**kwargs: object) -> OwnedSessionRecoveryStatus:
         report = cast(SessionLifecycleReport, kwargs["report"])
         finalized_reports.append(report)
-        reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report
         )
         return OwnedSessionRecoveryStatus(
@@ -2596,7 +1210,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
 
     monkeypatch.setattr(session_lifecycle, "finalize_remote_session_cleanup_report", finalize)
     monkeypatch.setattr(session_lifecycle, "read_remote_session_cleanup_report", read_report)
-    monkeypatch.setattr(cli, "_mark_owner_session_closed", forbid_closure)
+    monkeypatch.setattr(cli_owned_session_recovery, "_mark_owner_session_closed", forbid_closure)
 
     result = CliRunner().invoke(
         app,
@@ -2628,11 +1242,11 @@ def test_local_cleanup_report_artifact_is_chunked_reused_and_bounded_on_replacem
     report.resources[0].detail = "x" * (9 * 1024 * 1024)
     validation_path = tmp_path / "cleanup.json"
 
-    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
-    second = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    second = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -2648,7 +1262,7 @@ def test_local_cleanup_report_artifact_is_chunked_reused_and_bounded_on_replacem
 
     replacement = report.model_copy(deep=True)
     replacement.resources[0].detail = "y" * (9 * 1024 * 1024)
-    replaced = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    replaced = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         replacement,
         validation_report_path=validation_path,
     )
@@ -2675,7 +1289,7 @@ def test_local_cleanup_report_artifact_is_globally_bounded_across_report_parents
         report = _verified_teardown_report()
         report.cleanup_operation_id = f"cleanup-global-{index}"
         report.resources[0].detail = f"generation-{index}:" + (str(index) * 4096)
-        artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=tmp_path / f"report-parent-{index}" / "cleanup.json",
         )
@@ -2684,16 +1298,16 @@ def test_local_cleanup_report_artifact_is_globally_bounded_across_report_parents
 
     roots = {artifact.manifest_path.parent for artifact in artifacts}
     assert roots == {
-        cli._cleanup_evidence_state_parent() / "cleanup-evidence-v1"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent() / "cleanup-evidence-v1"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     }
     retained = list(artifacts[-1].manifest_path.parent.iterdir())
     retained_names = {path.name for path in retained}
     assert artifacts[0].manifest_path.name not in retained_names
     assert artifacts[1].manifest_path.name in retained_names
     assert artifacts[2].manifest_path.name in retained_names
-    assert len(retained) <= cli.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES - 1
+    assert len(retained) <= cli_owned_report_artifact.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES - 1
     assert sum(path.stat().st_size for path in retained) <= (
-        cli.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES
+        cli_owned_report_artifact.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES
     )
 
 
@@ -2709,18 +1323,18 @@ def test_cleanup_evidence_state_parent_rejects_cwd_relative_install_receipt(
 
     monkeypatch.chdir(first)
     with pytest.raises(ConfigurationError, match="must be an absolute path"):
-        cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     monkeypatch.chdir(second)
     with pytest.raises(ConfigurationError, match="must be an absolute path"):
-        cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
     tmp_path: Path,
 ) -> None:
-    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-state"
     try:
         if os.name == "nt":
@@ -2731,7 +1345,7 @@ def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
         parent.rename(displaced)
         parent.mkdir(mode=0o700)
         with pytest.raises(RelayError, match="lock identity changed|validation parent"):
-            cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 _verified_teardown_report(),
                 validation_report_path=tmp_path / "report.json",
                 evidence_lock=lock,
@@ -2739,7 +1353,7 @@ def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
         assert list(parent.iterdir()) == []
         assert {path.name for path in displaced.iterdir()} == {lock.path.name}
     finally:
-        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
@@ -2748,10 +1362,10 @@ def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
 ) -> None:
     if os.name != "nt":
         return
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-lock-parent"
     rename_errors: list[OSError] = []
-    original = cli._open_windows_pinned_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original = cli_cleanup_evidence._open_windows_pinned_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def try_swap_after_pin(*args: object, **kwargs: object) -> object:
         anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
@@ -2762,14 +1376,14 @@ def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
             rename_errors.append(exc)
         return anchor
 
-    monkeypatch.setattr(cli, "_open_windows_pinned_directory", try_swap_after_pin)
-    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(cli_cleanup_evidence, "_open_windows_pinned_directory", try_swap_after_pin)
+    lock = cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     try:
         assert rename_errors
         assert not displaced.exists()
         assert {path.name for path in parent.iterdir()} == {lock.path.name}
     finally:
-        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_windows_parent_guard_blocks_rename_and_auto_deletes(
@@ -2798,7 +1412,7 @@ def test_windows_cleanup_lock_swap_before_guard_creation_leaves_replacement_empt
 ) -> None:
     if os.name != "nt":
         return
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-before-guard"
     original = cluster_config.acquire_private_configuration_windows_parent_guard
 
@@ -2814,7 +1428,7 @@ def test_windows_cleanup_lock_swap_before_guard_creation_leaves_replacement_empt
         swap_then_guard,
     )
     with pytest.raises(RelayError, match="changed while pinning"):
-        cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert list(parent.iterdir()) == []
     assert list(displaced.iterdir()) == []
@@ -2828,7 +1442,7 @@ def test_windows_cleanup_artifact_guard_blocks_child_swap_before_pending_write(
         return
     seed = _verified_teardown_report()
     seed.cleanup_operation_id = "cleanup-child-guard-seed"
-    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         seed,
         validation_report_path=tmp_path / "seed.json",
     )
@@ -2854,7 +1468,7 @@ def test_windows_cleanup_artifact_guard_blocks_child_swap_before_pending_write(
     replacement.cleanup_operation_id = "cleanup-child-guard-replacement"
     replacement.resources[0].detail = "replacement"
 
-    result = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         replacement,
         validation_report_path=tmp_path / "replacement.json",
     )
@@ -2874,13 +1488,13 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
     validation_path = tmp_path / "cleanup.json"
     report = _verified_teardown_report()
     report.cleanup_operation_id = "cleanup-prior-one"
-    cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
     prior = report.model_copy(deep=True)
     prior.cleanup_operation_id = "cleanup-prior-two"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         prior,
         validation_report_path=validation_path,
     )
@@ -2898,7 +1512,7 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
     replacement.cleanup_operation_id = "cleanup-prior-three"
 
     with pytest.raises(RelayError, match="report artifact .* inconsistent"):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             replacement,
             validation_report_path=validation_path,
         )
@@ -2907,12 +1521,12 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
 @pytest.mark.parametrize("delta", [-1, 0, 1])
 def test_cleanup_public_json_boundary_is_byte_exact(delta: int) -> None:
     empty = cli._public_json({"detail": ""})  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    target = cli.MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES + delta
+    target = cli_cleanup_report.MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES + delta
     payload = {"detail": "x" * (target - len(empty.encode("utf-8")))}
     serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert len(serialized.encode("utf-8")) == target
-    bounded = cli._bounded_cleanup_public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bounded = cli_cleanup_report._bounded_cleanup_public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert (bounded is not None) is (delta < 0)
 
 
@@ -2921,7 +1535,7 @@ def test_cleanup_public_json_bound_counts_non_ascii_encoding() -> None:
     serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert "\\u03c0" in serialized
-    assert cli._bounded_cleanup_public_json(payload) == serialized  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert cli_cleanup_report._bounded_cleanup_public_json(payload) == serialized  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 @pytest.mark.parametrize("candidate_kind", ["chunk", "manifest"])
@@ -2936,7 +1550,7 @@ def test_local_cleanup_report_artifact_recovers_partial_pending_write(
     validation_path = tmp_path / f"{candidate_kind}.json"
     seed = report.model_copy(deep=True)
     seed.cleanup_operation_id = f"cleanup-partial-seed-{candidate_kind}"
-    seed_artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    seed_artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         seed,
         validation_report_path=tmp_path / "seed" / "cleanup.json",
     )
@@ -2947,7 +1561,7 @@ def test_local_cleanup_report_artifact_recovers_partial_pending_write(
     if os.name == "posix":
         pending.chmod(0o600)
 
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -2963,7 +1577,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     report = _verified_teardown_report()
     report.cleanup_operation_id = "cleanup-linked-window"
     validation_path = tmp_path / "linked.json"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -2971,7 +1585,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     pending = chunk.with_name(f".{chunk.name}.pending")
 
     os.link(chunk, pending)
-    recovered = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    recovered = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -2983,7 +1597,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     chunk.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
     os.link(chunk, pending)
     with pytest.raises(RelayError, match="linked file differs"):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=validation_path,
         )
@@ -2999,7 +1613,7 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
     report = _verified_teardown_report()
     report.cleanup_operation_id = f"cleanup-{alias_kind}"
     validation_path = tmp_path / f"{alias_kind}.json"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -3037,7 +1651,7 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
             "cannot be opened safely"
         ),
     ):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=validation_path,
         )
@@ -3071,7 +1685,9 @@ def test_normal_session_teardown_uses_compact_projection_for_large_report(
         return report
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", teardown)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", _fake_no_worker_observation
+    )
     validation_path = tmp_path / "large-normal.json"
 
     result = CliRunner().invoke(
@@ -3196,7 +1812,7 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         ]
     )
     report.resources[0].detail = "large-report-body:" + ("x" * (1100 * 1024))
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     recovery = OwnedSessionRecoveryStatus(
@@ -3284,13 +1900,17 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         "status_remote_session",
         stopped_status,
     )
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
     monkeypatch.setattr(
-        cli,
+        cli_owned_session_recovery, "_owned_session_recovery_status", recovered_status
+    )
+    monkeypatch.setattr(
+        cli_owned_relay_jobs,
         "_owner_session_admission_status",
         read_authoritative_admission,
     )
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", no_worker_observation)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", no_worker_observation
+    )
     report_reads: list[OwnedSessionRecoveryStatus] = []
 
     def read_report(**kwargs: object) -> SessionLifecycleReport:
@@ -3316,8 +1936,10 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     def forbid_finalization(**_kwargs: object) -> object:
         return forbidden("report finalization")
 
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", forbid_jobs)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbid_gateways)
+    monkeypatch.setattr(cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", forbid_jobs)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", forbid_gateways
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbid_teardown)
     monkeypatch.setattr(
         session_lifecycle, "finalize_remote_session_cleanup_report", forbid_finalization
@@ -3509,7 +2131,7 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
     monkeypatch.setattr(remote_cli, "run_remote_clio", forbidden_remote)
 
     with pytest.raises(RelayError, match="reference is not exact"):
-        cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
             session_id="session-1",
@@ -3563,7 +2185,7 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
 
@@ -3613,7 +2235,7 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", fail_first_mirror_close)
 
     def mark_closed(finalized_recovery: OwnedSessionRecoveryStatus) -> None:
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=queue,
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -3682,7 +2304,7 @@ def test_owner_session_closure_rejects_pending_admission_drift_before_mutation(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     admission: dict[str, object] = {
@@ -3752,7 +2374,7 @@ def test_owner_session_closure_rejects_pending_admission_drift_before_mutation(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
 
     with pytest.raises(RelayError, match="admission evidence|immutable cleanup intent"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=ClioCoreQueue(tmp_path / "core"),
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -3782,7 +2404,7 @@ def test_owner_session_closure_rejects_invalid_closed_evidence_before_mutation(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     closure = (
@@ -3847,7 +2469,7 @@ def test_owner_session_closure_rejects_invalid_closed_evidence_before_mutation(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
 
     with pytest.raises(RelayError, match="admission closure evidence|admission evidence"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=ClioCoreQueue(tmp_path / "core"),
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -3917,7 +2539,7 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
                 observed_state="running",
             )
         )
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status = OwnedSessionRecoveryStatus(
@@ -3978,7 +2600,7 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
     monkeypatch.setattr(remote_cli, "run_remote_clio", forbidden_remote)
 
     with pytest.raises(RelayError, match="connector evidence|scheduler disposition"):
-        cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
             session_id="session-1",
@@ -4033,7 +2655,7 @@ def test_owned_session_recovery_waits_for_late_start_metadata(
     def recover() -> None:
         try:
             observed.append(
-                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     cluster="ares",
                     session_id="late-session",
                     core_dir=tmp_path / "core",
@@ -4096,7 +2718,7 @@ def test_owned_session_recovery_waits_for_late_transition_lock_creation(
     def recover() -> None:
         try:
             observed.append(
-                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     cluster="ares",
                     session_id="late-session",
                     core_dir=tmp_path / "core",
@@ -4143,92 +2765,13 @@ def test_owned_session_recovery_fails_closed_when_transition_never_materializes(
     )
 
     with pytest.raises(RelayError, match="delayed remote start cannot be ruled out"):
-        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             session_id="late-session",
             core_dir=tmp_path / "core",
             home=home,
             timeout_seconds=0.05,
         )
-
-
-def test_owned_session_pre_start_probe_observes_uninitialized_transition_without_writes(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-
-    status = cli._inspect_owned_session_recovery_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        session_id="fresh-session",
-        core_dir=tmp_path / "core",
-        home=home,
-        timeout_seconds=0.05,
-    )
-
-    assert status.cluster == "ares"
-    assert status.session_id == "fresh-session"
-    assert status.cleanup_receipt is False
-    assert status.ownership_verified is False
-    assert status.recovery_verified is False
-    assert status.errors == [
-        "owned session transition is not currently observable; "
-        "start-owned remains the mutation authority"
-    ]
-    assert home.exists() is False
-
-
-def test_owned_session_pre_start_probe_delegates_existing_transition_to_strict_recovery(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    transition_path = (
-        home
-        / ".local"
-        / "share"
-        / "clio-relay"
-        / "sessions"
-        / "existing-session"
-        / "transition.lock"
-    )
-    transition_path.parent.mkdir(parents=True)
-    transition_path.write_text("", encoding="utf-8")
-    expected = OwnedSessionRecoveryStatus(
-        cluster="ares",
-        session_id="existing-session",
-        cleanup_receipt=True,
-        recovery_verified=True,
-    )
-    calls: list[dict[str, object]] = []
-
-    def strict_recovery(**kwargs: object) -> OwnedSessionRecoveryStatus:
-        calls.append(kwargs)
-        return expected
-
-    monkeypatch.setattr(
-        cli,
-        "_inspect_owned_session_recovery_after_transition",
-        strict_recovery,
-    )
-
-    observed = cli._inspect_owned_session_recovery_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        session_id="existing-session",
-        core_dir=tmp_path / "core",
-        home=home,
-        timeout_seconds=12.5,
-    )
-
-    assert observed is expected
-    assert calls == [
-        {
-            "cluster": "ares",
-            "session_id": "existing-session",
-            "core_dir": tmp_path / "core",
-            "home": home,
-            "timeout_seconds": 12.5,
-        }
-    ]
 
 
 def test_owned_session_recovery_refuses_symlinked_transition_lock(
@@ -4249,7 +2792,7 @@ def test_owned_session_recovery_refuses_symlinked_transition_lock(
     monkeypatch.setattr(Path, "lstat", symlinked_lock_lstat)
 
     with pytest.raises(RelayError, match="transition lock is not a regular file"):
-        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             session_id="late-session",
             core_dir=tmp_path / "core",
@@ -4283,7 +2826,9 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
     monkeypatch.setattr(session_lifecycle, "start_remote_session", fail_start)
     monkeypatch.setattr(remote_cli, "run_remote_clio", record_remote)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
+        cli_session_start,
+        "_verify_session_start_worker_release_identity",
+        accept_worker_compatibility,
     )
 
     result = CliRunner().invoke(
@@ -4333,7 +2878,7 @@ def test_cli_session_start_rejects_incompatible_worker_before_remote_mutation(
         )
 
     monkeypatch.setattr(installation_module, "installation_info", lambda: local_installation)
-    monkeypatch.setattr(cli, "_remote_worker_info", remote_worker_info)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", remote_worker_info)
     monkeypatch.setattr(session_lifecycle, "start_remote_session", record_start)
 
     result = CliRunner().invoke(
@@ -4397,10 +2942,10 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
 
     monkeypatch.setattr(cli, "_session_transition_lock", transition_lock)
     monkeypatch.setattr(installation_module, "installation_info", local_info)
-    monkeypatch.setattr(cli, "_remote_worker_info", remote_info)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", remote_info)
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -4452,7 +2997,7 @@ def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_pr
         return _start_receipt(kwargs, generation_id="generation-fresh")
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
@@ -4494,12 +3039,12 @@ def test_cli_session_start_returns_self_contained_current_selector(
 
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -4584,19 +3129,19 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
             start_input_policy=plan.input_policy,
             start_expected_api_release_identity_sha256=release.sha256(),
         )
-        return session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             plan=plan,
             status=status,
             transport_deadline_exceeded=True,
         )
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -4658,11 +3203,13 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
         return release
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
-    monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
+    monkeypatch.setattr(
+        cli_session_start, "_finalize_completed_cleanup_receipt_before_start", finalize
+    )
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     result = CliRunner().invoke(
         app,
@@ -4686,560 +3233,6 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
     assert result.exit_code == 1
     assert cleanup_calls == 0
     assert starts == 0
-
-
-def test_cli_api_start_verifies_process_bound_release_identity(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    installation = _installation_identity()
-    identity = _session_api_release_identity()
-    launches: list[tuple[str, int]] = []
-    events: list[str] = []
-    bound_app = object()
-    late_app = object()
-    http_api_module = importlib.import_module("clio_relay.http_api")
-    monkeypatch.setattr(http_api_module, "app", bound_app)
-    monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "a" * 64)
-
-    def publish() -> None:
-        events.append("publish")
-        os.environ.pop("CLIO_RELAY_SESSION_OWNER_TOKEN", None)
-        cast(Any, http_api_module).app = late_app
-
-    def launch(application: object, *, host: str, port: int) -> None:
-        assert application is bound_app
-        assert "CLIO_RELAY_SESSION_OWNER_TOKEN" not in os.environ
-        events.append("serve")
-        launches.append((host, port))
-
-    receipt = cli.InstallReceipt.model_validate(installation["receipt"])
-    monkeypatch.setattr(
-        installation_module, "verified_session_api_install_receipt", lambda: receipt
-    )
-
-    def unexpected_full_installation_probe() -> dict[str, object]:
-        raise AssertionError("API startup must not run full component installation probes")
-
-    monkeypatch.setattr(
-        installation_module, "installation_info", unexpected_full_installation_probe
-    )
-    monkeypatch.setattr(session_lifecycle, "publish_owned_session_api_startup_receipt", publish)
-    monkeypatch.setattr(cli.uvicorn, "run", launch)
-    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", identity.sha256())
-
-    accepted = CliRunner().invoke(app, ["api", "start", "--port", "9001"])
-
-    assert accepted.exit_code == 0, accepted.output
-    assert launches == [("127.0.0.1", 9001)]
-    assert events == ["publish", "serve"]
-
-    monkeypatch.setenv("CLIO_RELAY_API_RELEASE_IDENTITY_SHA256", "b" * 64)
-    rejected = CliRunner().invoke(app, ["api", "start", "--port", "9002"])
-
-    assert rejected.exit_code == 2
-    assert "release identity does not match running package" in rejected.output
-    assert launches == [("127.0.0.1", 9001)]
-
-
-def test_cli_session_submit_jarvis_uses_identity_proven_client(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
-    pipeline = tmp_path / "pipeline.yaml"
-    pipeline.write_text("name: acceptance\npkgs: []\n", encoding="utf-8")
-    captured: dict[str, object] = {}
-
-    def submit_owned(**kwargs: object) -> RelayJob:
-        captured.update(kwargs)
-        selected_settings = cast(cli.RelaySettings, kwargs["settings"])
-        payload = cast(dict[str, object], kwargs["payload"])
-        return RelayJob(
-            cluster="ares",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(pipeline_yaml=cast(str, payload["pipeline_yaml"])),
-            idempotency_key=cast(str, payload["idempotency_key"]),
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": selected_settings.owner_session_id,
-                "owner_session_generation_id": selected_settings.owner_session_generation_id,
-            },
-        )
-
-    monkeypatch.setattr(session_api, "submit_owned_session_job", submit_owned)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "submit-jarvis",
-            "--cluster",
-            "ares",
-            "--session-id",
-            "session-1",
-            "--session-generation-id",
-            "generation-1",
-            "--pipeline-yaml-file",
-            str(pipeline),
-            "--idempotency-key",
-            "acceptance-submit",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    document = json.loads(result.output)
-    assert document["metadata"]["owner_session_generation_id"] == "generation-1"
-    settings = cast(cli.RelaySettings, captured["settings"])
-    assert settings.api_token == "api-token"
-    assert settings.owner_session_cluster == "ares"
-    assert settings.remote_cluster is None
-    assert settings.owner_session_id == "session-1"
-    assert settings.owner_session_generation_id == "generation-1"
-    assert cast(dict[str, object], captured["payload"])["pipeline_yaml"] == (
-        "name: acceptance\npkgs: []\n"
-    )
-
-
-def test_cli_session_detach_never_records_owner_session_closure(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    _activate_owner_session(ClioCoreQueue(core_dir))
-    lifecycle_events: list[str] = []
-
-    def fake_detach(**_kwargs: object) -> SessionLifecycleReport:
-        lifecycle_events.append("observe_remote_api")
-        return SessionLifecycleReport(
-            cluster="ares",
-            session_id="session-1",
-            session_generation_id="generation-1",
-            mode="detach",
-            resources=[
-                CleanupResource(
-                    kind="remote_relay_api",
-                    resource_id="123",
-                    location="ares",
-                    action="retain",
-                    ownership_verified=True,
-                    outcome="retained",
-                    verified_after_operation=True,
-                )
-            ],
-        )
-
-    def fake_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
-        lifecycle_events.append("cleanup_desktop_connectors")
-        return []
-
-    monkeypatch.setattr(session_lifecycle, "detach_remote_session", fake_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", fake_gateway_cleanup)
-
-    result = CliRunner().invoke(
-        app,
-        ["session", "detach", "--cluster", "ares", "--session-id", "session-1"],
-    )
-
-    queue = ClioCoreQueue(core_dir)
-    assert result.exit_code == 0, result.output
-    assert lifecycle_events == [
-        "observe_remote_api",
-        "cleanup_desktop_connectors",
-        "observe_remote_api",
-    ]
-    assert queue.owner_session_is_closing("session-1") is False
-    assert queue.get_owner_session_closed("session-1") is None
-
-
-def test_cli_session_detach_reports_success_when_optional_worker_observation_times_out(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    core_dir = tmp_path / "core"
-    report_path = tmp_path / "detach-worker-timeout.json"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256", "a" * 64)
-    _activate_owner_session(ClioCoreQueue(core_dir))
-
-    def retained_session(**_kwargs: object) -> SessionLifecycleReport:
-        return SessionLifecycleReport(
-            cluster="ares",
-            session_id="session-1",
-            session_generation_id="generation-1",
-            mode="detach",
-            resources=[
-                CleanupResource(
-                    kind="remote_relay_api",
-                    resource_id="123",
-                    location="ares",
-                    action="retain",
-                    ownership_verified=True,
-                    outcome="retained",
-                    verified_after_operation=True,
-                )
-            ],
-        )
-
-    def timed_out_worker_observation(
-        _definition: ClusterDefinition,
-    ) -> tuple[None, RelayError]:
-        return None, RelayError("remote command timed out after 20 seconds: ares")
-
-    monkeypatch.setattr(session_lifecycle, "detach_remote_session", retained_session)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "detach",
-            "--cluster",
-            "ares",
-            "--session-id",
-            "session-1",
-            "--validation-report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["ok"] is True
-    assert payload["validation_status"] == "failed"
-    assert payload["validation_provenance_warning"] is True
-    assert payload["residual_resources"] == []
-    assert payload["resources"][0]["action"] == "retain"
-    assert payload["resources"][0]["outcome"] == "retained"
-    queue = ClioCoreQueue(core_dir)
-    assert queue.owner_session_is_closing("session-1") is False
-    assert queue.get_owner_session_closed("session-1") is None
-
-    validation_report = json.loads(report_path.read_text(encoding="utf-8"))
-    worker_check = next(
-        check
-        for check in validation_report["checks"]
-        if check["check_id"] == "worker.installation-info"
-    )
-    assert validation_report["status"] == "failed"
-    assert worker_check["status"] == "failed"
-    assert "timed out after 20 seconds" in worker_check["error"]
-
-
-def test_cli_session_detach_default_report_failure_controls_exit(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-
-    def incomplete_detach(**_kwargs: object) -> SessionLifecycleReport:
-        return SessionLifecycleReport(
-            cluster="ares",
-            session_id="session-1",
-            session_generation_id=None,
-            mode="detach",
-            resources=[
-                CleanupResource(
-                    kind="remote_relay_api",
-                    resource_id="123",
-                    location="ares",
-                    action="retain",
-                    ownership_verified=True,
-                    outcome="retained",
-                    verified_after_operation=True,
-                )
-            ],
-        )
-
-    def forbidden_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
-        raise AssertionError("unverified detach must not mutate gateway connectors")
-
-    monkeypatch.setattr(session_lifecycle, "detach_remote_session", incomplete_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_gateway_cleanup)
-
-    result = CliRunner().invoke(
-        app,
-        ["session", "detach", "--cluster", "ares", "--session-id", "session-1"],
-    )
-
-    assert result.exit_code == 1
-    reports = list((tmp_path / ".clio-relay" / "validation-reports").glob("*.json"))
-    assert len(reports) == 1
-    canonical = json.loads(reports[0].read_text(encoding="utf-8"))
-    assert canonical["status"] == "failed"
-    detach_check = next(
-        check for check in canonical["checks"] if check["check_id"] == "cleanup.detach"
-    )
-    assert detach_check["status"] == "failed"
-
-
-def test_cli_session_detach_rejects_generation_change_after_connector_cleanup(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    observations = iter(("generation-1", "generation-2"))
-    cleanup_calls: list[str] = []
-
-    def changing_detach(**_kwargs: object) -> SessionLifecycleReport:
-        generation_id = next(observations)
-        return SessionLifecycleReport(
-            cluster="ares",
-            session_id="session-1",
-            session_generation_id=generation_id,
-            mode="detach",
-            resources=[
-                CleanupResource(
-                    kind="remote_relay_api",
-                    resource_id="123",
-                    location="ares",
-                    action="retain",
-                    ownership_verified=True,
-                    outcome="retained",
-                    verified_after_operation=True,
-                )
-            ],
-        )
-
-    def record_gateway_cleanup(**_kwargs: object) -> list[dict[str, object]]:
-        cleanup_calls.append("called")
-        return []
-
-    monkeypatch.setattr(session_lifecycle, "detach_remote_session", changing_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", record_gateway_cleanup)
-
-    result = CliRunner().invoke(
-        app,
-        ["session", "detach", "--cluster", "ares", "--session-id", "session-1"],
-    )
-
-    assert result.exit_code == 1
-    assert "owned session generation changed during desktop detach" in result.output
-    assert cleanup_calls == ["called"]
-    reports = list((tmp_path / ".clio-relay" / "validation-reports").glob("*.json"))
-    canonical = json.loads(reports[0].read_text(encoding="utf-8"))
-    assert canonical["status"] == "failed"
-    assert canonical["cleanup"]["remaining_resources"] == []
-
-
-def test_cli_session_reopen_preserves_prior_generation_closure_history(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    prepared = runner.invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--candidate-generation-id",
-            "generation-1",
-        ],
-    )
-    quiesced = runner.invoke(
-        app,
-        [
-            "session",
-            "quiesce-intake",
-            "--session-id",
-            "session-1",
-            "--session-generation-id",
-            "generation-1",
-        ],
-    )
-    closed = runner.invoke(
-        app,
-        [
-            "session",
-            "mark-closed",
-            "--session-id",
-            "session-1",
-            "--session-generation-id",
-            "generation-1",
-        ],
-    )
-    reopened = runner.invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--recorded-generation-id",
-            "generation-1",
-            "--candidate-generation-id",
-            "generation-2",
-        ],
-    )
-    resumed = runner.invoke(
-        app,
-        [
-            "session",
-            "resume-intake",
-            "--session-id",
-            "session-1",
-            "--session-generation-id",
-            "generation-2",
-        ],
-    )
-
-    queue = ClioCoreQueue(core_dir)
-    assert prepared.exit_code == 0, prepared.output
-    assert quiesced.exit_code == 0, quiesced.output
-    assert closed.exit_code == 0, closed.output
-    assert reopened.exit_code == 0, reopened.output
-    assert resumed.exit_code == 0, resumed.output
-    assert queue.owner_session_is_closing("session-1") is False
-    assert (
-        queue.get_owner_session_closed(
-            "session-1",
-            session_generation_id="generation-1",
-        )
-        is not None
-    )
-    assert (
-        queue.get_owner_session_closed(
-            "session-1",
-            session_generation_id="generation-2",
-        )
-        is None
-    )
-
-
-def test_cli_session_prepare_start_preserves_active_generation_and_resources(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-    first = runner.invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--candidate-generation-id",
-            "generation-1",
-        ],
-    )
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="ares",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(command=["true"]),
-            idempotency_key="preserve-generation-job",
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": "session-1",
-                "owner_session_generation_id": "generation-1",
-            },
-        )
-    )
-    gateway = queue.create_gateway_session(
-        GatewaySession(
-            cluster="ares",
-            name="preserve-generation-gateway",
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": "session-1",
-                "owner_session_generation_id": "generation-1",
-            },
-        )
-    )
-
-    replacement = runner.invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--recorded-generation-id",
-            "generation-1",
-            "--candidate-generation-id",
-            "generation-2",
-        ],
-    )
-    dead_api_recovery = runner.invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--candidate-generation-id",
-            "generation-3",
-        ],
-    )
-
-    assert first.exit_code == 0, first.output
-    assert replacement.exit_code == 0, replacement.output
-    assert dead_api_recovery.exit_code == 0, dead_api_recovery.output
-    assert json.loads(replacement.output)["session_generation_id"] == "generation-1"
-    assert json.loads(dead_api_recovery.output)["session_generation_id"] == "generation-1"
-    assert queue.get_job(job.job_id).metadata["owner_session_generation_id"] == "generation-1"
-    assert (
-        queue.get_gateway_session(gateway.session_id).metadata["owner_session_generation_id"]
-        == "generation-1"
-    )
-
-
-def test_cli_session_prepare_start_refuses_new_generation_before_closure(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    queue = ClioCoreQueue(core_dir)
-    _activate_owner_session(queue)
-    queue.set_owner_session_closing(
-        "session-1",
-        session_generation_id="generation-1",
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "prepare-start",
-            "--session-id",
-            "session-1",
-            "--recorded-generation-id",
-            "generation-1",
-            "--candidate-generation-id",
-            "generation-2",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "unfinished generation transition" in result.output
-    assert queue.owner_session_is_closing("session-1") is True
-    assert (
-        queue.get_owner_session_closed(
-            "session-1",
-            session_generation_id="generation-1",
-        )
-        is None
-    )
 
 
 def test_cli_session_teardown_failure_leaves_generation_quiesced_not_closed(
@@ -5321,7 +3314,9 @@ def test_cli_session_teardown_requires_connectors_for_each_gateway(
             }
         ]
 
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", gateway_without_connectors)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", gateway_without_connectors
+    )
 
     result = CliRunner().invoke(
         app,
@@ -5354,7 +3349,9 @@ def test_cli_session_teardown_retries_same_policy_after_closure(
     )
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -5385,7 +3382,7 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256", "a" * 64)
     queue = ClioCoreQueue(core_dir)
     _activate_owner_session(queue)
-    kept_job = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    kept_job = cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job_id="job-kept",
         relay_state=JobState.SUCCEEDED,
         scheduler_job_ids=("21958",),
@@ -5420,12 +3417,20 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", list_owned_jobs)
-    monkeypatch.setattr(cli, "_scheduler_phase_after_operation", running_scheduler_job)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
-    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", list_owned_jobs)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_scheduler_phase_after_operation", running_scheduler_job
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", timed_out_worker_observation
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_cancel_owned_scheduler_jobs", forbid_cancellation
+    )
 
     result = CliRunner().invoke(
         app,
@@ -5516,7 +3521,9 @@ def test_cli_session_teardown_cleans_jarvis_gateway_before_stopping_owned_api(
         return _verified_teardown_report()
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", clean_jarvis_gateway)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", clean_jarvis_gateway
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", stop_owned_api)
 
     result = CliRunner().invoke(
@@ -5556,8 +3563,12 @@ def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", fail_after_api_stop)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", record_gateway_cleanup)
+    monkeypatch.setattr(
+        cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", fail_after_api_stop
+    )
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", record_gateway_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -5648,9 +3659,11 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         "teardown_remote_session",
         _fake_verified_teardown,
     )
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(
+        cli_owned_relay_jobs,
         "_list_remote_owned_active_cluster_jobs",
         _fake_empty_owned_jobs,
     )
@@ -5726,14 +3739,18 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         del observed_worker_info
         raise AssertionError("cleanup without an artifact digest must not claim worker identity")
 
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", forbid_worker_verification)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", forbid_worker_verification
+    )
 
     def observe_no_worker(
         _definition: ClusterDefinition,
     ) -> tuple[None, None]:
         return None, None
 
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", observe_no_worker
+    )
 
     report_path = tmp_path / "remote-teardown.json"
     result = CliRunner().invoke(
@@ -5818,58 +3835,6 @@ def test_cli_session_start_requires_token_by_default(
     )
 
     assert result.exit_code == 2
-
-
-def test_cli_jarvis_mcp_preflight_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    report_path = tmp_path / "jarvis-preflight-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "ares",
-            "--arguments-json",
-            "{}",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code != 0
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "jarvis-mcp.preflight"
-
-
-def test_cli_scheduler_preflight_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
-    report_path = tmp_path / "scheduler-preflight-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "validate-lifecycle",
-            "--cluster",
-            "missing",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code != 0
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "scheduler.preflight"
 
 
 @pytest.mark.parametrize(
@@ -6085,40 +4050,6 @@ def test_cli_invalid_scheduler_only_teardown_records_the_rejected_requested_poli
     assert report["cleanup"]["cancel_scheduler_jobs"] is True
 
 
-def test_cli_session_detach_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-
-    def fail_detach(**_kwargs: object) -> SessionLifecycleReport:
-        raise RelayError("remote session ownership check failed")
-
-    monkeypatch.setattr(session_lifecycle, "detach_remote_session", fail_detach)
-    report_path = tmp_path / "detach-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "detach",
-            "--cluster",
-            "ares",
-            "--session-id",
-            "session-1",
-            "--validation-report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["scenario"] == "cleanup"
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "session.detach"
-
-
 def test_cli_session_teardown_failure_writes_canonical_report(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -6131,13 +4062,13 @@ def test_cli_session_teardown_failure_writes_canonical_report(
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", fail_teardown)
     monkeypatch.setattr(
-        cli,
+        cli_remote_worker_attach,
         "_observe_worker_before_cleanup",
         _fake_no_worker_observation,
     )
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup,
         "_cleanup_owned_runtime_sessions",
         _fake_empty_runtime_cleanup,
     )
@@ -6213,133 +4144,6 @@ def test_failed_acceptance_report_overwrites_passed_partial_and_is_idempotent(
         partial_report=partial,
     )
     assert json.loads(report_path.read_text(encoding="utf-8")) == failed_once
-
-
-def test_release_validate_local_replaces_stale_success_on_preflight_failure(
-    tmp_path: Path,
-) -> None:
-    report_path = tmp_path / "local-release.json"
-    stale_report_id = _write_passing_validation_report(
-        report_path,
-        scenario="local-release",
-        cluster="local",
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "release",
-            "validate-local",
-            "--project-root",
-            str(tmp_path / "missing-checkout"),
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    current = LiveValidationReport.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert current.report_id != stale_report_id
-    assert current.scenario == "local-release"
-    assert current.cluster == "local"
-    assert current.status.value == "failed"
-    assert current.checks[-1].check_id == "local-release.completed"
-    assert "has no pyproject.toml" in (current.error or "")
-
-
-def test_live_test_replaces_stale_success_when_secret_resolution_fails(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.delenv("CLIO_RELAY_FRP_TOKEN", raising=False)
-    monkeypatch.delenv("CLIO_RELAY_STCP_SECRET", raising=False)
-    report_path = tmp_path / "live-test.json"
-    stale_report_id = _write_passing_validation_report(
-        report_path,
-        scenario="live-test",
-        cluster="ares",
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "live-test",
-            "--cluster",
-            "ares",
-            "--verify-transport",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    current = LiveValidationReport.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert current.report_id != stale_report_id
-    assert current.scenario == "live-test"
-    assert current.cluster == "ares"
-    assert current.status.value == "failed"
-    assert current.checks[-1].check_id == "live.completed"
-    assert "frp token" in (current.error or "")
-
-
-def test_live_test_resume_uses_sibling_report_and_preserves_checkpoint(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The CLI never seeds or overwrites the PENDING report selected for resume."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    pipeline = tmp_path / "pipeline.yaml"
-    pipeline.write_text("name: generic\npkgs: []\n", encoding="utf-8")
-    source_path = tmp_path / "pending-live-test.json"
-    source = new_live_validation_report(scenario="live-test", cluster="ares")
-    source.status = ValidationStatus.PENDING
-    source.completed_at = datetime.now(UTC)
-    write_validation_report(source, source_path)
-    source_bytes = source_path.read_bytes()
-    captured: list[LiveAcceptanceOptions] = []
-
-    def fake_run(options: LiveAcceptanceOptions) -> list[str]:
-        captured.append(options)
-        report_path = options.report_path
-        assert report_path is not None
-        report_id = options.report_id
-        report = new_live_validation_report(
-            scenario="live-test",
-            cluster="ares",
-            report_id=report_id,
-        )
-        report.status = ValidationStatus.PENDING
-        report.completed_at = datetime.now(UTC)
-        write_validation_report(report, report_path)
-        return ["validation.status=pending", f"validation.report={report_path.resolve()}"]
-
-    monkeypatch.setattr(live_acceptance, "run_live_acceptance", fake_run)
-    result = CliRunner().invoke(
-        app,
-        [
-            "live-test",
-            "--cluster",
-            "ares",
-            "--jarvis-yaml",
-            str(pipeline),
-            "--resume-report",
-            str(source_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert source_path.read_bytes() == source_bytes
-    assert len(captured) == 1
-    options = captured[0]
-    assert options.resume_report_path == source_path
-    output_path = options.report_path
-    assert output_path is not None
-    assert output_path != source_path
-    assert output_path.exists()
-    assert output_path.parent == source_path.parent
 
 
 def test_cli_session_teardown_defaults_to_keep_jobs(
@@ -6450,11 +4254,13 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
         recovery_calls.append("initial")
         return recovery
 
-    recover_after_finalization = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    recover_after_finalization = cli_owned_session_recovery._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     recovery_calls: list[str] = []
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", dead_status)
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
+    monkeypatch.setattr(
+        cli_owned_session_recovery, "_owned_session_recovery_status", recovered_status
+    )
 
     def verified_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardown_calls.append(kwargs)
@@ -6479,10 +4285,16 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
         write_report(report, path)
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_cancel_owned_scheduler_jobs", forbid_cancellation
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", observe_no_worker
+    )
     monkeypatch.setattr(validation_report, "write_validation_report", capture_report)
 
     result = CliRunner().invoke(
@@ -6733,7 +4545,9 @@ def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup
+    )
     monkeypatch.setattr(time, "sleep", acknowledge_after_poll)
 
     result = CliRunner().invoke(
@@ -6824,7 +4638,9 @@ def test_cli_session_teardown_does_not_stop_runtime_before_cancel_acknowledgment
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", forbidden_runtime_cleanup
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbidden_teardown)
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", advance_clock)
@@ -7182,7 +4998,7 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", forbidden_provider)
     jobs = [
-        cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             job_id="relay-owned",
             relay_state=JobState.RUNNING,
             scheduler_job_ids=("owned-123",),
@@ -7194,7 +5010,7 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
 
     for conflicting_id in ("owned-123", "untrusted-456"):
         with pytest.raises(RelayError, match="no scheduler cancellation was attempted"):
-            cli._preflight_scheduler_sentinels(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_owned_scheduler_cancel._preflight_scheduler_sentinels(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 ClusterDefinition(
                     name="ares",
                     ssh_host="ares",
@@ -7316,7 +5132,7 @@ def test_scheduler_sentinel_rejects_unsafe_post_cancel_phase(
         return UnsafeScheduler()
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", unsafe_provider)
-    resources, errors = cli._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources, errors = cli_owned_scheduler_cancel._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="ares", ssh_host="ares", scheduler_provider="slurm"),
         {"unrelated-sentinel": "running"},
     )
@@ -7465,7 +5281,7 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
         return CompletingScheduler()
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", completing_provider)
-    scheduler_resource, error = cli._cancel_owned_scheduler_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    scheduler_resource, error = cli_owned_scheduler_cancel._cancel_owned_scheduler_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="local", ssh_host="localhost", scheduler_provider="slurm"),
         "scheduler-1",
         relay_job_id="relay-1",
@@ -7498,7 +5314,7 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
         "cancel_scheduler_jobs": True,
     }
 
-    cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         session_id="session-1",
         session_generation_id="generation-1",
@@ -7535,7 +5351,7 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
         },
     }
 
-    owned = cli._owned_relay_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    owned = cli_owned_relay_jobs._owned_relay_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job,
         [task],
         scheduler_provider="slurm",
@@ -7543,7 +5359,7 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
 
     assert owned.scheduler_job_ids == ()
     assert owned.unowned_scheduler_job_ids == ("untrusted-123",)
-    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources = cli_owned_scheduler_cancel._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         [owned],
         definition=ClusterDefinition(
             name="ares",
@@ -7565,7 +5381,7 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
 ) -> None:
     """Default teardown succeeds when an owned job naturally leaves the active queue."""
 
-    owned = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    owned = cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job_id="relay-1",
         relay_state=JobState.SUCCEEDED,
         scheduler_job_ids=("21947",),
@@ -7580,11 +5396,11 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
         return "missing", None
 
     monkeypatch.setattr(
-        cli,
+        cli_owned_scheduler_cancel,
         "_scheduler_phase_after_operation",
         missing_phase,
     )
-    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources = cli_owned_scheduler_cancel._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         [owned],
         definition=ClusterDefinition(
             name="ares",
@@ -7599,7 +5415,7 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
         resources=[*_verified_teardown_report().resources, *resources]
     )
 
-    cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         session_id="session-1",
         session_generation_id="generation-1",
@@ -7662,7 +5478,7 @@ def test_scheduler_phase_batch_uses_one_remote_command(
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", remote_statuses)
 
-    observed = cli._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = cli_owned_scheduler_cancel._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         (("slurm", "101"), ("slurm", "102")),
     )
@@ -7673,56 +5489,6 @@ def test_scheduler_phase_batch_uses_one_remote_command(
         ("slurm", "101"): ("completed", None),
         ("slurm", "102"): ("running", None),
     }
-
-
-def test_scheduler_status_batch_command_returns_each_exact_identity(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="configured-target", scheduler_provider="slurm")
-
-    def poll(scheduler_job_id: str) -> SchedulerStatus:
-        return SchedulerStatus(
-            scheduler="slurm",
-            scheduler_job_id=scheduler_job_id,
-            phase=(
-                SchedulerPhase.COMPLETED if scheduler_job_id == "101" else SchedulerPhase.RUNNING
-            ),
-            record_found=True,
-            active_record_found=scheduler_job_id != "101",
-        )
-
-    scheduler = SimpleNamespace(poll=poll)
-
-    def resolve_provider(_provider: str) -> Any:
-        return scheduler
-
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", resolve_provider)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "status-batch",
-            "--cluster",
-            "configured-target",
-            "--provider",
-            "slurm",
-            "--scheduler-job-id",
-            "101",
-            "--scheduler-job-id",
-            "102",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["schema_version"] == "clio-relay.scheduler-status-batch.v1"
-    assert [status["scheduler_job_id"] for status in payload["statuses"]] == [
-        "101",
-        "102",
-    ]
 
 
 @pytest.mark.parametrize(
@@ -7779,7 +5545,7 @@ def test_owner_session_teardown_rejects_cancellation_under_keep_policy(
     report = _verified_teardown_report(resources=resources)
 
     with pytest.raises(RelayError, match=error_match):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -7802,7 +5568,7 @@ def test_owner_session_teardown_rejects_unknown_or_duplicate_cleanup_resources()
     unknown_report = _verified_teardown_report(resources=[*base.resources, unknown])
 
     with pytest.raises(RelayError, match="unknown cleanup resource kinds"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             unknown_report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -7813,7 +5579,7 @@ def test_owner_session_teardown_rejects_unknown_or_duplicate_cleanup_resources()
         resources=[*base.resources, base.resources[-1].model_copy()]
     )
     with pytest.raises(RelayError, match="duplicate cleanup resources"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             duplicate_report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -7827,7 +5593,7 @@ def test_owner_session_teardown_rejects_report_flags_that_drift_from_policy() ->
     report.relay_cancel_requested = True
 
     with pytest.raises(RelayError, match="relay-job disposition did not match cleanup policy"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -7993,13 +5759,13 @@ def test_remote_owned_job_discovery_never_cancels_unrelated_session(
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_remote)
 
-    jobs = cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "ares",
         owner_session_id="session-1",
         owner_session_generation_id="generation-1",
     )
-    canceled = cli._cancel_remote_owned_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    canceled = cli_owned_relay_jobs._cancel_remote_owned_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "ares",
         jobs,
@@ -8040,7 +5806,7 @@ def test_remote_owner_session_discovery_refuses_truncated_legacy_coverage(
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
 
     with pytest.raises(RelayError, match="bounded source limit"):
-        cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "ares",
             owner_session_id="session-1",
@@ -8120,7 +5886,7 @@ def test_owned_runtime_cleanup_scans_remote_gateway_core(
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_remote)
 
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=definition,
         owner_session_id="session-1",
@@ -8176,7 +5942,7 @@ def test_owned_runtime_cleanup_refuses_gateway_without_exact_generation(
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", forbidden_stop)
 
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         owner_session_id="session-1",
@@ -8264,7 +6030,7 @@ def test_owned_runtime_cleanup_rescans_for_late_exact_generation_gateway(
         raise AssertionError(args)
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=definition,
         owner_session_id="session-1",
@@ -8277,601 +6043,6 @@ def test_owned_runtime_cleanup_rescans_for_late_exact_generation_gateway(
     assert len(reports) == 2
     assert states == {"gateway-1": "closed", "gateway-2": "closed"}
     assert list_calls >= 5
-
-
-def test_cli_init_creates_empty_cluster_registry(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-
-    result = CliRunner().invoke(app, ["init"])
-
-    assert result.exit_code == 0
-    assert "clusters=" in result.output
-    assert "ares" not in result.output
-    registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
-    assert registry.clusters == {}
-
-
-def test_cli_init_threads_explicit_legacy_output_migration_authorization(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    observed: list[bool] = []
-
-    def capture_authorization(
-        _settings: object,
-        *,
-        migrate_legacy_output: bool = False,
-    ) -> object:
-        observed.append(migrate_legacy_output)
-        return object()
-
-    monkeypatch.setattr(storage_runtime, "storage_managed_queue", capture_authorization)
-
-    result = CliRunner().invoke(app, ["init", "--migrate-legacy-output"])
-
-    assert result.exit_code == 0
-    assert observed == [True]
-
-
-def test_cli_cluster_add_writes_explicit_definition(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "add",
-            "--name",
-            "delta",
-            "--ssh-host",
-            "delta-login",
-            "--scheduler-provider",
-            "slurm",
-            "--spack-executable",
-            "/opt/site/spack/bin/spack",
-            "--target-hostname",
-            "delta-login-1",
-            "--target-hostname",
-            "delta-login-1.example.edu",
-            "--ssh-host-key-sha256",
-            "SHA256:operator-pinned-fingerprint",
-            "--scheduler-cluster-name",
-            "delta",
-            "--site-marker-sha256",
-            "a" * 64,
-            "--agent-adapter",
-            "exec",
-            "--agent-npm-package",
-            "",
-            "--agent-npm-bin",
-            "clio",
-            "--frp-server-addr",
-            "relay.example.edu",
-            "--frp-protocol",
-            "tcp",
-            "--frp-server-port",
-            "7000",
-        ],
-    )
-
-    assert result.exit_code == 0
-    registry = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json")
-    definition = registry.require("delta")
-    assert definition.ssh_host == "delta-login"
-    assert definition.scheduler_provider == "slurm"
-    assert definition.spack_executable == "/opt/site/spack/bin/spack"
-    assert definition.target_identity == ClusterTargetIdentity(
-        hostnames=["delta-login-1", "delta-login-1.example.edu"],
-        ssh_host_key_sha256=["SHA256:operator-pinned-fingerprint"],
-        scheduler_cluster_name="delta",
-        site_marker_sha256="a" * 64,
-    )
-    assert definition.agent_adapter == "exec"
-    assert definition.agent_npm_package is None
-    assert definition.agent_npm_bin == "clio"
-    assert definition.frp_transport.server_addr == "relay.example.edu"
-    assert definition.frp_transport.protocol == "tcp"
-    assert definition.frp_transport.server_port == 7000
-    assert definition.frp_transport.direct.enabled is False
-    assert definition.frp_transport.direct.fallback_order == ["frp_stcp", "queue"]
-
-
-def test_cli_cluster_add_requires_hostname_and_host_key_pins_together(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "add",
-            "--name",
-            "delta",
-            "--ssh-host",
-            "delta-login",
-            "--target-hostname",
-            "delta-login-1",
-        ],
-        terminal_width=200,
-    )
-
-    assert result.exit_code == 2
-    assert not (tmp_path / ".clio-relay" / "clusters.json").exists()
-
-
-def test_cli_cluster_pin_target_preserves_every_unrelated_cluster_setting(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition.model_validate(
-        {
-            "name": "delta",
-            "ssh_host": "delta-login",
-            "bootstrap_profile": "site-profile",
-            "core_dir": "/srv/clio/core",
-            "spool_dir": "/scratch/clio/spool",
-            "jarvis_bin": "/opt/jarvis/bin/jarvis",
-            "spack_executable": "/opt/site/spack/bin/spack",
-            "frpc_bin": "/opt/frp/frpc",
-            "agent_bin": "/opt/agent/bin/agent",
-            "agent_adapter": "exec",
-            "agent_npm_package": "@example/agent",
-            "agent_npm_bin": "example-agent",
-            "agent_args": ["--profile", "science"],
-            "scheduler_provider": "slurm",
-            "remote_mcp_servers": {
-                "spack": {
-                    "command": "uvx",
-                    "args": [
-                        "--from",
-                        "/opt/clio/clio_kit-2.3.1-py3-none-any.whl",
-                        "clio-kit",
-                        "mcp-server",
-                        "spack",
-                    ],
-                    "namespace": "software",
-                    "allow_tools": ["spack_find", "spack_install"],
-                    "profiles": ["user"],
-                }
-            },
-            "frp_transport": {
-                "protocol": "tcp",
-                "server_addr": "relay.example.edu",
-                "server_port": 7000,
-                "token_env": "SITE_FRP_TOKEN",
-                "stcp_secret_env": "SITE_STCP_SECRET",
-                "direct": {
-                    "enabled": True,
-                    "mode": "xtcp",
-                    "fallback_order": ["xtcp", "frp_stcp", "queue"],
-                    "probe_timeout_seconds": 14,
-                },
-            },
-            "live_test": {
-                "jarvis_yaml": "site/pipeline.yaml",
-                "monitor_pattern": "iteration",
-                "progress_pattern": "progress",
-                "verify_transport": True,
-                "transport_local_bind_port": 19001,
-                "agent_prompt": "validate the site",
-            },
-            "target_identity": {
-                "hostnames": ["old-login.example.edu"],
-                "ssh_host_key_sha256": ["SHA256:old-key"],
-            },
-        }
-    )
-    ClusterRegistry(clusters={"delta": definition}).save(registry_path)
-    expected_unrelated = definition.model_dump(mode="json")
-    expected_unrelated.pop("target_identity")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-target",
-            "--cluster",
-            "delta",
-            "--target-hostname",
-            "delta-login-1",
-            "--target-hostname",
-            "delta-login-1.example.edu",
-            "--ssh-host-key-sha256",
-            "SHA256:new-key-a",
-            "--ssh-host-key-sha256",
-            "SHA256:new-key-b",
-            "--scheduler-cluster-name",
-            "delta-production",
-            "--site-marker-sha256",
-            "b" * 64,
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    updated = ClusterRegistry.load(registry_path).require("delta")
-    actual_unrelated = updated.model_dump(mode="json")
-    actual_unrelated.pop("target_identity")
-    assert actual_unrelated == expected_unrelated
-    assert updated.target_identity == ClusterTargetIdentity(
-        hostnames=["delta-login-1", "delta-login-1.example.edu"],
-        ssh_host_key_sha256=["SHA256:new-key-a", "SHA256:new-key-b"],
-        scheduler_cluster_name="delta-production",
-        site_marker_sha256="b" * 64,
-    )
-
-
-def test_cli_cluster_pin_target_clear_is_exclusive_and_preserves_cluster_config(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition(
-        name="frontier",
-        ssh_host="frontier-login",
-        agent_args=["--keep-this"],
-        target_identity=ClusterTargetIdentity(
-            hostnames=["frontier-login.example.edu"],
-            ssh_host_key_sha256=["SHA256:old-key"],
-        ),
-    )
-    ClusterRegistry(clusters={"frontier": definition}).save(registry_path)
-
-    rejected = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-target",
-            "--cluster",
-            "frontier",
-            "--clear",
-            "--target-hostname",
-            "unexpected.example.edu",
-        ],
-    )
-    assert rejected.exit_code == 2
-    assert ClusterRegistry.load(registry_path).require("frontier") == definition
-
-    cleared = CliRunner().invoke(
-        app,
-        ["cluster", "pin-target", "--cluster", "frontier", "--clear"],
-    )
-    assert cleared.exit_code == 0, cleared.output
-    updated = ClusterRegistry.load(registry_path).require("frontier")
-    assert updated.target_identity is None
-    assert updated.model_copy(update={"target_identity": definition.target_identity}) == definition
-
-
-def test_cli_cluster_pin_runtime_preserves_every_unrelated_cluster_setting(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """clio-relay#205 follow-up: pin-runtime is a partial update, not a wholesale replace."""
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition.model_validate(
-        {
-            "name": "ares-p5run2",
-            "ssh_host": "ares-login",
-            "bootstrap_profile": "site-profile",
-            "core_dir": "/srv/clio/core",
-            "spool_dir": "/scratch/clio/spool",
-            "jarvis_bin": "/opt/jarvis/bin/jarvis",
-            "spack_executable": "/opt/site/spack/bin/spack",
-            "frpc_bin": "/opt/frp/frpc",
-            "agent_bin": "/opt/agent/bin/agent",
-            "agent_adapter": "exec",
-            "agent_npm_package": "@example/agent",
-            "agent_npm_bin": "example-agent",
-            "agent_args": ["--profile", "science"],
-            "scheduler_provider": "slurm",
-            "remote_mcp_servers": {
-                "spack": {
-                    "command": "uvx",
-                    "args": [
-                        "--from",
-                        "/opt/clio/clio_kit-2.3.1-py3-none-any.whl",
-                        "clio-kit",
-                        "mcp-server",
-                        "spack",
-                    ],
-                    "namespace": "software",
-                    "allow_tools": ["spack_find", "spack_install"],
-                    "profiles": ["user"],
-                }
-            },
-            "frp_transport": {
-                "protocol": "tcp",
-                "server_addr": "relay.example.edu",
-                "server_port": 7000,
-                "token_env": "SITE_FRP_TOKEN",
-                "stcp_secret_env": "SITE_STCP_SECRET",
-                "direct": {
-                    "enabled": True,
-                    "mode": "xtcp",
-                    "fallback_order": ["xtcp", "frp_stcp", "queue"],
-                    "probe_timeout_seconds": 14,
-                },
-            },
-            "target_identity": {
-                "hostnames": ["ares-login.example.edu"],
-                "ssh_host_key_sha256": ["SHA256:pinned-key"],
-                "scheduler_cluster_name": "ares",
-                "site_marker_sha256": "a" * 64,
-            },
-        }
-    )
-    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
-    expected_unrelated = definition.model_dump(mode="json")
-    expected_unrelated.pop("relay_executable")
-    expected_unrelated.pop("relay_install_receipt")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-runtime",
-            "--cluster",
-            "ares-p5run2",
-            "--relay-executable",
-            "$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay",
-            "--install-receipt",
-            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    updated = ClusterRegistry.load(registry_path).require("ares-p5run2")
-    actual_unrelated = updated.model_dump(mode="json")
-    actual_unrelated.pop("relay_executable")
-    actual_unrelated.pop("relay_install_receipt")
-    assert actual_unrelated == expected_unrelated
-    assert updated.relay_executable == "$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay"
-    assert (
-        updated.relay_install_receipt
-        == "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json"
-    )
-
-
-def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#216: an edit that changes cluster_route_revision must warn loudly at edit
-    time -- cached MCP discovery evidence for the cluster silently strands
-    otherwise, and every call through it fails typed only later, per call.
-    """
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
-    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
-
-    changed = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-runtime",
-            "--cluster",
-            "ares-p5run2",
-            "--install-receipt",
-            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
-        ],
-    )
-    assert changed.exit_code == 0, changed.output
-    assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
-
-    # Re-pinning the identical value changes nothing: no repeated warning noise.
-    unchanged = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-runtime",
-            "--cluster",
-            "ares-p5run2",
-            "--install-receipt",
-            "$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
-        ],
-    )
-    assert unchanged.exit_code == 0, unchanged.output
-    assert "route revision changed" not in unchanged.output
-
-
-def test_cli_cluster_add_warns_when_route_revision_changes(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#216 rework: `cluster add` is one of the three sanctioned edit commands
-    the fix names (add / pin-target / pin-runtime) but only pin-runtime's
-    warning path was pinned by a test above -- this fills that gap for
-    `add`. Re-adding an EXISTING cluster with a changed routing-relevant
-    field (ssh_host) must warn loudly that cached MCP discovery evidence is
-    now stale, exactly like pin-runtime.
-    """
-    monkeypatch.chdir(tmp_path)
-
-    created = CliRunner().invoke(
-        app,
-        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-1"],
-    )
-    assert created.exit_code == 0, created.output
-    # First registration of a NEW cluster has no prior route revision to
-    # compare against (before=None) -- never a warning.
-    assert "route revision changed" not in created.output
-
-    changed = CliRunner().invoke(
-        app,
-        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
-    )
-    assert changed.exit_code == 0, changed.output
-    assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
-
-    # Re-adding with the identical routing-relevant fields changes nothing:
-    # no repeated warning noise.
-    unchanged = CliRunner().invoke(
-        app,
-        ["cluster", "add", "--name", "ares-p5run2", "--ssh-host", "ares-login-2"],
-    )
-    assert unchanged.exit_code == 0, unchanged.output
-    assert "route revision changed" not in unchanged.output
-
-
-def test_cli_cluster_pin_target_warns_when_route_revision_changes(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#216 rework: `cluster pin-target` is one of the three sanctioned edit
-    commands the fix names (add / pin-target / pin-runtime) but only
-    pin-runtime's warning path was pinned by a test above -- this fills
-    that gap for `pin-target`. target_identity is included in
-    cluster_route_revision()'s digest (it excludes only
-    remote_mcp_servers/worker_capacity), so pinning a physical target
-    identity strands cached MCP discovery evidence exactly like pin-runtime
-    and must warn the same way.
-    """
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition(name="ares-p5run2", ssh_host="ares-login")
-    ClusterRegistry(clusters={"ares-p5run2": definition}).save(registry_path)
-
-    changed = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-target",
-            "--cluster",
-            "ares-p5run2",
-            "--target-hostname",
-            "ares-login-1.example.edu",
-            "--ssh-host-key-sha256",
-            "SHA256:operator-pinned-fingerprint",
-        ],
-    )
-    assert changed.exit_code == 0, changed.output
-    assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
-
-    # Re-pinning the identical target identity changes nothing: no repeated
-    # warning noise.
-    unchanged = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-target",
-            "--cluster",
-            "ares-p5run2",
-            "--target-hostname",
-            "ares-login-1.example.edu",
-            "--ssh-host-key-sha256",
-            "SHA256:operator-pinned-fingerprint",
-        ],
-    )
-    assert unchanged.exit_code == 0, unchanged.output
-    assert "route revision changed" not in unchanged.output
-
-    # --clear also changes target_identity (back to None) and must warn too.
-    cleared = CliRunner().invoke(
-        app,
-        ["cluster", "pin-target", "--cluster", "ares-p5run2", "--clear"],
-    )
-    assert cleared.exit_code == 0, cleared.output
-    assert "route revision changed" in cleared.output
-
-
-def test_cli_cluster_pin_runtime_clear_is_exclusive_and_preserves_cluster_config(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    definition = ClusterDefinition(
-        name="frontier",
-        ssh_host="frontier-login",
-        agent_args=["--keep-this"],
-        relay_executable="$HOME/.local/share/clio-relay/generations/g1/bin/clio-relay",
-        relay_install_receipt="$HOME/.local/share/clio-relay/generations/g1/install-receipt.json",
-    )
-    ClusterRegistry(clusters={"frontier": definition}).save(registry_path)
-
-    rejected = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-runtime",
-            "--cluster",
-            "frontier",
-            "--clear",
-            "--install-receipt",
-            "$HOME/unexpected/install-receipt.json",
-        ],
-    )
-    assert rejected.exit_code == 2
-    assert ClusterRegistry.load(registry_path).require("frontier") == definition
-
-    cleared = CliRunner().invoke(
-        app,
-        ["cluster", "pin-runtime", "--cluster", "frontier", "--clear"],
-    )
-    assert cleared.exit_code == 0, cleared.output
-    updated = ClusterRegistry.load(registry_path).require("frontier")
-    assert updated.relay_install_receipt is None
-    assert updated.relay_executable == ClusterDefinition.model_fields["relay_executable"].default
-    assert (
-        updated.model_copy(
-            update={
-                "relay_executable": definition.relay_executable,
-                "relay_install_receipt": definition.relay_install_receipt,
-            }
-        )
-        == definition
-    )
-
-
-def test_cli_cluster_pin_runtime_rejects_an_unconfigured_cluster(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """clio-relay#205 follow-up: a typed error, not a silently-created entry."""
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    ClusterRegistry(clusters={}).save(registry_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "pin-runtime",
-            "--cluster",
-            "nonexistent",
-            "--install-receipt",
-            "$HOME/.local/share/clio-relay/install-receipt.json",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert result.exception is not None
-    assert isinstance(result.exception, ConfigurationError)
-    assert "nonexistent" in str(result.exception)
-    assert ClusterRegistry.load(registry_path).clusters == {}
 
 
 def test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix(
@@ -9101,7 +6272,7 @@ def test_ssh_host_key_fingerprints_prefers_all_configured_known_hosts_files(
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    fingerprints = cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "operator-alias"
     )
 
@@ -9165,7 +6336,7 @@ def test_ssh_host_key_fingerprints_resolves_alias_and_falls_back_to_keyscan(
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    fingerprints = cli._ssh_host_key_fingerprints("ares")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_host_key_fingerprints("ares")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     digest = base64.b64encode(hashlib.sha256(key_bytes).digest()).decode().rstrip("=")
     assert fingerprints == [f"SHA256:{digest}"]
@@ -9204,7 +6375,7 @@ def test_ssh_host_key_fingerprints_bounds_known_hosts_and_scan_timeouts(
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     with pytest.raises(ConfigurationError, match="ssh-keygen timed out") as captured:
-        cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_probe._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "generic-target"
         )
 
@@ -9227,7 +6398,7 @@ def test_ssh_host_key_fingerprint_parser_rejects_revoked_and_malformed_records()
     trusted_key = b"trusted-ca-key"
     trusted = base64.b64encode(trusted_key).decode()
 
-    fingerprints = cli._ssh_fingerprints_from_key_lines(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_fingerprints_from_key_lines(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "\n".join(
             [
                 f"@revoked host.example ssh-ed25519 {revoked}",
@@ -9239,27 +6410,6 @@ def test_ssh_host_key_fingerprint_parser_rejects_revoked_and_malformed_records()
 
     expected = base64.b64encode(hashlib.sha256(trusted_key).digest()).decode().rstrip("=")
     assert fingerprints == {f"SHA256:{expected}"}
-
-
-def test_endpoint_target_info_hashes_raw_machine_id_bytes(
-    tmp_path: Path,
-) -> None:
-    machine_id = tmp_path / "machine-id"
-    marker = b"production-site-id\n"
-    machine_id.write_bytes(marker)
-
-    observed = cli._physical_site_marker_sha256(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        machine_id
-    )
-
-    assert observed == hashlib.sha256(marker).hexdigest()
-    assert observed != hashlib.sha256(marker.strip()).hexdigest()
-
-    machine_id.write_bytes(b"\n")
-    with pytest.raises(ConfigurationError, match="physical site marker is empty"):
-        cli._physical_site_marker_sha256(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            machine_id
-        )
 
 
 def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
@@ -9313,9 +6463,11 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
     def fake_host_key_fingerprints(_host: str) -> list[str]:
         return ["SHA256:operator-pinned-fingerprint"]
 
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_host_key_fingerprints
+    )
 
-    info = cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    info = cli_remote_worker_probe._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     target = cast(dict[str, object], info["target_identity"])
     assert target["verified"] is True
@@ -9325,7 +6477,7 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
 
     target_scheduler_provider[0] = "external"
     with pytest.raises(ConfigurationError, match="physical target scheduler provider"):
-        cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_probe._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_remote_worker_info_threads_cluster_pinned_receipt_path(
@@ -9379,10 +6531,12 @@ def test_remote_worker_info_threads_cluster_pinned_receipt_path(
         return ["SHA256:operator-pinned-fingerprint"]
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_run_remote_clio)
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_host_key_fingerprints
+    )
 
-    cli._remote_worker_info(pinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    cli._remote_worker_info(unpinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_remote_worker_probe._remote_worker_info(pinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_remote_worker_probe._remote_worker_info(unpinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     worker_info_calls = [call for call in observed_arguments if call[1] == "worker-info"]
     assert worker_info_calls[0] == [
@@ -9443,9 +6597,9 @@ def test_remote_worker_info_uses_one_total_observation_deadline(
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
     monkeypatch.setattr(remote_cli, "remote_command_timeout", fake_timeout)
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_fingerprints)
+    monkeypatch.setattr(cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_fingerprints)
 
-    info = cli._remote_worker_info(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    info = cli_remote_worker_probe._remote_worker_info(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         timeout_seconds=20,
     )
@@ -9471,8 +6625,8 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
         observations.append(timeout_seconds)
         raise RelayError("remote worker identity observation timed out")
 
-    monkeypatch.setattr(cli, "_remote_worker_info", timed_out_worker_info)
-    observed_info, observation_error = cli._observe_worker_before_cleanup(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", timed_out_worker_info)
+    observed_info, observation_error = cli_remote_worker_attach._observe_worker_before_cleanup(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition
     )
     report = new_live_validation_report(scenario="cleanup", cluster="ares")
@@ -9483,7 +6637,7 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
     report_path = tmp_path / "bounded-cleanup-report.json"
 
     with pytest.raises(RelayError, match="identity observation timed out"):
-        cli._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_attach._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             definition,
             report_path,
@@ -9491,7 +6645,7 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
             worker_observation_error=observation_error,
         )
 
-    assert observations == [cli.REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS]
+    assert observations == [cli_remote_worker_attach.REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS]
     saved = json.loads(report_path.read_text(encoding="utf-8"))
     assert saved["status"] == "failed"
     assert saved["completed_at"] is not None
@@ -9523,10 +6677,12 @@ def test_cleanup_with_artifact_digest_keeps_worker_identity_verification_strict(
         del observed_worker_info
         raise ConfigurationError("remote worker wheel SHA-256 does not match")
 
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", reject_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", reject_worker_identity
+    )
 
     with pytest.raises(ConfigurationError, match="wheel SHA-256 does not match"):
-        cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_attach._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             ClusterDefinition(name="ares", ssh_host="ares"),
             report_path,
@@ -9554,7 +6710,7 @@ def test_cleanup_with_artifact_digest_records_optional_worker_observation_failur
     report_path = tmp_path / "optional-worker-observation.json"
     observation_error = RelayError("remote command timed out after 20 seconds: ares")
 
-    provenance_warning = cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    provenance_warning = cli_remote_worker_attach._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         ClusterDefinition(name="ares", ssh_host="ares"),
         report_path,
@@ -9568,657 +6724,6 @@ def test_cleanup_with_artifact_digest_records_optional_worker_observation_failur
     assert saved["checks"][-1]["check_id"] == "worker.installation-info"
     assert saved["checks"][-1]["status"] == "failed"
     assert "timed out after 20 seconds" in saved["checks"][-1]["error"]
-
-
-def test_cli_cluster_add_persists_direct_transport_optimization(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "add",
-            "--name",
-            "homelab",
-            "--ssh-host",
-            "homelab",
-            "--direct-transport",
-            "--direct-transport-mode",
-            "xtcp",
-            "--direct-transport-fallback",
-            "xtcp,frp_stcp,queue",
-        ],
-    )
-
-    assert result.exit_code == 0
-    definition = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("homelab")
-    assert definition.frp_transport.direct.enabled is True
-    assert definition.frp_transport.direct.mode == "xtcp"
-    assert definition.frp_transport.direct.fallback_order == ["xtcp", "frp_stcp", "queue"]
-    assert definition.frp_transport.server_addr == ""
-
-
-def test_cli_cluster_add_rejects_direct_transport_without_queue_fallback(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "add",
-            "--name",
-            "homelab",
-            "--ssh-host",
-            "homelab",
-            "--direct-transport",
-            "--direct-transport-fallback",
-            "xtcp,frp_stcp",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "fallback_order must end with queue" in result.output
-
-
-def test_cli_cluster_install_app_uses_explicit_app_installer(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="delta")
-    calls: list[tuple[str, str]] = []
-
-    def fake_install_cluster_app_over_ssh(*, ssh_host: str, app_name: str) -> list[str]:
-        calls.append((ssh_host, app_name))
-        return ["site_stack=ready"]
-
-    monkeypatch.setattr(
-        application_profiles, "install_cluster_app_over_ssh", fake_install_cluster_app_over_ssh
-    )
-
-    result = CliRunner().invoke(
-        app,
-        ["cluster", "install-app", "--cluster", "delta", "--app", "site-stack"],
-    )
-
-    assert result.exit_code == 0
-    assert calls == [("delta", "site-stack")]
-    assert "site_stack=ready" in result.output
-
-
-def test_cli_endpoint_service_requires_persistence_unless_explicitly_opted_out(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The operator-facing install defaults to persistent and names the diagnostic escape."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="delta")
-    persistence_requests: list[bool] = []
-
-    def fake_install_endpoint_user_service_over_ssh(
-        *,
-        cluster: str,
-        ssh_host: str,
-        service_text: str,
-        start: bool,
-        enable: bool,
-        require_persistent: bool,
-        timeout_seconds: float = 120.0,
-    ) -> list[str]:
-        del service_text, timeout_seconds
-        assert cluster == "delta"
-        assert ssh_host == "delta"
-        assert start is True
-        assert enable is True
-        persistence_requests.append(require_persistent)
-        return [
-            "endpoint_service.persistence="
-            + ("systemd-user-linger" if require_persistent else "login-scoped")
-        ]
-
-    monkeypatch.setattr(
-        deployment,
-        "install_endpoint_user_service_over_ssh",
-        fake_install_endpoint_user_service_over_ssh,
-    )
-
-    persistent = CliRunner().invoke(
-        app,
-        ["cluster", "install-endpoint-service", "--cluster", "delta"],
-    )
-    login_scoped = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "install-endpoint-service",
-            "--cluster",
-            "delta",
-            "--allow-login-scoped",
-        ],
-    )
-
-    assert persistent.exit_code == 0, persistent.output
-    assert login_scoped.exit_code == 0, login_scoped.output
-    assert persistence_requests == [True, False]
-    assert "endpoint_service.persistence=systemd-user-linger" in persistent.output
-    assert "endpoint_service.persistence=login-scoped" in login_scoped.output
-
-
-def test_cli_cluster_install_app_rejects_option_like_ssh_override(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="delta")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "install-app",
-            "--cluster",
-            "delta",
-            "--app",
-            "site-stack",
-            "--ssh-host=-oProxyCommand=malicious-command",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "ssh host must be one non-option destination" in result.output
-
-
-def test_cli_mcp_call_preserves_arguments(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    result = runner.invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            "ares",
-            "--server",
-            "remote-server",
-            "--server-arg",
-            "--stdio",
-            "--env-from",
-            "SCIENCE_TOKEN=SITE_SCIENCE_TOKEN",
-            "--tool",
-            "simulate",
-            "--arguments-json",
-            '{"steps": 100, "case": "site-simulation"}',
-            "--timeout-seconds",
-            "90",
-            "--idempotency-key",
-            "cli-mcp-call-args",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job_id = result.output.strip()
-    job = ClioCoreQueue(core_dir).get_job(job_id)
-    assert job.kind == JobKind.MCP_CALL
-    assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.server == "remote-server"
-    assert job.spec.server_args == ["--stdio"]
-    assert job.spec.env_from == {"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
-    assert job.spec.arguments == {"steps": 100, "case": "site-simulation"}
-    assert job.spec.timeout_seconds == 90
-
-
-@pytest.mark.parametrize(
-    ("operation", "operation_arguments", "expected_tool_arguments"),
-    [
-        ("tools/list", [], None),
-        (
-            "tools/call",
-            [
-                "--tool",
-                "inspect",
-                "--arguments-json",
-                '{"dataset":"asteroid-first-five"}',
-            ],
-            {"dataset": "asteroid-first-five"},
-        ),
-    ],
-)
-def test_cli_remote_mcp_call_stages_exact_route_authority_for_one_invocation(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    operation: str,
-    operation_arguments: list[str],
-    expected_tool_arguments: dict[str, object] | None,
-) -> None:
-    """Remote discovery and calls receive the exact operator route, then remove it."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    registration = RemoteMcpServerConfig(
-        command="science-mcp",
-        args=["--stdio"],
-        allow_tools=["inspect"],
-        profiles=["user"],
-    )
-    definition = ClusterDefinition(
-        name="alpha",
-        ssh_host="alpha-login",
-        scheduler_provider="slurm",
-        core_dir="$HOME/site/relay-core",
-        spool_dir="$HOME/site/relay-spool",
-        remote_mcp_servers={"science": registration},
-    )
-    ClusterRegistry(clusters={definition.name: definition}).save(
-        tmp_path / ".clio-relay" / "clusters.json"
-    )
-    registry_writes: list[tuple[str, bytes]] = []
-    argument_writes: list[tuple[str, bytes]] = []
-    removals: list[tuple[str, str, bool]] = []
-    shell_scripts: list[str] = []
-    events: list[str] = []
-
-    # `write_remote_file`/`remove_remote_file` now resolve through a single
-    # extraction-stable seam (`remote_cli.write_remote_file`/
-    # `remote_cli.remove_remote_file`) for BOTH the registry-staging call
-    # inside `staged_remote_cluster_registry` and the arguments-staging call
-    # inside cli.py's own mcp-call handling -- they used to be distinguishable
-    # by which namespace (`cli` vs `remote_cli`) intercepted the call, an
-    # accident of the bare-import coupling docs/design/relay-architecture-
-    # 2026-08.md SS4.6 describes, not a real distinction. Dispatch on the
-    # staged path itself instead, which is what actually differs.
-    def write_remote_file(
-        selected_definition: ClusterDefinition,
-        path: str,
-        data: bytes,
-    ) -> None:
-        assert selected_definition == definition
-        if path.endswith("/clusters.json"):
-            events.append("write-registry")
-            registry_writes.append((path, data))
-        elif path.endswith("/arguments.json"):
-            events.append("write-arguments")
-            argument_writes.append((path, data))
-        else:
-            raise AssertionError(f"unexpected remote write path: {path}")
-
-    def remove_remote_file(
-        selected_definition: ClusterDefinition,
-        path: str,
-        *,
-        remove_empty_parent: bool,
-    ) -> None:
-        assert selected_definition == definition
-        if path.endswith("/clusters.json"):
-            events.append("remove-registry")
-            removals.append(("registry", path, remove_empty_parent))
-        elif path.endswith("/arguments.json"):
-            events.append("remove-arguments")
-            removals.append(("arguments", path, remove_empty_parent))
-        else:
-            raise AssertionError(f"unexpected remote remove path: {path}")
-
-    def run_remote_shell(selected_definition: ClusterDefinition, script: str) -> str:
-        assert selected_definition == definition
-        events.append("run")
-        shell_scripts.append(script)
-        return "job_remote_mcp\n"
-
-    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_remote_file)
-    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_remote_file)
-    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_remote_shell)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            definition.name,
-            "--server",
-            registration.command,
-            "--server-arg=--stdio",
-            "--operation",
-            operation,
-            *operation_arguments,
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "job_remote_mcp"
-    assert len(registry_writes) == 1
-    registry_path, registry_payload = registry_writes[0]
-    staged_registry = ClusterRegistry.model_validate_json(registry_payload)
-    assert staged_registry.clusters == {definition.name: definition}
-    staged_definition = staged_registry.require(definition.name)
-    assert staged_definition.remote_mcp_servers == {"science": registration}
-    assert cluster_route_revision(staged_definition) == cluster_route_revision(definition)
-    assert registry_path.startswith(".local/share/clio-relay/desktop-submissions/mcp-registry-")
-    assert registry_path.endswith("/clusters.json")
-    assert len(shell_scripts) == 1
-    assert f'export CLIO_RELAY_CLUSTER_REGISTRY="$HOME/{registry_path}";' in shell_scripts[0]
-    assert "export CLIO_RELAY_CLI_MODE=local;" in shell_scripts[0]
-    assert f'"$HOME/.local/bin/clio-relay" mcp-call --cluster {definition.name}' in shell_scripts[0]
-    assert removals[-1] == ("registry", registry_path, True)
-    if expected_tool_arguments is None:
-        assert argument_writes == []
-        assert events == ["write-registry", "run", "remove-registry"]
-    else:
-        assert len(argument_writes) == 1
-        arguments_path, arguments_payload = argument_writes[0]
-        assert json.loads(arguments_payload) == expected_tool_arguments
-        assert removals == [
-            ("arguments", arguments_path, True),
-            ("registry", registry_path, True),
-        ]
-        assert events == [
-            "write-registry",
-            "write-arguments",
-            "run",
-            "remove-arguments",
-            "remove-registry",
-        ]
-
-
-def test_cli_remote_mcp_call_cleans_arguments_and_route_authority_after_failure(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """A failed remote launch removes both invocation-scoped staging files."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    registration = RemoteMcpServerConfig(
-        command="science-mcp",
-        args=["--stdio"],
-        allow_tools=["inspect"],
-    )
-    definition = ClusterDefinition(
-        name="alpha",
-        ssh_host="alpha-login",
-        remote_mcp_servers={"science": registration},
-    )
-    ClusterRegistry(clusters={definition.name: definition}).save(
-        tmp_path / ".clio-relay" / "clusters.json"
-    )
-    staged_paths: list[tuple[str, str]] = []
-    removed_paths: list[tuple[str, str, bool]] = []
-
-    # See the sibling `_stages_exact_route_authority_for_one_invocation` test:
-    # both the registry- and arguments-staging calls now resolve through the
-    # single extraction-stable `remote_cli.write_remote_file`/
-    # `remote_cli.remove_remote_file` seam, so dispatch on the staged path.
-    def write_remote_file(
-        _definition: ClusterDefinition,
-        path: str,
-        _data: bytes,
-    ) -> None:
-        if path.endswith("/clusters.json"):
-            staged_paths.append(("registry", path))
-        elif path.endswith("/arguments.json"):
-            staged_paths.append(("arguments", path))
-        else:
-            raise AssertionError(f"unexpected remote write path: {path}")
-
-    def remove_remote_file(
-        _definition: ClusterDefinition,
-        path: str,
-        *,
-        remove_empty_parent: bool,
-    ) -> None:
-        if path.endswith("/clusters.json"):
-            removed_paths.append(("registry", path, remove_empty_parent))
-        elif path.endswith("/arguments.json"):
-            removed_paths.append(("arguments", path, remove_empty_parent))
-        else:
-            raise AssertionError(f"unexpected remote remove path: {path}")
-
-    def fail_remote_shell(_definition: ClusterDefinition, _script: str) -> str:
-        raise RelayError("remote launch failed")
-
-    monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_remote_file)
-    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_remote_file)
-    monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", fail_remote_shell)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            definition.name,
-            "--server",
-            registration.command,
-            "--server-arg=--stdio",
-            "--tool",
-            "inspect",
-            "--arguments-json",
-            '{"dataset":"asteroid-first-five"}',
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "remote launch failed" in result.output
-    assert [kind for kind, _path in staged_paths] == ["registry", "arguments"]
-    assert removed_paths == [
-        ("arguments", staged_paths[1][1], True),
-        ("registry", staged_paths[0][1], True),
-    ]
-
-
-@pytest.mark.parametrize("command", ["mcp-call", "jarvis-mcp-call"])
-def test_cli_mcp_call_rejects_public_admission_class_option(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    command: str,
-) -> None:
-    """The CLI exposes no caller-selectable reserved worker lane."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            command,
-            "--cluster",
-            "ares",
-            "--tool",
-            "jarvis_describe" if command == "jarvis-mcp-call" else "inspect",
-            *(["--server", "arbitrary-mcp"] if command == "mcp-call" else []),
-            "--admission-class",
-            "control_query",
-        ],
-    )
-
-    assert result.exit_code == 2
-    output = unstyle(result.output)
-    assert "No such option" in output
-    assert "--admission-class" in output
-
-
-def test_cli_arbitrary_tools_list_remains_workload(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """An arbitrary MCP discovery command cannot occupy reserved capacity."""
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            "ares",
-            "--server",
-            "arbitrary-mcp",
-            "--server-arg=--hang",
-            "--operation",
-            "tools/list",
-            "--timeout-seconds",
-            "1",
-            "--idempotency-key",
-            "arbitrary-tools-list",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
-    assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.operation is McpOperation.TOOLS_LIST
-    assert job.spec.admission_class is McpAdmissionClass.WORKLOAD
-
-
-def test_cli_generic_default_key_tracks_timeout_and_derived_authority(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Default retries cannot alias workload, registered control, or timeout changes."""
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    def invoke(timeout: int) -> Any:
-        return CliRunner().invoke(
-            app,
-            [
-                "mcp-call",
-                "--cluster",
-                "ares",
-                "--server",
-                "science-mcp",
-                "--server-arg=--stdio",
-                "--operation",
-                "tools/list",
-                "--timeout-seconds",
-                str(timeout),
-            ],
-        )
-
-    workload_result = invoke(30)
-    assert workload_result.exit_code == 0, workload_result.output
-    registration = RemoteMcpServerConfig(
-        command="science-mcp",
-        args=["--stdio"],
-        allow_tools=["inspect"],
-        call_timeout_seconds=60,
-    )
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                remote_mcp_servers={"science": registration},
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    control_30_result = invoke(30)
-    control_60_result = invoke(60)
-    assert control_30_result.exit_code == 0, control_30_result.output
-    assert control_60_result.exit_code == 0, control_60_result.output
-
-    queue = ClioCoreQueue(core_dir)
-    jobs = [
-        queue.get_job(result.output.strip())
-        for result in (workload_result, control_30_result, control_60_result)
-    ]
-    assert all(isinstance(job.spec, McpCallSpec) for job in jobs)
-    specs = [cast(McpCallSpec, job.spec) for job in jobs]
-    assert specs[0].admission_class is McpAdmissionClass.WORKLOAD
-    assert specs[1].admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert specs[2].admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert len({job.idempotency_key for job in jobs}) == 3
-    legacy_server_digest = hashlib.sha256(
-        json.dumps(
-            {
-                "server": "science-mcp",
-                "args": ["--stdio"],
-                "env_from": {},
-                "expected_server_artifact_digest": None,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    legacy_arguments_digest = hashlib.sha256(
-        json.dumps(
-            {"operation": "tools/list", "tool": None, "arguments": {}},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    assert jobs[0].idempotency_key == (
-        f"mcp:ares:{legacy_server_digest}:tools/list:None:{legacy_arguments_digest}"
-    )
-
-
-def test_cli_pinned_jarvis_control_query_rejects_oversized_timeout(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Pinned control-query processes cannot outlive the reserved-lane bound."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    monkeypatch.setenv("CLIO_RELAY_REMOTE_CLUSTER", "ares")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-call",
-            "--cluster",
-            "ares",
-            "--operation",
-            "tools/list",
-            "--timeout-seconds",
-            str(MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS + 1),
-        ],
-    )
-
-    assert result.exit_code == 2
-    assert f"timeout exceeds {MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS} seconds" in result.output
-
-
-def test_cli_jarvis_mcp_call_uses_builtin_cluster_command(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("JARVIS_MCP_SPACK_COMMAND", "/opt/site/spack/bin/spack")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-call",
-            "--cluster",
-            "ares",
-            "--tool",
-            "jarvis_describe",
-            "--arguments-json",
-            '{"target":"packages"}',
-            "--idempotency-key",
-            "cli-jarvis-mcp",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
-    assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.server == "clio-kit"
-    assert job.spec.server_args == ["mcp-server", "jarvis"]
-    assert job.spec.env_from == {"JARVIS_MCP_SPACK_COMMAND": "JARVIS_MCP_SPACK_COMMAND"}
-    assert job.spec.tool == "jarvis_describe"
-    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
-    assert job.spec.arguments == {"target": "packages"}
 
 
 def test_jarvis_package_search_query_uses_bounded_virtual_call(
@@ -10261,10 +6766,10 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
         return artifacts
 
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_mcp_response_job_id", response_job_id)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_mcp_response_job_id", response_job_id)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
     monkeypatch.setattr(
-        cli,
+        cli_remote_collection_pagination,
         "_wait_for_local_job_terminal",
         wait_for_local_terminal,
     )
@@ -10272,7 +6777,9 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
         {"artifact_id": "artifact-result", "kind": "mcp_result"},
         {"artifact_id": "artifact-provenance", "kind": "provenance"},
     ]
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", complete_artifacts)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_complete_local_artifact_records", complete_artifacts
+    )
 
     def read_artifact(
         _queue: ClioCoreQueue,
@@ -10282,9 +6789,9 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
     ) -> dict[str, object]:
         return {"kind": kind}
 
-    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_artifact)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_local_json_artifact_kind", read_artifact)
 
-    result = cli._run_jarvis_package_search_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_package_search._run_jarvis_package_search_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=ClioCoreQueue(tmp_path / "core"),
@@ -10374,7 +6881,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
 
     assert artifact_payload != compact_payload
 
-    entry, binding = cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+    entry, binding = cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
         cluster="ares",
         discovery_job_id="job_discovery",
         result=result,
@@ -10396,7 +6903,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     unmarked.pop("expected_jarvis_cd_lock_binding")
     unmarked_payload = (json.dumps(unmarked, indent=2) + "\n").encode()
     with pytest.raises(RelayError, match="did not enforce the relay JARVIS-CD lock pin"):
-        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+        cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             discovery_job_id="job_unmarked",
             result=unmarked,
@@ -10412,7 +6919,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
 
     mismatched_payload = unmarked_payload
     with pytest.raises(RelayError, match="did not match its durable mcp_result artifact"):
-        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+        cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             discovery_job_id="job_mismatched_payload",
             result=result,
@@ -10448,1535 +6955,6 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     wrong_outer_hash.provenance.server_artifact["install_artifact_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="run jarvis-mcp-refresh"):
         cli.jarvis_mcp_artifact_binding_from_entry(wrong_outer_hash)
-
-
-def test_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """A retry cannot make an earlier MCP result the implicit discovery authority."""
-    definition = ClusterDefinition(name="configured-target", ssh_host="cluster.example")
-
-    def duplicate_results(
-        _definition: ClusterDefinition,
-        _job_id: str,
-    ) -> list[dict[str, object]]:
-        return [
-            {"artifact_id": "artifact-first", "kind": "mcp_result"},
-            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
-        ]
-
-    monkeypatch.setattr(cli, "_remote_artifact_records", duplicate_results)
-
-    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
-        cli._read_remote_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            definition,
-            "job-retried-discovery",
-        )
-
-
-def test_local_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Local mode applies the same unique durable authority as remote mode."""
-    queue = ClioCoreQueue(tmp_path / "core")
-
-    def duplicate_results(
-        _queue: ClioCoreQueue,
-        _job_id: str,
-    ) -> list[dict[str, object]]:
-        return [
-            {"artifact_id": "artifact-first", "kind": "mcp_result"},
-            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
-        ]
-
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", duplicate_results)
-
-    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
-        cli._read_local_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            queue,
-            "job-retried-local-discovery",
-        )
-
-
-def test_cli_remote_jarvis_call_defers_artifact_selection_to_target(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    writes: list[tuple[str, bytes]] = []
-    removals: list[tuple[str, bool]] = []
-    commands: list[list[str]] = []
-
-    def write_remote(_definition: ClusterDefinition, path: str, data: bytes) -> None:
-        writes.append((path, data))
-
-    def fail_local_resolution() -> str:
-        raise AssertionError("desktop resolved JARVIS artifact")
-
-    monkeypatch.setattr(
-        "clio_relay.remote_cli.write_remote_file",
-        write_remote,
-    )
-
-    def remove_remote(
-        _definition: ClusterDefinition,
-        path: str,
-        *,
-        remove_empty_parent: bool,
-    ) -> None:
-        removals.append((path, remove_empty_parent))
-
-    monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_remote)
-
-    def run_remote(_definition: ClusterDefinition, args: list[str]) -> str:
-        commands.append(args)
-        return "job_remote_jarvis\n"
-
-    monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", run_remote)
-    monkeypatch.setattr(
-        "clio_relay.jarvis_mcp.jarvis_mcp_server",
-        fail_local_resolution,
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-call",
-            "--cluster",
-            "ares",
-            "--tool",
-            "jarvis_describe",
-            "--arguments-json",
-            '{"target":"packages"}',
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert result.output.strip() == "job_remote_jarvis"
-    assert writes and json.loads(writes[0][1]) == {"target": "packages"}
-    assert removals == [(writes[0][0], True)]
-    assert commands[0][0] == "jarvis-mcp-call"
-    assert "--server" not in commands[0]
-
-
-def test_target_side_jarvis_discovery_uses_receipt_without_cluster_registry(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    monkeypatch.setenv("CLIO_RELAY_REMOTE_CLUSTER", "ares")
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-call",
-            "--cluster",
-            "ares",
-            "--operation",
-            "tools/list",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job = ClioCoreQueue(core_dir).get_job(result.output.strip())
-    assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.operation.value == "tools/list"
-    assert job.spec.tool is None
-    assert job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY
-    assert job.spec.timeout_seconds == MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS
-    assert job.spec.expected_jarvis_cd_lock_binding == jarvis_cd_lock_binding_expectation()
-
-
-def test_cli_mcp_call_reads_arguments_json_file(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    core_dir = tmp_path / "core"
-    arguments_path = tmp_path / "arguments.json"
-    arguments_path.write_text('\ufeff{"steps": 150, "sample": "ares-live"}', encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    runner = CliRunner()
-
-    result = runner.invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            "ares",
-            "--server",
-            "remote-server",
-            "--tool",
-            "echo",
-            "--arguments-json-file",
-            str(arguments_path),
-            "--idempotency-key",
-            "cli-mcp-call-file-args",
-        ],
-    )
-
-    assert result.exit_code == 0
-    job_id = result.output.strip()
-    job = ClioCoreQueue(core_dir).get_job(job_id)
-    assert isinstance(job.spec, McpCallSpec)
-    assert job.spec.arguments == {"steps": 150, "sample": "ares-live"}
-
-
-def test_cli_remote_job_submit_stages_yaml_and_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="test-host",
-                core_dir="/remote/core",
-                spool_dir="/remote/spool",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    (tmp_path / "input.in").write_text("run 150\n", encoding="utf-8")
-    yaml_path = tmp_path / "pipeline.yaml"
-    yaml_path.write_text(
-        """
-name: remote-submit
-x_clio_relay:
-  stage_files:
-    - local_path: input.in
-      remote_path: .local/share/clio-relay/live-tests/{run_id}/input.in
-pkgs:
-  - pkg_type: site.simulation
-    input: $HOME/.local/share/clio-relay/live-tests/{run_id}/input.in
-""".lstrip(),
-        encoding="utf-8",
-    )
-    writes: dict[str, bytes] = {}
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes | None = None,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        if "cat > " in command[2]:
-            remote_path = command[2].split("cat > ", maxsplit=1)[1].split(" &&", maxsplit=1)[0]
-            writes[remote_path.strip("'")] = input or b""
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-        if '"$HOME/.local/bin/clio-relay" job submit' in command[2]:
-            assert "CLIO_RELAY_CLI_MODE=local" in command[2]
-            assert 'CLIO_RELAY_CORE_DIR="/remote/core"' in command[2]
-            return subprocess.CompletedProcess(command, 0, b"job_remote\n", b"")
-        return subprocess.CompletedProcess(command, 0, b"", b"")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "ares",
-            "--jarvis-yaml",
-            str(yaml_path),
-            "--idempotency-key",
-            "desktop-submit",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert result.output.strip() == "job_remote"
-    assert ClioCoreQueue(tmp_path / ".clio-relay" / "core").list_jobs() == []
-    assert any(path.endswith("/input.in") for path in writes)
-    staged_yaml = next(
-        data.decode("utf-8") for path, data in writes.items() if path.endswith("/pipeline.yaml")
-    )
-    assert "x_clio_relay" not in staged_yaml
-    assert ".local/share/clio-relay/live-tests/pipeline-" in staged_yaml
-    assert any('"$HOME/.local/bin/clio-relay" job submit' in command[2] for command in commands)
-
-
-def test_cli_remote_wait_passthrough_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    commands: list[list[str]] = []
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000001",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
-        idempotency_key="long-remote-run",
-    )
-    wait_result = cli.job_wait_result(remote_job, timeout_seconds=1.0)
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        assert timeout == 11.0
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            wait_result.model_dump_json().encode("utf-8"),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-            "--poll-seconds",
-            "0.1",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == remote_job.job_id
-    assert observed["observation"]["outcome"] == "observation_unknown"
-    assert len(commands) == 1
-    assert f'"$HOME/.local/bin/clio-relay" job wait {remote_job.job_id}' in commands[0][2]
-
-
-def test_cli_remote_wait_transport_expiry_reobserves_exact_status(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000002",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="long-remote-run"),
-        idempotency_key="long-remote-run-timeout",
-    )
-    commands: list[list[str]] = []
-    timeouts: list[float | None] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        timeouts.append(timeout)
-        assert capture_output is True
-        assert check is False
-        if '"$HOME/.local/bin/clio-relay" job wait' in command[2]:
-            raise subprocess.TimeoutExpired(command, timeout or 0)
-        if '"$HOME/.local/bin/clio-relay" job status' in command[2]:
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps(
-                    {
-                        "job": remote_job.model_dump(mode="json"),
-                        "relay_queue": {"state": "queued"},
-                        "scheduler": [{"scheduler_job_id": "42", "raw_state": "PENDING"}],
-                        "terminal": False,
-                    }
-                ).encode("utf-8"),
-                b"",
-            )
-        raise AssertionError(f"unexpected command: {command}")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-            "--poll-seconds",
-            "0.1",
-        ],
-    )
-
-    assert result.exit_code == 0
-    observed = json.loads(result.output)
-    assert observed["job_id"] == remote_job.job_id
-    assert observed["state"] == "queued"
-    assert observed["observation"]["outcome"] == "observation_unknown"
-    assert observed["observation"]["scheduler_action"] == "none"
-    assert len(commands) == 2
-    assert timeouts == [11.0, 30.0]
-
-
-def test_cli_remote_wait_rejects_contradictory_terminal_claim(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    remote_job = RelayJob(
-        job_id="job_00000000000000000000000000000003",
-        cluster="ares",
-        kind=JobKind.JARVIS,
-        state=JobState.QUEUED,
-        spec=JarvisRunSpec(pipeline_name="hostile-remote-run"),
-        idempotency_key="hostile-remote-run",
-    )
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-        timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        assert capture_output is True
-        assert check is False
-        assert timeout == 11.0
-        contradictory = {
-            **remote_job.model_dump(mode="json"),
-            "observation": {
-                "outcome": "terminal",
-                "timeout_seconds": 1,
-                "scheduler_action": "none",
-                "relay_action": "none",
-            },
-        }
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps(contradictory).encode("utf-8"),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "wait",
-            remote_job.job_id,
-            "--cluster",
-            "ares",
-            "--timeout-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "remote job wait returned an invalid result" in result.output
-
-
-def _bootstrap_cli_fakes(
-    monkeypatch: MonkeyPatch,
-    *,
-    outcome: str = "noop_verified",
-    pin_present: bool = False,
-) -> None:
-    """Install the standard cluster-bootstrap CLI fakes used by the pin tests.
-
-    ``pin_present`` stands in for the remote presence probe: False models a pin
-    proven absent on the host (repairable), True a custom pin that resolves.
-    """
-
-    def fake_pinned_runtime_present(_definition: ClusterDefinition) -> bool:
-        return pin_present
-
-    monkeypatch.setattr(cli, "pinned_runtime_present", fake_pinned_runtime_present)
-
-    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
-        receipt = {
-            "schema_version": "clio-relay.bootstrap-receipt.v2",
-            "outcome": outcome,
-            "invocation_id": "bootstrap_test",
-            "bootstrap_profile": "linux-user",
-            "relay_install_spec": "clio-relay==1.0.0",
-            "install_receipt_sha256": "a" * 64,
-            "completed_at": "2026-07-11T00:00:00Z",
-        }
-        return [
-            "bootstrapped",
-            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
-            "bootstrap_invocation_id=bootstrap_test",
-            "bootstrap_install_receipt_sha256=" + "a" * 64,
-            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
-        ]
-
-    def fake_remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
-        return {
-            "schema_version": "clio-relay.cluster-target-info.v1",
-            "hostname": definition.ssh_host,
-            "fqdn": "ares.example.test",
-            "scheduler_provider": "external",
-            "scheduler_cluster_name": None,
-            "site_marker_sha256": "b" * 64,
-            "ssh_host": definition.ssh_host,
-            "ssh_host_key_sha256": ["SHA256:test"],
-            "expected_hostnames": ["ares.example.test"],
-            "expected_ssh_host_key_sha256": ["SHA256:test"],
-            "expected_scheduler_cluster_name": None,
-            "expected_site_marker_sha256": "b" * 64,
-            "verified": True,
-        }
-
-    def fake_bootstrap_reuse_acceptance_evidence(
-        receipt: dict[str, object],
-        *,
-        elapsed_seconds: float | int,
-    ) -> dict[str, object]:
-        return {
-            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
-            "outcome": receipt["outcome"],
-            "elapsed_seconds": float(elapsed_seconds),
-            "maximum_seconds": 30.0,
-            "payload_free": True,
-            "scheduler_untouched": True,
-            "jarvis_preserved": True,
-            "component_actions": {},
-            "service_operations": {},
-        }
-
-    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
-    monkeypatch.setattr(
-        bootstrap_acceptance,
-        "bootstrap_reuse_acceptance_evidence",
-        fake_bootstrap_reuse_acceptance_evidence,
-    )
-
-
-def test_cluster_bootstrap_repoints_a_stale_relay_executable_pin(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Bootstrap must leave the registry pointing at what it actually produced.
-
-    clio-relay#158: bootstrap installs the relay at its canonical stable
-    launcher, but the registry pin was never reconciled. A cluster pinned to a
-    generation path that has since been garbage-collected therefore stayed
-    pinned to the dead path -- bootstrap reported success (even
-    ``noop_verified``, because its preflight probes the canonical path, not the
-    pin) while every session command kept failing on the stale pointer. An
-    install that leaves a dead pointer behind is a silent half-deploy.
-    """
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                relay_executable="/srv/generations/gone/bin/clio-relay",
-                relay_install_receipt="/srv/generations/gone/install-receipt.json",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    _bootstrap_cli_fakes(monkeypatch)
-
-    result = CliRunner().invoke(
-        app,
-        ["cluster", "bootstrap", "--cluster", "ares"],
-    )
-
-    assert result.exit_code == 0
-    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
-    assert saved.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
-    assert saved.relay_install_receipt == BOOTSTRAP_PRODUCED_INSTALL_RECEIPT
-    # The repoint must be announced, never silent.
-    assert "relay_executable_repointed" in result.output
-
-
-def test_cluster_bootstrap_preserves_a_valid_custom_pin(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Review F1, at the CLI boundary: a resolving custom pin survives bootstrap.
-
-    The operator pinned this cluster at a shared-filesystem relay on purpose.
-    Bootstrap must not relocate it onto the canonical launcher just because it
-    installed one there.
-    """
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                relay_executable="/mnt/common/tenant-b/bin/clio-relay",
-                relay_install_receipt="/mnt/common/tenant-b/install-receipt.json",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    _bootstrap_cli_fakes(monkeypatch, pin_present=True)
-
-    result = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
-
-    assert result.exit_code == 0, result.output
-    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
-    assert saved.relay_executable == "/mnt/common/tenant-b/bin/clio-relay"
-    assert saved.relay_install_receipt == "/mnt/common/tenant-b/install-receipt.json"
-    assert "relay_executable_pin_preserved=/mnt/common/tenant-b/bin/clio-relay" in result.output
-    assert "relay_executable_repointed" not in result.output
-
-
-def test_cluster_probe_command_reports_a_typed_state(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Review F5(a): the probe must be reachable and typed through the CLI."""
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                relay_executable="/srv/generations/gone/bin/clio-relay",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-
-    def fake_run_remote_shell(_definition: ClusterDefinition, _script: str) -> str:
-        return (
-            "pinned_executable_present=false\n"
-            "pinned_receipt_present=false\n"
-            "produced_executable_present=true\n"
-            "produced_receipt_present=true\n"
-        )
-
-    monkeypatch.setattr(cluster_probe, "run_remote_shell", fake_run_remote_shell)
-
-    result = CliRunner().invoke(app, ["cluster", "probe", "--cluster", "ares"])
-
-    assert result.exit_code == 0, result.output
-    report = json.loads(result.output)
-    assert report["schema_version"] == "clio-relay.cluster-probe.v1"
-    assert report["state"] == "relay_executable_missing"
-    assert report["repair"] == "clio-relay cluster bootstrap --cluster ares"
-
-
-def test_dead_pin_repair_loop_probe_bootstrap_probe(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Review F5(b): the whole repair loop as ONE durable in-repo flow.
-
-    probe(dead) -> bootstrap(repoint) -> probe(ready), over a fake SSH layer
-    whose answers follow the registry, so the flow proves the pieces compose --
-    not merely that each behaves in isolation.
-    """
-    monkeypatch.chdir(tmp_path)
-    registry_path = tmp_path / ".clio-relay" / "clusters.json"
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                relay_executable="/srv/generations/gone/bin/clio-relay",
-                relay_install_receipt="/srv/generations/gone/install-receipt.json",
-            )
-        }
-    ).save(registry_path)
-
-    # The host carries ONLY the canonical launcher; the generation is gone.
-    present_on_host = {
-        BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
-        BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
-    }
-
-    def fake_run_remote_shell(definition: ClusterDefinition, _script: str) -> str:
-        def flag(path: str | None) -> str:
-            return "true" if path in present_on_host else "false"
-
-        return (
-            f"pinned_executable_present={flag(definition.relay_executable)}\n"
-            f"pinned_receipt_present={flag(definition.relay_install_receipt)}\n"
-            f"produced_executable_present={flag(BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE)}\n"
-            f"produced_receipt_present={flag(BOOTSTRAP_PRODUCED_INSTALL_RECEIPT)}\n"
-        )
-
-    monkeypatch.setattr(cluster_probe, "run_remote_shell", fake_run_remote_shell)
-
-    first = CliRunner().invoke(app, ["cluster", "probe", "--cluster", "ares"])
-    assert first.exit_code == 0, first.output
-    assert json.loads(first.output)["state"] == "relay_executable_missing"
-
-    _bootstrap_cli_fakes(monkeypatch)
-    monkeypatch.setattr(cli, "pinned_runtime_present", cluster_probe.pinned_runtime_present)
-    bootstrapped = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
-    assert bootstrapped.exit_code == 0, bootstrapped.output
-    assert "relay_executable_repointed" in bootstrapped.output
-
-    healed = CliRunner().invoke(app, ["cluster", "probe", "--cluster", "ares"])
-    assert healed.exit_code == 0, healed.output
-    healed_report = json.loads(healed.output)
-    assert healed_report["state"] == "ready"
-    assert healed_report["repair"] is None
-
-
-def test_cluster_bootstrap_leaves_an_already_correct_pin_untouched(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Reconciling the pin is idempotent and stays quiet when nothing changed."""
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry(
-        clusters={
-            "ares": ClusterDefinition(
-                name="ares",
-                ssh_host="ares",
-                relay_executable=BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
-                relay_install_receipt=BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    _bootstrap_cli_fakes(monkeypatch)
-
-    result = CliRunner().invoke(
-        app,
-        ["cluster", "bootstrap", "--cluster", "ares"],
-    )
-
-    assert result.exit_code == 0
-    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
-    assert saved.relay_executable == BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE
-    assert "relay_executable_repointed" not in result.output
-
-
-def test_cli_cluster_bootstrap_uses_package_source_root(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(
-        tmp_path,
-        jarvis_resource_graph_profile="ares",
-        allow_jarvis_resource_graph_build=True,
-    )
-    package_root = tmp_path / "package-root"
-    wheel = tmp_path / "clio_relay-0.0.0-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
-    captured: dict[str, object] = {}
-
-    def fake_package_source_root() -> Path:
-        return package_root
-
-    def fake_bootstrap_cluster_over_ssh(**kwargs: object) -> list[str]:
-        captured.update(kwargs)
-        receipt = {
-            "schema_version": "clio-relay.bootstrap-receipt.v2",
-            "outcome": "noop_verified",
-            "invocation_id": "bootstrap_test",
-            "bootstrap_profile": "linux-user",
-            "relay_install_spec": "clio-relay==1.0.0",
-            "install_receipt_sha256": "a" * 64,
-            "completed_at": "2026-07-11T00:00:00Z",
-        }
-        return [
-            "bootstrapped",
-            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
-            "bootstrap_invocation_id=bootstrap_test",
-            "bootstrap_install_receipt_sha256=" + "a" * 64,
-            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
-        ]
-
-    def fake_remote_target_identity(
-        definition: ClusterDefinition,
-    ) -> dict[str, object]:
-        assert definition.name == "ares"
-        assert definition.ssh_host == "ares"
-        return {
-            "schema_version": "clio-relay.cluster-target-info.v1",
-            "hostname": "ares",
-            "fqdn": "ares.example.test",
-            "scheduler_provider": "external",
-            "scheduler_cluster_name": None,
-            "site_marker_sha256": "b" * 64,
-            "ssh_host": "ares",
-            "ssh_host_key_sha256": ["SHA256:test"],
-            "expected_hostnames": ["ares.example.test"],
-            "expected_ssh_host_key_sha256": ["SHA256:test"],
-            "expected_scheduler_cluster_name": None,
-            "expected_site_marker_sha256": "b" * 64,
-            "verified": True,
-        }
-
-    def fake_bootstrap_reuse_acceptance_evidence(
-        receipt: dict[str, object],
-        *,
-        elapsed_seconds: float | int,
-    ) -> dict[str, object]:
-        assert receipt["outcome"] == "noop_verified"
-        assert 0 <= elapsed_seconds < 30
-        return {
-            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
-            "outcome": "noop_verified",
-            "elapsed_seconds": float(elapsed_seconds),
-            "maximum_seconds": 30.0,
-            "payload_free": True,
-            "scheduler_untouched": True,
-            "jarvis_preserved": True,
-            "component_actions": {},
-            "service_operations": {},
-        }
-
-    monkeypatch.setattr(bootstrap, "package_source_root", fake_package_source_root)
-    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
-    monkeypatch.setattr(
-        bootstrap_acceptance,
-        "bootstrap_reuse_acceptance_evidence",
-        fake_bootstrap_reuse_acceptance_evidence,
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "bootstrap",
-            "--cluster",
-            "ares",
-            "--relay-wheel",
-            str(wheel),
-            "--relay-artifact-sha256",
-            hashlib.sha256(b"wheel").hexdigest(),
-        ],
-    )
-
-    assert result.exit_code == 0
-    output_lines = result.output.splitlines()
-    assert output_lines[:-1] == [
-        "bootstrapped",
-        "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
-        "bootstrap_invocation_id=bootstrap_test",
-        "bootstrap_install_receipt_sha256=" + "a" * 64,
-        "bootstrap_receipt_json="
-        + json.dumps(
-            {
-                "schema_version": "clio-relay.bootstrap-receipt.v2",
-                "outcome": "noop_verified",
-                "invocation_id": "bootstrap_test",
-                "bootstrap_profile": "linux-user",
-                "relay_install_spec": "clio-relay==1.0.0",
-                "install_receipt_sha256": "a" * 64,
-                "completed_at": "2026-07-11T00:00:00Z",
-            },
-            sort_keys=True,
-        ),
-    ]
-    assert output_lines[-1].startswith("validation.report=")
-    report_path = Path(output_lines[-1].partition("=")[2])
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "passed"
-    assert report["checks"][0]["check_id"] == "cluster.bootstrap"
-    assert report["checks"][1]["check_id"] == "worker.target-identity"
-    assert report["checks"][1]["evidence"][0]["kind"] == "cluster_target"
-    # The runtime pin is reconciled only after the physical target verifies.
-    assert report["checks"][2]["check_id"] == "cluster.bootstrap.runtime-pin"
-    assert report["checks"][2]["evidence"][0]["kind"] == "bootstrap_runtime_pin"
-    assert report["checks"][3]["check_id"] == "cluster.bootstrap.reuse-slo"
-    reuse_evidence = report["checks"][3]["evidence"][0]
-    assert reuse_evidence["kind"] == "bootstrap_reuse_acceptance"
-    assert reuse_evidence["reference"] == "bootstrap-reuse:bootstrap_test"
-    assert reuse_evidence["metadata"]["payload_free"] is True
-    cluster_target = next(
-        resource for resource in report["resources"] if resource["kind"] == "cluster_target"
-    )
-    assert cluster_target["resource_id"] == "target:ares"
-    assert cluster_target["role"] == "physical_cluster_target"
-    assert cluster_target["metadata"]["verified"] is True
-    assert captured["ssh_host"] == "ares"
-    assert captured["source_root"] == package_root
-    assert captured["source_root"] != tmp_path
-    assert captured["relay_artifact_sha256"] == hashlib.sha256(b"wheel").hexdigest()
-    assert captured["relay_wheel"] == wheel
-    assert captured["jarvis_resource_graph_profile"] == "ares"
-    assert captured["allow_jarvis_resource_graph_build"] is True
-
-
-def test_bootstrap_same_generation_preserves_remote_mcp_cache(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    def reject_invalidation(
-        _cls: type[object],
-        _path: Path,
-        _cluster: str,
-    ) -> tuple[object, tuple[str, ...]]:
-        raise AssertionError("same-generation bootstrap must preserve cached MCP schemas")
-
-    monkeypatch.setattr(
-        cli.RemoteMcpSchemaCache,
-        "invalidate_cluster_entries",
-        classmethod(reject_invalidation),
-    )
-
-    evidence = cli._invalidate_remote_mcp_cache_after_bootstrap(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        receipt={
-            "generation": {
-                "previous": "a" * 64,
-                "active": "a" * 64,
-            }
-        },
-        registry_path=tmp_path / "clusters.json",
-    )
-
-    assert evidence == {
-        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-        "cluster": "ares",
-        "previous_generation": "a" * 64,
-        "active_generation": "a" * 64,
-        "generation_changed": False,
-        "action": "preserved",
-        "removed_server_count": 0,
-        "removed_server_names": [],
-    }
-
-
-def test_cluster_bootstrap_invalidates_cache_before_target_validation_and_records_evidence(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    report_path = tmp_path / "bootstrap-report.json"
-    events: list[str] = []
-
-    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
-        receipt = {
-            "schema_version": "clio-relay.bootstrap-receipt.v2",
-            "outcome": "reconciled",
-            "invocation_id": "bootstrap_generation_changed",
-            "generation": {
-                "previous": "a" * 64,
-                "active": "b" * 64,
-            },
-        }
-        return [
-            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
-            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
-        ]
-
-    def invalidate_cluster_entries(
-        cls: type[cli.RemoteMcpSchemaCache],
-        path: Path,
-        cluster: str,
-    ) -> tuple[cli.RemoteMcpSchemaCache, tuple[str, ...]]:
-        events.append("cache-invalidated")
-        assert path == (tmp_path / ".clio-relay" / "remote-mcp-cache.json").resolve()
-        assert cluster == "ares"
-        return cls(), ("__builtin_jarvis__", "jarvis-demo")
-
-    def fake_remote_target_identity(
-        _definition: ClusterDefinition,
-    ) -> dict[str, object]:
-        assert events == ["cache-invalidated"]
-        events.append("target-validated")
-        return {"verified": True}
-
-    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
-    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
-    monkeypatch.setattr(
-        cli.RemoteMcpSchemaCache,
-        "invalidate_cluster_entries",
-        classmethod(invalidate_cluster_entries),
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "bootstrap",
-            "--cluster",
-            "ares",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert events == ["cache-invalidated", "target-validated"]
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    bootstrap_check = cast(dict[str, object], report["checks"][0])
-    evidence = cast(list[dict[str, object]], bootstrap_check["evidence"])
-    cache_evidence = next(
-        item for item in evidence if item["kind"] == "remote_mcp_cache_invalidation"
-    )
-    assert cache_evidence["metadata"] == {
-        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-        "cluster": "ares",
-        "previous_generation": "a" * 64,
-        "active_generation": "b" * 64,
-        "generation_changed": True,
-        "action": "invalidated",
-        "removed_server_count": 2,
-        "removed_server_names": ["__builtin_jarvis__", "jarvis-demo"],
-    }
-    bootstrap_resource = next(
-        resource for resource in report["resources"] if resource["kind"] == "bootstrap_invocation"
-    )
-    assert (
-        bootstrap_resource["metadata"]["remote_mcp_cache_invalidation"]
-        == cache_evidence["metadata"]
-    )
-
-
-def test_cli_remote_task_event_passthrough_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    metadata_json = tmp_path / "metadata.json"
-    metadata_json.write_text('{"surface":"cli-file"}', encoding="utf-8")
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        return subprocess.CompletedProcess(command, 0, b'{"seq":1}\n', b"")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "record-task-event",
-            "task_remote",
-            "--cluster",
-            "ares",
-            "--event-type",
-            "dataset_found",
-            "--label",
-            "dataset",
-            "--summary",
-            "Found staged dataset",
-            "--status",
-            "succeeded",
-            "--path-ref",
-            "/mnt/common/datasets/example_001",
-            "--metadata-json-file",
-            str(metadata_json),
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert json.loads(result.output)["seq"] == 1
-    assert len(commands) == 1
-    assert "CLIO_RELAY_CLI_MODE=local" in commands[0][2]
-    assert '"$HOME/.local/bin/clio-relay" job record-task-event task_remote' in commands[0][2]
-    assert "--path-ref /mnt/common/datasets/example_001" in commands[0][2]
-    assert "cli-file" in commands[0][2]
-
-
-def test_cli_remote_gateway_passthrough_uses_cluster_core(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    gateway_json = tmp_path / "gateway.json"
-    gateway_json.write_text('{"strategy":"ssh_forward","remote_port":11111}', encoding="utf-8")
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            (b'{"session_id":"gateway_remote","cluster":"ares","name":"live-service-example"}\n'),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    created = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "create",
-            "--cluster",
-            "ares",
-            "--name",
-            "live-service-example",
-            "--gateway-json-file",
-            str(gateway_json),
-        ],
-    )
-    updated = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "update",
-            "gateway_remote",
-            "--cluster",
-            "ares",
-            "--state",
-            "ready",
-            "--node",
-            "ares-comp-01",
-        ],
-    )
-    closed = CliRunner().invoke(app, ["gateway", "close", "gateway_remote", "--cluster", "ares"])
-
-    assert created.exit_code == 0
-    assert updated.exit_code == 0
-    assert closed.exit_code == 0
-    assert [json.loads(item.output)["session_id"] for item in [created, updated, closed]] == [
-        "gateway_remote",
-        "gateway_remote",
-        "gateway_remote",
-    ]
-    assert '"$HOME/.local/bin/clio-relay" gateway create' in commands[0][2]
-    assert "remote_port" in commands[0][2]
-    assert '"$HOME/.local/bin/clio-relay" gateway update gateway_remote' in commands[1][2]
-    assert '"$HOME/.local/bin/clio-relay" gateway close gateway_remote' in commands[2][2]
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        [
-            "gateway",
-            "create",
-            "--cluster",
-            "ares",
-            "--name",
-            "forged-runtime",
-            "--scheduler",
-            "slurm",
-        ],
-        [
-            "gateway",
-            "update",
-            "gateway_target",
-            "--scheduler-job-id",
-            "12345",
-        ],
-    ],
-)
-def test_cli_generic_gateway_commands_have_no_scheduler_identity_arguments(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    command: list[str],
-) -> None:
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-
-    result = CliRunner().invoke(app, command)
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output
-    assert ClioCoreQueue(tmp_path / "core").list_gateway_sessions() == []
-
-
-@pytest.mark.parametrize(
-    ("option", "payload", "protected_field"),
-    [
-        ("--gateway-json", '{"runtime_spec":{"kind":"forged"}}', "gateway.runtime_spec"),
-        (
-            "--gateway-json",
-            '{"jarvis_runtime_binding":{"schema_version":"forged"}}',
-            "gateway.jarvis_runtime_binding",
-        ),
-        (
-            "--gateway-json",
-            '{"transport":{"remote_connector":{"pid":42}}}',
-            "gateway.transport.remote_connector",
-        ),
-        ("--metadata-json", '{"owner":"clio-relay"}', "metadata.owner"),
-    ],
-)
-def test_cli_generic_gateway_create_rejects_runtime_owned_json(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    option: str,
-    payload: str,
-    protected_field: str,
-) -> None:
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "create",
-            "--cluster",
-            "ares",
-            "--name",
-            "forged-runtime",
-            option,
-            payload,
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert protected_field in result.output
-    assert ClioCoreQueue(tmp_path / "core").list_gateway_sessions() == []
-
-
-def test_cli_generic_gateway_update_cannot_replace_relay_runtime_state(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    queue = ClioCoreQueue(core_dir)
-    runtime = queue.create_gateway_session(
-        GatewaySession(
-            cluster="ares",
-            name="relay-runtime",
-            gateway={
-                "runtime_spec": {"kind": "image-service"},
-                "ownership_intents": {"scheduler_submission": {"state": "recorded"}},
-            },
-            metadata={"owner": "clio-relay", "runtime_kind": "image-service"},
-        )
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "update",
-            runtime.session_id,
-            "--gateway-json",
-            '{"strategy":"ssh_forward"}',
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "cannot replace relay-managed runtime state" in result.stderr
-    assert queue.get_gateway_session(runtime.session_id).gateway == runtime.gateway
-
-
-def test_cli_generic_gateway_update_preserves_ordinary_gateway_mutations(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    created = CliRunner().invoke(
-        app,
-        ["gateway", "create", "--cluster", "ares", "--name", "ordinary-gateway"],
-    )
-    session_id = json.loads(created.output)["session_id"]
-
-    updated = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "update",
-            session_id,
-            "--gateway-json",
-            '{"strategy":"ssh_forward","local_port":5900}',
-            "--metadata-json",
-            '{"dataset":"example"}',
-        ],
-    )
-
-    assert created.exit_code == 0
-    assert updated.exit_code == 0
-    payload = json.loads(updated.output)
-    assert payload["gateway"] == {"strategy": "ssh_forward", "local_port": 5900}
-    assert payload["metadata"] == {"dataset": "example"}
-
-
-def test_cli_gateway_update_closed_session_reports_clean_error(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    created = CliRunner().invoke(
-        app,
-        ["gateway", "create", "--cluster", "ares", "--name", "live-service-example"],
-    )
-    assert created.exit_code == 0
-    session_id = json.loads(created.output)["session_id"]
-
-    closed = CliRunner().invoke(app, ["gateway", "close", session_id])
-    updated = CliRunner().invoke(app, ["gateway", "update", session_id, "--state", "ready"])
-
-    assert closed.exit_code == 0
-    assert updated.exit_code == 1
-    assert "error: cannot reopen closed gateway session" in updated.stderr
-    assert "Traceback" not in updated.output
-    assert "Traceback" not in updated.stderr
-
-
-def test_gateway_resume_reenters_exact_owner_session_admission(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Owned pending runtimes cannot resume outside their authoritative generation lock."""
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    queue = ClioCoreQueue(core_dir)
-    queue.initialize()
-    owner_session_id = "desktop-session"
-    owner_generation_id = "generation-1"
-    owner_admission_id = cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="test-cluster",
-        session_id=owner_session_id,
-    )
-    queue.mirror_owner_session_generation_open(
-        owner_admission_id,
-        session_generation_id=owner_generation_id,
-    )
-    gateway = queue.create_gateway_session(
-        GatewaySession(
-            cluster="test-cluster",
-            name="pending-runtime",
-            state=GatewaySessionState.PENDING,
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": owner_session_id,
-                "owner_session_generation_id": owner_generation_id,
-                "owner_session_admission_id": owner_admission_id,
-            },
-        )
-    )
-    definition = ClusterDefinition(name="test-cluster", ssh_host="test-login")
-    events: list[str] = []
-
-    class FakeResult:
-        def __init__(self, session: GatewaySession) -> None:
-            self.session = session
-
-        def to_live_validation_report(self, **_kwargs: object) -> LiveValidationReport:
-            report = new_live_validation_report(
-                scenario="gateway-runtime",
-                cluster="test-cluster",
-            )
-            recorder = ValidationRecorder(report)
-            with recorder.check("gateway.resume", "resume exact gateway"):
-                pass
-            recorder.finish()
-            return report
-
-    class FakeSupervisor:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def resume_start(self, *, session_id: str) -> FakeResult:
-            events.append("resume")
-            assert session_id == gateway.session_id
-            return FakeResult(queue.get_gateway_session(session_id))
-
-    def admit(**kwargs: object) -> nullcontext[SimpleNamespace]:
-        events.append("admit")
-        assert kwargs["session_id"] == owner_session_id
-        assert kwargs["session_generation_id"] == owner_generation_id
-        return nullcontext(
-            SimpleNamespace(
-                owner_session_id=owner_session_id,
-                owner_session_generation_id=owner_generation_id,
-                owner_session_admission_id=owner_admission_id,
-            )
-        )
-
-    def require_cluster(_cluster: str) -> ClusterDefinition:
-        return definition
-
-    def selected_queue(_settings: cli.RelaySettings) -> ClioCoreQueue:
-        return queue
-
-    def ignore_verified_report(
-        _report: LiveValidationReport,
-        _definition: ClusterDefinition,
-        _path: Path,
-    ) -> None:
-        return None
-
-    monkeypatch.setattr(cli, "_require_cluster", require_cluster)
-    monkeypatch.setattr(storage_runtime, "storage_managed_queue", selected_queue)
-    monkeypatch.setattr(service_runtime, "ServiceRuntimeSupervisor", FakeSupervisor)
-    monkeypatch.setattr(owner_session_admission, "owner_session_gateway_admission", admit)
-    monkeypatch.setattr(cli, "_write_remote_verified_report", ignore_verified_report)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "resume-runtime",
-            gateway.session_id,
-            "--cluster",
-            "test-cluster",
-            "--token",
-            "token",
-            "--secret-key",
-            "secret",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert events == ["admit", "resume"]
-
-
-def test_gateway_attach_runtime_prints_pending_resume_contract(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Attach must not strip a nonterminal gateway's exact retry selector."""
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    definition = ClusterDefinition(name="test-cluster", ssh_host="test-login")
-    gateway = GatewaySession(
-        session_id="gateway_pending_attach",
-        cluster="test-cluster",
-        name="pending-runtime",
-        state=GatewaySessionState.STARTING,
-        scheduler="slurm",
-        scheduler_job_id="12345",
-        gateway={
-            "connect_url": "http://127.0.0.1:28777",
-            "health_url": "http://127.0.0.1:28777/healthz",
-            "stream_url": "http://127.0.0.1:28777/live-data",
-        },
-        metadata={"owner": "clio-relay"},
-    )
-
-    class FakeSupervisor:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def attach(self, *, session_id: str) -> ServiceRuntimePendingResult:
-            assert session_id == gateway.session_id
-            return ServiceRuntimePendingResult(session=gateway)
-
-    def require_cluster(_cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(cli, "_require_cluster", require_cluster)
-    monkeypatch.setattr(service_runtime, "ServiceRuntimeSupervisor", FakeSupervisor)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "attach-runtime",
-            gateway.session_id,
-            "--cluster",
-            definition.name,
-            "--token",
-            "token",
-            "--secret-key",
-            "secret",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["session_id"] == gateway.session_id
-    assert payload["outcome"] == "pending"
-    assert payload["retry_selector"] == {
-        "cluster": definition.name,
-        "gateway_session_id": gateway.session_id,
-        "scheduler_provider": "slurm",
-        "scheduler_job_id": "12345",
-    }
-    assert payload["scheduler_action"] == "none"
-    assert payload["relay_action"] == "none"
-    assert payload["scheduler_cancel_requested"] is False
-    assert "connect_url" not in payload["gateway"]
-    assert "health_url" not in payload["gateway"]
-    assert "stream_url" not in payload["gateway"]
-
-
-def test_cli_remote_agent_run_preserves_posix_prompt_path(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    _write_test_cluster(tmp_path)
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        assert capture_output is True
-        assert check is False
-        return subprocess.CompletedProcess(command, 0, b"job_agent\n", b"")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "agent",
-            "run",
-            "--cluster",
-            "ares",
-            "--prompt",
-            "/home/user/prompt.md",
-            "--mcp-config",
-            "/home/user/mcp.toml",
-            "--idempotency-key",
-            "agent-posix-path",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert result.output.strip() == "job_agent"
-    assert "--prompt /home/user/prompt.md" in commands[0][2]
-    assert "--mcp-config /home/user/mcp.toml" in commands[0][2]
-    assert "\\home\\user" not in commands[0][2]
 
 
 def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
@@ -12075,15 +7053,17 @@ def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
     monkeypatch.setattr(
-        cli,
+        cli_remote_collection_pagination,
         "_wait_for_local_job_terminal",
         wait_for_local_terminal,
     )
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", artifacts)
-    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_result)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_complete_local_artifact_records", artifacts
+    )
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_local_json_artifact_kind", read_result)
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12096,7 +7076,7 @@ def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
 
     assert ["artifacts" in arguments for arguments in calls] == [False, False, True]
     assert all(0 < value <= 60 for value in timeout_values)
-    assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert result.call_job_id == "job-query-3"
     assert [item["state"] for item in result.lifecycle_observations] == [
         "running",
@@ -12160,9 +7140,9 @@ def test_post_run_execution_query_returns_exact_resumable_nonterminal_snapshot(
         }
     }
 
-    def execute_query(**kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         calls.append(cast(dict[str, object], kwargs["arguments"]))
-        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session=cast(cli.PackagedMcpStdioSession, session),
             call_job_id="job-query-1",
             call_status={"job": {"job_id": "job-query-1", "state": "succeeded"}},
@@ -12175,10 +7155,10 @@ def test_post_run_execution_query_returns_exact_resumable_nonterminal_snapshot(
         return None
 
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12226,7 +7206,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
         initialize_response={"protocolVersion": "2025-06-18"},
         evidence=evidence,
     )
-    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    attempt = cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session=cast(cli.PackagedMcpStdioSession, session),
         call_job_id="job-query-1",
         call_status={"terminal": True},
@@ -12236,7 +7216,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
     )
     calls = 0
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -12286,9 +7266,9 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
         }
 
     monkeypatch.setattr(time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(
-        cli,
+        cli_jarvis_execution_run,
         "_jarvis_execution_lifecycle_observation",
         submitted_observation,
     )
@@ -12298,7 +7278,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
 
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12333,9 +7313,9 @@ def test_first_query_observation_timeout_returns_exact_query_only_pending(
     def timeout(**_kwargs: object) -> None:
         raise ObservationTimeoutError("first query remains queued")
 
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", timeout)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", timeout)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12347,7 +7327,7 @@ def test_first_query_observation_timeout_returns_exact_query_only_pending(
         poll_seconds=1,
     )
 
-    assert isinstance(result, cli._JarvisExecutionQueryPending)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryPending)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert result.outcome == "observation_pending"
     assert result.lifecycle_observations == ()
     assert result.retry_selector() == selector
@@ -12410,8 +7390,8 @@ def test_terminal_execution_without_artifact_query_time_is_query_only_pending(
         }
     }
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session=cast(cli.PackagedMcpStdioSession, session),
             call_job_id="job-query-1",
             call_status={"terminal": True},
@@ -12421,9 +7401,9 @@ def test_terminal_execution_without_artifact_query_time_is_query_only_pending(
         )
 
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12464,7 +7444,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
         initialize_response={"protocolVersion": "2025-06-18"},
         evidence=evidence,
     )
-    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    attempt = cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session=cast(cli.PackagedMcpStdioSession, session),
         call_job_id="job-query-1",
         call_status={"terminal": True},
@@ -12474,7 +7454,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
     )
     calls = 0
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -12502,15 +7482,15 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
         }
 
     monkeypatch.setattr(time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(
-        cli,
+        cli_jarvis_execution_run,
         "_jarvis_execution_lifecycle_observation",
         terminal_observation,
     )
 
-    def run_query() -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def run_query() -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             definition=cast(ClusterDefinition, SimpleNamespace()),
             queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -12520,7 +7500,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
             wait_timeout_seconds=5.0,
             poll_seconds=1.0,
         )
-        assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         return result
 
     if is_retryable:
@@ -12598,7 +7578,7 @@ def test_nonterminal_jarvis_acceptance_report_is_pending_not_passed_or_failed() 
     def evidence() -> dict[str, object]:
         return {}
 
-    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="pipeline",
         execution_id="execution",
@@ -12625,7 +7605,7 @@ def test_nonterminal_jarvis_acceptance_report_is_pending_not_passed_or_failed() 
         ],
     )
 
-    pending = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    pending = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -12665,7 +7645,7 @@ def test_nonterminal_jarvis_acceptance_does_not_mask_unrelated_failure() -> None
             error="contract mismatch",
         )
     ]
-    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="pipeline",
         execution_id="execution",
@@ -12692,7 +7672,7 @@ def test_nonterminal_jarvis_acceptance_does_not_mask_unrelated_failure() -> None
         ],
     )
 
-    unchanged = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    unchanged = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -12830,431 +7810,15 @@ def _jarvis_resume_runtime_metadata(
     }
 
 
-def test_unobserved_query_checkpoint_resumes_after_multiday_delay_without_new_run(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Checkpoint age never turns a queued HPC execution into a failed or duplicate run."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    _write_test_cluster(tmp_path, name="test-cluster")
-    selector: dict[str, object] = {
-        "cluster": "test-cluster",
-        "scheduler_cluster": "test-cluster",
-        "pipeline_id": "pipeline",
-        "execution_id": "execution",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "4242",
-        "last_query_job_id": None,
-    }
-    checkpoint: dict[str, Any] = {
-        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "phase": "execution_query",
-        "observation_state": "not_observed",
-        "profile": "user",
-        "retry_selector": selector,
-        "builder_inputs": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "tool": "jarvis_run",
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitted",
-                scheduler_native_id="4242",
-            ),
-        },
-        "lifecycle_observations": [],
-    }
-    report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
-    old_time = datetime.now(UTC) - timedelta(days=30)
-    report.started_at = old_time
-    report.completed_at = old_time
-    report.status = ValidationStatus.PENDING
-    report.resources = [
-        ValidationResource(
-            kind="jarvis_execution",
-            resource_id="execution",
-            role="resumable_acceptance_workload",
-            cluster="test-cluster",
-            provider="slurm",
-            state="observation_pending",
-            metadata={
-                "retry_selector": selector,
-                "outcome": "observation_pending",
-                "scheduler_action": "none",
-                "relay_action": "retain",
-                "resume_checkpoint": checkpoint,
-            },
-        )
-    ]
-    resume_path = tmp_path / "multiday-query-pending.json"
-    write_validation_report(report, resume_path)
-    query_calls: list[dict[str, object]] = []
-
-    def still_pending(**kwargs: object) -> cli._JarvisExecutionQueryPending:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        query_calls.append(dict(kwargs))
-        return cli._JarvisExecutionQueryPending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="test-cluster",
-            pipeline_id="pipeline",
-            execution_id="execution",
-            selector=cast(dict[str, object], kwargs["retry_selector"]),
-        )
-
-    def forbid_new_run(**_kwargs: object) -> None:
-        raise AssertionError("query-only resume must not dispatch jarvis_run")
-
-    def execute_locally(_definition: ClusterDefinition) -> bool:
-        return False
-
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", still_pending)
-    monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
-    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(resume_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert len(query_calls) == 1
-    assert query_calls[0]["pipeline_id"] == "pipeline"
-    assert query_calls[0]["execution_id"] == "execution"
-    persisted = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
-    assert persisted.status is ValidationStatus.PENDING
-    persisted_selector = persisted.resources[0].metadata["retry_selector"]
-    assert persisted_selector["execution_id"] == "execution"
-    assert persisted.started_at == old_time
-
-
-def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Once jarvis_run returns a receipt, resume observes that job and never calls it again."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    _write_test_cluster(tmp_path, name="test-cluster")
-    pending_path = tmp_path / "dispatch-pending.json"
-    stdio_calls: list[dict[str, object]] = []
-    dispatch_calls: list[str] = []
-
-    def discover(**_kwargs: object) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
-        return "job-discovery", {}, [], b"{}"
-
-    def persist_discovery(**_kwargs: object) -> None:
-        return None
-
-    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        tools_list_response={},
-        call_response={},
-        call_job_id="job-search",
-        call_status={},
-        artifacts=[],
-        mcp_result=None,
-        provenance=None,
-        initialize_response={},
-        stdio_evidence={},
-    )
-
-    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return package_search
-
-    def run_session(**kwargs: object) -> SimpleNamespace:
-        stdio_calls.append(dict(kwargs))
-        call_response = {"result": {"structuredContent": {"job_id": "job-run"}}}
-        return SimpleNamespace(
-            tools_list_response={},
-            tools_call_response=call_response,
-            initialize_response={},
-            evidence=lambda: {"call_job_id": "job-run", "transport": "stdio"},
-        )
-
-    def complete_dispatch(**kwargs: object) -> dict[str, Any]:
-        checkpoint = cast(dict[str, Any], kwargs["checkpoint"])
-        selector = cast(dict[str, object], checkpoint["retry_selector"])
-        dispatch_calls.append(cast(str, selector["relay_job_id"]))
-        assert selector["relay_job_id"] == "job-run"
-        if len(dispatch_calls) == 1:
-            raise ObservationTimeoutError("relay dispatch remains queued")
-        return {
-            **cast(dict[str, Any], checkpoint["builder_inputs"]),
-            "call_status": {"terminal": True},
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitted",
-                scheduler_native_id="4242",
-            ),
-        }
-
-    def build_report(**kwargs: Any) -> LiveValidationReport:
-        report = new_live_validation_report(
-            scenario="remote-mcp",
-            cluster=cast(str, kwargs["cluster"]),
-        )
-        if kwargs["query_call_job_id"] == "":
-            now = datetime.now(UTC)
-            report.completed_at = now
-            report.status = ValidationStatus.FAILED
-            report.checks = [
-                ValidationCheck(
-                    check_id="remote-mcp.jarvis-call",
-                    summary="relay dispatch reaches terminal observation",
-                    status=ValidationStatus.FAILED,
-                    started_at=report.started_at,
-                    completed_at=now,
-                    error="observation pending",
-                )
-            ]
-            return report
-        recorder = ValidationRecorder(report)
-        with recorder.check("jarvis.complete", "same execution completed") as evidence:
-            evidence.append(EvidenceReference(kind="test", excerpt="same durable execution"))
-        recorder.finish()
-        return report
-
-    def terminal_query(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        pipeline_id = cast(str, kwargs["pipeline_id"])
-        execution_id = cast(str, kwargs["execution_id"])
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster="test-cluster",
-            pipeline_id=pipeline_id,
-            execution_id=execution_id,
-            outcome="terminal",
-            tools_list_response={},
-            call_response={},
-            call_job_id="job-query",
-            call_status={},
-            artifacts=[],
-            mcp_result=None,
-            provenance=None,
-            initialize_response={},
-            stdio_evidence={},
-            lifecycle_observations=[
-                _jarvis_resume_observation(
-                    query_job_id="job-query",
-                    state="completed",
-                    terminal=True,
-                    scheduler_native_id="4242",
-                )
-            ],
-        )
-
-    def execute_locally(_definition: ClusterDefinition) -> bool:
-        return False
-
-    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
-    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
-    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
-    monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", complete_dispatch)
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", terminal_query)
-    monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_report)
-    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
-
-    initial = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--package-search-query",
-            "paraview",
-            "--arguments-json",
-            '{"pipeline_id":"pipeline"}',
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-            "--report",
-            str(pending_path),
-        ],
-    )
-
-    assert initial.exit_code == 0, initial.output
-    assert len(stdio_calls) == 1
-    initial_arguments = cast(dict[str, object], stdio_calls[0]["arguments"])
-    assert isinstance(initial_arguments["idempotency_key"], str)
-    pending = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
-    checkpoint = pending.resources[-1].metadata["resume_checkpoint"]
-    assert checkpoint["phase"] == "jarvis_run_dispatch"
-    assert checkpoint["retry_selector"]["relay_job_id"] == "job-run"
-
-    resumed = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(pending_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert resumed.exit_code == 0, resumed.output
-    assert len(stdio_calls) == 1
-    assert dispatch_calls == ["job-run", "job-run"]
-    final = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
-    assert final.status is ValidationStatus.PASSED
-
-
-def test_stdio_receipt_timeout_replays_only_the_same_idempotent_intent(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """An ambiguous stdio boundary may replay its key, but may not mint a new workload key."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    _write_test_cluster(tmp_path, name="test-cluster")
-    pending_path = tmp_path / "intent-pending.json"
-    observed_arguments: list[dict[str, object]] = []
-
-    def discover(
-        **_kwargs: object,
-    ) -> tuple[str, dict[str, Any], list[dict[str, Any]], bytes]:
-        return "job-discovery", {}, [], b"{}"
-
-    def persist_discovery(**_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
-    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
-    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        tools_list_response={},
-        call_response={},
-        call_job_id="job-search",
-        call_status={},
-        artifacts=[],
-        mcp_result=None,
-        provenance=None,
-        initialize_response={},
-        stdio_evidence={},
-    )
-
-    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return package_search
-
-    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
-
-    def run_session(**kwargs: object) -> SimpleNamespace:
-        observed_arguments.append(cast(dict[str, object], kwargs["arguments"]))
-        if len(observed_arguments) == 1:
-            pre_dispatch = LiveValidationReport.model_validate_json(
-                pending_path.read_text(encoding="utf-8")
-            )
-            assert (
-                pre_dispatch.resources[0].metadata["resume_checkpoint"]["phase"]
-                == "jarvis_run_intent"
-            )
-            raise ObservationTimeoutError("stdio response was not observed")
-        return SimpleNamespace(
-            tools_list_response={},
-            tools_call_response={"result": {"structuredContent": {"job_id": "job-run"}}},
-            initialize_response={},
-            evidence=lambda: {"call_job_id": "job-run", "transport": "stdio"},
-        )
-
-    def still_queued(**_kwargs: object) -> None:
-        raise ObservationTimeoutError("accepted relay job remains queued")
-
-    def build_pending(**kwargs: Any) -> LiveValidationReport:
-        report = new_live_validation_report(
-            scenario="remote-mcp",
-            cluster=cast(str, kwargs["cluster"]),
-        )
-        now = datetime.now(UTC)
-        report.completed_at = now
-        report.status = ValidationStatus.FAILED
-        report.checks = [
-            ValidationCheck(
-                check_id="remote-mcp.jarvis-call",
-                summary="relay dispatch reaches terminal observation",
-                status=ValidationStatus.FAILED,
-                started_at=report.started_at,
-                completed_at=now,
-                error="observation pending",
-            )
-        ]
-        return report
-
-    def execute_locally(_definition: ClusterDefinition) -> bool:
-        return False
-
-    monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", still_queued)
-    monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_pending)
-    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
-
-    initial = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--package-search-query",
-            "paraview",
-            "--arguments-json",
-            '{"pipeline_id":"pipeline"}',
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-            "--report",
-            str(pending_path),
-        ],
-    )
-    assert initial.exit_code == 0, initial.output
-    first = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
-    assert first.resources[0].metadata["resume_checkpoint"]["phase"] == "jarvis_run_intent"
-
-    resumed = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(pending_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert resumed.exit_code == 0, resumed.output
-    assert len(observed_arguments) == 2
-    assert observed_arguments[0] == observed_arguments[1]
-    assert observed_arguments[0]["idempotency_key"] == observed_arguments[1]["idempotency_key"]
-    second = LiveValidationReport.model_validate_json(pending_path.read_text(encoding="utf-8"))
-    second_checkpoint = second.resources[-1].metadata["resume_checkpoint"]
-    assert second_checkpoint["phase"] == "jarvis_run_dispatch"
-    assert second_checkpoint["retry_selector"]["relay_job_id"] == "job-run"
-
-
 def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Path) -> None:
     """Old checkpoints remain valid, while any change to their exact intent remains invalid."""
-    execution_intent = cli._jarvis_run_execution_intent(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    execution_intent = cli_jarvis_intent_checkpoint._jarvis_run_execution_intent(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="test-cluster",
         profile="user",
         arguments={"pipeline_id": "pipeline"},
         idempotency_key="validation:jarvis-run:test-cluster:stable-key",
     )
-    checkpoint = cli._new_jarvis_intent_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    checkpoint = cli_jarvis_intent_checkpoint._new_jarvis_intent_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         execution_intent=execution_intent,
         pre_dispatch_inputs={
             "cluster": "test-cluster",
@@ -13265,14 +7829,14 @@ def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Pat
             "artifact_sha256": None,
         },
     )
-    report = cli._new_jarvis_intent_pending_report(checkpoint)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report = cli_jarvis_pending_report._new_jarvis_intent_pending_report(checkpoint)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     old_time = datetime.now(UTC) - timedelta(days=45)
     report.started_at = old_time
     report.completed_at = old_time
     path = tmp_path / "old-intent.json"
     write_validation_report(report, path)
 
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         path,
         cluster="test-cluster",
     )
@@ -13288,759 +7852,10 @@ def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Pat
     write_validation_report(tampered, tampered_path)
 
     with pytest.raises(ConfigurationError, match="dispatch identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             tampered_path,
             cluster="test-cluster",
         )
-
-
-def test_jarvis_validation_rejects_unresumable_secret_arguments(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
-    """A resume checkpoint never persists credentials needed to replay a workload call."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path, name="test-cluster")
-    report_path = tmp_path / "secret-rejected.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--package-search-query",
-            "paraview",
-            "--arguments-json",
-            '{"pipeline_id":"pipeline","api_token":"must-not-leak"}',
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 2
-    assert "credential-redacted" in result.output
-    assert "must-not-leak" not in result.output
-    assert "must-not-leak" not in report_path.read_text(encoding="utf-8")
-
-
-def test_jarvis_mcp_validate_resume_report_queries_exact_execution_without_new_run(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        json.dumps(
-            {
-                "clusters": {
-                    "test-cluster": ClusterDefinition(
-                        name="test-cluster",
-                        ssh_host="test-login",
-                    ).model_dump(mode="json")
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    resume_path = tmp_path / "jarvis-pending.json"
-    prior_observation = _jarvis_resume_observation(
-        query_job_id="job-query-old",
-        state="submitted",
-        terminal=False,
-        scheduler_native_id="4242",
-    )
-    checkpoint = {
-        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "phase": "execution_query",
-        "observation_state": "observed",
-        "profile": "user",
-        "retry_selector": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "pipeline_id": "pipeline",
-            "execution_id": "execution",
-            "scheduler_provider": "slurm",
-            "scheduler_native_id": "4242",
-            "last_query_job_id": "job-query-old",
-        },
-        "builder_inputs": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "tool": "jarvis_run",
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitted",
-                scheduler_native_id="4242",
-            ),
-        },
-        "lifecycle_observations": [prior_observation],
-    }
-    pending_report = new_live_validation_report(
-        scenario="remote-mcp",
-        cluster="test-cluster",
-    )
-    pending_report.status = ValidationStatus.PENDING
-    pending_report.completed_at = datetime.now(UTC)
-    pending_report.resources.append(
-        ValidationResource(
-            kind="jarvis_execution",
-            resource_id="execution",
-            role="resumable_acceptance_workload",
-            cluster="test-cluster",
-            provider="slurm",
-            state="submitted",
-            metadata={
-                "retry_selector": checkpoint["retry_selector"],
-                "resume_checkpoint": checkpoint,
-            },
-        )
-    )
-    write_validation_report(pending_report, resume_path)
-    query_calls: list[tuple[str, str, str]] = []
-
-    def query_exact_execution(
-        *,
-        cluster: str,
-        definition: ClusterDefinition,
-        queue: ClioCoreQueue,
-        profile: str,
-        pipeline_id: str,
-        execution_id: str,
-        retry_selector: dict[str, object] | None,
-        wait_timeout_seconds: float,
-        poll_seconds: float,
-    ) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        del definition, queue, retry_selector, wait_timeout_seconds, poll_seconds
-        query_calls.append((profile, pipeline_id, execution_id))
-        terminal_observation = _jarvis_resume_observation(
-            query_job_id="job-query-new",
-            state="completed",
-            terminal=True,
-            scheduler_native_id="4242",
-        )
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster=cluster,
-            pipeline_id=pipeline_id,
-            execution_id=execution_id,
-            outcome="terminal",
-            tools_list_response={},
-            call_response={},
-            call_job_id="job-query-new",
-            call_status={},
-            artifacts=[],
-            mcp_result=None,
-            provenance=None,
-            initialize_response={},
-            stdio_evidence={},
-            lifecycle_observations=[terminal_observation],
-        )
-
-    builder_calls: list[dict[str, Any]] = []
-
-    def build_report(**kwargs: Any) -> LiveValidationReport:
-        builder_calls.append(kwargs)
-        report = new_live_validation_report(
-            scenario="remote-mcp",
-            cluster="test-cluster",
-        )
-        recorder = ValidationRecorder(report)
-        with recorder.check("jarvis.resume", "resume exact execution") as evidence:
-            evidence.append(EvidenceReference(kind="test", excerpt="same execution"))
-        recorder.finish()
-        return report
-
-    def forbid_new_run(**_kwargs: object) -> None:
-        raise AssertionError("resume must not dispatch jarvis_run")
-
-    def execute_locally(_definition: ClusterDefinition) -> bool:
-        return False
-
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
-    monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_report)
-    monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
-    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(resume_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert query_calls == [("user", "pipeline", "execution")]
-    assert len(builder_calls) == 1
-    assert [
-        observation["state"] for observation in builder_calls[0]["query_lifecycle_observations"]
-    ] == ["submitted", "completed"]
-    completed = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
-    assert completed.status is ValidationStatus.PASSED
-
-
-def test_jarvis_resume_pending_returns_before_release_provenance_observation(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """A durable pending workload survives an ancillary worker-info failure boundary."""
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        json.dumps(
-            {
-                "clusters": {
-                    "test-cluster": ClusterDefinition(
-                        name="test-cluster",
-                        ssh_host="test-login",
-                    ).model_dump(mode="json")
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    resume_path = tmp_path / "jarvis-pending.json"
-    prior_observation = _jarvis_resume_observation(
-        query_job_id="job-query-old",
-        state="submitting",
-        terminal=False,
-        scheduler_native_id=None,
-        scheduler_cluster=None,
-    )
-    selector = {
-        "cluster": "test-cluster",
-        "scheduler_cluster": None,
-        "pipeline_id": "pipeline",
-        "execution_id": "execution",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": None,
-        "last_query_job_id": "job-query-old",
-    }
-    checkpoint = {
-        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "phase": "execution_query",
-        "observation_state": "observed",
-        "profile": "user",
-        "retry_selector": selector,
-        "builder_inputs": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": None,
-            "tool": "jarvis_run",
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitting",
-                scheduler_native_id=None,
-                scheduler_cluster=None,
-            ),
-        },
-        "lifecycle_observations": [prior_observation],
-    }
-    pending_report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
-    pending_report.status = ValidationStatus.PENDING
-    pending_report.completed_at = datetime.now(UTC)
-    pending_report.resources.append(
-        ValidationResource(
-            kind="jarvis_execution",
-            resource_id="execution",
-            role="resumable_acceptance_workload",
-            cluster="test-cluster",
-            provider="slurm",
-            state="submitting",
-            metadata={"retry_selector": selector, "resume_checkpoint": checkpoint},
-        )
-    )
-    write_validation_report(pending_report, resume_path)
-
-    def query_exact_execution(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        observation = _jarvis_resume_observation(
-            query_job_id="job-query-new",
-            state="submitted",
-            terminal=False,
-            scheduler_native_id="4242",
-            scheduler_cluster="linux",
-        )
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            cluster=cast(str, kwargs["cluster"]),
-            pipeline_id=cast(str, kwargs["pipeline_id"]),
-            execution_id=cast(str, kwargs["execution_id"]),
-            outcome="observation_unknown",
-            tools_list_response={},
-            call_response={},
-            call_job_id="job-query-new",
-            call_status={},
-            artifacts=[],
-            mcp_result=None,
-            provenance=None,
-            initialize_response={},
-            stdio_evidence={},
-            lifecycle_observations=[observation],
-        )
-
-    builder_calls: list[dict[str, Any]] = []
-
-    def build_pending_report(**kwargs: Any) -> LiveValidationReport:
-        builder_calls.append(kwargs)
-        report = new_live_validation_report(scenario="remote-mcp", cluster="test-cluster")
-        now = datetime.now(UTC)
-        report.status = ValidationStatus.FAILED
-        report.completed_at = now
-        report.checks = [
-            ValidationCheck(
-                check_id="remote-mcp.jarvis-live-progress",
-                summary="execution lifecycle remains nonterminal",
-                status=ValidationStatus.FAILED,
-                started_at=now,
-                completed_at=now,
-                evidence=[
-                    EvidenceReference(
-                        kind="test",
-                        excerpt="coherent pending lifecycle",
-                        metadata={
-                            "assertions": {
-                                "observation_count_bounded": True,
-                                "query_identities_coherent": True,
-                                "scheduler_identity_optional_coherent_and_stable": True,
-                                "lifecycle_prefix_coherent": True,
-                                "package_progress_nonregressing": True,
-                            }
-                        },
-                    )
-                ],
-                error="execution remains submitted",
-            ),
-            ValidationCheck(
-                check_id="remote-mcp.jarvis-execution-query",
-                summary="execution query remains resumable",
-                status=ValidationStatus.FAILED,
-                started_at=now,
-                completed_at=now,
-                evidence=[
-                    EvidenceReference(
-                        kind="test",
-                        excerpt="coherent resumable query",
-                        metadata={
-                            "assertions": {
-                                "local_query_surface_verified": True,
-                                "server_artifact_binding_verified": True,
-                                "resumable_query_job_verified": True,
-                                "resumable_result_transport_verified": True,
-                                "resumable_result_envelope_verified": True,
-                                "resumable_identity_coherent": True,
-                                "resumable_lifecycle_coherent": True,
-                                "resumable_runner_semantic_validation_verified": True,
-                            }
-                        },
-                    )
-                ],
-                error="artifact page is not terminal yet",
-            ),
-        ]
-        return report
-
-    worker_info_calls: list[str] = []
-
-    def fail_worker_info(_definition: ClusterDefinition) -> dict[str, object]:
-        worker_info_calls.append("called")
-        raise AssertionError("pending resume must not require release provenance")
-
-    def execute_remotely(_definition: ClusterDefinition) -> bool:
-        return True
-
-    def forbid_new_run(**_kwargs: object) -> None:
-        raise AssertionError("resume must not submit")
-
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
-    monkeypatch.setattr(
-        jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_pending_report
-    )
-    monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_remotely)
-    monkeypatch.setattr(cli, "_remote_worker_info", fail_worker_info)
-    monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(resume_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert worker_info_calls == []
-    assert len(builder_calls) == 1
-    assert builder_calls[0]["scheduler_cluster"] == "linux"
-    assert [
-        observation["state"] for observation in builder_calls[0]["query_lifecycle_observations"]
-    ] == ["submitting", "submitted"]
-    persisted = LiveValidationReport.model_validate_json(resume_path.read_text(encoding="utf-8"))
-    assert persisted.status is ValidationStatus.PENDING
-    resource = next(item for item in persisted.resources if item.kind == "jarvis_execution")
-    persisted_checkpoint = cast(dict[str, Any], resource.metadata["resume_checkpoint"])
-    assert persisted_checkpoint["retry_selector"]["cluster"] == "test-cluster"
-    assert persisted_checkpoint["retry_selector"]["scheduler_cluster"] == "linux"
-    assert persisted_checkpoint["builder_inputs"]["scheduler_cluster"] == "linux"
-
-
-def test_jarvis_resume_query_failure_preserves_pending_checkpoint(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """A transient resume failure writes separate evidence and preserves its selector."""
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        json.dumps(
-            {
-                "clusters": {
-                    "test-cluster": ClusterDefinition(
-                        name="test-cluster",
-                        ssh_host="test-login",
-                    ).model_dump(mode="json")
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    resume_path = tmp_path / "jarvis-pending.json"
-    checkpoint = {
-        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "phase": "execution_query",
-        "observation_state": "observed",
-        "profile": "user",
-        "retry_selector": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "pipeline_id": "pipeline",
-            "execution_id": "execution",
-            "scheduler_provider": "slurm",
-            "scheduler_native_id": "4242",
-            "last_query_job_id": "job-query-old",
-        },
-        "builder_inputs": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "tool": "jarvis_run",
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitted",
-                scheduler_native_id="4242",
-            ),
-        },
-        "lifecycle_observations": [
-            _jarvis_resume_observation(
-                query_job_id="job-query-old",
-                state="submitted",
-                terminal=False,
-                scheduler_native_id="4242",
-            )
-        ],
-    }
-    pending_report = new_live_validation_report(
-        scenario="remote-mcp",
-        cluster="test-cluster",
-    )
-    pending_report.status = ValidationStatus.PENDING
-    pending_report.completed_at = datetime.now(UTC)
-    pending_report.resources.append(
-        ValidationResource(
-            kind="jarvis_execution",
-            resource_id="execution",
-            role="resumable_acceptance_workload",
-            cluster="test-cluster",
-            provider="slurm",
-            state="submitted",
-            metadata={
-                "retry_selector": checkpoint["retry_selector"],
-                "resume_checkpoint": checkpoint,
-            },
-        )
-    )
-    write_validation_report(pending_report, resume_path)
-    original = resume_path.read_bytes()
-
-    def fail_query(**_kwargs: object) -> None:
-        raise TimeoutError("temporary relay observation timeout")
-
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", fail_query)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(resume_path),
-            "--wait-timeout-seconds",
-            "5",
-            "--poll-seconds",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert resume_path.read_bytes() == original
-    failure_paths = list(tmp_path.glob("jarvis-pending.resume-failure-*.json"))
-    assert len(failure_paths) == 1
-    failure = LiveValidationReport.model_validate_json(failure_paths[0].read_text(encoding="utf-8"))
-    assert failure.status is ValidationStatus.FAILED
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        resume_path,
-        cluster="test-cluster",
-    )
-    assert loaded["retry_selector"]["scheduler_native_id"] == "4242"
-
-    tampered_path = tmp_path / "jarvis-tampered.json"
-    tampered = LiveValidationReport.model_validate_json(original)
-    resource = tampered.resources[0]
-    resource.metadata["retry_selector"]["execution_id"] = "different-execution"
-    resource.metadata["resume_checkpoint"]["retry_selector"]["execution_id"] = "different-execution"
-    write_validation_report(tampered, tampered_path)
-    with pytest.raises(
-        ConfigurationError,
-        match="resume identity is invalid|observation identity changed",
-    ):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            tampered_path,
-            cluster="test-cluster",
-        )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "missing_record",
-        "record_identity",
-        "state",
-        "terminal",
-        "return_code",
-        "missing_progress",
-        "progress_identity",
-        "integrity_marker",
-        "gap_marker",
-        "coordinated_cluster",
-        "coordinated_mode",
-        "coordinated_provider",
-        "coordinated_pipeline",
-        "coordinated_execution",
-        "runtime_missing_native_execution",
-        "runtime_missing_handle",
-        "runtime_missing_record",
-        "runtime_missing_progress",
-        "runtime_handle_schema",
-        "runtime_handle_native_id",
-        "runtime_record_native_id",
-        "runtime_progress_execution",
-        "runtime_progress_schema",
-        "runtime_terminal_state",
-    ],
-)
-def test_jarvis_resume_rejects_tampered_checkpoint_before_remote_query(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    mutation: str,
-) -> None:
-    """Checkpoint-native documents are an admission boundary, not later report evidence."""
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        json.dumps(
-            {
-                "clusters": {
-                    "test-cluster": ClusterDefinition(
-                        name="test-cluster",
-                        ssh_host="test-login",
-                    ).model_dump(mode="json")
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    observation = _jarvis_resume_observation(
-        query_job_id="job-query-old",
-        state="submitted",
-        terminal=False,
-        scheduler_native_id="4242",
-    )
-    if mutation == "missing_record":
-        observation.pop("execution_record")
-    elif mutation == "record_identity":
-        record = cast(dict[str, Any], observation["execution_record"])
-        record["execution_id"] = "different-execution"
-    elif mutation == "state":
-        observation["state"] = "running"
-    elif mutation == "terminal":
-        observation["terminal"] = True
-    elif mutation == "return_code":
-        record = cast(dict[str, Any], observation["execution_record"])
-        record["return_code"] = 1
-    elif mutation == "missing_progress":
-        observation.pop("progress")
-    elif mutation == "progress_identity":
-        progress = cast(dict[str, Any], observation["progress"])
-        progress["execution_id"] = "different-execution"
-    elif mutation == "integrity_marker":
-        observation["relay_query_integrity"] = {}
-    elif mutation == "gap_marker":
-        observation["relay_query_verified_gap"] = {}
-    elif mutation in {"coordinated_cluster", "coordinated_mode", "coordinated_provider"}:
-        field, value = {
-            "coordinated_cluster": ("cluster", "different-cluster"),
-            "coordinated_mode": ("mode", "direct"),
-            "coordinated_provider": ("scheduler_provider", "pbs"),
-        }[mutation]
-        for document_name in ("execution_handle", "execution_record"):
-            document = cast(dict[str, Any], observation[document_name])
-            document[field] = value
-    elif mutation.startswith("runtime_"):
-        pass
-    else:
-        field = "pipeline_id" if mutation == "coordinated_pipeline" else "execution_id"
-        value = (
-            "different-pipeline" if mutation == "coordinated_pipeline" else "different-execution"
-        )
-        observation[field] = value
-        for document_name in ("execution_handle", "execution_record", "progress"):
-            document = cast(dict[str, Any], observation[document_name])
-            document[field] = value
-    selector = {
-        "cluster": "test-cluster",
-        "scheduler_cluster": "test-cluster",
-        "pipeline_id": "pipeline",
-        "execution_id": "execution",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "4242",
-        "last_query_job_id": "job-query-old",
-    }
-    checkpoint = {
-        "schema_version": cli._JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "phase": "execution_query",
-        "observation_state": "observed",
-        "profile": "user",
-        "retry_selector": selector,
-        "builder_inputs": {
-            "cluster": "test-cluster",
-            "scheduler_cluster": "test-cluster",
-            "tool": "jarvis_run",
-            "runtime_metadata": _jarvis_resume_runtime_metadata(
-                state="submitted",
-                scheduler_native_id="4242",
-            ),
-        },
-        "lifecycle_observations": [observation],
-    }
-    if mutation.startswith("runtime_"):
-        builder = cast(dict[str, Any], checkpoint["builder_inputs"])
-        runtime = cast(dict[str, Any], builder["runtime_metadata"])
-        details = cast(dict[str, Any], runtime["details"])
-        native = cast(dict[str, Any], details["native_execution"])
-        if mutation == "runtime_missing_native_execution":
-            details.pop("native_execution")
-        elif mutation in {
-            "runtime_missing_handle",
-            "runtime_missing_record",
-            "runtime_missing_progress",
-        }:
-            native.pop(
-                {
-                    "runtime_missing_handle": "execution_handle",
-                    "runtime_missing_record": "execution_record",
-                    "runtime_missing_progress": "progress",
-                }[mutation]
-            )
-        elif mutation == "runtime_terminal_state":
-            terminal = cast(dict[str, Any], runtime["terminal"])
-            terminal["state"] = "running"
-        else:
-            document_name, field, value = {
-                "runtime_handle_schema": (
-                    "execution_handle",
-                    "schema_version",
-                    "jarvis.execution.handle.v0",
-                ),
-                "runtime_handle_native_id": (
-                    "execution_handle",
-                    "scheduler_native_id",
-                    "9999",
-                ),
-                "runtime_record_native_id": (
-                    "execution_record",
-                    "scheduler_native_id",
-                    "9999",
-                ),
-                "runtime_progress_execution": (
-                    "progress",
-                    "execution_id",
-                    "different-execution",
-                ),
-                "runtime_progress_schema": (
-                    "progress",
-                    "schema_version",
-                    "jarvis.execution.progress.v0",
-                ),
-            }[mutation]
-            document = cast(dict[str, Any], native[document_name])
-            document[field] = value
-    pending_report = new_live_validation_report(
-        scenario="remote-mcp",
-        cluster="test-cluster",
-    )
-    pending_report.status = ValidationStatus.PENDING
-    pending_report.completed_at = datetime.now(UTC)
-    pending_report.resources.append(
-        ValidationResource(
-            kind="jarvis_execution",
-            resource_id="execution",
-            role="resumable_acceptance_workload",
-            cluster="test-cluster",
-            provider="slurm",
-            state=str(observation.get("state")),
-            metadata={"retry_selector": selector, "resume_checkpoint": checkpoint},
-        )
-    )
-    resume_path = tmp_path / f"tampered-{mutation}.json"
-    write_validation_report(pending_report, resume_path)
-    query_calls: list[str] = []
-
-    def forbid_query(**_kwargs: object) -> None:
-        query_calls.append("called")
-        raise AssertionError("tampered checkpoint reached a remote query")
-
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", forbid_query)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "jarvis-mcp-validate",
-            "--cluster",
-            "test-cluster",
-            "--resume-report",
-            str(resume_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert query_calls == []
 
 
 def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment(
@@ -14106,7 +7921,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     checkpoint_path = tmp_path / "scheduler-id-assigned.json"
     write_validation_report(report, checkpoint_path)
 
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         checkpoint_path,
         cluster="test-cluster",
     )
@@ -14130,7 +7945,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     stable_resource.metadata["retry_selector"] = stable_selector
     stable_path = tmp_path / "scheduler-cluster-unavailable.json"
     write_validation_report(stable_unknown_cluster, stable_path)
-    stable_loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    stable_loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         stable_path,
         cluster="test-cluster",
     )
@@ -14163,7 +7978,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
         cluster_path = tmp_path / f"scheduler-cluster-{mutation}.json"
         write_validation_report(cluster_tampered, cluster_path)
         with pytest.raises(ConfigurationError, match="observation identity changed"):
-            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 cluster_path,
                 cluster="test-cluster",
             )
@@ -14201,7 +8016,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
             ConfigurationError,
             match="resume checkpoint is invalid|runtime identity changed",
         ):
-            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 tampered_runtime_path,
                 cluster="test-cluster",
             )
@@ -14220,7 +8035,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     empty_query_path = tmp_path / "empty-query-job-id.json"
     write_validation_report(empty_query_report, empty_query_path)
     with pytest.raises(ConfigurationError, match="observation identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             empty_query_path,
             cluster="test-cluster",
         )
@@ -14244,7 +8059,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     write_validation_report(tampered, tampered_path)
 
     with pytest.raises(ConfigurationError, match="observation identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             tampered_path,
             cluster="test-cluster",
         )
@@ -14299,11 +8114,13 @@ def test_execution_query_remote_boundaries_share_one_deadline(
     monkeypatch.setattr(time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_remotely)
-    monkeypatch.setattr(cli, "_wait_for_remote_job_terminal", wait_for_terminal)
-    monkeypatch.setattr(cli, "_remote_artifact_records", artifact_records)
-    monkeypatch.setattr(cli, "_read_remote_json_artifact_kind", read_artifact)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_wait_for_remote_job_terminal", wait_for_terminal
+    )
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_remote_artifact_records", artifact_records)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_remote_json_artifact_kind", read_artifact)
 
-    cli._execute_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_jarvis_execution_run._execute_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
         profile="user",
@@ -14347,22 +8164,24 @@ def test_remote_status_and_artifact_io_apply_the_shared_deadline(
         return json.dumps({"encoding": "base64", "data": "e30="})
 
     monkeypatch.setattr(time, "monotonic", lambda: 10.0)
-    monkeypatch.setattr(cli, "_run_remote_clio_before_deadline", run_before_deadline)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_run_remote_clio_before_deadline", run_before_deadline
+    )
     definition = ClusterDefinition(name="ares", ssh_host="ares")
 
-    status = cli._wait_for_remote_job_terminal(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = cli_remote_collection_pagination._wait_for_remote_job_terminal(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "job-query",
         timeout_seconds=20.0,
         poll_seconds=2.0,
         deadline=25.0,
     )
-    artifacts = cli._remote_artifact_records(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifacts = cli_jarvis_artifact_io._remote_artifact_records(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "job-query",
         deadline=25.0,
     )
-    payload = cli._read_remote_artifact_kind_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    payload = cli_jarvis_artifact_io._read_remote_artifact_kind_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         artifacts,
         kind="mcp_result",
@@ -14381,7 +8200,7 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
         progress = {
             "packages": ([{"event_count": 1, "latest": {"sequence": 1}}] if index == 333 else [])
         }
-        cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             observations,
             {
                 "query_job_id": f"job-query-{index}",
@@ -14390,7 +8209,7 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
                 "progress": progress,
             },
         )
-    cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observations,
         {
             "query_job_id": "job-query-701",
@@ -14408,50 +8227,3 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
     assert [int(item.rsplit("-", 1)[1]) for item in retained_ids] == sorted(
         int(item.rsplit("-", 1)[1]) for item in retained_ids
     )
-
-
-def test_mcp_server_cli_dispatches_native_fastmcp_stdio(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    observed: list[str] = []
-
-    def run_stdio(*, profile: str) -> None:
-        observed.append(profile)
-
-    monkeypatch.setattr(fastmcp_server, "run_fastmcp_stdio", run_stdio)
-
-    result = CliRunner().invoke(app, ["mcp-server", "--profile", "operator"])
-
-    assert result.exit_code == 0
-    assert observed == ["operator"]
-
-
-def test_mcp_server_cli_dispatches_authenticated_fastmcp_http(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    observed: list[tuple[str, str, int, str]] = []
-
-    def run_http(*, profile: str, host: str, port: int, path: str) -> None:
-        observed.append((profile, host, port, path))
-
-    monkeypatch.setattr(fastmcp_server, "run_fastmcp_http", run_http)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-server",
-            "--profile",
-            "all",
-            "--transport",
-            "http",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "9876",
-            "--path",
-            "/relay-mcp",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert observed == [("all", "0.0.0.0", 9876, "/relay-mcp")]

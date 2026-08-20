@@ -13,6 +13,8 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_remote_command as session_remote_command
+import clio_relay.session_start_query as session_start_query
 import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
@@ -21,9 +23,11 @@ from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
+    SessionLifecycleReport,
+)
+from clio_relay.session_wire_models import (
     OwnedSessionStartStatusSelector,
     RemoteSessionStateEvidence,
-    SessionLifecycleReport,
 )
 from clio_relay.transport_probe import (
     run_frp_direct_http_probe,
@@ -723,7 +727,7 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
 
     def deadline(**kwargs: object) -> list[str]:
         start_invocations.append(kwargs)
-        raise session_lifecycle._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        raise session_remote_command._RemoteSessionCommandDeadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "start transport deadline"
         )
 
@@ -757,7 +761,7 @@ def test_ssh_forward_probe_preserves_nonterminal_start_after_transport_deadline(
         )
 
     monkeypatch.setattr(session_lifecycle, "start_remote_session", deadline)
-    monkeypatch.setattr(session_lifecycle, "status_remote_session_start", fake_status)
+    monkeypatch.setattr(session_start_query, "status_remote_session_start", fake_status)
 
     with pytest.raises(RelayError, match=f"state={expected_state}") as raised:
         run_ssh_forward_http_probe(

@@ -23,8 +23,15 @@ from pydantic import ValidationError
 from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli as relay_cli
-from clio_relay import remote_cli, remote_mcp
+import clio_relay.cli_remote_mcp as cli_remote_mcp
+import clio_relay.remote_mcp_validation as remote_mcp_validation
+from clio_relay import (
+    remote_cli,
+    remote_mcp,
+    remote_mcp_aliasing,
+    remote_mcp_cache,
+    remote_mcp_schema_validation,
+)
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -55,12 +62,6 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.remote_mcp import (
-    MAX_REMOTE_MCP_CACHE_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
-    MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES,
-    MAX_REMOTE_MCP_TOOLS_PER_SERVER,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
     RemoteMcpAcceptanceReport,
@@ -80,6 +81,13 @@ from clio_relay.remote_mcp import (
     is_remote_mcp_control_query,
     remote_mcp_server_artifact_digest,
 )
+from clio_relay.remote_mcp_acceptance_models import (
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+)
+from clio_relay.remote_mcp_cache import MAX_REMOTE_MCP_CACHE_BYTES, MAX_REMOTE_MCP_TOOLS_PER_SERVER
+from clio_relay.remote_mcp_tool_schema import MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES
 from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
@@ -843,7 +851,7 @@ def test_scientific_catalog_result_rejects_overdeep_content_without_traversing()
     dataset_id = "deep-water-impact-2018-yb31-first5"
     structured = _scientific_catalog_describe_result(dataset_id)
     nested: dict[str, object] = {"leaf": True}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"child": nested}
     descriptor = cast(dict[str, object], structured["dataset_descriptor"])
     descriptor["unsafe_test_nesting"] = nested
@@ -1011,7 +1019,7 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     entry = _entry(registration, cluster="alpha", server_name="science")
     path = tmp_path / "remote-mcp-cache.json"
     attempts = 0
-    original_replace = remote_mcp.os.replace
+    original_replace = remote_mcp_cache.os.replace
 
     def sharing_once(
         source: str | os.PathLike[str],
@@ -1026,8 +1034,8 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     def no_sleep(_seconds: float) -> None:
         return
 
-    monkeypatch.setattr(remote_mcp.os, "replace", sharing_once)
-    monkeypatch.setattr(remote_mcp.time, "sleep", no_sleep)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", sharing_once)
+    monkeypatch.setattr(remote_mcp_cache.time, "sleep", no_sleep)
 
     RemoteMcpSchemaCache.update_entry(path, entry)
 
@@ -1050,7 +1058,7 @@ def test_remote_mcp_cache_preserves_old_file_when_replace_fails(
         del source, target
         raise OSError("simulated replacement failure")
 
-    monkeypatch.setattr(remote_mcp.os, "replace", fail_replace)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", fail_replace)
 
     with pytest.raises(OSError, match="simulated replacement failure"):
         RemoteMcpSchemaCache.update_entry(path, replacement)
@@ -1097,7 +1105,7 @@ def test_remote_mcp_discovery_and_schema_sizes_are_bounded() -> None:
 
 def test_remote_mcp_schema_depth_is_bounded_before_recursive_validation() -> None:
     nested: dict[str, object] = {"type": "object"}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"allOf": [nested]}
 
     with pytest.raises(ValidationError, match="nesting levels"):
@@ -1123,7 +1131,11 @@ def test_remote_mcp_discovery_json_node_count_is_bounded(
     artifact = json.loads(_discovery_artifact(registration, tools=[_tool("inspect")]))
     artifact["server_info"] = {"wide": list(range(200))}
     payload = json.dumps(artifact).encode()
-    monkeypatch.setattr(remote_mcp, "MAX_REMOTE_MCP_JSON_NODES", 100)
+    # MAX_REMOTE_MCP_JSON_NODES is read inside _require_bounded_json_structure,
+    # which now lives in remote_mcp_schema_validation.py (#231) -- patch the
+    # module the guard actually reads its bound from, not remote_mcp's
+    # re-export (moved-symbol patch seam, design doc §4.6).
+    monkeypatch.setattr(remote_mcp_schema_validation, "MAX_REMOTE_MCP_JSON_NODES", 100)
 
     with pytest.raises(ValueError, match="100 JSON nodes"):
         _entry_from_payload(registration, payload)
@@ -1138,7 +1150,8 @@ def test_remote_mcp_protocol_error_diagnostic_is_bounded() -> None:
     with pytest.raises(ValueError) as error:
         _entry_from_payload(registration, payload)
 
-    assert len(str(error.value)) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS + 100
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert len(str(error.value)) <= max_chars + 100
     assert str(error.value).endswith("... [truncated]")
 
 
@@ -1404,9 +1417,9 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
     contract_artifact = cast(
         dict[str, object],
         json.loads(
-            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json").read_text(
-                encoding="utf-8"
-            )
+            (
+                Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json"
+            ).read_text(encoding="utf-8")
         ),
     )
     tools = cast(list[dict[str, object]], contract_artifact["tools"])
@@ -1850,7 +1863,8 @@ def test_catalog_aliases_remain_interoperable_for_long_remote_names() -> None:
     assert sorted(first.tools) == sorted(second.tools)
     assert len(first.tools) == 2
     assert all(
-        len(alias) <= remote_mcp.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH for alias in first.tools
+        len(alias) <= remote_mcp_aliasing.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+        for alias in first.tools
     )
     assert all(re.fullmatch(r"[a-z0-9_]+", alias) is not None for alias in first.tools)
 
@@ -3357,7 +3371,7 @@ def test_cli_remote_refresh_stages_exact_registry_for_tools_list_and_cleans_it(
     monkeypatch.setattr("clio_relay.remote_cli.write_remote_file", write_registry)
     monkeypatch.setattr("clio_relay.remote_cli.remove_remote_file", remove_registry)
     monkeypatch.setattr(remote_cli, "run_remote_clio", run_remote)
-    monkeypatch.setattr(relay_cli, "_read_remote_mcp_result_artifact", read_artifact)
+    monkeypatch.setattr(cli_remote_mcp, "_read_remote_mcp_result_artifact", read_artifact)
 
     result = CliRunner().invoke(
         app,
@@ -4194,7 +4208,8 @@ def test_spack_structured_result_bounds_output_schema_error_evidence() -> None:
     schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
     errors = cast(list[str], schema_evidence["validation_errors"])
     assert len(errors) == remote_mcp.MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS
-    assert all(len(error) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS for error in errors)
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert all(len(error) <= max_chars for error in errors)
     assert schema_evidence["validation_errors_truncated"] is True
 
 
@@ -5013,7 +5028,9 @@ def test_cli_fresh_spack_preflight_resolves_every_alias_before_dispatch(
         dispatched = True
         raise AssertionError("preflight failure must precede dispatch")
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", reject_dispatch)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", reject_dispatch
+    )
     report_path = tmp_path / "validation" / "fresh-preflight.json"
 
     result = CliRunner().invoke(
@@ -5089,8 +5106,12 @@ def test_cli_fresh_spack_runs_ordered_transition_and_emits_combined_report(
             manifest_sha256="6" * 64,
         )
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", execute)
-    monkeypatch.setattr("clio_relay.cli._collect_spack_configuration_observation", observe)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", execute
+    )
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.collect_spack_configuration_observation", observe
+    )
     output_path = tmp_path / "validation" / "fresh-transition.json"
 
     result = CliRunner().invoke(
@@ -5165,8 +5186,12 @@ def test_cli_fresh_spack_refuses_install_when_preinstall_is_not_absent(
         observed = True
         raise AssertionError("configuration observation must follow proven absence")
 
-    monkeypatch.setattr("clio_relay.cli._execute_remote_mcp_validation_call", execute)
-    monkeypatch.setattr("clio_relay.cli._collect_spack_configuration_observation", observe)
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.execute_remote_mcp_validation_call", execute
+    )
+    monkeypatch.setattr(
+        "clio_relay.remote_mcp_validation.collect_spack_configuration_observation", observe
+    )
     report_path = tmp_path / "validation" / "fresh-refused.json"
 
     result = CliRunner().invoke(
@@ -5204,7 +5229,9 @@ def test_remote_spack_configuration_observation_uses_bounded_bash_command(
         return json.dumps(payload)
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
-    collect_remote = relay_cli.__dict__["_collect_remote_spack_configuration_observation"]
+    collect_remote = remote_mcp_validation.__dict__[
+        "_collect_remote_spack_configuration_observation"
+    ]
     observation = collect_remote(
         definition=ClusterDefinition(name="alpha", ssh_host="ares"),
         phase="preinstall",
@@ -5213,14 +5240,16 @@ def test_remote_spack_configuration_observation_uses_bounded_bash_command(
     )
 
     assert observation.manifest_sha256 == expected_sha256
-    assert observed_timeout == [relay_cli.SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS]
+    assert observed_timeout == [
+        remote_mcp_validation.SPACK_CONFIGURATION_OBSERVATION_TIMEOUT_SECONDS
+    ]
     assert len(commands) == 1
     assert commands[0].startswith("python3 -c ")
     assert "powershell" not in commands[0].lower()
     assert "cmd.exe" not in commands[0].lower()
     assert shlex.quote(manifest_path) in commands[0]
-    assert commands[0].endswith(f" {relay_cli.MAX_SPACK_CONFIGURATION_TREE_ENTRIES}")
-    observer_script = relay_cli.__dict__["_remote_spack_configuration_observer_script"]
+    assert commands[0].endswith(f" {remote_mcp_validation.MAX_SPACK_CONFIGURATION_TREE_ENTRIES}")
+    observer_script = remote_mcp_validation.__dict__["_remote_spack_configuration_observer_script"]
     observer_source = observer_script()
     compile(observer_source, "<observer>", "exec")
     assert "O_NOFOLLOW" in observer_source
@@ -5236,7 +5265,9 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    require_exact_tree = relay_cli.__dict__["_require_exact_spack_configuration_component_set"]
+    require_exact_tree = remote_mcp_validation.__dict__[
+        "_require_exact_spack_configuration_component_set"
+    ]
     wrapper = tmp_path / "bin" / "spack"
     configuration = tmp_path / "config" / "config.yaml"
     wrapper.parent.mkdir()
@@ -5269,7 +5300,7 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
 
     extra.unlink()
     with monkeypatch.context() as bound_patch:
-        bound_patch.setattr(relay_cli, "MAX_SPACK_CONFIGURATION_TREE_ENTRIES", 2)
+        bound_patch.setattr(remote_mcp_validation, "MAX_SPACK_CONFIGURATION_TREE_ENTRIES", 2)
         with pytest.raises(RelayError, match="entry count exceeded"):
             require_exact_tree(tmp_path, declarations)
 
@@ -5277,7 +5308,7 @@ def test_spack_configuration_tree_rejects_extra_symlink_and_unbounded_entries(
 def test_local_spack_configuration_observation_is_real_and_nofollow(
     tmp_path: Path,
 ) -> None:
-    collect_local = relay_cli.__dict__["_collect_local_spack_configuration_observation"]
+    collect_local = remote_mcp_validation.__dict__["_collect_local_spack_configuration_observation"]
     if os.name == "nt":
         with pytest.raises(RelayError, match="requires a POSIX host"):
             collect_local(
@@ -5325,7 +5356,7 @@ def test_remote_spack_configuration_observation_fails_closed(
     case: str,
 ) -> None:
     output = (
-        "x" * (relay_cli.MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES + 1)
+        "x" * (remote_mcp_validation.MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES + 1)
         if case == "oversized"
         else json.dumps(
             {
@@ -5351,7 +5382,7 @@ def test_remote_spack_configuration_observation_fails_closed(
         return output
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_shell", run_shell)
-    collect = relay_cli.__dict__["_collect_spack_configuration_observation"]
+    collect = remote_mcp_validation.collect_spack_configuration_observation
 
     with pytest.raises(RelayError):
         collect(
@@ -5384,7 +5415,7 @@ def test_remote_spack_configuration_observation_fails_closed(
 def test_spack_configuration_manifest_parser_rejects_unsafe_input(
     manifest: bytes,
 ) -> None:
-    parse_manifest = relay_cli.__dict__["_parse_spack_configuration_manifest"]
+    parse_manifest = remote_mcp_validation.__dict__["_parse_spack_configuration_manifest"]
     with pytest.raises(RelayError):
         parse_manifest(manifest)
 

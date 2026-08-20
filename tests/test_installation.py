@@ -4,22 +4,17 @@ import hashlib
 import json
 import logging
 import os
-import shutil
-import subprocess
 import sys
-import venv
-import zipfile
-from base64 import urlsafe_b64encode
 from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 import clio_relay.installation as installation_module
+import clio_relay.worker_runtime_verification as worker_runtime_verification_module
 from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
 from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
@@ -33,9 +28,7 @@ from clio_relay.installation import (
     PersistentUvToolIdentity,
     installation_info,
     load_install_receipt,
-    probe_clio_kit_native_execution_contract,
     verified_session_api_install_receipt,
-    verify_distribution_file_source,
     verify_remote_clio_kit_native_execution_component,
     verify_remote_native_jarvis_component,
     verify_remote_worker_info,
@@ -44,13 +37,10 @@ from clio_relay.installation import (
     write_self_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
-    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     DEFAULT_JARVIS_MCP_COMMAND,
     JARVIS_MCP_COMMAND_ENV,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
-    jarvis_user_contract,
-    jarvis_user_contract_titles,
 )
 from clio_relay.validation_report import (
     InstallSource,
@@ -91,726 +81,6 @@ def _verified_locked_jarvis_runtime() -> dict[str, object]:
             "wheel_entry_count": 1,
         },
     }
-
-
-def test_distribution_file_source_accepts_a_canonical_filesystem_alias(
-    tmp_path: Path,
-) -> None:
-    canonical_home = tmp_path / "mnt" / "common" / "operator"
-    canonical_home.mkdir(parents=True)
-    wheel = canonical_home / "jarvis_cd-1.2.2-py3-none-any.whl"
-    wheel.write_bytes(b"verified-wheel")
-    lexical_home = tmp_path / "home" / "operator"
-    lexical_home.parent.mkdir()
-    try:
-        lexical_home.symlink_to(canonical_home, target_is_directory=True)
-        source = lexical_home / wheel.name
-    except OSError:
-        source = canonical_home / ".." / canonical_home.name / wheel.name
-
-    resolved = verify_distribution_file_source(
-        direct_url_text=json.dumps({"url": source.as_uri(), "archive_info": {}}),
-        expected_artifact=wheel,
-    )
-
-    assert resolved == wheel.resolve()
-
-
-@pytest.mark.parametrize(
-    ("direct_url_text", "message"),
-    [
-        ("not-json", "not valid JSON"),
-        ("[]", "must contain an object"),
-        ("{}", "does not name a source URL"),
-        (json.dumps({"url": "https://example.invalid/wheel.whl"}), "not a local file URL"),
-        (json.dumps({"url": "file://remote.example/wheel.whl"}), "must not contain an authority"),
-        (json.dumps({"url": "file:relative.whl"}), "path must be absolute"),
-        (json.dumps({"url": "file:///wheel.whl?source=other"}), "query or fragment"),
-        (json.dumps({"url": "file:///wheel.whl#other"}), "query or fragment"),
-        (json.dumps({"url": "file://[invalid/wheel.whl"}), "source URL is not valid"),
-    ],
-)
-def test_distribution_file_source_rejects_ambiguous_metadata(
-    tmp_path: Path,
-    direct_url_text: str,
-    message: str,
-) -> None:
-    wheel = tmp_path / "jarvis_cd-1.2.2-py3-none-any.whl"
-    wheel.write_bytes(b"verified-wheel")
-
-    with pytest.raises(ConfigurationError, match=message):
-        verify_distribution_file_source(
-            direct_url_text=direct_url_text,
-            expected_artifact=wheel,
-        )
-
-
-def test_distribution_file_source_rejects_a_different_existing_artifact(
-    tmp_path: Path,
-) -> None:
-    expected = tmp_path / "expected.whl"
-    other = tmp_path / "other.whl"
-    expected.write_bytes(b"same-bytes")
-    other.write_bytes(b"same-bytes")
-
-    with pytest.raises(ConfigurationError, match="does not match the verified wheel"):
-        verify_distribution_file_source(
-            direct_url_text=json.dumps({"url": other.as_uri()}),
-            expected_artifact=expected,
-        )
-
-
-def test_distribution_file_source_rejects_a_decoded_nul_path(tmp_path: Path) -> None:
-    wheel = tmp_path / "jarvis_cd-1.2.2-py3-none-any.whl"
-    wheel.write_bytes(b"verified-wheel")
-
-    with pytest.raises(ConfigurationError, match="cannot be resolved"):
-        verify_distribution_file_source(
-            direct_url_text=json.dumps({"url": f"{wheel.as_uri()}%00"}),
-            expected_artifact=wheel,
-        )
-
-
-def test_distribution_file_source_decodes_file_url_percent_escapes_once(
-    tmp_path: Path,
-) -> None:
-    wheel = tmp_path / "jarvis%20cd.whl"
-    wheel.write_bytes(b"verified-wheel")
-    source_url = wheel.as_uri()
-    assert "%2520" in source_url
-
-    resolved = verify_distribution_file_source(
-        direct_url_text=json.dumps({"url": source_url}),
-        expected_artifact=wheel,
-    )
-
-    assert resolved == wheel.resolve()
-
-
-def test_native_jarvis_runtime_accepts_canonical_source_aliases(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep provider and execution provenance true across one home-mount alias."""
-    canonical_home = tmp_path / "mnt" / "common" / "operator"
-    canonical_home.mkdir(parents=True)
-    wheel = canonical_home / "jarvis_cd-1.2.2-py3-none-any.whl"
-    wheel.write_bytes(b"verified-jarvis-wheel")
-    visible_home = tmp_path / "home" / "operator"
-    visible_home.parent.mkdir()
-    try:
-        visible_home.symlink_to(canonical_home, target_is_directory=True)
-        visible_wheel = visible_home / wheel.name
-    except OSError:
-        alias_directory = canonical_home / "alias"
-        alias_directory.mkdir()
-        visible_wheel = alias_directory / ".." / wheel.name
-    source_url = {"value": visible_wheel.as_uri()}
-
-    def read_direct_url(_name: str) -> str:
-        return json.dumps({"url": source_url["value"]})
-
-    distribution = cast(
-        metadata.Distribution,
-        SimpleNamespace(
-            name="jarvis-cd",
-            version="1.2.2",
-            entry_points=[],
-            read_text=read_direct_url,
-        ),
-    )
-    capability = NativeJarvisExecutionCapability(
-        operations=[
-            "execution_handle.progress",
-            "execution_store.resolve_service_runtime_authority",
-            "pipeline.get_execution",
-            "pipeline.get_execution_progress",
-            "pipeline.run",
-        ]
-    )
-
-    def probe_execution(_python: str | None, _distribution: str) -> dict[str, object]:
-        return {
-            "executable": sys.executable,
-            "distribution": "jarvis-cd",
-            "distribution_version": "1.2.2",
-            "direct_url": source_url["value"],
-            "entry_points": [],
-        }
-
-    def find_distribution(_name: str) -> metadata.Distribution:
-        return distribution
-
-    def probe_capability(_python: str | None) -> NativeJarvisExecutionCapability:
-        return capability
-
-    def match_jarvis_executable(
-        _executable: str | None,
-        _python: str | None,
-        *,
-        runtime_command: list[str],
-    ) -> bool:
-        return bool(runtime_command)
-
-    def probe_record_closure(
-        _python: str | None,
-        _distribution_name: str,
-        _expected_artifact: Path | None,
-        *,
-        environment: dict[str, str] | None = None,
-    ) -> dict[str, object]:
-        del environment
-        return {
-            "schema_version": "clio-relay.python-record-closure.v1",
-            "verified": True,
-            "tree_scanned": False,
-            "tree_copied": False,
-        }
-
-    monkeypatch.setattr(installation_module.metadata, "distribution", find_distribution)
-    monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
-    monkeypatch.setattr(
-        installation_module,
-        "_probe_python_distribution_record_closure",
-        probe_record_closure,
-    )
-    monkeypatch.setattr(
-        installation_module,
-        "probe_jarvis_native_execution_capability",
-        probe_capability,
-    )
-    monkeypatch.setattr(
-        installation_module,
-        "_jarvis_executable_matches_interpreter",
-        match_jarvis_executable,
-    )
-    runtime_identity_probe_name = "_native_jarvis_component_runtime_identity"
-    runtime_identity_probe = cast(
-        Callable[[ComponentArtifactIdentity], dict[str, object]],
-        getattr(installation_module, runtime_identity_probe_name),
-    )
-    component = ComponentArtifactIdentity(
-        distribution="jarvis-cd",
-        distribution_version="1.2.2",
-        install_spec=str(wheel),
-        requested_source="wheel",
-        artifact_filename=wheel.name,
-        artifact_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
-        runtime_artifact_path=str(wheel.resolve()),
-        runtime_command=[sys.executable, "-m", "jarvis_cd"],
-        runtime_interpreters={"provider": sys.executable, "execution": sys.executable},
-        runtime_executables={"jarvis": sys.executable},
-        native_execution=capability,
-    )
-
-    identity = runtime_identity_probe(component)
-
-    assert identity["provider_interpreter_verified"] is True
-    assert identity["execution_source_verified"] is True
-    assert identity["runtime_artifact_path_verified"] is True
-    assert identity["execution_interpreter_verified"] is True
-    assert identity["verified"] is True
-
-    other = canonical_home / "other" / wheel.name
-    other.parent.mkdir()
-    other.write_bytes(wheel.read_bytes())
-    source_url["value"] = other.as_uri()
-    substituted = runtime_identity_probe(component)
-
-    assert substituted["provider_interpreter_verified"] is False
-    assert substituted["execution_source_verified"] is False
-    assert substituted["runtime_artifact_path_verified"] is False
-    assert substituted["execution_interpreter_verified"] is False
-    assert substituted["verified"] is False
-
-
-def test_relay_execution_runtime_requires_exact_wheel_closure_and_imports(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A retained JARVIS interpreter must prove the exact relay package runtime."""
-    wheel = tmp_path / "clio_relay-1.5.0-py3-none-any.whl"
-    wheel.write_bytes(b"verified-relay-wheel")
-    import_verified = {"value": True}
-
-    def probe_execution(_python: str | None, _distribution: str) -> dict[str, object]:
-        return {
-            "executable": sys.executable,
-            "distribution": "clio-relay",
-            "distribution_version": "1.5.0",
-            "direct_url": wheel.as_uri(),
-            "entry_points": [],
-        }
-
-    def probe_record_closure(
-        _python: str | None,
-        _distribution_name: str,
-        _expected_artifact: Path | None,
-        *,
-        environment: dict[str, str] | None = None,
-    ) -> dict[str, object]:
-        del environment
-        return {
-            "schema_version": "clio-relay.python-record-closure.v1",
-            "verified": True,
-            "tree_scanned": False,
-            "tree_copied": False,
-        }
-
-    def probe_imports(
-        _python: str | None,
-        *,
-        expected_version: str | None,
-    ) -> dict[str, object]:
-        assert expected_version == "1.5.0"
-        return {"verified": import_verified["value"], "error": None}
-
-    monkeypatch.setattr(installation_module, "_probe_python_distribution", probe_execution)
-    monkeypatch.setattr(
-        installation_module,
-        "_probe_python_distribution_record_closure",
-        probe_record_closure,
-    )
-    monkeypatch.setattr(
-        installation_module,
-        "_probe_relay_execution_imports",
-        probe_imports,
-    )
-    component = ComponentArtifactIdentity(
-        distribution="clio-relay",
-        distribution_version="1.5.0",
-        install_spec=str(wheel),
-        requested_source="wheel",
-        artifact_filename=wheel.name,
-        artifact_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
-        runtime_artifact_path=str(wheel),
-        runtime_interpreters={"provider": sys.executable, "execution": sys.executable},
-    )
-
-    identity = installation_module._relay_execution_runtime_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        component
-    )
-
-    assert identity["execution_runtime_verified"] is True
-    assert identity["execution_record_closure_verified"] is True
-    assert identity["execution_imports_verified"] is True
-
-    import_verified["value"] = False
-    rejected = installation_module._relay_execution_runtime_identity(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        component
-    )
-    assert rejected["execution_runtime_verified"] is False
-    assert rejected["execution_imports_verified"] is False
-
-
-def _record_row(relative: str, payload: bytes) -> str:
-    digest = urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
-    return f"{relative},sha256={digest},{len(payload)}"
-
-
-def _bound_python_script_header(executable: str, *, posix_launcher: str = "uv") -> bytes:
-    if os.name == "nt":
-        return f"#!{executable}\n".encode()
-    if posix_launcher == "uv":
-        provider = "'" + executable.replace("'", "'\"'\"'") + "'"
-    elif posix_launcher == "pip":
-        provider = executable
-    else:
-        raise AssertionError(f"unsupported fixture launcher: {posix_launcher}")
-    return f"#!/bin/sh\n'''exec' {provider} \"$0\" \"$@\"\n' '''\n".encode()
-
-
-def _create_wheel_scripts_fixture(
-    tmp_path: Path,
-    *,
-    posix_launcher: str = "uv",
-) -> tuple[Path, str, Path, dict[str, Path], dict[str, str]]:
-    environment = tmp_path / "environment"
-    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
-    invoked_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    completed = subprocess.run(
-        [
-            str(invoked_python),
-            "-I",
-            "-c",
-            (
-                "import json, sys, sysconfig; "
-                "print(json.dumps({'executable': sys.executable, "
-                "'paths': sysconfig.get_paths()}))"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    runtime = cast(dict[str, object], json.loads(completed.stdout))
-    executable = cast(str, runtime["executable"])
-    paths = cast(dict[str, str], runtime["paths"])
-    site_packages = Path(paths["purelib"])
-    scripts_root = Path(paths["scripts"])
-    scripts_root.mkdir(parents=True, exist_ok=True)
-
-    metadata_root = "fixture_jarvis-1.0.dist-info"
-    record_name = f"{metadata_root}/RECORD"
-    entry_points = b"[console_scripts]\nfixture-jarvis = fixture_jarvis.cli:main\n"
-    installed_members = {
-        "fixture_jarvis/__init__.py": b'"""Fixture package."""\n',
-        "fixture_jarvis/cli.py": b"def main() -> None:\n    return None\n",
-        f"{metadata_root}/METADATA": (
-            b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
-        ),
-        f"{metadata_root}/WHEEL": (
-            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
-        ),
-        f"{metadata_root}/entry_points.txt": entry_points,
-    }
-    for relative, payload in installed_members.items():
-        destination = site_packages / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
-
-    source_scripts = {
-        "fixture-jarvis": b"#!python\nprint('wheel console body')\n",
-        "fixture-resource": b"#!python\nprint('wheel resource body')\n",
-    }
-    header = _bound_python_script_header(executable, posix_launcher=posix_launcher)
-    installed_scripts = {
-        "fixture-jarvis": scripts_root / "fixture-jarvis",
-        "fixture-resource": scripts_root / "fixture-resource",
-    }
-    installed_scripts["fixture-jarvis"].write_bytes(
-        header
-        + b"import sys\n"
-        + b"from fixture_jarvis.cli import main\n"
-        + b"if __name__ == '__main__':\n"
-        + b"    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
-        + b"    sys.exit(main())\n"
-    )
-    installed_scripts["fixture-resource"].write_bytes(header + b"print('wheel resource body')\n")
-    if os.name != "nt":
-        for script in installed_scripts.values():
-            script.chmod(0o755)
-
-    installed_record_rows = [
-        _record_row(relative, payload) for relative, payload in sorted(installed_members.items())
-    ]
-    record_members: dict[str, str] = {}
-    for script_name, script in sorted(installed_scripts.items()):
-        relative = os.path.relpath(script, site_packages).replace("\\", "/")
-        record_members[script_name] = relative
-        installed_record_rows.append(_record_row(relative, script.read_bytes()))
-    installed_record_rows.append(f"{record_name},,")
-    installed_record = site_packages / record_name
-    installed_record.write_text("\n".join(installed_record_rows) + "\n", encoding="utf-8")
-
-    wheel_members = dict(installed_members)
-    for script_name, payload in source_scripts.items():
-        wheel_members[f"fixture_jarvis-1.0.data/scripts/{script_name}"] = payload
-    wheel_record_rows = [
-        _record_row(relative, payload) for relative, payload in sorted(wheel_members.items())
-    ]
-    wheel_record_rows.append(f"{record_name},,")
-    wheel_record = ("\n".join(wheel_record_rows) + "\n").encode()
-    wheel = tmp_path / "fixture_jarvis-1.0-py3-none-any.whl"
-    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for relative, payload in wheel_members.items():
-            archive.writestr(relative, payload)
-        archive.writestr(record_name, wheel_record)
-    return invoked_python, executable, wheel, installed_scripts, record_members
-
-
-def _create_wheel_data_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    environment = tmp_path / "environment"
-    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
-    invoked_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    completed = subprocess.run(
-        [
-            str(invoked_python),
-            "-I",
-            "-c",
-            (
-                "import json, sysconfig; "
-                "print(json.dumps({'purelib': sysconfig.get_path('purelib'), "
-                "'data': sysconfig.get_path('data')}))"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    paths = cast(dict[str, str], json.loads(completed.stdout))
-    site_packages = Path(paths["purelib"])
-    data_root = Path(paths["data"])
-    metadata_root = "fixture_jarvis-1.0.dist-info"
-    record_name = f"{metadata_root}/RECORD"
-    wheel_data_name = "fixture_jarvis-1.0.data/data/wfcommons-schema.json"
-    data_payload = b'{"schema": "fixture"}\n'
-    installed_data = data_root / "wfcommons-schema.json"
-    installed_data.parent.mkdir(parents=True, exist_ok=True)
-    installed_data.write_bytes(data_payload)
-    members = {
-        "fixture_jarvis/__init__.py": b'"""Fixture package."""\n',
-        f"{metadata_root}/METADATA": (
-            b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
-        ),
-        f"{metadata_root}/WHEEL": (
-            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
-        ),
-    }
-    installed_record_rows: list[str] = []
-    for relative, payload in sorted(members.items()):
-        destination = site_packages / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
-        installed_record_rows.append(_record_row(relative, payload))
-    installed_data_relative = os.path.relpath(installed_data, site_packages).replace("\\", "/")
-    installed_record_rows.append(_record_row(installed_data_relative, data_payload))
-    installed_record_rows.append(f"{record_name},,")
-    installed_record = site_packages / record_name
-    installed_record.write_text("\n".join(installed_record_rows) + "\n", encoding="utf-8")
-
-    wheel_members = {**members, wheel_data_name: data_payload}
-    wheel_record_rows = [
-        _record_row(relative, payload) for relative, payload in sorted(wheel_members.items())
-    ]
-    wheel_record_rows.append(f"{record_name},,")
-    wheel = tmp_path / "fixture_jarvis-1.0-py3-none-any.whl"
-    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for relative, payload in wheel_members.items():
-            archive.writestr(relative, payload)
-        archive.writestr(record_name, ("\n".join(wheel_record_rows) + "\n").encode())
-    return invoked_python, wheel, installed_record, installed_data
-
-
-def _refresh_installed_record_member(
-    python: Path,
-    distribution_name: str,
-    relative: str,
-    payload: bytes,
-) -> None:
-    completed = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            (
-                "from importlib import metadata; "
-                "print(metadata.distribution('"
-                + distribution_name
-                + "').locate_file('fixture_jarvis-1.0.dist-info/RECORD'))"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    record = Path(completed.stdout.strip())
-    replacement = _record_row(relative, payload)
-    rows = record.read_text(encoding="utf-8").splitlines()
-    matching = [index for index, row in enumerate(rows) if row.startswith(relative + ",")]
-    assert len(matching) == 1
-    rows[matching[0]] = replacement
-    record.write_text("\n".join(rows) + "\n", encoding="utf-8")
-
-
-@pytest.mark.parametrize("posix_launcher", ["uv", "pip"])
-def test_native_jarvis_record_closure_verifies_standard_wheel_scripts(
-    tmp_path: Path,
-    posix_launcher: str,
-) -> None:
-    python, _, wheel, _, _ = _create_wheel_scripts_fixture(
-        tmp_path,
-        posix_launcher=posix_launcher,
-    )
-    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-    verified = probe(str(python), "fixture-jarvis", wheel)
-
-    assert verified["verified"] is True
-    assert verified["wheel_script_transform_count"] == 2
-    transforms = {
-        cast(str, item["member"]): item
-        for item in cast(list[dict[str, object]], verified["wheel_script_transforms"])
-    }
-    console = transforms["fixture_jarvis-1.0.data/scripts/fixture-jarvis"]
-    resource = transforms["fixture_jarvis-1.0.data/scripts/fixture-resource"]
-    assert console["transform"] == "declared-console-wrapper"
-    assert console["entry_point"] == "fixture_jarvis.cli:main"
-    assert resource["transform"] == "interpreter-shebang"
-    assert resource["entry_point"] is None
-    expected_launcher = (
-        "direct-interpreter" if os.name == "nt" else f"{posix_launcher}-posix-trampoline"
-    )
-    assert console["launcher"] == expected_launcher
-    assert resource["launcher"] == expected_launcher
-
-
-def test_native_jarvis_record_closure_verifies_standard_wheel_data(
-    tmp_path: Path,
-) -> None:
-    python, wheel, installed_record, installed_data = _create_wheel_data_fixture(tmp_path)
-    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-    verified = probe(str(python), "fixture-jarvis", wheel)
-
-    assert verified["verified"] is True
-    assert verified["wheel_payload_file_count"] == 4
-
-    relative = os.path.relpath(installed_data, installed_record.parent.parent).replace("\\", "/")
-    rows = installed_record.read_text(encoding="utf-8").splitlines()
-    installed_record.write_text(
-        "\n".join(row for row in rows if not row.startswith(relative + ",")) + "\n",
-        encoding="utf-8",
-    )
-    unowned = probe(str(python), "fixture-jarvis", wheel)
-
-    assert unowned["verified"] is False
-    assert unowned["error_code"] == "installed-wheel-data-file-is-not-owned-by-distribution-RECORD"
-
-
-@pytest.mark.parametrize("tamper", ["resource-body", "console-wrapper", "trampoline"])
-def test_native_jarvis_record_closure_rejects_arbitrary_script_transforms(
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    python, executable, wheel, scripts, record_members = _create_wheel_scripts_fixture(tmp_path)
-    script_name = "fixture-resource" if tamper != "console-wrapper" else "fixture-jarvis"
-    script = scripts[script_name]
-    payload = script.read_bytes()
-    if tamper == "resource-body":
-        payload = _bound_python_script_header(executable) + b"print('substituted body')\n"
-        expected_error = "body does not match"
-    elif tamper == "console-wrapper":
-        payload += b"print('injected statement')\n"
-        expected_error = "not a canonical declared wrapper"
-    else:
-        if os.name == "nt":
-            payload = payload.replace(
-                f"#!{executable}\n".encode(),
-                f"#!{executable} -I\n".encode(),
-                1,
-            )
-        else:
-            payload = payload.replace(b' "$0" "$@"\n', b' "$0" "$@"; echo injected\n', 1)
-        expected_error = "not bound" if os.name == "nt" else "invalid POSIX shell trampoline"
-    script.write_bytes(payload)
-    if os.name != "nt":
-        script.chmod(0o755)
-    _refresh_installed_record_member(
-        python,
-        "fixture-jarvis",
-        record_members[script_name],
-        payload,
-    )
-    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-    rejected = probe(str(python), "fixture-jarvis", wheel)
-
-    assert rejected["verified"] is False
-    assert expected_error in str(rejected["error"])
-    assert rejected["error_code"] != "unclassified-record-closure-error"
-
-
-def test_native_jarvis_record_closure_rejects_a_tampered_installed_member(
-    tmp_path: Path,
-) -> None:
-    environment = tmp_path / "environment"
-    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
-    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    completed = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    site_packages = Path(completed.stdout.strip())
-    package = site_packages / "fixture_jarvis"
-    metadata_root = site_packages / "fixture_jarvis-1.0.dist-info"
-    package.mkdir(parents=True)
-    metadata_root.mkdir()
-    members = {
-        "fixture_jarvis/__init__.py": b'"""Fixture package."""\n',
-        "fixture_jarvis/runtime.py": b"VALUE = 1\n",
-        "fixture_jarvis-1.0.dist-info/METADATA": (
-            b"Metadata-Version: 2.1\nName: fixture-jarvis\nVersion: 1.0\n\n"
-        ),
-        "fixture_jarvis-1.0.dist-info/WHEEL": (
-            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
-        ),
-    }
-    record_name = "fixture_jarvis-1.0.dist-info/RECORD"
-    record_lines: list[str] = []
-    for relative, payload in sorted(members.items()):
-        encoded = urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
-        record_lines.append(f"{relative},sha256={encoded},{len(payload)}")
-        destination = site_packages / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
-    record_lines.append(f"{record_name},,")
-    record = ("\n".join(record_lines) + "\n").encode()
-    (site_packages / record_name).write_bytes(record)
-    wheel = tmp_path / "fixture_jarvis-1.0-py3-none-any.whl"
-    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for relative, payload in members.items():
-            archive.writestr(relative, payload)
-        archive.writestr(record_name, record)
-    probe = installation_module._probe_python_distribution_record_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-    verified = probe(str(python), "fixture-jarvis", wheel)
-
-    assert verified["verified"] is True
-    assert verified["wheel_payload_file_count"] == len(members)
-    assert verified["tree_scanned"] is False
-    assert verified["tree_copied"] is False
-
-    (package / "runtime.py").write_bytes(b"VALUE = 2\n")
-    tampered = probe(str(python), "fixture-jarvis", wheel)
-
-    assert tampered["verified"] is False
-    assert "digest mismatch" in str(tampered["error"])
-
-
-def test_jarvis_launcher_matches_a_uv_managed_python_symlink(tmp_path: Path) -> None:
-    """Bind JARVIS to the venv bin directory without following Python out of it."""
-    environment_bin = tmp_path / "environment" / "bin"
-    environment_bin.mkdir(parents=True)
-    python = environment_bin / ("python.exe" if os.name == "nt" else "python")
-    jarvis = environment_bin / ("jarvis.exe" if os.name == "nt" else "jarvis")
-    if os.name == "nt":
-        shutil.copy2(sys.executable, python)
-        shutil.copy2(sys.executable, jarvis)
-        executable = jarvis
-    else:
-        managed_python = tmp_path / "uv" / "python" / "bin" / "python3.12"
-        managed_python.parent.mkdir(parents=True)
-        managed_python.symlink_to(Path(sys.executable).resolve())
-        python.symlink_to(managed_python)
-        jarvis.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        jarvis.chmod(0o755)
-        external_bin = tmp_path / "external-bin"
-        external_bin.mkdir()
-        executable = external_bin / "jarvis"
-        executable.symlink_to(jarvis)
-        assert python.resolve().parent != environment_bin.resolve()
-
-    matcher_name = "_jarvis_executable_matches_interpreter"
-    matcher = cast(Callable[..., bool], getattr(installation_module, matcher_name))
-
-    assert matcher(str(executable), str(python), runtime_command=[str(executable), "--help"])
-
-    other = tmp_path / "other-bin" / executable.name
-    other.parent.mkdir()
-    if os.name == "nt":
-        shutil.copy2(sys.executable, other)
-    else:
-        other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        other.chmod(0o755)
-    assert not matcher(str(other), str(python), runtime_command=[str(other), "--help"])
 
 
 def test_install_receipt_binds_running_package_to_wheel_bytes(tmp_path: Path) -> None:
@@ -1842,55 +1112,6 @@ def test_remote_clio_kit_component_generic_error_when_never_probed(tmp_path: Pat
         verify_remote_clio_kit_native_execution_component(info, receipt)
 
 
-def test_clio_kit_probe_requires_unified_progress_and_artifact_query(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _clio_kit_jarvis_contract_document()
-
-    def probe(_command: list[str], *, label: str) -> dict[str, object]:
-        assert label == "clio-kit native execution contract"
-        return document
-
-    monkeypatch.setattr(
-        installation_module,
-        "run_json_probe",
-        probe,
-    )
-
-    capability = probe_clio_kit_native_execution_contract(
-        ["/home/user/.local/bin/clio-kit", "mcp-server", "jarvis"]
-    )
-
-    assert capability.operations == ["jarvis_get_execution", "jarvis_run"]
-    assert capability.contract_sha256 == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
-
-
-def test_clio_kit_probe_rejects_execution_query_without_artifact_selector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _clio_kit_jarvis_contract_document()
-    tools = cast(list[dict[str, object]], document["tools"])
-    query = next(tool for tool in tools if tool["name"] == "jarvis_get_execution")
-    input_schema = cast(dict[str, object], query["inputSchema"])
-    properties = cast(dict[str, object], input_schema["properties"])
-    properties.pop("artifacts")
-
-    def probe(_command: list[str], *, label: str) -> dict[str, object]:
-        assert label == "clio-kit native execution contract"
-        return document
-
-    monkeypatch.setattr(
-        installation_module,
-        "run_json_probe",
-        probe,
-    )
-
-    with pytest.raises(ConfigurationError, match="query surface did not match"):
-        probe_clio_kit_native_execution_contract(
-            ["/home/user/.local/bin/clio-kit", "mcp-server", "jarvis"]
-        )
-
-
 def test_remote_worker_identity_is_bound_to_fresh_running_endpoint(tmp_path: Path) -> None:
     wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
     wheel.write_bytes(b"candidate-wheel")
@@ -2233,7 +1454,9 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
     monkeypatch.setattr(installation_module, "installation_info", current_installation)
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
 
     result = worker_runtime_info(
         cluster="ares-p5run2",
@@ -2336,8 +1559,10 @@ def test_worker_runtime_info_expands_home_anchored_pinned_receipt(
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
     monkeypatch.setattr(installation_module, "installation_info", current_installation)
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
-    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
+    monkeypatch.setattr(worker_runtime_verification_module.os.path, "expanduser", fake_expanduser)
 
     result = worker_runtime_info(
         cluster="ares-p5run2",
@@ -2375,7 +1600,7 @@ def test_worker_runtime_info_unloadable_home_anchored_pin_refuses_typed(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+    monkeypatch.setattr(worker_runtime_verification_module.os.path, "expanduser", fake_expanduser)
 
     with pytest.raises(
         ConfigurationError,
@@ -2430,7 +1655,9 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     def worker_process_matches(_pid: int) -> bool:
         return True
 
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
 
     def reject_history(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("worker readiness must not scan endpoint history")
@@ -2967,24 +2194,3 @@ def test_jarvis_mcp_override_cannot_masquerade_as_receipt_bound_runtime(
     ]
     assert runtime["command_matches_receipt"] is False
     assert runtime["artifact_identity_verified"] is False
-
-
-def _clio_kit_jarvis_contract_document() -> dict[str, object]:
-    titles = jarvis_user_contract_titles()
-    tools = [
-        {
-            "name": name,
-            "title": titles[name],
-            "description": definition["description"],
-            "inputSchema": definition["inputSchema"],
-            "outputSchema": definition["outputSchema"],
-            "annotations": definition["annotations"],
-        }
-        for name, definition in sorted(jarvis_user_contract().items())
-    ]
-    return {
-        "schema_version": "clio-kit.mcp-user-contract.v1",
-        "contract_id": CLIO_KIT_JARVIS_CONTRACT_ID,
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
-        "tools": tools,
-    }

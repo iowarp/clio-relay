@@ -11,11 +11,10 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint as endpoint_module
+from clio_relay import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import (
-    MCP_RUNNER_BASE_ENV_NAMES,
     EndpointWorker,
     _close_recovery_directory_anchor,  # pyright: ignore[reportPrivateUsage]
     _durable_jarvis_execution_recovery,  # pyright: ignore[reportPrivateUsage]
@@ -25,6 +24,7 @@ from clio_relay.endpoint import (
     _open_or_create_recovery_directory,  # pyright: ignore[reportPrivateUsage]
     _read_owned_recovery_result,  # pyright: ignore[reportPrivateUsage]
 )
+from clio_relay.endpoint_sidecar_types import MCP_RUNNER_BASE_ENV_NAMES
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
     EndpointRole,
@@ -42,7 +42,7 @@ def _trusted_recovery_record(
 ) -> tuple[RelayJob, RelayTask, dict[str, Any]]:
     """Build one valid prepared recovery record without dispatching a process."""
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     digest = remote_mcp_server_artifact_digest(verified_jarvis_server_artifact())
     job = RelayJob(
         cluster="research-cluster",
@@ -51,7 +51,9 @@ def _trusted_recovery_record(
             server=command[0],
             server_args=command[1:],
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_jarvis_cd_lock_binding=(
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments={
                 "pipeline_id": "durable-science",
@@ -230,7 +232,7 @@ def test_execution_start_persists_process_and_dispatch_release_atomically(
 ) -> None:
     """No durable write can expose a released process as an unreleased dispatch."""
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     digest = remote_mcp_server_artifact_digest(verified_jarvis_server_artifact())
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
@@ -243,7 +245,7 @@ def test_execution_start_persists_process_and_dispatch_release_atomically(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "durable-science"},

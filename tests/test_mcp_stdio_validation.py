@@ -20,6 +20,7 @@ from pytest import MonkeyPatch
 
 from clio_relay import __version__
 from clio_relay import mcp_stdio_validation as mcp_stdio_validation_module
+from clio_relay import mcp_stdio_validation_process as mcp_stdio_validation_process_module
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ObservationTimeoutError, RelayError
@@ -319,7 +320,7 @@ sys.stdout.buffer.flush()
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
     monkeypatch.setenv("MCP_TEST_TOKEN", "top-secret-value")
-    monkeypatch.setattr(mcp_stdio_validation_module, "_MAX_STDOUT_BYTES", 1_024)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_MAX_STDOUT_BYTES", 1_024)
 
     with pytest.raises(RelayError, match="stdout byte limit") as captured:
         run_packaged_mcp_stdio_session(
@@ -362,7 +363,7 @@ sys.stderr.buffer.flush()
 """.lstrip(),
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
-    monkeypatch.setattr(mcp_stdio_validation_module, "_MAX_STDERR_BYTES", 1_024)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_MAX_STDERR_BYTES", 1_024)
 
     with pytest.raises(RelayError, match="stderr byte limit") as captured:
         run_packaged_mcp_stdio_session(
@@ -448,11 +449,15 @@ def test_packaged_stdio_timeout_keeps_child_stderr_off_public_error(
         capture.append(stream.read())
         activity.set()
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "monotonic", clock)
-    monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", spawn)
-    monkeypatch.setattr(mcp_stdio_validation_module, "_capture_pipe", capture_pipe)
-    monkeypatch.setattr(mcp_stdio_validation_module, "_terminate_bounded_process", ignore_process)
-    monkeypatch.setattr(mcp_stdio_validation_module, "release_owned_process", ignore_process)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "monotonic", clock)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "_capture_pipe", capture_pipe)
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "_terminate_bounded_process", ignore_process
+    )
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "release_owned_process", ignore_process
+    )
 
     with (
         caplog.at_level("WARNING", logger="clio_relay.mcp_stdio_validation"),
@@ -504,14 +509,18 @@ def test_packaged_stdio_rejects_root_that_becomes_terminal_after_deadline(
         )
         return process
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "monotonic", clock)
-    monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "monotonic", clock)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", spawn)
 
     def ignore_process(_process: object) -> None:
         return None
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "_terminate_bounded_process", ignore_process)
-    monkeypatch.setattr(mcp_stdio_validation_module, "release_owned_process", ignore_process)
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "_terminate_bounded_process", ignore_process
+    )
+    monkeypatch.setattr(
+        mcp_stdio_validation_process_module, "release_owned_process", ignore_process
+    )
 
     with pytest.raises(
         ObservationTimeoutError,
@@ -995,7 +1004,7 @@ def test_packaged_stdio_surfaces_safe_failed_startup_cleanup_evidence(
             cause=RuntimeError("private startup detail"),
         )
 
-    monkeypatch.setattr(mcp_stdio_validation_module, "spawn_owned_process", fail_spawn)
+    monkeypatch.setattr(mcp_stdio_validation_process_module, "spawn_owned_process", fail_spawn)
     with pytest.raises(RelayError, match="cleanup_verified=False") as failure:
         run_packaged_mcp_stdio_session(profile="user", tool="jarvis_run", arguments={})
     assert "pid=8123" in str(failure.value)

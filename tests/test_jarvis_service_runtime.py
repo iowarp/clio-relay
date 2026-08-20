@@ -18,13 +18,17 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import clio_relay.cli as cli_module
-import clio_relay.http_api as http_api_module
+import clio_relay.cli_jarvis_mcp as cli_jarvis_mcp
+import clio_relay.http_api_routes_session as http_api_routes_session_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
-import clio_relay.service_runtime as service_runtime_module
+import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
+import clio_relay.service_runtime_core as service_runtime_core_module
+import clio_relay.service_runtime_observation as service_runtime_observation_module
+import clio_relay.service_runtime_readiness as service_runtime_readiness_module
+import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
@@ -90,7 +94,7 @@ def _private_authority_resolver(  # pyright: ignore[reportUnusedFunction]
         return f"Bearer {'a' * 64}"
 
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_core_module,
         "resolve_jarvis_service_runtime_authorization",
         resolve_for_test,
     )
@@ -481,8 +485,11 @@ def test_owned_session_authority_endpoint_reverifies_owned_artifact_before_resol
         observed.update(kwargs)
         return authority
 
+    # split/http-api-w3 (iowarp/clio-relay#231):
+    # resolve_owned_jarvis_runtime_authority moved to
+    # http_api_routes_session.py -- the patch target follows the move.
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_session_module,
         "resolve_local_verified_jarvis_service_runtime_authority",
         resolve_local_verified,
     )
@@ -576,8 +583,11 @@ def test_private_runtime_authority_endpoint_is_unavailable_on_non_owned_api(
     def forbidden(*_args: object, **_kwargs: object) -> Any:
         raise AssertionError("ordinary API must not invoke a private authority resolver")
 
+    # split/http-api-w3 (iowarp/clio-relay#231):
+    # resolve_owned_jarvis_runtime_authority moved to
+    # http_api_routes_session.py -- the patch target follows the move.
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_session_module,
         "resolve_local_verified_jarvis_service_runtime_authority",
         forbidden,
     )
@@ -893,7 +903,13 @@ def test_hidden_relay_authority_command_emits_one_private_json_document(
         captured.update(kwargs)
         return authority
 
-    monkeypatch.setattr(cli_module, "resolve_local_jarvis_service_runtime_authority", resolve_local)
+    # #231 cli.py decomposition: jarvis_runtime_authority (and its
+    # resolve_local_jarvis_service_runtime_authority import) moved to
+    # cli_jarvis_mcp.py -- patch it there, not on cli.py, which no longer
+    # binds this name at all.
+    monkeypatch.setattr(
+        cli_jarvis_mcp, "resolve_local_jarvis_service_runtime_authority", resolve_local
+    )
     monkeypatch.setenv("CLIO_RELAY_JARVIS_BIN", "/released/bin/jarvis")
     digest = authority.token_sha256
     result = CliRunner().invoke(
@@ -2230,17 +2246,21 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
         headers: dict[str, str] | None,
         maximum_bytes: int | None,
         deadline: float | None = None,
-    ) -> service_runtime_module._BoundedHttpResponse:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> service_runtime_types_module._BoundedHttpResponse:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         del deadline
         readiness_requests.append((url, headers))
         assert maximum_bytes is None
-        return service_runtime_module._BoundedHttpResponse(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return service_runtime_types_module._BoundedHttpResponse(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             status_code=401 if headers is None else 200,
             headers=httpx.Headers(),
             content=b"",
         )
 
-    monkeypatch.setattr(service_runtime_module, "_read_bounded_http_response", read_readiness)
+    monkeypatch.setattr(
+        service_runtime_readiness_module,
+        "_read_bounded_http_response",
+        read_readiness,
+    )
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -3100,7 +3120,10 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
     )
     reverified: list[str] = []
     reverified_settings: list[RelaySettings | None] = []
-    original_reverify = service_runtime_module.reverify_jarvis_service_runtime
+    # #231 class-mixin split: _verified_scheduler_submission (the caller, via
+    # detach/stop) now lives in service_runtime_observation.py, not
+    # service_runtime.py -- patch the symbol where it is looked up.
+    original_reverify = service_runtime_observation_module.reverify_jarvis_service_runtime
 
     def tracked_reverify(**kwargs: Any) -> Any:
         observed = original_reverify(**kwargs)
@@ -3109,7 +3132,7 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
         return observed
 
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_observation_module,
         "reverify_jarvis_service_runtime",
         tracked_reverify,
     )
@@ -3328,8 +3351,11 @@ def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
             raise RelayError("owned API generation is already stopped")
         return verified
 
+    # #231 class-mixin split: _verified_scheduler_submission lives in
+    # service_runtime_observation.py, not service_runtime.py -- patch the
+    # symbol where it is looked up.
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_observation_module,
         "reverify_jarvis_service_runtime",
         stopped_api_then_direct_source,
     )
@@ -3956,7 +3982,7 @@ def test_jarvis_bind_preserves_and_resumes_allocation_connector_after_lost_start
             )
         if "__CLIO_WRITE_ALLOCATION_FRPC__" in script:
             events.append("start-side-effect")
-            raise service_runtime_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            raise service_runtime_types_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 "lost allocation connector start response"
             )
         _session, intent, connector, step = allocation_context()
@@ -4135,7 +4161,7 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
             "stderr_path": ownership_intent["stderr_path"],
             "metadata_path": ownership_intent["metadata_path"],
         }
-        service_runtime_module._write_local_connector_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity_module._write_local_connector_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             Path(str(ownership_intent["metadata_path"])),
             connector,
         )
@@ -4167,7 +4193,11 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
         )
 
     monkeypatch.setattr(supervisor, "_start_local_visitor", start_local_then_lose_response)
-    monkeypatch.setattr(service_runtime_module, "_local_connector_identity_status", connector_owned)
+    monkeypatch.setattr(
+        service_runtime_connector_identity_module,
+        "_local_connector_identity_status",
+        connector_owned,
+    )
     monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
     monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
 
