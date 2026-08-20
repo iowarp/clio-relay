@@ -534,7 +534,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # by type instead of a substring match on QueueConflictError (the banned
     # prose-match pattern). Campaign merge: 9391 base -5 (#242 gating)
     # +4 (CQ16) = 9390, the measured merged count.
-    "src/clio_relay/service_runtime.py": 9390,
+    # #231 service-runtime split, slice 1: the zero-dependency primitives
+    # (untyped-dict coercion helpers, two small connector-config validators,
+    # the cleanup-resource gateway binder, and the just-started-process-group
+    # rollback helper) moved to the new service_runtime_primitives.py (96
+    # lines). Every internal call site was requalified to `_primitives.<name>`
+    # so the existing `monkeypatch.setattr(service_runtime, ...)` tests that
+    # target these names keep failing loudly instead of silently no-op'ing;
+    # the one test that patched `_terminate_just_started_process_group`
+    # in-place was repointed to the new module. Net -46 lines even though 49
+    # lines moved out: qualifying ~220 call sites pushed several lines past
+    # the 100-col limit and `ruff format` reflowed them across more lines.
+    # 9390 -> 9344.
+    "src/clio_relay/service_runtime.py": 9344,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new

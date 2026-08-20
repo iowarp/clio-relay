@@ -28,6 +28,7 @@ from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
+import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import cli as relay_cli
 from clio_relay.cli import app
@@ -250,7 +251,7 @@ def test_subprocess_runner_terminates_process_group_when_private_input_delivery_
     monkeypatch.setattr(service_runtime.subprocess, "Popen", fake_popen)
     terminated: list[int] = []
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_primitives,
         "_terminate_just_started_process_group",
         terminated.append,
     )

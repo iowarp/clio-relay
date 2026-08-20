@@ -30,6 +30,7 @@ import httpx
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from clio_relay import service_runtime_primitives as _primitives
 from clio_relay.browser_gateway import (
     CAPABILITY_ENV,
     UPSTREAM_AUTHORIZATION_ENV,
@@ -116,7 +117,6 @@ _LOCAL_CONNECTOR_WRAPPER_CODE = (
     "child=subprocess.Popen(sys.argv[3:]); "
     "raise SystemExit(child.wait())"
 )
-_OWNERSHIP_INTENT_SCHEMA = "clio-relay.gateway-ownership-intent.v1"
 _MAX_SUBMISSION_OUTPUT_BYTES = 262_144
 _MAX_LOCAL_HEALTH_BYTES = 64 * 1024
 _GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS = 60.0
@@ -128,7 +128,6 @@ _JARVIS_BIND_IDENTITY_SCHEMA = "clio-relay.jarvis-bind-identity.v1"
 _JARVIS_BIND_POLICY_SCHEMA = "clio-relay.jarvis-bind-policy.v1"
 _REMOTE_SUBMISSION_VERIFICATION_SCHEMA = "clio-relay.gateway-submission-verification.v1"
 _REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
-_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_POLL_SECONDS = 0.25
 _RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS = 5.0
@@ -408,7 +407,7 @@ def _deliver_process_input(
     if delivery_error is None:
         return
     if isolate_process_group:
-        _terminate_just_started_process_group(process.pid)
+        _primitives._terminate_just_started_process_group(process.pid)
     else:
         with suppress(OSError):
             process.terminate()
@@ -502,11 +501,11 @@ class ServiceRuntimeStartResult:
                     provider=self.session.scheduler,
                 )
             )
-        transport = _object(self.session.gateway.get("transport", {}))
+        transport = _primitives._object(self.session.gateway.get("transport", {}))
         for connector_role in ("remote_connector", "desktop_connector"):
-            connector = _object(transport.get(connector_role, {}))
-            pid = _optional_int(connector.get("pid"))
-            scheduler_step_id = _optional_str(connector.get("scheduler_step_id"))
+            connector = _primitives._object(transport.get(connector_role, {}))
+            pid = _primitives._optional_int(connector.get("pid"))
+            scheduler_step_id = _primitives._optional_str(connector.get("scheduler_step_id"))
             resource_id = str(pid) if pid is not None else scheduler_step_id
             if resource_id is None:
                 continue
@@ -548,7 +547,7 @@ class ServiceRuntimePendingResult:
             "scheduler_provider": self.session.scheduler,
             "scheduler_job_id": scheduler_job_id,
         }
-        binding = _object(self.session.gateway.get("jarvis_runtime_binding", {}))
+        binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
         if binding:
             required = {
                 "source_relay_job_id",
@@ -576,12 +575,12 @@ class ServiceRuntimePendingResult:
             return selector
         if scheduler_job_id is not None:
             return selector
-        intents = _object(self.session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get("scheduler_submission", {}))
-        submission_id = _optional_str(intent.get("submission_id"))
-        submission_marker = _optional_str(intent.get("submission_marker"))
+        intents = _primitives._object(self.session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get("scheduler_submission", {}))
+        submission_id = _primitives._optional_str(intent.get("submission_id"))
+        submission_marker = _primitives._optional_str(intent.get("submission_marker"))
         if (
-            intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA
+            intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA
             or intent.get("state") != "starting"
             or intent.get("scheduler_provider") != self.session.scheduler
             or submission_id is None
@@ -622,7 +621,7 @@ class ServiceRuntimePendingResult:
         observed_at = utc_now()
         selector = self.retry_selector()
         scheduler_job_id = self.session.scheduler_job_id
-        jarvis_binding = _object(self.session.gateway.get("jarvis_runtime_binding", {}))
+        jarvis_binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
         unresolved_submission = scheduler_job_id is None and not jarvis_binding
         summary = (
             "exact scheduler submission intent is durable; submission outcome is unresolved"
@@ -779,7 +778,7 @@ class ServiceRuntimeStopResult:
         from clio_relay.validation_report import CleanupEvidence
 
         operation_intent_name = "detach_intent" if self.mode == "detach" else "teardown_intent"
-        operation_intent = _object(self.session.gateway.get(operation_intent_name, {}))
+        operation_intent = _primitives._object(self.session.gateway.get(operation_intent_name, {}))
         raw_cancel_scheduler_jobs: object = (
             False if self.mode == "detach" else operation_intent.get("cancel_scheduler_job")
         )
@@ -788,7 +787,7 @@ class ServiceRuntimeStopResult:
         return CleanupEvidence(
             requested=True,
             mode=self.mode,
-            operation_id=_optional_str(operation_intent.get("operation_id")),
+            operation_id=_primitives._optional_str(operation_intent.get("operation_id")),
             cancel_scheduler_jobs=raw_cancel_scheduler_jobs,
             actions=[resource.model_dump(mode="json") for resource in self.resources],
             remaining_resources=[
@@ -852,8 +851,8 @@ class ServiceRuntimeStopResult:
             and scheduler_resources[0].provider == self.session.scheduler
         )
         if unresolved_submission:
-            scheduler_intent = _object(
-                _object(self.session.gateway.get("ownership_intents", {})).get(
+            scheduler_intent = _primitives._object(
+                _primitives._object(self.session.gateway.get("ownership_intents", {})).get(
                     "scheduler_submission",
                     {},
                 )
@@ -1335,15 +1334,15 @@ class ServiceRuntimeSupervisor:
             )
         session = self._reconcile_ownership_intents(session)
         if session.state is GatewaySessionState.FAILED:
-            scheduler_intent = _object(
-                _object(session.gateway.get("ownership_intents", {})).get(
+            scheduler_intent = _primitives._object(
+                _primitives._object(session.gateway.get("ownership_intents", {})).get(
                     "scheduler_submission",
                     {},
                 )
             )
             if scheduler_intent.get("reconciliation_outcome") == "definitive_failure":
                 raise RelayError(
-                    _optional_str(scheduler_intent.get("reconciliation_error"))
+                    _primitives._optional_str(scheduler_intent.get("reconciliation_error"))
                     or "scheduler submission reconciliation failed definitively"
                 )
         if session.state is GatewaySessionState.DEGRADED:
@@ -1442,8 +1441,8 @@ class ServiceRuntimeSupervisor:
                 queue_state="running",
                 node=node,
             )
-            transport = _object(session.gateway.get("transport", {}))
-            recovered_remote = _object(transport.get("remote_connector", {}))
+            transport = _primitives._object(session.gateway.get("transport", {}))
+            recovered_remote = _primitives._object(transport.get("remote_connector", {}))
             if recovered_remote:
                 if not self._connector_reuse_is_verified(
                     session,
@@ -1501,14 +1500,14 @@ class ServiceRuntimeSupervisor:
                         "remote_connector",
                         _new_ownership_intent("recorded", **remote_connector),
                         transport={
-                            **_object(session.gateway.get("transport", {})),
+                            **_primitives._object(session.gateway.get("transport", {})),
                             "proxy_name": proxy_name,
                             "remote_connector": remote_connector,
                         },
                     ),
                 )
-            transport = _object(session.gateway.get("transport", {}))
-            recovered_local = _object(transport.get("desktop_connector", {}))
+            transport = _primitives._object(session.gateway.get("transport", {}))
+            recovered_local = _primitives._object(transport.get("desktop_connector", {}))
             if recovered_local:
                 if not self._connector_reuse_is_verified(
                     session,
@@ -1547,7 +1546,7 @@ class ServiceRuntimeSupervisor:
                         "desktop_connector",
                         _new_ownership_intent("recorded", **local_connector),
                         transport={
-                            **_object(session.gateway.get("transport", {})),
+                            **_primitives._object(session.gateway.get("transport", {})),
                             "proxy_name": proxy_name,
                             "remote_connector": remote_connector,
                             "desktop_connector": local_connector,
@@ -1673,8 +1672,8 @@ class ServiceRuntimeSupervisor:
     def _ready_start_result(self, session: GatewaySession) -> ServiceRuntimeStartResult:
         """Rehydrate an idempotent ready result from one exact durable gateway record."""
         gateway = session.gateway
-        connect_url = _optional_str(gateway.get("connect_url"))
-        health_url = _optional_str(gateway.get("health_url"))
+        connect_url = _primitives._optional_str(gateway.get("connect_url"))
+        health_url = _primitives._optional_str(gateway.get("health_url"))
         if connect_url is None or health_url is None:
             raise RelayError("ready gateway session omitted its durable connection URLs")
         compatibility_raw = gateway.get("compatibility_urls")
@@ -1691,21 +1690,21 @@ class ServiceRuntimeSupervisor:
             session=session,
             connect_url=connect_url,
             health_url=health_url,
-            stream_url=_optional_str(gateway.get("stream_url")),
+            stream_url=_primitives._optional_str(gateway.get("stream_url")),
             compatibility_urls=compatibility_urls,
-            events_url=_optional_str(gateway.get("events_url")),
-            state_url=_optional_str(gateway.get("state_url")),
-            command_url=_optional_str(gateway.get("command_url")),
+            events_url=_primitives._optional_str(gateway.get("events_url")),
+            state_url=_primitives._optional_str(gateway.get("state_url")),
+            command_url=_primitives._optional_str(gateway.get("command_url")),
         )
 
     @staticmethod
     def _first_unresolved_connector_role(session: GatewaySession) -> str | None:
         """Return one connector whose exact durable identity remains ambiguous."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        transport = _object(session.gateway.get("transport", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
         for role in ("remote_connector", "desktop_connector"):
-            intent = _object(intents.get(role, {}))
-            record = _object(transport.get(role, {}))
+            intent = _primitives._object(intents.get(role, {}))
+            record = _primitives._object(transport.get(role, {}))
             if intent.get("reconciliation_error") is not None:
                 return role
             if intent.get("state") in {"starting", "recorded"} and (
@@ -1719,14 +1718,14 @@ class ServiceRuntimeSupervisor:
     @staticmethod
     def _scheduler_submission_reconciliation_is_pending(session: GatewaySession) -> bool:
         """Return whether one exact pre-submit identity still awaits sidecar publication."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get("scheduler_submission", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get("scheduler_submission", {}))
         return bool(
             session.scheduler_job_id is None
-            and intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
+            and intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA
             and intent.get("state") == "starting"
-            and _optional_str(intent.get("submission_id")) is not None
-            and _optional_str(intent.get("submission_marker")) is not None
+            and _primitives._optional_str(intent.get("submission_id")) is not None
+            and _primitives._optional_str(intent.get("submission_marker")) is not None
             and intent.get("scheduler_provider") == session.scheduler
         )
 
@@ -1737,13 +1736,13 @@ class ServiceRuntimeSupervisor:
         role: str,
     ) -> bool:
         """Allow a new generation only after durable non-start or exact absence proof."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get(role, {}))
-        transport = _object(session.gateway.get("transport", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get(role, {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
         return bool(
-            intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
+            intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA
             and intent.get("state") in {"not_started", "absent_verified"}
-            and not _object(transport.get(role, {}))
+            and not _primitives._object(transport.get(role, {}))
             and intent.get("reconciliation_error") is None
         )
 
@@ -1754,12 +1753,12 @@ class ServiceRuntimeSupervisor:
         role: str,
     ) -> bool:
         """Require fresh live reconciliation before adopting a durable connector record."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get(role, {}))
-        transport = _object(session.gateway.get("transport", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get(role, {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
         return bool(
-            _object(transport.get(role, {}))
-            and intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
+            _primitives._object(transport.get(role, {}))
+            and intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA
             and intent.get("state") == "recorded"
             and intent.get("live_identity_verified") is True
             and intent.get("reconciliation_error") is None
@@ -1772,9 +1771,9 @@ class ServiceRuntimeSupervisor:
         role: str,
     ) -> ServiceRuntimePendingResult:
         """Persist an ambiguous connector identity as resumable, without replacement."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get(role, {}))
-        detail = _optional_str(intent.get("reconciliation_error"))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get(role, {}))
+        detail = _primitives._optional_str(intent.get("reconciliation_error"))
         error = RelayError(
             detail or f"{role.replace('_', ' ')} identity has not been proven live for this intent"
         )
@@ -1804,8 +1803,8 @@ class ServiceRuntimeSupervisor:
                 recovered = self._reconcile_ownership_intents(
                     self.queue.get_gateway_session(session_id)
                 )
-                recovered_remote = _object(
-                    _object(recovered.gateway.get("transport", {})).get(
+                recovered_remote = _primitives._object(
+                    _primitives._object(recovered.gateway.get("transport", {})).get(
                         "remote_connector",
                         {},
                     )
@@ -1827,7 +1826,7 @@ class ServiceRuntimeSupervisor:
                     local_rollback.detail or "desktop connector rollback was not proven"
                 )
         if remote_connector is not None:
-            remote_pid = _optional_int(remote_connector.get("pid"))
+            remote_pid = _primitives._optional_int(remote_connector.get("pid"))
             if remote_pid is None:
                 cleanup_errors.append("remote connector rollback has no recorded pid")
             else:
@@ -2132,11 +2131,11 @@ class ServiceRuntimeSupervisor:
         if stored_binding != verified.binding:
             raise ConfigurationError("JARVIS gateway binding identity changed")
         owner_identity = self._jarvis_bind_owner_identity(
-            owner_session_id=_optional_str(session.metadata.get("owner_session_id")),
-            owner_session_generation_id=_optional_str(
+            owner_session_id=_primitives._optional_str(session.metadata.get("owner_session_id")),
+            owner_session_generation_id=_primitives._optional_str(
                 session.metadata.get("owner_session_generation_id")
             ),
-            owner_session_admission_id=_optional_str(
+            owner_session_admission_id=_primitives._optional_str(
                 session.metadata.get("owner_session_admission_id")
             ),
         )
@@ -2151,7 +2150,7 @@ class ServiceRuntimeSupervisor:
             raise RelayError("JARVIS gateway deterministic binding identity is invalid")
         if expected_owner_identity is not None and owner_identity != expected_owner_identity:
             raise ConfigurationError("JARVIS gateway owner identity changed")
-        policy = _object(session.gateway.get("jarvis_bind_policy", {}))
+        policy = _primitives._object(session.gateway.get("jarvis_bind_policy", {}))
         actual_port = policy.get("actual_desktop_bind_port")
         if (
             policy.get("schema_version") != _JARVIS_BIND_POLICY_SCHEMA
@@ -2240,8 +2239,8 @@ class ServiceRuntimeSupervisor:
             return self._connector_recovery_pending(session, role=unresolved_connector)
 
         proxy_name = f"{session.session_id}-service"
-        transport = _object(session.gateway.get("transport", {}))
-        remote_connector = _object(transport.get("remote_connector", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        remote_connector = _primitives._object(transport.get("remote_connector", {}))
         if remote_connector:
             if not self._connector_reuse_is_verified(session, role="remote_connector"):
                 return self._connector_recovery_pending(session, role="remote_connector")
@@ -2325,15 +2324,15 @@ class ServiceRuntimeSupervisor:
                     "remote_connector",
                     _new_ownership_intent("recorded", **remote_connector),
                     transport={
-                        **_object(session.gateway.get("transport", {})),
+                        **_primitives._object(session.gateway.get("transport", {})),
                         "proxy_name": proxy_name,
                         "remote_connector": remote_connector,
                     },
                 ),
             )
 
-        transport = _object(session.gateway.get("transport", {}))
-        local_connector = _object(transport.get("desktop_connector", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        local_connector = _primitives._object(transport.get("desktop_connector", {}))
         if local_connector:
             if not self._connector_reuse_is_verified(session, role="desktop_connector"):
                 return self._connector_recovery_pending(session, role="desktop_connector")
@@ -2370,7 +2369,7 @@ class ServiceRuntimeSupervisor:
                     "desktop_connector",
                     _new_ownership_intent("recorded", **local_connector),
                     transport={
-                        **_object(session.gateway.get("transport", {})),
+                        **_primitives._object(session.gateway.get("transport", {})),
                         "proxy_name": proxy_name,
                         "remote_connector": remote_connector,
                         "desktop_connector": local_connector,
@@ -2469,8 +2468,8 @@ class ServiceRuntimeSupervisor:
         role: Literal["remote_connector", "desktop_connector"],
     ) -> dict[str, object]:
         """Reuse an absence-proven generation instead of inventing a retry identity."""
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        previous = _object(intents.get(role, {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        previous = _primitives._object(intents.get(role, {}))
         if previous.get("state") != "absent_verified":
             if role == "desktop_connector":
                 return self._local_connector_intent(session)
@@ -2510,9 +2509,9 @@ class ServiceRuntimeSupervisor:
             recovered = self._reconcile_ownership_intents(
                 self.queue.get_gateway_session(session_id)
             )
-            transport = _object(recovered.gateway.get("transport", {}))
-            local_connector = _object(transport.get("desktop_connector", {})) or None
-            remote_connector = _object(transport.get("remote_connector", {})) or None
+            transport = _primitives._object(recovered.gateway.get("transport", {}))
+            local_connector = _primitives._object(transport.get("desktop_connector", {})) or None
+            remote_connector = _primitives._object(transport.get("remote_connector", {})) or None
         except (ConfigurationError, RelayError) as exc:
             cleanup_errors.append(f"connector rollback reconciliation failed: {exc}")
         if local_connector is not None:
@@ -2540,7 +2539,7 @@ class ServiceRuntimeSupervisor:
                             result.detail or "allocation connector rollback was not proven"
                         )
                 else:
-                    remote_pid = _optional_int(remote_connector.get("pid"))
+                    remote_pid = _primitives._optional_int(remote_connector.get("pid"))
                     if remote_pid is None:
                         raise RelayError("remote connector rollback has no recorded pid")
                     result = _last_json_object(
@@ -2849,10 +2848,10 @@ class ServiceRuntimeSupervisor:
             record.revocation_path,
         )
         _write_browser_revocation_marker(revocation_path, record.attachment_id)
-        transport = _object(session.gateway.get("transport", {}))
-        proxy = _object(transport.get("browser_proxy", {}))
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        intent = _object(intents.get("browser_proxy", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        proxy = _primitives._object(transport.get("browser_proxy", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        intent = _primitives._object(intents.get("browser_proxy", {}))
         absence_verified = False
         if not proxy:
             proxy, absence_verified = _discover_local_connector(
@@ -2903,7 +2902,7 @@ class ServiceRuntimeSupervisor:
         session = self.queue.finish_gateway_browser_attachment_revoke(
             session.session_id,
             attachment=revoked,
-            browser_proxy_absent_intent=_object(intents["browser_proxy"]),
+            browser_proxy_absent_intent=_primitives._object(intents["browser_proxy"]),
             metadata={"browser_detached_at": revoked_at},
         )
         persisted_revoked = BrowserAttachmentRecord.model_validate(
@@ -3032,11 +3031,11 @@ class ServiceRuntimeSupervisor:
         )
 
         session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
-        teardown_intent = _object(session.gateway.get("teardown_intent", {}))
-        ownership_intents = _object(session.gateway.get("ownership_intents", {}))
-        transport = _object(session.gateway.get("transport", {}))
-        desktop_connector = _object(transport.get("desktop_connector", {}))
-        remote_connector = _object(transport.get("remote_connector", {}))
+        teardown_intent = _primitives._object(session.gateway.get("teardown_intent", {}))
+        ownership_intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        desktop_connector = _primitives._object(transport.get("desktop_connector", {}))
+        remote_connector = _primitives._object(transport.get("remote_connector", {}))
         resources: list[CleanupResource] = []
         errors: list[str] = []
         if browser_resource is not None:
@@ -3052,12 +3051,14 @@ class ServiceRuntimeSupervisor:
                 "desktop_connector",
             ),
         )
-        local_resource = _bind_cleanup_resource_to_gateway(local_resource, session.session_id)
+        local_resource = _primitives._bind_cleanup_resource_to_gateway(
+            local_resource, session.session_id
+        )
         resources.append(local_resource)
         if local_resource.residual:
             errors.append(local_resource.detail or "desktop connector cleanup failed")
         stopped_remote_pid = None
-        remote_pid = _optional_int(remote_connector.get("pid"))
+        remote_pid = _primitives._optional_int(remote_connector.get("pid"))
         allocation_scoped = remote_connector.get("execution_scope") == "scheduler_allocation"
         remote_owned = (
             remote_connector.get("owner") == "clio-relay"
@@ -3073,11 +3074,11 @@ class ServiceRuntimeSupervisor:
                 remote_resource = CleanupResource(
                     kind="remote_connector",
                     resource_id=(
-                        _optional_str(remote_connector.get("scheduler_step_id"))
+                        _primitives._optional_str(remote_connector.get("scheduler_step_id"))
                         or session.session_id
                     ),
                     location=self.definition.ssh_host,
-                    provider=_optional_str(remote_connector.get("scheduler_provider")),
+                    provider=_primitives._optional_str(remote_connector.get("scheduler_provider")),
                     action="stop",
                     ownership_verified=False,
                     outcome="refused",
@@ -3154,9 +3155,11 @@ class ServiceRuntimeSupervisor:
                     detail=str(exc),
                 )
                 errors.append(str(exc))
-        resources.append(_bind_cleanup_resource_to_gateway(remote_resource, session.session_id))
+        resources.append(
+            _primitives._bind_cleanup_resource_to_gateway(remote_resource, session.session_id)
+        )
         canceled_scheduler_job = None
-        scheduler_intent = _object(ownership_intents.get("scheduler_submission", {}))
+        scheduler_intent = _primitives._object(ownership_intents.get("scheduler_submission", {}))
         if scheduler_contract.unresolved_submission:
             unresolved_scheduler = CleanupResource(
                 kind="scheduler_job",
@@ -3415,9 +3418,9 @@ class ServiceRuntimeSupervisor:
         pending_without_connectors = self._pending_submission_has_no_connector_side_effects(session)
         scheduler_contract = _validated_durable_scheduler_contract(session, strict=False)
         session, browser_resource, browser_error = self._revoke_browser_for_runtime_cleanup(session)
-        transport = _object(session.gateway.get("transport", {}))
-        desktop_connector = _object(transport.get("desktop_connector", {}))
-        ownership_intents = _object(session.gateway.get("ownership_intents", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        desktop_connector = _primitives._object(transport.get("desktop_connector", {}))
+        ownership_intents = _primitives._object(session.gateway.get("ownership_intents", {}))
         desktop_absence_verified = _intent_proves_absence(
             ownership_intents,
             "desktop_connector",
@@ -3428,7 +3431,9 @@ class ServiceRuntimeSupervisor:
             require_record=not (pending_without_connectors or desktop_absence_verified),
             absence_verified=pending_without_connectors or desktop_absence_verified,
         )
-        local_resource = _bind_cleanup_resource_to_gateway(local_resource, session.session_id)
+        local_resource = _primitives._bind_cleanup_resource_to_gateway(
+            local_resource, session.session_id
+        )
         resources = [local_resource]
         if browser_resource is not None:
             resources.insert(0, browser_resource)
@@ -3437,8 +3442,8 @@ class ServiceRuntimeSupervisor:
         )
         if browser_error is not None:
             errors.append(browser_error)
-        remote_connector = _object(transport.get("remote_connector", {}))
-        remote_pid = _optional_int(remote_connector.get("pid"))
+        remote_connector = _primitives._object(transport.get("remote_connector", {}))
+        remote_pid = _primitives._optional_int(remote_connector.get("pid"))
         if remote_connector.get("execution_scope") == "scheduler_allocation":
             try:
                 allocation_resource = self._retained_allocation_connector_resource(
@@ -3449,11 +3454,11 @@ class ServiceRuntimeSupervisor:
                 allocation_resource = CleanupResource(
                     kind="remote_connector",
                     resource_id=(
-                        _optional_str(remote_connector.get("scheduler_step_id"))
+                        _primitives._optional_str(remote_connector.get("scheduler_step_id"))
                         or session.session_id
                     ),
                     location=self.definition.ssh_host,
-                    provider=_optional_str(remote_connector.get("scheduler_provider")),
+                    provider=_primitives._optional_str(remote_connector.get("scheduler_provider")),
                     action="retain",
                     ownership_verified=False,
                     outcome="failed",
@@ -3461,7 +3466,7 @@ class ServiceRuntimeSupervisor:
                     detail=str(exc),
                 )
             resources.append(
-                _bind_cleanup_resource_to_gateway(
+                _primitives._bind_cleanup_resource_to_gateway(
                     allocation_resource,
                     session.session_id,
                 )
@@ -3502,7 +3507,7 @@ class ServiceRuntimeSupervisor:
                 except RelayError as exc:
                     remote_detail = str(exc)
             resources.append(
-                _bind_cleanup_resource_to_gateway(
+                _primitives._bind_cleanup_resource_to_gateway(
                     CleanupResource(
                         kind="remote_connector",
                         resource_id=str(remote_pid),
@@ -3521,7 +3526,7 @@ class ServiceRuntimeSupervisor:
                 errors.append(remote_detail)
         elif pending_without_connectors:
             resources.append(
-                _bind_cleanup_resource_to_gateway(
+                _primitives._bind_cleanup_resource_to_gateway(
                     CleanupResource(
                         kind="remote_connector",
                         resource_id=session.session_id,
@@ -3542,7 +3547,7 @@ class ServiceRuntimeSupervisor:
         else:
             errors.append("owned remote connector record is missing during detach")
             resources.append(
-                _bind_cleanup_resource_to_gateway(
+                _primitives._bind_cleanup_resource_to_gateway(
                     CleanupResource(
                         kind="remote_connector",
                         resource_id=session.session_id,
@@ -3557,8 +3562,8 @@ class ServiceRuntimeSupervisor:
                 )
             )
         if scheduler_contract.unresolved_submission:
-            scheduler_intent = _object(
-                _object(session.gateway.get("ownership_intents", {})).get(
+            scheduler_intent = _primitives._object(
+                _primitives._object(session.gateway.get("ownership_intents", {})).get(
                     "scheduler_submission",
                     {},
                 )
@@ -3761,8 +3766,8 @@ class ServiceRuntimeSupervisor:
             ):
                 raise RelayError("detached JARVIS runtime endpoints changed before reattachment")
             service_authorization = self._jarvis_runtime_authorization(verified_runtime)
-        transport = _object(session.gateway.get("transport", {}))
-        remote_connector = _object(transport.get("remote_connector", {}))
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        remote_connector = _primitives._object(transport.get("remote_connector", {}))
         if not remote_connector or not self._connector_reuse_is_verified(
             session,
             role="remote_connector",
@@ -3771,12 +3776,12 @@ class ServiceRuntimeSupervisor:
                 session,
                 role="remote_connector",
             )
-        proxy_name = _optional_str(transport.get("proxy_name"))
+        proxy_name = _primitives._optional_str(transport.get("proxy_name"))
         if proxy_name is None:
             raise ConfigurationError("gateway session has no recorded transport proxy name")
-        existing = _object(transport.get("desktop_connector", {}))
-        existing_pid = _optional_int(existing.get("pid"))
-        existing_config = _optional_str(existing.get("config_path"))
+        existing = _primitives._object(transport.get("desktop_connector", {}))
+        existing_pid = _primitives._optional_int(existing.get("pid"))
+        existing_config = _primitives._optional_str(existing.get("config_path"))
         existing_owned = (
             existing.get("owner") == "clio-relay"
             and existing.get("session_id") == session_id
@@ -3824,7 +3829,7 @@ class ServiceRuntimeSupervisor:
                         "desktop_connector",
                         _new_ownership_intent("recorded", **local_connector),
                         transport={
-                            **_object(session.gateway.get("transport", {})),
+                            **_primitives._object(session.gateway.get("transport", {})),
                             "desktop_connector": local_connector,
                         },
                     ),
@@ -3883,8 +3888,8 @@ class ServiceRuntimeSupervisor:
                     recovered = self._reconcile_ownership_intents(
                         self.queue.get_gateway_session(session.session_id)
                     )
-                    recovered_local = _object(
-                        _object(recovered.gateway.get("transport", {})).get(
+                    recovered_local = _primitives._object(
+                        _primitives._object(recovered.gateway.get("transport", {})).get(
                             "desktop_connector",
                             {},
                         )
@@ -3956,7 +3961,7 @@ class ServiceRuntimeSupervisor:
                 gateway={
                     **session.gateway,
                     "transport": {
-                        **_object(session.gateway.get("transport", {})),
+                        **_primitives._object(session.gateway.get("transport", {})),
                         "desktop_connector": local_connector,
                     },
                 },
@@ -4152,24 +4157,26 @@ class ServiceRuntimeSupervisor:
             return False
         if "service" in session.gateway:
             return False
-        transport = _object(session.gateway.get("transport", {}))
-        if _object(transport.get("remote_connector", {})) or _object(
+        transport = _primitives._object(session.gateway.get("transport", {}))
+        if _primitives._object(transport.get("remote_connector", {})) or _primitives._object(
             transport.get("desktop_connector", {})
         ):
             return False
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         scheduler_identity_exact = (
             self._scheduler_submission_reconciliation_is_pending(session)
             if session.scheduler_job_id is None
-            else scheduler_intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
+            else scheduler_intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA
             and scheduler_intent.get("state") == "recorded"
             and scheduler_intent.get("scheduler_provider") == session.scheduler
             and scheduler_intent.get("scheduler_job_id") == session.scheduler_job_id
         )
         return scheduler_identity_exact and all(
-            _object(intents.get(role, {})).get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
-            and _object(intents.get(role, {})).get("state") in {"not_started", "absent_verified"}
+            _primitives._object(intents.get(role, {})).get("schema_version")
+            == _primitives._OWNERSHIP_INTENT_SCHEMA
+            and _primitives._object(intents.get(role, {})).get("state")
+            in {"not_started", "absent_verified"}
             for role in ("remote_connector", "desktop_connector")
         )
 
@@ -4182,12 +4189,12 @@ class ServiceRuntimeSupervisor:
             or "service" in session.gateway
         ):
             return False
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         return bool(
             self._scheduler_submission_reconciliation_is_pending(session)
             if session.scheduler_job_id is None
-            else scheduler_intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA
+            else scheduler_intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA
             and scheduler_intent.get("state") == "recorded"
             and scheduler_intent.get("scheduler_job_id") == session.scheduler_job_id
         )
@@ -4485,7 +4492,7 @@ class ServiceRuntimeSupervisor:
     ) -> dict[str, object]:
         """Return a gateway payload containing an atomically paired intent update."""
         gateway = dict(session.gateway)
-        intents = _object(gateway.get("ownership_intents", {}))
+        intents = _primitives._object(gateway.get("ownership_intents", {}))
         intents[role] = intent
         gateway["ownership_intents"] = intents
         gateway.update(gateway_updates)
@@ -4515,7 +4522,7 @@ class ServiceRuntimeSupervisor:
     ) -> None:
         """Require a complete remote connector identity bound to one durable intent."""
         if (
-            intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA
+            intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA
             or intent.get("state") not in {"starting", "recorded"}
             or connector.get("owner") != "clio-relay"
             or connector.get("session_id") != session_id
@@ -4555,10 +4562,10 @@ class ServiceRuntimeSupervisor:
             ):
                 raise RelayError("recorded allocation connector identity changed after publication")
             return
-        pid = _optional_int(connector.get("pid"))
-        process_group_id = _optional_int(connector.get("process_group_id"))
-        config_path = _optional_str(connector.get("config_path"))
-        log_path = _optional_str(connector.get("log_path"))
+        pid = _primitives._optional_int(connector.get("pid"))
+        process_group_id = _primitives._optional_int(connector.get("process_group_id"))
+        config_path = _primitives._optional_str(connector.get("config_path"))
+        log_path = _primitives._optional_str(connector.get("log_path"))
         if pid is None or process_group_id != pid or config_path is None or log_path is None:
             raise RelayError("remote connector record has incomplete process identity")
         validated_config = _validated_remote_session_file(
@@ -4593,7 +4600,7 @@ class ServiceRuntimeSupervisor:
     ) -> None:
         """Require a complete desktop connector identity bound to one durable intent."""
         if (
-            intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA
+            intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA
             or intent.get("state") not in {"starting", "recorded"}
             or connector.get("owner") != "clio-relay"
             or connector.get("session_id") != session_id
@@ -4602,9 +4609,9 @@ class ServiceRuntimeSupervisor:
             != _required_intent_str(intent, "connector_generation_id")
         ):
             raise RelayError("desktop connector record does not match its durable intent")
-        pid = _optional_int(connector.get("pid"))
-        process_group_id = _optional_int(connector.get("process_group_id"))
-        start_marker = _optional_str(connector.get("process_start_marker"))
+        pid = _primitives._optional_int(connector.get("pid"))
+        process_group_id = _primitives._optional_int(connector.get("process_group_id"))
+        start_marker = _primitives._optional_str(connector.get("process_start_marker"))
         if pid is None or process_group_id is None or start_marker is None:
             raise RelayError("desktop connector record has incomplete process identity")
         runtime_dir = (self.settings.core_dir.parent / "runtime-sessions" / session_id).resolve()
@@ -4615,7 +4622,7 @@ class ServiceRuntimeSupervisor:
             "metadata_path",
         )
         for field in path_fields:
-            value = _optional_str(connector.get(field))
+            value = _primitives._optional_str(connector.get(field))
             if value is None or Path(value).resolve().parent != runtime_dir:
                 raise RelayError("desktop connector record escaped its owned runtime directory")
         identity_fields = (
@@ -4646,17 +4653,19 @@ class ServiceRuntimeSupervisor:
     def _reconcile_ownership_intents(self, session: GatewaySession) -> GatewaySession:
         """Recover scheduler and connector identities written before a hard exit."""
         gateway = dict(session.gateway)
-        intents = _object(gateway.get("ownership_intents", {}))
+        intents = _primitives._object(gateway.get("ownership_intents", {}))
         if not intents:
             return session
-        transport = _object(gateway.get("transport", {}))
+        transport = _primitives._object(gateway.get("transport", {}))
         changed = False
         scheduler_job_id = session.scheduler_job_id
         definitive_submission_failure: _DefinitiveSubmissionReconciliationError | None = None
 
-        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         if scheduler_job_id is None and scheduler_intent.get("state") == "recorded":
-            recorded_scheduler_job_id = _optional_str(scheduler_intent.get("scheduler_job_id"))
+            recorded_scheduler_job_id = _primitives._optional_str(
+                scheduler_intent.get("scheduler_job_id")
+            )
             if recorded_scheduler_job_id is not None:
                 scheduler_job_id = recorded_scheduler_job_id
                 changed = True
@@ -4665,9 +4674,11 @@ class ServiceRuntimeSupervisor:
             and scheduler_intent.get("state") == "starting"
             and scheduler_intent.get("reconciliation_outcome") != "definitive_failure"
         ):
-            submission_id = _optional_str(scheduler_intent.get("submission_id"))
-            scheduler_provider = _optional_str(scheduler_intent.get("scheduler_provider"))
-            submission_marker = _optional_str(scheduler_intent.get("submission_marker"))
+            submission_id = _primitives._optional_str(scheduler_intent.get("submission_id"))
+            scheduler_provider = _primitives._optional_str(
+                scheduler_intent.get("scheduler_provider")
+            )
+            submission_marker = _primitives._optional_str(scheduler_intent.get("submission_marker"))
             if (
                 submission_id is not None
                 and scheduler_provider is not None
@@ -4688,7 +4699,7 @@ class ServiceRuntimeSupervisor:
                         record.get("schema_version") == _REMOTE_SUBMISSION_VERIFICATION_SCHEMA
                         and record.get("verification_outcome") == "definitive_invalid"
                     ):
-                        reported_error = _optional_str(record.get("error"))
+                        reported_error = _primitives._optional_str(record.get("error"))
                         message = (
                             reported_error[:1024]
                             if reported_error is not None
@@ -4823,8 +4834,8 @@ class ServiceRuntimeSupervisor:
                     intents["scheduler_submission"] = unresolved_intent
                     changed = True
 
-        remote_intent = _object(intents.get("remote_connector", {}))
-        remote_record = _object(transport.get("remote_connector", {}))
+        remote_intent = _primitives._object(intents.get("remote_connector", {}))
+        remote_record = _primitives._object(transport.get("remote_connector", {}))
         if remote_intent.get("state") in {"starting", "recorded"}:
             try:
                 if remote_record:
@@ -4838,23 +4849,23 @@ class ServiceRuntimeSupervisor:
                     remote_intent,
                     "connector_generation_id",
                 )
-                allocation_placement = _object(remote_intent.get("placement", {}))
+                allocation_placement = _primitives._object(remote_intent.get("placement", {}))
                 result = _last_json_object(
                     self._ssh(
                         _remote_connector_discovery_script(
                             session_id=session.session_id,
                             owner_token=owner_token,
                             connector_generation_id=generation_id,
-                            allocation_provider=_optional_str(
+                            allocation_provider=_primitives._optional_str(
                                 remote_intent.get("scheduler_provider")
                             ),
-                            allocation_job_id=_optional_str(
+                            allocation_job_id=_primitives._optional_str(
                                 remote_intent.get("scheduler_native_id")
                             ),
-                            allocation_step_marker=_optional_str(
+                            allocation_step_marker=_primitives._optional_str(
                                 remote_intent.get("scheduler_step_marker")
                             ),
-                            allocation_placement_host=_optional_str(
+                            allocation_placement_host=_primitives._optional_str(
                                 allocation_placement.get("placement_host")
                             ),
                         )
@@ -4968,8 +4979,8 @@ class ServiceRuntimeSupervisor:
             intents["remote_connector"] = unresolved_remote
             changed = True
 
-        local_intent = _object(intents.get("desktop_connector", {}))
-        local_record = _object(transport.get("desktop_connector", {}))
+        local_intent = _primitives._object(intents.get("desktop_connector", {}))
+        local_record = _primitives._object(transport.get("desktop_connector", {}))
         if local_intent.get("state") in {"starting", "recorded"}:
             try:
                 if local_record:
@@ -5107,8 +5118,8 @@ class ServiceRuntimeSupervisor:
             or connector_base.get("connector_generation_id") != generation_id
             or connector_base.get("owner_token") != intent.get("owner_token")
             or connector_base.get("placement") != intent.get("placement")
-            or _optional_str(connector_base.get("config_path")) is None
-            or _optional_str(connector_base.get("log_path")) is None
+            or _primitives._optional_str(connector_base.get("config_path")) is None
+            or _primitives._optional_str(connector_base.get("log_path")) is None
             or connector_base.get("pid") is not None
         ):
             raise RelayError("allocation connector sidecar identity does not match its intent")
@@ -5165,7 +5176,7 @@ class ServiceRuntimeSupervisor:
         allow_quiesced_owner_source_recovery: bool = False,
     ) -> _VerifiedSchedulerSubmission:
         """Prove the exact provider and job ID from the relay-created remote sidecar."""
-        scheduler_job_id = _optional_str(session.scheduler_job_id)
+        scheduler_job_id = _primitives._optional_str(session.scheduler_job_id)
         if scheduler_job_id is None:
             raise RelayError("scheduler ownership verification requires an exact job id")
         try:
@@ -5218,19 +5229,19 @@ class ServiceRuntimeSupervisor:
                 scheduler_job_id=binding.scheduler_native_id,
                 spec=spec,
             )
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         if (
-            scheduler_intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA
+            scheduler_intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA
             or scheduler_intent.get("state") != "recorded"
         ):
             raise RelayError(
                 "scheduler ownership is not backed by a recorded relay submission intent"
             )
-        submission_id = _optional_str(scheduler_intent.get("submission_id"))
-        intent_provider = _optional_str(scheduler_intent.get("scheduler_provider"))
-        submission_marker = _optional_str(scheduler_intent.get("submission_marker"))
-        intent_job_id = _optional_str(scheduler_intent.get("scheduler_job_id"))
+        submission_id = _primitives._optional_str(scheduler_intent.get("submission_id"))
+        intent_provider = _primitives._optional_str(scheduler_intent.get("scheduler_provider"))
+        submission_marker = _primitives._optional_str(scheduler_intent.get("submission_marker"))
+        intent_job_id = _primitives._optional_str(scheduler_intent.get("scheduler_job_id"))
         if None in {
             submission_id,
             intent_provider,
@@ -5296,10 +5307,12 @@ class ServiceRuntimeSupervisor:
         session: GatewaySession,
     ) -> bool:
         """Authorize a non-canceling direct source read for an exact closing owner."""
-        teardown_intent = _object(session.gateway.get("teardown_intent", {}))
-        owner_session_id = _optional_str(session.metadata.get("owner_session_id"))
-        generation_id = _optional_str(session.metadata.get("owner_session_generation_id"))
-        admission_id = _optional_str(session.metadata.get("owner_session_admission_id"))
+        teardown_intent = _primitives._object(session.gateway.get("teardown_intent", {}))
+        owner_session_id = _primitives._optional_str(session.metadata.get("owner_session_id"))
+        generation_id = _primitives._optional_str(
+            session.metadata.get("owner_session_generation_id")
+        )
+        admission_id = _primitives._optional_str(session.metadata.get("owner_session_admission_id"))
         if owner_session_id is None or generation_id is None or admission_id is None:
             return False
         try:
@@ -5344,8 +5357,8 @@ class ServiceRuntimeSupervisor:
         require_record: bool = False,
         absence_verified: bool = False,
     ) -> tuple[int | None, CleanupResource]:
-        pid = _optional_int(connector.get("pid"))
-        config_path = _optional_str(connector.get("config_path"))
+        pid = _primitives._optional_int(connector.get("pid"))
+        config_path = _primitives._optional_str(connector.get("config_path"))
         expected_directory = (
             self.settings.core_dir.parent / "runtime-sessions" / session_id
         ).resolve()
@@ -5395,9 +5408,9 @@ class ServiceRuntimeSupervisor:
                 )
             durable_identity = (
                 owned
-                and _optional_str(connector.get("owner_token")) is not None
-                and _optional_int(connector.get("process_group_id")) is not None
-                and _optional_str(connector.get("process_start_marker")) is not None
+                and _primitives._optional_str(connector.get("owner_token")) is not None
+                and _primitives._optional_int(connector.get("process_group_id")) is not None
+                and _primitives._optional_str(connector.get("process_start_marker")) is not None
                 and no_group_members
             )
             return None, CleanupResource(
@@ -5462,7 +5475,7 @@ class ServiceRuntimeSupervisor:
         ).resolve()
         paths: list[Path] = []
         for field in ("config_path", "stdout_path", "stderr_path", "metadata_path"):
-            raw_path = _optional_str(connector.get(field))
+            raw_path = _primitives._optional_str(connector.get(field))
             if raw_path is None:
                 raise RelayError(f"unpublished desktop connector omitted {field}")
             path = Path(raw_path).resolve()
@@ -5675,7 +5688,7 @@ class ServiceRuntimeSupervisor:
     ) -> GatewaySession:
         """Persist an inconclusive observation without failing the owned submission."""
 
-        previous_status = _object(session.gateway.get("scheduler_status", {}))
+        previous_status = _primitives._object(session.gateway.get("scheduler_status", {}))
         observed_at = utc_now().isoformat()
         gateway = {
             **session.gateway,
@@ -5980,7 +5993,7 @@ class ServiceRuntimeSupervisor:
                 ownership_intent,
             )
         transport = self.definition.frp_transport
-        server_addr = _require_server_addr(transport.server_addr, self.cluster)
+        server_addr = _primitives._require_server_addr(transport.server_addr, self.cluster)
         config = render_proxy_config(
             FrpLinkConfig(
                 server_addr=server_addr,
@@ -5990,7 +6003,7 @@ class ServiceRuntimeSupervisor:
                 secret_key=self.secret_key,
                 proxy_name=proxy_name,
             ),
-            proxy_type=_frp_proxy_type(spec.transport_mode),
+            proxy_type=_primitives._frp_proxy_type(spec.transport_mode),
             local_ip=node,
             local_port=spec.service_port,
         )
@@ -6040,8 +6053,8 @@ class ServiceRuntimeSupervisor:
                 or step_identity.verified is not True
             ):
                 raise RelayError("allocation connector scheduler step identity did not match")
-            config_path = _optional_str(start_result.get("config_path"))
-            log_path = _optional_str(start_result.get("log_path"))
+            config_path = _primitives._optional_str(start_result.get("config_path"))
+            log_path = _primitives._optional_str(start_result.get("log_path"))
             if config_path is None or log_path is None:
                 raise RelayError("allocation connector start omitted its owned paths")
             return {
@@ -6143,13 +6156,13 @@ class ServiceRuntimeSupervisor:
             )
         except (TypeError, ValueError) as exc:
             raise RelayError("allocation connector has invalid provider-native identity") from exc
-        generation_id = _optional_str(connector.get("connector_generation_id"))
-        provider_name = _optional_str(connector.get("scheduler_provider"))
-        scheduler_job_id = _optional_str(connector.get("scheduler_native_id"))
-        scheduler_step_id = _optional_str(connector.get("scheduler_step_id"))
-        step_marker = _optional_str(connector.get("scheduler_step_marker"))
-        config_path = _optional_str(connector.get("config_path"))
-        log_path = _optional_str(connector.get("log_path"))
+        generation_id = _primitives._optional_str(connector.get("connector_generation_id"))
+        provider_name = _primitives._optional_str(connector.get("scheduler_provider"))
+        scheduler_job_id = _primitives._optional_str(connector.get("scheduler_native_id"))
+        scheduler_step_id = _primitives._optional_str(connector.get("scheduler_step_id"))
+        step_marker = _primitives._optional_str(connector.get("scheduler_step_marker"))
+        config_path = _primitives._optional_str(connector.get("config_path"))
+        log_path = _primitives._optional_str(connector.get("log_path"))
         if None in {
             generation_id,
             provider_name,
@@ -6347,7 +6360,7 @@ class ServiceRuntimeSupervisor:
         ownership_intent: dict[str, object],
     ) -> dict[str, object]:
         transport = self.definition.frp_transport
-        server_addr = _require_server_addr(transport.server_addr, self.cluster)
+        server_addr = _primitives._require_server_addr(transport.server_addr, self.cluster)
         runtime_dir = self.settings.core_dir.parent / "runtime-sessions" / session.session_id
         runtime_dir.mkdir(parents=True, exist_ok=True)
         config_path = Path(_required_intent_str(ownership_intent, "config_path")).resolve()
@@ -6362,7 +6375,7 @@ class ServiceRuntimeSupervisor:
             ownership_intent,
             "connector_generation_id",
         )
-        visitor_type = _frp_proxy_type(spec.transport_mode)
+        visitor_type = _primitives._frp_proxy_type(spec.transport_mode)
         visitor = start_owned_frp_visitor(
             frpc_bin=self.settings.frpc_bin,
             config=FrpLinkConfig(
@@ -6391,7 +6404,7 @@ class ServiceRuntimeSupervisor:
             ],
             process_factory=self.runner.popen,
             identity_factory=self.runner.local_process_identity,
-            rollback=_terminate_just_started_process_group,
+            rollback=_primitives._terminate_just_started_process_group,
         )
         connector: dict[str, object] = {
             "owner": "clio-relay",
@@ -6478,7 +6491,7 @@ class ServiceRuntimeSupervisor:
                 expected_config=str(config_path),
             )
         except BaseException:
-            _terminate_just_started_process_group(process.pid)
+            _primitives._terminate_just_started_process_group(process.pid)
             raise
         proxy: dict[str, object] = {
             "owner": "clio-relay",
@@ -8092,7 +8105,7 @@ def _connector_step_marker(session_id: str, connector_generation_id: str) -> str
 def _new_ownership_intent(state: str, **identity: object) -> dict[str, object]:
     """Return one versioned gateway ownership transition record."""
     return {
-        "schema_version": _OWNERSHIP_INTENT_SCHEMA,
+        "schema_version": _primitives._OWNERSHIP_INTENT_SCHEMA,
         "state": state,
         "updated_at": utc_now().isoformat(),
         **identity,
@@ -8124,10 +8137,10 @@ def _submission_reconciliation_failure_evidence(
 
     output = record.get("output")
     output_bytes = output.encode("utf-8") if isinstance(output, str) else None
-    recorded_digest = _optional_str(
+    recorded_digest = _primitives._optional_str(
         record.get("observed_output_sha256") or record.get("output_sha256")
     )
-    reported_identity = _object(record.get("observed_identity", {}))
+    reported_identity = _primitives._object(record.get("observed_identity", {}))
     scheduler_submission_outcome = {
         "command_failure": "submit_command_failed",
         "integrity_failure": "unknown_due_to_integrity_failure",
@@ -8206,7 +8219,7 @@ def _validated_durable_scheduler_contract(
         )
 
     def unresolved_or_known() -> _DurableSchedulerContract:
-        scheduler_job_id = _optional_str(session.scheduler_job_id)
+        scheduler_job_id = _primitives._optional_str(session.scheduler_job_id)
         return _DurableSchedulerContract(
             provider=session.scheduler,
             scheduler_job_id=scheduler_job_id,
@@ -8225,7 +8238,7 @@ def _validated_durable_scheduler_contract(
             return unresolved_or_known()
         raise RelayError("gateway has no durable scheduler submission intent")
     typed_scheduler_intent = cast(dict[str, object], scheduler_intent)
-    if typed_scheduler_intent.get("schema_version") != _OWNERSHIP_INTENT_SCHEMA:
+    if typed_scheduler_intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA:
         if not strict:
             return unresolved_or_known()
         raise RelayError("gateway scheduler submission intent has the wrong schema")
@@ -8249,7 +8262,7 @@ def _validated_durable_scheduler_contract(
             scheduler_job_id=None,
         )
 
-    intent_provider = _optional_str(typed_scheduler_intent.get("scheduler_provider"))
+    intent_provider = _primitives._optional_str(typed_scheduler_intent.get("scheduler_provider"))
     if intent_provider != session.scheduler:
         if not strict:
             return unresolved_or_known()
@@ -8257,8 +8270,8 @@ def _validated_durable_scheduler_contract(
     if state == "starting":
         if (
             session.scheduler_job_id is not None
-            or _optional_str(typed_scheduler_intent.get("submission_id")) is None
-            or _optional_str(typed_scheduler_intent.get("submission_marker")) is None
+            or _primitives._optional_str(typed_scheduler_intent.get("submission_id")) is None
+            or _primitives._optional_str(typed_scheduler_intent.get("submission_marker")) is None
         ):
             if not strict:
                 return unresolved_or_known()
@@ -8269,7 +8282,7 @@ def _validated_durable_scheduler_contract(
             unresolved_submission=True,
         )
     if state == "recorded":
-        intent_job_id = _optional_str(typed_scheduler_intent.get("scheduler_job_id"))
+        intent_job_id = _primitives._optional_str(typed_scheduler_intent.get("scheduler_job_id"))
         if intent_job_id is None or intent_job_id != session.scheduler_job_id:
             if not strict:
                 return unresolved_or_known()
@@ -8287,15 +8300,17 @@ def _validated_durable_scheduler_contract(
 
 def _intent_proves_absence(intents: dict[str, object], role: str) -> bool:
     """Return whether a durable intent proves a connector never started or is absent."""
-    intent = _object(intents.get(role, {}))
-    return intent.get("schema_version") == _OWNERSHIP_INTENT_SCHEMA and intent.get("state") in {
+    intent = _primitives._object(intents.get(role, {}))
+    return intent.get("schema_version") == _primitives._OWNERSHIP_INTENT_SCHEMA and intent.get(
+        "state"
+    ) in {
         "not_started",
         "absent_verified",
     }
 
 
 def _required_intent_str(intent: dict[str, object], field: str) -> str:
-    value = _optional_str(intent.get(field))
+    value = _primitives._optional_str(intent.get(field))
     if value is None:
         raise RelayError(f"connector ownership intent has no {field}")
     return value
@@ -8434,7 +8449,7 @@ def _validate_completed_detach_resources(
     desktop = next(item for item in resources if item.kind == "desktop_connector")
     remote = next(item for item in resources if item.kind == "remote_connector")
     gateway = next(item for item in resources if item.kind == "gateway_record")
-    ownership_intents = _object(session.gateway.get("ownership_intents", {}))
+    ownership_intents = _primitives._object(session.gateway.get("ownership_intents", {}))
     remote_absence_proven = _intent_proves_absence(
         ownership_intents,
         "remote_connector",
@@ -8487,8 +8502,8 @@ def _validate_completed_detach_resources(
     submissions = [item for item in resources if item.kind == "scheduler_submission"]
     if submissions:
         item = submissions[0]
-        intents = _object(session.gateway.get("ownership_intents", {}))
-        scheduler_intent = _object(intents.get("scheduler_submission", {}))
+        intents = _primitives._object(session.gateway.get("ownership_intents", {}))
+        scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         if (
             not scheduler_contract.unresolved_submission
             or item.resource_id != scheduler_intent.get("submission_id")
@@ -8571,11 +8586,11 @@ def _validate_completed_teardown_resources(
         or not gateway.verified_after_operation
     ):
         raise RelayError(error)
-    remote_connector = _object(
-        _object(session.gateway.get("transport", {})).get("remote_connector", {})
+    remote_connector = _primitives._object(
+        _primitives._object(session.gateway.get("transport", {})).get("remote_connector", {})
     )
     if remote_connector.get("execution_scope") == "scheduler_allocation":
-        if stopped_remote_pid is not None or remote.resource_id != _optional_str(
+        if stopped_remote_pid is not None or remote.resource_id != _primitives._optional_str(
             remote_connector.get("scheduler_step_id")
         ):
             raise RelayError(error)
@@ -8918,13 +8933,13 @@ def _capture_local_connector_identity(
 def _local_connector_identity_status(
     connector: dict[str, object],
 ) -> tuple[Literal["owned", "missing", "replaced", "unverified"], str | None]:
-    pid = _optional_int(connector.get("pid"))
+    pid = _primitives._optional_int(connector.get("pid"))
     if pid is None:
         return "missing", "connector record has no process id"
-    owner_token = _optional_str(connector.get("owner_token"))
-    config_path = _optional_str(connector.get("config_path"))
-    process_group_id = _optional_int(connector.get("process_group_id"))
-    start_marker = _optional_str(connector.get("process_start_marker"))
+    owner_token = _primitives._optional_str(connector.get("owner_token"))
+    config_path = _primitives._optional_str(connector.get("config_path"))
+    process_group_id = _primitives._optional_int(connector.get("process_group_id"))
+    start_marker = _primitives._optional_str(connector.get("process_start_marker"))
     if (
         owner_token is None
         or config_path is None
@@ -8958,11 +8973,11 @@ def _local_connector_identity_status(
 
 def _local_connector_group_members(connector: dict[str, object]) -> list[int]:
     """Return all live processes carrying the connector's unforgeable identity."""
-    pid = _optional_int(connector.get("pid"))
-    process_group_id = _optional_int(connector.get("process_group_id"))
-    owner_token = _optional_str(connector.get("owner_token"))
-    generation_id = _optional_str(connector.get("connector_generation_id"))
-    config_path = _optional_str(connector.get("config_path"))
+    pid = _primitives._optional_int(connector.get("pid"))
+    process_group_id = _primitives._optional_int(connector.get("process_group_id"))
+    owner_token = _primitives._optional_str(connector.get("owner_token"))
+    generation_id = _primitives._optional_str(connector.get("connector_generation_id"))
+    config_path = _primitives._optional_str(connector.get("config_path"))
     if (
         pid is None
         or process_group_id is None
@@ -9048,15 +9063,15 @@ def _windows_connector_descendants(*, pid: int, expected_config: str) -> list[in
     while changed:
         changed = False
         for item in processes:
-            child = _optional_int(item.get("ProcessId"))
-            parent = _optional_int(item.get("ParentProcessId"))
+            child = _primitives._optional_int(item.get("ProcessId"))
+            parent = _primitives._optional_int(item.get("ParentProcessId"))
             if child is not None and parent in descendants and child not in descendants:
                 descendants.add(child)
                 changed = True
     matches: list[int] = []
     for item in processes:
-        child = _optional_int(item.get("ProcessId"))
-        command_line = _optional_str(item.get("CommandLine"))
+        child = _primitives._optional_int(item.get("ProcessId"))
+        command_line = _primitives._optional_str(item.get("CommandLine"))
         if (
             child is not None
             and child in descendants
@@ -9286,8 +9301,8 @@ def _linux_pidfd_send_signal(process_fd: int, sig: int) -> None:
 
 
 def _terminate_local_connector(connector: dict[str, object]) -> int | None:
-    pid = _optional_int(connector.get("pid"))
-    process_group_id = _optional_int(connector.get("process_group_id"))
+    pid = _primitives._optional_int(connector.get("pid"))
+    process_group_id = _primitives._optional_int(connector.get("process_group_id"))
     if pid is None or process_group_id is None:
         return None
     if _local_connector_identity_status(connector)[0] != "owned":
@@ -9312,25 +9327,6 @@ def _terminate_local_connector(connector: dict[str, object]) -> int | None:
     return None
 
 
-def _terminate_just_started_process_group(pid: int) -> None:
-    """Best-effort rollback for a process whose durable identity capture failed."""
-    if os.name == "nt":
-        with suppress(subprocess.TimeoutExpired):
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS,
-            )
-        return
-    with suppress(ProcessLookupError):
-        os.killpg(pid, signal.SIGTERM)
-    time.sleep(0.1)
-    with suppress(ProcessLookupError):
-        os.killpg(pid, signal.SIGKILL)
-
-
 def _run_bounded_local_cleanup(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run one local ownership/cleanup command with a strict wall-clock bound."""
     try:
@@ -9339,52 +9335,10 @@ def _run_bounded_local_cleanup(command: Sequence[str]) -> subprocess.CompletedPr
             capture_output=True,
             text=True,
             check=False,
-            timeout=_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+            timeout=_primitives._LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         raise RelayError(
             "local cleanup command timed out after "
-            f"{_LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS:g} seconds: {command[0]}"
+            f"{_primitives._LOCAL_CLEANUP_COMMAND_TIMEOUT_SECONDS:g} seconds: {command[0]}"
         ) from exc
-
-
-def _object(value: object) -> dict[str, object]:
-    return cast(dict[str, object], value) if isinstance(value, dict) else {}
-
-
-def _bind_cleanup_resource_to_gateway(
-    resource: CleanupResource,
-    gateway_session_id: str,
-) -> CleanupResource:
-    """Bind connector cleanup evidence to its exact durable gateway record."""
-    return resource.model_copy(
-        update={
-            "metadata": {
-                **resource.metadata,
-                "gateway_session_id": gateway_session_id,
-            }
-        }
-    )
-
-
-def _optional_int(value: object) -> int | None:
-    return value if isinstance(value, int) else None
-
-
-def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
-def _require_server_addr(server_addr: str, cluster: str) -> str:
-    if server_addr.strip():
-        return server_addr
-    raise ConfigurationError(f"frp server address is not configured for cluster {cluster}")
-
-
-def _frp_proxy_type(transport_mode: str) -> Literal["stcp", "xtcp"]:
-    normalized = transport_mode.strip().lower().replace("_", "-")
-    if normalized in {"frp-stcp", "frp-stcp-wss", "stcp", "relay"}:
-        return "stcp"
-    if normalized in {"frp-xtcp", "frp-xtcp-wss", "xtcp", "direct", "nat-bypass"}:
-        return "xtcp"
-    raise ConfigurationError(f"unsupported service runtime transport mode: {transport_mode}")
