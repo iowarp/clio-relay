@@ -14,6 +14,7 @@ import re
 import urllib.parse
 from typing import Any, cast
 
+from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.jarvis_service_runtime import (
@@ -25,12 +26,20 @@ from clio_relay.jarvis_service_runtime import (
 from clio_relay.live_acceptance_models import (
     MAX_ACCEPTANCE_COLLECTION_RECORDS,
     SecureRuntimeProbeConfig,
+    _AcceptanceObservationPending,
     _secure_runtime_canonical_json_sha256,
 )
-from clio_relay.live_acceptance_secret_redaction import _assert_secret_free_document
+from clio_relay.live_acceptance_secret_redaction import (
+    _assert_secret_free_document,
+    _record_runtime_cleanup,
+    _redacted_error_text,
+    _redacted_text,
+)
 from clio_relay.models import GatewaySession
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
+from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.storage_runtime import StorageManagedQueue
+from clio_relay.validation_report import ValidationRecorder
 
 
 def _select_secure_runtime_handoff(
@@ -306,3 +315,81 @@ def _validated_secure_runtime_bind(
             raise RelayError(f"secure runtime public {key} is not a clean loopback URL")
     _assert_secret_free_document(bind_result, forbidden_values=set(), label="secure runtime bind")
     return gateway_session_id, binding
+
+
+def _cleanup_secure_runtime_failure(
+    *,
+    cluster: str,
+    recorder: ValidationRecorder,
+    supervisor: ServiceRuntimeSupervisor | None,
+    runtime_queue: StorageManagedQueue | None,
+    baseline_gateway_session_ids: set[str] | None,
+    handoff: JarvisServiceRuntimeHandoff | None,
+    gateway_session_id: str | None,
+    active_attachment: BrowserAttachmentGrant | None,
+    teardown_complete: bool,
+    primary_error: Exception | None,
+    forbidden_values: set[str],
+) -> None:
+    """Best-effort cleanup for a secure runtime acceptance that failed mid-lifecycle.
+
+    Discovers the exact orphaned gateway session by handoff match when the
+    lifecycle failed before binding produced one, then -- unless teardown
+    already completed, or the failure was itself a bounded pending
+    observation (never a cleanup trigger) -- detaches any still-open
+    browser attachment and stops the runtime without a scheduler
+    cancellation, attaching every redacted cleanup error as a note on
+    ``primary_error`` rather than replacing it.
+    """
+    cleanup_session_ids: list[str] = []
+    if gateway_session_id is not None:
+        cleanup_session_ids.append(gateway_session_id)
+    elif (
+        supervisor is not None
+        and runtime_queue is not None
+        and baseline_gateway_session_ids is not None
+        and handoff is not None
+    ):
+        try:
+            cleanup_session_ids.extend(
+                session.session_id
+                for session in _gateway_sessions_for_acceptance(runtime_queue, cluster=cluster)
+                if session.session_id not in baseline_gateway_session_ids
+                and _gateway_session_matches_handoff(session, handoff=handoff)
+            )
+        except Exception as cleanup_discovery_exc:
+            if primary_error is not None:
+                primary_error.add_note(
+                    "secure runtime cleanup discovery: "
+                    + _redacted_error_text(cleanup_discovery_exc, forbidden_values)
+                )
+    if (
+        supervisor is not None
+        and cleanup_session_ids
+        and not teardown_complete
+        and not isinstance(primary_error, _AcceptanceObservationPending)
+    ):
+        cleanup_errors: list[str] = []
+        if active_attachment is not None and gateway_session_id is not None:
+            try:
+                supervisor.browser_detach(
+                    session_id=gateway_session_id,
+                    attachment_id=active_attachment.attachment_id,
+                )
+            except Exception as cleanup_exc:
+                cleanup_errors.append(_redacted_error_text(cleanup_exc, forbidden_values))
+        for cleanup_session_id in cleanup_session_ids:
+            try:
+                cleanup = supervisor.stop(
+                    session_id=cleanup_session_id,
+                    cancel_scheduler_job=False,
+                )
+                _record_runtime_cleanup(recorder, cleanup, role="secure_runtime_failure_cleanup")
+                if cleanup.errors or cleanup.residual_resources:
+                    cleanup_errors.extend(
+                        _redacted_text(item, forbidden_values) for item in cleanup.errors
+                    )
+            except Exception as cleanup_exc:
+                cleanup_errors.append(_redacted_error_text(cleanup_exc, forbidden_values))
+        if cleanup_errors and primary_error is not None:
+            primary_error.add_note("secure runtime cleanup: " + "; ".join(cleanup_errors))

@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 
 from clio_relay.browser_gateway import BrowserAttachmentGrant
 from clio_relay.errors import RelayError
+from clio_relay.jarvis_service_runtime import JarvisServiceRuntimeBinding
 from clio_relay.live_acceptance_browser_http import (
     _canonical_finite_json_bytes,
     _direct_browser_http_request,
@@ -32,6 +33,7 @@ from clio_relay.live_acceptance_models import (
     MAX_SECURE_RUNTIME_SSE_EVENT_BYTES,
     SecureRuntimeEndpointAdapter,
     SecureRuntimeHttpEvidence,
+    SecureRuntimeProbeConfig,
     _BrowserHttpRequestError,
     _secure_runtime_canonical_json_sha256,
     _secure_runtime_json_pointer_value,
@@ -228,6 +230,83 @@ def _browser_sse_observation(
         ),
         document,
     )
+
+
+def _observe_correlated_browser_triad(
+    active_attachment: BrowserAttachmentGrant,
+    *,
+    config: SecureRuntimeProbeConfig,
+    binding: JarvisServiceRuntimeBinding,
+    health_command_id: str | None,
+    state_command_id: str | None,
+    event_command_id: str | None,
+    event_name: str,
+    timeout_seconds: float,
+) -> tuple[
+    SecureRuntimeHttpEvidence,
+    SecureRuntimeHttpEvidence,
+    SecureRuntimeHttpEvidence,
+    set[int],
+]:
+    """Observe and correlate health/state/events, returning all three plus their revisions.
+
+    The same health->state->events shape runs twice in the secure runtime
+    acceptance lifecycle -- once before any command (every ``*_command_id``
+    is ``None``) and once after reconnect (state/events already carry the
+    prior command's identity; health never tracks a command). Each field's
+    expected command id is an explicit parameter rather than inferred, so
+    this stays a pure projection of the two call sites' existing behavior.
+    """
+    health, health_document = _browser_json_observation(
+        active_attachment.health_url,
+        endpoint="health",
+        method="GET",
+        body=None,
+        timeout_seconds=timeout_seconds,
+    )
+    health, health_revision = _correlate_secure_runtime_browser_document(
+        health_document,
+        health,
+        endpoint="health",
+        adapter=config.protocol_adapter.health,
+        expected_service_instance_id=binding.service_instance_id,
+        expected_execution_id=binding.jarvis_execution_id,
+        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+        expected_command_id=health_command_id,
+    )
+    state, state_document = _browser_json_observation(
+        active_attachment.state_url,
+        endpoint="state",
+        method="GET",
+        body=None,
+        timeout_seconds=timeout_seconds,
+    )
+    state, state_revision = _correlate_secure_runtime_browser_document(
+        state_document,
+        state,
+        endpoint="state",
+        adapter=config.protocol_adapter.state,
+        expected_service_instance_id=binding.service_instance_id,
+        expected_execution_id=binding.jarvis_execution_id,
+        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+        expected_command_id=state_command_id,
+    )
+    event, event_document = _browser_sse_observation(
+        active_attachment.events_url,
+        timeout_seconds=timeout_seconds,
+        expected_event_name=event_name,
+    )
+    event, event_revision = _correlate_secure_runtime_browser_document(
+        event_document,
+        event,
+        endpoint="events",
+        adapter=config.protocol_adapter.events,
+        expected_service_instance_id=binding.service_instance_id,
+        expected_execution_id=binding.jarvis_execution_id,
+        expected_dataset_descriptor_sha256=binding.dataset_descriptor_sha256,
+        expected_command_id=event_command_id,
+    )
+    return health, state, event, {health_revision, state_revision, event_revision}
 
 
 def _wait_for_changed_sse_event(

@@ -814,7 +814,7 @@ def test_secure_runtime_orchestration_never_waits_for_outer_job_terminal(
         "clio_relay.live_acceptance_job_verification._verify_completed_job", forbidden_batch_call
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        "clio_relay.live_acceptance_secure_runtime._verify_secure_runtime_acceptance",
         verify_secure_runtime,
     )
 
@@ -952,7 +952,7 @@ def test_secure_runtime_query_pending_report_resumes_exact_execution(
         configured_probe,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._verify_secure_runtime_acceptance",
+        "clio_relay.live_acceptance_secure_runtime._verify_secure_runtime_acceptance",
         verify_secure_runtime,
     )
     definition = ClusterDefinition(name="test-cluster", ssh_host="test-host")
@@ -3376,7 +3376,7 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
 
@@ -3394,8 +3394,12 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
     def managed_queue(_settings: object) -> EmptyGatewayQueue:
         return EmptyGatewayQueue()
 
-    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
-    monkeypatch.setattr("clio_relay.live_acceptance.ServiceRuntimeSupervisor", _SecureSupervisor)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.storage_managed_queue", managed_queue
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.ServiceRuntimeSupervisor", _SecureSupervisor
+    )
     _SecureSupervisor.reset(ready_session)
 
     json_calls: list[tuple[str, str]] = []
@@ -3543,15 +3547,15 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         "clio_relay.live_acceptance_browser_evidence._browser_sse_observation", browser_sse
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._wait_for_changed_sse_event",
+        "clio_relay.live_acceptance_secure_runtime._wait_for_changed_sse_event",
         changed_sse,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._wait_for_changed_browser_state",
+        "clio_relay.live_acceptance_secure_runtime._wait_for_changed_browser_state",
         changed_state,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance._assert_browser_capability_revoked",
+        "clio_relay.live_acceptance_secure_runtime._assert_browser_capability_revoked",
         revoke,
     )
 
@@ -3727,11 +3731,11 @@ def test_secure_runtime_ready_binding_wait_is_bounded(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
-    monkeypatch.setattr("clio_relay.live_acceptance.time.sleep", sleep)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.monotonic", monotonic)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.sleep", sleep)
     recorder = ValidationRecorder(
         new_live_validation_report(
             scenario="secure-runtime-readiness-timeout",
@@ -3887,10 +3891,10 @@ def test_secure_runtime_late_ready_binding_fails_deadline(
         )
 
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.time.monotonic", monotonic)
+    monkeypatch.setattr("clio_relay.live_acceptance_secure_runtime.time.monotonic", monotonic)
     recorder = ValidationRecorder(
         new_live_validation_report(
             scenario="secure-runtime-late-ready",
@@ -4104,12 +4108,14 @@ def test_secure_runtime_bind_failure_preserves_error_and_attempts_safe_teardown(
 
     FailingCleanupSupervisor.reset(session)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_packaged_mcp_stdio_session",
+        "clio_relay.live_acceptance_secure_runtime.run_packaged_mcp_stdio_session",
         packaged_session,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.storage_managed_queue", managed_queue)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.ServiceRuntimeSupervisor",
+        "clio_relay.live_acceptance_secure_runtime.storage_managed_queue", managed_queue
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_secure_runtime.ServiceRuntimeSupervisor",
         FailingCleanupSupervisor,
     )
     recorder = ValidationRecorder(
