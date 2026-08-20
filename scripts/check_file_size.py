@@ -1071,10 +1071,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # ratchet-up.
     "src/clio_relay/spool.py": 1000,
     "src/clio_relay/storage_policy.py": 1826,
-    # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
-    # while exposing only StorageDecision.message, never its serialized
-    # exception payload.
-    "src/clio_relay/storage_runtime.py": 1124,
+    # storage_runtime.py's own ratchet-baseline entry and history comment
+    # (R9 fix round 2: +11 lines marking storage-policy refusals as public,
+    # exposing only StorageDecision.message, never its serialized exception
+    # payload) were removed here (split/storage-runtime-w2): the file is now
+    # a 204-line facade over its owner modules -- storage_runtime_errors.py
+    # (the StorageRuntimeError/StorageAdmissionError/StorageRuntimeViolation
+    # hierarchy plus the decision-conversion helpers), storage_runtime_core.py
+    # (StorageRuntimeConfig/StorageRuntime and its production factory), and
+    # storage_managed_queue.py (StorageManagedQueue's construction/lifecycle,
+    # composed from the storage_managed_queue_admission.py /
+    # storage_managed_queue_leasing.py method-group mixins) -- comfortably
+    # under DEFAULT_MAX_LINES.
     # N13 (closing-round review): +2 lines -- the blanket `# pyright:
     # ignore` on the cross-owner `_job_matches_mcp_admission_class` import
     # is re-narrowed to `[reportPrivateUsage]`, which forces the import
