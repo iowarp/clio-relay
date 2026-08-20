@@ -601,7 +601,18 @@ RATCHET_BASELINE: dict[str, int] = {
     # exhausted; from here every slice peels one mixin off
     # ServiceRuntimeSupervisor, which now derives from the mixin as its
     # first base). 5840 -> 5613.
-    "src/clio_relay/service_runtime.py": 5613,
+    # #231 service-runtime split, slice 11: the start/resume-start state
+    # machine (start, resume_start, _resume_start_locked,
+    # _complete_runtime_start_locked, the connector reuse/launch/recovery
+    # predicates, _ready_start_result, _rollback_runtime_start) moved to the
+    # new service_runtime_start.py (796 lines, at the sweet-spot cap -- one
+    # cohesive state machine, documented in the module docstring rather than
+    # force-split) as `_ServiceRuntimeStartMixin`. The shared
+    # _RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS constant (used by this
+    # mixin plus the not-yet-extracted jarvis-bind and browser clusters)
+    # moved to service_runtime_readiness.py, which every caller already
+    # imports, rather than being duplicated three times. 5613 -> 4873.
+    "src/clio_relay/service_runtime.py": 4873,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new

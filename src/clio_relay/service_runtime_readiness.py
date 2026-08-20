@@ -38,6 +38,11 @@ from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import ServiceRuntimeSpec, utc_now
 
+# #231 service-runtime split, slice 11: shared by the start/jarvis-bind/browser
+# mixins' local-health waits -- moved here (rather than duplicated three times)
+# since every caller already imports this module for _read_bounded_http_response.
+_RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS = 5.0
+
 
 def _read_bounded_http_response(
     url: str,
