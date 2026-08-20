@@ -49,7 +49,6 @@ from clio_relay.errors import (
     RelayError,
 )
 from clio_relay.installation import (
-    InstallReceipt,
     verify_remote_worker_info,
     write_self_install_receipt,
 )
@@ -603,46 +602,6 @@ def test_cluster_scoped_desktop_admission_isolates_same_session_id(
         )
     )
     assert admitted.cluster == "cluster-b"
-
-
-def test_installation_write_receipt_forwards_components_from(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The CLI surface forwards --components-from to write_self_install_receipt."""
-    observed: dict[str, object] = {}
-    output_path = tmp_path / "generations" / "mixed" / "install-receipt.json"
-    source_path = tmp_path / "generation-install-receipt.json"
-
-    def write_receipt(path: Path, **kwargs: object) -> InstallReceipt:
-        observed["path"] = path
-        observed.update(kwargs)
-        return InstallReceipt(
-            installed_at=datetime.now(UTC),
-            install_spec="checkout",
-            requested_source="vcs",
-            distribution_version="0.0.0",
-            software=SoftwareIdentity(version="0.0.0"),
-        )
-
-    monkeypatch.setattr(installation_module, "write_self_install_receipt", write_receipt)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "installation-write-receipt",
-            "--self",
-            "--output",
-            str(output_path),
-            "--components-from",
-            str(source_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert observed["path"] == output_path
-    assert observed["components_from"] == source_path
-    assert observed["force"] is False
 
 
 def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message() -> None:

@@ -193,7 +193,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # extraction (cli_diagnostics.py, 452 lines): -348 net lines.
     # #231 cli.py decomposition: init/install-frp top-level command-module
     # extraction (cli_init.py, 87 lines): -31 net lines.
-    "src/clio_relay/cli.py": 12543,
+    # #231 cli.py decomposition: installation-write-receipt/installation-info/
+    # bootstrap-inspect top-level command-module extraction
+    # (cli_installation_receipt.py, 446 lines): -346 net lines.
+    "src/clio_relay/cli.py": 12197,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

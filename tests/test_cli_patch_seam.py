@@ -90,6 +90,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_gateway_runtime": _SRC_ROOT / "cli_gateway_runtime.py",
     "cli_cluster_deploy": _SRC_ROOT / "cli_cluster_deploy.py",
     "cli_diagnostics": _SRC_ROOT / "cli_diagnostics.py",
+    "cli_installation_receipt": _SRC_ROOT / "cli_installation_receipt.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -122,7 +123,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # the cluster deployment command-group extraction (cluster_bootstrap's
     # only cli.py call site).
     ("bootstrap", "package_source_root", "cli_cluster_deploy"),
-    ("installation", "worker_runtime_info", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's only cli.py call site).
+    ("installation", "worker_runtime_info", "cli_installation_receipt"),
     # #231 cli.py decomposition: moved caller cli -> cli_endpoint with the
     # endpoint command-group extraction (EndpointWorker's only cli.py call
     # site was endpoint_start).
@@ -138,7 +142,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # doctor/live-test command-group extraction (run_live_acceptance's only
     # cli.py call site was live_test).
     ("live_acceptance", "run_live_acceptance", "cli_diagnostics"),
-    ("bootstrap_reconcile", "bootstrap_invocation_lock", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's own serialization lock; its only cli.py call site).
+    ("bootstrap_reconcile", "bootstrap_invocation_lock", "cli_installation_receipt"),
     ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli"),
     ("session_lifecycle", "read_remote_session_cleanup_report", "cli"),
     ("session_lifecycle", "inspect_owned_session_recovery_status", "cli"),
@@ -149,8 +156,14 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # R8(ii): moved caller cli -> cli_relay_host with the relay-host extraction.
     ("transport_probe", "run_frp_http_probe", "cli_relay_host"),
     ("core_queue", "ClioCoreQueue", "cli"),
-    ("bootstrap_reconcile", "inspect_exact_bootstrap_noop", "cli"),
-    ("bounded_process", "run_bounded_process", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's only cli.py call site).
+    ("bootstrap_reconcile", "inspect_exact_bootstrap_noop", "cli_installation_receipt"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's only cli.py call site).
+    ("bounded_process", "run_bounded_process", "cli_installation_receipt"),
     ("storage_runtime", "storage_managed_queue", "cli"),
     ("service_runtime", "ServiceRuntimeSupervisor", "cli"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
@@ -162,9 +175,18 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("transport_probe", "run_ssh_forward_http_probe", "cli_relay_host"),
     ("mcp_server", "load_registered_remote_mcp_catalog", "cli"),
     ("relay_ops", "wait_for_terminal", "cli"),
-    ("bootstrap_reconcile", "write_bootstrap_receipt", "cli"),
-    ("bootstrap_reconcile", "proven_active_generation_mismatch", "cli"),
-    ("installation", "write_self_install_receipt", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's only cli.py call site).
+    ("bootstrap_reconcile", "write_bootstrap_receipt", "cli_installation_receipt"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (bootstrap_
+    # inspect's only cli.py call site).
+    ("bootstrap_reconcile", "proven_active_generation_mismatch", "cli_installation_receipt"),
+    # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
+    # with the installation/receipt command-group extraction (installation_
+    # write_receipt's only cli.py call site).
+    ("installation", "write_self_install_receipt", "cli_installation_receipt"),
     # #231 cli.py decomposition: moved caller cli -> cli_job (its only call
     # site was job_wait).
     ("relay_ops", "observe_until_terminal", "cli_job"),
