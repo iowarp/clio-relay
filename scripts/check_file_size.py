@@ -368,13 +368,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # evidence lock, through Python closures rather than explicit
     # parameters) and `_persist_local_cleanup_report_artifact` (810 lines,
     # its own sequential chunk-hash-and-write body) each move as one
-    # atomic, unsplit unit into their own new files -- splitting either
-    # into standalone top-level functions would mean converting closures
-    # into an explicit multi-parameter API, a semantic rewrite of
-    # security-sensitive cleanup-evidence-locked code out of scope for a
-    # verbatim move -- so cli_session_teardown.py and
-    # cli_owned_report_artifact.py enter RATCHET_BASELINE below rather than
-    # forcing an unsafe split. Every external sibling module that reached a
+    # atomic, unsplit unit into their own new files -- so
+    # cli_owned_report_artifact.py enters RATCHET_BASELINE below rather
+    # than forcing an unsafe split of its own irreducible sequential body.
+    # Every external sibling module that reached a
     # moved symbol via `cli.<name>` (cli_session.py, cli_session_owned.py,
     # cli_gateway_runtime.py, cli_remote_mcp.py, remote_mcp_validation.py,
     # cli_jarvis_mcp.py, cli_jarvis_mcp_validate.py,
@@ -394,13 +391,41 @@ RATCHET_BASELINE: dict[str, int] = {
     # removed per ground rule 5, the largest single ratchet-down of the
     # #231 campaign.
     #
-    # The two irreducible units the wave-2 pass above carved out on their
-    # own, each new but already over DEFAULT_MAX_LINES for the closure/
-    # sequential-body reasons that comment explains -- entered here rather
-    # than force-split, per this file's own docstring ("a known-oversized
+    # The other of the two irreducible units the wave-2 pass above carved
+    # out on its own, already over DEFAULT_MAX_LINES for the sequential-
+    # body reasons that comment explains -- entered here rather than
+    # force-split, per this file's own docstring ("a known-oversized
     # module still awaiting decomposition").
-    "src/clio_relay/cli_session_teardown.py": 1524,
     "src/clio_relay/cli_owned_report_artifact.py": 878,
+    # split/cli-session-teardown-w3: cli_session_teardown.py's own further
+    # decomposition (the closure factory the comment above describes) into
+    # a 266-line facade -- the Typer signature, preflight, and
+    # guarded_action/locked_action, which are irreducibly part of the
+    # decorated command function -- over six new owner modules, each
+    # taking the shared, mutable cli_session_teardown_state._TeardownState
+    # in place of the closures' free variables: cli_session_teardown_state
+    # (127, the state object plus _persist_verified_cleanup_report_before_
+    # closure, itself already a fully explicit-parameter function so it
+    # moved verbatim), cli_session_teardown_recovery (258, resolve owner-
+    # session identity/recovery status and finish an already-finalized
+    # retry), cli_session_teardown_jobs (396, quiesce admission, list/
+    # cancel owned relay jobs, preflight scheduler sentinels),
+    # cli_session_teardown_finalize (312, the coordinator teardown call,
+    # post-cancel reconciliation, verification, and authoritative
+    # closure), cli_session_teardown_report (537 -- above the 150-500
+    # sweet spot; its docstring explains why the three cohesive report-
+    # emission functions stay one module), cli_session_teardown_action (42,
+    # composes the phases into the `action` callable). Every function body
+    # moved verbatim from the pre-split nested closures; only the free-
+    # variable reads/writes (now `state.<name>`) and the two report-
+    # emission call sites changed shape. `session_lifecycle.teardown_
+    # remote_session`'s and `_persist_verified_cleanup_report_before_
+    # closure`'s (which calls `finalize_remote_session_cleanup_report`/
+    # `read_remote_session_cleanup_report`) audited-collaborator entries in
+    # tests/test_cli_patch_seam.py were repointed from `cli_session_
+    # teardown` to the new modules that now hold their one call site, per
+    # this table's own "moved caller" precedent. Comfortably under
+    # DEFAULT_MAX_LINES -- entry removed per ground rule 5.
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
