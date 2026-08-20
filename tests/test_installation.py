@@ -33,7 +33,6 @@ from clio_relay.installation import (
     PersistentUvToolIdentity,
     installation_info,
     load_install_receipt,
-    probe_clio_kit_native_execution_contract,
     verified_session_api_install_receipt,
     verify_remote_clio_kit_native_execution_component,
     verify_remote_native_jarvis_component,
@@ -43,13 +42,10 @@ from clio_relay.installation import (
     write_self_install_receipt,
 )
 from clio_relay.jarvis_mcp import (
-    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
     DEFAULT_JARVIS_MCP_COMMAND,
     JARVIS_MCP_COMMAND_ENV,
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
-    jarvis_user_contract,
-    jarvis_user_contract_titles,
 )
 from clio_relay.validation_report import (
     InstallSource,
@@ -1747,55 +1743,6 @@ def test_remote_clio_kit_component_generic_error_when_never_probed(tmp_path: Pat
         verify_remote_clio_kit_native_execution_component(info, receipt)
 
 
-def test_clio_kit_probe_requires_unified_progress_and_artifact_query(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _clio_kit_jarvis_contract_document()
-
-    def probe(_command: list[str], *, label: str) -> dict[str, object]:
-        assert label == "clio-kit native execution contract"
-        return document
-
-    monkeypatch.setattr(
-        installation_module,
-        "run_json_probe",
-        probe,
-    )
-
-    capability = probe_clio_kit_native_execution_contract(
-        ["/home/user/.local/bin/clio-kit", "mcp-server", "jarvis"]
-    )
-
-    assert capability.operations == ["jarvis_get_execution", "jarvis_run"]
-    assert capability.contract_sha256 == CLIO_KIT_JARVIS_USER_CONTRACT_SHA256
-
-
-def test_clio_kit_probe_rejects_execution_query_without_artifact_selector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _clio_kit_jarvis_contract_document()
-    tools = cast(list[dict[str, object]], document["tools"])
-    query = next(tool for tool in tools if tool["name"] == "jarvis_get_execution")
-    input_schema = cast(dict[str, object], query["inputSchema"])
-    properties = cast(dict[str, object], input_schema["properties"])
-    properties.pop("artifacts")
-
-    def probe(_command: list[str], *, label: str) -> dict[str, object]:
-        assert label == "clio-kit native execution contract"
-        return document
-
-    monkeypatch.setattr(
-        installation_module,
-        "run_json_probe",
-        probe,
-    )
-
-    with pytest.raises(ConfigurationError, match="query surface did not match"):
-        probe_clio_kit_native_execution_contract(
-            ["/home/user/.local/bin/clio-kit", "mcp-server", "jarvis"]
-        )
-
-
 def test_remote_worker_identity_is_bound_to_fresh_running_endpoint(tmp_path: Path) -> None:
     wheel = tmp_path / "clio_relay-1.0.0-py3-none-any.whl"
     wheel.write_bytes(b"candidate-wheel")
@@ -2872,24 +2819,3 @@ def test_jarvis_mcp_override_cannot_masquerade_as_receipt_bound_runtime(
     ]
     assert runtime["command_matches_receipt"] is False
     assert runtime["artifact_identity_verified"] is False
-
-
-def _clio_kit_jarvis_contract_document() -> dict[str, object]:
-    titles = jarvis_user_contract_titles()
-    tools = [
-        {
-            "name": name,
-            "title": titles[name],
-            "description": definition["description"],
-            "inputSchema": definition["inputSchema"],
-            "outputSchema": definition["outputSchema"],
-            "annotations": definition["annotations"],
-        }
-        for name, definition in sorted(jarvis_user_contract().items())
-    ]
-    return {
-        "schema_version": "clio-kit.mcp-user-contract.v1",
-        "contract_id": CLIO_KIT_JARVIS_CONTRACT_ID,
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
-        "tools": tools,
-    }
