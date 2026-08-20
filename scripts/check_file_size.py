@@ -550,7 +550,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # types and the CommandRunner protocol (three narrow RelayError
     # subclasses, five frozen dataclasses, the Protocol) moved to the new
     # service_runtime_types.py (161 lines). 9344 -> 9211.
-    "src/clio_relay/service_runtime.py": 9211,
+    # #231 service-runtime split, slice 3: the mutually-coupled
+    # scheduler-submission-parsing + gateway-intent + completed-resource
+    # validation cluster moved to the new service_runtime_scheduler_contracts.py
+    # (800 lines, at the cap -- two sibling concerns that call back into each
+    # other, documented in the module docstring rather than force-split).
+    # 9211 -> 8502.
+    "src/clio_relay/service_runtime.py": 8502,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
