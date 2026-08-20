@@ -357,7 +357,22 @@ RATCHET_BASELINE: dict[str, int] = {
     # instead (183 -> 210 lines there) -- both windows-handles and the still-
     # co-resident orchestration depend on it from that one leaf, and neither
     # depends on the other. Net: 8447 -> 8108.
-    "src/clio_relay/endpoint.py": 8108,
+    # #231 endpoint split, slice 5: -504 net lines -- the private JARVIS
+    # execution-recovery directory lifecycle (timestamp/process-identity
+    # validation, directory-anchor build/restore/validate,
+    # open-or-create/close/revalidate, and the bounded recovery-result read/
+    # remove primitives) plus the generic private-JSON-file serialize/
+    # atomic-write primitive it's written through move to the new owner
+    # module `endpoint_recovery_directory.py` (577 lines -- above the 150-500
+    # sweet spot but under the 800 real-seam-split threshold; the module's
+    # own docstring documents why its three internal layers stay one module
+    # rather than a forced cut). Four functions with no remaining endpoint.py
+    # call site (_private_json_payload, _recovery_directory_anchor_from_
+    # metadata, _recovery_directory_anchor_from_stat, _validate_recovery_
+    # directory_stat) dropped out of endpoint.py's forward import entirely;
+    # no test referenced them directly, so no test re-pointing was needed.
+    # Net: 8108 -> 7604.
+    "src/clio_relay/endpoint.py": 7604,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
