@@ -469,8 +469,8 @@ selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel bootstrap installs by default is
-`clio_kit-2.7.2-py3-none-any.whl` with SHA-256
-`8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5`.
+`clio_kit-2.10.2-py3-none-any.whl` with SHA-256
+`315640571cd49d458c946c03676b0bd50216ebcf0c3d9974988dea2090d5ec0d`.
 Its canonical contract is `clio-kit-jarvis-user-v3.7.1`. The relay's own
 vendored certification snapshot of that contract (used to cross-check the
 bundled `_contracts/jarvis-user-v3.7.1.json` copy against a known-good
