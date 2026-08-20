@@ -682,7 +682,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # contract while v3.7 remains the current input-staging contract.
     "src/clio_relay/models.py": 2299,
     "src/clio_relay/process_containment.py": 2678,
-    "src/clio_relay/queue_management.py": 1671,
+    # split/queue-management-w2: queue_management.py is now a 70-line
+    # re-export facade (entry removed -- under DEFAULT_MAX_LINES). The
+    # implementation moved to eight single-concern owner modules:
+    # queue_diagnosis_constants.py, queue_worker_capacity.py,
+    # queue_admission_snapshot.py, queue_listing.py,
+    # queue_admission_simulation.py, queue_diagnosis.py,
+    # queue_stale_recovery.py, queue_worker_status.py -- all under
+    # DEFAULT_MAX_LINES, none needs a baseline entry either.
     # +11 net lines -- the first live worker_status() read raced a
     # just-registered fleet's own background slot heartbeats
     # (worker_generation_complete could read transiently False before the
