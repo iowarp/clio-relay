@@ -21,7 +21,15 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
-from clio_relay import process_containment, queue_artifacts
+from clio_relay import (
+    endpoint_execution_sidecar_cleanup,
+    endpoint_jarvis_recovery,
+    endpoint_runtime_sidecar_anchor,
+    endpoint_sidecar_types,
+    endpoint_windows_sidecar_handles,
+    process_containment,
+    queue_artifacts,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -1228,7 +1236,9 @@ def test_execution_sidecar_cleanup_removes_only_owned_non_directory_entries(
             [hostile],
             spool_path=spool,
             expected_anchors={
-                hostile: private._runtime_sidecar_anchor(os.stat(hostile, follow_symlinks=False))
+                hostile: endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
+                    os.stat(hostile, follow_symlinks=False)
+                )
             },
         )
     assert hostile.is_dir()
@@ -1251,7 +1261,7 @@ def test_execution_sidecar_quarantine_name_is_bounded_on_long_spool_paths(
         anchor_metadata,
         task_id="long-path-sidecar",
     )
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     assert len(quarantine.name) == 47
     assert len(quarantine.name) <= len(source.name)
@@ -1284,7 +1294,7 @@ def test_execution_sidecar_quarantine_restarts_beyond_windows_max_path(
         "restart-evidence",
         encoding="utf-8",
     )
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     first = private._remove_execution_sidecars(
         [source],
@@ -1292,7 +1302,7 @@ def test_execution_sidecar_quarantine_restarts_beyond_windows_max_path(
         expected_anchors={source: anchor},
         expected_quarantines={source: quarantine},
     )
-    restarted_anchor = private._runtime_sidecar_anchor(
+    restarted_anchor = endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
         os.stat(internal_filesystem_path(quarantine), follow_symlinks=False)
     )
     second = private._remove_execution_sidecars(
@@ -1356,7 +1366,7 @@ def test_sidecar_quarantine_never_replaces_existing_evidence(tmp_path: Path) -> 
     sidecar = spool / ".runtime-no-replace.jsonl"
     anchor = private._precreate_runtime_sidecar(sidecar)
     sidecar.write_text("owned", encoding="utf-8")
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
     quarantine.write_text("hostile", encoding="utf-8")
     if os.name != "nt":
         quarantine.chmod(0o600)
@@ -1379,7 +1389,7 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
 ) -> None:
     private = cast(Any, endpoint_module)
     if os.name == "nt":
-        assert private._WINDOWS_FILE_RENAME_INFO == 3
+        assert endpoint_sidecar_types._WINDOWS_FILE_RENAME_INFO == 3
         return
     spool = tmp_path / "spool" / "job"
     spool.mkdir(parents=True)
@@ -1387,7 +1397,7 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
     anchor = private._precreate_runtime_sidecar(sidecar)
     sidecar.write_text("anchored", encoding="utf-8")
     moved_anchor = spool / ".runtime-race.anchored"
-    original_rename = private._rename_noreplace_at
+    original_rename = endpoint_execution_sidecar_cleanup._rename_noreplace_at
 
     def swap_before_rename(directory_fd: int, source_name: str, quarantine_name: str) -> None:
         sidecar.rename(moved_anchor)
@@ -1395,8 +1405,12 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
         sidecar.chmod(0o600)
         original_rename(directory_fd, source_name, quarantine_name)
 
-    monkeypatch.setattr(endpoint_module, "_rename_noreplace_at", swap_before_rename)
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    monkeypatch.setattr(
+        endpoint_execution_sidecar_cleanup,
+        "_rename_noreplace_at",
+        swap_before_rename,
+    )
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     with pytest.raises(ConfigurationError, match="identity or permissions changed"):
         private._remove_execution_sidecars(
@@ -1459,26 +1473,26 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
             calls.append(("closed", handle))
 
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_open_windows_cleanup_handle",
             fake_open_windows_cleanup_handle,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_windows_handle_information",
             fake_windows_handle_information,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_quarantine_windows_sidecar_by_handle",
             fake_quarantine_windows_sidecar_by_handle,
         )
         monkeypatch.setattr(
-            endpoint_module,
+            endpoint_windows_sidecar_handles,
             "_close_windows_cleanup_handle",
             fake_close_windows_cleanup_handle,
         )
-        cast(Any, endpoint_module)._remove_execution_sidecars_windows(
+        cast(Any, endpoint_windows_sidecar_handles)._remove_execution_sidecars_windows(
             [progress],
             spool_path=spool,
             expected_spool_identity=(os.stat(spool).st_dev, os.stat(spool).st_ino),
@@ -1487,7 +1501,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
         assert calls == [(progress.name, 41), ("closed", 41)]
         return
 
-    original_quarantine = private._quarantine_windows_sidecar_by_handle
+    original_quarantine = endpoint_windows_sidecar_handles._quarantine_windows_sidecar_by_handle
     moved_spool = spool.with_name("job-replaced")
     replacement_attempts: list[OSError] = []
 
@@ -1512,7 +1526,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
         )
 
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_windows_sidecar_handles,
         "_quarantine_windows_sidecar_by_handle",
         adversarial_quarantine,
     )
@@ -1541,7 +1555,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
                 [junction],
                 spool_path=spool,
                 expected_anchors={
-                    junction: private._runtime_sidecar_anchor(
+                    junction: endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
                         os.stat(junction, follow_symlinks=False)
                     )
                 },
@@ -1555,7 +1569,7 @@ def test_windows_repeated_quarantine_creates_only_exact_directory_entries(
 ) -> None:
     private = cast(Any, endpoint_module)
     if os.name != "nt":
-        assert private._WINDOWS_FILE_RENAME_INFO == 3
+        assert endpoint_sidecar_types._WINDOWS_FILE_RENAME_INFO == 3
         return
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -1570,7 +1584,9 @@ def test_windows_repeated_quarantine_creates_only_exact_directory_entries(
             anchor_metadata,
             task_id=f"windows-repeat-{iteration}",
         )
-        quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+        quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(
+            anchor
+        )
 
         result = private._remove_execution_sidecars(
             [source],
@@ -1630,8 +1646,14 @@ def test_windows_repeated_quarantine_restart_acknowledgment_is_exact(
             runtime_anchor_metadata,
             task_id=task.task_id,
         )
-        progress_quarantine = spool / private._execution_sidecar_quarantine_name(progress_anchor)
-        runtime_quarantine = spool / private._execution_sidecar_quarantine_name(runtime_anchor)
+        progress_quarantine = (
+            spool
+            / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(progress_anchor)
+        )
+        runtime_quarantine = (
+            spool
+            / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(runtime_anchor)
+        )
         queue.register_execution_cleanup(
             task.task_id,
             {
@@ -3121,7 +3143,7 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
 ) -> None:
     install_site_progress_plugin(monkeypatch)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3138,7 +3160,9 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
                 expected_server_artifact_digest=digest,
                 expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None
+                    if registered
+                    else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3240,7 +3264,7 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
 ) -> None:
     install_site_progress_plugin(monkeypatch)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3254,7 +3278,7 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3349,7 +3373,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
     monkeypatch: MonkeyPatch,
 ) -> None:
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     server_artifact = verified_jarvis_server_artifact()
@@ -3363,7 +3387,7 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "pipeline-live"},
@@ -3656,7 +3680,7 @@ def _native_mcp_result_document(
         "expected_jarvis_cd_lock_binding": (
             None
             if expected_registered_contract is not None
-            else endpoint_module.jarvis_cd_lock_binding_expectation()
+            else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
         ),
         "observed_server_artifact_digest": digest,
         "server_artifact": server_artifact,
@@ -5947,7 +5971,7 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
         server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_jarvis_recovery,
         "jarvis_mcp_command",
         lambda: command,
     )
@@ -5961,7 +5985,9 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
                 expected_server_artifact_digest=digest,
                 expected_registered_contract=("clio-kit-jarvis-user-v3.7.1" if registered else None),
                 expected_jarvis_cd_lock_binding=(
-                    None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+                    None
+                    if registered
+                    else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "runtime-test"},
@@ -6074,7 +6100,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     idempotency_key = "native-direct-runtime"
     relay_job_id = "job_22222222222222222222222222222222"
     execution_id = deterministic_jarvis_execution_id(
@@ -6092,7 +6118,7 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={
@@ -6328,8 +6354,8 @@ def test_trusted_jarvis_mcp_result_requires_content_derived_server_digest(
     """Self-reported digests cannot substitute for the persisted artifact document."""
     command = ["clio-kit", "mcp-server", "jarvis"]
     claimed_digest = "f" * 64
-    expected_lock = endpoint_module.jarvis_cd_lock_binding_expectation()
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    expected_lock = endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6371,7 +6397,7 @@ def test_worker_refuses_builtin_semantics_without_jarvis_lock_marker(
 ) -> None:
     """A generic JARVIS call cannot unlock built-in progress/runtime handling."""
     command = ["clio-kit", "mcp-server", "jarvis"]
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6396,8 +6422,8 @@ def test_worker_refuses_result_with_mismatched_jarvis_lock_marker(
 ) -> None:
     """Built-in result evidence must carry the same lock marker as its job."""
     command = ["clio-kit", "mcp-server", "jarvis"]
-    expected = endpoint_module.jarvis_cd_lock_binding_expectation()
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    expected = endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -6441,7 +6467,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
     ]
     digest = "d" * 64
     monkeypatch.setattr(
-        endpoint_module,
+        endpoint_jarvis_recovery,
         "jarvis_mcp_command",
         lambda: ["uvx", *server_args],
     )
@@ -6452,7 +6478,9 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
             server="uvx",
             server_args=server_args,
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_jarvis_cd_lock_binding=(
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments={"pipeline_id": "owned"},
         ),
@@ -6469,7 +6497,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
                 "env_from": {},
                 "expected_server_artifact_digest": digest,
                 "expected_jarvis_cd_lock_binding": (
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 "observed_server_artifact_digest": digest,
                 "operation": "tools/call",
@@ -6493,7 +6521,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
     command = ["clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     arguments = {"pipeline_id": "owned"}
     job = RelayJob(
         cluster="research-cluster",
@@ -6502,7 +6530,9 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             server=command[0],
             server_args=command[1:],
             expected_server_artifact_digest=digest,
-            expected_jarvis_cd_lock_binding=(endpoint_module.jarvis_cd_lock_binding_expectation()),
+            expected_jarvis_cd_lock_binding=(
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
+            ),
             tool="jarvis_run",
             arguments=arguments,
         ),
@@ -6517,7 +6547,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
             "env_from": {},
             "expected_server_artifact_digest": digest,
             "expected_jarvis_cd_lock_binding": (
-                endpoint_module.jarvis_cd_lock_binding_expectation()
+                endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
             ),
             "observed_server_artifact_digest": digest,
             "server_artifact": server_artifact,

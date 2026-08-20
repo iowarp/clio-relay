@@ -367,7 +367,126 @@ RATCHET_BASELINE: dict[str, int] = {
     # import account for the delta. A justified, minimal ratchet-up -- the
     # alternative (leaving either call site unguarded) is the silent
     # slot-death and 0-byte-log defect the issue reports.
-    "src/clio_relay/endpoint.py": 8743,
+    # #231 endpoint split, slice 1: -90 net lines -- the three filesystem-
+    # identity dataclasses (`_PackageProgressLogState`, `_RuntimeSidecarAnchor`,
+    # `_RecoveryDirectoryAnchor`) plus every progress/runtime-sidecar byte-
+    # budget constant and the Windows kernel32 constant set move to the new
+    # leaf owner module `endpoint_sidecar_types.py` (160 lines, under the
+    # default cap). Both `EndpointWorker` and the ~90 still-co-resident
+    # module-level helper functions now import these forward from the new
+    # module by the same names, so every existing `endpoint.<name>` access
+    # and monkeypatch target keeps resolving unchanged. Net: 8743 -> 8653.
+    # #231 endpoint split, slice 2: -63 net lines -- the package-progress-log
+    # path/identity primitives (_progress_log_identity,
+    # _normalize_package_progress_log_path, _validated_native_subprocess_cwd,
+    # _render_progress_log_identity, _open_package_progress_log) move to the
+    # new leaf owner module `endpoint_progress_log_io.py` (94 lines). Net:
+    # 8653 -> 8590.
+    # #231 endpoint split, slice 3: -143 net lines -- the runtime-sidecar
+    # filesystem-anchor lifecycle (_runtime_sidecar_anchor,
+    # _runtime_sidecar_anchor_from_metadata, _validate_runtime_sidecar_stat,
+    # _precreate_runtime_sidecar, _open_owned_sidecar) moves to the new owner
+    # module `endpoint_runtime_sidecar_anchor.py` (183 lines). Net:
+    # 8590 -> 8447.
+    # #231 endpoint split, slice 4: -339 net lines -- the Windows ctypes
+    # sidecar-handle primitives (_open_windows_cleanup_handle,
+    # _windows_handle_information, _mark_windows_handle_for_rename,
+    # _close_windows_cleanup_handle, _validate_windows_sidecar_handle,
+    # _quarantine_windows_sidecar_by_handle, _remove_execution_sidecars_
+    # windows) move to the new owner module
+    # `endpoint_windows_sidecar_handles.py` (387 lines). The one function that
+    # would otherwise create a cycle between this module and the still-
+    # co-resident execution-sidecar cleanup orchestration,
+    # _execution_sidecar_quarantine_name (a pure function of one anchor, no
+    # cleanup state), relocates to `endpoint_runtime_sidecar_anchor.py`
+    # instead (183 -> 210 lines there) -- both windows-handles and the still-
+    # co-resident orchestration depend on it from that one leaf, and neither
+    # depends on the other. Net: 8447 -> 8108.
+    # #231 endpoint split, slice 5: -504 net lines -- the private JARVIS
+    # execution-recovery directory lifecycle (timestamp/process-identity
+    # validation, directory-anchor build/restore/validate,
+    # open-or-create/close/revalidate, and the bounded recovery-result read/
+    # remove primitives) plus the generic private-JSON-file serialize/
+    # atomic-write primitive it's written through move to the new owner
+    # module `endpoint_recovery_directory.py` (577 lines -- above the 150-500
+    # sweet spot but under the 800 real-seam-split threshold; the module's
+    # own docstring documents why its three internal layers stay one module
+    # rather than a forced cut). Four functions with no remaining endpoint.py
+    # call site (_private_json_payload, _recovery_directory_anchor_from_
+    # metadata, _recovery_directory_anchor_from_stat, _validate_recovery_
+    # directory_stat) dropped out of endpoint.py's forward import entirely;
+    # no test referenced them directly, so no test re-pointing was needed.
+    # Net: 8108 -> 7604.
+    # #231 endpoint split, slice 6: -469 net lines -- JARVIS execution-
+    # recovery dispatch trust and orchestration (_trusted_jarvis_mcp_route
+    # and every function that calls it: intent build/validate, pending
+    # check, result-identity/trust checks, dispatch-refusal attribution and
+    # rendering, runtime-recovery-state restore, execution-query
+    # attestation validation) plus the MCP runner environment/command
+    # construction move to the new owner module
+    # `endpoint_jarvis_recovery.py` (553 lines). Every moved function still
+    # has a direct `EndpointWorker` call site, so all eleven stay forward-
+    # imported into endpoint.py under their original names; six collateral
+    # imports (jarvis_mcp_command, jarvis_cd_lock_binding_expectation,
+    # jarvis_mcp_server_artifact_binding_verified,
+    # remote_mcp_server_artifact_binding_verified, jarvis_dispatch_refusal,
+    # REGISTERED_JARVIS_EXECUTION_CONTRACTS) and MCP_RUNNER_BASE_ENV_NAMES
+    # drop out of endpoint.py's own imports entirely once their only
+    # remaining callers moved with the functions that used them.
+    # test_endpoint.py's and test_jarvis_execution_recovery_guards.py's
+    # `monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", ...)` /
+    # `endpoint_module.jarvis_cd_lock_binding_expectation()` sites (24 call
+    # sites total) re-point to the new module -- the internal call from
+    # `_trusted_jarvis_mcp_route` now resolves in
+    # `endpoint_jarvis_recovery`'s own globals, not endpoint.py's, so the
+    # old patch target went dead. Net: 7604 -> 7135.
+    # #231 endpoint split, slice 7: -372 net lines -- cross-platform
+    # execution-sidecar quarantine orchestration (the durable cleanup-plan/
+    # quarantine-path-restore/acknowledgment builders, the Linux
+    # renameat2(RENAME_NOREPLACE) primitive, the cross-platform
+    # _remove_execution_sidecars orchestrator, and anchor-descriptor
+    # release) moves to the new owner module
+    # `endpoint_execution_sidecar_cleanup.py` (426 lines). Only
+    # `_remove_execution_sidecars` keeps a remaining `EndpointWorker` call
+    # site; the other five functions (plus `_execution_sidecar_quarantine_
+    # name`/`_validate_runtime_sidecar_stat` on the already-extracted
+    # `endpoint_runtime_sidecar_anchor.py`, and
+    # `_remove_execution_sidecars_windows` on `endpoint_windows_sidecar_
+    # handles.py`) drop out of endpoint.py's own imports entirely, taking
+    # the now-dead `ctypes`/`errno`/`stat` imports and two schema constants
+    # with them. test_endpoint.py's seven direct
+    # `_execution_sidecar_quarantine_name` calls and one `_rename_noreplace_
+    # at` monkeypatch/direct-call pair re-point to the new modules per the
+    # same rule slice 3/4/6 established. Net: 7135 -> 6763.
+    # #231 endpoint split, slice 8: -447 net lines -- package-progress
+    # observation trust (bounded sidecar-record reading/checkpointing plus
+    # provider/MCP-bridge/native-HMAC notification cross-checks) moves to
+    # the new owner module `endpoint_progress_trust.py` (505 lines --
+    # slightly above the 150-500 sweet spot; the module's docstring
+    # documents why its two layers stay together). Only
+    # `_normalized_provider_distribution` has no remaining `EndpointWorker`
+    # call site (its only caller, `_trusted_mcp_progress_metadata`, moved
+    # with it); no test referenced it directly. Net: 6763 -> 6316.
+    # #231 endpoint split, slice 9: -501 net lines -- the ENTIRE remaining
+    # module-level function tail (everything after `EndpointWorker`) moves
+    # out, split along its last real seam: worker-environment identity +
+    # scheduler-naming/status normalization + bounded coercion helpers
+    # (`endpoint_worker_environment.py`, 330 lines) and durable job/task/
+    # runtime-metadata classification predicates
+    # (`endpoint_scheduler_metadata.py`, 292 lines). endpoint.py is now
+    # exactly `EndpointWorker` (plus its module-scope constants/imports) --
+    # the assembly the doc's own inventory named as the file's largest
+    # single concern, still unsequenced there. `bootstrap_cluster_
+    # environment` (a public, non-underscore name) has zero remaining
+    # callers anywhere in the repository (verified by a full-tree grep
+    # before the move, not just endpoint.py) and drops out of endpoint.py's
+    # forward import entirely -- preserved as-is per this campaign's scope
+    # (decomposition, not dead-code removal); `_scheduler_name_from_document`
+    # similarly has no remaining `EndpointWorker` call site (only its
+    # recursive self-calls and its one caller, `_scheduler_name_from_yaml`,
+    # which moved with it). No test referenced either directly. Net:
+    # 6316 -> 5815.
+    "src/clio_relay/endpoint.py": 5815,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
