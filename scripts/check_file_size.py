@@ -135,7 +135,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # safe, bounded wheel/sdist inspection (ZIP/tar member reads, path
     # safety, ZIP64/central-directory preflight, core-metadata identity
     # binding) assembled into build_distribution_archive_receipt.
-    "src/clio_relay/ci_validation.py": 2975,
+    # #231: -556 net lines -- branch_protection.py becomes the owner for the
+    # repository governance receipt lifecycle (build/verify/fetch-live/
+    # verify-live) and the raw branch/tag/environment/immutable-releases
+    # protection-receipt builders it assembles from.
+    "src/clio_relay/ci_validation.py": 2419,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared

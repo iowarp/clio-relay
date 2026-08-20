@@ -11,9 +11,18 @@ from typing import cast
 
 import pytest
 
-from clio_relay.ci_validation import (
+from clio_relay.branch_protection import (
     GITHUB_ACTIONS_APP_ID,
     MAIN_REVIEW_POLICY,
+    REQUIRE_LAST_PUSH_APPROVAL,
+    REQUIRED_APPROVING_REVIEW_COUNT,
+    REQUIRED_MERGE_QUEUE_PARAMETERS,
+    build_repository_governance,
+    fetch_live_repository_governance,
+    verify_live_repository_governance,
+    verify_repository_governance,
+)
+from clio_relay.ci_validation import (
     MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
     MAX_DISTRIBUTION_BYTES,
     MAX_FIXED_JSON_BYTES,
@@ -24,22 +33,17 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
     MAX_VALIDATION_REPORT_ASSETS,
     MAX_VALIDATION_REPORT_BYTES,
-    REQUIRE_LAST_PUSH_APPROVAL,
-    REQUIRED_APPROVING_REVIEW_COUNT,
     REQUIRED_CI_JOBS,
     REQUIRED_ENVIRONMENTS,
     REQUIRED_MATRIX_JOBS,
-    REQUIRED_MERGE_QUEUE_PARAMETERS,
     ProvenanceError,
     build_actions_artifact_manifest,
     build_candidate_build_receipt,
     build_ci_status,
     build_exact_release_asset_inventory,
-    build_repository_governance,
     build_staged_release_asset_plan,
     build_tag_binding,
     build_validation_report_asset_manifest,
-    fetch_live_repository_governance,
     resolve_live_release,
     select_ci_run,
     validate_release_acceptance_matrix,
@@ -49,9 +53,7 @@ from clio_relay.ci_validation import (
     verify_exact_release_asset_inventory,
     verify_live_mutation_authority,
     verify_live_release_identity,
-    verify_live_repository_governance,
     verify_release_identity,
-    verify_repository_governance,
     write_candidate_checksum_manifest,
 )
 
