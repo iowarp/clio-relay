@@ -276,7 +276,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
     # deletion offsets it: these are two new, real config fields, not a fixable
     # regression.
-    "src/clio_relay/cluster_config.py": 1863,
+    # split/cluster-config-w2: cluster_config.py is now a 127-line facade
+    # (assembly/re-exports + default_registry_path only) over eight owner
+    # modules -- cluster_config_models.py (Pydantic schema),
+    # cluster_config_registry.py (ClusterRegistry + cluster_route_revision),
+    # cluster_config_io.py (bounded configuration reads), and the four-module
+    # Windows-ACL split (cluster_config_windows_primitives.py,
+    # cluster_config_windows_acl.py, cluster_config_windows_paths.py,
+    # cluster_config_windows_guard.py). Comfortably under DEFAULT_MAX_LINES
+    # with no baseline entry needed. Entry removed per ground rule 5 --
+    # ratchet down.
     # #231 CQ8: idempotency admission and endpoint registration/heartbeat
     # ownership move behind typed owner/store seams, lowering the facade
     # ratchet by 504 lines.

@@ -238,12 +238,16 @@ PINSITES: tuple[PinSite, ...] = (
     # -- jarvis_contract: the user contract id/path literal (§1's ---------
     # -- "13-copy v3.7" story) -- mutable literal sites --------------------
     _row(
+        # iowarp/clio-relay#231 split/cluster-config: RemoteMcpContract moved
+        # from cluster_config.py (a thin facade now) to its real owner module,
+        # cluster_config_models.py -- this site follows the definition, not
+        # the facade's re-export line.
         "jc.cluster_config",
-        "src/clio_relay/cluster_config.py",
+        "src/clio_relay/cluster_config_models.py",
         _JC,
         _LN,
         "RemoteMcpContract Literal member",
-        line=280,
+        line=139,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
