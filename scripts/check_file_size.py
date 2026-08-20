@@ -471,7 +471,20 @@ RATCHET_BASELINE: dict[str, int] = {
     # 6098. The matching/long-poll mechanics live in the sub-800 observation
     # owner; the additional routed lines retain incremental remote log cursors
     # so long-running jobs do not rescan only the first log page.
-    "src/clio_relay/mcp_server.py": 6098,
+    # clio-relay#264: +9 net lines -- relay_list_artifacts/relay_read_artifact
+    # were the only two artifact-facing tools missing the cluster/
+    # route_revision routing every sibling job/artifact tool already has
+    # (relay_status, relay_cancel, relay_artifact_lineage, relay_wait), so a
+    # jarvis execution dispatched to a configured remote cluster always
+    # answered not-found for its own registered artifacts. Both dispatch
+    # bodies now resolve the caller's asserted cluster (the existing
+    # _job_target) and delegate the local/remote/owned fetch mechanics to
+    # the new sub-800 artifact_routing.py owner; two schema property blocks
+    # (cluster/route_revision + dependentRequired, matching relay_artifact_
+    # lineage's shape) account for the added lines, offset by deleting the
+    # now-dead local-only _read_model_artifact_bytes. A justified, minimal
+    # ratchet-up: 6098 -> 6107.
+    "src/clio_relay/mcp_server.py": 6107,
     # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
     # timeout message and log its bounded diagnostic once server-side.
     "src/clio_relay/mcp_stdio_validation.py": 1285,
