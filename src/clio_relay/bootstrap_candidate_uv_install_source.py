@@ -2,14 +2,15 @@
 
 Split from bootstrap.py (clio-relay#255). `_BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE`
 is the standalone Python program that verifies/installs the pinned uv and
-the relay's own provider before any candidate code runs; the package-source
-overlay/name list and `_bootstrap_candidate_package_sources()` identify
-exactly which repository-relative sources travel with a candidate.
+the relay's own provider before any candidate code runs. The package-source
+overlay/name list and `_bootstrap_candidate_package_sources()` -- which
+identify exactly which repository-relative sources travel with a candidate
+-- now live in the sibling `bootstrap_candidate_package_sources` module
+(split during the integrate-w2 merge train once that manifest grew past
+this file's own line budget); re-exported below under their original names.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 _BOOTSTRAP_CANDIDATE_UV_INSTALL_SOURCE = r"""import base64
 import ctypes
@@ -719,35 +720,15 @@ if action.endswith("-and-exec"):
     )
 print("bootstrap_candidate_provider_sha256=" + provider_sha256)
 print("bootstrap_candidate_install=fd-bound-wheel-verified:" + action)"""
-_BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
-    b"\nfrom importlib import metadata as _clio_relay_metadata\n"
-    b"from pkgutil import extend_path\n\n"
-    b"__path__ = extend_path(__path__, __name__)\n"
-    b"try:\n"
-    b"    __version__ = _clio_relay_metadata.version('clio-relay')\n"
-    b"except _clio_relay_metadata.PackageNotFoundError:\n"
-    b"    pass\n"
-)
-_BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
-    "bootstrap_full_activation_staging.py",
-    "bootstrap_jarvis_staging.py",
-    "bootstrap_provider_build_info.py",
-    "bootstrap_reconcile.py",
-    "bootstrap_recovery.py",
-    "bounded_process.py",
-    "errors.py",
-    "process_containment.py",
-    "safe_archive.py",
-)
 
-
-def _bootstrap_candidate_package_sources() -> dict[str, bytes]:
-    """Return the exact sources overlaid during candidate reconciliation."""
-    package_root = Path(__file__).parent
-    sources = {
-        "__init__.py": (package_root / "__init__.py").read_bytes()
-        + _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY
-    }
-    for name in _BOOTSTRAP_CANDIDATE_SOURCE_NAMES:
-        sources[name] = (package_root / name).read_bytes()
-    return sources
+# The candidate-overlay package manifest (_BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY,
+# _BOOTSTRAP_CANDIDATE_SOURCE_NAMES, _bootstrap_candidate_package_sources) now
+# lives in bootstrap_candidate_package_sources.py -- split out during the
+# integrate-w2 merge train once the manifest grew past this file's 800-line
+# new-file cap. Re-exported here under their original names: bootstrap.py
+# imports _bootstrap_candidate_package_sources from this module's own path.
+from clio_relay.bootstrap_candidate_package_sources import (  # noqa: E402, F401
+    _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY,
+    _BOOTSTRAP_CANDIDATE_SOURCE_NAMES,
+    _bootstrap_candidate_package_sources,
+)
