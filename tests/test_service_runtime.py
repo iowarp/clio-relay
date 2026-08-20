@@ -28,6 +28,7 @@ from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
+import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_types as service_runtime_types
@@ -133,7 +134,7 @@ def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> N
         (
             "import sys",
             "from pathlib import Path",
-            "from clio_relay.service_runtime import SubprocessCommandRunner",
+            "from clio_relay.service_runtime_command_runner import SubprocessCommandRunner",
             "started, stop, stopped, stdout, stderr = map(Path, sys.argv[1:6])",
             "process = SubprocessCommandRunner().popen(",
             "    [sys.executable, '-c', sys.argv[6], str(started), str(stop), str(stopped)],",
@@ -201,7 +202,7 @@ def test_subprocess_runner_delivers_private_input_and_immediate_eof(tmp_path: Pa
         "Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
     )
 
-    process = service_runtime.SubprocessCommandRunner().popen(
+    process = service_runtime_command_runner.SubprocessCommandRunner().popen(
         [
             sys.executable,
             "-c",
@@ -262,7 +263,7 @@ def test_subprocess_runner_terminates_process_group_when_private_input_delivery_
     secret = b"private-bootstrap-value"
 
     with pytest.raises(RelayError, match="failed to deliver private process bootstrap") as caught:
-        service_runtime.SubprocessCommandRunner().popen(
+        service_runtime_command_runner.SubprocessCommandRunner().popen(
             ["browser-gateway-test"],
             stdout_path=tmp_path / "failed-bootstrap.out",
             stderr_path=tmp_path / "failed-bootstrap.err",

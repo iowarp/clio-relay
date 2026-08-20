@@ -560,7 +560,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # process discovery/identity/signaling cluster (POSIX pidfd primitives +
     # Windows CIM enumeration) moved to the new
     # service_runtime_connector_identity.py (682 lines). 8502 -> 7866.
-    "src/clio_relay/service_runtime.py": 7866,
+    # #231 service-runtime split, slice 5: the concrete SubprocessCommandRunner
+    # (CommandRunner protocol default implementation) plus its stdin-delivery
+    # helper moved to the new service_runtime_command_runner.py (154 lines).
+    # 7866 -> 7740.
+    "src/clio_relay/service_runtime.py": 7740,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
