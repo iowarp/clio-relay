@@ -634,7 +634,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # detach/attach cluster -- moved to the new service_runtime_stop.py (688
     # lines) as `_ServiceRuntimeStopMixin`. The two teardown schema constants
     # move with their only callers. 3749 -> 3107.
-    "src/clio_relay/service_runtime.py": 3107,
+    # #231 service-runtime split, slice 15: desktop-connector-only detach --
+    # detach, _detach_serialized, _prepare_detach_intent,
+    # _completed_detach_result, _consume_completed_detach_for_attach, and the
+    # three resumability predicates (interleaved with the intent helpers in
+    # the original source since they are one concern: what a detached
+    # generation proves and who may resume it) -- moved to the new
+    # service_runtime_detach.py (564 lines) as `_ServiceRuntimeDetachMixin`.
+    # The attach mixin calls back into this module's predicates via `self`.
+    # 3107 -> 2596.
+    "src/clio_relay/service_runtime.py": 2596,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
