@@ -25,6 +25,7 @@ import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
+import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
 import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
@@ -4136,7 +4137,7 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
             "stderr_path": ownership_intent["stderr_path"],
             "metadata_path": ownership_intent["metadata_path"],
         }
-        service_runtime_module._write_local_connector_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity_module._write_local_connector_sidecar(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             Path(str(ownership_intent["metadata_path"])),
             connector,
         )
@@ -4168,7 +4169,11 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
         )
 
     monkeypatch.setattr(supervisor, "_start_local_visitor", start_local_then_lose_response)
-    monkeypatch.setattr(service_runtime_module, "_local_connector_identity_status", connector_owned)
+    monkeypatch.setattr(
+        service_runtime_connector_identity_module,
+        "_local_connector_identity_status",
+        connector_owned,
+    )
     monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
     monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
 

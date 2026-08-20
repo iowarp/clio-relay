@@ -28,6 +28,7 @@ from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
+import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_types as service_runtime_types
 import clio_relay.session_lifecycle as session_lifecycle
@@ -74,7 +75,7 @@ from tests.gateway_ownership_crash_fixture import (
     definition as crash_fixture_definition,
 )
 
-_REAL_OBSERVE_LOCAL_PROCESS = service_runtime._observe_local_process  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+_REAL_OBSERVE_LOCAL_PROCESS = service_runtime_connector_identity._observe_local_process  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 class FakeProcess:
@@ -413,7 +414,9 @@ def _fake_connector_process_absent(  # pyright: ignore[reportUnusedFunction]
     def process_absent(_pid: int) -> None:
         return None
 
-    monkeypatch.setattr(service_runtime, "_observe_local_process", process_absent)
+    monkeypatch.setattr(
+        service_runtime_connector_identity, "_observe_local_process", process_absent
+    )
 
 
 class FakeRunner(CommandRunner):
@@ -1494,13 +1497,17 @@ def _start_lifecycle_frp_runtime(
         frpc_bin="frpc-test",
     )
     runner = LifecycleFrpRunner()
-    monkeypatch.setattr(service_runtime, "_observe_local_process", runner.observe_process)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity, "_observe_local_process", runner.observe_process
+    )
+    monkeypatch.setattr(
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         runner.process_group_members,
     )
-    monkeypatch.setattr(service_runtime, "_local_process_ids", runner.process_ids)
+    monkeypatch.setattr(
+        service_runtime_connector_identity, "_local_process_ids", runner.process_ids
+    )
     supervisor = ServiceRuntimeSupervisor(
         settings=settings,
         queue=ClioCoreQueue(settings.core_dir),
@@ -1594,15 +1601,24 @@ def test_service_runtime_frp_teardown_escalates_and_verifies_process_cleanup(
     def no_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(service_runtime, "os", types.SimpleNamespace(name="posix"))
-    monkeypatch.setattr(service_runtime.signal, "SIGKILL", sigkill, raising=False)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
+        "os",
+        types.SimpleNamespace(name="posix"),
+    )
+    monkeypatch.setattr(
+        service_runtime_connector_identity.signal,
+        "SIGKILL",
+        sigkill,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        service_runtime_connector_identity,
         "_local_connector_identity_status",
         identity_status,
     )
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         group_members,
     )
@@ -1614,7 +1630,7 @@ def test_service_runtime_frp_teardown_escalates_and_verifies_process_cleanup(
 
     clock = iter((0.0, 6.0, 7.0, 8.0))
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_signal_owned_posix_connector_processes",
         signal_processes,
     )
@@ -1720,7 +1736,7 @@ def test_gateway_connector_hard_exit_resumes_exact_live_sidecar_generation(
     )
     assert crashed.returncode == 84, crashed.stderr
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_observe_local_process",
         _REAL_OBSERVE_LOCAL_PROCESS,
     )
@@ -3089,7 +3105,7 @@ def test_detached_starting_runtime_attach_is_single_observation_and_resumable(
         )
 
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_discover_local_connector",
         prove_persisted_fake_connector_live,
     )
@@ -3274,7 +3290,9 @@ def test_two_concurrent_attaches_create_at_most_one_connector_generation(
         return "missing", "the prior detached connector is absent"
 
     monkeypatch.setattr(supervisor, "_start_local_visitor", track_start)
-    monkeypatch.setattr(service_runtime, "_local_connector_identity_status", connector_status)
+    monkeypatch.setattr(
+        service_runtime_connector_identity, "_local_connector_identity_status", connector_status
+    )
 
     def attach_once() -> str:
         try:
@@ -3348,7 +3366,9 @@ def test_attach_recovers_and_stops_local_connector_after_lost_start_response(
         )
 
     monkeypatch.setattr(supervisor, "_start_local_visitor", start_then_lose_response)
-    monkeypatch.setattr(service_runtime, "_local_connector_identity_status", connector_owned)
+    monkeypatch.setattr(
+        service_runtime_connector_identity, "_local_connector_identity_status", connector_owned
+    )
     monkeypatch.setattr(supervisor, "_stop_local_connector", stop_local)
 
     with pytest.raises(RelayError, match="lost reattach connector start response"):
@@ -3782,12 +3802,14 @@ def test_unobservable_local_connector_intent_remains_retryable_after_restart(
         del command_markers
         return [4242]
 
-    monkeypatch.setattr(service_runtime, "_local_process_ids", candidate_processes)
+    monkeypatch.setattr(
+        service_runtime_connector_identity, "_local_process_ids", candidate_processes
+    )
 
     def inaccessible(_pid: int) -> object:
         raise RelayError("candidate process identity read failed")
 
-    monkeypatch.setattr(service_runtime, "_observe_local_process", inaccessible)
+    monkeypatch.setattr(service_runtime_connector_identity, "_observe_local_process", inaccessible)
     restarted = ServiceRuntimeSupervisor(
         settings=settings,
         queue=ClioCoreQueue(settings.core_dir),
@@ -3831,12 +3853,12 @@ def test_windows_connector_discovery_ignores_system_idle_process(
 
     monkeypatch.setattr(service_runtime.os, "name", "nt")
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_run_bounded_local_cleanup",
         enumerate_processes,
     )
 
-    assert service_runtime._local_process_ids(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert service_runtime_connector_identity._local_process_ids(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         command_markers=(owner_token, generation_id, config_path),
     ) == [555]
 
@@ -3851,7 +3873,7 @@ def test_windows_system_idle_process_allows_connector_absence_proof(
     def enumerate_processes(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    real_local_process_ids = service_runtime._local_process_ids  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    real_local_process_ids = service_runtime_connector_identity._local_process_ids  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def windows_process_ids(*, command_markers: tuple[str, ...] = ()) -> list[int]:
         with monkeypatch.context() as windows:
@@ -3862,18 +3884,20 @@ def test_windows_system_idle_process_allows_connector_absence_proof(
         raise AssertionError("PID zero must never reach connector identity observation")
 
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_run_bounded_local_cleanup",
         enumerate_processes,
     )
-    monkeypatch.setattr(service_runtime, "_local_process_ids", windows_process_ids)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity, "_local_process_ids", windows_process_ids
+    )
+    monkeypatch.setattr(
+        service_runtime_connector_identity,
         "_observe_local_process",
         forbid_process_observation,
     )
     session_id = "owned-session"
-    connector, absence_verified = service_runtime._discover_local_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    connector, absence_verified = service_runtime_connector_identity._discover_local_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         {
             "owner_token": "owner-token",
             "connector_generation_id": "generation-1",
@@ -3900,7 +3924,7 @@ def test_windows_connector_discovery_rejects_invalid_process_identity(
 
     monkeypatch.setattr(service_runtime.os, "name", "nt")
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_run_bounded_local_cleanup",
         enumerate_processes,
     )
@@ -3909,7 +3933,7 @@ def test_windows_connector_discovery_rejects_invalid_process_identity(
         RelayError,
         match="local Windows process enumeration returned an invalid process id",
     ):
-        service_runtime._local_process_ids()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._local_process_ids()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_local_connector_pid_reuse_is_not_authorized(
@@ -3926,7 +3950,7 @@ def test_local_connector_pid_reuse_is_not_authorized(
     def observe(_pid: int) -> object:
         return observed
 
-    monkeypatch.setattr(service_runtime, "_observe_local_process", observe)
+    monkeypatch.setattr(service_runtime_connector_identity, "_observe_local_process", observe)
     connector: dict[str, object] = {
         "pid": 555,
         "process_group_id": 555,
@@ -3935,11 +3959,11 @@ def test_local_connector_pid_reuse_is_not_authorized(
         "config_path": "/owned/desktop-frpc.toml",
     }
     assert (
-        service_runtime._local_connector_identity_status(connector)[0]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._local_connector_identity_status(connector)[0]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         == "replaced"
     )
     assert (
-        service_runtime._terminate_local_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._terminate_local_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             connector
         )
         is None
@@ -3978,14 +4002,14 @@ def test_posix_connector_cleanup_skips_pid_reused_after_pidfd_open(
         raise AssertionError("killpg must not be used")
 
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         group_members,
     )
     monkeypatch.setattr(service_runtime.os, "pidfd_open", pidfd_open, raising=False)
     monkeypatch.setattr(service_runtime.os, "close", closed.append)
     monkeypatch.setattr(
-        service_runtime.signal,
+        service_runtime_connector_identity.signal,
         "pidfd_send_signal",
         pidfd_send_signal,
         raising=False,
@@ -3997,7 +4021,7 @@ def test_posix_connector_cleanup_skips_pid_reused_after_pidfd_open(
         raising=False,
     )
 
-    result = service_runtime._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = service_runtime_connector_identity._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         connector,
         signal.SIGTERM,
     )
@@ -4036,21 +4060,21 @@ def test_posix_connector_cleanup_signals_only_revalidated_pidfd(
         signaled.append((process_fd, sig))
 
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         group_members,
     )
     monkeypatch.setattr(service_runtime.os, "pidfd_open", pidfd_open, raising=False)
     monkeypatch.setattr(service_runtime.os, "close", closed.append)
     monkeypatch.setattr(
-        service_runtime.signal,
+        service_runtime_connector_identity.signal,
         "pidfd_send_signal",
         pidfd_send_signal,
         raising=False,
     )
     sigkill = getattr(signal, "SIGKILL", 9)
 
-    result = service_runtime._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = service_runtime_connector_identity._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         connector,
         sigkill,
     )
@@ -4086,22 +4110,22 @@ def test_posix_connector_cleanup_uses_libc_when_python_omits_pidfd_wrappers(
         signaled.append((process_fd, sig))
 
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         group_members,
     )
     monkeypatch.setattr(service_runtime.os, "pidfd_open", None, raising=False)
     monkeypatch.setattr(
-        service_runtime.signal,
+        service_runtime_connector_identity.signal,
         "pidfd_send_signal",
         None,
         raising=False,
     )
-    monkeypatch.setattr(service_runtime, "_linux_pidfd_open", libc_open)
-    monkeypatch.setattr(service_runtime, "_linux_pidfd_send_signal", libc_send)
+    monkeypatch.setattr(service_runtime_connector_identity, "_linux_pidfd_open", libc_open)
+    monkeypatch.setattr(service_runtime_connector_identity, "_linux_pidfd_send_signal", libc_send)
     monkeypatch.setattr(service_runtime.os, "close", closed.append)
 
-    result = service_runtime._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = service_runtime_connector_identity._signal_owned_posix_connector_processes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         connector,
         signal.SIGTERM,
     )
@@ -4128,15 +4152,15 @@ def test_linux_pidfd_raw_syscall_fallback_preserves_errno(
         return library
 
     monkeypatch.setattr(service_runtime.sys, "platform", "linux")
-    monkeypatch.setattr(service_runtime.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(service_runtime.ctypes, "CDLL", load_libc)
+    monkeypatch.setattr(service_runtime_connector_identity.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(service_runtime_connector_identity.ctypes, "CDLL", load_libc)
 
     with pytest.raises(ProcessLookupError) as open_error:
-        service_runtime._linux_pidfd_open(555)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._linux_pidfd_open(555)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert open_error.value.errno == errno.ESRCH
 
     with pytest.raises(PermissionError) as send_error:
-        service_runtime._linux_pidfd_send_signal(93, signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._linux_pidfd_send_signal(93, signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert send_error.value.errno == errno.EPERM
     assert syscall.calls == [434, 424]
 
@@ -4158,13 +4182,13 @@ def test_remote_pidfd_helpers_fall_back_and_preserve_errno(
 
     monkeypatch.setattr(service_runtime.os, "pidfd_open", None, raising=False)
     monkeypatch.setattr(
-        service_runtime.signal,
+        service_runtime_connector_identity.signal,
         "pidfd_send_signal",
         None,
         raising=False,
     )
-    monkeypatch.setattr(service_runtime.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(service_runtime.ctypes, "CDLL", load_libc)
+    monkeypatch.setattr(service_runtime_connector_identity.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(service_runtime_connector_identity.ctypes, "CDLL", load_libc)
     stop_script = service_runtime._remote_stop_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session_id="gateway-fixture",
         pid=555,
@@ -4177,11 +4201,11 @@ def test_remote_pidfd_helpers_fall_back_and_preserve_errno(
     helper_end = stop_program.index("\ndef signal_owned_processes", helper_start)
     helper_program = stop_program[helper_start:helper_end]
     namespace: dict[str, object] = {
-        "ctypes": service_runtime.ctypes,
+        "ctypes": service_runtime_connector_identity.ctypes,
         "errno": errno,
         "os": service_runtime.os,
-        "platform": service_runtime.platform,
-        "signal": service_runtime.signal,
+        "platform": service_runtime_connector_identity.platform,
+        "signal": service_runtime_connector_identity.signal,
     }
     exec(compile(helper_program, "remote-pidfd-helpers", "exec"), namespace)
     open_process_fd = cast(Callable[[int], int], namespace["open_process_fd"])
@@ -4223,14 +4247,14 @@ def test_windows_connector_pid_reuse_is_not_authorized_by_descendant_scan(
         return [556]
 
     monkeypatch.setattr(service_runtime.os, "name", "nt")
-    monkeypatch.setattr(service_runtime, "_observe_local_process", observe)
+    monkeypatch.setattr(service_runtime_connector_identity, "_observe_local_process", observe)
     monkeypatch.setattr(
-        service_runtime,
+        service_runtime_connector_identity,
         "_local_connector_group_members",
         group_members,
     )
 
-    status, detail = service_runtime._local_connector_identity_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status, detail = service_runtime_connector_identity._local_connector_identity_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         connector
     )
 
@@ -4252,7 +4276,7 @@ def test_local_connector_token_mismatch_is_not_authorized(
     def observe(_pid: int) -> object:
         return observed
 
-    monkeypatch.setattr(service_runtime, "_observe_local_process", observe)
+    monkeypatch.setattr(service_runtime_connector_identity, "_observe_local_process", observe)
     connector: dict[str, object] = {
         "pid": 555,
         "process_group_id": 555,
@@ -4261,7 +4285,7 @@ def test_local_connector_token_mismatch_is_not_authorized(
         "config_path": "/owned/desktop-frpc.toml",
     }
     assert (
-        service_runtime._local_connector_identity_status(connector)[0]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        service_runtime_connector_identity._local_connector_identity_status(connector)[0]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         == "unverified"
     )
 
@@ -5419,7 +5443,7 @@ def test_transient_connector_discovery_preserves_exact_intent_and_returns_pendin
             raise RelayError("temporary desktop connector sidecar read failure")
 
         monkeypatch.setattr(
-            service_runtime,
+            service_runtime_connector_identity,
             "_discover_local_connector",
             fail_local_discovery,
         )
