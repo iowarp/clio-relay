@@ -564,7 +564,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # (confirmed by grep), so no re-export is needed -- only
     # MAX_VIRTUAL_REMOTE_MCP_CANDIDATES is imported back (the
     # catalog-assembly candidate-limit check still reads it). 4445 -> 4376.
-    "src/clio_relay/remote_mcp.py": 4376,
+    # #231 slice 5: the local relay control envelope injection cluster
+    # (inject_cluster_argument, virtual_schema_error,
+    # remote_input_schema_requires_wrapper, _contains_document_root_reference,
+    # _schema_identifier_keyword, _schema_establishes_embedded_resource,
+    # _relocate_legacy_local_references, VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS/
+    # _FIELDS, MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES) moved to the new
+    # remote_mcp_schema_wrapping.py (271 lines, under DEFAULT_MAX_LINES).
+    # inject_cluster_argument and VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS are
+    # re-exported (tests import the former; queue_tasks.py and this file's
+    # own catalog-assembly body import/read the latter). The rest have no
+    # caller outside remote_mcp.py's own body (confirmed by grep), so no
+    # re-export. 4376 -> 4171.
+    "src/clio_relay/remote_mcp.py": 4171,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
