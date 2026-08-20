@@ -683,15 +683,19 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/models.py": 2299,
     "src/clio_relay/process_containment.py": 2678,
     "src/clio_relay/queue_management.py": 1671,
-    # +11 net lines -- the first live worker_status() read raced a
-    # just-registered fleet's own background slot heartbeats
-    # (worker_generation_complete could read transiently False before the
-    # supervised generation settled), failing run_queue_management_validation
-    # with "configured kind concurrency is not an object" under full-suite
-    # timing. Retried on the module's usual bounded budget instead of a
-    # one-shot read; a real misconfiguration (no worker_generation_id at all)
-    # still fails immediately. A justified, minimal ratchet-up.
-    "src/clio_relay/queue_validation.py": 1546,
+    # queue_validation.py split (split/queue-validation-w2): the module is
+    # now an assembly/facade only -- every real concern moved verbatim to
+    # seven new owner modules (live_validation_constants.py/_support.py/
+    # _process.py/_capacity.py/_jobs.py/_cleanup.py, plus
+    # live_validation_orchestrator.py for the single
+    # run_queue_management_validation entry point, 566 lines -- above the
+    # 150-500 sweet spot but under the 800 cap, the same "one real,
+    # undividable concern" precedent as endpoint_recovery_directory.py's
+    # note in this file). The facade itself is 164 lines (re-exports only,
+    # every original name kept so no importer changed), comfortably under
+    # DEFAULT_MAX_LINES -- entry removed per this script's own documented
+    # convention: "remove the entry once the file is under
+    # DEFAULT_MAX_LINES".
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
