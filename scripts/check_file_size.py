@@ -133,7 +133,41 @@ RATCHET_BASELINE: dict[str, int] = {
     # computation (doc's §7 "derived-digest-with-ordering" rule: never
     # recompute the hash independently). Single owner, ground rule 1 -- a
     # justified, minimal ratchet-up.
-    "src/clio_relay/ci_validation.py": 3787,
+    # #231: -201 net lines -- provenance_primitives.py (clio-relay#231) is
+    # extracted first as the shared owner for JSON/type primitives, the
+    # ProvenanceError/GitHubNotFound exceptions, the GitHubJsonFetcher
+    # protocol + _github_fetcher, and the release policy constants every
+    # other ci_validation owner module depends on.
+    # #231: -206 net lines -- payload_policy.py becomes the owner for
+    # archive-member filename/size policy (tag/candidate/tag-binding/
+    # promotion payload name validators + limits) and the SHA256SUMS
+    # checksum-manifest read/write pair.
+    # #231: -405 net lines -- distribution_archive.py becomes the owner for
+    # safe, bounded wheel/sdist inspection (ZIP/tar member reads, path
+    # safety, ZIP64/central-directory preflight, core-metadata identity
+    # binding) assembled into build_distribution_archive_receipt.
+    # #231: -556 net lines -- branch_protection.py becomes the owner for the
+    # repository governance receipt lifecycle (build/verify/fetch-live/
+    # verify-live) and the raw branch/tag/environment/immutable-releases
+    # protection-receipt builders it assembles from.
+    # #231: -236 net lines -- release_identity.py becomes the owner for
+    # resolving/verifying a live GitHub release's identity and gating
+    # persistent mutations on protected main/tag/governance/release state.
+    # #231: -440 net lines -- candidate_provenance.py becomes the owner for
+    # the pre-tag receipt chain: sealing a merge-queue candidate build (one
+    # build + six matrix-report validations, incl. the complementary
+    # POSIX/Windows platform-marked-test partition proof) and binding a
+    # protected release tag to that tested tree via its merged pull request.
+    # #231: -231 net lines -- ci_run_status.py becomes the owner for CI run
+    # and job identity: selecting the sole successful merge-queue ci.yml run
+    # for a commit, and building/verifying the CI status receipt that binds
+    # it to the already-sealed candidate build and tag binding.
+    # #231: ci_validation.py is now under DEFAULT_MAX_LINES (701 lines, an
+    # assembly/facade only -- re-exports + the argparse CLI -- after
+    # provenance_primitives.py/payload_policy.py/distribution_archive.py/
+    # branch_protection.py/release_identity.py/candidate_provenance.py/
+    # ci_run_status.py/actions_artifact.py/release_assets.py each took one
+    # owner concern). Entry removed per ground rule 5 -- ratchet down.
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared

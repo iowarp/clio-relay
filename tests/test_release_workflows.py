@@ -302,7 +302,7 @@ def test_release_mutations_require_live_admin_read_immutability_governance() -> 
         assert "--method PUT" not in text
         assert "--method DELETE" not in text
 
-    source = (ROOT / "src" / "clio_relay" / "ci_validation.py").read_text(encoding="utf-8")
+    source = (ROOT / "src" / "clio_relay" / "branch_protection.py").read_text(encoding="utf-8")
     assert 'fetch_admin_json(f"repos/{repository}/immutable-releases")' in source
     assert '"enabled": True' in source
     assert '"enforced_by_owner": True' in source

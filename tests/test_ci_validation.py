@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import gzip
 import hashlib
-import io
 import json
-import stat
-import tarfile
 import zipfile
 from copy import deepcopy
 from pathlib import Path
@@ -15,15 +11,41 @@ from typing import cast
 
 import pytest
 
-from clio_relay import ci_validation
-from clio_relay.ci_validation import (
+from clio_relay.actions_artifact import (
+    MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
+    build_actions_artifact_manifest,
+    verify_actions_artifact_archive,
+)
+from clio_relay.branch_protection import (
     GITHUB_ACTIONS_APP_ID,
     MAIN_REVIEW_POLICY,
-    MAX_ACTIONS_ARTIFACT_ARCHIVE_BYTES,
+    REQUIRE_LAST_PUSH_APPROVAL,
+    REQUIRED_APPROVING_REVIEW_COUNT,
+    REQUIRED_MERGE_QUEUE_PARAMETERS,
+    build_repository_governance,
+    fetch_live_repository_governance,
+    verify_live_repository_governance,
+    verify_repository_governance,
+)
+from clio_relay.candidate_provenance import (
+    REQUIRED_MATRIX_JOBS,
+    build_candidate_build_receipt,
+    build_tag_binding,
+)
+from clio_relay.ci_run_status import (
+    REQUIRED_CI_JOBS,
+    build_ci_status,
+    select_ci_run,
+    verify_ci_status,
+)
+from clio_relay.ci_validation import (
+    REQUIRED_ENVIRONMENTS,
+    ProvenanceError,
+    write_candidate_checksum_manifest,
+)
+from clio_relay.provenance_primitives import (
     MAX_DISTRIBUTION_BYTES,
-    MAX_DISTRIBUTION_MEMBERS,
     MAX_FIXED_JSON_BYTES,
-    MAX_JSON_DOCUMENT_BYTES,
     MAX_MANIFEST_BYTES,
     MAX_RELEASE_ASSET_AGGREGATE_BYTES,
     MAX_RELEASE_ASSET_BYTES,
@@ -31,36 +53,22 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_AGGREGATE_BYTES,
     MAX_VALIDATION_REPORT_ASSETS,
     MAX_VALIDATION_REPORT_BYTES,
-    REQUIRE_LAST_PUSH_APPROVAL,
-    REQUIRED_APPROVING_REVIEW_COUNT,
-    REQUIRED_CI_JOBS,
-    REQUIRED_ENVIRONMENTS,
-    REQUIRED_MATRIX_JOBS,
-    REQUIRED_MERGE_QUEUE_PARAMETERS,
-    ProvenanceError,
-    build_actions_artifact_manifest,
-    build_candidate_build_receipt,
-    build_ci_status,
-    build_distribution_archive_receipt,
+)
+from clio_relay.release_assets import (
     build_exact_release_asset_inventory,
-    build_repository_governance,
     build_staged_release_asset_plan,
-    build_tag_binding,
-    build_validation_report_asset_manifest,
-    fetch_live_repository_governance,
-    resolve_live_release,
-    select_ci_run,
     validate_release_acceptance_matrix,
-    verify_actions_artifact_archive,
-    verify_ci_status,
-    verify_downloaded_validation_report_assets,
     verify_exact_release_asset_inventory,
+)
+from clio_relay.release_identity import (
+    resolve_live_release,
     verify_live_mutation_authority,
     verify_live_release_identity,
-    verify_live_repository_governance,
     verify_release_identity,
-    verify_repository_governance,
-    write_candidate_checksum_manifest,
+)
+from clio_relay.validation_report_assets import (
+    build_validation_report_asset_manifest,
+    verify_downloaded_validation_report_assets,
 )
 
 REPOSITORY = "iowarp/clio-relay"
@@ -763,48 +771,6 @@ def _write_promotion_zip(path: Path) -> None:
             archive.writestr(name, payload)
 
 
-def _write_distribution_archives(
-    directory: Path,
-    *,
-    metadata_version: str = "1.0.0",
-    sdist_extra: tuple[tarfile.TarInfo, bytes | None] | None = None,
-) -> tuple[Path, Path]:
-    wheel = directory / "clio_relay-1.0.0-py3-none-any.whl"
-    sdist = directory / "clio_relay-1.0.0.tar.gz"
-    metadata = (
-        f"Metadata-Version: 2.4\nName: clio-relay\nVersion: {metadata_version}\n\n"
-    ).encode()
-    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("clio_relay/__init__.py", b"__version__ = '1.0.0'\n")
-        archive.writestr("clio_relay-1.0.0.dist-info/METADATA", metadata)
-        archive.writestr(
-            "clio_relay-1.0.0.dist-info/WHEEL",
-            b"Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-        )
-        archive.writestr("clio_relay-1.0.0.dist-info/RECORD", b"")
-    with tarfile.open(sdist, "w:gz") as archive:
-        root = tarfile.TarInfo("clio_relay-1.0.0")
-        root.type = tarfile.DIRTYPE
-        archive.addfile(root)
-        entries = {
-            "clio_relay-1.0.0/PKG-INFO": metadata,
-            "clio_relay-1.0.0/pyproject.toml": b"[build-system]\nrequires=[]\n",
-            "clio_relay-1.0.0/src/clio_relay/__init__.py": b"__version__='1.0.0'\n",
-        }
-        for name, content in entries.items():
-            member = tarfile.TarInfo(name)
-            member.size = len(content)
-            archive.addfile(member, io.BytesIO(content))
-        if sdist_extra is not None:
-            member, content = sdist_extra
-            if content is not None:
-                member.size = len(content)
-                archive.addfile(member, io.BytesIO(content))
-            else:
-                archive.addfile(member)
-    return wheel, sdist
-
-
 def test_actions_artifact_manifest_and_archive_bind_exact_api_identity(tmp_path: Path) -> None:
     archive = tmp_path / "candidate.zip"
     _write_tag_payload_zip(archive)
@@ -992,112 +958,6 @@ def test_promotion_artifact_extracts_only_the_bounded_canonical_tree(tmp_path: P
     verify_actions_artifact_archive(manifest, archive, tmp_path / "promotion")
 
     assert (tmp_path / "promotion/evidence/recovery/candidate-release-gate-1.0.json").is_file()
-
-
-def test_distribution_archives_are_fully_bounded_and_identity_checked(tmp_path: Path) -> None:
-    wheel, sdist = _write_distribution_archives(tmp_path)
-
-    receipt = build_distribution_archive_receipt(
-        wheel,
-        sdist,
-        project="clio-relay",
-        version="1.0.0",
-    )
-
-    assert receipt["schema_version"] == "clio-relay.distribution-archives.v1"
-    assert cast(dict[str, object], receipt["wheel"])["member_count"] == 4
-    assert cast(dict[str, object], receipt["sdist"])["top_level_directory"] == ("clio_relay-1.0.0")
-    assert cast(dict[str, object], receipt["limits"])["maximum_members"] == (
-        MAX_DISTRIBUTION_MEMBERS
-    )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    ["traversal", "sdist_traversal", "symlink", "metadata", "member_limit", "member_size"],
-)
-def test_distribution_archive_preflight_rejects_adversarial_members(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mutation: str,
-) -> None:
-    if mutation == "metadata":
-        wheel, sdist = _write_distribution_archives(tmp_path, metadata_version="9.9.9")
-    elif mutation in {"sdist_traversal", "symlink"}:
-        link = tarfile.TarInfo("clio_relay-1.0.0/escape")
-        content: bytes | None = None
-        if mutation == "symlink":
-            link.type = tarfile.SYMTYPE
-            link.linkname = "../../escape"
-        else:
-            link.name = "../escape"
-            content = b"escape"
-        wheel, sdist = _write_distribution_archives(
-            tmp_path,
-            sdist_extra=(link, content),
-        )
-    else:
-        wheel, sdist = _write_distribution_archives(tmp_path)
-    if mutation == "traversal":
-        with zipfile.ZipFile(wheel, "a", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("../escape", b"escape")
-    elif mutation == "member_limit":
-        monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_MEMBERS", 2)
-    elif mutation == "member_size":
-        monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_MEMBER_BYTES", 8)
-
-    with pytest.raises(ProvenanceError):
-        build_distribution_archive_receipt(
-            wheel,
-            sdist,
-            project="clio-relay",
-            version="1.0.0",
-        )
-
-
-def test_distribution_archive_preflight_rejects_zip_symlinks_and_expansion(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    wheel, sdist = _write_distribution_archives(tmp_path)
-    link = zipfile.ZipInfo("clio_relay/link")
-    link.external_attr = (stat.S_IFLNK | 0o777) << 16
-    with zipfile.ZipFile(wheel, "a") as archive:
-        archive.writestr(link, b"../../escape")
-    with pytest.raises(ProvenanceError, match="not regular"):
-        build_distribution_archive_receipt(
-            wheel,
-            sdist,
-            project="clio-relay",
-            version="1.0.0",
-        )
-
-
-def test_distribution_archive_rejects_raw_gzip_expansion_before_tar_parsing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    wheel, sdist = _write_distribution_archives(tmp_path)
-    monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_TAR_BYTES", 1024)
-    sdist.write_bytes(gzip.compress(b"x" * 1025))
-
-    with pytest.raises(ProvenanceError, match="tar stream exceeds"):
-        build_distribution_archive_receipt(
-            wheel,
-            sdist,
-            project="clio-relay",
-            version="1.0.0",
-        )
-
-    wheel, sdist = _write_distribution_archives(tmp_path)
-    monkeypatch.setattr(ci_validation, "MAX_DISTRIBUTION_UNCOMPRESSED_BYTES", 32)
-    with pytest.raises(ProvenanceError, match="aggregate"):
-        build_distribution_archive_receipt(
-            wheel,
-            sdist,
-            project="clio-relay",
-            version="1.0.0",
-        )
 
 
 def test_exact_release_assets_bind_ids_names_sizes_and_digests(tmp_path: Path) -> None:
@@ -1987,12 +1847,3 @@ def test_downloaded_report_verification_rejects_tampered_preflight_manifest(
 
     with pytest.raises(ProvenanceError):
         verify_downloaded_validation_report_assets(manifest, report_dir)
-
-
-def test_json_loader_rejects_oversized_input_before_decoding(tmp_path: Path) -> None:
-    document = tmp_path / "oversized.json"
-    with document.open("wb") as stream:
-        stream.truncate(MAX_JSON_DOCUMENT_BYTES + 1)
-
-    with pytest.raises(ProvenanceError, match="exceeds"):
-        ci_validation._load_json(document)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
