@@ -576,7 +576,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # own catalog-assembly body import/read the latter). The rest have no
     # caller outside remote_mcp.py's own body (confirmed by grep), so no
     # re-export. 4376 -> 4171.
-    "src/clio_relay/remote_mcp.py": 4171,
+    # #231 slice 6: the schema discovery cache (RemoteMcpSchemaCacheEntry,
+    # RemoteMcpSchemaCache, _fsync_cache_directory, the digest/fingerprint
+    # helpers, and cache_entry_from_discovery_artifact) moved to the new
+    # remote_mcp_cache.py (428 lines, under DEFAULT_MAX_LINES). Eight of the
+    # nine public names have a real reader elsewhere in this file's own
+    # catalog-assembly/admission-resolution body (confirmed by grep), so
+    # they are imported via a plain `from ... import`, which is also the
+    # re-export cli.py/mcp_server.py/jarvis_mcp.py/jarvis_mcp_validation.py
+    # rely on. remote_mcp_server_artifact_binding_verified has no reader
+    # left in this file's own body -- only endpoint.py and
+    # jarvis_service_runtime.py import it directly -- so it is re-exported
+    # via qualified assignment instead. 4171 -> 3839.
+    "src/clio_relay/remote_mcp.py": 3839,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
