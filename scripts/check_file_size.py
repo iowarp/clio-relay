@@ -164,6 +164,46 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/bootstrap.py": 925,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
+    #
+    # split/bootstrap-journal-w3 (retry after wave-2 reported BLOCKED and did
+    # nothing): a facade-plus-owner-modules split -- the pattern every other
+    # entry in this table uses -- is UNSAFE for this one file, confirmed by
+    # investigation rather than assumed. bootstrap.py's
+    # render_linux_user_bootstrap_script reads this file's RAW BYTES verbatim
+    # (`Path(__file__).with_name("bootstrap_journal.py").read_bytes()`) and
+    # embeds them as one base64 blob that bootstrap_script_preamble.py's
+    # `bootstrap_journal_action()` shell function `exec()`s in an isolated
+    # namespace (`{"__name__": "__main__", "__file__": "bootstrap_journal.py"}`)
+    # on the TARGET cluster before anything -- not even the clio_relay
+    # package itself -- has been downloaded or installed there (the module's
+    # own docstring states this contract; #158 exists because of it). A
+    # facade that does `from clio_relay.bootstrap_journal_X import ...` at
+    # module scope raises ModuleNotFoundError the instant that exec runs on a
+    # virgin host, regardless of which CLI action was requested. Verified
+    # with an isolated-interpreter repro reproducing the exact preamble
+    # mechanism (`python -I -c "exec(compile(<stand-in facade source with one
+    # sibling import>, ...))"`, cwd a bare temp dir): fails with
+    # `ModuleNotFoundError: No module named 'clio_relay.bootstrap_journal_
+    # ops'` even though the identical source imports fine as an ordinary
+    # installed-package member -- exactly why the local test suite alone
+    # would never catch this regression. The other split families this table
+    # documents (bootstrap_reconcile.py, process_containment.py, ...) survive
+    # their own split because their deployment path installs the WHOLE
+    # candidate-overlay directory onto sys.path first
+    # (bootstrap_candidate_package_sources.py lists every owner module by
+    # name so real Python imports resolve); bootstrap_journal.py has no
+    # equivalent directory-shipping path -- it is one exec'd text blob by
+    # design, specifically so the very first bootstrap action can run before
+    # any directory of relay code exists on the host. Making it splittable
+    # would mean teaching bootstrap.py's embedding step to concatenate
+    # multiple owner-module sources into one flattened blob at render time (a
+    # real bundler, not a verbatim MOVE) -- a change to the #158-hardened
+    # first-bootstrap delivery mechanism itself, out of scope for a
+    # decomposition pass and not attempted without owner sign-off.
+    # tests/test_bootstrap_journal_portability.py::
+    # test_first_install_journal_forbids_clio_relay_imports now pins this
+    # constraint in CI so a future split attempt fails fast there instead of
+    # only on a live remote cluster.
     "src/clio_relay/bootstrap_journal.py": 1534,
     # #158: +6 net lines -- the receipt binds that activation evidence was
     # recorded, rather than equating the activated digest with the packaged

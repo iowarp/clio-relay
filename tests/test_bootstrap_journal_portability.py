@@ -83,3 +83,46 @@ def test_first_install_journal_still_stamps_utc_timestamps() -> None:
 
     stamped = datetime.now(timezone.utc).isoformat()
     assert stamped.endswith("+00:00")
+
+
+def test_first_install_journal_forbids_clio_relay_imports() -> None:
+    """The embedded exec() blob has no clio_relay package to import from.
+
+    ``bootstrap.py``'s ``render_linux_user_bootstrap_script`` reads this
+    file's RAW BYTES verbatim (``Path(__file__).with_name("bootstrap_journal
+    .py").read_bytes()``) and embeds them as one base64 blob that
+    ``bootstrap_script_preamble.py``'s ``bootstrap_journal_action()`` shell
+    function ``exec()``s in an isolated namespace
+    (``{"__name__": "__main__", "__file__": "bootstrap_journal.py"}``) on the
+    TARGET cluster before anything -- not even the ``clio_relay`` package
+    itself -- has been downloaded or installed there. A module-level
+    ``import clio_relay...`` (absolute or relative) here would raise
+    ``ModuleNotFoundError`` the instant that exec runs on a virgin host,
+    regardless of which CLI action was requested, so this module cannot
+    become a thin facade over sibling ``clio_relay.bootstrap_journal_*``
+    owner modules the way its cousins (``bootstrap_reconcile.py``,
+    ``process_containment.py``, ...) can -- their split survives because
+    their own deployment path installs the whole candidate-overlay
+    directory onto ``sys.path`` first; this module has no equivalent
+    directory-shipping path. See the ``scripts/check_file_size.py``
+    ``RATCHET_BASELINE`` entry for this file for the full investigation
+    (split/bootstrap-journal-w3) and the isolated-interpreter repro that
+    proved it.
+    """
+    tree = ast.parse(_module_source())
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level > 0 or (node.module and node.module.split(".")[0] == "clio_relay"):
+                target = node.module or ("." * node.level)
+                violations.append(f"line {node.lineno}: from {target} import ...")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "clio_relay":
+                    violations.append(f"line {node.lineno}: import {alias.name}")
+
+    assert not violations, (
+        "bootstrap_journal.py is exec()'d as one raw self-contained blob on a "
+        "virgin cluster with no clio_relay package installed -- it cannot "
+        "import any clio_relay sibling module: " + "; ".join(violations)
+    )
