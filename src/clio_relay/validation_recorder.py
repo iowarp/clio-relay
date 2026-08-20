@@ -9,18 +9,18 @@ validation run proceeds, and :func:`new_live_validation_report` builds the
 seeded report a run starts from (package/install-source identity plus
 evidence-trust provenance).
 
-Several call sites still reach back into :mod:`clio_relay.validation_report`
-for concerns not yet extracted to their own owner module (install-source
-detection, invocation redaction, and the durable report/Markdown writers).
-Those imports are function-scoped -- not module-scoped -- because
+One call site still reaches back into :mod:`clio_relay.validation_report`
+for a concern not yet extracted to its own owner module (install-source
+detection). That import is function-scoped -- not module-scoped -- because
 :mod:`clio_relay.validation_report` imports :class:`ValidationRecorder` from
 here for its own re-export surface; a module-scope import in the other
 direction would be a load-order circular import (the proven idiom -- see the
-module docstring precedent in :mod:`clio_relay.session_wire_models`). Each
+module docstring precedent in :mod:`clio_relay.session_wire_models`). The
 function-scoped import gets re-pointed at the real owner module as that
-concern is extracted in turn (acceptance-line fact classification already
-moved to :mod:`clio_relay.acceptance_facts`, imported at module scope here
-since that module has no back-reference of its own).
+concern is extracted in turn (acceptance-line fact classification and
+invocation redaction already moved to :mod:`clio_relay.acceptance_facts` and
+:mod:`clio_relay.redaction`, both imported at module scope here since
+neither module has a back-reference of its own).
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ from clio_relay.acceptance_facts import acceptance_scope, line_proves_success
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import logical_filesystem_text
 from clio_relay.identifiers import DurableRecordId
+from clio_relay.redaction import redacted_invocation
 from clio_relay.validation_limits import TRANSPORT_PROBE_EVIDENCE_KEY
 from clio_relay.validation_schema import (
     EvidenceOrigin,
@@ -469,11 +470,7 @@ def new_live_validation_report(
     report_id: DurableRecordId | None = None,
 ) -> LiveValidationReport:
     """Create a report seeded with package, source, and invocation provenance."""
-    from clio_relay.validation_report import (
-        _redacted_invocation,
-        detect_install_source,
-        detect_software_identity,
-    )
+    from clio_relay.validation_report import detect_install_source, detect_software_identity
 
     return LiveValidationReport(
         report_id=(report_id if report_id is not None else f"validation_{uuid4().hex}"),
@@ -487,7 +484,7 @@ def new_live_validation_report(
             source_override=install_source,
             artifact_sha256=artifact_sha256,
         ),
-        invocation=_redacted_invocation([str(item) for item in sys.orig_argv]),
+        invocation=redacted_invocation([str(item) for item in sys.orig_argv]),
     )
 
 

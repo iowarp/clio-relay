@@ -599,7 +599,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # to acceptance_facts.py (160 lines). No re-export needed -- the only
     # internal caller (validation_recorder.py) now imports it directly.
     # 4480 -> 4336.
-    "src/clio_relay/validation_report.py": 4336,
+    # #231 split/validation-report S4: credential/secret redaction
+    # (sensitive_key/collect_sensitive_values/redact_sensitive_value/
+    # redacted_invocation/redact_url/redact_sensitive_values) moved to
+    # redaction.py (155 lines). redact_sensitive_values is re-exported
+    # (external HTTP/MCP/public-records callers); the private helpers were
+    # internal-only, so validation_recorder.py and the three still-inline
+    # call sites here import directly from redaction.py. 4336 -> 4211.
+    "src/clio_relay/validation_report.py": 4211,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

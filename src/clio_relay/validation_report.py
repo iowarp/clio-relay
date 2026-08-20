@@ -49,6 +49,8 @@ from clio_relay.filesystem_paths import (
     internal_filesystem_path,
     logical_filesystem_path,
 )
+from clio_relay.redaction import redact_sensitive_values as redact_sensitive_values
+from clio_relay.redaction import redact_url as _redact_url
 
 # Schema + budget catalog (#231; docs/design/relay-architecture-2026-08.md):
 # the pydantic/StrEnum wire-model catalog moved to validation_schema.py, and
@@ -1038,21 +1040,6 @@ def write_validation_report(report: LiveValidationReport, path: Path) -> None:
     validated = LiveValidationReport.model_validate(report.model_dump(mode="python"))
     payload = redact_sensitive_values(validated.model_dump(mode="json"))
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
-def redact_sensitive_values(value: object) -> object:
-    """Return a JSON-compatible copy with capability and credential values removed.
-
-    Runtime ownership tokens are intentionally durable because cleanup must be able
-    to authenticate a process after the originating CLI exits. They are capabilities,
-    however, and must never be copied into reports or routine CLI responses. Values
-    found under a sensitive key are also removed from free-form strings elsewhere in
-    the document so command/evidence text cannot accidentally disclose the same
-    credential.
-    """
-    sensitive_values: set[str] = set()
-    _collect_sensitive_values(value, sensitive_values)
-    return _redact_sensitive_value(value, sensitive_values)
 
 
 def write_release_gate_result(result: ReleaseGateResult, path: Path) -> None:
@@ -3196,118 +3183,6 @@ def _optional_string(value: object) -> str | None:
 
 def _optional_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
-
-
-def _sensitive_key(key: object) -> bool:
-    if not isinstance(key, str):
-        return False
-    normalized = key.strip().casefold().replace("-", "_").replace(".", "_")
-    if normalized in {
-        "authorization",
-        "credential",
-        "credentials",
-        "password",
-        "private_key",
-        "secret",
-        "secret_key",
-        "token",
-    }:
-        return True
-    return normalized.endswith(
-        (
-            "_authorization",
-            "_credential",
-            "_credentials",
-            "_password",
-            "_private_key",
-            "_secret",
-            "_secret_key",
-            "_token",
-        )
-    )
-
-
-def _collect_sensitive_values(value: object, output: set[str]) -> None:
-    if isinstance(value, dict):
-        mapping = cast(dict[object, object], value)
-        for key, nested in mapping.items():
-            if _sensitive_key(key) and isinstance(nested, str) and nested:
-                output.add(nested)
-            else:
-                _collect_sensitive_values(nested, output)
-        return
-    if isinstance(value, list):
-        for nested in cast(list[object], value):
-            _collect_sensitive_values(nested, output)
-        return
-    if isinstance(value, tuple):
-        for nested in cast(tuple[object, ...], value):
-            _collect_sensitive_values(nested, output)
-
-
-def _redact_sensitive_value(value: object, sensitive_values: set[str]) -> object:
-    if isinstance(value, dict):
-        mapping = cast(dict[object, object], value)
-        return {
-            str(key): (
-                "<redacted>"
-                if _sensitive_key(key)
-                else _redact_sensitive_value(nested, sensitive_values)
-            )
-            for key, nested in mapping.items()
-        }
-    if isinstance(value, list):
-        return [
-            _redact_sensitive_value(nested, sensitive_values)
-            for nested in cast(list[object], value)
-        ]
-    if isinstance(value, tuple):
-        return [
-            _redact_sensitive_value(nested, sensitive_values)
-            for nested in cast(tuple[object, ...], value)
-        ]
-    if isinstance(value, str):
-        redacted = value
-        for sensitive in sorted(sensitive_values, key=len, reverse=True):
-            redacted = redacted.replace(sensitive, "<redacted>")
-        return redacted
-    return value
-
-
-def _redacted_invocation(arguments: list[str]) -> list[str]:
-    sensitive = {
-        "--api-token",
-        "--password",
-        "--secret",
-        "--token",
-        "--transport-secret-key",
-        "--transport-token",
-    }
-    redacted: list[str] = []
-    hide_next = False
-    for argument in arguments:
-        if hide_next:
-            redacted.append("<redacted>")
-            hide_next = False
-            continue
-        flag, separator, _value = argument.partition("=")
-        if flag in sensitive:
-            redacted.append(f"{flag}=<redacted>" if separator else flag)
-            hide_next = not separator
-            continue
-        redacted.append(argument)
-    return redacted
-
-
-def _redact_url(value: str) -> str:
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme not in {"http", "https", "ssh", "git"}:
-        return value
-    hostname = parsed.hostname or ""
-    netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{hostname}:{parsed.port}"
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 class _WindowsValidationFileTime(ctypes.Structure):
