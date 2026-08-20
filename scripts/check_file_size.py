@@ -532,7 +532,30 @@ RATCHET_BASELINE: dict[str, int] = {
     # first three are re-exported under their original names (external
     # importers across several modules and tests); the rest are private with
     # no callers outside remote_mcp.py. 5255 -> 5099.
-    "src/clio_relay/remote_mcp.py": 5099,
+    # #231 slice 3: the release-acceptance evidence wire model cluster
+    # (RemoteMcpCatalogIssue through RemoteMcpAcceptanceReport, 10 classes;
+    # _acceptance_artifact_resource, _append_spack_transition_resources; the
+    # two path-canonicalization primitives their validators call) moved to
+    # the new remote_mcp_acceptance_models.py (769 lines, under
+    # DEFAULT_MAX_LINES). Every model class remote_mcp.py still references
+    # is re-exported via `from ... import`. Three of the four bound
+    # Spack-configuration constants have no reader left in this file's own
+    # body but cli.py imports them directly, so they are re-exported via
+    # qualified assignment instead (`X = remote_mcp_acceptance_models.X`) --
+    # ruff's unused-import check has no equivalent for a plain module-level
+    # assignment, unlike the `from ... import` it kept stripping as dead
+    # de facto proving those three names really are body-unused now. This
+    # is why the net reduction (5099 -> 4445) is 16 lines short of a
+    # forced-contiguous cut: the qualified-assignment block plus the
+    # explanatory comments are new, real structure this re-export needs.
+    # RemoteMcpSpackConfigurationComponentObservation has no importer at
+    # all (confirmed by ruff F401 and grep), so it alone stays unexported.
+    # The validator *functions* that build these reports
+    # (build_remote_mcp_acceptance_report, the Spack/scientific-catalog
+    # families) stay here -- design doc §4.5 names that cluster as needing
+    # reordering, a separate future slice, not a contiguous cut alongside
+    # the models.
+    "src/clio_relay/remote_mcp.py": 4445,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
