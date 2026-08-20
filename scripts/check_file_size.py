@@ -373,7 +373,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # the 800-line default cap, so core_queue.py drops out of the ratchet
     # baseline entirely (this script's own documented convention: "remove
     # the entry once the file is under DEFAULT_MAX_LINES").
-    "src/clio_relay/deployment.py": 1243,
+    # #231 split/deployment-w2: deployment.py's three concerns move to their
+    # own owners -- deployment_activation.py (the bounded systemd activation-
+    # observer bash template + its timing constants, 649 lines), deployment_
+    # unit.py (the unit-file template, escaping helpers, and cluster -> unit-
+    # name mapping, 272 lines), deployment_ssh.py (the SSH install/restart
+    # operations, 375 lines) -- all three under the 800-line default cap, so
+    # none needs a baseline entry of its own. deployment.py itself becomes a
+    # 70-line facade re-exporting the original public (and two tested
+    # private) names verbatim; 1243 -> 70 drops it out of the ratchet
+    # baseline entirely, same convention as core_queue.py above.
     # #231 R9 fix round 3: cohesive wire-adapter owner split out of
     # door_errors.py. Both sides are recorded exactly even below the default
     # cap so this decomposition cannot silently re-accrete.
