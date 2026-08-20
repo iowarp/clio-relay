@@ -91,6 +91,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_cluster_deploy": _SRC_ROOT / "cli_cluster_deploy.py",
     "cli_diagnostics": _SRC_ROOT / "cli_diagnostics.py",
     "cli_installation_receipt": _SRC_ROOT / "cli_installation_receipt.py",
+    "cli_jarvis_mcp": _SRC_ROOT / "cli_jarvis_mcp.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -216,8 +217,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # only two cli.py call sites were start-runtime and resume-runtime, both
     # of which now live in cli_gateway_runtime.py).
     ("owner_session_admission", "owner_session_gateway_admission", "cli_gateway_runtime"),
-    ("fastmcp_server", "run_fastmcp_stdio", "cli"),
-    ("fastmcp_server", "run_fastmcp_http", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_jarvis_mcp with the
+    # jarvis-mcp command-group extraction (mcp_server's only cli.py call site).
+    ("fastmcp_server", "run_fastmcp_stdio", "cli_jarvis_mcp"),
+    ("fastmcp_server", "run_fastmcp_http", "cli_jarvis_mcp"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
     # the cluster deployment command-group extraction (cluster_endpoint_
     # service_status's only cli.py call site).
@@ -237,7 +240,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("bootstrap_acceptance", "bootstrap_reuse_acceptance_evidence", "cli_cluster_deploy"),
     ("remote_mcp", "build_remote_mcp_acceptance_report", "cli"),
     ("jarvis_mcp", "jarvis_mcp_server", "cli"),
-    ("remote_cli", "remove_remote_file", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_jarvis_mcp with the
+    # jarvis-mcp command-group extraction (mcp_call's and jarvis_mcp_call's
+    # only cli.py call sites, both now in this same module).
+    ("remote_cli", "remove_remote_file", "cli_jarvis_mcp"),
     # #231 cli.py decomposition: moved caller cli -> cli_queue_maintenance
     # (its only cli.py call site was queue_validate).
     ("queue_validation", "run_queue_management_validation", "cli_queue_maintenance"),
@@ -245,7 +251,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # #231 cli.py decomposition: moved caller cli -> cli_scheduler (its only
     # call site was scheduler_validate_lifecycle).
     ("scheduler_validation", "run_scheduler_lifecycle_validation", "cli_scheduler"),
-    ("remote_cli", "write_remote_file", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_jarvis_mcp with the
+    # jarvis-mcp command-group extraction (mcp_call's and jarvis_mcp_call's
+    # only cli.py call sites, both now in this same module).
+    ("remote_cli", "write_remote_file", "cli_jarvis_mcp"),
 )
 
 

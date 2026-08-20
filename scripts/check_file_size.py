@@ -196,7 +196,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 cli.py decomposition: installation-write-receipt/installation-info/
     # bootstrap-inspect top-level command-module extraction
     # (cli_installation_receipt.py, 446 lines): -346 net lines.
-    "src/clio_relay/cli.py": 12197,
+    # #231 cli.py decomposition: jarvis-mcp top-level command-group extraction
+    # -- the thin command layer only (jarvis-runtime-authority/mcp-call/
+    # jarvis-mcp-call/jarvis-mcp-refresh/mcp-server into cli_jarvis_mcp.py,
+    # 662 lines; jarvis-mcp-validate alone into cli_jarvis_mcp_validate.py,
+    # 538 lines, since combined they would exceed the 800-line cap). The
+    # ~2,450-line JARVIS execution-query engine these commands call stays
+    # cli.py-resident (unsequenced future work, see cli_jarvis_mcp.py's own
+    # docstring): -1004 net lines.
+    "src/clio_relay/cli.py": 11193,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No
