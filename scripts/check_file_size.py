@@ -1137,7 +1137,29 @@ RATCHET_BASELINE: dict[str, int] = {
     # mcp_server_module by tests, not monkeypatched, just no longer called bare
     # in this file) alongside the rest of the cluster's dispatcher-reached
     # names.
-    "src/clio_relay/mcp_server.py": 2554,
+    #
+    # split/mcp-server-w3 slice 8 (#231): the job status/artifact-lineage/
+    # cancel/observe/wait cluster, the most heavily interconnected cluster
+    # split so far, moves out. A single module would have measured over the
+    # 800-line ratchet cap, so it splits along its own seam:
+    # mcp_job_status.py (read-only status/lineage: _job_target,
+    # _require_local_job_cluster, _status_job, _used_artifacts_tool,
+    # _used_by_tool) and mcp_job_lifecycle.py (mutating/bounded-
+    # reconciliation: _cancel_job, _observe_job, _observe_remote_pattern,
+    # _wait_job, _observed_remote_wait_job, _relay_job_from_wait_document,
+    # _job_logs, _event_match_candidates, _bounded_observe_value,
+    # _append_bounded_observe_matches). mcp_job_lifecycle.py calls two
+    # mcp_job_status.py names bare (_job_target, _require_local_job_cluster)
+    # -- neither is monkeypatched, so that is a plain one-directional leaf
+    # import, not a back-reference. mcp_dispatch.py's #264 artifact-routing
+    # dispatch bodies (slice 3) follow the same rule: they now import
+    # `_job_target` directly from `clio_relay.mcp_job_status` instead of
+    # reaching it through `_mcp_server.<name>` -- `_job_target` moved out from
+    # under the back-reference wave-1's own tree never needed (it predates
+    # #264), so the dispatch bodies are repointed to the plain leaf import
+    # here rather than carrying a now-broken `_mcp_server._job_target`
+    # attribute lookup forward.
+    "src/clio_relay/mcp_server.py": 1832,
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in

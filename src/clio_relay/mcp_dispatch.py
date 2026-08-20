@@ -62,6 +62,7 @@ from clio_relay.mcp_arguments import (
     _response_page_cursor,
     _response_page_limit,
 )
+from clio_relay.mcp_job_status import _job_target
 from clio_relay.mcp_tool_catalog import _authorized_static_tool_names, static_mcp_tool_names
 from clio_relay.models import Cursor, artifact_use_payload
 from clio_relay.public_records import public_gateway_session
@@ -355,7 +356,7 @@ def _call_tool(
             limit=_job_log_limit(arguments),
         )
     elif name == "relay_list_artifacts":
-        list_artifacts_target = _mcp_server._job_target(arguments)
+        list_artifacts_target = _job_target(arguments)
         result = artifact_routing.list_artifacts(
             arguments,
             queue=queue,
@@ -376,7 +377,7 @@ def _call_tool(
             else _mcp_server._used_by_tool(arguments, queue=queue, settings=settings)
         )
     elif name == "relay_read_artifact":
-        read_artifact_target = _mcp_server._job_target(arguments)
+        read_artifact_target = _job_target(arguments)
         result = artifact_routing.read_artifact(
             arguments,
             queue=queue,
