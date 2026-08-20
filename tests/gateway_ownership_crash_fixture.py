@@ -15,11 +15,13 @@ from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import ServiceRuntimeSpec
-from clio_relay.service_runtime import (
+from clio_relay.service_runtime import ServiceRuntimeSupervisor
+from clio_relay.service_runtime_connector_identity import (
+    _capture_local_connector_identity,  # pyright: ignore[reportPrivateUsage]
+)
+from clio_relay.service_runtime_types import (
     CommandRunner,
     LocalConnectorIdentity,
-    ServiceRuntimeSupervisor,
-    _capture_local_connector_identity,  # pyright: ignore[reportPrivateUsage]
 )
 
 
