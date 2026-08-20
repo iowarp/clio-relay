@@ -789,7 +789,85 @@ RATCHET_BASELINE: dict[str, int] = {
     # block to a single-line `from clio_relay.session_wire_models import
     # CleanupResource, OwnedSessionStartResult` -- ratchet down. 1795 -> 1794.
     "src/clio_relay/transport_probe.py": 1794,
-    "src/clio_relay/validation_report.py": 5458,
+    # #231 split/validation-report S1: the pydantic/StrEnum wire-model
+    # catalog (LiveValidationReport, ReleaseGatePolicy, InstallSource, ...)
+    # moved to validation_schema.py (650 lines) and the byte/count budget
+    # constants moved to validation_limits.py (37 lines), each re-exported
+    # here via the `X as X` self-import idiom (door_errors.py's precedent)
+    # for the existing public/monkeypatch surface -- one name per line so
+    # ruff's F401 does not prune a name this module no longer references
+    # internally. 5458 -> 4924.
+    # #231 split/validation-report S2: ValidationRecorder + the seeded-report
+    # factory (new_live_validation_report/_validation_evidence_trust) moved
+    # to validation_recorder.py (517 lines), same re-export treatment.
+    # 4924 -> 4480.
+    # #231 split/validation-report S3: acceptance-line fact classification
+    # (line_proves_success/acceptance_scope + the fact-value catalogs) moved
+    # to acceptance_facts.py (160 lines). No re-export needed -- the only
+    # internal caller (validation_recorder.py) now imports it directly.
+    # 4480 -> 4336.
+    # #231 split/validation-report S4: credential/secret redaction
+    # (sensitive_key/collect_sensitive_values/redact_sensitive_value/
+    # redacted_invocation/redact_url/redact_sensitive_values) moved to
+    # redaction.py (155 lines). redact_sensitive_values is re-exported
+    # (external HTTP/MCP/public-records callers); the private helpers were
+    # internal-only, so validation_recorder.py and the three still-inline
+    # call sites here import directly from redaction.py. 4336 -> 4211.
+    # #231 split/validation-report S5: artifact-identity verification (wheel/
+    # PyPI/VCS-commit provenance binding a claimed artifact_sha256 to the
+    # bytes this process loaded) moved to artifact_identity_verification.py
+    # (563 lines -- over the 150-500 sweet spot but under the 800 cap; one
+    # coherent concern, not split further). Every top-level entry point
+    # test_validation_report.py exercises directly (not just the ones this
+    # module's own remaining code still calls) is re-exported under its
+    # original private name -- three via `public_name as _old_name` plus a
+    # forced-keep lint suppression comment (ruff's unused-import exemption
+    # only recognizes a literal `X as X` self-import, not a rename) since a
+    # genuinely unused rename import is otherwise pruned silently. 4211 ->
+    # 3751.
+    # #231 split/validation-report S6: the Spack fresh-install transition
+    # check (one release-policy requirement bound against an exact
+    # preinstall/install/postinstall job/check/artifact evidence graph)
+    # moved to spack_transition_checks.py (612 lines -- over the sweet spot,
+    # under the 800 cap; one coherent concern). Only its entry point has a
+    # caller left in this file (gate evaluation); no inner binding helper is
+    # tested directly, so nothing else needed re-export. 3751 -> 3174.
+    # #231 split/validation-report S7: install-source-detection primitives --
+    # over 800 lines combined, a real three-way seam split (ground rule per
+    # the split recipe). regular_file_identity.py (92 lines) is the shared
+    # snapshot-verified-read leaf both other modules and this file's own
+    # remaining _detect_launcher_receipt/detect_install_source depend on;
+    # process_ancestry.py (226 lines) walks the OS parent chain for the
+    # launching uv executable; uv_tool_receipt.py (474 lines) binds the
+    # install-once uv-tool receipt + installed-RECORD closure. Every symbol
+    # this file's own remaining orchestration still calls, plus the two uv
+    # receipt functions test_validation_report.py exercises directly, are
+    # re-exported. 3174 -> 2482.
+    # #231 split/validation-report S8: release-gate evaluation -- over 900
+    # lines combined, a real three-way seam split. release_gate_targets.py
+    # (268 lines) binds reports and policy pins to one physical cluster
+    # target identity; release_gate_resources.py (206 lines) matches a
+    # requirement's stateful resources and JARVIS execution; both are
+    # coherent sub-concerns release_gate_evaluation.py (588 lines, the core
+    # evaluate_release_gate orchestration) calls into. Nothing in this
+    # file's own remaining code (report I/O, the durable validation
+    # directory) calls any of it any more except the public
+    # evaluate_release_gate entry point cli.py imports, so only that one
+    # name is re-exported; two back-references (validation_schema.py's
+    # _normalized_hostname, already pointed at
+    # artifact_identity_verification.py for is_official_github_release_wheel
+    # in S7) are re-pointed at their real owner modules directly instead of
+    # hopping through this file. 2482 -> 1534.
+    # #231 split/validation-report S9: the durable validation directory --
+    # over 1000 lines, a real three-way seam split. validation_directory_
+    # windows.py (314 lines) pins/verifies/creates directories through a
+    # raw CreateFileW handle (Windows has no O_NOFOLLOW/dir_fd equivalent);
+    # validation_writer_lock.py (317 lines) is the cross-platform parent-
+    # wide writer lock plus its stale-.pending sweep, built on the windows
+    # primitives; durable_validation_write.py (537 lines) is the top-level
+    # orchestration (durably_ensure_validation_directory + the atomic
+    # text-replace pair) built on both. validation_report.py is now under
+    # DEFAULT_MAX_LINES -- entry removed. 1534 -> 505.
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
