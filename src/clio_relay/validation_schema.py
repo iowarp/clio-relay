@@ -17,13 +17,13 @@ The logic that *constructs*, *records into*, *evaluates*, or *durably
 writes* these types stays in their own owner modules (recorder, gate
 evaluation, install-source detection, the durable validation directory) and
 imports the types from here. Two validators below reach back for a small
-classification helper: :func:`~clio_relay.artifact_identity_verification.
-is_official_github_release_wheel` (its real owner) and
-``_normalized_hostname`` (not yet extracted to its own owner module, still
-:mod:`clio_relay.validation_report`); both imports are function-scoped to
-avoid a load-order circular import (the proven idiom -- see the module
-docstring precedent in :mod:`clio_relay.session_wire_models`), and each gets
-re-pointed at its real owner module as that concern is extracted.
+classification helper -- :func:`~clio_relay.artifact_identity_verification.
+is_official_github_release_wheel` and :func:`~clio_relay.
+release_gate_targets.normalized_hostname` -- both function-scoped to avoid a
+load-order circular import (the proven idiom -- see the module docstring
+precedent in :mod:`clio_relay.session_wire_models`): each helper's owner
+module imports types from here at module scope, so a module-scope import in
+this direction would be circular.
 """
 
 from __future__ import annotations
@@ -535,9 +535,9 @@ class ReleaseTargetIdentity(BaseModel):
     @model_validator(mode="after")
     def validate_pin_fields(self) -> ReleaseTargetIdentity:
         """Reject ambiguous policy pins while allowing explicit pending sentinels."""
-        from clio_relay.validation_report import _normalized_hostname
+        from clio_relay.release_gate_targets import normalized_hostname
 
-        normalized_hostnames = [_normalized_hostname(item) for item in self.hostnames]
+        normalized_hostnames = [normalized_hostname(item) for item in self.hostnames]
         if any(not item for item in normalized_hostnames) or len(set(normalized_hostnames)) != len(
             normalized_hostnames
         ):

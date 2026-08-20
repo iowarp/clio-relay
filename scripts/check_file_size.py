@@ -636,7 +636,22 @@ RATCHET_BASELINE: dict[str, int] = {
     # this file's own remaining orchestration still calls, plus the two uv
     # receipt functions test_validation_report.py exercises directly, are
     # re-exported. 3174 -> 2482.
-    "src/clio_relay/validation_report.py": 2482,
+    # #231 split/validation-report S8: release-gate evaluation -- over 900
+    # lines combined, a real three-way seam split. release_gate_targets.py
+    # (268 lines) binds reports and policy pins to one physical cluster
+    # target identity; release_gate_resources.py (206 lines) matches a
+    # requirement's stateful resources and JARVIS execution; both are
+    # coherent sub-concerns release_gate_evaluation.py (588 lines, the core
+    # evaluate_release_gate orchestration) calls into. Nothing in this
+    # file's own remaining code (report I/O, the durable validation
+    # directory) calls any of it any more except the public
+    # evaluate_release_gate entry point cli.py imports, so only that one
+    # name is re-exported; two back-references (validation_schema.py's
+    # _normalized_hostname, already pointed at
+    # artifact_identity_verification.py for is_official_github_release_wheel
+    # in S7) are re-pointed at their real owner modules directly instead of
+    # hopping through this file. 2482 -> 1534.
+    "src/clio_relay/validation_report.py": 1534,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
