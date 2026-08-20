@@ -581,7 +581,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # lines). This closes out the module-level function extractions named
     # in the concern inventory; service_runtime.py is now imports + module
     # constants + the ServiceRuntimeSupervisor class only. 6948 -> 6523.
-    "src/clio_relay/service_runtime.py": 6523,
+    # #231 service-runtime split, slice 9: the three frozen outcome
+    # dataclasses (ServiceRuntimeStartResult/ServiceRuntimePendingResult/
+    # ServiceRuntimeStopResult) plus their to_live_validation_report
+    # conversions and the ten RUNTIME_*_CHECK_ID identifiers moved to the
+    # new service_runtime_results.py (722 lines); re-exported here under a
+    # `# noqa: F401` header since cli.py/mcp_server.py/live_acceptance.py
+    # bare-import them and cli.py is out of this split's scope to edit.
+    # This was the last extractable module-level content -- everything
+    # remaining is imports, module constants, and the
+    # ServiceRuntimeSupervisor class itself. 6523 -> 5840.
+    "src/clio_relay/service_runtime.py": 5840,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new

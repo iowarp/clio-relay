@@ -12,10 +12,9 @@ import sys
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
 import httpx
 from filelock import FileLock
@@ -26,6 +25,7 @@ from clio_relay import service_runtime_connector_identity as _connector_identity
 from clio_relay import service_runtime_connector_step_scripts as _connector_step_scripts
 from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_readiness as _readiness
+from clio_relay import service_runtime_results as _results
 from clio_relay import service_runtime_scheduler_contracts as _scheduler_contracts
 from clio_relay import service_runtime_submission_scripts as _submission_scripts
 from clio_relay import service_runtime_types as _types
@@ -82,31 +82,18 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.owner_session_admission import desktop_owner_session_admission_id
-from clio_relay.public_records import public_gateway_payload
 from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.scheduler_providers import (
     SchedulerAllocationConnectorProvider,
     provider_for_scheduler,
 )
+from clio_relay.service_runtime_results import (
+    ServiceRuntimePendingResult,  # noqa: F401 -- cli.py/mcp_server.py/live_acceptance.py bare-import this
+    ServiceRuntimeStartResult,  # noqa: F401 -- cli.py bare-imports this; see rationale above
+    ServiceRuntimeStopResult,  # noqa: F401 -- cli.py/mcp_server.py/live_acceptance.py bare-import this
+)
 from clio_relay.session_wire_models import CleanupResource
 
-if TYPE_CHECKING:
-    from clio_relay.validation_report import (
-        CleanupEvidence,
-        LiveValidationReport,
-        ValidationResource,
-    )
-
-RUNTIME_SUBMIT_CHECK_ID = "gateway.submit"
-RUNTIME_ALLOCATED_CHECK_ID = "gateway.allocated"
-RUNTIME_READY_CHECK_ID = "gateway.ready"
-RUNTIME_CONNECT_CHECK_ID = "gateway.connect"
-RUNTIME_DETACH_CHECK_ID = "gateway.detach-connectors"
-RUNTIME_DETACHED_RECORD_CHECK_ID = "gateway.detached-record"
-RUNTIME_TEARDOWN_CHECK_ID = "gateway.stop-connectors"
-RUNTIME_SCHEDULER_RETAINED_CHECK_ID = "gateway.jobs-preserved-default"
-RUNTIME_SCHEDULER_CANCELED_CHECK_ID = "gateway.scheduler-canceled"
-RUNTIME_CLOSED_CHECK_ID = "gateway.closed-record"
 _LOCAL_CONNECTOR_WRAPPER_CODE = (
     "import subprocess,sys; "
     "_owner_token=sys.argv[1]; "
@@ -125,678 +112,6 @@ _REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS = 120.0
 _CONNECTOR_STEP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _CONNECTOR_STEP_CLEANUP_POLL_SECONDS = 0.25
 _RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS = 5.0
-
-
-@dataclass(frozen=True)
-class ServiceRuntimeStartResult:
-    """Result of a started service runtime session."""
-
-    session: GatewaySession
-    connect_url: str
-    health_url: str
-    stream_url: str | None
-    compatibility_urls: dict[str, str]
-    events_url: str | None
-    state_url: str | None = None
-    command_url: str | None = None
-
-    def to_live_validation_report(
-        self,
-        *,
-        launcher: str | None = None,
-        install_source: str | None = None,
-        artifact_sha256: str | None = None,
-    ) -> LiveValidationReport:
-        """Convert a proven-ready runtime to canonical release evidence."""
-        from clio_relay.validation_report import (
-            EvidenceReference,
-            ValidationCheck,
-            ValidationResource,
-            ValidationStatus,
-            new_live_validation_report,
-        )
-
-        report = new_live_validation_report(
-            scenario="gateway-runtime",
-            cluster=self.session.cluster,
-            launcher=launcher,
-            install_source=install_source,
-            artifact_sha256=artifact_sha256,
-        )
-        completed_at = utc_now()
-        checks = [
-            (RUNTIME_SUBMIT_CHECK_ID, "scheduler runtime submitted"),
-            (RUNTIME_ALLOCATED_CHECK_ID, "runtime received an allocated service node"),
-            (RUNTIME_READY_CHECK_ID, "runtime reached ready state"),
-            (RUNTIME_CONNECT_CHECK_ID, "desktop health connection succeeded"),
-        ]
-        report.checks = [
-            ValidationCheck(
-                check_id=check_id,
-                summary=summary,
-                status=ValidationStatus.PASSED,
-                started_at=report.started_at,
-                completed_at=completed_at,
-                evidence=[
-                    EvidenceReference(
-                        kind="gateway_runtime",
-                        reference=self.health_url,
-                        excerpt=summary,
-                        metadata={"session_id": self.session.session_id},
-                    )
-                ],
-            )
-            for check_id, summary in checks
-        ]
-        report.resources.append(
-            ValidationResource(
-                kind="gateway_session",
-                resource_id=self.session.session_id,
-                role="service_runtime",
-                cluster=self.session.cluster,
-                state=self.session.state.value,
-                metadata=self.session.model_dump(mode="json"),
-            )
-        )
-        if self.session.scheduler_job_id is not None:
-            report.resources.append(
-                ValidationResource(
-                    kind="scheduler_job",
-                    resource_id=self.session.scheduler_job_id,
-                    role="service_runtime",
-                    cluster=self.session.cluster,
-                    state=self.session.queue_state,
-                    provider=self.session.scheduler,
-                )
-            )
-        transport = _primitives._object(self.session.gateway.get("transport", {}))
-        for connector_role in ("remote_connector", "desktop_connector"):
-            connector = _primitives._object(transport.get(connector_role, {}))
-            pid = _primitives._optional_int(connector.get("pid"))
-            scheduler_step_id = _primitives._optional_str(connector.get("scheduler_step_id"))
-            resource_id = str(pid) if pid is not None else scheduler_step_id
-            if resource_id is None:
-                continue
-            report.resources.append(
-                ValidationResource(
-                    kind="connector",
-                    resource_id=resource_id,
-                    role=connector_role,
-                    cluster=self.session.cluster,
-                    state="running",
-                    references=[
-                        str(connector["config_path"])
-                        if isinstance(connector.get("config_path"), str)
-                        else self.connect_url
-                    ],
-                    metadata=connector,
-                )
-            )
-        report.completed_at = completed_at
-        report.status = ValidationStatus.PASSED
-        return report
-
-
-@dataclass(frozen=True)
-class ServiceRuntimePendingResult:
-    """Durable, resumable outcome for a submitted runtime not ready yet."""
-
-    session: GatewaySession
-    outcome: Literal["pending"] = "pending"
-    scheduler_action: Literal["none"] = "none"
-    relay_action: Literal["none"] = "none"
-
-    def retry_selector(self) -> dict[str, object]:
-        """Return the exact selector required to advance this submission in place."""
-        scheduler_job_id = self.session.scheduler_job_id
-        selector: dict[str, object] = {
-            "cluster": self.session.cluster,
-            "gateway_session_id": self.session.session_id,
-            "scheduler_provider": self.session.scheduler,
-            "scheduler_job_id": scheduler_job_id,
-        }
-        binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
-        if binding:
-            required = {
-                "source_relay_job_id",
-                "source_relay_artifact_id",
-                "package_id",
-                "package_name",
-                "service_instance_id",
-            }
-            if not required.issubset(binding):
-                raise RelayError("pending JARVIS runtime omitted its durable binding identity")
-            selector.update(
-                {
-                    "resume_tool": "relay_bind_jarvis_runtime",
-                    "binding": {
-                        "cluster": self.session.cluster,
-                        "source_job_id": binding["source_relay_job_id"],
-                        "source_artifact_id": binding["source_relay_artifact_id"],
-                        "package_id": binding["package_id"],
-                        "package_name": binding["package_name"],
-                        "service_instance_id": binding["service_instance_id"],
-                    },
-                    "name": self.session.name,
-                }
-            )
-            return selector
-        if scheduler_job_id is not None:
-            return selector
-        intents = _primitives._object(self.session.gateway.get("ownership_intents", {}))
-        intent = _primitives._object(intents.get("scheduler_submission", {}))
-        submission_id = _primitives._optional_str(intent.get("submission_id"))
-        submission_marker = _primitives._optional_str(intent.get("submission_marker"))
-        if (
-            intent.get("schema_version") != _primitives._OWNERSHIP_INTENT_SCHEMA
-            or intent.get("state") != "starting"
-            or intent.get("scheduler_provider") != self.session.scheduler
-            or submission_id is None
-            or submission_marker is None
-        ):
-            raise RelayError("pending runtime omitted its durable submission identity")
-        selector.update(
-            {
-                "submission_id": submission_id,
-                "submission_marker": submission_marker,
-            }
-        )
-        return selector
-
-    def to_live_validation_report(
-        self,
-        *,
-        launcher: str | None = None,
-        install_source: str | None = None,
-        artifact_sha256: str | None = None,
-    ) -> LiveValidationReport:
-        """Record an honest nonterminal observation that cannot satisfy a release gate."""
-        from clio_relay.validation_report import (
-            EvidenceReference,
-            ValidationCheck,
-            ValidationResource,
-            ValidationStatus,
-            new_live_validation_report,
-        )
-
-        report = new_live_validation_report(
-            scenario="gateway-runtime",
-            cluster=self.session.cluster,
-            launcher=launcher,
-            install_source=install_source,
-            artifact_sha256=artifact_sha256,
-        )
-        observed_at = utc_now()
-        selector = self.retry_selector()
-        scheduler_job_id = self.session.scheduler_job_id
-        jarvis_binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
-        unresolved_submission = scheduler_job_id is None and not jarvis_binding
-        summary = (
-            "exact scheduler submission intent is durable; submission outcome is unresolved"
-            if unresolved_submission
-            else (
-                "verified JARVIS runtime binding is durable and its local gateway is not ready yet"
-                if jarvis_binding
-                else "scheduler-backed gateway is durably submitted and not ready yet"
-            )
-        )
-        report.checks.append(
-            ValidationCheck(
-                check_id=RUNTIME_ALLOCATED_CHECK_ID,
-                summary=summary,
-                status=ValidationStatus.PENDING,
-                started_at=report.started_at,
-                completed_at=observed_at,
-                evidence=[
-                    EvidenceReference(
-                        kind="gateway_resume_selector",
-                        excerpt=json.dumps(selector, sort_keys=True),
-                        metadata={
-                            **selector,
-                            "scheduler_action": self.scheduler_action,
-                            "relay_action": self.relay_action,
-                        },
-                    )
-                ],
-            )
-        )
-        report.resources.append(
-            ValidationResource(
-                kind="gateway_session",
-                resource_id=self.session.session_id,
-                cluster=self.session.cluster,
-                state=self.session.state.value,
-                metadata={"retry_selector": selector},
-            )
-        )
-        if jarvis_binding:
-            report.resources.append(
-                ValidationResource(
-                    kind="jarvis_service_runtime",
-                    resource_id=cast(str, jarvis_binding["service_instance_id"]),
-                    cluster=self.session.cluster,
-                    provider=self.session.scheduler,
-                    state=self.session.queue_state,
-                    metadata={
-                        "gateway_session_id": self.session.session_id,
-                        "jarvis_execution_id": jarvis_binding.get("jarvis_execution_id"),
-                        "scheduler_job_id": scheduler_job_id,
-                        "cancel_requested": False,
-                        "resubmit_requested": False,
-                    },
-                )
-            )
-            if scheduler_job_id is not None:
-                report.resources.append(
-                    ValidationResource(
-                        kind="scheduler_job",
-                        resource_id=scheduler_job_id,
-                        cluster=self.session.cluster,
-                        provider=self.session.scheduler,
-                        state=self.session.queue_state,
-                        metadata={
-                            "gateway_session_id": self.session.session_id,
-                            "retained": True,
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        },
-                    )
-                )
-        else:
-            report.resources.append(
-                ValidationResource(
-                    kind=("scheduler_job" if not unresolved_submission else "scheduler_submission"),
-                    resource_id=(scheduler_job_id or cast(str, selector["submission_id"])),
-                    cluster=self.session.cluster,
-                    provider=self.session.scheduler,
-                    state=(
-                        self.session.queue_state if not unresolved_submission else "intent_recorded"
-                    ),
-                    metadata=(
-                        {
-                            "gateway_session_id": self.session.session_id,
-                            "retained": True,
-                            "scheduler_job_id": scheduler_job_id,
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        }
-                        if not unresolved_submission
-                        else {
-                            "gateway_session_id": self.session.session_id,
-                            "scheduler_job_id": None,
-                            "submission_id": selector["submission_id"],
-                            "submission_marker": selector["submission_marker"],
-                            "submission_outcome": "unresolved",
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        }
-                    ),
-                )
-            )
-        report.completed_at = observed_at
-        report.status = ValidationStatus.PENDING
-        report.error = None
-        return report
-
-
-@dataclass(frozen=True)
-class ServiceRuntimeStopResult:
-    """Result of stopping owned runtime connector processes."""
-
-    session: GatewaySession
-    mode: Literal["detach", "teardown"]
-    stopped_local_pid: int | None
-    stopped_remote_pid: int | None
-    canceled_scheduler_job: str | None
-    resources: list[CleanupResource]
-    errors: list[str]
-
-    @property
-    def residual_resources(self) -> list[CleanupResource]:
-        """Return requested cleanup actions that left a resource running."""
-        return [resource for resource in self.resources if resource.residual]
-
-    def json_payload(self) -> dict[str, object]:
-        """Return a machine-readable cleanup report."""
-        return public_gateway_payload(
-            {
-                "session": self.session.model_dump(mode="json"),
-                "resources": [resource.model_dump(mode="json") for resource in self.resources],
-                "residual_resources": [
-                    resource.model_dump(mode="json") for resource in self.residual_resources
-                ],
-                "validation_resources": [
-                    resource.model_dump(mode="json") for resource in self.validation_resources()
-                ],
-                "cleanup_evidence": self.to_cleanup_evidence().model_dump(mode="json"),
-                "errors": self.errors,
-                "ok": not self.errors and not self.residual_resources,
-            }
-        )
-
-    def validation_resources(self) -> list[ValidationResource]:
-        """Return cleanup resources in the shared validation-report shape."""
-        return [
-            resource.to_validation_resource(cluster=self.session.cluster)
-            for resource in self.resources
-        ]
-
-    def to_cleanup_evidence(self) -> CleanupEvidence:
-        """Convert this stop result to shared cleanup evidence."""
-        from clio_relay.validation_report import CleanupEvidence
-
-        operation_intent_name = "detach_intent" if self.mode == "detach" else "teardown_intent"
-        operation_intent = _primitives._object(self.session.gateway.get(operation_intent_name, {}))
-        raw_cancel_scheduler_jobs: object = (
-            False if self.mode == "detach" else operation_intent.get("cancel_scheduler_job")
-        )
-        if not isinstance(raw_cancel_scheduler_jobs, bool):
-            raise RelayError("gateway cleanup operation policy is invalid")
-        return CleanupEvidence(
-            requested=True,
-            mode=self.mode,
-            operation_id=_primitives._optional_str(operation_intent.get("operation_id")),
-            cancel_scheduler_jobs=raw_cancel_scheduler_jobs,
-            actions=[resource.model_dump(mode="json") for resource in self.resources],
-            remaining_resources=[
-                resource.to_validation_resource(cluster=self.session.cluster)
-                for resource in self.residual_resources
-            ],
-        )
-
-    def to_live_validation_report(
-        self,
-        *,
-        launcher: str | None = None,
-        install_source: str | None = None,
-        artifact_sha256: str | None = None,
-    ) -> LiveValidationReport:
-        """Convert runtime teardown to canonical release evidence."""
-        from clio_relay.validation_report import (
-            EvidenceReference,
-            ValidationCheck,
-            ValidationResource,
-            ValidationStatus,
-            new_live_validation_report,
-        )
-
-        report = new_live_validation_report(
-            scenario="gateway-runtime",
-            cluster=self.session.cluster,
-            launcher=launcher,
-            install_source=install_source,
-            artifact_sha256=artifact_sha256,
-        )
-        completed_at = utc_now()
-        desktop_connectors = [
-            resource for resource in self.resources if resource.kind == "desktop_connector"
-        ]
-        remote_connectors = [
-            resource for resource in self.resources if resource.kind == "remote_connector"
-        ]
-        scheduler_resources = [
-            resource for resource in self.resources if resource.kind == "scheduler_job"
-        ]
-        scheduler_submission_resources = [
-            resource for resource in self.resources if resource.kind == "scheduler_submission"
-        ]
-        gateway_resources = [
-            resource for resource in self.resources if resource.kind == "gateway_record"
-        ]
-        cancellation_requested = any(
-            resource.action == "cancel" for resource in scheduler_resources
-        )
-        unresolved_submission = bool(
-            self.session.scheduler_job_id is None
-            and self.session.gateway.get("jarvis_runtime_binding") is None
-            and _scheduler_contracts._validated_durable_scheduler_contract(
-                self.session
-            ).unresolved_submission
-        )
-        scheduler_identity_exact = bool(
-            not scheduler_resources
-            if self.session.scheduler_job_id is None
-            else len(scheduler_resources) == 1
-            and scheduler_resources[0].resource_id == self.session.scheduler_job_id
-            and scheduler_resources[0].provider == self.session.scheduler
-        )
-        if unresolved_submission:
-            scheduler_intent = _primitives._object(
-                _primitives._object(self.session.gateway.get("ownership_intents", {})).get(
-                    "scheduler_submission",
-                    {},
-                )
-            )
-            scheduler_submission_exact = (
-                not scheduler_resources
-                and len(scheduler_submission_resources) == 1
-                and scheduler_submission_resources[0].resource_id
-                == scheduler_intent.get("submission_id")
-                and scheduler_submission_resources[0].provider == self.session.scheduler
-                and scheduler_submission_resources[0].action == "retain"
-                and scheduler_submission_resources[0].outcome == "retained"
-                and scheduler_submission_resources[0].observed_state == "intent_recorded"
-                and scheduler_submission_resources[0].ownership_verified
-                and scheduler_submission_resources[0].verified_after_operation
-                and not scheduler_submission_resources[0].residual
-                and scheduler_submission_resources[0].metadata.get("submission_marker")
-                == scheduler_intent.get("submission_marker")
-                and scheduler_submission_resources[0].metadata.get("scheduler_job_id") is None
-                and scheduler_submission_resources[0].metadata.get("cancel_requested") is False
-                and scheduler_submission_resources[0].metadata.get("resubmit_requested") is False
-            )
-            scheduler_check = (
-                RUNTIME_SCHEDULER_RETAINED_CHECK_ID,
-                "exact scheduler submission intent retained; no job, cancellation, or "
-                "resubmission is claimed",
-                scheduler_submission_exact,
-            )
-        elif cancellation_requested:
-            scheduler_check = (
-                RUNTIME_SCHEDULER_CANCELED_CHECK_ID,
-                "scheduler cancellation reached an observed canceled state",
-                scheduler_identity_exact
-                and all(
-                    resource.action == "cancel"
-                    and resource.outcome == "canceled"
-                    and resource.ownership_verified
-                    and resource.verified_after_operation
-                    and resource.observed_state in _scheduler_contracts._CANCELED_RUNTIME_STATES
-                    and not resource.residual
-                    for resource in scheduler_resources
-                ),
-            )
-        else:
-            allowed_retention_outcomes = (
-                {"retained"} if self.mode == "detach" else {"retained", "terminal", "missing"}
-            )
-            scheduler_check = (
-                RUNTIME_SCHEDULER_RETAINED_CHECK_ID,
-                "scheduler job preserved by default and its disposition observed",
-                scheduler_identity_exact
-                and (
-                    self.session.scheduler_job_id is None
-                    or all(
-                        resource.action == "retain"
-                        and resource.outcome in allowed_retention_outcomes
-                        and resource.ownership_verified
-                        and resource.verified_after_operation
-                        and resource.observed_state is not None
-                        and (
-                            resource.observed_state in _scheduler_contracts._ACTIVE_RUNTIME_STATES
-                            if self.mode == "detach"
-                            else resource.observed_state
-                            not in {"not-found", "not_found", "unknown"}
-                        )
-                        and not resource.residual
-                        for resource in scheduler_resources
-                    )
-                ),
-            )
-        if self.mode == "detach":
-            desktop_stopped = len(desktop_connectors) == 1 and all(
-                resource.metadata.get("gateway_session_id") == self.session.session_id
-                and resource.action == "stop"
-                and resource.outcome in {"stopped", "missing"}
-                and resource.ownership_verified
-                and resource.verified_after_operation
-                and not resource.residual
-                for resource in desktop_connectors
-            )
-            remote_retained = len(remote_connectors) == 1 and all(
-                resource.metadata.get("gateway_session_id") == self.session.session_id
-                and resource.action == "retain"
-                and resource.outcome == "retained"
-                and resource.ownership_verified
-                and resource.verified_after_operation
-                and not resource.residual
-                for resource in remote_connectors
-            )
-            no_connector_side_effects = (
-                len(desktop_connectors) == 1
-                and desktop_connectors[0].action == "stop"
-                and desktop_connectors[0].outcome == "missing"
-                and desktop_connectors[0].ownership_verified
-                and desktop_connectors[0].verified_after_operation
-                and not desktop_connectors[0].residual
-                and len(remote_connectors) == 1
-                and remote_connectors[0].action == "retain"
-                and remote_connectors[0].outcome == "missing"
-                and remote_connectors[0].observed_state == "not_created"
-                and remote_connectors[0].ownership_verified
-                and remote_connectors[0].verified_after_operation
-                and not remote_connectors[0].residual
-            )
-            check_values = [
-                (
-                    RUNTIME_DETACH_CHECK_ID,
-                    (
-                        "connector intents prove no connector side effects were created"
-                        if no_connector_side_effects
-                        else "desktop connector stopped and remote connector retained"
-                    ),
-                    no_connector_side_effects
-                    if no_connector_side_effects
-                    else desktop_stopped and remote_retained,
-                ),
-                scheduler_check,
-                (
-                    RUNTIME_DETACHED_RECORD_CHECK_ID,
-                    "gateway record remains available for reattachment",
-                    self.session.state == GatewaySessionState.DEGRADED
-                    and len(gateway_resources) == 1
-                    and all(
-                        resource.resource_id == self.session.session_id
-                        and resource.action == "retain"
-                        and resource.outcome == "retained"
-                        and resource.ownership_verified
-                        and resource.verified_after_operation
-                        and not resource.residual
-                        for resource in gateway_resources
-                    ),
-                ),
-            ]
-        else:
-            connector_resources = [*desktop_connectors, *remote_connectors]
-            connectors_stopped = (
-                len(desktop_connectors) == 1
-                and len(remote_connectors) == 1
-                and all(
-                    resource.metadata.get("gateway_session_id") == self.session.session_id
-                    and resource.action == "stop"
-                    and resource.outcome in {"stopped", "missing"}
-                    and resource.ownership_verified
-                    and resource.verified_after_operation
-                    and not resource.residual
-                    for resource in connector_resources
-                )
-            )
-            gateway_closed = (
-                self.session.state == GatewaySessionState.CLOSED
-                and len(gateway_resources) == 1
-                and gateway_resources[0].resource_id == self.session.session_id
-                and gateway_resources[0].action == "close"
-                and gateway_resources[0].outcome == "closed"
-                and gateway_resources[0].ownership_verified
-                and gateway_resources[0].verified_after_operation
-                and not gateway_resources[0].residual
-            )
-            check_values = [
-                (RUNTIME_TEARDOWN_CHECK_ID, "owned runtime connectors stopped", connectors_stopped),
-                scheduler_check,
-                (
-                    RUNTIME_CLOSED_CHECK_ID,
-                    "gateway record closed",
-                    gateway_closed,
-                ),
-            ]
-        report.checks = [
-            ValidationCheck(
-                check_id=check_id,
-                summary=summary,
-                status=ValidationStatus.PASSED if passed else ValidationStatus.FAILED,
-                started_at=report.started_at,
-                completed_at=completed_at,
-                evidence=[
-                    EvidenceReference(
-                        kind="gateway_cleanup",
-                        excerpt=summary,
-                        metadata=self.json_payload(),
-                    )
-                ],
-                error=None if passed else summary,
-            )
-            for check_id, summary, passed in check_values
-        ]
-        report.resources = self.validation_resources()
-        report.resources.append(
-            ValidationResource(
-                kind="gateway_session",
-                resource_id=self.session.session_id,
-                role="service_runtime",
-                cluster=self.session.cluster,
-                state=self.session.state.value,
-                metadata=self.session.model_dump(mode="json"),
-            )
-        )
-        if self.session.scheduler_job_id is not None:
-            scheduler_observation = next(
-                (
-                    resource
-                    for resource in scheduler_resources
-                    if resource.resource_id == self.session.scheduler_job_id
-                ),
-                None,
-            )
-            report.resources.append(
-                ValidationResource(
-                    kind="scheduler_job",
-                    resource_id=self.session.scheduler_job_id,
-                    role="service_runtime",
-                    cluster=self.session.cluster,
-                    state=(
-                        "canceled"
-                        if self.canceled_scheduler_job is not None
-                        else (
-                            scheduler_observation.observed_state
-                            if scheduler_observation is not None
-                            else self.session.queue_state
-                        )
-                    ),
-                    provider=self.session.scheduler,
-                )
-            )
-        report.cleanup = self.to_cleanup_evidence()
-        report.completed_at = completed_at
-        report.status = (
-            ValidationStatus.PASSED
-            if all(check.status is ValidationStatus.PASSED for check in report.checks)
-            else ValidationStatus.FAILED
-        )
-        report.error = (
-            None if report.status is ValidationStatus.PASSED else "gateway cleanup failed"
-        )
-        return report
 
 
 class ServiceRuntimeSupervisor:
@@ -842,7 +157,7 @@ class ServiceRuntimeSupervisor:
         owner_session_id: str | None = None,
         owner_session_generation_id: str | None = None,
         owner_session_admission_id: str | None = None,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Start a scheduler-backed remote service and bind it to a desktop port."""
         if spec.deployment_driver == "jarvis-bound":
             raise ConfigurationError("jarvis-bound runtimes must use bind_verified_jarvis_runtime")
@@ -939,7 +254,7 @@ class ServiceRuntimeSupervisor:
                     provider_status=None,
                     state=GatewaySessionState.PENDING,
                 )
-                return ServiceRuntimePendingResult(session=pending)
+                return _results.ServiceRuntimePendingResult(session=pending)
             submission = _scheduler_contracts._parse_runtime_submission(submit_output)
             scheduler_job_id = submission.scheduler_job_id
             session = self._update(
@@ -966,7 +281,7 @@ class ServiceRuntimeSupervisor:
                 initial_service_host=submission.service_host,
             )
             if node is None:
-                return ServiceRuntimePendingResult(
+                return _results.ServiceRuntimePendingResult(
                     session=self.queue.get_gateway_session(session.session_id)
                 )
             completion_started = True
@@ -991,7 +306,7 @@ class ServiceRuntimeSupervisor:
         self,
         *,
         session_id: str,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Advance one exact durable runtime submission without resubmitting it."""
         self.queue.initialize()
         with self._gateway_transition_lock(session_id):
@@ -1001,7 +316,7 @@ class ServiceRuntimeSupervisor:
         self,
         *,
         session_id: str,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Advance one durable start while the caller holds its transition lock."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -1108,7 +423,7 @@ class ServiceRuntimeSupervisor:
                 error=exc,
                 provider_status=None,
             )
-            return ServiceRuntimePendingResult(session=pending_session)
+            return _results.ServiceRuntimePendingResult(session=pending_session)
         try:
             node = self._observe_allocation_and_health_once(
                 session,
@@ -1125,7 +440,9 @@ class ServiceRuntimeSupervisor:
             )
             raise
         if node is None:
-            return ServiceRuntimePendingResult(session=self.queue.get_gateway_session(session_id))
+            return _results.ServiceRuntimePendingResult(
+                session=self.queue.get_gateway_session(session_id)
+            )
         return self._complete_runtime_start_locked(
             session_id=session_id,
             spec=submission.spec,
@@ -1138,7 +455,7 @@ class ServiceRuntimeSupervisor:
         session_id: str,
         spec: ServiceRuntimeSpec,
         node: str,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Create connectors and publish readiness while holding the session transition lock."""
         session = self._reconcile_ownership_intents(self.queue.get_gateway_session(session_id))
         remote_connector: dict[str, object] | None = None
@@ -1201,7 +518,7 @@ class ServiceRuntimeSupervisor:
                         queue_state=latest.queue_state or "running",
                         preserve_scheduler_status=True,
                     )
-                    return ServiceRuntimePendingResult(session=pending)
+                    return _results.ServiceRuntimePendingResult(session=pending)
                 session = self.queue.get_gateway_session(session.session_id)
                 session = self._update(
                     session,
@@ -1293,7 +610,7 @@ class ServiceRuntimeSupervisor:
                     queue_state=session.queue_state or "running",
                     preserve_scheduler_status=True,
                 )
-                return ServiceRuntimePendingResult(session=pending_session)
+                return _results.ServiceRuntimePendingResult(session=pending_session)
             events_url = (
                 f"{spec.protocol}://{spec.desktop_bind_addr}:"
                 f"{spec.desktop_bind_port}{spec.event_stream_path}"
@@ -1360,7 +677,7 @@ class ServiceRuntimeSupervisor:
                 },
                 metadata={"ready_at": utc_now().isoformat()},
             )
-            return ServiceRuntimeStartResult(
+            return _results.ServiceRuntimeStartResult(
                 session=session,
                 connect_url=connect_url,
                 health_url=health_url,
@@ -1379,7 +696,7 @@ class ServiceRuntimeSupervisor:
             )
             raise
 
-    def _ready_start_result(self, session: GatewaySession) -> ServiceRuntimeStartResult:
+    def _ready_start_result(self, session: GatewaySession) -> _results.ServiceRuntimeStartResult:
         """Rehydrate an idempotent ready result from one exact durable gateway record."""
         gateway = session.gateway
         connect_url = _primitives._optional_str(gateway.get("connect_url"))
@@ -1396,7 +713,7 @@ class ServiceRuntimeSupervisor:
             if isinstance(compatibility_raw, dict)
             else {}
         )
-        return ServiceRuntimeStartResult(
+        return _results.ServiceRuntimeStartResult(
             session=session,
             connect_url=connect_url,
             health_url=health_url,
@@ -1479,7 +796,7 @@ class ServiceRuntimeSupervisor:
         session: GatewaySession,
         *,
         role: str,
-    ) -> ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimePendingResult:
         """Persist an ambiguous connector identity as resumable, without replacement."""
         intents = _primitives._object(session.gateway.get("ownership_intents", {}))
         intent = _primitives._object(intents.get(role, {}))
@@ -1496,7 +813,7 @@ class ServiceRuntimeSupervisor:
             queue_state=session.queue_state or "running",
             preserve_scheduler_status=True,
         )
-        return ServiceRuntimePendingResult(session=pending)
+        return _results.ServiceRuntimePendingResult(session=pending)
 
     def _rollback_runtime_start(
         self,
@@ -1587,7 +904,7 @@ class ServiceRuntimeSupervisor:
         transport_mode: str = "frp-stcp-wss",
         readiness_timeout_seconds: float = 300.0,
         poll_seconds: float = 2.0,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Bind or resume one exact JARVIS-owned service without submitting work.
 
         The immutable binding and owner identity derive the gateway ID. Reissuing
@@ -1910,7 +1227,7 @@ class ServiceRuntimeSupervisor:
         authorization: str | None,
         readiness_timeout_seconds: float,
         poll_seconds: float,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Advance one exact JARVIS binding while holding its transition lock."""
         session = self.queue.get_gateway_session(session_id)
         spec = self._validate_jarvis_binding_session(session=session, verified=verified)
@@ -1987,7 +1304,7 @@ class ServiceRuntimeSupervisor:
                     queue_state=runtime.lifecycle,
                     preserve_scheduler_status=True,
                 )
-                return ServiceRuntimePendingResult(session=pending)
+                return _results.ServiceRuntimePendingResult(session=pending)
             except RelayError as exc:
                 provider_status: SchedulerStatus | None = None
                 if (
@@ -2028,7 +1345,7 @@ class ServiceRuntimeSupervisor:
                     ),
                     preserve_scheduler_status=provider_status is None,
                 )
-                return ServiceRuntimePendingResult(session=pending)
+                return _results.ServiceRuntimePendingResult(session=pending)
             # Allocation connector startup can publish placement intent first.
             session = self.queue.get_gateway_session(session.session_id)
             session = self._update(
@@ -2075,7 +1392,7 @@ class ServiceRuntimeSupervisor:
                     queue_state=runtime.lifecycle,
                     preserve_scheduler_status=True,
                 )
-                return ServiceRuntimePendingResult(session=pending)
+                return _results.ServiceRuntimePendingResult(session=pending)
             session = self._update(
                 session,
                 gateway=self._gateway_with_ownership_intent(
@@ -2124,7 +1441,7 @@ class ServiceRuntimeSupervisor:
                 queue_state=runtime.lifecycle,
                 preserve_scheduler_status=True,
             )
-            return ServiceRuntimePendingResult(session=pending)
+            return _results.ServiceRuntimePendingResult(session=pending)
 
         session = self._update(
             session,
@@ -2164,7 +1481,7 @@ class ServiceRuntimeSupervisor:
             },
             metadata={"ready_at": utc_now().isoformat()},
         )
-        return ServiceRuntimeStartResult(
+        return _results.ServiceRuntimeStartResult(
             session=session,
             connect_url=connect_url,
             health_url=health_url,
@@ -2698,7 +2015,7 @@ class ServiceRuntimeSupervisor:
         session_id: str,
         cancel_scheduler_job: bool = False,
         final_state: GatewaySessionState = GatewaySessionState.CLOSED,
-    ) -> ServiceRuntimeStopResult:
+    ) -> _results.ServiceRuntimeStopResult:
         """Serialize and durably replay one owned runtime teardown operation."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -2717,7 +2034,7 @@ class ServiceRuntimeSupervisor:
         session_id: str,
         cancel_scheduler_job: bool,
         final_state: GatewaySessionState,
-    ) -> ServiceRuntimeStopResult:
+    ) -> _results.ServiceRuntimeStopResult:
         """Execute teardown while holding the exact cluster/session transition lock."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -3107,7 +2424,7 @@ class ServiceRuntimeSupervisor:
                 },
             },
         )
-        return ServiceRuntimeStopResult(
+        return _results.ServiceRuntimeStopResult(
             session=updated,
             mode="teardown",
             stopped_local_pid=stopped_local_pid,
@@ -3117,14 +2434,14 @@ class ServiceRuntimeSupervisor:
             errors=errors,
         )
 
-    def detach(self, *, session_id: str) -> ServiceRuntimeStopResult:
+    def detach(self, *, session_id: str) -> _results.ServiceRuntimeStopResult:
         """Serialize detachment against attach and teardown for this gateway."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
         with self._gateway_transition_lock(session_id):
             return self._detach_serialized(session_id=session_id)
 
-    def _detach_serialized(self, *, session_id: str) -> ServiceRuntimeStopResult:
+    def _detach_serialized(self, *, session_id: str) -> _results.ServiceRuntimeStopResult:
         """Stop only the desktop connector while holding the gateway transition lock."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -3415,7 +2732,7 @@ class ServiceRuntimeSupervisor:
                 },
             },
         )
-        return ServiceRuntimeStopResult(
+        return _results.ServiceRuntimeStopResult(
             session=updated,
             mode="detach",
             stopped_local_pid=stopped_local_pid,
@@ -3429,7 +2746,7 @@ class ServiceRuntimeSupervisor:
         self,
         *,
         session_id: str,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Serialize attachment against detach and teardown for this gateway."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -3440,7 +2757,7 @@ class ServiceRuntimeSupervisor:
         self,
         *,
         session_id: str,
-    ) -> ServiceRuntimeStartResult | ServiceRuntimePendingResult:
+    ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Recreate the desktop connector while holding the gateway transition lock."""
         session = self.queue.get_gateway_session(session_id)
         self._validate_gateway_transition_session(session)
@@ -3608,7 +2925,7 @@ class ServiceRuntimeSupervisor:
                     queue_state=session.queue_state or "running",
                     preserve_scheduler_status=True,
                 )
-                return ServiceRuntimePendingResult(session=pending)
+                return _results.ServiceRuntimePendingResult(session=pending)
         except Exception as exc:
             cleanup_error: str | None = None
             if not created_connector:
@@ -3718,7 +3035,7 @@ class ServiceRuntimeSupervisor:
                 cleanup_error=cleanup_error,
             )
             raise
-        return ServiceRuntimeStartResult(
+        return _results.ServiceRuntimeStartResult(
             session=updated,
             connect_url=connect_url,
             health_url=health_url,
@@ -3780,7 +3097,7 @@ class ServiceRuntimeSupervisor:
     def _completed_detach_result(
         self,
         session: GatewaySession,
-    ) -> ServiceRuntimeStopResult | None:
+    ) -> _results.ServiceRuntimeStopResult | None:
         """Rehydrate exact completed detach evidence without repeating side effects."""
         intent = _scheduler_contracts._validated_gateway_detach_intent(session)
         raw_result = session.gateway.get("detach")
@@ -3844,7 +3161,7 @@ class ServiceRuntimeSupervisor:
             errors=errors,
         ):
             raise RelayError("gateway detach evidence is invalid")
-        return ServiceRuntimeStopResult(
+        return _results.ServiceRuntimeStopResult(
             session=session,
             mode="detach",
             stopped_local_pid=stopped_local_pid,
@@ -4116,7 +3433,7 @@ class ServiceRuntimeSupervisor:
         *,
         cancel_scheduler_job: bool,
         final_state: GatewaySessionState,
-    ) -> ServiceRuntimeStopResult | None:
+    ) -> _results.ServiceRuntimeStopResult | None:
         """Rehydrate exact non-retryable teardown evidence without repeating side effects."""
         raw_result = session.gateway.get("teardown")
         retryable = session.metadata.get("cleanup_retryable")
@@ -4209,7 +3526,7 @@ class ServiceRuntimeSupervisor:
             errors=errors,
         ):
             raise RelayError("completed gateway teardown evidence is invalid")
-        return ServiceRuntimeStopResult(
+        return _results.ServiceRuntimeStopResult(
             session=session,
             mode="teardown",
             stopped_local_pid=stopped_local_pid,
