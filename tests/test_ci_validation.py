@@ -50,13 +50,15 @@ from clio_relay.ci_validation import (
     MAX_VALIDATION_REPORT_BYTES,
     REQUIRED_ENVIRONMENTS,
     ProvenanceError,
+    build_validation_report_asset_manifest,
+    verify_downloaded_validation_report_assets,
+    write_candidate_checksum_manifest,
+)
+from clio_relay.release_assets import (
     build_exact_release_asset_inventory,
     build_staged_release_asset_plan,
-    build_validation_report_asset_manifest,
     validate_release_acceptance_matrix,
-    verify_downloaded_validation_report_assets,
     verify_exact_release_asset_inventory,
-    write_candidate_checksum_manifest,
 )
 from clio_relay.release_identity import (
     resolve_live_release,
