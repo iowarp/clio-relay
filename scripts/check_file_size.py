@@ -664,14 +664,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # with no baseline entry needed.
     "src/clio_relay/jarvis_execution.py": 875,
     "src/clio_relay/jarvis_mcp.py": 947,
-    # #231 R6-fix review, A6: +1 net line -- `_execution_query_contract_evidence`'s
-    # own `expected_filters` set was a stale v3.6-shaped copy that never
-    # gained `content_max_bytes` when the v3.7 contract added it (7ea003a
-    # touched `installation.py`'s equivalent guard but missed this one) --
-    # the acceptance validator was reporting a fully compliant remote
-    # contract as FAILED. A ratchet-up for a one-line real bug fix, not
-    # accretion.
-    "src/clio_relay/jarvis_mcp_validation.py": 2672,
+    # jarvis_mcp_validation.py's own ratchet-baseline entry and history
+    # comment (most recently: #231 R6-fix review, A6, the `expected_filters`
+    # `content_max_bytes` fix) were removed here (split/jarvis-mcp-validation):
+    # the file is now 38 lines (a facade only -- two re-exports) after its
+    # evidence-building logic moved to eight owner modules --
+    # jarvis_mcp_validation_core.py (JSON/type primitives), _contract.py
+    # (local/remote tool-contract validation), _package_search.py
+    # (``jarvis_describe`` call evidence), _execution_query.py (post-run
+    # ``jarvis_get_execution`` evidence), _progress_semantics.py (one native
+    # progress event's semantics), _lifecycle_progress.py (execution-query
+    # lifecycle/package-progress evidence, 482 lines, re-exported here under
+    # its private name because tests call it directly via
+    # ``jarvis_validation._jarvis_query_lifecycle_progress_evidence``),
+    # _live_progress.py (``jarvis_run`` native progress-notification
+    # evidence), and _report.py (``build_jarvis_mcp_validation_report``, 797
+    # lines -- one indivisible orchestrating function, at the sweet-spot cap
+    # like ``service_runtime_start.py``'s precedent) -- comfortably under
+    # DEFAULT_MAX_LINES with no baseline entry needed.
     # #231 R6 review fixes: +11 net lines -- F5, `_load_source` checks
     # is_delivery_refusal on the source envelope FIRST and raises the
     # refusal's own message/code, instead of the generic "is not a base64
