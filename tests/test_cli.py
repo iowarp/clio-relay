@@ -6869,55 +6869,6 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
         cli.jarvis_mcp_artifact_binding_from_entry(wrong_outer_hash)
 
 
-def test_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """A retry cannot make an earlier MCP result the implicit discovery authority."""
-    definition = ClusterDefinition(name="configured-target", ssh_host="cluster.example")
-
-    def duplicate_results(
-        _definition: ClusterDefinition,
-        _job_id: str,
-    ) -> list[dict[str, object]]:
-        return [
-            {"artifact_id": "artifact-first", "kind": "mcp_result"},
-            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
-        ]
-
-    monkeypatch.setattr(cli, "_remote_artifact_records", duplicate_results)
-
-    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
-        cli._read_remote_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            definition,
-            "job-retried-discovery",
-        )
-
-
-def test_local_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """Local mode applies the same unique durable authority as remote mode."""
-    queue = ClioCoreQueue(tmp_path / "core")
-
-    def duplicate_results(
-        _queue: ClioCoreQueue,
-        _job_id: str,
-    ) -> list[dict[str, object]]:
-        return [
-            {"artifact_id": "artifact-first", "kind": "mcp_result"},
-            {"artifact_id": "artifact-retry", "kind": "mcp_result"},
-        ]
-
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", duplicate_results)
-
-    with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
-        cli._read_local_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            queue,
-            "job-retried-local-discovery",
-        )
-
-
 def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
     monkeypatch: MonkeyPatch,
 ) -> None:

@@ -210,7 +210,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # _artifact_use_cli_value/_artifact_use_idempotency_suffix real bodies
     # moved to cli_support.py, cli.py keeps each as a thin forwarder under
     # its original name: -50 net lines.
-    "src/clio_relay/cli.py": 11143,
+    # #231 cli.py decomposition: remote_mcp_app extraction -- the register/
+    # unregister/list/reload/refresh command layer plus its exclusive cache
+    # helpers into cli_remote_mcp.py (557 lines), remote-mcp-validate's
+    # thin command body into cli_remote_mcp_validate.py (402 lines), and the
+    # ~780-line spack-configuration validation engine it drives into the new
+    # real owner module remote_mcp_validation.py. cli.py keeps only the
+    # shared discovery/artifact-reading helpers still used by the resident
+    # JARVIS execution-query engine: -1464 net lines.
+    "src/clio_relay/cli.py": 9679,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

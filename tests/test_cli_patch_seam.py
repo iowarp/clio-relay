@@ -93,6 +93,9 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_diagnostics": _SRC_ROOT / "cli_diagnostics.py",
     "cli_installation_receipt": _SRC_ROOT / "cli_installation_receipt.py",
     "cli_jarvis_mcp": _SRC_ROOT / "cli_jarvis_mcp.py",
+    "cli_remote_mcp": _SRC_ROOT / "cli_remote_mcp.py",
+    "cli_remote_mcp_validate": _SRC_ROOT / "cli_remote_mcp_validate.py",
+    "remote_mcp_validation": _SRC_ROOT / "remote_mcp_validation.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -175,7 +178,11 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # R8(ii): moved caller cli -> cli_relay_host with the relay-host extraction.
     ("transport_probe", "run_frp_direct_http_probe", "cli_relay_host"),
     ("transport_probe", "run_ssh_forward_http_probe", "cli_relay_host"),
-    ("mcp_server", "load_registered_remote_mcp_catalog", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_remote_mcp with the
+    # remote-mcp command-group extraction (register/list/refresh's call
+    # site; cli_remote_mcp_validate.py reaches it too, but this is the
+    # primary command-group owner).
+    ("mcp_server", "load_registered_remote_mcp_catalog", "cli_remote_mcp"),
     ("relay_ops", "wait_for_terminal", "cli"),
     # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
     # with the installation/receipt command-group extraction (bootstrap_
@@ -239,7 +246,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # the cluster deployment command-group extraction (cluster_bootstrap's
     # only cli.py call site).
     ("bootstrap_acceptance", "bootstrap_reuse_acceptance_evidence", "cli_cluster_deploy"),
-    ("remote_mcp", "build_remote_mcp_acceptance_report", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> remote_mcp_validation
+    # with the remote_mcp_app extraction (remote-mcp-validate's fresh-Spack
+    # transition report; its only call site).
+    ("remote_mcp", "build_remote_mcp_acceptance_report", "remote_mcp_validation"),
     ("jarvis_mcp", "jarvis_mcp_server", "cli"),
     # #231 cli.py decomposition: moved caller cli -> cli_jarvis_mcp with the
     # jarvis-mcp command-group extraction (mcp_call's and jarvis_mcp_call's
@@ -248,7 +258,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # #231 cli.py decomposition: moved caller cli -> cli_queue_maintenance
     # (its only cli.py call site was queue_validate).
     ("queue_validation", "run_queue_management_validation", "cli_queue_maintenance"),
-    ("remote_cli", "run_remote_shell", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> remote_mcp_validation
+    # with the remote_mcp_app extraction (the Spack configuration observer's
+    # only call site).
+    ("remote_cli", "run_remote_shell", "remote_mcp_validation"),
     # #231 cli.py decomposition: moved caller cli -> cli_scheduler (its only
     # call site was scheduler_validate_lifecycle).
     ("scheduler_validation", "run_scheduler_lifecycle_validation", "cli_scheduler"),

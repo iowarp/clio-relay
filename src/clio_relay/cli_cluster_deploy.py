@@ -13,13 +13,19 @@ two-file-one-Typer pattern ``cli_queue.py``/``cli_queue_maintenance.py`` and
 commands span well past the 800-line new-file cap, so the module stays
 split by this exact registry/deployment seam rather than merged into one.
 
-**Two private helpers moved here as exclusive domain logic.**
-``_invalidate_remote_mcp_cache_after_bootstrap`` and
-``_resolved_worker_capacity_policy`` had every one of their call sites
-inside this exact six-command group (``cluster_bootstrap`` and
-``cluster_install_endpoint_service`` respectively) -- not shared plumbing,
-matching ``cli_cluster.py``'s own reasoning for ``_route_revision_before_
-edit``/``_warn_if_route_revision_changed``/``_split_csv``.
+**Two private helpers moved here.** ``_invalidate_remote_mcp_cache_after_
+bootstrap`` had every one of its call sites inside this exact six-command
+group (``cluster_bootstrap``) -- not shared plumbing, matching
+``cli_cluster.py``'s own reasoning for ``_route_revision_before_edit``/
+``_warn_if_route_revision_changed``/``_split_csv``. ``_resolved_worker_
+capacity_policy`` (``cluster_install_endpoint_service``'s) turned out NOT
+to be single-caller -- ``cli_endpoint.py``'s ``endpoint_start`` and
+``endpoint_render_user_service`` also call it (a gap this fix-forward
+closed: ``cli_endpoint.py`` now reaches it via ``import clio_relay.
+cli_cluster_deploy as cli_cluster_deploy`` rather than the stale
+``cli._resolved_worker_capacity_policy`` it was left calling when this
+module was cut). It stays defined here rather than moving again to
+``cli_support.py`` since this remains its primary/majority owner.
 
 **Collaborators imported directly, not through ``cli``.** None of
 ``clio_relay.cluster_probe``, ``clio_relay.bootstrap_pin``,

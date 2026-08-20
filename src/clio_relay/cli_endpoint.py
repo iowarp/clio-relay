@@ -19,6 +19,17 @@ collaborators (``tests/test_cli_patch_seam.py``). ``render_endpoint_user_
 service``/``write_endpoint_user_service`` (``deployment.py``, not audited)
 are imported directly, matching ``cli.py``'s own prior style.
 
+**Fix-forward: ``_resolved_worker_capacity_policy``.** ``endpoint_start``
+and ``endpoint_render_user_service`` call ``cli_cluster_deploy.
+_resolved_worker_capacity_policy`` via ``import clio_relay.
+cli_cluster_deploy as cli_cluster_deploy`` -- not ``cli.<symbol>``. That
+function moved to ``cli_cluster_deploy.py`` in an earlier slice of this
+same campaign, whose own docstring at the time (incorrectly) claimed
+``cluster_install_endpoint_service`` was its only caller; these two
+call sites here were left pointing at ``cli._resolved_worker_capacity_
+policy``, which stopped existing the moment that slice landed. Caught by
+this campaign's broader regression sweep and corrected in place.
+
 **Reassigned patch-seam caller.** ``endpoint.EndpointWorker`` had exactly
 one call site in the whole of ``cli.py`` -- ``endpoint_start`` itself --
 unlike ``scheduler_providers.provider_for_scheduler`` (16 call sites, stays
@@ -34,11 +45,12 @@ same bookkeeping this campaign already did for ``cli_api.py`` and
 ``_physical_site_marker_sha256`` had exactly one call site in the whole of
 ``cli.py`` -- ``endpoint_target_info`` itself -- unlike the cross-cutting
 helpers left in ``cli.py`` (``_require_cluster``, ``_run_or_exit``,
-``_resolved_worker_capacity_policy``, ``_kind_concurrency_options``,
-``_public_json``, each with multiple call sites across unrelated groups). A
-single-caller private helper is domain logic for this group, not shared
-plumbing, so it moves with its only caller, the same reasoning
-``cli_api.py``'s ``_require_process_bound_session_api_release`` documents.
+``_kind_concurrency_options``, ``_public_json``, each with multiple call
+sites across unrelated groups). A single-caller private helper is domain
+logic for this group, not shared plumbing, so it moves with its only
+caller, the same reasoning ``cli_api.py``'s ``_require_process_bound_
+session_api_release`` documents. (``_resolved_worker_capacity_policy`` is
+NOT cli.py-resident -- see the fix-forward note above.)
 
 **The import-cycle discipline.** ``cli`` is never bound as a module-level
 name here, matching every prior extraction: it is imported function-locally,
@@ -133,6 +145,7 @@ def endpoint_start(
 ) -> None:
     """Start a desktop or worker endpoint."""
     import clio_relay.cli as cli
+    import clio_relay.cli_cluster_deploy as cli_cluster_deploy
 
     settings = RelaySettings.from_env()
     definition: ClusterDefinition | None = None
@@ -148,7 +161,7 @@ def endpoint_start(
         # own disconnected CLI defaults -- a fresh worker deployment that never pins
         # these flags otherwise gets control_query_concurrency=0 and silently
         # starves every control-class job.
-        capacity = cli._resolved_worker_capacity_policy(
+        capacity = cli_cluster_deploy._resolved_worker_capacity_policy(
             definition,
             concurrency=concurrency,
             control_query_concurrency=control_query_concurrency,
@@ -290,9 +303,10 @@ def endpoint_render_user_service(
 ) -> None:
     """Render a sudo-less systemd user service for a worker endpoint."""
     import clio_relay.cli as cli
+    import clio_relay.cli_cluster_deploy as cli_cluster_deploy
 
     definition = cli._require_cluster(cluster)
-    capacity = cli._resolved_worker_capacity_policy(
+    capacity = cli_cluster_deploy._resolved_worker_capacity_policy(
         definition,
         concurrency=concurrency,
         control_query_concurrency=control_query_concurrency,
