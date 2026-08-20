@@ -519,7 +519,7 @@ def test_bump_dry_run_reports_every_kit_version_site_and_writes_nothing(
 def test_bump_dry_run_reports_no_changes_when_target_equals_current(
     mirrored_root: Path,
 ) -> None:
-    changes = plan_bump(mirrored_root, BumpTargets(relay_version="1.6.6"))
+    changes = plan_bump(mirrored_root, BumpTargets(relay_version="1.6.7"))
     assert changes == ()
 
 

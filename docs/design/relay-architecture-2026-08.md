@@ -993,14 +993,14 @@ literals, `docs/release-gate-1.0.yaml`, `examples/release-gate/report-matrix-1.0
 `docs/release.md`, `docs/release-acceptance-1.0.md`, `README.md`) after four
 dead protected tags (v1.6.1-v1.6.4) each died on a missed site. Three
 distinct families of pin exist today, verified against the current tree
-(`1.6.6`):
+(`1.6.7`):
 
 **Release version** (`pyproject.toml:3`, `src/clio_relay/__init__.py:5` —
-both `"1.6.6"`) plus the mirrored copies `docs/release-gate-1.0.yaml:6`
-(`release_version: "1.6.6"`) and `examples/release-gate/report-matrix-1.0.json:3`
-(`"release_version": "1.6.6"`), each paired with a self-digest
+both `"1.6.7"`) plus the mirrored copies `docs/release-gate-1.0.yaml:6`
+(`release_version: "1.6.7"`) and `examples/release-gate/report-matrix-1.0.json:3`
+(`"release_version": "1.6.7"`), each paired with a self-digest
 (`acceptance_matrix_sha256` / `matrix_sha256`, value
-`affef812c611feb1e8828a61347c824271f859ed3e74a1969247f8c26037b61e`) recorded
+`919d5ef886c23bea9901c99d8d85b341e79a41190bef3210b9ebac0b1448f98d`) recorded
 at `docs/release-gate-1.0.yaml:8`, `examples/release-gate/report-matrix-1.0.json:4`,
 and asserted against in `tests/test_ci_validation.py:1793-1794`.
 
