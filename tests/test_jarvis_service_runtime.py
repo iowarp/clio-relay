@@ -24,9 +24,9 @@ import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
-import clio_relay.service_runtime as service_runtime_module
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
 import clio_relay.service_runtime_core as service_runtime_core_module
+import clio_relay.service_runtime_observation as service_runtime_observation_module
 import clio_relay.service_runtime_readiness as service_runtime_readiness_module
 import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
@@ -3108,7 +3108,10 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
     )
     reverified: list[str] = []
     reverified_settings: list[RelaySettings | None] = []
-    original_reverify = service_runtime_module.reverify_jarvis_service_runtime
+    # #231 class-mixin split: _verified_scheduler_submission (the caller, via
+    # detach/stop) now lives in service_runtime_observation.py, not
+    # service_runtime.py -- patch the symbol where it is looked up.
+    original_reverify = service_runtime_observation_module.reverify_jarvis_service_runtime
 
     def tracked_reverify(**kwargs: Any) -> Any:
         observed = original_reverify(**kwargs)
@@ -3117,7 +3120,7 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
         return observed
 
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_observation_module,
         "reverify_jarvis_service_runtime",
         tracked_reverify,
     )
@@ -3336,8 +3339,11 @@ def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
             raise RelayError("owned API generation is already stopped")
         return verified
 
+    # #231 class-mixin split: _verified_scheduler_submission lives in
+    # service_runtime_observation.py, not service_runtime.py -- patch the
+    # symbol where it is looked up.
     monkeypatch.setattr(
-        service_runtime_module,
+        service_runtime_observation_module,
         "reverify_jarvis_service_runtime",
         stopped_api_then_direct_source,
     )

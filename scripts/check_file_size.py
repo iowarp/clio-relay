@@ -656,7 +656,23 @@ RATCHET_BASELINE: dict[str, int] = {
     # _local_connector_intent -- moved to the new
     # service_runtime_reconciliation.py (732 lines) as
     # `_ServiceRuntimeReconciliationMixin`. 2292 -> 1614.
-    "src/clio_relay/service_runtime.py": 1614,
+    # #231 service-runtime split, slice 18: scheduler/runtime observation and
+    # verification -- _verified_scheduler_submission,
+    # _quiesced_owner_source_recovery_is_authorized,
+    # _observe_allocation_and_health_once (the single-shot, never-blocking
+    # observation core) and its _record_runtime_observation_pending
+    # persister, _retained_scheduler_resource, and the scheduler-polling
+    # primitives -- moved to the new service_runtime_observation.py (673
+    # lines) as `_ServiceRuntimeObservationMixin`. Slice 18b: the shared
+    # desktop-connector stop primitive _stop_local_connector (called from
+    # five other mixins) and its _remove_unpublished_local_connector_files
+    # cleanup split out separately into service_runtime_local_connector.py
+    # (171 lines) as `_ServiceRuntimeLocalConnectorMixin`, since bundling it
+    # with observation would have crossed the 800-line cap. 1614 -> 854.
+    # What remains is imports, module constants, the not-yet-extracted
+    # remote-connector-lifecycle + health-wait cluster, and the class
+    # statement itself.
+    "src/clio_relay/service_runtime.py": 854,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
