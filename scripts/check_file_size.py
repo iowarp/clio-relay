@@ -131,7 +131,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # archive-member filename/size policy (tag/candidate/tag-binding/
     # promotion payload name validators + limits) and the SHA256SUMS
     # checksum-manifest read/write pair.
-    "src/clio_relay/ci_validation.py": 3380,
+    # #231: -405 net lines -- distribution_archive.py becomes the owner for
+    # safe, bounded wheel/sdist inspection (ZIP/tar member reads, path
+    # safety, ZIP64/central-directory preflight, core-metadata identity
+    # binding) assembled into build_distribution_archive_receipt.
+    "src/clio_relay/ci_validation.py": 2975,
     # #231 R6 review fixes: +22 net lines -- F6, `job read-artifact` exits 1
     # on a T2 refusal (is_delivery_refusal) instead of a silent 0 alongside
     # a body that says result_available: false; F5, the shared
