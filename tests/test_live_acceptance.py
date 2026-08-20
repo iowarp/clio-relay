@@ -3534,8 +3534,12 @@ def test_secure_runtime_acceptance_records_exact_v35_browser_and_cleanup_path(
         assert proxy_stopped is True
         revoked_urls.append(url)
 
-    monkeypatch.setattr("clio_relay.live_acceptance._browser_json_observation", browser_json)
-    monkeypatch.setattr("clio_relay.live_acceptance._browser_sse_observation", browser_sse)
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_browser_evidence._browser_json_observation", browser_json
+    )
+    monkeypatch.setattr(
+        "clio_relay.live_acceptance_browser_evidence._browser_sse_observation", browser_sse
+    )
     monkeypatch.setattr(
         "clio_relay.live_acceptance._wait_for_changed_sse_event",
         changed_sse,
