@@ -42,6 +42,8 @@ import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.service_runtime as service_runtime
 import clio_relay.session_api as session_api
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.session_lifecycle_report as session_lifecycle_report
+import clio_relay.session_start_query as session_start_query
 import clio_relay.storage_runtime as storage_runtime
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
@@ -111,11 +113,11 @@ from clio_relay.service_runtime import (
 from clio_relay.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
-    RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
     SessionLifecycleReport,
     session_lifecycle_report_sha256,
 )
+from clio_relay.session_wire_models import RemoteSessionStateEvidence
 from clio_relay.validation_report import (
     EvidenceReference,
     InstallSource,
@@ -185,7 +187,7 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         report: SessionLifecycleReport,
         **_kwargs: object,
     ) -> tuple[SessionLifecycleReport, OwnedSessionRecoveryStatus]:
-        reference, _payload = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        reference, _payload = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report
         )
         generation_id = report.session_generation_id
@@ -2201,7 +2203,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
     report_sha256 = session_lifecycle_report_sha256(report)
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status_calls = 0
@@ -2351,7 +2353,7 @@ def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
         "cancel_scheduler_jobs": False,
     }
     report_sha256 = session_lifecycle_report_sha256(report)
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     finalized_status = OwnedSessionRecoveryStatus(
@@ -2448,7 +2450,7 @@ def test_finalized_cleanup_report_rejects_retry_identity_drift(
     report.cleanup_policy = policy
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status = OwnedSessionRecoveryStatus(
@@ -2549,7 +2551,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     def finalize(**kwargs: object) -> OwnedSessionRecoveryStatus:
         report = cast(SessionLifecycleReport, kwargs["report"])
         finalized_reports.append(report)
-        reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report
         )
         return OwnedSessionRecoveryStatus(
@@ -3196,7 +3198,7 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         ]
     )
     report.resources[0].detail = "large-report-body:" + ("x" * (1100 * 1024))
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     recovery = OwnedSessionRecoveryStatus(
@@ -3563,7 +3565,7 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
 
@@ -3682,7 +3684,7 @@ def test_owner_session_closure_rejects_pending_admission_drift_before_mutation(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     admission: dict[str, object] = {
@@ -3782,7 +3784,7 @@ def test_owner_session_closure_rejects_invalid_closed_evidence_before_mutation(
     }
     report.relay_cancel_requested = False
     report.scheduler_cancel_requested = False
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     closure = (
@@ -3917,7 +3919,7 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
                 observed_state="running",
             )
         )
-    report_reference, _ = session_lifecycle._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report_reference, _ = session_lifecycle_report._coordinator_report_reference(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report
     )
     status = OwnedSessionRecoveryStatus(
@@ -4584,7 +4586,7 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
             start_input_policy=plan.input_policy,
             start_expected_api_release_identity_sha256=release.sha256(),
         )
-        return session_lifecycle._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return session_start_query._session_start_result_from_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             plan=plan,
             status=status,
             transport_deadline_exceeded=True,

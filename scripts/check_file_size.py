@@ -713,7 +713,56 @@ RATCHET_BASELINE: dict[str, int] = {
     # errors.py to keep this minimal; what remains needs the ClusterDefinition
     # and the bounded result in hand, so it cannot move. A justified, minimal
     # ratchet-up.
-    "src/clio_relay/session_lifecycle.py": 7840,
+    # split/session-lifecycle rework (#231, slices A-K): session_lifecycle.py
+    # was 7840 lines at the start of this rework. Slices A-J moved every
+    # bare-imported (cli.py) concern out to owner modules one at a time,
+    # each ratcheted down here in turn; slice K then found that the two
+    # remaining resident clusters (inspect_owned_session_recovery_status +
+    # its private helper, and the SSH-remote-orchestration group) reach
+    # session_lifecycle only through cli.py's MODULE-QUALIFIED attribute
+    # access (`session_lifecycle.inspect_owned_session_recovery_status(...)`),
+    # not a bare import -- and Python resolves a re-exported name off a
+    # module identically to one defined there, so the same
+    # cli.py-compatibility re-export trick used for every bare-imported name
+    # in slices A-J also covers qualified access. Slice K moved
+    # inspect_owned_session_recovery_status (self-contained: no other
+    # resident function was its consumer or dependency) to the new
+    # session_recovery_inspection.py owner and re-exported it the same way.
+    # 3461 -> 1357 -> 582 lines, back under the 800-line default cap --
+    # session_lifecycle.py graduates out of RATCHET_BASELINE. The remaining
+    # SSH-remote-orchestration cluster (start_remote_session,
+    # status_remote_session, start_remote_session_durable,
+    # teardown_remote_session, finalize_remote_session_cleanup_report,
+    # read_remote_session_cleanup_report, detach_remote_session,
+    # publish_owned_session_api_startup_receipt) and cli.py's own
+    # compatibility re-export block are what remain; full slice-by-slice
+    # detail lives in the split/session-lifecycle branch history.
+    # split/session-lifecycle slice J (#231): execute_owned_session_start
+    # alone is ~910 lines of crash-recovery start logic (systemd containment,
+    # broker handoff, resumable-attempt promotion) that does not decompose
+    # along a clean second seam without restructuring the function itself --
+    # out of scope for a mechanical extraction slice. Matches the
+    # queue_management.py/queue_validation.py precedent of a ratcheted,
+    # justified new-file cap above the 800-line default.
+    "src/clio_relay/session_start_execution.py": 1190,
+    # split/session-lifecycle slice J (#231): the failed-start teardown path
+    # (_execute_owned_failed_start_teardown, 243 lines) plus
+    # execute_owned_session_teardown (342 lines) and their three small
+    # private helpers form one cohesive, already-minimal cluster; splitting
+    # execute_owned_session_teardown itself out of its own helper cluster
+    # would separate functions that only ever call each other. 22 lines over
+    # the 800 default.
+    "src/clio_relay/session_cleanup_execution.py": 822,
+    # split/session-lifecycle slice K (#231): inspect_owned_session_recovery_
+    # status is the single dominant read path every recovery/start/teardown
+    # decision in the split verifies against -- durable metadata, process
+    # identity, cluster-registry, and core-admission agreement all have to be
+    # read and cross-checked in one place. It does not decompose along a
+    # clean second seam without restructuring the function itself, out of
+    # scope for a mechanical extraction slice. Matches the
+    # queue_management.py/queue_validation.py precedent of a ratcheted,
+    # justified new-file cap above the 800-line default.
+    "src/clio_relay/session_recovery_inspection.py": 838,
     "src/clio_relay/spool.py": 964,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public

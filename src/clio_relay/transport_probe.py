@@ -28,10 +28,10 @@ from clio_relay.remote_values import render_remote_shell_path, render_remote_she
 from clio_relay.session_lifecycle import (
     SessionLifecycleReport,
     detach_remote_session,
-    plan_remote_session_start,
     start_remote_session_durable,
     teardown_remote_session,
 )
+from clio_relay.session_start_query import plan_remote_session_start
 from clio_relay.session_wire_models import CleanupResource, OwnedSessionStartResult
 from clio_relay.validation_report import (
     TransportCleanupAction,
