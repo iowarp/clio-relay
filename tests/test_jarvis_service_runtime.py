@@ -25,6 +25,7 @@ import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
 import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime as service_runtime_module
+import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
@@ -2230,11 +2231,11 @@ def test_agent_bind_persists_urls_and_rejects_runtime_commands(
         headers: dict[str, str] | None,
         maximum_bytes: int | None,
         deadline: float | None = None,
-    ) -> service_runtime_module._BoundedHttpResponse:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> service_runtime_types_module._BoundedHttpResponse:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         del deadline
         readiness_requests.append((url, headers))
         assert maximum_bytes is None
-        return service_runtime_module._BoundedHttpResponse(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return service_runtime_types_module._BoundedHttpResponse(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             status_code=401 if headers is None else 200,
             headers=httpx.Headers(),
             content=b"",
@@ -3956,7 +3957,7 @@ def test_jarvis_bind_preserves_and_resumes_allocation_connector_after_lost_start
             )
         if "__CLIO_WRITE_ALLOCATION_FRPC__" in script:
             events.append("start-side-effect")
-            raise service_runtime_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            raise service_runtime_types_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 "lost allocation connector start response"
             )
         _session, intent, connector, step = allocation_context()

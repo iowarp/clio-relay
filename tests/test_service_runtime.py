@@ -29,6 +29,7 @@ from typer.testing import CliRunner
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime as service_runtime
 import clio_relay.service_runtime_primitives as service_runtime_primitives
+import clio_relay.service_runtime_types as service_runtime_types
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import cli as relay_cli
 from clio_relay.cli import app
@@ -49,12 +50,14 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
 )
 from clio_relay.service_runtime import (
-    CommandRunner,
-    LocalConnectorIdentity,
     ServiceRuntimePendingResult,
     ServiceRuntimeStartResult,
     ServiceRuntimeStopResult,
     ServiceRuntimeSupervisor,
+)
+from clio_relay.service_runtime_types import (
+    CommandRunner,
+    LocalConnectorIdentity,
 )
 from clio_relay.session_lifecycle import CleanupResource
 from clio_relay.validation_report import (
@@ -696,7 +699,7 @@ class LifecycleFrpRunner(FakeRunner):
         process = next((item for item in self.frp_processes if item.pid == pid), None)
         if process is None or process.returncode is not None:
             return None
-        return service_runtime._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return service_runtime_types._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             pid=process.pid,
             process_group_id=process.pid,
             process_start_marker=f"start-{process.pid}",
@@ -3912,7 +3915,7 @@ def test_windows_connector_discovery_rejects_invalid_process_identity(
 def test_local_connector_pid_reuse_is_not_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed = service_runtime._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = service_runtime_types._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pid=555,
         process_group_id=555,
         process_start_marker="new-start",
@@ -4197,7 +4200,7 @@ def test_remote_pidfd_helpers_fall_back_and_preserve_errno(
 def test_windows_connector_pid_reuse_is_not_authorized_by_descendant_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed = service_runtime._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = service_runtime_types._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pid=555,
         process_group_id=555,
         process_start_marker="new-start",
@@ -4238,7 +4241,7 @@ def test_windows_connector_pid_reuse_is_not_authorized_by_descendant_scan(
 def test_local_connector_token_mismatch_is_not_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed = service_runtime._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = service_runtime_types._ObservedLocalProcess(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pid=555,
         process_group_id=555,
         process_start_marker="same-start",

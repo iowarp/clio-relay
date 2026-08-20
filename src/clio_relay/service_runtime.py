@@ -24,13 +24,14 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import httpx
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from clio_relay import service_runtime_primitives as _primitives
+from clio_relay import service_runtime_types as _types
 from clio_relay.browser_gateway import (
     CAPABILITY_ENV,
     UPSTREAM_AUTHORIZATION_ENV,
@@ -156,142 +157,6 @@ _ACTIVE_RUNTIME_STATES = {
 _CANCELED_RUNTIME_STATES = {"canceled", "cancelled"}
 
 
-class _DefinitiveRuntimeObservationError(RelayError):
-    """An observation that proves this runtime cannot safely become ready."""
-
-
-class _AmbiguousRemoteSideEffectError(RelayError):
-    """A remote command may have completed after its transport observation was lost."""
-
-
-class _DefinitiveSubmissionReconciliationError(RelayError):
-    """An exact submission sidecar proves that its submission cannot be resumed."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        evidence: dict[str, object],
-        failure_kind: Literal[
-            "command_failure",
-            "integrity_failure",
-            "response_invalid",
-        ],
-    ) -> None:
-        super().__init__(message)
-        self.evidence = evidence
-        self.failure_kind = failure_kind
-
-    @property
-    def queue_state(self) -> str:
-        """Return a queue state that does not overclaim scheduler disposition."""
-        return {
-            "command_failure": "submission_failed",
-            "integrity_failure": "submission_integrity_failed",
-            "response_invalid": "submission_response_invalid",
-        }[self.failure_kind]
-
-    @property
-    def scheduler_submission_outcome(self) -> str:
-        """Describe only what the durable evidence proves about submission."""
-        return {
-            "command_failure": "submit_command_failed",
-            "integrity_failure": "unknown_due_to_integrity_failure",
-            "response_invalid": "unknown_due_to_invalid_response",
-        }[self.failure_kind]
-
-
-@dataclass(frozen=True)
-class LocalConnectorIdentity:
-    """Immutable identity captured for an owned desktop connector process group."""
-
-    pid: int
-    process_group_id: int
-    process_start_marker: str
-    owner_token: str
-
-
-@dataclass(frozen=True)
-class _BoundedHttpResponse:
-    """Response metadata plus an optional fully consumed, caller-bounded body."""
-
-    status_code: int
-    headers: httpx.Headers
-    content: bytes
-
-
-@dataclass
-class _BoundedHttpReadState:
-    """Cross-thread state for one absolute-deadline HTTP response read."""
-
-    result: _BoundedHttpResponse | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True)
-class _ObservedLocalProcess:
-    pid: int
-    process_group_id: int
-    process_start_marker: str
-    command_line: str
-    environment: bytes | None
-
-
-@dataclass(frozen=True)
-class _VerifiedSchedulerSubmission:
-    """Scheduler identity proven against the relay-created remote sidecar."""
-
-    provider: str
-    scheduler_job_id: str
-    spec: ServiceRuntimeSpec
-
-
-@dataclass(frozen=True)
-class _DurableSchedulerContract:
-    """Scheduler identity or explicit absence proven by durable gateway state."""
-
-    provider: str
-    scheduler_job_id: str | None
-    unresolved_submission: bool = False
-
-
-class CommandRunner(Protocol):
-    """Protocol for local command execution used by the supervisor."""
-
-    def run(
-        self,
-        command: Sequence[str],
-        *,
-        input_text: str | None = None,
-        timeout_seconds: float | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        """Run a command and return the completed process."""
-        ...
-
-    def popen(
-        self,
-        command: Sequence[str],
-        *,
-        stdout_path: Path,
-        stderr_path: Path,
-        env: dict[str, str] | None = None,
-        isolate_process_group: bool = False,
-        input_bytes: bytes | None = None,
-    ) -> subprocess.Popen[bytes]:
-        """Start a long-running local process."""
-        ...
-
-    def local_process_identity(
-        self,
-        *,
-        pid: int,
-        owner_token: str,
-        expected_config: str,
-    ) -> LocalConnectorIdentity:
-        """Capture and verify immutable process identity after launch."""
-        ...
-
-
 class SubprocessCommandRunner:
     """Command runner backed by subprocess."""
 
@@ -370,7 +235,7 @@ class SubprocessCommandRunner:
         pid: int,
         owner_token: str,
         expected_config: str,
-    ) -> LocalConnectorIdentity:
+    ) -> _types.LocalConnectorIdentity:
         """Capture and verify immutable process identity after launch."""
         return _capture_local_connector_identity(
             pid=pid,
@@ -1101,7 +966,7 @@ class ServiceRuntimeSupervisor:
         definition: ClusterDefinition,
         token: str,
         secret_key: str,
-        runner: CommandRunner | None = None,
+        runner: _types.CommandRunner | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.settings = settings
@@ -1221,7 +1086,7 @@ class ServiceRuntimeSupervisor:
                         submission_marker=submission_marker,
                     )
                 )
-            except _AmbiguousRemoteSideEffectError as exc:
+            except _types._AmbiguousRemoteSideEffectError as exc:
                 pending = self._record_runtime_observation_pending(
                     self.queue.get_gateway_session(session.session_id),
                     node=None,
@@ -1406,7 +1271,7 @@ class ServiceRuntimeSupervisor:
                 submission.scheduler_job_id,
                 initial_service_host=session.node,
             )
-        except _DefinitiveRuntimeObservationError as exc:
+        except _types._DefinitiveRuntimeObservationError as exc:
             self._rollback_runtime_start(
                 session_id=session_id,
                 error=exc,
@@ -1480,7 +1345,7 @@ class ServiceRuntimeSupervisor:
                         proxy_name=proxy_name,
                         ownership_intent=remote_intent,
                     )
-                except _AmbiguousRemoteSideEffectError as exc:
+                except _types._AmbiguousRemoteSideEffectError as exc:
                     latest = self.queue.get_gateway_session(session.session_id)
                     pending = self._record_runtime_observation_pending(
                         latest,
@@ -2262,7 +2127,7 @@ class ServiceRuntimeSupervisor:
                     allocation_provider=verified.binding.scheduler_provider,
                     allocation_job_id=verified.binding.scheduler_native_id,
                 )
-            except _AmbiguousRemoteSideEffectError as exc:
+            except _types._AmbiguousRemoteSideEffectError as exc:
                 latest = self.queue.get_gateway_session(session.session_id)
                 pending = self._record_runtime_observation_pending(
                     latest,
@@ -2292,7 +2157,7 @@ class ServiceRuntimeSupervisor:
                     SchedulerPhase.FAILED,
                     SchedulerPhase.CANCELED,
                 }:
-                    definitive = _DefinitiveRuntimeObservationError(
+                    definitive = _types._DefinitiveRuntimeObservationError(
                         "scheduler job reached a terminal state before its verified JARVIS "
                         "service could be bound: "
                         f"job={verified.binding.scheduler_native_id} "
@@ -2397,7 +2262,7 @@ class ServiceRuntimeSupervisor:
                 authorization=authorization,
                 max_attempts=1,
             )
-        except _DefinitiveRuntimeObservationError as exc:
+        except _types._DefinitiveRuntimeObservationError as exc:
             self._rollback_jarvis_binding(session_id=session_id, error=exc)
             raise
         except RelayError as exc:
@@ -3867,7 +3732,7 @@ class ServiceRuntimeSupervisor:
                         authorization=service_authorization,
                         max_attempts=1,
                     )
-            except _DefinitiveRuntimeObservationError as exc:
+            except _types._DefinitiveRuntimeObservationError as exc:
                 self._rollback_jarvis_binding(session_id=session_id, error=exc)
                 raise
             except RelayError as exc:
@@ -4659,7 +4524,7 @@ class ServiceRuntimeSupervisor:
         transport = _primitives._object(gateway.get("transport", {}))
         changed = False
         scheduler_job_id = session.scheduler_job_id
-        definitive_submission_failure: _DefinitiveSubmissionReconciliationError | None = None
+        definitive_submission_failure: _types._DefinitiveSubmissionReconciliationError | None = None
 
         scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         if scheduler_job_id is None and scheduler_intent.get("state") == "recorded":
@@ -4706,7 +4571,7 @@ class ServiceRuntimeSupervisor:
                             else "scheduler submission sidecar failed integrity verification"
                         )
                         failure_kind: Literal["integrity_failure"] = "integrity_failure"
-                        raise _DefinitiveSubmissionReconciliationError(
+                        raise _types._DefinitiveSubmissionReconciliationError(
                             message,
                             evidence=_submission_reconciliation_failure_evidence(
                                 session_id=session.session_id,
@@ -4728,7 +4593,7 @@ class ServiceRuntimeSupervisor:
                             or record.get("submission_marker") != submission_marker
                         ):
                             message = "scheduler submission sidecar identity is invalid"
-                            raise _DefinitiveSubmissionReconciliationError(
+                            raise _types._DefinitiveSubmissionReconciliationError(
                                 message,
                                 evidence=_submission_reconciliation_failure_evidence(
                                     session_id=session.session_id,
@@ -4744,7 +4609,7 @@ class ServiceRuntimeSupervisor:
                         returncode = record.get("returncode")
                         if isinstance(returncode, bool) or not isinstance(returncode, int):
                             message = "scheduler submission sidecar return code is invalid"
-                            raise _DefinitiveSubmissionReconciliationError(
+                            raise _types._DefinitiveSubmissionReconciliationError(
                                 message,
                                 evidence=_submission_reconciliation_failure_evidence(
                                     session_id=session.session_id,
@@ -4762,7 +4627,7 @@ class ServiceRuntimeSupervisor:
                                 "scheduler submission command completed unsuccessfully: "
                                 f"returncode={returncode}"
                             )
-                            raise _DefinitiveSubmissionReconciliationError(
+                            raise _types._DefinitiveSubmissionReconciliationError(
                                 message,
                                 evidence=_submission_reconciliation_failure_evidence(
                                     session_id=session.session_id,
@@ -4777,7 +4642,7 @@ class ServiceRuntimeSupervisor:
                             )
                         if not isinstance(output, str):
                             message = "scheduler submission sidecar output is invalid"
-                            raise _DefinitiveSubmissionReconciliationError(
+                            raise _types._DefinitiveSubmissionReconciliationError(
                                 message,
                                 evidence=_submission_reconciliation_failure_evidence(
                                     session_id=session.session_id,
@@ -4794,7 +4659,7 @@ class ServiceRuntimeSupervisor:
                             submission = _parse_runtime_submission(output)
                         except RelayError as exc:
                             message = f"scheduler submission sidecar output is invalid: {exc}"
-                            raise _DefinitiveSubmissionReconciliationError(
+                            raise _types._DefinitiveSubmissionReconciliationError(
                                 message,
                                 evidence=_submission_reconciliation_failure_evidence(
                                     session_id=session.session_id,
@@ -4818,7 +4683,7 @@ class ServiceRuntimeSupervisor:
                         )
                         gateway["submit_output"] = output.strip()
                         changed = True
-                except _DefinitiveSubmissionReconciliationError as exc:
+                except _types._DefinitiveSubmissionReconciliationError as exc:
                     failed_intent = dict(scheduler_intent)
                     failed_intent["reconciliation_error"] = str(exc)
                     failed_intent["reconciliation_outcome"] = "definitive_failure"
@@ -5174,7 +5039,7 @@ class ServiceRuntimeSupervisor:
         session: GatewaySession,
         *,
         allow_quiesced_owner_source_recovery: bool = False,
-    ) -> _VerifiedSchedulerSubmission:
+    ) -> _types._VerifiedSchedulerSubmission:
         """Prove the exact provider and job ID from the relay-created remote sidecar."""
         scheduler_job_id = _primitives._optional_str(session.scheduler_job_id)
         if scheduler_job_id is None:
@@ -5224,7 +5089,7 @@ class ServiceRuntimeSupervisor:
                 raise RelayError(
                     "scheduler identity disagrees with the verified JARVIS runtime binding"
                 )
-            return _VerifiedSchedulerSubmission(
+            return _types._VerifiedSchedulerSubmission(
                 provider=binding.scheduler_provider,
                 scheduler_job_id=binding.scheduler_native_id,
                 spec=spec,
@@ -5296,7 +5161,7 @@ class ServiceRuntimeSupervisor:
         submission = _parse_runtime_submission(output)
         if submission.scheduler_job_id != scheduler_job_id:
             raise RelayError("scheduler job identity disagrees with the anchored submission output")
-        return _VerifiedSchedulerSubmission(
+        return _types._VerifiedSchedulerSubmission(
             provider=canonical_provider,
             scheduler_job_id=scheduler_job_id,
             spec=spec,
@@ -5521,7 +5386,7 @@ class ServiceRuntimeSupervisor:
         if provider_status is not None:
             provider_state = provider_status.phase.value
             if provider_state in _TERMINAL_RUNTIME_STATES:
-                raise _DefinitiveRuntimeObservationError(
+                raise _types._DefinitiveRuntimeObservationError(
                     "scheduler job reached a terminal state before the service became ready: "
                     f"job={scheduler_job_id} state={provider_state}"
                 )
@@ -5612,7 +5477,7 @@ class ServiceRuntimeSupervisor:
             scheduler_state.strip().lower() if scheduler_state else "unknown"
         )
         if normalized_scheduler_state in _TERMINAL_RUNTIME_STATES:
-            raise _DefinitiveRuntimeObservationError(
+            raise _types._DefinitiveRuntimeObservationError(
                 "scheduler job reached a terminal state before the service became ready: "
                 f"job={scheduler_job_id} state={normalized_scheduler_state}"
             )
@@ -6523,16 +6388,18 @@ class ServiceRuntimeSupervisor:
         """Prove the versioned JARVIS HTTP authorization boundary is live."""
         if runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
             if authorization is not None:
-                raise _DefinitiveRuntimeObservationError(
+                raise _types._DefinitiveRuntimeObservationError(
                     "legacy JARVIS service runtime unexpectedly resolved authorization"
                 )
         elif runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V2:
             if authorization is None:
-                raise _DefinitiveRuntimeObservationError(
+                raise _types._DefinitiveRuntimeObservationError(
                     "authenticated JARVIS service runtime omitted authorization"
                 )
         else:
-            raise _DefinitiveRuntimeObservationError("JARVIS service runtime schema is unsupported")
+            raise _types._DefinitiveRuntimeObservationError(
+                "JARVIS service runtime schema is unsupported"
+            )
         deadline = time.monotonic() + timeout_seconds
         last_error = "no response"
         attempts = 0
@@ -6551,7 +6418,7 @@ class ServiceRuntimeSupervisor:
                     last_error = f"legacy anonymous health status={anonymous.status_code}"
                 else:
                     if 200 <= anonymous.status_code < 300:
-                        raise _DefinitiveRuntimeObservationError(
+                        raise _types._DefinitiveRuntimeObservationError(
                             "authenticated JARVIS service health accepted an anonymous request"
                         )
                     if anonymous.status_code != 401:
@@ -6566,7 +6433,7 @@ class ServiceRuntimeSupervisor:
                         if 200 <= authenticated.status_code < 300:
                             return
                         if authenticated.status_code in {401, 403}:
-                            raise _DefinitiveRuntimeObservationError(
+                            raise _types._DefinitiveRuntimeObservationError(
                                 "authenticated JARVIS service rejected its verified authority"
                             )
                         last_error = f"authenticated health status={authenticated.status_code}"
@@ -6734,14 +6601,14 @@ class ServiceRuntimeSupervisor:
                 timeout_seconds=_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
-            raise _AmbiguousRemoteSideEffectError(
+            raise _types._AmbiguousRemoteSideEffectError(
                 "remote service runtime command timed out after "
                 f"{_REMOTE_RUNTIME_COMMAND_TIMEOUT_SECONDS:g} seconds"
             ) from exc
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             if result.returncode == 255:
-                raise _AmbiguousRemoteSideEffectError(
+                raise _types._AmbiguousRemoteSideEffectError(
                     f"remote service runtime transport failed: {detail}"
                 )
             raise RelayError(f"remote service runtime command failed: {detail}")
@@ -6754,7 +6621,7 @@ def _read_bounded_http_response(
     headers: dict[str, str] | None,
     maximum_bytes: int | None,
     deadline: float | None = None,
-) -> _BoundedHttpResponse:
+) -> _types._BoundedHttpResponse:
     """Read headers and, when requested, a bounded body by one absolute deadline."""
 
     if maximum_bytes is not None and maximum_bytes <= 0:
@@ -6764,7 +6631,7 @@ def _read_bounded_http_response(
     if remaining <= 0:
         raise httpx.TimeoutException("HTTP response total deadline expired before connection")
 
-    state = _BoundedHttpReadState()
+    state = _types._BoundedHttpReadState()
     cancelled = threading.Event()
     completed = threading.Event()
     client = _new_readiness_http_client(remaining)
@@ -6773,7 +6640,7 @@ def _read_bounded_http_response(
         try:
             with client.stream("GET", url, headers=headers) as response:
                 if maximum_bytes is None:
-                    state.result = _BoundedHttpResponse(
+                    state.result = _types._BoundedHttpResponse(
                         status_code=response.status_code,
                         headers=httpx.Headers(response.headers),
                         content=b"",
@@ -6800,7 +6667,7 @@ def _read_bounded_http_response(
                     content.extend(chunk)
                 if cancelled.is_set():
                     return
-                state.result = _BoundedHttpResponse(
+                state.result = _types._BoundedHttpResponse(
                     status_code=response.status_code,
                     headers=httpx.Headers(response.headers),
                     content=bytes(content),
@@ -8186,7 +8053,7 @@ def _validated_durable_scheduler_contract(
     session: GatewaySession,
     *,
     strict: bool = True,
-) -> _DurableSchedulerContract:
+) -> _types._DurableSchedulerContract:
     """Cross-check scheduler identity or explicit absence across durable records."""
     try:
         spec = ServiceRuntimeSpec.model_validate(session.gateway.get("runtime_spec"))
@@ -8213,14 +8080,14 @@ def _validated_durable_scheduler_contract(
             raise RelayError(
                 "scheduler job identity disagrees between the gateway and JARVIS runtime binding"
             )
-        return _DurableSchedulerContract(
+        return _types._DurableSchedulerContract(
             provider=expected_provider,
             scheduler_job_id=scheduler_job_id,
         )
 
-    def unresolved_or_known() -> _DurableSchedulerContract:
+    def unresolved_or_known() -> _types._DurableSchedulerContract:
         scheduler_job_id = _primitives._optional_str(session.scheduler_job_id)
-        return _DurableSchedulerContract(
+        return _types._DurableSchedulerContract(
             provider=session.scheduler,
             scheduler_job_id=scheduler_job_id,
             unresolved_submission=scheduler_job_id is None,
@@ -8257,7 +8124,7 @@ def _validated_durable_scheduler_contract(
             raise RelayError(
                 "gateway scheduler job identity contradicts an explicit absence intent"
             )
-        return _DurableSchedulerContract(
+        return _types._DurableSchedulerContract(
             provider=session.scheduler,
             scheduler_job_id=None,
         )
@@ -8276,7 +8143,7 @@ def _validated_durable_scheduler_contract(
             if not strict:
                 return unresolved_or_known()
             raise RelayError("starting scheduler submission intent has inconsistent identity")
-        return _DurableSchedulerContract(
+        return _types._DurableSchedulerContract(
             provider=session.scheduler,
             scheduler_job_id=None,
             unresolved_submission=True,
@@ -8289,7 +8156,7 @@ def _validated_durable_scheduler_contract(
             raise RelayError(
                 "scheduler job identity disagrees between the gateway and submission intent"
             )
-        return _DurableSchedulerContract(
+        return _types._DurableSchedulerContract(
             provider=session.scheduler,
             scheduler_job_id=intent_job_id,
         )
@@ -8766,7 +8633,7 @@ def _discover_local_connector(
         if status == "owned":
             return sidecar, False
 
-    observed_matches: list[_ObservedLocalProcess] = []
+    observed_matches: list[_types._ObservedLocalProcess] = []
     observation_errors: list[str] = []
     for pid in _local_process_ids(
         command_markers=(owner_token, generation_id, config_path),
@@ -8905,7 +8772,7 @@ def _capture_local_connector_identity(
     pid: int,
     owner_token: str,
     expected_config: str,
-) -> LocalConnectorIdentity:
+) -> _types.LocalConnectorIdentity:
     deadline = time.time() + 5
     last_detail = "process did not appear"
     while time.time() < deadline:
@@ -8920,7 +8787,7 @@ def _capture_local_connector_identity(
             expected_process_group_id=pid,
         )
         if owned:
-            return LocalConnectorIdentity(
+            return _types.LocalConnectorIdentity(
                 pid=pid,
                 process_group_id=observed.process_group_id,
                 process_start_marker=observed.process_start_marker,
@@ -9084,7 +8951,7 @@ def _windows_connector_descendants(*, pid: int, expected_config: str) -> list[in
 
 
 def _observed_connector_matches(
-    observed: _ObservedLocalProcess,
+    observed: _types._ObservedLocalProcess,
     *,
     owner_token: str,
     expected_config: str,
@@ -9116,7 +8983,7 @@ def _command_contains_path(command_line: str, expected_path: str) -> bool:
     )
 
 
-def _observe_local_process(pid: int) -> _ObservedLocalProcess | None:
+def _observe_local_process(pid: int) -> _types._ObservedLocalProcess | None:
     if pid <= 0:
         return None
     if os.name == "nt":
@@ -9138,7 +9005,7 @@ def _observe_local_process(pid: int) -> _ObservedLocalProcess | None:
         return None
     except (OSError, IndexError) as exc:
         raise RelayError(f"cannot observe local connector candidate {pid}: {exc}") from exc
-    return _ObservedLocalProcess(
+    return _types._ObservedLocalProcess(
         pid=pid,
         process_group_id=process_group_id,
         process_start_marker=stat_fields[19],
@@ -9147,7 +9014,7 @@ def _observe_local_process(pid: int) -> _ObservedLocalProcess | None:
     )
 
 
-def _observe_windows_process(pid: int) -> _ObservedLocalProcess | None:
+def _observe_windows_process(pid: int) -> _types._ObservedLocalProcess | None:
     command = (
         f"$cim = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; "
         "if ($null -eq $cim) { exit 3 }; "
@@ -9178,7 +9045,7 @@ def _observe_windows_process(pid: int) -> _ObservedLocalProcess | None:
     start_marker = payload.get("start_marker")
     if not isinstance(command_line, str) or not isinstance(start_marker, str):
         raise RelayError(f"local Windows connector candidate {pid} lacks identity fields")
-    return _ObservedLocalProcess(
+    return _types._ObservedLocalProcess(
         pid=pid,
         process_group_id=pid,
         process_start_marker=start_marker,

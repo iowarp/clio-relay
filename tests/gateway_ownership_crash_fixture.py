@@ -16,10 +16,12 @@ from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import ServiceRuntimeSpec
 from clio_relay.service_runtime import (
-    CommandRunner,
-    LocalConnectorIdentity,
     ServiceRuntimeSupervisor,
     _capture_local_connector_identity,  # pyright: ignore[reportPrivateUsage]
+)
+from clio_relay.service_runtime_types import (
+    CommandRunner,
+    LocalConnectorIdentity,
 )
 
 
