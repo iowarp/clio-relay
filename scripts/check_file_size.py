@@ -997,7 +997,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # mcp_server_module.is_virtual_jarvis_tool directly (not a monkeypatch, a
     # plain attribute access), and it lost its only bare in-file caller
     # (`_tool_definitions_and_remote_catalog`) to this same slice.
-    "src/clio_relay/mcp_server.py": 4049,
+    #
+    # split/mcp-server-w3 slice 5 (#231): the relay-queue MCP tools
+    # (_queue_cancel_tool, _queue_list_tool, _queue_diagnose_tool,
+    # _queue_stale_tool, _queue_cleanup_stale_tool, _worker_status_tool,
+    # plus their two purely-internal helpers _queue_tool_target /
+    # _queue_route_result) move to mcp_queue_tools.py. Two names on their
+    # remote branch (`should_execute_on_cluster`, `OwnedSessionApiClient`)
+    # are directly monkeypatched by tests, and three more (`_owned_json`,
+    # `_remote_json`, `_validate_owned_job_status`) stay defined in
+    # mcp_server.py itself -- both go through the `_mcp_server.<name>`
+    # function-scope back-reference established in slices 3/4.
+    # `_queue_tool_target`/`_queue_route_result` use neither, so the six
+    # tool functions' calls into them stay bare, same-module references.
+    # mcp_server.py re-exports the six dispatcher-reached tool functions
+    # (mcp_dispatch.py's `_call_tool` reaches them only through the
+    # `_mcp_server.<name>` back-reference too); the two internal helpers
+    # need no re-export since nothing outside this module calls them.
+    "src/clio_relay/mcp_server.py": 3647,
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
