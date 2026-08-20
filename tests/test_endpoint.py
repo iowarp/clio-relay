@@ -22,6 +22,7 @@ from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
 from clio_relay import (
+    endpoint_execution_sidecar_cleanup,
     endpoint_jarvis_recovery,
     endpoint_runtime_sidecar_anchor,
     endpoint_sidecar_types,
@@ -1260,7 +1261,7 @@ def test_execution_sidecar_quarantine_name_is_bounded_on_long_spool_paths(
         anchor_metadata,
         task_id="long-path-sidecar",
     )
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     assert len(quarantine.name) == 47
     assert len(quarantine.name) <= len(source.name)
@@ -1293,7 +1294,7 @@ def test_execution_sidecar_quarantine_restarts_beyond_windows_max_path(
         "restart-evidence",
         encoding="utf-8",
     )
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     first = private._remove_execution_sidecars(
         [source],
@@ -1365,7 +1366,7 @@ def test_sidecar_quarantine_never_replaces_existing_evidence(tmp_path: Path) -> 
     sidecar = spool / ".runtime-no-replace.jsonl"
     anchor = private._precreate_runtime_sidecar(sidecar)
     sidecar.write_text("owned", encoding="utf-8")
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
     quarantine.write_text("hostile", encoding="utf-8")
     if os.name != "nt":
         quarantine.chmod(0o600)
@@ -1396,7 +1397,7 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
     anchor = private._precreate_runtime_sidecar(sidecar)
     sidecar.write_text("anchored", encoding="utf-8")
     moved_anchor = spool / ".runtime-race.anchored"
-    original_rename = private._rename_noreplace_at
+    original_rename = endpoint_execution_sidecar_cleanup._rename_noreplace_at
 
     def swap_before_rename(directory_fd: int, source_name: str, quarantine_name: str) -> None:
         sidecar.rename(moved_anchor)
@@ -1404,8 +1405,12 @@ def test_posix_source_swap_during_quarantine_retains_every_inode(
         sidecar.chmod(0o600)
         original_rename(directory_fd, source_name, quarantine_name)
 
-    monkeypatch.setattr(endpoint_module, "_rename_noreplace_at", swap_before_rename)
-    quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+    monkeypatch.setattr(
+        endpoint_execution_sidecar_cleanup,
+        "_rename_noreplace_at",
+        swap_before_rename,
+    )
+    quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(anchor)
 
     with pytest.raises(ConfigurationError, match="identity or permissions changed"):
         private._remove_execution_sidecars(
@@ -1579,7 +1584,9 @@ def test_windows_repeated_quarantine_creates_only_exact_directory_entries(
             anchor_metadata,
             task_id=f"windows-repeat-{iteration}",
         )
-        quarantine = spool / private._execution_sidecar_quarantine_name(anchor)
+        quarantine = spool / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(
+            anchor
+        )
 
         result = private._remove_execution_sidecars(
             [source],
@@ -1639,8 +1646,14 @@ def test_windows_repeated_quarantine_restart_acknowledgment_is_exact(
             runtime_anchor_metadata,
             task_id=task.task_id,
         )
-        progress_quarantine = spool / private._execution_sidecar_quarantine_name(progress_anchor)
-        runtime_quarantine = spool / private._execution_sidecar_quarantine_name(runtime_anchor)
+        progress_quarantine = (
+            spool
+            / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(progress_anchor)
+        )
+        runtime_quarantine = (
+            spool
+            / endpoint_runtime_sidecar_anchor._execution_sidecar_quarantine_name(runtime_anchor)
+        )
         queue.register_execution_cleanup(
             task.task_id,
             {

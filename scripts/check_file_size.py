@@ -395,7 +395,25 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_trusted_jarvis_mcp_route` now resolves in
     # `endpoint_jarvis_recovery`'s own globals, not endpoint.py's, so the
     # old patch target went dead. Net: 7604 -> 7135.
-    "src/clio_relay/endpoint.py": 7135,
+    # #231 endpoint split, slice 7: -372 net lines -- cross-platform
+    # execution-sidecar quarantine orchestration (the durable cleanup-plan/
+    # quarantine-path-restore/acknowledgment builders, the Linux
+    # renameat2(RENAME_NOREPLACE) primitive, the cross-platform
+    # _remove_execution_sidecars orchestrator, and anchor-descriptor
+    # release) moves to the new owner module
+    # `endpoint_execution_sidecar_cleanup.py` (426 lines). Only
+    # `_remove_execution_sidecars` keeps a remaining `EndpointWorker` call
+    # site; the other five functions (plus `_execution_sidecar_quarantine_
+    # name`/`_validate_runtime_sidecar_stat` on the already-extracted
+    # `endpoint_runtime_sidecar_anchor.py`, and
+    # `_remove_execution_sidecars_windows` on `endpoint_windows_sidecar_
+    # handles.py`) drop out of endpoint.py's own imports entirely, taking
+    # the now-dead `ctypes`/`errno`/`stat` imports and two schema constants
+    # with them. test_endpoint.py's seven direct
+    # `_execution_sidecar_quarantine_name` calls and one `_rename_noreplace_
+    # at` monkeypatch/direct-call pair re-point to the new modules per the
+    # same rule slice 3/4/6 established. Net: 7135 -> 6763.
+    "src/clio_relay/endpoint.py": 6763,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
