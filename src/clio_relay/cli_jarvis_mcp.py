@@ -591,20 +591,23 @@ def jarvis_mcp_refresh(
 ) -> None:
     """Refresh the verified JARVIS contract and pre-launch artifact binding."""
     import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
 
     definition = cli._require_cluster(cluster)
 
     def action() -> None:
         queue = cli._managed_queue_from_env()
         queue.initialize()
-        job_id, result, artifacts, artifact_payload = cli._run_jarvis_remote_contract_discovery(
-            cluster=cluster,
-            definition=definition,
-            queue=queue,
-            wait_timeout_seconds=wait_timeout_seconds,
-            poll_seconds=poll_seconds,
+        job_id, result, artifacts, artifact_payload = (
+            cli_jarvis_remote_contract._run_jarvis_remote_contract_discovery(
+                cluster=cluster,
+                definition=definition,
+                queue=queue,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
         )
-        entry, binding = cli._persist_jarvis_remote_contract_discovery(
+        entry, binding = cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(
             cluster=cluster,
             discovery_job_id=job_id,
             result=result,

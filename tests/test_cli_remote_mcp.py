@@ -6,15 +6,19 @@ result_artifact``/``_read_local_mcp_result_artifact``'s extraction into
 ``src/clio_relay/cli_remote_mcp.py`` (that module's own docstring names
 these as "exclusive helpers moved with their only caller"). Neither test
 drives ``CliRunner``; both call the moved function directly to prove the
-shared duplicate-artifact ambiguity guard (``cli._artifact_record``, which
-stays cli.py-resident) still fires through the relocated wrapper. The
-``monkeypatch.setattr(cli, "_remote_artifact_records", ...)``/
-``monkeypatch.setattr(cli, "_complete_local_artifact_records", ...)`` calls
-below are unchanged from the original -- those two collaborators stay
-cli.py-resident (the JARVIS execution-query engine still calls them), and
-``cli_remote_mcp.py`` reaches them via a function-local
-``import clio_relay.cli as cli`` module-attribute lookup, so patching the
-``cli`` module directly is still the correct seam.
+shared duplicate-artifact ambiguity guard (``cli_jarvis_artifact_io.
+_artifact_record``) still fires through the relocated wrapper.
+
+Updated for the #231 wave-2 (session start/teardown + JARVIS
+execution-query engine) extraction: ``_remote_artifact_records`` and
+``_complete_local_artifact_records`` moved off cli.py to
+``cli_jarvis_artifact_io.py``/``cli_remote_collection_pagination.py``
+alongside the rest of the JARVIS engine, so the
+``monkeypatch.setattr(...)`` calls below target those owner modules
+directly, and ``cli_remote_mcp.py`` reaches them the same way (a
+function-local ``import clio_relay.cli_jarvis_artifact_io as
+cli_jarvis_artifact_io`` module-attribute lookup) rather than through
+``cli.py``.
 
 The bulk of ``remote-mcp`` command coverage (register/unregister/list/
 reload/refresh/validate) lives in ``tests/test_remote_mcp.py`` (a different
@@ -30,7 +34,8 @@ from pathlib import Path
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
-import clio_relay.cli as cli
+import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 import clio_relay.cli_remote_mcp as cli_remote_mcp
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.core_queue import ClioCoreQueue
@@ -64,7 +69,7 @@ def test_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
             {"artifact_id": "artifact-retry", "kind": "mcp_result"},
         ]
 
-    monkeypatch.setattr(cli, "_remote_artifact_records", duplicate_results)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_remote_artifact_records", duplicate_results)
 
     with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
         cli_remote_mcp._read_remote_mcp_result_artifact(  # noqa: SLF001
@@ -89,7 +94,9 @@ def test_local_jarvis_discovery_rejects_ambiguous_mcp_result_artifacts(
             {"artifact_id": "artifact-retry", "kind": "mcp_result"},
         ]
 
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", duplicate_results)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_complete_local_artifact_records", duplicate_results
+    )
 
     with pytest.raises(RelayError, match="durable artifact authority is ambiguous"):
         cli_remote_mcp._read_local_mcp_result_artifact(  # noqa: SLF001

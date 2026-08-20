@@ -22,6 +22,28 @@ from click import unstyle
 from filelock import FileLock
 from typer.testing import CliRunner
 
+import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
+import clio_relay.cli_cleanup_report as cli_cleanup_report
+import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
+import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
+import clio_relay.cli_jarvis_intent_checkpoint as cli_jarvis_intent_checkpoint
+import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
+import clio_relay.cli_jarvis_pending_report as cli_jarvis_pending_report
+import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
+import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
+import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.cli_owned_report_artifact as cli_owned_report_artifact
+import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
+import clio_relay.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
+import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.cli_session_start as cli_session_start
+import clio_relay.cli_session_teardown as cli_session_teardown
 import clio_relay.cluster_config as cluster_config
 import clio_relay.installation as installation_module
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
@@ -104,7 +126,7 @@ from clio_relay.validation_report import (
 )
 
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
-    cli._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_session_teardown._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 
 
@@ -207,7 +229,7 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         finalized_statuses[report.session_id] = status
         return report, status
 
-    real_recovery_status = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    real_recovery_status = cli_owned_session_recovery._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def recover_preserved_report(**kwargs: object) -> OwnedSessionRecoveryStatus:
         session_id = cast(str, kwargs["session_id"])
@@ -260,11 +282,13 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         )
 
     monkeypatch.setattr(
-        cli,
+        cli_session_teardown,
         "_persist_verified_cleanup_report_before_closure",
         preserve_verified_report,
     )
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recover_preserved_report)
+    monkeypatch.setattr(
+        cli_owned_session_recovery, "_owned_session_recovery_status", recover_preserved_report
+    )
 
 
 def _write_test_cluster(
@@ -624,7 +648,7 @@ def test_decode_artifact_envelope_reports_a_delivery_refusal_by_its_own_message(
     }
 
     with pytest.raises(RelayError, match="artifact_content_too_large.*transfer limit"):
-        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_artifact_io._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             envelope
         )
 
@@ -634,7 +658,7 @@ def test_decode_artifact_envelope_still_rejects_a_genuinely_malformed_envelope()
     refusal) must still raise the original, distinct complaint.
     """
     with pytest.raises(RelayError, match="must use base64 encoding"):
-        cli._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_artifact_io._decode_artifact_envelope(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             {"encoding": "raw"}
         )
 
@@ -686,7 +710,9 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_run_remote_clio)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
+        cli_session_start,
+        "_verify_session_start_worker_release_identity",
+        accept_worker_compatibility,
     )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
@@ -885,7 +911,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
 
     if closed_admission_drift:
         with pytest.raises(RelayError, match="admission evidence"):
-            cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 definition=ClusterDefinition(name="ares", ssh_host="ares"),
                 cluster="ares",
                 session_id="session-1",
@@ -894,7 +920,7 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
         assert local_mutations == 0
         return
 
-    cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
         session_id="session-1",
@@ -1095,7 +1121,7 @@ def test_finalized_cleanup_report_rejects_retry_identity_drift(
         )
 
     with pytest.raises(RelayError, match=expected_error):
-        cli._verified_finalized_cleanup_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_report._verified_finalized_cleanup_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             status,
             report=selected_report,
             cluster="ares",
@@ -1120,10 +1146,14 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", _fake_no_worker_observation
+    )
+    monkeypatch.setattr(
+        cli_session_teardown,
         "_persist_verified_cleanup_report_before_closure",
         _REAL_PERSIST_VERIFIED_CLEANUP_REPORT,
     )
@@ -1180,7 +1210,7 @@ def test_session_teardown_never_closes_before_finalized_sidecar_reread(
 
     monkeypatch.setattr(session_lifecycle, "finalize_remote_session_cleanup_report", finalize)
     monkeypatch.setattr(session_lifecycle, "read_remote_session_cleanup_report", read_report)
-    monkeypatch.setattr(cli, "_mark_owner_session_closed", forbid_closure)
+    monkeypatch.setattr(cli_owned_session_recovery, "_mark_owner_session_closed", forbid_closure)
 
     result = CliRunner().invoke(
         app,
@@ -1212,11 +1242,11 @@ def test_local_cleanup_report_artifact_is_chunked_reused_and_bounded_on_replacem
     report.resources[0].detail = "x" * (9 * 1024 * 1024)
     validation_path = tmp_path / "cleanup.json"
 
-    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
-    second = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    second = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -1232,7 +1262,7 @@ def test_local_cleanup_report_artifact_is_chunked_reused_and_bounded_on_replacem
 
     replacement = report.model_copy(deep=True)
     replacement.resources[0].detail = "y" * (9 * 1024 * 1024)
-    replaced = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    replaced = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         replacement,
         validation_report_path=validation_path,
     )
@@ -1259,7 +1289,7 @@ def test_local_cleanup_report_artifact_is_globally_bounded_across_report_parents
         report = _verified_teardown_report()
         report.cleanup_operation_id = f"cleanup-global-{index}"
         report.resources[0].detail = f"generation-{index}:" + (str(index) * 4096)
-        artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=tmp_path / f"report-parent-{index}" / "cleanup.json",
         )
@@ -1268,16 +1298,16 @@ def test_local_cleanup_report_artifact_is_globally_bounded_across_report_parents
 
     roots = {artifact.manifest_path.parent for artifact in artifacts}
     assert roots == {
-        cli._cleanup_evidence_state_parent() / "cleanup-evidence-v1"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent() / "cleanup-evidence-v1"  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     }
     retained = list(artifacts[-1].manifest_path.parent.iterdir())
     retained_names = {path.name for path in retained}
     assert artifacts[0].manifest_path.name not in retained_names
     assert artifacts[1].manifest_path.name in retained_names
     assert artifacts[2].manifest_path.name in retained_names
-    assert len(retained) <= cli.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES - 1
+    assert len(retained) <= cli_owned_report_artifact.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_ENTRIES - 1
     assert sum(path.stat().st_size for path in retained) <= (
-        cli.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES
+        cli_owned_report_artifact.MAX_LOCAL_CLEANUP_REPORT_ARTIFACT_STORED_BYTES
     )
 
 
@@ -1293,18 +1323,18 @@ def test_cleanup_evidence_state_parent_rejects_cwd_relative_install_receipt(
 
     monkeypatch.chdir(first)
     with pytest.raises(ConfigurationError, match="must be an absolute path"):
-        cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     monkeypatch.chdir(second)
     with pytest.raises(ConfigurationError, match="must be an absolute path"):
-        cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
     tmp_path: Path,
 ) -> None:
-    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock = cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-state"
     try:
         if os.name == "nt":
@@ -1315,7 +1345,7 @@ def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
         parent.rename(displaced)
         parent.mkdir(mode=0o700)
         with pytest.raises(RelayError, match="lock identity changed|validation parent"):
-            cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 _verified_teardown_report(),
                 validation_report_path=tmp_path / "report.json",
                 evidence_lock=lock,
@@ -1323,7 +1353,7 @@ def test_cleanup_artifact_parent_swap_after_lock_has_zero_replacement_mutation(
         assert list(parent.iterdir()) == []
         assert {path.name for path in displaced.iterdir()} == {lock.path.name}
     finally:
-        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
@@ -1332,10 +1362,10 @@ def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
 ) -> None:
     if os.name != "nt":
         return
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-lock-parent"
     rename_errors: list[OSError] = []
-    original = cli._open_windows_pinned_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original = cli_cleanup_evidence._open_windows_pinned_directory  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def try_swap_after_pin(*args: object, **kwargs: object) -> object:
         anchor = original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
@@ -1346,14 +1376,14 @@ def test_windows_cleanup_lock_guard_blocks_parent_swap_before_lock_open(
             rename_errors.append(exc)
         return anchor
 
-    monkeypatch.setattr(cli, "_open_windows_pinned_directory", try_swap_after_pin)
-    lock = cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(cli_cleanup_evidence, "_open_windows_pinned_directory", try_swap_after_pin)
+    lock = cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     try:
         assert rename_errors
         assert not displaced.exists()
         assert {path.name for path in parent.iterdir()} == {lock.path.name}
     finally:
-        cli._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._release_cleanup_evidence_lock(lock)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_windows_parent_guard_blocks_rename_and_auto_deletes(
@@ -1382,7 +1412,7 @@ def test_windows_cleanup_lock_swap_before_guard_creation_leaves_replacement_empt
 ) -> None:
     if os.name != "nt":
         return
-    parent = cli._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    parent = cli_cleanup_evidence._cleanup_evidence_state_parent()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     displaced = tmp_path / "displaced-before-guard"
     original = cluster_config.acquire_private_configuration_windows_parent_guard
 
@@ -1398,7 +1428,7 @@ def test_windows_cleanup_lock_swap_before_guard_creation_leaves_replacement_empt
         swap_then_guard,
     )
     with pytest.raises(RelayError, match="changed while pinning"):
-        cli._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_cleanup_evidence._acquire_cleanup_evidence_lock()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert list(parent.iterdir()) == []
     assert list(displaced.iterdir()) == []
@@ -1412,7 +1442,7 @@ def test_windows_cleanup_artifact_guard_blocks_child_swap_before_pending_write(
         return
     seed = _verified_teardown_report()
     seed.cleanup_operation_id = "cleanup-child-guard-seed"
-    first = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         seed,
         validation_report_path=tmp_path / "seed.json",
     )
@@ -1438,7 +1468,7 @@ def test_windows_cleanup_artifact_guard_blocks_child_swap_before_pending_write(
     replacement.cleanup_operation_id = "cleanup-child-guard-replacement"
     replacement.resources[0].detail = "replacement"
 
-    result = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         replacement,
         validation_report_path=tmp_path / "replacement.json",
     )
@@ -1458,13 +1488,13 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
     validation_path = tmp_path / "cleanup.json"
     report = _verified_teardown_report()
     report.cleanup_operation_id = "cleanup-prior-one"
-    cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
     prior = report.model_copy(deep=True)
     prior.cleanup_operation_id = "cleanup-prior-two"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         prior,
         validation_report_path=validation_path,
     )
@@ -1482,7 +1512,7 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
     replacement.cleanup_operation_id = "cleanup-prior-three"
 
     with pytest.raises(RelayError, match="report artifact .* inconsistent"):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             replacement,
             validation_report_path=validation_path,
         )
@@ -1491,12 +1521,12 @@ def test_local_cleanup_report_artifact_rejects_consistently_tampered_prior_repor
 @pytest.mark.parametrize("delta", [-1, 0, 1])
 def test_cleanup_public_json_boundary_is_byte_exact(delta: int) -> None:
     empty = cli._public_json({"detail": ""})  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    target = cli.MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES + delta
+    target = cli_cleanup_report.MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES + delta
     payload = {"detail": "x" * (target - len(empty.encode("utf-8")))}
     serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert len(serialized.encode("utf-8")) == target
-    bounded = cli._bounded_cleanup_public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    bounded = cli_cleanup_report._bounded_cleanup_public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert (bounded is not None) is (delta < 0)
 
 
@@ -1505,7 +1535,7 @@ def test_cleanup_public_json_bound_counts_non_ascii_encoding() -> None:
     serialized = cli._public_json(payload)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     assert "\\u03c0" in serialized
-    assert cli._bounded_cleanup_public_json(payload) == serialized  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert cli_cleanup_report._bounded_cleanup_public_json(payload) == serialized  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 @pytest.mark.parametrize("candidate_kind", ["chunk", "manifest"])
@@ -1520,7 +1550,7 @@ def test_local_cleanup_report_artifact_recovers_partial_pending_write(
     validation_path = tmp_path / f"{candidate_kind}.json"
     seed = report.model_copy(deep=True)
     seed.cleanup_operation_id = f"cleanup-partial-seed-{candidate_kind}"
-    seed_artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    seed_artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         seed,
         validation_report_path=tmp_path / "seed" / "cleanup.json",
     )
@@ -1531,7 +1561,7 @@ def test_local_cleanup_report_artifact_recovers_partial_pending_write(
     if os.name == "posix":
         pending.chmod(0o600)
 
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -1547,7 +1577,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     report = _verified_teardown_report()
     report.cleanup_operation_id = "cleanup-linked-window"
     validation_path = tmp_path / "linked.json"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -1555,7 +1585,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     pending = chunk.with_name(f".{chunk.name}.pending")
 
     os.link(chunk, pending)
-    recovered = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    recovered = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -1567,7 +1597,7 @@ def test_local_cleanup_report_artifact_validates_link_window_before_unlink(
     chunk.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
     os.link(chunk, pending)
     with pytest.raises(RelayError, match="linked file differs"):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=validation_path,
         )
@@ -1583,7 +1613,7 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
     report = _verified_teardown_report()
     report.cleanup_operation_id = f"cleanup-{alias_kind}"
     validation_path = tmp_path / f"{alias_kind}.json"
-    artifact = cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifact = cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         validation_report_path=validation_path,
     )
@@ -1621,7 +1651,7 @@ def test_local_cleanup_report_artifact_rejects_external_aliases(
             "cannot be opened safely"
         ),
     ):
-        cli._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_report_artifact._persist_local_cleanup_report_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             validation_report_path=validation_path,
         )
@@ -1655,7 +1685,9 @@ def test_normal_session_teardown_uses_compact_projection_for_large_report(
         return report
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", teardown)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", _fake_no_worker_observation)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", _fake_no_worker_observation
+    )
     validation_path = tmp_path / "large-normal.json"
 
     result = CliRunner().invoke(
@@ -1868,13 +1900,17 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
         "status_remote_session",
         stopped_status,
     )
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
     monkeypatch.setattr(
-        cli,
+        cli_owned_session_recovery, "_owned_session_recovery_status", recovered_status
+    )
+    monkeypatch.setattr(
+        cli_owned_relay_jobs,
         "_owner_session_admission_status",
         read_authoritative_admission,
     )
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", no_worker_observation)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", no_worker_observation
+    )
     report_reads: list[OwnedSessionRecoveryStatus] = []
 
     def read_report(**kwargs: object) -> SessionLifecycleReport:
@@ -1900,8 +1936,10 @@ def test_session_teardown_reuses_finalized_report_before_rediscovery(
     def forbid_finalization(**_kwargs: object) -> object:
         return forbidden("report finalization")
 
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", forbid_jobs)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbid_gateways)
+    monkeypatch.setattr(cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", forbid_jobs)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", forbid_gateways
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbid_teardown)
     monkeypatch.setattr(
         session_lifecycle, "finalize_remote_session_cleanup_report", forbid_finalization
@@ -2093,7 +2131,7 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
     monkeypatch.setattr(remote_cli, "run_remote_clio", forbidden_remote)
 
     with pytest.raises(RelayError, match="reference is not exact"):
-        cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
             session_id="session-1",
@@ -2197,7 +2235,7 @@ def test_local_owner_session_closure_replay_is_read_only_after_split_failure(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", fail_first_mirror_close)
 
     def mark_closed(finalized_recovery: OwnedSessionRecoveryStatus) -> None:
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=queue,
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -2336,7 +2374,7 @@ def test_owner_session_closure_rejects_pending_admission_drift_before_mutation(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
 
     with pytest.raises(RelayError, match="admission evidence|immutable cleanup intent"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=ClioCoreQueue(tmp_path / "core"),
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -2431,7 +2469,7 @@ def test_owner_session_closure_rejects_invalid_closed_evidence_before_mutation(
     monkeypatch.setattr(ClioCoreQueue, "set_owner_session_closed", forbidden_local)
 
     with pytest.raises(RelayError, match="admission closure evidence|admission evidence"):
-        cli._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._mark_owner_session_closed(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             queue=ClioCoreQueue(tmp_path / "core"),
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
@@ -2562,7 +2600,7 @@ def test_session_start_rejects_invalid_finalized_cleanup_before_closure(
     monkeypatch.setattr(remote_cli, "run_remote_clio", forbidden_remote)
 
     with pytest.raises(RelayError, match="connector evidence|scheduler disposition"):
-        cli._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             definition=ClusterDefinition(name="ares", ssh_host="ares"),
             cluster="ares",
             session_id="session-1",
@@ -2617,7 +2655,7 @@ def test_owned_session_recovery_waits_for_late_start_metadata(
     def recover() -> None:
         try:
             observed.append(
-                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     cluster="ares",
                     session_id="late-session",
                     core_dir=tmp_path / "core",
@@ -2680,7 +2718,7 @@ def test_owned_session_recovery_waits_for_late_transition_lock_creation(
     def recover() -> None:
         try:
             observed.append(
-                cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                     cluster="ares",
                     session_id="late-session",
                     core_dir=tmp_path / "core",
@@ -2727,7 +2765,7 @@ def test_owned_session_recovery_fails_closed_when_transition_never_materializes(
     )
 
     with pytest.raises(RelayError, match="delayed remote start cannot be ruled out"):
-        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             session_id="late-session",
             core_dir=tmp_path / "core",
@@ -2754,7 +2792,7 @@ def test_owned_session_recovery_refuses_symlinked_transition_lock(
     monkeypatch.setattr(Path, "lstat", symlinked_lock_lstat)
 
     with pytest.raises(RelayError, match="transition lock is not a regular file"):
-        cli._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             session_id="late-session",
             core_dir=tmp_path / "core",
@@ -2788,7 +2826,9 @@ def test_cli_session_start_does_not_reopen_intake_when_process_start_fails(
     monkeypatch.setattr(session_lifecycle, "start_remote_session", fail_start)
     monkeypatch.setattr(remote_cli, "run_remote_clio", record_remote)
     monkeypatch.setattr(
-        cli, "_verify_session_start_worker_release_identity", accept_worker_compatibility
+        cli_session_start,
+        "_verify_session_start_worker_release_identity",
+        accept_worker_compatibility,
     )
 
     result = CliRunner().invoke(
@@ -2838,7 +2878,7 @@ def test_cli_session_start_rejects_incompatible_worker_before_remote_mutation(
         )
 
     monkeypatch.setattr(installation_module, "installation_info", lambda: local_installation)
-    monkeypatch.setattr(cli, "_remote_worker_info", remote_worker_info)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", remote_worker_info)
     monkeypatch.setattr(session_lifecycle, "start_remote_session", record_start)
 
     result = CliRunner().invoke(
@@ -2902,10 +2942,10 @@ def test_cli_session_start_verifies_exact_worker_inside_lock_before_mutation(
 
     monkeypatch.setattr(cli, "_session_transition_lock", transition_lock)
     monkeypatch.setattr(installation_module, "installation_info", local_info)
-    monkeypatch.setattr(cli, "_remote_worker_info", remote_info)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", remote_info)
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -2957,7 +2997,7 @@ def test_cli_session_start_fresh_session_proceeds_after_uninitialized_cleanup_pr
         return _start_receipt(kwargs, generation_id="generation-fresh")
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
@@ -2999,12 +3039,12 @@ def test_cli_session_start_returns_self_contained_current_selector(
 
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -3096,12 +3136,12 @@ def test_cli_session_start_nonready_handle_exits_two_and_is_unusable(
         )
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_finalize_completed_cleanup_receipt_before_start",
         _fake_no_completed_cleanup,
     )
@@ -3163,11 +3203,13 @@ def test_cli_session_start_rejects_stale_plan_before_cleanup_mutation(
         return release
 
     monkeypatch.setattr(
-        cli,
+        cli_session_start,
         "_verify_session_start_worker_release_identity",
         verify_worker_compatibility,
     )
-    monkeypatch.setattr(cli, "_finalize_completed_cleanup_receipt_before_start", finalize)
+    monkeypatch.setattr(
+        cli_session_start, "_finalize_completed_cleanup_receipt_before_start", finalize
+    )
     monkeypatch.setattr(session_lifecycle, "start_remote_session", start)
     result = CliRunner().invoke(
         app,
@@ -3272,7 +3314,9 @@ def test_cli_session_teardown_requires_connectors_for_each_gateway(
             }
         ]
 
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", gateway_without_connectors)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", gateway_without_connectors
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3305,7 +3349,9 @@ def test_cli_session_teardown_retries_same_policy_after_closure(
     )
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3336,7 +3382,7 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_ARTIFACT_SHA256", "a" * 64)
     queue = ClioCoreQueue(core_dir)
     _activate_owner_session(queue)
-    kept_job = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    kept_job = cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job_id="job-kept",
         relay_state=JobState.SUCCEEDED,
         scheduler_job_ids=("21958",),
@@ -3371,12 +3417,20 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", list_owned_jobs)
-    monkeypatch.setattr(cli, "_scheduler_phase_after_operation", running_scheduler_job)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
-    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", list_owned_jobs)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_scheduler_phase_after_operation", running_scheduler_job
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", timed_out_worker_observation
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_cancel_owned_scheduler_jobs", forbid_cancellation
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3467,7 +3521,9 @@ def test_cli_session_teardown_cleans_jarvis_gateway_before_stopping_owned_api(
         return _verified_teardown_report()
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", clean_jarvis_gateway)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", clean_jarvis_gateway
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", stop_owned_api)
 
     result = CliRunner().invoke(
@@ -3507,8 +3563,12 @@ def test_cli_session_teardown_failure_preserves_stopped_api_evidence(
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_list_owned_active_cluster_jobs", fail_after_api_stop)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", record_gateway_cleanup)
+    monkeypatch.setattr(
+        cli_owned_relay_jobs, "_list_owned_active_cluster_jobs", fail_after_api_stop
+    )
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", record_gateway_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3599,9 +3659,11 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         "teardown_remote_session",
         _fake_verified_teardown,
     )
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(
+        cli_owned_relay_jobs,
         "_list_remote_owned_active_cluster_jobs",
         _fake_empty_owned_jobs,
     )
@@ -3677,14 +3739,18 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         del observed_worker_info
         raise AssertionError("cleanup without an artifact digest must not claim worker identity")
 
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", forbid_worker_verification)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", forbid_worker_verification
+    )
 
     def observe_no_worker(
         _definition: ClusterDefinition,
     ) -> tuple[None, None]:
         return None, None
 
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", observe_no_worker
+    )
 
     report_path = tmp_path / "remote-teardown.json"
     result = CliRunner().invoke(
@@ -3996,13 +4062,13 @@ def test_cli_session_teardown_failure_writes_canonical_report(
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", fail_teardown)
     monkeypatch.setattr(
-        cli,
+        cli_remote_worker_attach,
         "_observe_worker_before_cleanup",
         _fake_no_worker_observation,
     )
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(
-        cli,
+        cli_owned_runtime_cleanup,
         "_cleanup_owned_runtime_sessions",
         _fake_empty_runtime_cleanup,
     )
@@ -4188,11 +4254,13 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
         recovery_calls.append("initial")
         return recovery
 
-    recover_after_finalization = cli._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    recover_after_finalization = cli_owned_session_recovery._owned_session_recovery_status  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     recovery_calls: list[str] = []
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", dead_status)
-    monkeypatch.setattr(cli, "_owned_session_recovery_status", recovered_status)
+    monkeypatch.setattr(
+        cli_owned_session_recovery, "_owned_session_recovery_status", recovered_status
+    )
 
     def verified_teardown(**kwargs: object) -> SessionLifecycleReport:
         teardown_calls.append(kwargs)
@@ -4217,10 +4285,16 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
         write_report(report, path)
 
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_cancel_local_owned_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_cancel_owned_scheduler_jobs", forbid_cancellation)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", observe_no_worker)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(cli_owned_relay_jobs, "_cancel_local_owned_jobs", forbid_cancellation)
+    monkeypatch.setattr(
+        cli_owned_scheduler_cancel, "_cancel_owned_scheduler_jobs", forbid_cancellation
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", observe_no_worker
+    )
     monkeypatch.setattr(validation_report, "write_validation_report", capture_report)
 
     result = CliRunner().invoke(
@@ -4471,7 +4545,9 @@ def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup
+    )
     monkeypatch.setattr(time, "sleep", acknowledge_after_poll)
 
     result = CliRunner().invoke(
@@ -4562,7 +4638,9 @@ def test_cli_session_teardown_does_not_stop_runtime_before_cancel_acknowledgment
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     _activate_owner_session(queue)
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_runtime_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", forbidden_runtime_cleanup
+    )
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbidden_teardown)
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", advance_clock)
@@ -4920,7 +4998,7 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", forbidden_provider)
     jobs = [
-        cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             job_id="relay-owned",
             relay_state=JobState.RUNNING,
             scheduler_job_ids=("owned-123",),
@@ -4932,7 +5010,7 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
 
     for conflicting_id in ("owned-123", "untrusted-456"):
         with pytest.raises(RelayError, match="no scheduler cancellation was attempted"):
-            cli._preflight_scheduler_sentinels(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_owned_scheduler_cancel._preflight_scheduler_sentinels(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 ClusterDefinition(
                     name="ares",
                     ssh_host="ares",
@@ -5054,7 +5132,7 @@ def test_scheduler_sentinel_rejects_unsafe_post_cancel_phase(
         return UnsafeScheduler()
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", unsafe_provider)
-    resources, errors = cli._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources, errors = cli_owned_scheduler_cancel._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="ares", ssh_host="ares", scheduler_provider="slurm"),
         {"unrelated-sentinel": "running"},
     )
@@ -5203,7 +5281,7 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
         return CompletingScheduler()
 
     monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", completing_provider)
-    scheduler_resource, error = cli._cancel_owned_scheduler_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    scheduler_resource, error = cli_owned_scheduler_cancel._cancel_owned_scheduler_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="local", ssh_host="localhost", scheduler_provider="slurm"),
         "scheduler-1",
         relay_job_id="relay-1",
@@ -5236,7 +5314,7 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
         "cancel_scheduler_jobs": True,
     }
 
-    cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         session_id="session-1",
         session_generation_id="generation-1",
@@ -5273,7 +5351,7 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
         },
     }
 
-    owned = cli._owned_relay_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    owned = cli_owned_relay_jobs._owned_relay_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job,
         [task],
         scheduler_provider="slurm",
@@ -5281,7 +5359,7 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
 
     assert owned.scheduler_job_ids == ()
     assert owned.unowned_scheduler_job_ids == ("untrusted-123",)
-    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources = cli_owned_scheduler_cancel._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         [owned],
         definition=ClusterDefinition(
             name="ares",
@@ -5303,7 +5381,7 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
 ) -> None:
     """Default teardown succeeds when an owned job naturally leaves the active queue."""
 
-    owned = cli._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    owned = cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         job_id="relay-1",
         relay_state=JobState.SUCCEEDED,
         scheduler_job_ids=("21947",),
@@ -5318,11 +5396,11 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
         return "missing", None
 
     monkeypatch.setattr(
-        cli,
+        cli_owned_scheduler_cancel,
         "_scheduler_phase_after_operation",
         missing_phase,
     )
-    resources = cli._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    resources = cli_owned_scheduler_cancel._owned_job_cleanup_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         [owned],
         definition=ClusterDefinition(
             name="ares",
@@ -5337,7 +5415,7 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
         resources=[*_verified_teardown_report().resources, *resources]
     )
 
-    cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         session_id="session-1",
         session_generation_id="generation-1",
@@ -5400,7 +5478,7 @@ def test_scheduler_phase_batch_uses_one_remote_command(
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", remote_statuses)
 
-    observed = cli._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observed = cli_owned_scheduler_cancel._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         (("slurm", "101"), ("slurm", "102")),
     )
@@ -5467,7 +5545,7 @@ def test_owner_session_teardown_rejects_cancellation_under_keep_policy(
     report = _verified_teardown_report(resources=resources)
 
     with pytest.raises(RelayError, match=error_match):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -5490,7 +5568,7 @@ def test_owner_session_teardown_rejects_unknown_or_duplicate_cleanup_resources()
     unknown_report = _verified_teardown_report(resources=[*base.resources, unknown])
 
     with pytest.raises(RelayError, match="unknown cleanup resource kinds"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             unknown_report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -5501,7 +5579,7 @@ def test_owner_session_teardown_rejects_unknown_or_duplicate_cleanup_resources()
         resources=[*base.resources, base.resources[-1].model_copy()]
     )
     with pytest.raises(RelayError, match="duplicate cleanup resources"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             duplicate_report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -5515,7 +5593,7 @@ def test_owner_session_teardown_rejects_report_flags_that_drift_from_policy() ->
     report.relay_cancel_requested = True
 
     with pytest.raises(RelayError, match="relay-job disposition did not match cleanup policy"):
-        cli._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owner_session_teardown_verify._verify_owner_session_teardown(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             session_id="session-1",
             session_generation_id="generation-1",
@@ -5681,13 +5759,13 @@ def test_remote_owned_job_discovery_never_cancels_unrelated_session(
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_remote)
 
-    jobs = cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "ares",
         owner_session_id="session-1",
         owner_session_generation_id="generation-1",
     )
-    canceled = cli._cancel_remote_owned_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    canceled = cli_owned_relay_jobs._cancel_remote_owned_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "ares",
         jobs,
@@ -5728,7 +5806,7 @@ def test_remote_owner_session_discovery_refuses_truncated_legacy_coverage(
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
 
     with pytest.raises(RelayError, match="bounded source limit"):
-        cli._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             ClusterDefinition(name="ares", ssh_host="ares"),
             "ares",
             owner_session_id="session-1",
@@ -5808,7 +5886,7 @@ def test_owned_runtime_cleanup_scans_remote_gateway_core(
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_remote)
 
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=definition,
         owner_session_id="session-1",
@@ -5864,7 +5942,7 @@ def test_owned_runtime_cleanup_refuses_gateway_without_exact_generation(
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", forbidden_stop)
 
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         owner_session_id="session-1",
@@ -5952,7 +6030,7 @@ def test_owned_runtime_cleanup_rescans_for_late_exact_generation_gateway(
         raise AssertionError(args)
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
-    reports = cli._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=definition,
         owner_session_id="session-1",
@@ -6194,7 +6272,7 @@ def test_ssh_host_key_fingerprints_prefers_all_configured_known_hosts_files(
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    fingerprints = cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "operator-alias"
     )
 
@@ -6258,7 +6336,7 @@ def test_ssh_host_key_fingerprints_resolves_alias_and_falls_back_to_keyscan(
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    fingerprints = cli._ssh_host_key_fingerprints("ares")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_host_key_fingerprints("ares")  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     digest = base64.b64encode(hashlib.sha256(key_bytes).digest()).decode().rstrip("=")
     assert fingerprints == [f"SHA256:{digest}"]
@@ -6297,7 +6375,7 @@ def test_ssh_host_key_fingerprints_bounds_known_hosts_and_scan_timeouts(
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     with pytest.raises(ConfigurationError, match="ssh-keygen timed out") as captured:
-        cli._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_probe._ssh_host_key_fingerprints(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             "generic-target"
         )
 
@@ -6320,7 +6398,7 @@ def test_ssh_host_key_fingerprint_parser_rejects_revoked_and_malformed_records()
     trusted_key = b"trusted-ca-key"
     trusted = base64.b64encode(trusted_key).decode()
 
-    fingerprints = cli._ssh_fingerprints_from_key_lines(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    fingerprints = cli_remote_worker_probe._ssh_fingerprints_from_key_lines(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         "\n".join(
             [
                 f"@revoked host.example ssh-ed25519 {revoked}",
@@ -6385,9 +6463,11 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
     def fake_host_key_fingerprints(_host: str) -> list[str]:
         return ["SHA256:operator-pinned-fingerprint"]
 
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_host_key_fingerprints
+    )
 
-    info = cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    info = cli_remote_worker_probe._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     target = cast(dict[str, object], info["target_identity"])
     assert target["verified"] is True
@@ -6397,7 +6477,7 @@ def test_remote_worker_info_binds_worker_to_operator_pinned_physical_target(
 
     target_scheduler_provider[0] = "external"
     with pytest.raises(ConfigurationError, match="physical target scheduler provider"):
-        cli._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_probe._remote_worker_info(definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
 def test_remote_worker_info_threads_cluster_pinned_receipt_path(
@@ -6451,10 +6531,12 @@ def test_remote_worker_info_threads_cluster_pinned_receipt_path(
         return ["SHA256:operator-pinned-fingerprint"]
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_run_remote_clio)
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_host_key_fingerprints)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_host_key_fingerprints
+    )
 
-    cli._remote_worker_info(pinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    cli._remote_worker_info(unpinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_remote_worker_probe._remote_worker_info(pinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_remote_worker_probe._remote_worker_info(unpinned_definition)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     worker_info_calls = [call for call in observed_arguments if call[1] == "worker-info"]
     assert worker_info_calls[0] == [
@@ -6515,9 +6597,9 @@ def test_remote_worker_info_uses_one_total_observation_deadline(
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
     monkeypatch.setattr(remote_cli, "remote_command_timeout", fake_timeout)
-    monkeypatch.setattr(cli, "_ssh_host_key_fingerprints", fake_fingerprints)
+    monkeypatch.setattr(cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_fingerprints)
 
-    info = cli._remote_worker_info(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    info = cli_remote_worker_probe._remote_worker_info(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         timeout_seconds=20,
     )
@@ -6543,8 +6625,8 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
         observations.append(timeout_seconds)
         raise RelayError("remote worker identity observation timed out")
 
-    monkeypatch.setattr(cli, "_remote_worker_info", timed_out_worker_info)
-    observed_info, observation_error = cli._observe_worker_before_cleanup(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", timed_out_worker_info)
+    observed_info, observation_error = cli_remote_worker_attach._observe_worker_before_cleanup(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition
     )
     report = new_live_validation_report(scenario="cleanup", cluster="ares")
@@ -6555,7 +6637,7 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
     report_path = tmp_path / "bounded-cleanup-report.json"
 
     with pytest.raises(RelayError, match="identity observation timed out"):
-        cli._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_attach._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             definition,
             report_path,
@@ -6563,7 +6645,7 @@ def test_cleanup_worker_observation_is_bounded_and_never_retried_after_cleanup(
             worker_observation_error=observation_error,
         )
 
-    assert observations == [cli.REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS]
+    assert observations == [cli_remote_worker_attach.REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS]
     saved = json.loads(report_path.read_text(encoding="utf-8"))
     assert saved["status"] == "failed"
     assert saved["completed_at"] is not None
@@ -6595,10 +6677,12 @@ def test_cleanup_with_artifact_digest_keeps_worker_identity_verification_strict(
         del observed_worker_info
         raise ConfigurationError("remote worker wheel SHA-256 does not match")
 
-    monkeypatch.setattr(cli, "_attach_verified_remote_worker", reject_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", reject_worker_identity
+    )
 
     with pytest.raises(ConfigurationError, match="wheel SHA-256 does not match"):
-        cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_attach._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             ClusterDefinition(name="ares", ssh_host="ares"),
             report_path,
@@ -6626,7 +6710,7 @@ def test_cleanup_with_artifact_digest_records_optional_worker_observation_failur
     report_path = tmp_path / "optional-worker-observation.json"
     observation_error = RelayError("remote command timed out after 20 seconds: ares")
 
-    provenance_warning = cli._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    provenance_warning = cli_remote_worker_attach._write_cleanup_validation_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         ClusterDefinition(name="ares", ssh_host="ares"),
         report_path,
@@ -6682,10 +6766,10 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
         return artifacts
 
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_mcp_response_job_id", response_job_id)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_mcp_response_job_id", response_job_id)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
     monkeypatch.setattr(
-        cli,
+        cli_remote_collection_pagination,
         "_wait_for_local_job_terminal",
         wait_for_local_terminal,
     )
@@ -6693,7 +6777,9 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
         {"artifact_id": "artifact-result", "kind": "mcp_result"},
         {"artifact_id": "artifact-provenance", "kind": "provenance"},
     ]
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", complete_artifacts)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_complete_local_artifact_records", complete_artifacts
+    )
 
     def read_artifact(
         _queue: ClioCoreQueue,
@@ -6703,9 +6789,9 @@ def test_jarvis_package_search_query_uses_bounded_virtual_call(
     ) -> dict[str, object]:
         return {"kind": kind}
 
-    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_artifact)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_local_json_artifact_kind", read_artifact)
 
-    result = cli._run_jarvis_package_search_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_package_search._run_jarvis_package_search_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=ClioCoreQueue(tmp_path / "core"),
@@ -6795,7 +6881,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
 
     assert artifact_payload != compact_payload
 
-    entry, binding = cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+    entry, binding = cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
         cluster="ares",
         discovery_job_id="job_discovery",
         result=result,
@@ -6817,7 +6903,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
     unmarked.pop("expected_jarvis_cd_lock_binding")
     unmarked_payload = (json.dumps(unmarked, indent=2) + "\n").encode()
     with pytest.raises(RelayError, match="did not enforce the relay JARVIS-CD lock pin"):
-        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+        cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             discovery_job_id="job_unmarked",
             result=unmarked,
@@ -6833,7 +6919,7 @@ def test_jarvis_discovery_persists_exact_durable_artifact_bytes(
 
     mismatched_payload = unmarked_payload
     with pytest.raises(RelayError, match="did not match its durable mcp_result artifact"):
-        cli._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
+        cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(  # pyright: ignore[reportPrivateUsage]
             cluster="ares",
             discovery_job_id="job_mismatched_payload",
             result=result,
@@ -6967,15 +7053,17 @@ def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
     monkeypatch.setattr(
-        cli,
+        cli_remote_collection_pagination,
         "_wait_for_local_job_terminal",
         wait_for_local_terminal,
     )
-    monkeypatch.setattr(cli, "_complete_local_artifact_records", artifacts)
-    monkeypatch.setattr(cli, "_read_local_json_artifact_kind", read_result)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_complete_local_artifact_records", artifacts
+    )
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_local_json_artifact_kind", read_result)
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -6988,7 +7076,7 @@ def test_post_run_execution_query_polls_progress_then_requests_artifacts_once(
 
     assert ["artifacts" in arguments for arguments in calls] == [False, False, True]
     assert all(0 < value <= 60 for value in timeout_values)
-    assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert result.call_job_id == "job-query-3"
     assert [item["state"] for item in result.lifecycle_observations] == [
         "running",
@@ -7052,9 +7140,9 @@ def test_post_run_execution_query_returns_exact_resumable_nonterminal_snapshot(
         }
     }
 
-    def execute_query(**kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         calls.append(cast(dict[str, object], kwargs["arguments"]))
-        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session=cast(cli.PackagedMcpStdioSession, session),
             call_job_id="job-query-1",
             call_status={"job": {"job_id": "job-query-1", "state": "succeeded"}},
@@ -7067,10 +7155,10 @@ def test_post_run_execution_query_returns_exact_resumable_nonterminal_snapshot(
         return None
 
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -7118,7 +7206,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
         initialize_response={"protocolVersion": "2025-06-18"},
         evidence=evidence,
     )
-    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    attempt = cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session=cast(cli.PackagedMcpStdioSession, session),
         call_job_id="job-query-1",
         call_status={"terminal": True},
@@ -7128,7 +7216,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
     )
     calls = 0
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -7178,9 +7266,9 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
         }
 
     monkeypatch.setattr(time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(
-        cli,
+        cli_jarvis_execution_run,
         "_jarvis_execution_lifecycle_observation",
         submitted_observation,
     )
@@ -7190,7 +7278,7 @@ def test_later_query_observation_timeout_preserves_latest_durable_snapshot(
 
     monkeypatch.setattr(time, "sleep", no_sleep)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -7225,9 +7313,9 @@ def test_first_query_observation_timeout_returns_exact_query_only_pending(
     def timeout(**_kwargs: object) -> None:
         raise ObservationTimeoutError("first query remains queued")
 
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", timeout)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", timeout)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -7239,7 +7327,7 @@ def test_first_query_observation_timeout_returns_exact_query_only_pending(
         poll_seconds=1,
     )
 
-    assert isinstance(result, cli._JarvisExecutionQueryPending)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryPending)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     assert result.outcome == "observation_pending"
     assert result.lifecycle_observations == ()
     assert result.retry_selector() == selector
@@ -7302,8 +7390,8 @@ def test_terminal_execution_without_artifact_query_time_is_query_only_pending(
         }
     }
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             session=cast(cli.PackagedMcpStdioSession, session),
             call_job_id="job-query-1",
             call_status={"terminal": True},
@@ -7313,9 +7401,9 @@ def test_terminal_execution_without_artifact_query_time_is_query_only_pending(
         )
 
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
 
-    result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         definition=cast(ClusterDefinition, SimpleNamespace()),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -7356,7 +7444,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
         initialize_response={"protocolVersion": "2025-06-18"},
         evidence=evidence,
     )
-    attempt = cli._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    attempt = cli_jarvis_execution_types._JarvisExecutionQueryAttempt(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         session=cast(cli.PackagedMcpStdioSession, session),
         call_job_id="job-query-1",
         call_status={"terminal": True},
@@ -7366,7 +7454,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
     )
     calls = 0
 
-    def execute_query(**_kwargs: object) -> cli._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def execute_query(**_kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryAttempt:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -7394,15 +7482,15 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
         }
 
     monkeypatch.setattr(time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(cli, "_execute_jarvis_execution_query", execute_query)
+    monkeypatch.setattr(cli_jarvis_execution_run, "_execute_jarvis_execution_query", execute_query)
     monkeypatch.setattr(
-        cli,
+        cli_jarvis_execution_run,
         "_jarvis_execution_lifecycle_observation",
         terminal_observation,
     )
 
-    def run_query() -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        result = cli._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def run_query() -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        result = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             definition=cast(ClusterDefinition, SimpleNamespace()),
             queue=cast(ClioCoreQueue, SimpleNamespace()),
@@ -7412,7 +7500,7 @@ def test_terminal_artifact_query_only_defers_typed_observation_timeout(
             wait_timeout_seconds=5.0,
             poll_seconds=1.0,
         )
-        assert isinstance(result, cli._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        assert isinstance(result, cli_jarvis_execution_types._JarvisExecutionQueryAcceptance)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         return result
 
     if is_retryable:
@@ -7490,7 +7578,7 @@ def test_nonterminal_jarvis_acceptance_report_is_pending_not_passed_or_failed() 
     def evidence() -> dict[str, object]:
         return {}
 
-    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="pipeline",
         execution_id="execution",
@@ -7517,7 +7605,7 @@ def test_nonterminal_jarvis_acceptance_report_is_pending_not_passed_or_failed() 
         ],
     )
 
-    pending = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    pending = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -7557,7 +7645,7 @@ def test_nonterminal_jarvis_acceptance_does_not_mask_unrelated_failure() -> None
             error="contract mismatch",
         )
     ]
-    query = cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="pipeline",
         execution_id="execution",
@@ -7584,7 +7672,7 @@ def test_nonterminal_jarvis_acceptance_does_not_mask_unrelated_failure() -> None
         ],
     )
 
-    unchanged = cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    unchanged = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -7724,13 +7812,13 @@ def _jarvis_resume_runtime_metadata(
 
 def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Path) -> None:
     """Old checkpoints remain valid, while any change to their exact intent remains invalid."""
-    execution_intent = cli._jarvis_run_execution_intent(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    execution_intent = cli_jarvis_intent_checkpoint._jarvis_run_execution_intent(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="test-cluster",
         profile="user",
         arguments={"pipeline_id": "pipeline"},
         idempotency_key="validation:jarvis-run:test-cluster:stable-key",
     )
-    checkpoint = cli._new_jarvis_intent_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    checkpoint = cli_jarvis_intent_checkpoint._new_jarvis_intent_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         execution_intent=execution_intent,
         pre_dispatch_inputs={
             "cluster": "test-cluster",
@@ -7741,14 +7829,14 @@ def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Pat
             "artifact_sha256": None,
         },
     )
-    report = cli._new_jarvis_intent_pending_report(checkpoint)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    report = cli_jarvis_pending_report._new_jarvis_intent_pending_report(checkpoint)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     old_time = datetime.now(UTC) - timedelta(days=45)
     report.started_at = old_time
     report.completed_at = old_time
     path = tmp_path / "old-intent.json"
     write_validation_report(report, path)
 
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         path,
         cluster="test-cluster",
     )
@@ -7764,7 +7852,7 @@ def test_multiday_dispatch_intent_rejects_tampering_without_expiry(tmp_path: Pat
     write_validation_report(tampered, tampered_path)
 
     with pytest.raises(ConfigurationError, match="dispatch identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             tampered_path,
             cluster="test-cluster",
         )
@@ -7833,7 +7921,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     checkpoint_path = tmp_path / "scheduler-id-assigned.json"
     write_validation_report(report, checkpoint_path)
 
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         checkpoint_path,
         cluster="test-cluster",
     )
@@ -7857,7 +7945,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     stable_resource.metadata["retry_selector"] = stable_selector
     stable_path = tmp_path / "scheduler-cluster-unavailable.json"
     write_validation_report(stable_unknown_cluster, stable_path)
-    stable_loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    stable_loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         stable_path,
         cluster="test-cluster",
     )
@@ -7890,7 +7978,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
         cluster_path = tmp_path / f"scheduler-cluster-{mutation}.json"
         write_validation_report(cluster_tampered, cluster_path)
         with pytest.raises(ConfigurationError, match="observation identity changed"):
-            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 cluster_path,
                 cluster="test-cluster",
             )
@@ -7928,7 +8016,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
             ConfigurationError,
             match="resume checkpoint is invalid|runtime identity changed",
         ):
-            cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 tampered_runtime_path,
                 cluster="test-cluster",
             )
@@ -7947,7 +8035,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     empty_query_path = tmp_path / "empty-query-job-id.json"
     write_validation_report(empty_query_report, empty_query_path)
     with pytest.raises(ConfigurationError, match="observation identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             empty_query_path,
             cluster="test-cluster",
         )
@@ -7971,7 +8059,7 @@ def test_jarvis_resume_checkpoint_accepts_only_monotonic_scheduler_id_assignment
     write_validation_report(tampered, tampered_path)
 
     with pytest.raises(ConfigurationError, match="observation identity changed"):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             tampered_path,
             cluster="test-cluster",
         )
@@ -8026,11 +8114,13 @@ def test_execution_query_remote_boundaries_share_one_deadline(
     monkeypatch.setattr(time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_remotely)
-    monkeypatch.setattr(cli, "_wait_for_remote_job_terminal", wait_for_terminal)
-    monkeypatch.setattr(cli, "_remote_artifact_records", artifact_records)
-    monkeypatch.setattr(cli, "_read_remote_json_artifact_kind", read_artifact)
+    monkeypatch.setattr(
+        cli_remote_collection_pagination, "_wait_for_remote_job_terminal", wait_for_terminal
+    )
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_remote_artifact_records", artifact_records)
+    monkeypatch.setattr(cli_jarvis_artifact_io, "_read_remote_json_artifact_kind", read_artifact)
 
-    cli._execute_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_jarvis_execution_run._execute_jarvis_execution_query(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         queue=cast(ClioCoreQueue, SimpleNamespace()),
         profile="user",
@@ -8074,22 +8164,24 @@ def test_remote_status_and_artifact_io_apply_the_shared_deadline(
         return json.dumps({"encoding": "base64", "data": "e30="})
 
     monkeypatch.setattr(time, "monotonic", lambda: 10.0)
-    monkeypatch.setattr(cli, "_run_remote_clio_before_deadline", run_before_deadline)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_run_remote_clio_before_deadline", run_before_deadline
+    )
     definition = ClusterDefinition(name="ares", ssh_host="ares")
 
-    status = cli._wait_for_remote_job_terminal(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    status = cli_remote_collection_pagination._wait_for_remote_job_terminal(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "job-query",
         timeout_seconds=20.0,
         poll_seconds=2.0,
         deadline=25.0,
     )
-    artifacts = cli._remote_artifact_records(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    artifacts = cli_jarvis_artifact_io._remote_artifact_records(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         "job-query",
         deadline=25.0,
     )
-    payload = cli._read_remote_artifact_kind_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    payload = cli_jarvis_artifact_io._read_remote_artifact_kind_bytes(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         artifacts,
         kind="mcp_result",
@@ -8108,7 +8200,7 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
         progress = {
             "packages": ([{"event_count": 1, "latest": {"sequence": 1}}] if index == 333 else [])
         }
-        cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             observations,
             {
                 "query_job_id": f"job-query-{index}",
@@ -8117,7 +8209,7 @@ def test_execution_query_observations_compact_without_losing_milestones() -> Non
                 "progress": progress,
             },
         )
-    cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observations,
         {
             "query_job_id": "job-query-701",

@@ -130,6 +130,7 @@ def _try_remote_job_wait_passthrough(
 ) -> bool:
     """Run one bounded remote wait and preserve its durable receipt on observation expiry."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 
     if cluster is None:
         return False
@@ -160,7 +161,7 @@ def _try_remote_job_wait_passthrough(
                         str(poll_seconds),
                     ],
                 )
-            document = cli._json_output(payload, "remote job wait")
+            document = cli_remote_collection_pagination._json_output(payload, "remote job wait")
             if "observation" in document:
                 try:
                     result = JobWaitResult.model_validate(document)
@@ -173,7 +174,7 @@ def _try_remote_job_wait_passthrough(
                 )
         except ObservationTimeoutError as observation_error:
             with remote_cli.remote_command_timeout(REMOTE_JOB_WAIT_STATUS_TIMEOUT_SECONDS):
-                status = cli._json_output(
+                status = cli_remote_collection_pagination._json_output(
                     remote_cli.run_remote_clio(definition, ["job", "status", job_id]),
                     "remote job status after bounded wait",
                 )

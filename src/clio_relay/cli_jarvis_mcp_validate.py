@@ -153,6 +153,17 @@ def jarvis_mcp_validate(
 ) -> None:
     """Exercise JARVIS run/query semantics and persist release acceptance evidence."""
     import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+    import clio_relay.cli_jarvis_dispatch as cli_jarvis_dispatch
+    import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
+    import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
+    import clio_relay.cli_jarvis_intent_checkpoint as cli_jarvis_intent_checkpoint
+    import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
+    import clio_relay.cli_jarvis_pending_report as cli_jarvis_pending_report
+    import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
+    import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+    import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
+    import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 
     report_path = report or resume_report or default_report_path(cluster)
     failure_report_path = report_path
@@ -177,7 +188,7 @@ def jarvis_mcp_validate(
                 raise typer.BadParameter(
                     "--resume-report cannot be combined with run or package-search arguments"
                 )
-            checkpoint = cli._load_jarvis_validation_resume_checkpoint(
+            checkpoint = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(
                 resume_report,
                 cluster=cluster,
             )
@@ -236,7 +247,9 @@ def jarvis_mcp_validate(
 
         def emit(validation: LiveValidationReport, *, attach_worker: bool = False) -> None:
             if attach_worker and remote_cli.should_execute_on_cluster(definition):
-                attach_verified_worker_identity(validation, cli._remote_worker_info(definition))
+                attach_verified_worker_identity(
+                    validation, cli_remote_worker_probe._remote_worker_info(definition)
+                )
             validation_report_module.write_validation_report(validation, report_path)
             report_written[0] = True
             typer.echo(validation.model_dump_json(indent=2))
@@ -251,7 +264,8 @@ def jarvis_mcp_validate(
         def finish_execution_query(
             *,
             builder_inputs: dict[str, Any],
-            execution_query: cli._JarvisExecutionQueryAcceptance | cli._JarvisExecutionQueryPending,
+            execution_query: cli_jarvis_execution_types._JarvisExecutionQueryAcceptance
+            | cli_jarvis_execution_types._JarvisExecutionQueryPending,
             checkpoint_profile: str,
         ) -> None:
             selector = execution_query.retry_selector()
@@ -261,7 +275,9 @@ def jarvis_mcp_validate(
             }
             observations = (
                 []
-                if isinstance(execution_query, cli._JarvisExecutionQueryPending)
+                if isinstance(
+                    execution_query, cli_jarvis_execution_types._JarvisExecutionQueryPending
+                )
                 else list(execution_query.lifecycle_observations)
             )
             checkpoint = {
@@ -273,11 +289,13 @@ def jarvis_mcp_validate(
                 "builder_inputs": builder_inputs,
                 "lifecycle_observations": observations,
             }
-            if isinstance(execution_query, cli._JarvisExecutionQueryPending):
-                validation = cli._build_unobserved_jarvis_query_pending_report(
-                    builder_inputs=builder_inputs,
-                    execution_query=execution_query,
-                    checkpoint=checkpoint,
+            if isinstance(execution_query, cli_jarvis_execution_types._JarvisExecutionQueryPending):
+                validation = (
+                    cli_jarvis_pending_report._build_unobserved_jarvis_query_pending_report(
+                        builder_inputs=builder_inputs,
+                        execution_query=execution_query,
+                        checkpoint=checkpoint,
+                    )
                 )
             else:
                 validation = jarvis_mcp_validation.build_jarvis_mcp_validation_report(
@@ -294,7 +312,7 @@ def jarvis_mcp_validate(
                     query_lifecycle_observations=observations,
                 )
                 if execution_query.outcome != "terminal":
-                    validation = cli._mark_jarvis_validation_pending(
+                    validation = cli_jarvis_pending_report._mark_jarvis_validation_pending(
                         validation,
                         execution_query=execution_query,
                         resume_checkpoint=checkpoint,
@@ -312,7 +330,7 @@ def jarvis_mcp_validate(
                     **cast(dict[str, object], selector),
                     "last_query_job_id": None,
                 }
-                execution_query = cli._run_post_run_jarvis_execution_query(
+                execution_query = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(
                     cluster=cluster,
                     definition=definition,
                     queue=queue,
@@ -323,11 +341,13 @@ def jarvis_mcp_validate(
                     wait_timeout_seconds=wait_timeout_seconds,
                     poll_seconds=poll_seconds,
                 )
-                cli._require_same_jarvis_resume_identity(
+                cli_jarvis_resume_checkpoint._require_same_jarvis_resume_identity(
                     expected=selector,
                     observed=execution_query.retry_selector(),
                 )
-                if isinstance(execution_query, cli._JarvisExecutionQueryPending):
+                if isinstance(
+                    execution_query, cli_jarvis_execution_types._JarvisExecutionQueryPending
+                ):
                     retain_existing_pending_report()
                     return
                 prior_observations = [
@@ -337,7 +357,7 @@ def jarvis_mcp_validate(
                 ]
                 execution_query = replace(
                     execution_query,
-                    lifecycle_observations=cli._merge_jarvis_execution_query_observations(
+                    lifecycle_observations=cli_jarvis_query_observation._merge_jarvis_execution_query_observations(
                         prior_observations,
                         execution_query.lifecycle_observations,
                     ),
@@ -355,21 +375,21 @@ def jarvis_mcp_validate(
                 remote_tools_list_result,
                 remote_discovery_artifacts,
                 remote_discovery_payload,
-            ) = cli._run_jarvis_remote_contract_discovery(
+            ) = cli_jarvis_remote_contract._run_jarvis_remote_contract_discovery(
                 cluster=cluster,
                 definition=definition,
                 queue=queue,
                 wait_timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
-            cli._persist_jarvis_remote_contract_discovery(
+            cli_jarvis_remote_contract._persist_jarvis_remote_contract_discovery(
                 cluster=cluster,
                 discovery_job_id=remote_discovery_job_id,
                 result=remote_tools_list_result,
                 artifacts=remote_discovery_artifacts,
                 artifact_payload=remote_discovery_payload,
             )
-            package_search = cli._run_jarvis_package_search_query(
+            package_search = cli_jarvis_package_search._run_jarvis_package_search_query(
                 cluster=cluster,
                 definition=definition,
                 queue=queue,
@@ -401,25 +421,25 @@ def jarvis_mcp_validate(
                 "install_source": validation_install_source,
                 "artifact_sha256": validation_artifact_sha256,
             }
-            idempotency_key = cli._new_jarvis_validation_idempotency_key(
+            idempotency_key = cli_jarvis_intent_checkpoint._new_jarvis_validation_idempotency_key(
                 cluster=cluster,
                 profile=profile,
                 arguments=arguments,
             )
-            execution_intent = cli._jarvis_run_execution_intent(
+            execution_intent = cli_jarvis_intent_checkpoint._jarvis_run_execution_intent(
                 cluster=cluster,
                 profile=profile,
                 arguments=arguments,
                 idempotency_key=idempotency_key,
             )
-            checkpoint = cli._new_jarvis_intent_resume_checkpoint(
+            checkpoint = cli_jarvis_intent_checkpoint._new_jarvis_intent_resume_checkpoint(
                 execution_intent=execution_intent,
                 pre_dispatch_inputs=pre_dispatch_inputs,
             )
             # Persist the replayable identity before crossing the ambiguous stdio boundary.
             # A process or host failure can therefore resume with this exact key.
             validation_report_module.write_validation_report(
-                cli._new_jarvis_intent_pending_report(checkpoint), report_path
+                cli_jarvis_pending_report._new_jarvis_intent_pending_report(checkpoint), report_path
             )
         else:
             execution_intent = cast(dict[str, object], checkpoint["execution_intent"])
@@ -437,10 +457,10 @@ def jarvis_mcp_validate(
                 if resume_checkpoint is not None:
                     retain_existing_pending_report()
                 else:
-                    emit(cli._new_jarvis_intent_pending_report(checkpoint))
+                    emit(cli_jarvis_pending_report._new_jarvis_intent_pending_report(checkpoint))
                 return
             call_response = stdio_session.tools_call_response
-            job_id = cli._mcp_response_job_id(call_response)
+            job_id = cli_jarvis_artifact_io._mcp_response_job_id(call_response)
             builder_inputs: dict[str, Any] = {
                 **pre_dispatch_inputs,
                 "scheduler_cluster": None,
@@ -457,14 +477,14 @@ def jarvis_mcp_validate(
                 "initialize_response": stdio_session.initialize_response,
                 "stdio_evidence": stdio_session.evidence(),
             }
-            checkpoint = cli._promote_jarvis_intent_to_dispatch_checkpoint(
+            checkpoint = cli_jarvis_intent_checkpoint._promote_jarvis_intent_to_dispatch_checkpoint(
                 checkpoint,
                 job_id=job_id,
                 builder_inputs=builder_inputs,
             )
 
         try:
-            builder_inputs = cli._complete_jarvis_run_dispatch(
+            builder_inputs = cli_jarvis_dispatch._complete_jarvis_run_dispatch(
                 definition=definition,
                 queue=queue,
                 checkpoint=checkpoint,
@@ -472,7 +492,7 @@ def jarvis_mcp_validate(
                 poll_seconds=poll_seconds,
             )
         except ObservationTimeoutError:
-            emit(cli._build_jarvis_dispatch_pending_report(checkpoint))
+            emit(cli_jarvis_pending_report._build_jarvis_dispatch_pending_report(checkpoint))
             return
         raw_runtime_metadata = builder_inputs.get("runtime_metadata")
         runtime_metadata = (
@@ -488,13 +508,13 @@ def jarvis_mcp_validate(
             raise RelayError("JARVIS run metadata omitted the pipeline_id required for its query")
         if not isinstance(execution_id, str) or not execution_id:
             raise RelayError("JARVIS run metadata omitted the execution_id required for its query")
-        retry_selector = cli._jarvis_execution_retry_selector_from_runtime_metadata(
+        retry_selector = cli_jarvis_dispatch._jarvis_execution_retry_selector_from_runtime_metadata(
             runtime_metadata,
             cluster=cluster,
             pipeline_id=pipeline_id,
             execution_id=execution_id,
         )
-        execution_query = cli._run_post_run_jarvis_execution_query(
+        execution_query = cli_jarvis_execution_run._run_post_run_jarvis_execution_query(
             cluster=cluster,
             definition=definition,
             queue=queue,

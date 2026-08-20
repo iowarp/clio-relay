@@ -177,7 +177,8 @@ def execute_remote_mcp_validation_call(
     reserved_names: set[str],
 ) -> RemoteMcpValidationCall:
     """Run one virtual alias and build its ordinary durable acceptance report."""
-    import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 
     stdio_session = mcp_stdio_validation.run_packaged_mcp_stdio_session(
         profile=profile,
@@ -188,7 +189,7 @@ def execute_remote_mcp_validation_call(
             else {"cluster": cluster, **remote_arguments}
         ),
     )
-    job_id = cli._mcp_response_job_id(stdio_session.tools_call_response)
+    job_id = cli_jarvis_artifact_io._mcp_response_job_id(stdio_session.tools_call_response)
     if execute_remotely:
         remote_cli.run_remote_clio(
             definition,
@@ -202,17 +203,17 @@ def execute_remote_mcp_validation_call(
                 str(poll_seconds),
             ],
         )
-        call_status = cli._json_output(
+        call_status = cli_remote_collection_pagination._json_output(
             remote_cli.run_remote_clio(definition, ["job", "status", job_id]),
             "remote MCP validation job status",
         )
-        artifacts = cli._remote_artifact_records(definition, job_id)
-        mcp_result = cli._read_remote_json_artifact_kind(
+        artifacts = cli_jarvis_artifact_io._remote_artifact_records(definition, job_id)
+        mcp_result = cli_jarvis_artifact_io._read_remote_json_artifact_kind(
             definition,
             artifacts,
             kind="mcp_result",
         )
-        provenance = cli._read_remote_json_artifact_kind(
+        provenance = cli_jarvis_artifact_io._read_remote_json_artifact_kind(
             definition,
             artifacts,
             kind="provenance",
@@ -225,13 +226,13 @@ def execute_remote_mcp_validation_call(
             poll_seconds=poll_seconds,
         )
         call_status = relay_ops.job_status(queue, job_id)
-        artifacts = cli._complete_local_artifact_records(queue, job_id)
-        mcp_result = cli._read_local_json_artifact_kind(
+        artifacts = cli_remote_collection_pagination._complete_local_artifact_records(queue, job_id)
+        mcp_result = cli_jarvis_artifact_io._read_local_json_artifact_kind(
             queue,
             artifacts,
             kind="mcp_result",
         )
-        provenance = cli._read_local_json_artifact_kind(
+        provenance = cli_jarvis_artifact_io._read_local_json_artifact_kind(
             queue,
             artifacts,
             kind="provenance",
@@ -346,7 +347,7 @@ def _collect_remote_spack_configuration_observation(
     expected_sha256: str,
 ) -> RemoteMcpSpackConfigurationObservation:
     """Collect a configuration observation through one bounded Bash/SSH command."""
-    import clio_relay.cli as cli
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 
     script = _remote_spack_configuration_observer_script()
     command = " ".join(
@@ -367,7 +368,9 @@ def _collect_remote_spack_configuration_observation(
         output = remote_cli.run_remote_shell(definition, command)
     if len(output.encode("utf-8")) > MAX_SPACK_CONFIGURATION_OBSERVATION_OUTPUT_BYTES:
         raise RelayError("remote Spack configuration observation output exceeded its bound")
-    payload = cli._json_output(output, f"{phase} Spack configuration observation")
+    payload = cli_remote_collection_pagination._json_output(
+        output, f"{phase} Spack configuration observation"
+    )
     try:
         return RemoteMcpSpackConfigurationObservation.model_validate(payload)
     except ValidationError as exc:

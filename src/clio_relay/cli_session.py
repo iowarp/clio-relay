@@ -121,18 +121,20 @@ def session_plan_start(
 ) -> None:
     """Emit a read-only exact plan that can survive loss of the start client."""
     import clio_relay.cli as cli
+    import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
+    import clio_relay.cli_session_start as cli_session_start
 
     definition = cli._require_cluster(cluster)
     settings = RelaySettings.from_env()
 
     def action() -> None:
         dev_mode_findings = VerificationFindings()
-        release_identity = cli._verify_session_start_worker_release_identity(
+        release_identity = cli_session_start._verify_session_start_worker_release_identity(
             definition,
             dev_mode=dev_mode_enabled(cluster_dev_mode=definition.dev_mode),
             findings=dev_mode_findings,
         )
-        cli._echo_dev_mode_findings(dev_mode_findings)
+        cli_session_start._echo_dev_mode_findings(dev_mode_findings)
         typer.echo(
             session_lifecycle.plan_remote_session_start(
                 cluster=cluster,
@@ -141,7 +143,7 @@ def session_plan_start(
                 remote_api_port=remote_api_port,
                 replace=replace,
                 require_token=require_token,
-                input_policy=cli._owned_session_input_policy(settings),
+                input_policy=cli_cleanup_evidence._owned_session_input_policy(settings),
                 start_operation_id=start_operation_id,
                 expected_api_release_identity_sha256=release_identity.sha256(),
             ).model_dump_json(indent=2)
@@ -196,6 +198,7 @@ def session_start_status(
 ) -> None:
     """Query one exact start once without imposing an aggregate wait deadline."""
     import clio_relay.cli as cli
+    import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
 
     definition = cli._require_cluster(cluster)
     settings = RelaySettings.from_env()
@@ -208,7 +211,7 @@ def session_start_status(
             remote_api_port=remote_api_port,
             replace=replace,
             require_token=require_token,
-            input_policy=cli._owned_session_input_policy(settings),
+            input_policy=cli_cleanup_evidence._owned_session_input_policy(settings),
             start_operation_id=start_operation_id,
             expected_cluster_route_revision=cluster_route_revision,
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
@@ -255,6 +258,7 @@ def session_start_watch(
 ) -> None:
     """Watch a durable handle; exit 0 is ready, 1 failed, and 2 detached."""
     import clio_relay.cli as cli
+    import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
 
     definition = cli._require_cluster(cluster)
     settings = RelaySettings.from_env()
@@ -267,7 +271,7 @@ def session_start_watch(
             remote_api_port=remote_api_port,
             replace=replace,
             require_token=require_token,
-            input_policy=cli._owned_session_input_policy(settings),
+            input_policy=cli_cleanup_evidence._owned_session_input_policy(settings),
             start_operation_id=start_operation_id,
             expected_cluster_route_revision=cluster_route_revision,
             expected_api_release_identity_sha256=expected_api_release_identity_sha256,
@@ -368,9 +372,14 @@ def session_detach(
 ) -> None:
     """Close the desktop attachment while retaining remote work and session processes."""
     import clio_relay.cli as cli
+    import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+    import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+    import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+    import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     canonical_report_path = validation_report or default_report_path(cluster)
-    seed_report = cli._new_cleanup_acceptance_report(
+    seed_report = cli_remote_worker_attach._new_cleanup_acceptance_report(
         scenario="cleanup",
         cluster=cluster,
         mode="detach",
@@ -406,7 +415,9 @@ def session_detach(
     def action() -> None:
         remote_execution = remote_cli.should_execute_on_cluster(definition)
         queue = cli._managed_queue_from_env()
-        cleanup_worker_info, cleanup_worker_error = cli._observe_worker_before_cleanup(definition)
+        cleanup_worker_info, cleanup_worker_error = (
+            cli_remote_worker_attach._observe_worker_before_cleanup(definition)
+        )
         pre_detach_report = session_lifecycle.detach_remote_session(
             definition=definition,
             session_id=session_id,
@@ -422,26 +433,26 @@ def session_detach(
         canonical_report[0] = pre_detach_canonical.model_copy(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
-        session_generation_id = cli._verified_owner_session_detach(
+        session_generation_id = cli_owned_session_recovery._verified_owner_session_detach(
             pre_detach_report,
             session_id=session_id,
         )
         if remote_execution:
-            owned_jobs = cli._list_remote_owned_active_cluster_jobs(
+            owned_jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
                 definition,
                 cluster,
                 owner_session_id=session_id,
                 owner_session_generation_id=session_generation_id,
             )
         else:
-            owned_jobs = cli._list_owned_active_cluster_jobs(
+            owned_jobs = cli_owned_relay_jobs._list_owned_active_cluster_jobs(
                 queue,
                 cluster,
                 owner_session_id=session_id,
                 owner_session_generation_id=session_generation_id,
                 scheduler_provider=definition.scheduler_provider,
             )
-        gateway_reports = cli._cleanup_owned_runtime_sessions(
+        gateway_reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(
             cluster=cluster,
             definition=definition,
             owner_session_id=session_id,
@@ -450,14 +461,14 @@ def session_detach(
             cancel_scheduler_jobs=False,
         )
         if remote_execution:
-            post_operation_jobs = cli._list_remote_owned_active_cluster_jobs(
+            post_operation_jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
                 definition,
                 cluster,
                 owner_session_id=session_id,
                 owner_session_generation_id=session_generation_id,
             )
         else:
-            post_operation_jobs = cli._list_owned_active_cluster_jobs(
+            post_operation_jobs = cli_owned_relay_jobs._list_owned_active_cluster_jobs(
                 queue,
                 cluster,
                 owner_session_id=session_id,
@@ -470,7 +481,7 @@ def session_detach(
             cluster=cluster,
         )
         try:
-            cli._verified_owner_session_detach(
+            cli_owned_session_recovery._verified_owner_session_detach(
                 report,
                 session_id=session_id,
                 expected_session_generation_id=session_generation_id,
@@ -480,7 +491,7 @@ def session_detach(
             if detail not in report.errors:
                 report.errors.append(detail)
         report.resources.extend(
-            cli._owned_job_cleanup_resources(
+            cli_owned_scheduler_cancel._owned_job_cleanup_resources(
                 owned_jobs,
                 definition=definition,
                 location=definition.ssh_host,
@@ -489,7 +500,7 @@ def session_detach(
                 post_operation_jobs=post_operation_jobs,
             )
         )
-        cli._merge_gateway_cleanup_resources(report, gateway_reports)
+        cli_owned_runtime_cleanup._merge_gateway_cleanup_resources(report, gateway_reports)
         payload = report.json_payload()
         payload["gateway_sessions"] = gateway_reports
         canonical = report.to_live_validation_report(
@@ -503,7 +514,7 @@ def session_detach(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        provenance_warning = cli._write_cleanup_validation_report(
+        provenance_warning = cli_remote_worker_attach._write_cleanup_validation_report(
             canonical,
             definition,
             canonical_report_path,
@@ -540,7 +551,9 @@ def session_detach(
 
     def locked_action() -> None:
         with (
-            remote_cli.remote_command_timeout(cli.REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS),
+            remote_cli.remote_command_timeout(
+                cli_owned_relay_jobs.REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS
+            ),
             cli._session_transition_lock(cluster=cluster, session_id=session_id),
         ):
             guarded_action()

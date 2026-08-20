@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 from clio_relay import bootstrap, bootstrap_receipt_validation, cli
 from clio_relay.bootstrap import (
     DEFAULT_REMOTE_CORE_DIR,
@@ -1289,7 +1290,9 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
 
     monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
     monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
 
     result = CliRunner().invoke(
         cli.app,

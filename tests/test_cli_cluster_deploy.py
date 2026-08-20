@@ -48,6 +48,7 @@ import clio_relay.bootstrap as bootstrap
 import clio_relay.bootstrap_acceptance as bootstrap_acceptance
 import clio_relay.cli as cli
 import clio_relay.cli_cluster_deploy as cli_cluster_deploy
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.cluster_probe as cluster_probe
 import clio_relay.deployment as deployment
 from clio_relay.bootstrap_pin import (
@@ -251,7 +252,9 @@ def _bootstrap_cli_fakes(
         }
 
     monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
     monkeypatch.setattr(
         bootstrap_acceptance,
         "bootstrap_reuse_acceptance_evidence",
@@ -536,7 +539,9 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
 
     monkeypatch.setattr(bootstrap, "package_source_root", fake_package_source_root)
     monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
     monkeypatch.setattr(
         bootstrap_acceptance,
         "bootstrap_reuse_acceptance_evidence",
@@ -691,7 +696,9 @@ def test_cluster_bootstrap_invalidates_cache_before_target_validation_and_record
 
     monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
     monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(cli, "_remote_target_identity", fake_remote_target_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
     monkeypatch.setattr(
         cli.RemoteMcpSchemaCache,
         "invalidate_cluster_entries",

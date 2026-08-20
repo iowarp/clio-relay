@@ -32,8 +32,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
 import clio_relay.cli_session_owned as cli_session_owned
-from clio_relay import cli
 from clio_relay.cli import app
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models import GatewaySession, JarvisRunSpec, JobKind, RelayJob
@@ -118,7 +118,7 @@ def test_owned_session_pre_start_probe_delegates_existing_transition_to_strict_r
         return expected
 
     monkeypatch.setattr(
-        cli,
+        cli_owned_session_recovery,
         "_inspect_owned_session_recovery_after_transition",
         strict_recovery,
     )

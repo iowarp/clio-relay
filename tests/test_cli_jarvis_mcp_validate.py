@@ -50,6 +50,13 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.cli_jarvis_dispatch as cli_jarvis_dispatch
+import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
+import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
+import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
+import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
 import clio_relay.remote_cli as remote_cli
@@ -174,9 +181,9 @@ def test_unobserved_query_checkpoint_resumes_after_multiday_delay_without_new_ru
     write_validation_report(report, resume_path)
     query_calls: list[dict[str, object]] = []
 
-    def still_pending(**kwargs: object) -> cli._JarvisExecutionQueryPending:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def still_pending(**kwargs: object) -> cli_jarvis_execution_types._JarvisExecutionQueryPending:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         query_calls.append(dict(kwargs))
-        return cli._JarvisExecutionQueryPending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryPending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="test-cluster",
             pipeline_id="pipeline",
             execution_id="execution",
@@ -189,7 +196,9 @@ def test_unobserved_query_checkpoint_resumes_after_multiday_delay_without_new_ru
     def execute_locally(_definition: ClusterDefinition) -> bool:
         return False
 
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", still_pending)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", still_pending
+    )
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
 
@@ -238,7 +247,7 @@ def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
     def persist_discovery(**_kwargs: object) -> None:
         return None
 
-    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    package_search = cli_jarvis_package_search._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tools_list_response={},
         call_response={},
         call_job_id="job-search",
@@ -250,7 +259,7 @@ def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
         stdio_evidence={},
     )
 
-    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def search(**_kwargs: object) -> cli_jarvis_package_search._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         return package_search
 
     def run_session(**kwargs: object) -> SimpleNamespace:
@@ -305,10 +314,12 @@ def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
         recorder.finish()
         return report
 
-    def terminal_query(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def terminal_query(
+        **kwargs: object,
+    ) -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         pipeline_id = cast(str, kwargs["pipeline_id"])
         execution_id = cast(str, kwargs["execution_id"])
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="test-cluster",
             pipeline_id=pipeline_id,
             execution_id=execution_id,
@@ -335,12 +346,18 @@ def test_initial_relay_dispatch_timeout_resumes_exact_job_without_duplicate_run(
     def execute_locally(_definition: ClusterDefinition) -> bool:
         return False
 
-    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
-    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
-    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
+    monkeypatch.setattr(
+        cli_jarvis_remote_contract, "_run_jarvis_remote_contract_discovery", discover
+    )
+    monkeypatch.setattr(
+        cli_jarvis_remote_contract, "_persist_jarvis_remote_contract_discovery", persist_discovery
+    )
+    monkeypatch.setattr(cli_jarvis_package_search, "_run_jarvis_package_search_query", search)
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", complete_dispatch)
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", terminal_query)
+    monkeypatch.setattr(cli_jarvis_dispatch, "_complete_jarvis_run_dispatch", complete_dispatch)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", terminal_query
+    )
     monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_report)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
 
@@ -414,9 +431,13 @@ def test_stdio_receipt_timeout_replays_only_the_same_idempotent_intent(
     def persist_discovery(**_kwargs: object) -> None:
         return None
 
-    monkeypatch.setattr(cli, "_run_jarvis_remote_contract_discovery", discover)
-    monkeypatch.setattr(cli, "_persist_jarvis_remote_contract_discovery", persist_discovery)
-    package_search = cli._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(
+        cli_jarvis_remote_contract, "_run_jarvis_remote_contract_discovery", discover
+    )
+    monkeypatch.setattr(
+        cli_jarvis_remote_contract, "_persist_jarvis_remote_contract_discovery", persist_discovery
+    )
+    package_search = cli_jarvis_package_search._JarvisPackageSearchAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tools_list_response={},
         call_response={},
         call_job_id="job-search",
@@ -428,10 +449,10 @@ def test_stdio_receipt_timeout_replays_only_the_same_idempotent_intent(
         stdio_evidence={},
     )
 
-    def search(**_kwargs: object) -> cli._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def search(**_kwargs: object) -> cli_jarvis_package_search._JarvisPackageSearchAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         return package_search
 
-    monkeypatch.setattr(cli, "_run_jarvis_package_search_query", search)
+    monkeypatch.setattr(cli_jarvis_package_search, "_run_jarvis_package_search_query", search)
 
     def run_session(**kwargs: object) -> SimpleNamespace:
         observed_arguments.append(cast(dict[str, object], kwargs["arguments"]))
@@ -478,7 +499,7 @@ def test_stdio_receipt_timeout_replays_only_the_same_idempotent_intent(
         return False
 
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", run_session)
-    monkeypatch.setattr(cli, "_complete_jarvis_run_dispatch", still_queued)
+    monkeypatch.setattr(cli_jarvis_dispatch, "_complete_jarvis_run_dispatch", still_queued)
     monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_pending)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
 
@@ -646,7 +667,7 @@ def test_jarvis_mcp_validate_resume_report_queries_exact_execution_without_new_r
         retry_selector: dict[str, object] | None,
         wait_timeout_seconds: float,
         poll_seconds: float,
-    ) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         del definition, queue, retry_selector, wait_timeout_seconds, poll_seconds
         query_calls.append((profile, pipeline_id, execution_id))
         terminal_observation = _jarvis_resume_observation(
@@ -655,7 +676,7 @@ def test_jarvis_mcp_validate_resume_report_queries_exact_execution_without_new_r
             terminal=True,
             scheduler_native_id="4242",
         )
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster=cluster,
             pipeline_id=pipeline_id,
             execution_id=execution_id,
@@ -692,7 +713,9 @@ def test_jarvis_mcp_validate_resume_report_queries_exact_execution_without_new_r
     def execute_locally(_definition: ClusterDefinition) -> bool:
         return False
 
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", query_exact_execution
+    )
     monkeypatch.setattr(jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_report)
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_locally)
@@ -796,7 +819,9 @@ def test_jarvis_resume_pending_returns_before_release_provenance_observation(
     )
     write_validation_report(pending_report, resume_path)
 
-    def query_exact_execution(**kwargs: object) -> cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    def query_exact_execution(
+        **kwargs: object,
+    ) -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observation = _jarvis_resume_observation(
             query_job_id="job-query-new",
             state="submitted",
@@ -804,7 +829,7 @@ def test_jarvis_resume_pending_returns_before_release_provenance_observation(
             scheduler_native_id="4242",
             scheduler_cluster="linux",
         )
-        return cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster=cast(str, kwargs["cluster"]),
             pipeline_id=cast(str, kwargs["pipeline_id"]),
             execution_id=cast(str, kwargs["execution_id"]),
@@ -894,12 +919,14 @@ def test_jarvis_resume_pending_returns_before_release_provenance_observation(
     def forbid_new_run(**_kwargs: object) -> None:
         raise AssertionError("resume must not submit")
 
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", query_exact_execution)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", query_exact_execution
+    )
     monkeypatch.setattr(
         jarvis_mcp_validation, "build_jarvis_mcp_validation_report", build_pending_report
     )
     monkeypatch.setattr(remote_cli, "should_execute_on_cluster", execute_remotely)
-    monkeypatch.setattr(cli, "_remote_worker_info", fail_worker_info)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_worker_info", fail_worker_info)
     monkeypatch.setattr(mcp_stdio_validation, "run_packaged_mcp_stdio_session", forbid_new_run)
 
     result = CliRunner().invoke(
@@ -1015,7 +1042,9 @@ def test_jarvis_resume_query_failure_preserves_pending_checkpoint(
     def fail_query(**_kwargs: object) -> None:
         raise TimeoutError("temporary relay observation timeout")
 
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", fail_query)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", fail_query
+    )
 
     result = CliRunner().invoke(
         app,
@@ -1038,7 +1067,7 @@ def test_jarvis_resume_query_failure_preserves_pending_checkpoint(
     assert len(failure_paths) == 1
     failure = LiveValidationReport.model_validate_json(failure_paths[0].read_text(encoding="utf-8"))
     assert failure.status is ValidationStatus.FAILED
-    loaded = cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         resume_path,
         cluster="test-cluster",
     )
@@ -1054,7 +1083,7 @@ def test_jarvis_resume_query_failure_preserves_pending_checkpoint(
         ConfigurationError,
         match="resume identity is invalid|observation identity changed",
     ):
-        cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             tampered_path,
             cluster="test-cluster",
         )
@@ -1261,7 +1290,9 @@ def test_jarvis_resume_rejects_tampered_checkpoint_before_remote_query(
         query_calls.append("called")
         raise AssertionError("tampered checkpoint reached a remote query")
 
-    monkeypatch.setattr(cli, "_run_post_run_jarvis_execution_query", forbid_query)
+    monkeypatch.setattr(
+        cli_jarvis_execution_run, "_run_post_run_jarvis_execution_query", forbid_query
+    )
 
     result = CliRunner().invoke(
         app,

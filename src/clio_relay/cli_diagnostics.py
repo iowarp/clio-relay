@@ -294,6 +294,7 @@ def live_test(
 ) -> None:
     """Run configurable live acceptance checks for a cluster."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     report_path = report or (
         _live_acceptance_resume_output_path(resume_report)
@@ -423,7 +424,7 @@ def live_test(
                 current_report.status is ValidationStatus.PASSED
                 and remote_cli.should_execute_on_cluster(definition)
             ):
-                cli._write_remote_verified_report(
+                cli_remote_worker_attach._write_remote_verified_report(
                     current_report,
                     definition,
                     report_path,

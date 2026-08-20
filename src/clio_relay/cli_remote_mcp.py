@@ -127,37 +127,41 @@ def _read_remote_mcp_result_artifact(
     definition: ClusterDefinition,
     job_id: str,
 ) -> tuple[dict[str, object], bytes]:
-    import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 
-    artifacts = cli._remote_artifact_records(definition, job_id)
-    artifact = cli._artifact_record(artifacts, kind="mcp_result")
+    artifacts = cli_jarvis_artifact_io._remote_artifact_records(definition, job_id)
+    artifact = cli_jarvis_artifact_io._artifact_record(artifacts, kind="mcp_result")
     if artifact is None:
         raise RelayError(f"remote MCP discovery job has no mcp_result artifact: {job_id}")
     artifact_id = artifact.get("artifact_id")
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError("remote MCP result artifact has no artifact_id")
-    envelope = cli._json_output(
+    envelope = cli_remote_collection_pagination._json_output(
         remote_cli.run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
         "remote discovery artifact payload",
     )
-    return artifact, cli._decode_artifact_envelope(envelope)
+    return artifact, cli_jarvis_artifact_io._decode_artifact_envelope(envelope)
 
 
 def _read_local_mcp_result_artifact(
     queue: Any,
     job_id: str,
 ) -> tuple[dict[str, object], bytes]:
-    import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 
-    artifacts = cli._complete_local_artifact_records(queue, job_id)
-    artifact = cli._artifact_record(artifacts, kind="mcp_result")
+    artifacts = cli_remote_collection_pagination._complete_local_artifact_records(queue, job_id)
+    artifact = cli_jarvis_artifact_io._artifact_record(artifacts, kind="mcp_result")
     if artifact is None:
         raise RelayError(f"remote MCP discovery job has no mcp_result artifact: {job_id}")
     artifact_id = artifact.get("artifact_id")
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError("local MCP result artifact has no artifact_id")
     envelope = read_artifact_bytes(queue, artifact_id)
-    return cast(dict[str, object], artifact), cli._decode_artifact_envelope(envelope)
+    return cast(dict[str, object], artifact), cli_jarvis_artifact_io._decode_artifact_envelope(
+        envelope
+    )
 
 
 @remote_mcp_app.command("register")
@@ -398,6 +402,9 @@ def remote_mcp_refresh(
 ) -> None:
     """Discover a registered server through a durable MCP tools/list relay job."""
     import clio_relay.cli as cli
+    import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+    import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 
     registry_path = default_registry_path()
     registry = ClusterRegistry.load(registry_path)
@@ -432,14 +439,14 @@ def remote_mcp_refresh(
             for child_name, source_name in sorted(registration.env_from.items()):
                 remote_args.extend(["--env-from", f"{child_name}={source_name}"])
             with staged_remote_cluster_registry(definition) as remote_registry_path:
-                job_id = cli._last_nonempty_line(
+                job_id = cli_remote_worker_probe._last_nonempty_line(
                     remote_cli.run_remote_clio(
                         definition,
                         remote_args,
                         cluster_registry_path=remote_registry_path,
                     )
                 )
-            wait_result = cli._json_output(
+            wait_result = cli_remote_collection_pagination._json_output(
                 remote_cli.run_remote_clio(
                     definition,
                     [
@@ -454,7 +461,7 @@ def remote_mcp_refresh(
                 ),
                 "remote discovery wait",
             )
-            cli._require_discovery_success(wait_result, job_id)
+            cli_jarvis_remote_contract._require_discovery_success(wait_result, job_id)
             artifact, artifact_payload = _read_remote_mcp_result_artifact(
                 definition,
                 job_id,
@@ -505,7 +512,9 @@ def remote_mcp_refresh(
                 timeout_seconds=wait_timeout_seconds,
                 poll_seconds=poll_seconds,
             )
-            cli._require_discovery_success(terminal.model_dump(mode="json"), job.job_id)
+            cli_jarvis_remote_contract._require_discovery_success(
+                terminal.model_dump(mode="json"), job.job_id
+            )
             artifact, artifact_payload = _read_local_mcp_result_artifact(queue, job.job_id)
             job_id = job.job_id
         entry = cache_entry_from_discovery_artifact(
