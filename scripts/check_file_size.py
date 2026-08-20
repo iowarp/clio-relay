@@ -669,10 +669,19 @@ RATCHET_BASELINE: dict[str, int] = {
     # cleanup split out separately into service_runtime_local_connector.py
     # (171 lines) as `_ServiceRuntimeLocalConnectorMixin`, since bundling it
     # with observation would have crossed the 800-line cap. 1614 -> 854.
-    # What remains is imports, module constants, the not-yet-extracted
-    # remote-connector-lifecycle + health-wait cluster, and the class
-    # statement itself.
-    "src/clio_relay/service_runtime.py": 854,
+    # #231 service-runtime split, slice 19 (final): the last two clusters --
+    # remote/allocation connector lifecycle (_start_remote_connector,
+    # _allocation_connector_identity, _poll_allocation_connector_step,
+    # _stop_allocation_connector, _retained_allocation_connector_resource)
+    # moved to the new service_runtime_remote_connector.py (497 lines) as
+    # `_ServiceRuntimeRemoteConnectorMixin`; local process start + HTTP
+    # health waits (_start_local_visitor, _start_browser_proxy,
+    # _wait_for_jarvis_health, _wait_for_browser_health,
+    # _wait_for_local_health) moved to the new service_runtime_local_start.py
+    # (376 lines) as `_ServiceRuntimeLocalStartMixin`. service_runtime.py is
+    # now assembly-only: imports, the mixin composition list, and the class
+    # docstring recording it. 854 -> 78. #231 CLOSED for this file.
+    "src/clio_relay/service_runtime.py": 78,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
