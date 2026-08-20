@@ -18,21 +18,23 @@ bring-up identity, before surfacing anything (clio-relay#213). That is never a
 silent redial -- it costs no new transport and is itself a typed, visible
 ``stream_reproven`` event -- and it never substitutes for the explicit
 channel-level reconnect above.
+
+The raw identity-bound-stream wire mechanics (:mod:`clio_relay.
+remote_connection_stream_io`) and the connections-by-cluster registry
+(:mod:`clio_relay.remote_connection_registry`) are owned by their own
+modules; both are re-exported here so every existing import of this module
+keeps working unchanged.
 """
 
 from __future__ import annotations
 
-import hmac
 import http.client
-import json
 import math
 import secrets
 import threading
-import urllib.parse
 from contextlib import suppress
 from typing import Final, Literal, cast
 
-from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
@@ -48,40 +50,41 @@ from clio_relay.control_channel import (
     build_transport,
     channel_event,
 )
-from clio_relay.errors import ConfigurationError, ObservationTimeoutError, RelayError
-from clio_relay.job_identity import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
+from clio_relay.errors import ConfigurationError, RelayError
+
+# Facade: the pooled-stream wire mechanics moved to remote_connection_stream_io.py
+# (identity-bound stream open/request/read + the clio-relay#213 stale-stream
+# classifier); the connections-by-cluster registry moved to
+# remote_connection_registry.py. `_is_stale_stream_error`/
+# `_open_identity_bound_stream`/`_request_json_on_stream` each still have a
+# bare-name call site inside `RemoteConnection` below, so they are imported by
+# name (this file's own globals resolve them, so a test monkeypatch on
+# `clio_relay.remote_connection.<name>` still reaches those call sites).
+# `MAX_SESSION_API_RESPONSE_BYTES`/`RemoteConnectionRegistry`/
+# `connection_registry` have no reader left in this file's own body (only
+# session_api.py and tests import them directly from here), so they use the
+# `X as X` self-alias idiom ruff/pyflakes recognizes as an intentional
+# re-export instead of a `from ... import` it would otherwise flag unused.
+from clio_relay.remote_connection_registry import (
+    RemoteConnectionRegistry as RemoteConnectionRegistry,
+)
+from clio_relay.remote_connection_registry import (
+    connection_registry as connection_registry,
+)
+from clio_relay.remote_connection_stream_io import (
+    MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
+)
+from clio_relay.remote_connection_stream_io import (
+    _is_stale_stream_error,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    _open_identity_bound_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    _request_json_on_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 
-MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 MAX_RECORDED_CHANNEL_EVENTS: Final = 256
 # Idle streams held over the one channel; more concurrent operations simply open
 # more streams through the same forward, which costs no new transport.
 MAX_POOLED_CHANNEL_STREAMS: Final = 8
 DEFAULT_OWNED_SESSION_API_PORT: Final = 8765
-CHANNEL_EVENT_REPORT_SCHEMA: Final = "clio-relay.control-channel-report.v1"
-
-# clio-relay#213: the closed set of exceptions `_request_json_on_stream` wraps and
-# chains that mean the *stream* died at the OS level (idle-closed, reset, a bad
-# status line) rather than the request being genuinely rejected. Deliberately
-# narrow: an HTTP-status failure or a slow-but-live server (ObservationTimeoutError)
-# must never retry under a second identity-bound stream.
-_STALE_STREAM_ERROR_TYPES: Final = (ConnectionError, http.client.BadStatusLine)
-
-
-def _is_stale_stream_error(exc: BaseException) -> bool:
-    """Return True only for the narrow, OS-observed dead-pooled-stream signature."""
-    return isinstance(exc.__cause__, _STALE_STREAM_ERROR_TYPES)
-
-
-_IDENTITY_FIELDS: Final = (
-    "schema_version",
-    "cluster",
-    "session_id",
-    "session_generation_id",
-    "nonce",
-)
 
 
 def validate_channel_request(*, method: str, path: str) -> str:
@@ -706,182 +709,6 @@ class RemoteConnection:
             sink(event)
 
 
-class RemoteConnectionRegistry:
-    """The one local relay's connections to many remote relays.
-
-    The client-facing MCP endpoint stays single and stable while connections in
-    here come and go; a cluster's connection is created on first use and reused
-    by every later operation for that cluster.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._connections: dict[str, RemoteConnection] = {}
-        self._retired: list[dict[str, object]] = []
-
-    def connection(
-        self,
-        *,
-        definition: ClusterDefinition,
-        settings: RelaySettings,
-        remote_api_port: int | None = None,
-        transport_mode: TransportMode | None = None,
-        process_factory: ChannelProcessFactory | None = None,
-        timeout_seconds: float = 30.0,
-        event_sink: ChannelEventSink | None = None,
-        allow_interactive_authorization: bool | None = None,
-    ) -> RemoteConnection:
-        """Return the held connection for one cluster, establishing it once.
-
-        Bring-up can block for as long as a user takes to authorize it, so the
-        registry lock is never held across it: one cluster connecting must not
-        stall every other cluster's operations, nor the acceptance report.
-        """
-        with self._lock:
-            existing = self._connections.get(definition.name)
-            if existing is not None and existing.matches(
-                settings=settings,
-                remote_api_port=remote_api_port,
-            ):
-                held = existing
-            else:
-                held = None
-                if existing is not None:
-                    # The pinned identity changed, so this is a different
-                    # connection, not a retry. Retire the old one but keep its
-                    # transport count, or the acceptance measurement loses it.
-                    self._connections.pop(definition.name, None)
-                    self._retired.append(_retired_report(existing))
-        if held is not None:
-            held.connect()
-            return held
-        if existing is not None:
-            existing.close()
-        created = RemoteConnection(
-            definition=definition,
-            settings=settings,
-            remote_api_port=remote_api_port,
-            transport_mode=transport_mode,
-            process_factory=process_factory,
-            timeout_seconds=timeout_seconds,
-            event_sink=event_sink,
-            allow_interactive_authorization=allow_interactive_authorization,
-        )
-        created.connect()
-        with self._lock:
-            raced = self._connections.get(definition.name)
-            if raced is not None:
-                self._retired.append(_retired_report(created))
-                created.close()
-                return raced
-            self._connections[definition.name] = created
-        return created
-
-    def get(self, cluster: str) -> RemoteConnection | None:
-        """Return the existing connection for one cluster without creating it."""
-        with self._lock:
-            return self._connections.get(cluster)
-
-    def reconnect(self, cluster: str) -> RemoteConnection:
-        """Re-establish one cluster's dropped channel on explicit instruction.
-
-        This is the only way a replacement transport is ever opened.  In
-        ``ssh_forward`` mode calling it is what the present user authorizes, so
-        it must be reached from an operator action and never from a retry.
-        """
-        with self._lock:
-            connection = self._connections.get(cluster)
-        if connection is None:
-            raise ConfigurationError(f"no owned session connection is held for cluster {cluster}")
-        connection.reconnect()
-        return connection
-
-    def disconnect(self, cluster: str) -> None:
-        """Close and forget one cluster's connection."""
-        with self._lock:
-            connection = self._connections.pop(cluster, None)
-            if connection is not None:
-                self._retired.append(_retired_report(connection))
-        if connection is not None:
-            connection.close()
-
-    def close_all(self) -> None:
-        """Close every held connection this local relay owns."""
-        with self._lock:
-            connections = list(self._connections.values())
-            self._connections.clear()
-            self._retired.extend(_retired_report(item) for item in connections)
-        for connection in connections:
-            connection.close()
-
-    @property
-    def clusters(self) -> tuple[str, ...]:
-        """Return the clusters this local relay currently holds a channel to."""
-        with self._lock:
-            return tuple(sorted(self._connections))
-
-    def event_report(self) -> dict[str, object]:
-        """Return the client half of the one-held-channel acceptance measurement.
-
-        ``established`` plus ``reestablished`` is exactly the number of new
-        transport connections this local relay opened, which is what a desktop
-        process sampler and the cluster's ``sshd`` session log independently
-        count in the deployment gate.  Reading it costs no transport.
-        """
-        with self._lock:
-            connections = dict(self._connections)
-            retired = list(self._retired)
-        clusters: dict[str, object] = {}
-        for cluster, connection in connections.items():
-            events = connection.events
-            clusters[cluster] = {
-                "transport_mode": connection.transport_mode,
-                "identity_anchor": connection.identity_anchor,
-                "session_id": connection.session_id,
-                "session_generation_id": connection.session_generation_id,
-                "remote_api_port": connection.remote_api_port,
-                "connected": connection.connected,
-                "transport_connections_opened": sum(
-                    1 for event in events if event.event in {"established", "reestablished"}
-                ),
-                "events": [event.model_dump(mode="json") for event in events],
-            }
-        live = sum(
-            cast(int, cast(dict[str, object], value)["transport_connections_opened"])
-            for value in clusters.values()
-        )
-        retired_total = sum(cast(int, item["transport_connections_opened"]) for item in retired)
-        return {
-            "schema_version": CHANNEL_EVENT_REPORT_SCHEMA,
-            "clusters": clusters,
-            "retired": retired,
-            "transport_connections_opened": live + retired_total,
-        }
-
-
-def _retired_report(connection: RemoteConnection) -> dict[str, object]:
-    """Keep a retired connection's transport count for the acceptance report."""
-    events = connection.events
-    return {
-        "cluster": connection.cluster,
-        "session_id": connection.session_id,
-        "session_generation_id": connection.session_generation_id,
-        "transport_mode": connection.transport_mode,
-        "identity_anchor": connection.identity_anchor,
-        "transport_connections_opened": sum(
-            1 for event in events if event.event in {"established", "reestablished"}
-        ),
-    }
-
-
-_REGISTRY = RemoteConnectionRegistry()
-
-
-def connection_registry() -> RemoteConnectionRegistry:
-    """Return the process-wide registry of remote relay connections."""
-    return _REGISTRY
-
-
 def owned_session_credentials(
     *,
     definition: ClusterDefinition,
@@ -906,168 +733,3 @@ def owned_session_credentials(
             "owned remote request requires CLIO_RELAY_API_TOKEN for authentication"
         )
     return session_id, generation_id, api_token
-
-
-def _open_identity_bound_stream(
-    *,
-    endpoint: ChannelEndpoint,
-    nonce: str,
-    expected_identity: dict[str, object],
-    timeout_seconds: float,
-) -> http.client.HTTPConnection:
-    """Prove one non-reconnecting TCP stream before any credential is sent."""
-    stream = http.client.HTTPConnection(endpoint.host, endpoint.port, timeout=timeout_seconds)
-    try:
-        stream.connect()
-        stream.auto_open = 0
-        stream.request(
-            "GET",
-            "/session-identity?" + urllib.parse.urlencode({"nonce": nonce}),
-            headers={"Accept": "application/json", "Connection": "keep-alive"},
-        )
-        proof_response = stream.getresponse()
-        proof_document = read_json_response(proof_response, label="session identity challenge")
-        if proof_response.status != 200 or not isinstance(proof_document, dict):
-            raise RelayError("owned session API did not return a valid server identity challenge")
-        verify_session_identity(
-            cast(dict[str, object], proof_document),
-            expected=expected_identity,
-        )
-        if proof_response.will_close or stream.sock is None:
-            raise RelayError(
-                "owned session API closed the identity-proven connection before authentication"
-            )
-        return stream
-    except (OSError, http.client.HTTPException) as exc:
-        stream.close()
-        raise RelayError("owned session API identity challenge failed") from exc
-    except BaseException:
-        stream.close()
-        raise
-
-
-def _request_json_on_stream(
-    *,
-    stream: http.client.HTTPConnection,
-    method: str,
-    path: str,
-    query: dict[str, object] | None,
-    body: dict[str, object] | None,
-    api_token: str,
-    session_id: str,
-    generation_id: str,
-    response_timeout_seconds: float | None,
-) -> object:
-    """Issue one request without permitting HTTPConnection to reconnect."""
-    encoded_query = "" if query is None else "?" + urllib.parse.urlencode(query)
-    encoded_body = None if body is None else json.dumps(body).encode("utf-8")
-    proven_socket = stream.sock
-    prior_connection_timeout = stream.timeout
-    prior_socket_timeout: float | None = None
-    response_timeout_applied = False
-    try:
-        if response_timeout_seconds is not None:
-            if proven_socket is None:
-                raise RelayError("owned session API identity-proven connection is not open")
-            prior_socket_timeout = proven_socket.gettimeout()
-            stream.timeout = response_timeout_seconds
-            proven_socket.settimeout(response_timeout_seconds)
-            response_timeout_applied = True
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_token}",
-            OWNER_SESSION_ID_HEADER: session_id,
-            SESSION_GENERATION_ID_HEADER: generation_id,
-        }
-        if encoded_body is not None:
-            headers["Content-Type"] = "application/json"
-        stream.request(
-            method,
-            path + encoded_query,
-            body=encoded_body,
-            headers=headers,
-        )
-        response = stream.getresponse()
-        document = read_json_response(response, label=f"{method} {path}")
-        if not 200 <= response.status < 300:
-            # A1 (#231 R6 review): door_errors.as_http_problem spreads the
-            # original T2 refusal document's fields (doc §6.4) into the 413
-            # problem body (fault.data, F4) -- recognized here so its own
-            # typed code/message surfaces instead of the generic "HTTP
-            # {status}: {raw json blob}" that discards the structure.
-            typed_document = (
-                cast(dict[str, object], document) if isinstance(document, dict) else None
-            )
-            if typed_document is not None and is_delivery_refusal(typed_document):
-                code = cast(dict[str, object], typed_document.get("delivery", {})).get("code")
-                raise RelayError(
-                    f"owned session API request refused delivery ({code}): "
-                    f"{describe_delivery_refusal(typed_document)}"
-                )
-            detail = json.dumps(document, ensure_ascii=False)[:2_000]
-            raise RelayError(
-                f"owned session API request failed: {method} {path}: "
-                f"HTTP {response.status}: {detail}"
-            )
-        return document
-    except (OSError, http.client.HTTPException) as exc:
-        if response_timeout_applied and isinstance(exc, TimeoutError):
-            raise ObservationTimeoutError(
-                f"owned session API response observation timed out for {method} {path}"
-            ) from exc
-        raise RelayError(
-            f"owned session API identity-bound request failed for {method} {path}: {exc}"
-        ) from exc
-    finally:
-        if response_timeout_seconds is not None:
-            stream.timeout = prior_connection_timeout
-            if (
-                response_timeout_applied
-                and stream.sock is proven_socket
-                and proven_socket is not None
-            ):
-                try:
-                    proven_socket.settimeout(prior_socket_timeout)
-                except OSError:
-                    # The response may have closed the proven socket.  Never let
-                    # HTTPConnection reconnect it under the authenticated client.
-                    stream.close()
-
-
-def read_json_response(response: http.client.HTTPResponse, *, label: str) -> object:
-    """Read one bounded JSON document from a channel response."""
-    payload = response.read(MAX_SESSION_API_RESPONSE_BYTES + 1)
-    if len(payload) > MAX_SESSION_API_RESPONSE_BYTES:
-        raise RelayError(f"owned session API {label} response exceeded its byte limit")
-    try:
-        return json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RelayError(f"owned session API {label} response was not UTF-8 JSON") from exc
-
-
-def verify_session_identity(
-    observed: dict[str, object],
-    *,
-    expected: dict[str, object],
-) -> None:
-    """Require the reached listener to be the bring-up-proven session.
-
-    ``expected`` is proven under whatever identity anchor this connection's
-    mode declares (§8.3) -- the ssh-authenticated bootstrap act in
-    ``ssh_forward`` mode, the weaker ``preshared_link_secret`` anchor in
-    modes (a)/(b) -- never assumed to be ssh-specific here.
-    """
-    if any(observed.get(field) != expected.get(field) for field in _IDENTITY_FIELDS):
-        raise RelayError(
-            "owned session API server identity did not match the bring-up-proven session"
-        )
-    observed_signature = observed.get("hmac_sha256")
-    expected_signature = expected.get("hmac_sha256")
-    if (
-        not isinstance(observed_signature, str)
-        or not isinstance(expected_signature, str)
-        or len(observed_signature) != 64
-        or len(expected_signature) != 64
-        or not hmac.compare_digest(observed_signature, expected_signature)
-    ):
-        raise RelayError("owned session API server identity HMAC did not verify")
