@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import io
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -43,6 +44,8 @@ from clio_relay.worker_lifetime_lock import (
     WorkerLifetimeLockUnavailable,
     exclusive_migration_lifetime,
 )
+
+logger = logging.getLogger(__name__)
 
 BOOTSTRAP_DESIRED_STATE_SCHEMA = "clio-relay.bootstrap-desired-state.v1"
 BOOTSTRAP_RECEIPT_SCHEMA = "clio-relay.bootstrap-receipt.v2"
@@ -3518,14 +3521,33 @@ def resolve_receipt_bound_jarvis_python(
         not isinstance(jarvis_runtime, dict)
         or cast(dict[str, object], jarvis_runtime).get("verified") is not True
     ):
-        raise ConfigurationError("relay-managed JARVIS runtime did not verify its receipt")
+        # Dev mode defers this identity enforcement LOUDLY, exactly like the
+        # receipt_matches_install sibling above -- a hand-deployed runtime is
+        # the sanctioned dev-mode state (2026-08-19: the un-deferred form
+        # crash-looped the ares worker every ~10s after a hand-install, #250
+        # family). Enforcement returns with the release recipe.
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise ConfigurationError("relay-managed JARVIS runtime did not verify its receipt")
+        logger.warning(
+            "jarvis runtime receipt verification deferred reason=deferred_dev_mode "
+            "check=jarvis_runtime_verified"
+        )
     relay_runtime = runtime.get("clio-relay")
     if (
         not isinstance(relay_runtime, dict)
         or cast(dict[str, object], relay_runtime).get("execution_runtime_verified") is not True
     ):
-        raise ConfigurationError(
-            "relay-managed JARVIS execution runtime did not verify its relay receipt"
+        from clio_relay.dev_mode import dev_mode_enabled
+
+        if not dev_mode_enabled():
+            raise ConfigurationError(
+                "relay-managed JARVIS execution runtime did not verify its relay receipt"
+            )
+        logger.warning(
+            "jarvis execution runtime verification deferred reason=deferred_dev_mode "
+            "check=execution_runtime_verified"
         )
 
     raw_manifest = receipt.get("deployment_manifest")
