@@ -74,12 +74,18 @@ _configured_path = (
     live_acceptance_models._configured_path  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 
-# live_acceptance_remote_io.py
+# live_acceptance_remote_io.py -- _remote_env has no bare caller left in
+# this file, but tests/test_remote_value_contract.py reaches it via
+# vars(live_acceptance)["_remote_env"], not a `from X import Y` this
+# module's own import audit would catch.
 _decode_artifact_text = (
     live_acceptance_remote_io._decode_artifact_text  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 _remote_clio_json = (
     live_acceptance_remote_io._remote_clio_json  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
+_remote_env = (
+    live_acceptance_remote_io._remote_env  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 _remote_shell = (
     live_acceptance_remote_io._remote_shell  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
