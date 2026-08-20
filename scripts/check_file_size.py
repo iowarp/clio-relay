@@ -1014,7 +1014,24 @@ RATCHET_BASELINE: dict[str, int] = {
     # (mcp_dispatch.py's `_call_tool` reaches them only through the
     # `_mcp_server.<name>` back-reference too); the two internal helpers
     # need no re-export since nothing outside this module calls them.
-    "src/clio_relay/mcp_server.py": 3647,
+    "src/clio_relay/mcp_server.py": 3282,
+    #
+    # split/mcp-server-w3 slice 6 (#231): the gateway-session / monitor-rule /
+    # progress MCP tools (_monitor_rule_from_arguments, _record_progress,
+    # _record_task_event, _create_gateway_session, _bind_jarvis_runtime,
+    # _jarvis_runtime_binding_selectors, _update_gateway_session,
+    # _reject_generic_gateway_runtime_fields, _required_environment_secret)
+    # move to mcp_gateway_tools.py. Two names `_bind_jarvis_runtime` calls are
+    # directly monkeypatched by tests (`_remote_cluster_definition`, which
+    # also stays defined in mcp_server.py since many other functions call it
+    # too, and `resolve_jarvis_service_runtime`, imported from
+    # clio_relay.jarvis_service_runtime everywhere else but reached here
+    # through the back-reference specifically because of the monkeypatch) --
+    # both go through the `_mcp_server.<name>` function-scope back-reference.
+    # mcp_server.py re-exports both of the dispatcher/monkeypatch-reached
+    # names it needs (resolve_jarvis_service_runtime plus the six tool
+    # functions mcp_dispatch.py's `_call_tool` reaches only through its own
+    # back-reference).
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
