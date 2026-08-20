@@ -675,9 +675,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # now-dead local-only _read_model_artifact_bytes. A justified, minimal
     # ratchet-up: 6098 -> 6107.
     "src/clio_relay/mcp_server.py": 6107,
-    # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
-    # timeout message and log its bounded diagnostic once server-side.
-    "src/clio_relay/mcp_stdio_validation.py": 1285,
+    # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
+    # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
+    # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
+    # assembly/facade over its six owner modules --
+    # mcp_stdio_validation_executable.py, mcp_stdio_validation_process_io.py,
+    # mcp_stdio_validation_process.py, mcp_stdio_validation_contract.py,
+    # mcp_stdio_validation_jarvis_contract.py, mcp_stdio_validation_
+    # support.py), comfortably under DEFAULT_MAX_LINES with no baseline
+    # entry needed.
     # #231 R9 fix round 2: +3 lines retain v3.6 as a handle-first execution
     # contract while v3.7 remains the current input-staging contract.
     "src/clio_relay/models.py": 2299,
