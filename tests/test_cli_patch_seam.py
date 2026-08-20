@@ -89,6 +89,7 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_session": _SRC_ROOT / "cli_session.py",
     "cli_gateway_runtime": _SRC_ROOT / "cli_gateway_runtime.py",
     "cli_cluster_deploy": _SRC_ROOT / "cli_cluster_deploy.py",
+    "cli_diagnostics": _SRC_ROOT / "cli_diagnostics.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -133,7 +134,10 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     ("bootstrap", "bootstrap_cluster_over_ssh", "cli_cluster_deploy"),
     ("jarvis_mcp_validation", "build_jarvis_mcp_validation_report", "cli"),
     ("frp_check", "run_frpc_connection_check", "cli"),
-    ("live_acceptance", "run_live_acceptance", "cli"),
+    # #231 cli.py decomposition: moved caller cli -> cli_diagnostics with the
+    # doctor/live-test command-group extraction (run_live_acceptance's only
+    # cli.py call site was live_test).
+    ("live_acceptance", "run_live_acceptance", "cli_diagnostics"),
     ("bootstrap_reconcile", "bootstrap_invocation_lock", "cli"),
     ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli"),
     ("session_lifecycle", "read_remote_session_cleanup_report", "cli"),
