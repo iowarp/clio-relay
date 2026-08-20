@@ -618,7 +618,14 @@ RATCHET_BASELINE: dict[str, int] = {
     # only recognizes a literal `X as X` self-import, not a rename) since a
     # genuinely unused rename import is otherwise pruned silently. 4211 ->
     # 3751.
-    "src/clio_relay/validation_report.py": 3751,
+    # #231 split/validation-report S6: the Spack fresh-install transition
+    # check (one release-policy requirement bound against an exact
+    # preinstall/install/postinstall job/check/artifact evidence graph)
+    # moved to spack_transition_checks.py (612 lines -- over the sweet spot,
+    # under the 800 cap; one coherent concern). Only its entry point has a
+    # caller left in this file (gate evaluation); no inner binding helper is
+    # tested directly, so nothing else needed re-export. 3751 -> 3174.
+    "src/clio_relay/validation_report.py": 3174,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
