@@ -756,9 +756,33 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 3: +16 lines keep subprocess stderr out of the marked
     # timeout message and log its bounded diagnostic once server-side.
     "src/clio_relay/mcp_stdio_validation.py": 1285,
-    # #231 R9 fix round 2: +3 lines retain v3.6 as a handle-first execution
-    # contract while v3.7 remains the current input-staging contract.
-    "src/clio_relay/models.py": 2299,
+    # split/models-w2 (#231): models.py's own ratchet-baseline entry and its
+    # v3.6/v3.7 history comment are removed here: the file is now a
+    # re-export facade (~170 lines, well under DEFAULT_MAX_LINES) over eleven
+    # new domain owner modules -- models_shared.py (cross-domain constants +
+    # canonical-JSON/identity helpers), models_enums.py (durable
+    # state-machine enums), models_artifact_provenance.py (W3C-PROV artifact
+    # use/transform records), models_jarvis_package.py (package input
+    # contracts), models_jarvis_pipeline.py (pipeline staged-input lineage/
+    # bindings/run manifests), models_job_specs.py (the JobSpec union and its
+    # members), models_job.py (RelayJob plus its GC/closure lifecycle),
+    # models_job_telemetry.py (task/event/progress/cursor/lease records),
+    # models_mcp_admission.py (MCP control-query authority + SEP-2663 task
+    # records), models_scheduling.py (endpoint + scheduler-cancellation +
+    # scheduler/connector observation records), models_gateway.py (artifact
+    # index + gateway/service-runtime records). Every one of the original
+    # 111 module-level names is re-exported here under its original name, a
+    # pure move verified by an exhaustive module-attribute diff against the
+    # pre-split tree.
+    # NOTE (integrate-w2 merge accounting): the models-w2 branch forked from
+    # develop before split/process-containment-w2 landed, so its copy of this
+    # dict still carried process_containment.py's pre-split entry ("src/
+    # clio_relay/process_containment.py": 2678) immediately after this
+    # comment. That entry is correctly omitted here -- split/process-
+    # containment-w2 (merged into integrate-w2 first) already brought
+    # process_containment.py under DEFAULT_MAX_LINES and removed its baseline
+    # entry per ground rule 5; re-adding it would resurrect a stale, already-
+    # superseded ratchet ceiling on a file this merge did not touch.
     "src/clio_relay/queue_management.py": 1671,
     # +11 net lines -- the first live worker_status() read raced a
     # just-registered fleet's own background slot heartbeats
