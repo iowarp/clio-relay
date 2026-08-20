@@ -28,7 +28,12 @@ from uuid import uuid4
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from clio_relay import __version__, bootstrap_pin, bootstrap_receipt_validation
+from clio_relay import (
+    __version__,
+    bootstrap_full_activation_staging,
+    bootstrap_pin,
+    bootstrap_receipt_validation,
+)
 from clio_relay.bootstrap_reconcile import (
     BootstrapDesiredState,
 )
@@ -1808,6 +1813,7 @@ _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
     b"    pass\n"
 )
 _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
+    "bootstrap_full_activation_staging.py",
     "bootstrap_jarvis_staging.py",
     "bootstrap_provider_build_info.py",
     "bootstrap_reconcile.py",
@@ -3540,6 +3546,7 @@ else:
     sys.modules[name] = module
     spec.loader.exec_module(module)
 from clio_relay import bootstrap_jarvis_staging, bootstrap_recovery
+from clio_relay import bootstrap_full_activation_staging
 journal_path = Path(os.environ["BOOTSTRAP_TRANSACTION_JOURNAL"])
 if action == "journal-create":
     service_value = os.environ["BOOTSTRAP_SERVICE_ACTIVE_BEFORE"]
@@ -3621,6 +3628,18 @@ elif action == "recovery-jarvis-venv-promote":
             invocation_id=arguments[0],
             retired_at=arguments[1],
             staged_identity=(identity.device, identity.inode),
+        )
+    except module.ConfigurationError as exc:
+        raise SystemExit(str(exc)) from None
+    print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+elif action == "full-activation-reconcile":
+    # clio-relay#257: see bootstrap_full_activation_staging.
+    promote = bootstrap_full_activation_staging.promote_full_mode_activation_links_from_manifest
+    try:
+        evidence = promote(
+            Path(arguments[0]),
+            expected_manifest_sha256=arguments[1],
+            desired_fingerprint=os.environ["BOOTSTRAP_DESIRED_FINGERPRINT"],
         )
     except module.ConfigurationError as exc:
         raise SystemExit(str(exc)) from None
@@ -5565,6 +5584,11 @@ def render_linux_user_bootstrap_script(
         invocation_id=invocation_id,
         candidate_uv_install_program=candidate_uv_install_program,
     )
+    # clio-relay#257: rendered-script chunks from bootstrap_full_activation_staging.
+    bfas = bootstrap_full_activation_staging
+    ownership_proof_adoption_python = bfas.ownership_proof_populated_host_adoption_python()
+    stable_activation_link_adoption = bfas.stable_activation_link_adoption_shell()
+    shared_directory_mkdir_owned_helper = bfas.shared_directory_mkdir_owned_helper_shell()
     script = f"""set -euo pipefail
 umask 077
 export PATH="$HOME/.local/bin:$PATH"
@@ -6554,6 +6578,13 @@ if [ "$BOOTSTRAP_PLAN_MODE" = "full" ] && \
   fi
   JARVIS_STAGING_MODE=1
 fi
+# clio-relay#257: current already resolving means the host is populated.
+ACTIVATION_STAGING_MODE=0
+if [ -e "$HOME/.local/share/clio-relay/current" ] || \
+   [ -L "$HOME/.local/share/clio-relay/current" ]; then
+  ACTIVATION_STAGING_MODE=1
+fi
+export ACTIVATION_STAGING_MODE
 if [ "$BOOTSTRAP_PLAN_MODE" = "full" ] && \
    [ "$JARVIS_EXISTING_FILE_COUNT" -eq 0 ] && \
    [ -z "$JARVIS_RESOURCE_GRAPH_PROFILE" ]; then
@@ -6605,7 +6636,7 @@ BOOTSTRAP_GENERATION="$HOME/.local/share/clio-relay/generations/$BOOTSTRAP_DESIR
 BOOTSTRAP_TRANSACTION_ROOT="$HOME/.local/share/clio-relay/transactions/$BOOTSTRAP_INVOCATION_ID"
 BOOTSTRAP_OWNED_PATHS_JSON="$(
   python3 - "$BOOTSTRAP_DESIRED_FINGERPRINT" "$BOOTSTRAP_INVOCATION_ID" \
-    "$JARVIS_STAGING_MODE" \
+    "$JARVIS_STAGING_MODE" "$ACTIVATION_STAGING_MODE" \
     <<'__CLIO_RELAY_FRESH_OWNERSHIP__'
 import hashlib
 import json
@@ -6619,6 +6650,7 @@ home = Path.home()
 fingerprint = sys.argv[1]
 invocation_id = sys.argv[2]
 jarvis_staging_mode = sys.argv[3] == "1"
+activation_staging_mode = sys.argv[4] == "1"
 
 def classify(path: Path) -> os.stat_result | None:
     try:
@@ -6708,35 +6740,7 @@ jarvis_venv_entry = (
     if jarvis_staging_mode
     else ("jarvis_venv", home / ".local/share/clio-relay/jarvis-venv", "directory")
 )
-for name, path, kind in (
-    jarvis_venv_entry,
-    ("clio_kit_wheels", home / ".local/share/clio-relay/component-wheels/clio-kit", "directory"),
-    ("jarvis_cd_wheels", home / ".local/share/clio-relay/component-wheels/jarvis-cd", "directory"),
-    ("uv_tools", home / ".local/share/clio-relay/uv-tools", "directory"),
-    ("uv_bin", home / ".local/share/clio-relay/uv-bin", "directory"),
-    ("uv_python", home / ".local/share/clio-relay/uv-python", "directory"),
-    (
-        "transaction_root",
-        home / ".local/share/clio-relay/transactions" / invocation_id,
-        "directory",
-    ),
-    ("relay_source", home / ".local/src/clio-relay", "symlink"),
-    ("jarvis_state", home / ".ppi-jarvis", "directory"),
-    ("jarvis_config", home / ".local/share/clio-relay/jarvis-config", "directory"),
-    ("jarvis_private", home / ".local/share/clio-relay/jarvis-private", "directory"),
-    ("jarvis_shared", home / ".local/share/clio-relay/jarvis-shared", "directory"),
-    ("generation", home / ".local/share/clio-relay/generations" / fingerprint, "directory"),
-    ("current", home / ".local/share/clio-relay/current", "symlink"),
-    (
-        "install_receipt",
-        home / ".local/share/clio-relay/install-receipt.json",
-        "symlink",
-    ),
-    ("managed_repo", home / ".local/share/clio-relay/clio_relay", "symlink"),
-    ("relay_launcher", home / ".local/bin/clio-relay", "symlink"),
-    ("jarvis_launcher", home / ".local/bin/jarvis", "symlink"),
-):
-    absent(name, path, kind)
+{ownership_proof_adoption_python}
 
 print(json.dumps(owned, sort_keys=True, separators=(",", ":")))
 __CLIO_RELAY_FRESH_OWNERSHIP__
@@ -6839,7 +6843,8 @@ if [ ! -x "$HOME/.local/bin/uv" ] \
   echo "$UV_EXECUTABLE_SHA256 *$HOME/.local/bin/uv" | sha256sum --check --strict -
   BOOTSTRAP_UV_DOWNLOADED=1
 fi
-bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_python
+{shared_directory_mkdir_owned_helper}
+bootstrap_mkdir_owned_if_absent "$HOME/.local/share/clio-relay/uv-python" uv_python
 uv python install 3.12
 
 if [ ! -x "$AGENT_BIN" ] && [ -n "$AGENT_NPM_PACKAGE" ] && command -v npm >/dev/null 2>&1; then
@@ -6880,7 +6885,7 @@ JARVIS_CD_WHEEL_SHA256="{JARVIS_CD_WHEEL_SHA256}"
 JARVIS_CD_WHEEL_DIR="$HOME/.local/share/clio-relay/component-wheels/jarvis-cd"
 JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"
 mkdir -m 0700 -p "$(dirname "$JARVIS_CD_WHEEL_DIR")"
-bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_cd_wheels
+bootstrap_mkdir_owned_if_absent "$JARVIS_CD_WHEEL_DIR" jarvis_cd_wheels
 JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
 bootstrap_fetch_exact_artifact \\
   "$JARVIS_CD_WHEEL_URL" "$JARVIS_CD_WHEEL_SHA256" "$JARVIS_CD_STAGING"
@@ -6894,7 +6899,8 @@ JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_INSTALL_SPEC"
 JARVIS_MCP_ARTIFACT_PATH=""
 JARVIS_MCP_REQUESTED_SOURCE="checkout"
 JARVIS_MCP_VERSION=""
-bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" clio_kit_wheels
+bootstrap_mkdir_owned_if_absent \
+  "$HOME/.local/share/clio-relay/component-wheels/clio-kit" clio_kit_wheels
 case "$JARVIS_MCP_INSTALL_SPEC" in
   "{CLIO_KIT_JARVIS_MCP_WHEEL_URL}")
     JARVIS_MCP_VERSION="{CLIO_KIT_JARVIS_MCP_VERSION}"
@@ -6951,8 +6957,8 @@ esac
 echo "$JARVIS_MCP_ARTIFACT_SHA256 *$JARVIS_MCP_ARTIFACT_PATH" | \
   sha256sum --check --strict -
 deactivate
-bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_tools
-bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" uv_bin
+bootstrap_mkdir_owned_if_absent "$HOME/.local/share/clio-relay/uv-tools" uv_tools
+bootstrap_mkdir_owned_if_absent "$HOME/.local/share/clio-relay/uv-bin" uv_bin
 uv tool install --force --python 3.12 --no-config \\
   --default-index https://pypi.org/simple "$JARVIS_MCP_INSTALL_TARGET"
 JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"
@@ -6978,8 +6984,12 @@ if [ -n "$SOURCE_ARCHIVE_SHA256" ]; then
   echo "$SOURCE_ARCHIVE_SHA256 *$SOURCE_ARCHIVE" | sha256sum --check --strict -
 fi
 bootstrap_safe_extract "$JARVIS_VENV/bin/python" "$SOURCE_ARCHIVE" "$DEST"
-bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" relay_source \
-  "$DEST"
+if [ "$ACTIVATION_STAGING_MODE" != "1" ]; then
+  bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" relay_source \
+    "$DEST"
+fi
+# clio-relay#257: staging mode never creates it here -- promoted with
+# `current` at the fenced full-activation-reconcile boundary below.
 RELAY_INSTALL_SPEC={rendered_relay_install_spec}
 RELAY_ARTIFACT_SHA256={rendered_relay_artifact_sha256}
 RELAY_INSTALL_TARGET="$RELAY_INSTALL_SPEC"
@@ -7611,8 +7621,9 @@ if [ "$BOOTSTRAP_VERIFIED_DESIRED_FINGERPRINT" != \
   echo "fresh bootstrap desired fingerprint changed after provider installation" >&2
   exit 1
 fi
-if [ -e "$HOME/.local/share/clio-relay/current" ] || \
-   [ -L "$HOME/.local/share/clio-relay/current" ]; then
+if [ "$ACTIVATION_STAGING_MODE" != "1" ] && \
+   {{ [ -e "$HOME/.local/share/clio-relay/current" ] || \
+      [ -L "$HOME/.local/share/clio-relay/current" ]; }}; then
   echo "fresh bootstrap found an existing current generation pointer" >&2
   exit 1
 fi
@@ -7635,6 +7646,9 @@ import os
 import sys
 from pathlib import Path
 
+from clio_relay.bootstrap_full_activation_staging import (
+    capture_full_mode_activation_paths_json,
+)
 from clio_relay.bootstrap_reconcile import (
     BootstrapReconcilePlan,
     execution_environment_identity,
@@ -7668,10 +7682,13 @@ plan = BootstrapReconcilePlan(
         "uv": "replace",
     }},
 )
+# clio-relay#257: carries the pre-swap snapshot durably in the manifest, so
+# a later crash-recovery promotion reads back the SAME one, never fresh.
 manifest = {{
     "schema_version": "clio-relay.bootstrap-generation.v1",
     "fingerprint": fingerprint,
     "plan": plan.model_dump(mode="json"),
+    "full_activation_paths": capture_full_mode_activation_paths_json(Path.home()),
     "legacy_execution_identity": execution_identity,
     "active_execution_identity": execution_identity,
     "jarvis_wrapper_sha256": wrapper["sha256"],
@@ -7693,6 +7710,10 @@ try:
 finally:
     os.close(descriptor)
 __CLIO_RELAY_FULL_GENERATION_MANIFEST__
+BOOTSTRAP_GENERATION_MANIFEST_SHA256="$(
+  sha256sum "$BOOTSTRAP_GENERATION/manifest.json" | awk '{{print $1}}'
+)"
+export BOOTSTRAP_GENERATION_MANIFEST_SHA256
 BOOTSTRAP_GENERATION_IDENTITY="$(bootstrap_path_set_identity \
   "$BOOTSTRAP_GENERATION/manifest.json" \
   "$BOOTSTRAP_GENERATION/.prepared" \
@@ -7706,14 +7727,16 @@ bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
 bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" \
   prepared "$BOOTSTRAP_DESIRED_FINGERPRINT"
 bootstrap_journal_action advance "$BOOTSTRAP_TRANSACTION_JOURNAL" activating
-bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" \
-  current "$BOOTSTRAP_GENERATION"
-bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" \
-  install_receipt "$HOME/.local/share/clio-relay/current/install-receipt.json"
-bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" \
-  relay_launcher "$HOME/.local/share/clio-relay/current/bin/clio-relay"
-bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" \
-  jarvis_launcher "$HOME/.local/share/clio-relay/current/bin/jarvis"
+if [ "$ACTIVATION_STAGING_MODE" = "1" ]; then
+  # clio-relay#257: current was never claimed absent -- promote it now, in
+  # the same fenced "activating" window a virgin host creates it in directly.
+  bootstrap_candidate_action full-activation-reconcile \
+    "$BOOTSTRAP_GENERATION" "$BOOTSTRAP_GENERATION_MANIFEST_SHA256" >/dev/null
+else
+  bootstrap_journal_action symlink-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" \
+    current "$BOOTSTRAP_GENERATION"
+fi
+{stable_activation_link_adoption}
 BOOTSTRAP_ACTIVATION_IDENTITY="$(bootstrap_path_set_identity \
   "$HOME/.local/share/clio-relay/current" \
   "$HOME/.local/share/clio-relay/install-receipt.json" \
