@@ -246,6 +246,8 @@ def cluster_bootstrap(
 ) -> None:
     """Bootstrap a configured cluster's tools, relay package, and endpoint directories."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+    import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 
     report_path = report or default_report_path(cluster)
     try:
@@ -323,7 +325,7 @@ def cluster_bootstrap(
                     raise RelayError(
                         "bootstrap did not return exactly one durable receipt reference"
                     )
-                receipt = cli._json_output(
+                receipt = cli_remote_collection_pagination._json_output(
                     receipt_lines[0].partition("=")[2],
                     "bootstrap invocation receipt",
                 )
@@ -374,7 +376,7 @@ def cluster_bootstrap(
                     if ssh_host is not None
                     else definition
                 )
-                target_identity = cli._remote_target_identity(target_definition)
+                target_identity = cli_remote_worker_probe._remote_target_identity(target_definition)
                 target_evidence.append(
                     EvidenceReference(
                         kind="cluster_target",

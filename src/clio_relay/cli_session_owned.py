@@ -188,6 +188,7 @@ def session_recovery_status(
 ) -> None:
     """Return fail-closed recovery evidence for an ambiguous or dead session start."""
     import clio_relay.cli as cli
+    import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
 
     def action() -> None:
         settings_core_dir = RelaySettings.from_env().core_dir
@@ -198,7 +199,7 @@ def session_recovery_status(
                 core_dir=settings_core_dir,
             )
             if pre_start_cleanup_probe
-            else cli._inspect_owned_session_recovery_after_transition(
+            else cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(
                 cluster=cluster,
                 session_id=session_id,
                 core_dir=settings_core_dir,
@@ -361,10 +362,10 @@ def _inspect_owned_session_recovery_before_start(
     timeout_seconds: float | None = None,
 ) -> OwnedSessionRecoveryStatus:
     """Observe cleanup state without requiring a fresh session transition to exist."""
-    import clio_relay.cli as cli
+    import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
 
     resolved_timeout_seconds = (
-        cli.OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS
+        cli_owned_session_recovery.OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS
         if timeout_seconds is None
         else timeout_seconds
     )
@@ -398,7 +399,7 @@ def _inspect_owned_session_recovery_before_start(
                 "start-owned remains the mutation authority"
             ],
         )
-    return cli._inspect_owned_session_recovery_after_transition(
+    return cli_owned_session_recovery._inspect_owned_session_recovery_after_transition(
         cluster=cluster,
         session_id=session_id,
         core_dir=core_dir,

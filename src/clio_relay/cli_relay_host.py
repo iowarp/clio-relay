@@ -238,6 +238,7 @@ def test_frpc(
 ) -> None:
     """Run a live frpc login check and persist canonical success or failure evidence."""
     import clio_relay.cli as cli
+    import clio_relay.cli_transport_validation as cli_transport_validation
 
     canonical_report_path = validation_report or default_report_path(cluster)
 
@@ -275,7 +276,7 @@ def test_frpc(
 
     def action() -> None:
         cli._echo_lines(
-            cli._run_frpc_connection_validation(
+            cli_transport_validation._run_frpc_connection_validation(
                 cluster=cluster,
                 proxy_name=proxy_name,
                 frpc_bin=settings.frpc_bin,
@@ -385,6 +386,7 @@ def test_http_transport(
 ) -> None:
     """Run an end-to-end HTTP health check through frp STCP."""
     import clio_relay.cli as cli
+    import clio_relay.cli_transport_validation as cli_transport_validation
 
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
@@ -405,7 +407,7 @@ def test_http_transport(
         raise
     cli._run_or_exit(
         lambda: cli._echo_lines(
-            cli._run_transport_validation(
+            cli_transport_validation._run_transport_validation(
                 cluster=cluster,
                 transport_mode="frp-relay",
                 resource_id=proxy_name,
@@ -492,6 +494,7 @@ def test_direct_transport(
 ) -> None:
     """Run an end-to-end HTTP health check through frp XTCP direct transport."""
     import clio_relay.cli as cli
+    import clio_relay.cli_transport_validation as cli_transport_validation
 
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
@@ -512,7 +515,7 @@ def test_direct_transport(
         raise
     cli._run_or_exit(
         lambda: cli._echo_lines(
-            cli._run_transport_validation(
+            cli_transport_validation._run_transport_validation(
                 cluster=cluster,
                 transport_mode="frp-direct",
                 resource_id=proxy_name,
@@ -592,6 +595,7 @@ def test_ssh_transport(
 ) -> None:
     """Run an end-to-end HTTP health check through SSH local port forwarding."""
     import clio_relay.cli as cli
+    import clio_relay.cli_transport_validation as cli_transport_validation
 
     canonical_report_path = validation_report or default_report_path(cluster)
     try:
@@ -612,7 +616,7 @@ def test_ssh_transport(
         raise
     cli._run_or_exit(
         lambda: cli._echo_lines(
-            cli._run_transport_validation(
+            cli_transport_validation._run_transport_validation(
                 cluster=cluster,
                 transport_mode="ssh-forward",
                 resource_id=session_id,

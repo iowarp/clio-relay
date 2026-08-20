@@ -127,9 +127,15 @@ def scheduler_status_batch_command(
 ) -> None:
     """Read a bounded exact scheduler batch through one cluster invocation."""
     import clio_relay.cli as cli
+    import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 
-    if not scheduler_job_ids or len(scheduler_job_ids) > cli.MAX_SCHEDULER_STATUS_BATCH:
-        raise typer.BadParameter(f"provide 1-{cli.MAX_SCHEDULER_STATUS_BATCH} scheduler job ids")
+    if (
+        not scheduler_job_ids
+        or len(scheduler_job_ids) > cli_owned_scheduler_cancel.MAX_SCHEDULER_STATUS_BATCH
+    ):
+        raise typer.BadParameter(
+            f"provide 1-{cli_owned_scheduler_cancel.MAX_SCHEDULER_STATUS_BATCH} scheduler job ids"
+        )
     if len(set(scheduler_job_ids)) != len(scheduler_job_ids):
         raise typer.BadParameter("scheduler job ids cannot contain duplicates")
     definition = cli._require_cluster(cluster)
@@ -625,6 +631,7 @@ def scheduler_validate_lifecycle(
 ) -> None:
     """Deterministically validate held-to-completed scheduler lifecycle semantics."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 
     resolved_report = report_path or default_report_path(cluster)
     try:
@@ -664,7 +671,7 @@ def scheduler_validate_lifecycle(
             try:
                 attach_verified_worker_identity(
                     report,
-                    cli._remote_worker_info(definition),
+                    cli_remote_worker_probe._remote_worker_info(definition),
                 )
             except BaseException as exc:
                 recorder = ValidationRecorder(report)

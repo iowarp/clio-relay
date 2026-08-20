@@ -24,6 +24,7 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.owner_session_admission as owner_session_admission
 import clio_relay.service_runtime as service_runtime
 import clio_relay.storage_runtime as storage_runtime
@@ -148,7 +149,9 @@ def test_gateway_resume_reenters_exact_owner_session_admission(
     monkeypatch.setattr(storage_runtime, "storage_managed_queue", selected_queue)
     monkeypatch.setattr(service_runtime, "ServiceRuntimeSupervisor", FakeSupervisor)
     monkeypatch.setattr(owner_session_admission, "owner_session_gateway_admission", admit)
-    monkeypatch.setattr(cli, "_write_remote_verified_report", ignore_verified_report)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_write_remote_verified_report", ignore_verified_report
+    )
 
     result = CliRunner().invoke(
         app,

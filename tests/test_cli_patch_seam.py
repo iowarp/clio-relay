@@ -96,6 +96,16 @@ _GUARDED_CALLERS: dict[str, Path] = {
     "cli_remote_mcp": _SRC_ROOT / "cli_remote_mcp.py",
     "cli_remote_mcp_validate": _SRC_ROOT / "cli_remote_mcp_validate.py",
     "remote_mcp_validation": _SRC_ROOT / "remote_mcp_validation.py",
+    # #231 wave-2 (session start/teardown + JARVIS execution-query engine
+    # extraction): the audited collaborators these six moved-into modules
+    # now call directly, replacing "cli" as the entries' `caller` below.
+    "cli_session_start": _SRC_ROOT / "cli_session_start.py",
+    "cli_session_teardown": _SRC_ROOT / "cli_session_teardown.py",
+    "cli_owned_session_recovery": _SRC_ROOT / "cli_owned_session_recovery.py",
+    "cli_jarvis_execution_run": _SRC_ROOT / "cli_jarvis_execution_run.py",
+    "cli_jarvis_pending_report": _SRC_ROOT / "cli_jarvis_pending_report.py",
+    "cli_transport_validation": _SRC_ROOT / "cli_transport_validation.py",
+    "cli_cleanup_evidence": _SRC_ROOT / "cli_cleanup_evidence.py",
 }
 
 # (owner module short name, real symbol name as defined on that module,
@@ -113,17 +123,17 @@ _GUARDED_CALLERS: dict[str, Path] = {
 # guard checks for `job_status`, since re-importing it under any alias
 # reintroduces the same coupling).
 AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
-    ("session_lifecycle", "status_remote_session", "cli"),
-    ("session_lifecycle", "teardown_remote_session", "cli"),
+    ("session_lifecycle", "status_remote_session", "cli_session"),
+    ("session_lifecycle", "teardown_remote_session", "cli_session_teardown"),
     ("remote_cli", "run_remote_clio", "cli"),
     ("remote_cli", "should_execute_on_cluster", "cli"),
-    ("mcp_stdio_validation", "run_packaged_mcp_stdio_session", "cli"),
+    ("mcp_stdio_validation", "run_packaged_mcp_stdio_session", "cli_jarvis_execution_run"),
     # #231 cli.py decomposition: moved caller cli -> cli_session with the
     # session command-group extraction (detach_remote_session's only cli.py
     # call site was session_detach).
     ("session_lifecycle", "detach_remote_session", "cli_session"),
-    ("installation", "installation_info", "cli"),
-    ("session_lifecycle", "start_remote_session", "cli"),
+    ("installation", "installation_info", "cli_installation_receipt"),
+    ("session_lifecycle", "start_remote_session", "cli_session_start"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
     # the cluster deployment command-group extraction (cluster_bootstrap's
     # only cli.py call site).
@@ -136,13 +146,13 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # endpoint command-group extraction (EndpointWorker's only cli.py call
     # site was endpoint_start).
     ("endpoint", "EndpointWorker", "cli_endpoint"),
-    ("scheduler_providers", "provider_for_scheduler", "cli"),
+    ("scheduler_providers", "provider_for_scheduler", "cli_endpoint"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
     # the cluster deployment command-group extraction (cluster_bootstrap's
     # only cli.py call site).
     ("bootstrap", "bootstrap_cluster_over_ssh", "cli_cluster_deploy"),
-    ("jarvis_mcp_validation", "build_jarvis_mcp_validation_report", "cli"),
-    ("frp_check", "run_frpc_connection_check", "cli"),
+    ("jarvis_mcp_validation", "build_jarvis_mcp_validation_report", "cli_jarvis_pending_report"),
+    ("frp_check", "run_frpc_connection_check", "cli_transport_validation"),
     # #231 cli.py decomposition: moved caller cli -> cli_diagnostics with the
     # doctor/live-test command-group extraction (run_live_acceptance's only
     # cli.py call site was live_test).
@@ -151,16 +161,16 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # with the installation/receipt command-group extraction (bootstrap_
     # inspect's own serialization lock; its only cli.py call site).
     ("bootstrap_reconcile", "bootstrap_invocation_lock", "cli_installation_receipt"),
-    ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli"),
-    ("session_lifecycle", "read_remote_session_cleanup_report", "cli"),
-    ("session_lifecycle", "inspect_owned_session_recovery_status", "cli"),
+    ("session_lifecycle", "finalize_remote_session_cleanup_report", "cli_session_teardown"),
+    ("session_lifecycle", "read_remote_session_cleanup_report", "cli_session_teardown"),
+    ("session_lifecycle", "inspect_owned_session_recovery_status", "cli_owned_session_recovery"),
     # #231 cli.py decomposition: moved caller cli -> cli_release with the
     # release command-group extraction (run_local_release_validation's only
     # cli.py call site was release_validate_local).
     ("release_validation", "run_local_release_validation", "cli_release"),
     # R8(ii): moved caller cli -> cli_relay_host with the relay-host extraction.
     ("transport_probe", "run_frp_http_probe", "cli_relay_host"),
-    ("core_queue", "ClioCoreQueue", "cli"),
+    ("core_queue", "ClioCoreQueue", "cli_installation_receipt"),
     # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
     # with the installation/receipt command-group extraction (bootstrap_
     # inspect's only cli.py call site).
@@ -169,8 +179,8 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # with the installation/receipt command-group extraction (bootstrap_
     # inspect's only cli.py call site).
     ("bounded_process", "run_bounded_process", "cli_installation_receipt"),
-    ("storage_runtime", "storage_managed_queue", "cli"),
-    ("service_runtime", "ServiceRuntimeSupervisor", "cli"),
+    ("storage_runtime", "storage_managed_queue", "cli_queue_maintenance"),
+    ("service_runtime", "ServiceRuntimeSupervisor", "cli_gateway_runtime"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
     # the cluster deployment command-group extraction (cluster_install_
     # endpoint_service's only cli.py call site).
@@ -183,7 +193,7 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # site; cli_remote_mcp_validate.py reaches it too, but this is the
     # primary command-group owner).
     ("mcp_server", "load_registered_remote_mcp_catalog", "cli_remote_mcp"),
-    ("relay_ops", "wait_for_terminal", "cli"),
+    ("relay_ops", "wait_for_terminal", "remote_mcp_validation"),
     # #231 cli.py decomposition: moved caller cli -> cli_installation_receipt
     # with the installation/receipt command-group extraction (bootstrap_
     # inspect's only cli.py call site).
@@ -203,8 +213,8 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # (queue_validate was the last remaining cli.py call site once the
     # scheduler group's own two call sites moved to cli_scheduler.py).
     ("scheduler_providers", "validation_provider_for_scheduler", "cli_queue_maintenance"),
-    ("cluster_config", "open_private_atomic_file", "cli"),
-    ("session_lifecycle", "start_remote_session_durable", "cli"),
+    ("cluster_config", "open_private_atomic_file", "cli_cleanup_evidence"),
+    ("session_lifecycle", "start_remote_session_durable", "cli_session_start"),
     # #231 cli.py decomposition: moved caller cli -> cli_api with the api
     # command-group extraction (api_start was each symbol's only cli.py call
     # site).
@@ -214,8 +224,8 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # session command-group extraction (submit_owned_session_job's only
     # cli.py call site was session_submit_jarvis).
     ("session_api", "submit_owned_session_job", "cli_session"),
-    ("validation_report", "write_validation_report", "cli"),
-    ("remote_cli", "remote_command_timeout", "cli"),
+    ("validation_report", "write_validation_report", "cli_session_teardown"),
+    ("remote_cli", "remote_command_timeout", "cli_job"),
     # #231 cli.py decomposition: moved caller cli -> cli_cluster_deploy with
     # the cluster deployment command-group extraction (cluster_install_app's
     # only cli.py call site).
@@ -237,8 +247,12 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # the cluster deployment command-group extraction (cluster_restart_
     # endpoint_service's only cli.py call site).
     ("deployment", "restart_endpoint_user_service_over_ssh", "cli_cluster_deploy"),
-    ("relay_ops", "job_status", "cli"),
-    ("cluster_config", "acquire_private_configuration_windows_parent_guard", "cli"),
+    ("relay_ops", "job_status", "cli_job_records"),
+    (
+        "cluster_config",
+        "acquire_private_configuration_windows_parent_guard",
+        "cli_cleanup_evidence",
+    ),
     # #231 cli.py decomposition: moved caller cli -> cli_scheduler with the
     # scheduler command-group extraction (every call site was inside it).
     ("scheduler_providers", "allocation_connector_provider_for_scheduler", "cli_scheduler"),
@@ -250,7 +264,7 @@ AUDITED_COLLABORATORS: tuple[tuple[str, str, str], ...] = (
     # with the remote_mcp_app extraction (remote-mcp-validate's fresh-Spack
     # transition report; its only call site).
     ("remote_mcp", "build_remote_mcp_acceptance_report", "remote_mcp_validation"),
-    ("jarvis_mcp", "jarvis_mcp_server", "cli"),
+    ("jarvis_mcp", "jarvis_mcp_server", "cli_jarvis_mcp"),
     # #231 cli.py decomposition: moved caller cli -> cli_jarvis_mcp with the
     # jarvis-mcp command-group extraction (mcp_call's and jarvis_mcp_call's
     # only cli.py call sites, both now in this same module).

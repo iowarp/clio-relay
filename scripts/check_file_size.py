@@ -338,7 +338,69 @@ RATCHET_BASELINE: dict[str, int] = {
     # real owner module remote_mcp_validation.py. cli.py keeps only the
     # shared discovery/artifact-reading helpers still used by the resident
     # JARVIS execution-query engine: -1464 net lines.
-    "src/clio_relay/cli.py": 9679,
+    # #231 wave-2 (session start/teardown + the resident JARVIS
+    # execution-query engine, the two blocks the wave-1 command-module
+    # passes above deliberately left cli.py-resident): a 24-module,
+    # AST-driven mechanical extraction (every top-level def/class/constant
+    # moved verbatim; cross-module bare-name references rewritten to
+    # `module.name` at their exact recorded position, never a blind
+    # text search-and-replace). Owner modules: cli_cleanup_evidence.py (463,
+    # the crash-released cleanup-evidence lock + Windows directory pinning),
+    # cli_cleanup_report.py (98, the start/teardown-shared finalized-report
+    # verifier), cli_session_start.py (314, the `session start` command),
+    # cli_owned_relay_jobs.py (753), cli_owned_scheduler_cancel.py (660),
+    # cli_owned_runtime_cleanup.py (354), cli_owned_session_recovery.py
+    # (491), cli_owner_session_teardown_verify.py (272),
+    # cli_jarvis_remote_contract.py (239), cli_jarvis_artifact_io.py (155),
+    # cli_jarvis_package_search.py (93), cli_jarvis_execution_types.py (80),
+    # cli_jarvis_intent_checkpoint.py (121), cli_jarvis_pending_report.py
+    # (300), cli_jarvis_resume_checkpoint.py (465), cli_jarvis_dispatch.py
+    # (170), cli_jarvis_query_observation.py (658),
+    # cli_jarvis_execution_run.py (361), cli_remote_collection_pagination.py
+    # (299, the paginated collection walker owned_runtime_cleanup and the
+    # JARVIS engine both call), cli_remote_worker_probe.py (293),
+    # cli_transport_validation.py (284), cli_remote_worker_attach.py (177).
+    # `session teardown` (a ~1400-line deeply nested closure factory --
+    # `action` -> `checkpoint_finalized_cleanup_artifact`/
+    # `emit_completed_report`/`emit_finalized_retry_report` ->
+    # `guarded_action` -> `locked_action` -- threading ~20 enclosing local
+    # variables, including the mutable `canonical_report` cell and the
+    # evidence lock, through Python closures rather than explicit
+    # parameters) and `_persist_local_cleanup_report_artifact` (810 lines,
+    # its own sequential chunk-hash-and-write body) each move as one
+    # atomic, unsplit unit into their own new files -- splitting either
+    # into standalone top-level functions would mean converting closures
+    # into an explicit multi-parameter API, a semantic rewrite of
+    # security-sensitive cleanup-evidence-locked code out of scope for a
+    # verbatim move -- so cli_session_teardown.py and
+    # cli_owned_report_artifact.py enter RATCHET_BASELINE below rather than
+    # forcing an unsafe split. Every external sibling module that reached a
+    # moved symbol via `cli.<name>` (cli_session.py, cli_session_owned.py,
+    # cli_gateway_runtime.py, cli_remote_mcp.py, remote_mcp_validation.py,
+    # cli_jarvis_mcp.py, cli_jarvis_mcp_validate.py,
+    # cli_remote_mcp_validate.py, cli_scheduler.py, cli_diagnostics.py,
+    # cli_queue_maintenance.py, cli_cluster_deploy.py, cli_relay_host.py --
+    # 89 call sites total) was updated to reach the real new owner module
+    # directly, matching the wave-1 "moved caller cli -> X" precedent
+    # already used throughout this table. Now 429 lines -- an assembly of
+    # imports, `app` setup, the ~15 top-level command registrations, and
+    # the cli_support.py-forwarded/still-resident shared-plumbing tail
+    # (`_run_or_exit`, `_require_cluster`, `_managed_queue_from_env`, the
+    # JSON/artifact-use/environment-reference helpers, and a handful of
+    # small JARVIS-validation constants three of the new JARVIS modules
+    # still reach via the same `cli.<name>` forwarding pattern, since they
+    # also have a pre-existing external caller in cli_jarvis_mcp_validate.py
+    # this pass did not otherwise touch). Under DEFAULT_MAX_LINES -- entry
+    # removed per ground rule 5, the largest single ratchet-down of the
+    # #231 campaign.
+    #
+    # The two irreducible units the wave-2 pass above carved out on their
+    # own, each new but already over DEFAULT_MAX_LINES for the closure/
+    # sequential-body reasons that comment explains -- entered here rather
+    # than force-split, per this file's own docstring ("a known-oversized
+    # module still awaiting decomposition").
+    "src/clio_relay/cli_session_teardown.py": 1524,
+    "src/clio_relay/cli_owned_report_artifact.py": 878,
     # #231 R5: +16 net lines -- FrpTransportConfig gains proxy_name +
     # identity_anchor (the §8.3 typed opt-in frp_transport.py's build_transport
     # refusal reads) plus the IdentityAnchor type alias and its docstring. No

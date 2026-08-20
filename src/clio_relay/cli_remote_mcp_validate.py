@@ -139,6 +139,7 @@ def remote_mcp_validate(
 ) -> None:
     """Call one virtual tool and emit canonical durable acceptance evidence."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 
     canonical_report_path = validation_report or default_report_path(cluster)
     canonical_written = [False]
@@ -239,7 +240,9 @@ def remote_mcp_validate(
         queue.initialize()
         execute_remotely = remote_cli.should_execute_on_cluster(prepared.definition)
         remote_install_info = (
-            cli._remote_worker_info(prepared.definition) if execute_remotely else None
+            cli_remote_worker_probe._remote_worker_info(prepared.definition)
+            if execute_remotely
+            else None
         )
         cache = RemoteMcpSchemaCache.load(
             default_remote_mcp_cache_path(registry_path=prepared.registry_path)

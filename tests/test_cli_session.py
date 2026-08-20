@@ -34,6 +34,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.session_api as session_api
 import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay import cli
@@ -168,7 +170,9 @@ def test_cli_session_detach_never_records_owner_session_closure(
         return []
 
     monkeypatch.setattr(session_lifecycle, "detach_remote_session", fake_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", fake_gateway_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", fake_gateway_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -223,8 +227,12 @@ def test_cli_session_detach_reports_success_when_optional_worker_observation_tim
         return None, RelayError("remote command timed out after 20 seconds: ares")
 
     monkeypatch.setattr(session_lifecycle, "detach_remote_session", retained_session)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup)
-    monkeypatch.setattr(cli, "_observe_worker_before_cleanup", timed_out_worker_observation)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_observe_worker_before_cleanup", timed_out_worker_observation
+    )
 
     result = CliRunner().invoke(
         app,
@@ -294,7 +302,9 @@ def test_cli_session_detach_default_report_failure_controls_exit(
         raise AssertionError("unverified detach must not mutate gateway connectors")
 
     monkeypatch.setattr(session_lifecycle, "detach_remote_session", incomplete_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", forbidden_gateway_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", forbidden_gateway_cleanup
+    )
 
     result = CliRunner().invoke(
         app,
@@ -347,7 +357,9 @@ def test_cli_session_detach_rejects_generation_change_after_connector_cleanup(
         return []
 
     monkeypatch.setattr(session_lifecycle, "detach_remote_session", changing_detach)
-    monkeypatch.setattr(cli, "_cleanup_owned_runtime_sessions", record_gateway_cleanup)
+    monkeypatch.setattr(
+        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", record_gateway_cleanup
+    )
 
     result = CliRunner().invoke(
         app,

@@ -117,6 +117,8 @@ def gateway_start_runtime(
 ) -> None:
     """Start and bind a scheduler-backed streaming service runtime."""
     import clio_relay.cli as cli
+    import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     canonical_report_path = validation_report or default_report_path(cluster)
     report_id: list[str | None] = [None]
@@ -158,7 +160,7 @@ def gateway_start_runtime(
                 session_generation_id=owner_session_generation_id,
                 transition_lock_factory=cli._session_transition_lock,
                 session_status_reader=session_lifecycle.status_remote_session,
-                admission_status_reader=cli._owner_session_admission_status,
+                admission_status_reader=cli_owned_relay_jobs._owner_session_admission_status,
             ) as admission:
                 result = supervisor.start(
                     name=name,
@@ -181,7 +183,9 @@ def gateway_start_runtime(
             # remote observation that could hide the already-durable result.
             validation_report_module.write_validation_report(canonical, canonical_report_path)
         else:
-            cli._write_remote_verified_report(canonical, definition, canonical_report_path)
+            cli_remote_worker_attach._write_remote_verified_report(
+                canonical, definition, canonical_report_path
+            )
         payload = public_gateway_session(result.session)
         if isinstance(result, ServiceRuntimePendingResult):
             payload["outcome"] = result.outcome
@@ -264,6 +268,8 @@ def gateway_resume_runtime(
 ) -> None:
     """Advance one exact submitted runtime without creating another scheduler job."""
     import clio_relay.cli as cli
+    import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     canonical_report_path = validation_report or default_report_path(cluster)
     report_id: list[str | None] = [None]
@@ -313,7 +319,7 @@ def gateway_resume_runtime(
                 session_generation_id=typed_owner_generation_id,
                 transition_lock_factory=cli._session_transition_lock,
                 session_status_reader=session_lifecycle.status_remote_session,
-                admission_status_reader=cli._owner_session_admission_status,
+                admission_status_reader=cli_owned_relay_jobs._owner_session_admission_status,
             ) as admission:
                 if admission.owner_session_admission_id != typed_owner_admission_id:
                     raise RelayError("owned gateway runtime admission identity changed")
@@ -332,7 +338,9 @@ def gateway_resume_runtime(
             # observation after the exact runtime query already completed.
             validation_report_module.write_validation_report(canonical, canonical_report_path)
         else:
-            cli._write_remote_verified_report(canonical, definition, canonical_report_path)
+            cli_remote_worker_attach._write_remote_verified_report(
+                canonical, definition, canonical_report_path
+            )
         payload = public_gateway_session(result.session)
         if isinstance(result, ServiceRuntimePendingResult):
             payload["outcome"] = result.outcome
@@ -473,9 +481,10 @@ def gateway_detach_runtime(
 ) -> None:
     """Stop the owned desktop connector while retaining the remote runtime and job."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     canonical_report_path = validation_report or default_report_path(cluster)
-    seed_report = cli._new_cleanup_acceptance_report(
+    seed_report = cli_remote_worker_attach._new_cleanup_acceptance_report(
         scenario="gateway-runtime",
         cluster=cluster,
         mode="detach",
@@ -515,7 +524,9 @@ def gateway_detach_runtime(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        cli._write_remote_verified_report(canonical, definition, canonical_report_path)
+        cli_remote_worker_attach._write_remote_verified_report(
+            canonical, definition, canonical_report_path
+        )
         payload = result.json_payload()
         payload["session"] = public_gateway_session(result.session)
         payload["validation_report"] = str(canonical_report_path.resolve())
@@ -653,9 +664,10 @@ def gateway_stop_runtime(
 ) -> None:
     """Stop owned runtime relay connectors and optionally cancel scheduler work."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     canonical_report_path = validation_report or default_report_path(cluster)
-    seed_report = cli._new_cleanup_acceptance_report(
+    seed_report = cli_remote_worker_attach._new_cleanup_acceptance_report(
         scenario="gateway-runtime",
         cluster=cluster,
         mode="teardown",
@@ -698,7 +710,9 @@ def gateway_stop_runtime(
             update={"report_id": seed_report.report_id, "started_at": seed_report.started_at}
         )
         canonical_report[0] = canonical
-        cli._write_remote_verified_report(canonical, definition, canonical_report_path)
+        cli_remote_worker_attach._write_remote_verified_report(
+            canonical, definition, canonical_report_path
+        )
         payload = result.json_payload()
         payload["session"] = public_gateway_session(result.session)
         payload["validation_report"] = str(canonical_report_path.resolve())

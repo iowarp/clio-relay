@@ -388,6 +388,7 @@ def queue_validate(
 ) -> None:
     """Validate real bounded queue admission, cleanup, and scheduler preservation."""
     import clio_relay.cli as cli
+    import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 
     resolved_report = report or default_report_path(cluster)
     artifact_sha256 = validation_artifact_sha256 or (
@@ -430,7 +431,9 @@ def queue_validate(
             canonical = LiveValidationReport.model_validate_json(
                 remote_cli.run_remote_clio(definition, args).strip()
             )
-            cli._write_remote_verified_report(canonical, definition, resolved_report)
+            cli_remote_worker_attach._write_remote_verified_report(
+                canonical, definition, resolved_report
+            )
             if markdown_report is not None:
                 ValidationRecorder(canonical).write(resolved_report, markdown_report)
         else:

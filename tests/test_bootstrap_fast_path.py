@@ -30,6 +30,7 @@ import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspecti
 import clio_relay.bounded_process as bounded_process
 import clio_relay.cli as cli
 import clio_relay.cli_installation_receipt as cli_installation_receipt
+import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.core_queue as core_queue
 import clio_relay.installation as installation
 from clio_relay import __version__
@@ -2101,7 +2102,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     def remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
         return {"verified": True}
 
-    monkeypatch.setattr(cli, "_remote_target_identity", remote_target_identity)
+    monkeypatch.setattr(cli_remote_worker_probe, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
         cli.app,
