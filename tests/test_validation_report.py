@@ -185,9 +185,7 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(
     parent = tmp_path / "reports"
     parent.mkdir(mode=0o700)
     displaced = tmp_path / "displaced-reports"
-    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        parent
-    )
+    writer_lock = validation_writer_lock_module.acquire_validation_writer_lock(parent)
     try:
         parent.rename(displaced)
         if create_replacement:
@@ -199,9 +197,7 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(
                 writer_lock=writer_lock,
             )
     finally:
-        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            writer_lock
-        )
+        validation_writer_lock_module.release_validation_writer_lock(writer_lock)
 
     assert parent.exists() is create_replacement
     if create_replacement:
