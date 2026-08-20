@@ -1014,7 +1014,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # (mcp_dispatch.py's `_call_tool` reaches them only through the
     # `_mcp_server.<name>` back-reference too); the two internal helpers
     # need no re-export since nothing outside this module calls them.
-    "src/clio_relay/mcp_server.py": 3282,
     #
     # split/mcp-server-w3 slice 6 (#231): the gateway-session / monitor-rule /
     # progress MCP tools (_monitor_rule_from_arguments, _record_progress,
@@ -1104,6 +1103,41 @@ RATCHET_BASELINE: dict[str, int] = {
     # split/mcp-server-w3 also forked after all four of those w2 branches had
     # already landed on develop, so it never carried their stale entries in
     # the first place -- no reintroduction to omit.)
+    #
+    # split/mcp-server-w3 slice 7 (#231): the MCP result-verification/
+    # artifact-completion cluster (the largest, most interconnected cluster
+    # split so far) splits along its natural seam into mcp_remote_transport.py
+    # (paged remote/owned-session JSON fetching and collection completion:
+    # _remote_json, _remote_json_value, _owned_json, _validate_owned_job_status,
+    # _complete_local_artifacts, _complete_remote_collection,
+    # _complete_owned_collection, _validate_complete_collection_page,
+    # _remote_job_logs, _owned_job_logs) and mcp_result_verification.py (MCP
+    # result decoding/verification and terminal-evidence shaping:
+    # _VerifiedMcpResult, _verified_mcp_result, _owned_mcp_result_is_required,
+    # _verified_owned_mcp_result, _verified_local_mcp_result,
+    # _decode_verified_mcp_result, _mcp_result_artifact, _bounded_mcp_result,
+    # _restore_jarvis_service_authorization_descriptors,
+    # _jarvis_service_runtime_items, _mcp_tool_result_failed,
+    # _public_mcp_result_artifact, _attach_terminal_mcp_evidence,
+    # _render_remote_mcp_context). Fresh split off current develop: the #264
+    # fix already deleted the dead _read_model_artifact_bytes helper (its only
+    # caller, the old inline relay_read_artifact dispatch body, was replaced by
+    # artifact_routing.read_artifact in slice 3), so it is not part of this
+    # cluster and mcp_server.py carries no matching re-export for it -- wave-1's
+    # own history for this slice lists it among the moved names because that
+    # branch forked before #264 landed; it is correctly absent here.
+    # Five bare calls inside the cluster need the `_mcp_server.<name>`
+    # function-scope back-reference instead of a same-module bare call:
+    # `_remote_json_value` -> `run_remote_clio`;
+    # `_complete_remote_collection`/`_remote_job_logs`/`_verified_mcp_result` ->
+    # `_remote_json`; `_verified_local_mcp_result` -> `_complete_local_artifacts`
+    # -- splitting the cluster into two modules did not change any of these,
+    # since the target is monkeypatched either way. mcp_server.py re-exports
+    # `_bounded_mcp_result`/`_decode_verified_mcp_result` (read directly off
+    # mcp_server_module by tests, not monkeypatched, just no longer called bare
+    # in this file) alongside the rest of the cluster's dispatcher-reached
+    # names.
+    "src/clio_relay/mcp_server.py": 2554,
     # #231 R5: +28 net lines -- an `identity_anchor` property (derived from
     # cluster config, independent of link state, §8.3) plus stamping it on
     # every `channel_event(...)` call site (9) and surfacing it in
