@@ -716,7 +716,7 @@ Install the cluster-side server once, then launch its persistent executable:
 
 ```bash
 uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.10.2/clio_kit-2.10.2-py3-none-any.whl
+  https://github.com/iowarp/clio-kit/releases/download/v2.10.3/clio_kit-2.10.3-py3-none-any.whl
 clio-kit mcp-server jarvis
 ```
 

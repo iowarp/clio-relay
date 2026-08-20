@@ -99,7 +99,7 @@ DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS = 7.0
 DEFAULT_EXECUTION_WATCH_CEILING_SECONDS = 24 * 60 * 60
 
 #: Typed reason recorded when a client asks to cancel a job mid-watch.
-#: JARVIS's registered user contract (``_contracts/jarvis-user-v3.7.1.json``)
+#: JARVIS's registered user contract (``_contracts/jarvis-user-v3.7.2.json``)
 #: exposes no cancel tool alongside ``jarvis_run``/``jarvis_get_execution``
 #: -- owner ruling (#266): relay must never issue a raw ``scancel`` against
 #: a scheduler job JARVIS submitted and owns. Refuse the cancel request
