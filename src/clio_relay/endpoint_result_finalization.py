@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import cast
 
 from clio_relay.console_stream import (
+    CONSOLE_STDERR_STREAM,
     CONSOLE_STREAM,
     ConsoleLiveTailer,
     flush_terminal_console_from_path,
+    flush_terminal_console_stderr_from_path,
 )
 from clio_relay.endpoint_sidecar_types import (
     AGENT_RESULT_MAX_BYTES,
@@ -46,14 +48,16 @@ class ResultFinalizationMixin:
         result_path: Path,
         console_tailer: ConsoleLiveTailer | None,
     ) -> None:
-        """Guarantee the console stream carries the application's full log.
+        """Guarantee the console/console_stderr streams carry the
+        application's full logs.
 
         The #259 terminal-flush half: the live tailer wired through
         ``on_poll`` is a best-effort demo aid, but this call -- triggered
         for every ``mcp_result`` artifact index, including worker-restart
         recovery replay where no live tailer ever ran -- is the one that
-        must always succeed at making ``console`` complete, or report a
-        typed, non-fatal reason. It never fails the job.
+        must always succeed at making ``console``/``console_stderr``
+        complete, or report a typed, non-fatal reason. It never fails the
+        job.
         """
         if not (
             job.kind is JobKind.MCP_CALL
@@ -69,6 +73,16 @@ class ResultFinalizationMixin:
                 outcome.message or "console terminal flush reason",
                 payload={"stream": CONSOLE_STREAM, "reason": outcome.reason},
             )
+        stderr_outcome = flush_terminal_console_stderr_from_path(
+            spool, result_path, tailer=console_tailer
+        )
+        if stderr_outcome.reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                f"console_stderr.{stderr_outcome.reason}",
+                stderr_outcome.message or "console_stderr terminal flush reason",
+                payload={"stream": CONSOLE_STDERR_STREAM, "reason": stderr_outcome.reason},
+            )
 
     def _append_optional_result_artifacts(
         self,
@@ -76,7 +90,15 @@ class ResultFinalizationMixin:
         spool: JobSpool,
         *,
         console_tailer: ConsoleLiveTailer | None = None,
-    ) -> None:
+    ) -> dict[str, object] | None:
+        """Index the job's optional terminal result artifacts.
+
+        Returns clio-relay#265's typed ``outputs_missing`` payload (or
+        ``None``) from the ONE ``mcp_result`` ingest this method always
+        performs for a terminal jarvis_run -- the caller
+        (``_run_job_impl``) folds it into the job's success/failure verdict.
+        """
+        outputs_missing: dict[str, object] | None = None
         candidates = {
             "agent_result": spool.path / "agent-result.json",
             "agent_last_message": spool.path / "agent-last-message.txt",
@@ -88,13 +110,17 @@ class ResultFinalizationMixin:
             candidate = None
             if kind == "agent_last_message" and job.kind is JobKind.REMOTE_AGENT:
                 candidate = self._remote_agent_final_artifact(job, spool, path)
+            if kind == "mcp_result":
+                _indexed, _truncation, outputs_missing = ingest_jarvis_execution_outputs_from_path(
+                    self.queue, job, path, spool.path
+                )
+                self._flush_terminal_console(job, spool, path, console_tailer)
             if self._append_spool_artifact_once(
                 job,
                 spool,
                 path,
                 kind=kind,
                 candidate=candidate,
-                console_tailer=console_tailer,
             ):
                 self.queue.append_event(
                     job.job_id,
@@ -102,6 +128,7 @@ class ResultFinalizationMixin:
                     f"Result artifact available: {kind}",
                     payload={"path": str(path)},
                 )
+        return outputs_missing
 
     def _remote_agent_final_artifact(
         self,
@@ -172,13 +199,17 @@ class ResultFinalizationMixin:
         *,
         kind: str,
         candidate: ArtifactRef | None = None,
-        console_tailer: ConsoleLiveTailer | None = None,
     ) -> bool:
-        """Index one immutable spool artifact, tolerating restart replay."""
+        """Index one immutable spool artifact, tolerating restart replay.
+
+        ``mcp_result`` no longer ingests declared JARVIS execution outputs
+        here (moved to each caller, #265): the ingest's typed
+        ``outputs_missing`` verdict must reach the caller, and this helper's
+        return type (a plain "was newly indexed" bool) is shared by five
+        call sites across three modules, most of which have nothing to do
+        with a terminal jarvis_run result.
+        """
         candidate = candidate or spool.artifact_for(path, kind=kind)
-        if kind == "mcp_result":
-            ingest_jarvis_execution_outputs_from_path(self.queue, job, path, spool.path)
-            self._flush_terminal_console(job, spool, path, console_tailer)
         cursor: int | None = 1
         while cursor is not None:
             artifacts, cursor, _total = self.queue.list_artifacts_page(

@@ -47,6 +47,7 @@ from clio_relay.jarvis_dispatch_failure import (
     JARVIS_DISPATCH_REFUSAL_RESOLUTION,
     JarvisDispatchRefusal,
 )
+from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs_from_path
 from clio_relay.jarvis_run_environment import (
     jarvis_run_environment_values,
     registered_site_spack_command,
@@ -430,11 +431,25 @@ class JarvisDispatchMixin:
             ("stdout", spool.path / "stdout.log"),
             ("stderr", spool.path / "stderr.log"),
             ("console", spool.path / "console.log"),
+            ("console_stderr", spool.path / "console_stderr.log"),
             ("log_capture", spool.log_capture_path),
             ("mcp_result", spool.path / "mcp-result.json"),
         ):
             if not internal_filesystem_path(path).is_file():
                 raise RelayError(f"recovered JARVIS spool omitted {kind}: {path}")
+            if kind == "mcp_result":
+                # #265: this crash-recovery reconciliation path (a worker
+                # restart finalizing a JARVIS dispatch abandoned mid-run) is
+                # NOT wired into #265's terminal-state fold today -- it never
+                # reaches `_run_job_impl`/`resolve_execution_outcome`, whose
+                # target state this method's own caller already computes
+                # independently (`endpoint_execution_lifecycle.py`). The
+                # ingest still runs so #252's output indexing keeps working
+                # and the typed `jarvis.execution_output_missing`/`_empty`/
+                # `_outputs_missing` events still land on the job's event
+                # log for observability -- only the FORCED-failure fold is
+                # the known, documented gap here.
+                ingest_jarvis_execution_outputs_from_path(self.queue, job, path, spool.path)
             created = self._append_spool_artifact_once(job, spool, path, kind=kind)
             if created and kind == "mcp_result":
                 self.queue.append_event(
