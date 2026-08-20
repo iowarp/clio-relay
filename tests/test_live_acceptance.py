@@ -279,7 +279,7 @@ def test_transport_http_client_sends_exact_owned_session_binding(
         captured.update({name.lower(): value for name, value in request.header_items()})
         return _HttpResponse()
 
-    monkeypatch.setattr("clio_relay.live_acceptance.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.urllib.request.urlopen", urlopen)
 
     assert _http_json(
         "http://127.0.0.1:18000",
@@ -1530,7 +1530,7 @@ def test_live_acceptance_verifies_transport_when_enabled(
         raise AssertionError(f"unexpected command: {command}")
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     lines = run_live_acceptance(
         LiveAcceptanceOptions(
@@ -1628,7 +1628,7 @@ def test_live_acceptance_report_records_exact_transport_cleanup_resources(
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     run_live_acceptance(
         LiveAcceptanceOptions(
@@ -1706,7 +1706,7 @@ def test_live_acceptance_report_preserves_partial_transport_cleanup(
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     with pytest.raises(RelayError, match="structured residual resources"):
         run_live_acceptance(
@@ -1776,7 +1776,7 @@ def test_live_acceptance_report_ingests_cleanup_evidence_attached_to_probe_failu
         "clio_relay.live_acceptance.run_cluster_doctor",
         fake_cluster_doctor,
     )
-    monkeypatch.setattr("clio_relay.live_acceptance.run_frp_http_probe", fake_transport)
+    monkeypatch.setattr("clio_relay.live_acceptance_transport.run_frp_http_probe", fake_transport)
 
     with pytest.raises(RelayError, match="failed during cleanup"):
         run_live_acceptance(
@@ -1816,7 +1816,7 @@ def test_live_acceptance_rejects_transport_without_verified_cleanup(
         fake_cluster_doctor,
     )
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_http_probe",
         fake_transport,
     )
 
@@ -1872,7 +1872,7 @@ def test_live_acceptance_verifies_direct_transport_when_enabled(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -1927,7 +1927,7 @@ def test_live_acceptance_verifies_configured_direct_transport(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -1972,7 +1972,7 @@ def test_live_acceptance_rejects_direct_transport_fallback_unless_allowed(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
@@ -2008,7 +2008,7 @@ def test_live_acceptance_requires_full_direct_xtcp_evidence(
 
     monkeypatch.setattr("clio_relay.live_acceptance.run_cluster_doctor", fake_cluster_doctor)
     monkeypatch.setattr(
-        "clio_relay.live_acceptance.run_frp_direct_http_probe",
+        "clio_relay.live_acceptance_transport.run_frp_direct_http_probe",
         fake_direct_transport,
     )
 
