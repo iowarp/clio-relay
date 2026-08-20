@@ -168,8 +168,25 @@ RATCHET_BASELINE: dict[str, int] = {
     # resolve_receipt_bound_jarvis_python now DEFER under dev mode loudly
     # instead of crash-looping a hand-deployed worker (the un-deferred
     # execution_runtime_verified check restarted the ares worker every ~10s;
-    # #250 family). Ratchets back with the #255 bootstrap decomposition.
-    "src/clio_relay/bootstrap_reconcile.py": 4490,
+    # #250 family).
+    # #255 split/bootstrap-reconcile: bootstrap_reconcile.py becomes a thin
+    # 184-line facade (schema/constant + every public and private symbol
+    # re-exported verbatim under its original name) over seventeen new owner
+    # modules -- bootstrap_reconcile_constants.py (33), _primitives.py (351,
+    # the acyclic filesystem/identity base every other owner imports from),
+    # _models.py (272), _transaction.py (291), _locks.py (122),
+    # _execution_identity.py (264), _readiness.py (111),
+    # _activation_paths.py (548 -- above the 150-500 sweet spot: it owns
+    # _verify_stable_symlink, verified through by generation inspection,
+    # JARVIS wrapper binding, repository reconciliation, and reconcile
+    # planning alike, so splitting it further would mean rewriting that
+    # shared primitive's home, not moving it), _inspection.py (333),
+    # _jarvis_wrapper_binding.py (380), _generation_staging.py (325),
+    # _replacement_provider.py (245), _planning.py (409 -- one function,
+    # plan_bootstrap_reconcile, deliberately kept alone since a further cut
+    # would mean rewriting its body), _planning_support.py (242),
+    # _receipt.py (358), _builtin_repos.py (213), _repository.py (443).
+    # Under DEFAULT_MAX_LINES -- entry removed per ground rule 5.
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.
