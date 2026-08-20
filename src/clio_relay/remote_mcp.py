@@ -15,44 +15,68 @@ import hmac
 import json
 import logging
 import math
-import os
 import re
-import time
-from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from filelock import FileLock
-from jsonschema import (
-    Draft3Validator,
-    Draft4Validator,
-    Draft6Validator,
-    Draft7Validator,
-    Draft201909Validator,
-    Draft202012Validator,
-)
-from jsonschema.exceptions import SchemaError
-from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from jsonschema import Draft202012Validator
 
+# Release-acceptance evidence wire models moved to
+# remote_mcp_acceptance_models.py (#231; design doc §4.5/§5). Every model
+# class this module still references directly is re-exported under its
+# original name -- cli.py and remote_mcp.py's own validator functions
+# (staying here; doc §4.5 flags that cluster as needing reordering, a
+# separate slice) construct and consume them. Three of the four bound
+# Spack-configuration constants (cli.py's own Spack fresh-install report
+# command imports them, but nothing in remote_mcp.py's own body reads them
+# any more) are re-exported below via qualified assignment rather than a
+# `from ... import` -- ruff's unused-import check has no equivalent for a
+# plain module-level assignment, so this is the re-export-only idiom
+# (matching cli_support.py's forwarder pattern) instead of a `from` import
+# ruff would keep stripping as dead. RemoteMcpSpackConfigurationComponentObservation
+# is used only inside the moved model definitions themselves and has no
+# external importer either, so it alone is not re-exported.
+# _acceptance_artifact_resource and _append_spack_transition_resources are
+# private with no callers outside
+# RemoteMcpAcceptanceReport.to_live_validation_report itself, so they are
+# not re-exported either.
+# The schema discovery cache (classes, digest/fingerprint helpers, and the
+# durable-artifact parser) moved to remote_mcp_cache.py (#231; design doc
+# §4.5/§5). Eight of these nine names have a real reader elsewhere in this
+# file's own catalog-assembly/admission-resolution code (confirmed by grep
+# before the move), so they are imported via a plain `from ... import` with
+# no unused-import risk -- that same import is the re-export cli.py,
+# mcp_server.py, jarvis_mcp.py, and jarvis_mcp_validation.py rely on.
+# remote_mcp_server_artifact_binding_verified has no reader left in this
+# file's own body -- only endpoint.py and jarvis_service_runtime.py import
+# it directly -- so it is re-exported via qualified assignment instead
+# (ruff's unused-import check has no equivalent for a plain module-level
+# assignment, unlike the `from ... import` it kept stripping as dead).
+# Agent-facing JSON-Schema builders for remote MCP job receipts/handoffs
+# moved to remote_mcp_wire_schemas.py (#231; design doc §4.5/§5). All four
+# names are re-exported under their original names -- mcp_server.py,
+# jarvis_mcp.py, jarvis_mcp_validation.py, and tests import them directly
+# from clio_relay.remote_mcp. VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA and
+# virtual_jarvis_job_output_schema have a real local reader too
+# (VirtualRemoteMcpTool.definition), so they use a plain `from ... import`.
+# cluster_route_revision_json_schema and jarvis_service_runtime_handoff_json_schema
+# have no reader left in this file's own body (both calls moved into
+# remote_mcp_wire_schemas.py's own definitions), so they are re-exported via
+# qualified assignment instead (ruff's unused-import check has no
+# equivalent for a plain module-level assignment).
+from clio_relay import remote_mcp_acceptance_models, remote_mcp_cache, remote_mcp_wire_schemas
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
-    RemoteMcpProfile,
     RemoteMcpServerConfig,
     cluster_route_revision,
     default_registry_path,
-    ensure_private_configuration_directory,
-    open_private_atomic_file,
-    read_bounded_configuration_bytes,
 )
 from clio_relay.errors import NotFoundError, RelayError
-from clio_relay.identifiers import durable_record_id_json_schema
 from clio_relay.models import (
     REGISTERED_JARVIS_USER_CONTRACT,
     JobKind,
@@ -63,39 +87,160 @@ from clio_relay.models import (
     McpControlQueryEvidence,
     McpOperation,
 )
+from clio_relay.remote_mcp_acceptance_models import (
+    MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL,
+    RemoteMcpAcceptanceCheck,
+    RemoteMcpAcceptanceReport,
+    RemoteMcpCatalogIssue,
+    RemoteMcpSpackConfigurationObservation,
+    RemoteMcpSpackInstallTransitionEvidence,
+    RemoteMcpSpackTransitionArtifactEvidence,
+    RemoteMcpSpackTransitionCallEvidence,
+    RemoteMcpSpackTransitionStdioEvidence,
+    RemoteMcpStructuredResultExpectation,
+    _is_canonical_absolute_posix_path,
+    _is_canonical_relative_posix_path,
+)
+
+# Virtual tool alias assignment/collision-resolution moved to
+# remote_mcp_aliasing.py (#231; design doc §4.5/§5). None of these have a
+# caller outside remote_mcp.py's own catalog-assembly code, so they are
+# imported directly with no re-export needed.
+from clio_relay.remote_mcp_aliasing import (
+    MAX_VIRTUAL_REMOTE_MCP_CANDIDATES,
+    _assign_aliases,
+    _profile_allows,
+    _safe_name,
+)
+from clio_relay.remote_mcp_cache import (
+    RemoteMcpSchemaCache,
+    RemoteMcpSchemaCacheEntry,
+    cache_entry_from_discovery_artifact,
+    default_remote_mcp_cache_path,
+    remote_mcp_execution_fingerprint,
+    remote_mcp_registration_revision,
+    remote_mcp_schema_digest,
+    remote_mcp_server_artifact_digest,
+)
+
+# JSON / JSON-Schema validation primitives moved to
+# remote_mcp_schema_validation.py (#231; design doc §4.5/§5). Imported
+# directly -- these are private helpers with no external callers, so no
+# re-export under the old name is needed here.
+from clio_relay.remote_mcp_schema_validation import (
+    _JSON_SCHEMA_VALIDATORS,
+    _bounded_diagnostic,
+    _JsonSchemaInstanceValidator,
+    _require_bounded_json_structure,
+    _require_finite_json,
+    _validate_json_schema,
+)
+
+# Local relay control envelope injection moved to
+# remote_mcp_schema_wrapping.py (#231; design doc §4.5/§5).
+# inject_cluster_argument and VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS are
+# re-exported under their original names -- tests import the former
+# directly, and queue_tasks.py imports the latter directly (plus this
+# file's own catalog-assembly body still reads it). VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS
+# and MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES are imported back for this file's own
+# remaining readers but have no external importer, so they are not
+# re-exported. Every other name is private with no caller outside
+# remote_mcp.py's own body, imported directly with no re-export.
+from clio_relay.remote_mcp_schema_wrapping import (
+    MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES,
+    VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
+    inject_cluster_argument,
+    remote_input_schema_requires_wrapper,
+    virtual_schema_error,
+)
+
+# Tool schema, discovery provenance, and identity-verification primitives
+# moved to remote_mcp_tool_schema.py (#231; design doc §4.5/§5).
+# RemoteMcpToolSchema, RemoteMcpDiscoveryProvenance, and
+# is_remote_mcp_control_query are re-exported under their original names --
+# several other modules and tests import them directly from
+# clio_relay.remote_mcp. The rest are private helpers with no callers
+# outside remote_mcp.py, imported directly with no re-export needed.
+from clio_relay.remote_mcp_tool_schema import (
+    REMOTE_MCP_CACHE_SOURCE,
+    RemoteMcpDiscoveryProvenance,
+    RemoteMcpToolSchema,
+    _immutable_remote_mcp_install_verified,
+    _is_sha256,
+    _server_artifact_verified,
+    _stable_digest,
+    is_remote_mcp_control_query,
+)
+from clio_relay.remote_mcp_wire_schemas import (
+    VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
+    virtual_jarvis_job_output_schema,
+)
 
 if TYPE_CHECKING:
     from clio_relay.core_queue import ClioCoreQueue
-    from clio_relay.validation_report import LiveValidationReport, ValidationResource
 
 JSON = dict[str, Any]
 MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS = 600
-REMOTE_MCP_CACHE_ENV = "CLIO_RELAY_REMOTE_MCP_CACHE"
-REMOTE_MCP_CACHE_VERSION = 1
-REMOTE_MCP_CACHE_SOURCE = "durable_relay_mcp_tools_list"
-MAX_REMOTE_MCP_CACHE_BYTES = 16 * 1024 * 1024
-MAX_REMOTE_MCP_DISCOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024
-MAX_REMOTE_MCP_CACHE_ENTRIES = 1_024
-MAX_REMOTE_MCP_TOOLS_PER_SERVER = 2_048
-MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES = 1024 * 1024
-MAX_REMOTE_MCP_PROVENANCE_BYTES = 1024 * 1024
+# REMOTE_MCP_CACHE_ENV, REMOTE_MCP_CACHE_VERSION, MAX_REMOTE_MCP_CACHE_BYTES,
+# MAX_REMOTE_MCP_DISCOVERY_ARTIFACT_BYTES, MAX_REMOTE_MCP_CACHE_ENTRIES, and
+# MAX_REMOTE_MCP_TOOLS_PER_SERVER moved to remote_mcp_cache.py (imported
+# above) -- none have a reader left in this file's own body (confirmed by
+# grep), so none are imported back. REMOTE_MCP_CACHE_SOURCE,
+# MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES, and MAX_REMOTE_MCP_PROVENANCE_BYTES
+# moved to remote_mcp_tool_schema.py (imported above) -- REMOTE_MCP_CACHE_SOURCE
+# is read here too (the catalog freshness check below), so it is imported
+# rather than duplicated.
 MAX_REMOTE_MCP_SCIENTIFIC_CATALOG_STRUCTURED_BYTES = 1024 * 1024
-MAX_REMOTE_MCP_JSON_DEPTH = 64
-MAX_REMOTE_MCP_JSON_NODES = 100_000
-MAX_REMOTE_MCP_DIAGNOSTIC_CHARS = 4_096
+# cluster_route_revision_json_schema / jarvis_service_runtime_handoff_json_schema
+# re-export (see comment on the remote_mcp_wire_schemas import above) --
+# qualified assignment, not `from ... import`, since this file's own body
+# has no reader for either any more.
+cluster_route_revision_json_schema = remote_mcp_wire_schemas.cluster_route_revision_json_schema
+jarvis_service_runtime_handoff_json_schema = (
+    remote_mcp_wire_schemas.jarvis_service_runtime_handoff_json_schema
+)
+# remote_mcp_server_artifact_binding_verified re-export (see comment on the
+# remote_mcp_cache import above) -- qualified assignment, not `from ...
+# import`, since this file's own body has no reader for it any more.
+remote_mcp_server_artifact_binding_verified = (
+    remote_mcp_cache.remote_mcp_server_artifact_binding_verified
+)
+# MAX_REMOTE_MCP_JSON_DEPTH, MAX_REMOTE_MCP_JSON_NODES, and
+# MAX_REMOTE_MCP_DIAGNOSTIC_CHARS moved to remote_mcp_schema_validation.py
+# (imported above); kept here as bare names via that import for the
+# call sites below that still reference them directly.
 MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS = 8
-MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL = 64
-MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS = 64
-MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES = 16 * 1024 * 1024
-MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES = 64 * 1024
-MAX_VIRTUAL_REMOTE_MCP_CANDIDATES = 10_000
+# MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL moved to
+# remote_mcp_acceptance_models.py (imported above) -- read here too (the
+# Spack transition report builders below), so it is imported rather than
+# duplicated. The other three Spack-configuration constants moved there too
+# but have no reader left in this file's own body -- cli.py imports them
+# directly, so they are re-exported below via qualified assignment (ruff's
+# unused-import check has no equivalent for a plain module-level
+# assignment, unlike a `from ... import` it would keep stripping as dead).
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES = (
+    remote_mcp_acceptance_models.MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES
+)
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS = (
+    remote_mcp_acceptance_models.MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS
+)
+MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES = (
+    remote_mcp_acceptance_models.MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES
+)
+# MAX_VIRTUAL_REMOTE_MCP_CANDIDATES and MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+# moved to remote_mcp_aliasing.py (imported below). Only the former is read
+# here too (the catalog-assembly candidate-limit check), so only it is
+# imported back; the latter has no reader left outside the moved alias
+# functions themselves.
 MAX_REMOTE_MCP_CATALOG_ISSUES = 10_000
-MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH = 64
-MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES = 32_768
+# MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES moved to remote_mcp_schema_wrapping.py
+# (imported above) -- imported back since the log-limit validation below
+# still reads it.
 
 logger = logging.getLogger(__name__)
-REMOTE_MCP_REPLACE_ATTEMPTS = 25
-REMOTE_MCP_REPLACE_RETRY_SECONDS = 0.02
+# REMOTE_MCP_REPLACE_ATTEMPTS and REMOTE_MCP_REPLACE_RETRY_SECONDS moved to
+# remote_mcp_cache.py with RemoteMcpSchemaCache._write_atomic, their only
+# reader.
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = REGISTERED_JARVIS_USER_CONTRACT
 CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID = "clio-kit-jarvis-user-v3.6"
 CLIO_KIT_JARVIS_USER_CONTRACT_IDS = frozenset(
@@ -270,1200 +415,6 @@ CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_SHA256 = (
         CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID
     ]
 )
-_COMPOSED_SCHEMA_KEYS = {
-    "$dynamicRef",
-    "$recursiveRef",
-    "$ref",
-    "allOf",
-    "anyOf",
-    "else",
-    "if",
-    "oneOf",
-    "not",
-    "then",
-}
-_FLAT_SCHEMA_KEYS = {
-    "$comment",
-    "$defs",
-    "$id",
-    "$schema",
-    "additionalProperties",
-    "default",
-    "definitions",
-    "deprecated",
-    "description",
-    "examples",
-    "properties",
-    "readOnly",
-    "required",
-    "title",
-    "type",
-    "writeOnly",
-}
-_JSON_SCHEMA_VALIDATORS = {
-    str(validator.META_SCHEMA.get("$id") or validator.META_SCHEMA.get("id")).rstrip("#"): validator
-    for validator in (
-        Draft3Validator,
-        Draft4Validator,
-        Draft6Validator,
-        Draft7Validator,
-        Draft201909Validator,
-        Draft202012Validator,
-    )
-}
-_JSON_SCHEMA_VALIDATORS.update(
-    {
-        dialect.replace("http://", "https://", 1): validator
-        for dialect, validator in tuple(_JSON_SCHEMA_VALIDATORS.items())
-        if dialect.startswith("http://")
-    }
-)
-
-VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS: dict[str, JSON] = {
-    "idempotency_key": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 512,
-        "description": (
-            "Stable retry identity consumed by clio-relay and never forwarded to the "
-            "remote MCP server. Reuse it only for the exact same call payload."
-        ),
-    },
-    "wait_for_terminal": {
-        "type": "boolean",
-        "default": False,
-        "description": (
-            "Wait for this relay job to finish and return its bounded MCP result in the "
-            "same tool response. This field is consumed by clio-relay and is never "
-            "forwarded to the remote MCP server."
-        ),
-    },
-    "wait_timeout_seconds": {
-        "type": "number",
-        "default": 600,
-        "exclusiveMinimum": 0,
-        "description": "Maximum local relay wait; never forwarded to the remote MCP server.",
-    },
-    "poll_seconds": {
-        "type": "number",
-        "default": 2,
-        "exclusiveMinimum": 0,
-        "description": "Local relay wait polling interval; never forwarded remotely.",
-    },
-    "include_logs": {
-        "type": "boolean",
-        "default": False,
-        "description": (
-            "Include bounded stdout and stderr when waiting for a terminal result. "
-            "This field is never forwarded to the remote MCP server."
-        ),
-    },
-    "log_limit": {
-        "type": "integer",
-        "default": MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES,
-        "minimum": 1,
-        "maximum": MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES,
-        "description": "Maximum bytes per returned log stream; never forwarded remotely.",
-    },
-}
-VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS = frozenset(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS)
-
-
-class _NonFiniteJsonError(ValueError):
-    """Non-standard NaN or infinity token in a purported JSON artifact."""
-
-
-class _JsonSchemaInstanceValidator(Protocol):
-    """Typed subset of a jsonschema validator used for instance checks."""
-
-    def iter_errors(self, instance: object) -> Iterable[JsonSchemaValidationError]:
-        """Yield every schema violation observed in one JSON-compatible instance."""
-        ...
-
-
-_SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9_]+")
-
-
-def cluster_route_revision_json_schema() -> JSON:
-    """Return the agent-facing schema for an opaque cluster route revision."""
-
-    return {
-        "type": "string",
-        "pattern": "^[0-9a-f]{64}$",
-        "description": (
-            "Opaque cluster-route revision copied exactly from a relay job receipt. "
-            "This is not a scientific-dataset catalog revision."
-        ),
-    }
-
-
-VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA: JSON = {
-    "type": "object",
-    "properties": {
-        "cluster": {"type": "string"},
-        "job_id": {"type": "string"},
-        "state": {
-            "type": "string",
-            "enum": ["queued", "leased", "running", "succeeded", "failed", "canceled"],
-        },
-        "kind": {"type": "string", "const": "mcp_call"},
-        "terminal": {"type": "boolean"},
-        "remote": {"type": "boolean"},
-        "route_revision": cluster_route_revision_json_schema(),
-        "catalog_revision": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$",
-            "description": (
-                "Opaque revision of the locally advertised remote-MCP tool catalog; "
-                "this is not a scientific-dataset catalog revision."
-            ),
-        },
-        "last_error": {"type": ["string", "null"]},
-        "observation": {
-            "type": "object",
-            "properties": {
-                "outcome": {
-                    "type": "string",
-                    "enum": ["terminal", "observation_unknown"],
-                },
-                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
-                "scheduler_action": {"type": "string", "const": "none"},
-                "relay_action": {"type": "string", "const": "none"},
-            },
-            "required": [
-                "outcome",
-                "timeout_seconds",
-                "scheduler_action",
-                "relay_action",
-            ],
-            "additionalProperties": False,
-            "description": (
-                "Result of the bounded observation requested by this call. "
-                "observation_unknown preserves the durable job for later observation."
-            ),
-        },
-        "mcp_result": {"type": "object"},
-        "mcp_result_artifact": {"type": "object"},
-        "logs": {"type": "object"},
-    },
-    "required": [
-        "cluster",
-        "job_id",
-        "state",
-        "kind",
-        "terminal",
-        "route_revision",
-        "catalog_revision",
-    ],
-    "additionalProperties": False,
-}
-
-
-def jarvis_service_runtime_handoff_json_schema(
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact agent-facing JARVIS service handoff schema."""
-    return {
-        "type": "object",
-        "properties": {
-            "cluster": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256,
-                **({"enum": sorted(clusters)} if clusters is not None else {}),
-            },
-            "source_job_id": durable_record_id_json_schema(),
-            "source_artifact_id": durable_record_id_json_schema(),
-            "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "package_name": {"type": "string", "minLength": 1, "maxLength": 256},
-            "service_instance_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512,
-            },
-        },
-        "required": [
-            "cluster",
-            "source_job_id",
-            "source_artifact_id",
-            "package_id",
-            "package_name",
-            "service_instance_id",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def virtual_jarvis_job_output_schema(
-    remote_tool: str,
-    *,
-    clusters: list[str] | None = None,
-) -> JSON:
-    """Return the exact relay job receipt schema for one verified JARVIS tool."""
-    if remote_tool not in CLIO_KIT_JARVIS_USER_TOOL_NAMES:
-        raise ValueError(f"unknown virtual JARVIS tool: {remote_tool}")
-    output_schema = deepcopy(VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA)
-    if remote_tool == "jarvis_get_execution":
-        output_properties = cast(JSON, output_schema["properties"])
-        output_properties["service_runtime_bindings"] = {
-            "type": "array",
-            "description": (
-                "Ready-service handoffs derived from the verified durable MCP result. "
-                "Pass one item unchanged as relay_bind_jarvis_runtime.binding."
-            ),
-            "items": jarvis_service_runtime_handoff_json_schema(clusters=clusters),
-            "maxItems": 4_096,
-        }
-    return output_schema
-
-
-class RemoteMcpToolSchema(BaseModel):
-    """Validated tool contract returned by a remote MCP ``tools/list`` call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(max_length=512)
-    title: str | None = Field(default=None, max_length=4_096)
-    description: str | None = Field(default=None, max_length=65_536)
-    input_schema: JSON
-    output_schema: JSON | None = None
-    annotations: JSON | None = None
-
-    @field_validator("name")
-    @classmethod
-    def _name_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("remote MCP tool name must not be blank")
-        return value
-
-    @model_validator(mode="after")
-    def _schema_must_be_bounded(self) -> RemoteMcpToolSchema:
-        _require_bounded_json_structure(self.input_schema, label="inputSchema")
-        _require_finite_json(self.input_schema, label="inputSchema")
-        _validate_json_schema(self.input_schema, label="inputSchema")
-        if self.output_schema is not None:
-            _require_bounded_json_structure(self.output_schema, label="outputSchema")
-            _require_finite_json(self.output_schema, label="outputSchema")
-            _validate_json_schema(self.output_schema, label="outputSchema")
-        if self.annotations is not None:
-            _require_bounded_json_structure(self.annotations, label="annotations")
-            _require_finite_json(self.annotations, label="annotations")
-        payload = json.dumps(
-            self.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES:
-            raise ValueError(
-                f"remote MCP tool schema exceeds {MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES} bytes"
-            )
-        return self
-
-
-def is_remote_mcp_control_query(tool: RemoteMcpToolSchema) -> bool:
-    """Return whether discovery explicitly classifies a tool as a safe query.
-
-    MCP annotations are advisory server claims, so this predicate is only one
-    input to admission. Callers must additionally bind the invocation to the
-    registered route and exact discovered server artifact before assigning the
-    reserved control-query class.
-    """
-    annotations = tool.annotations
-    return bool(
-        annotations is not None
-        and annotations.get("readOnlyHint") is True
-        and annotations.get("destructiveHint") is False
-    )
-
-
-class RemoteMcpDiscoveryProvenance(BaseModel):
-    """Durable evidence associated with one cached remote discovery."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    source: str = REMOTE_MCP_CACHE_SOURCE
-    discovery_job_id: str
-    artifact_id: str
-    artifact_sha256: str
-    protocol_version: str | None = None
-    server_info: JSON = Field(default_factory=dict)
-    server_artifact: JSON = Field(default_factory=dict)
-
-    @field_validator("artifact_sha256")
-    @classmethod
-    def _artifact_digest_must_be_sha256(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
-            raise ValueError("remote MCP discovery artifact SHA-256 must be 64 hex characters")
-        return normalized
-
-    @model_validator(mode="after")
-    def _provenance_must_be_bounded(self) -> RemoteMcpDiscoveryProvenance:
-        _require_bounded_json_structure(self.server_info, label="server_info")
-        _require_bounded_json_structure(self.server_artifact, label="server_artifact")
-        payload = json.dumps(
-            self.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_REMOTE_MCP_PROVENANCE_BYTES:
-            raise ValueError(
-                f"remote MCP provenance exceeds {MAX_REMOTE_MCP_PROVENANCE_BYTES} bytes"
-            )
-        return self
-
-
-class RemoteMcpSchemaCacheEntry(BaseModel):
-    """Cluster-scoped schema snapshot for one registered remote MCP server."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    cluster: str = Field(max_length=256)
-    server_name: str = Field(max_length=256)
-    execution_fingerprint: str
-    discovered_at: datetime
-    expires_at: datetime
-    schema_digest: str
-    tools: list[RemoteMcpToolSchema] = Field(max_length=MAX_REMOTE_MCP_TOOLS_PER_SERVER)
-    provenance: RemoteMcpDiscoveryProvenance
-
-    @field_validator("cluster", "server_name")
-    @classmethod
-    def _identity_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("remote MCP cache identity fields must not be blank")
-        return value
-
-    @field_validator("discovered_at", "expires_at")
-    @classmethod
-    def _timestamps_must_be_timezone_aware(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("remote MCP cache timestamps must be timezone-aware")
-        return value
-
-    @field_validator("tools")
-    @classmethod
-    def _tool_names_must_be_unique(
-        cls, value: list[RemoteMcpToolSchema]
-    ) -> list[RemoteMcpToolSchema]:
-        names = [tool.name for tool in value]
-        if len(names) != len(set(names)):
-            raise ValueError("remote MCP discovery returned duplicate tool names")
-        return value
-
-    @model_validator(mode="after")
-    def _schema_digest_must_match_tools(self) -> RemoteMcpSchemaCacheEntry:
-        observed = remote_mcp_schema_digest(self.tools)
-        if self.schema_digest != observed:
-            raise ValueError("remote MCP cache schema digest does not match cached tools")
-        return self
-
-    def is_fresh(self, *, now: datetime | None = None) -> bool:
-        """Return whether the schema snapshot has not reached its expiry time."""
-        current = now or datetime.now(UTC)
-        return current < self.expires_at
-
-
-class RemoteMcpSchemaCache(BaseModel):
-    """Versioned, atomically persisted remote MCP schema cache."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    version: int = REMOTE_MCP_CACHE_VERSION
-    entries: list[RemoteMcpSchemaCacheEntry] = Field(
-        default_factory=lambda: list[RemoteMcpSchemaCacheEntry](),
-        max_length=MAX_REMOTE_MCP_CACHE_ENTRIES,
-    )
-
-    @field_validator("version")
-    @classmethod
-    def _version_must_be_supported(cls, value: int) -> int:
-        if value != REMOTE_MCP_CACHE_VERSION:
-            raise ValueError(f"unsupported remote MCP cache version: {value}")
-        return value
-
-    @field_validator("entries")
-    @classmethod
-    def _entry_keys_must_be_unique(
-        cls, value: list[RemoteMcpSchemaCacheEntry]
-    ) -> list[RemoteMcpSchemaCacheEntry]:
-        keys = [(entry.cluster, entry.server_name) for entry in value]
-        if len(keys) != len(set(keys)):
-            raise ValueError("remote MCP cache entries must be unique per cluster and server")
-        return value
-
-    @classmethod
-    def load(cls, path: Path) -> RemoteMcpSchemaCache:
-        """Load a cache without creating a file for read-only MCP operations."""
-        if not path.exists():
-            return cls()
-        return cls.model_validate_json(
-            read_bounded_configuration_bytes(path, max_bytes=MAX_REMOTE_MCP_CACHE_BYTES)
-        )
-
-    def entry_for(self, cluster: str, server_name: str) -> RemoteMcpSchemaCacheEntry | None:
-        """Return one cluster/server cache entry when present."""
-        return next(
-            (
-                entry
-                for entry in self.entries
-                if entry.cluster == cluster and entry.server_name == server_name
-            ),
-            None,
-        )
-
-    @classmethod
-    def update_entry(
-        cls,
-        path: Path,
-        entry: RemoteMcpSchemaCacheEntry,
-    ) -> RemoteMcpSchemaCache:
-        """Atomically replace one cache entry while serializing concurrent refreshes."""
-        ensure_private_configuration_directory(path.parent)
-        with FileLock(f"{path}.lock"):
-            cache = cls.load(path)
-            entries = [
-                current
-                for current in cache.entries
-                if (current.cluster, current.server_name) != (entry.cluster, entry.server_name)
-            ]
-            entries.append(entry)
-            updated = cls(
-                entries=sorted(entries, key=lambda item: (item.cluster, item.server_name))
-            )
-            updated._write_atomic(path)
-            return updated
-
-    @classmethod
-    def remove_entry(cls, path: Path, cluster: str, server_name: str) -> RemoteMcpSchemaCache:
-        """Atomically remove a cache entry after an operator unregisters a server."""
-        ensure_private_configuration_directory(path.parent)
-        with FileLock(f"{path}.lock"):
-            cache = cls.load(path)
-            updated = cls(
-                entries=[
-                    entry
-                    for entry in cache.entries
-                    if (entry.cluster, entry.server_name) != (cluster, server_name)
-                ]
-            )
-            updated._write_atomic(path)
-            return updated
-
-    @classmethod
-    def invalidate_cluster_entries(
-        cls,
-        path: Path,
-        cluster: str,
-    ) -> tuple[RemoteMcpSchemaCache, tuple[str, ...]]:
-        """Atomically invalidate every cached server schema for one cluster."""
-        ensure_private_configuration_directory(path.parent)
-        with FileLock(f"{path}.lock"):
-            cache = cls.load(path)
-            removed_server_names = tuple(
-                sorted(entry.server_name for entry in cache.entries if entry.cluster == cluster)
-            )
-            if not removed_server_names:
-                return cache, removed_server_names
-            updated = cls(entries=[entry for entry in cache.entries if entry.cluster != cluster])
-            updated._write_atomic(path)
-            return updated, removed_server_names
-
-    def _write_atomic(self, path: Path) -> None:
-        payload = (self.model_dump_json(indent=2) + "\n").encode("utf-8")
-        if len(payload) > MAX_REMOTE_MCP_CACHE_BYTES:
-            raise ValueError(f"remote MCP cache exceeds {MAX_REMOTE_MCP_CACHE_BYTES} bytes")
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
-        try:
-            with open_private_atomic_file(temporary) as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            for attempt in range(REMOTE_MCP_REPLACE_ATTEMPTS):
-                try:
-                    os.replace(temporary, path)
-                    break
-                except PermissionError:
-                    if attempt + 1 >= REMOTE_MCP_REPLACE_ATTEMPTS:
-                        raise
-                    time.sleep(REMOTE_MCP_REPLACE_RETRY_SECONDS)
-            _fsync_cache_directory(path.parent)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
-class RemoteMcpCatalogIssue(BaseModel):
-    """Reason a registered or discovered remote capability is not exposed.
-
-    ``enforcement`` (clio-relay#242 dev-mode course correction) marks a
-    version/sha/contract-grounded issue that dev mode chose to LOG AND
-    PROCEED past rather than withhold the capability for --
-    ``"deferred_dev_mode"`` means this registration/tool IS in
-    ``VirtualRemoteMcpCatalog.tools`` despite the reason recorded here; the
-    default ``"enforced"`` means the capability really is withheld, exactly
-    as every issue meant before this field existed.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    cluster: str
-    server_name: str
-    reason: str
-    tool_name: str | None = None
-    enforcement: Literal["enforced", "deferred_dev_mode"] = "enforced"
-
-
-class RemoteMcpAcceptanceCheck(BaseModel):
-    """One canonical remote MCP release-validation assertion."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    passed: bool
-    message: str
-    evidence: JSON = Field(default_factory=dict)
-
-
-class RemoteMcpStructuredResultExpectation(BaseModel):
-    """Operator-supplied semantic expectations for one structured MCP result."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["clio-relay.remote-mcp-result-expectation.v1"] = (
-        "clio-relay.remote-mcp-result-expectation.v1"
-    )
-    contract: Literal[
-        "clio-kit-spack-user-v2.1", "clio-kit-spack-user-v2", "clio-kit-spack-user-v2.3"
-    ]
-    tool: Literal["spack_find", "spack_locate", "spack_install"]
-    package_name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9_.+-]+$")
-    dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
-    requested_spec: str | None = Field(default=None, min_length=1, max_length=4_096)
-    prefix: str | None = Field(default=None, min_length=2, max_length=4_096)
-    reuse: bool | None = None
-    fresh_install_store_root: str | None = Field(default=None, min_length=2, max_length=4_096)
-    fresh_install_configuration_sha256: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    fresh_install_configuration_manifest_path: str | None = Field(
-        default=None,
-        min_length=2,
-        max_length=4_096,
-    )
-
-    @model_validator(mode="after")
-    def validate_operation_fields(self) -> RemoteMcpStructuredResultExpectation:
-        """Require only the operation-specific expectations used by the contract."""
-        if self.contract == CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3 and self.tool == "spack_install":
-            # v2.3 revised spack_install's outputSchema (a single "package" object
-            # plus "prefix"/"load_spec"/"log_path"/"log_tail" replacing the v2.1
-            # "packages" array); _validate_spack_install_result still assumes the
-            # v2.1 shape. Fail closed with a typed reason rather than silently
-            # evaluating the wrong schema -- porting install-result verification
-            # to v2.3 is tracked separately, out of this contract-recognition fix.
-            raise ValueError(
-                "structured-result expectations for spack_install under "
-                "clio-kit-spack-user-v2.3 are not yet supported (v2.3 revised the "
-                "install outputSchema); use spack_find or spack_locate under v2.3, "
-                "or declare the v2.1/v2 contract for install verification"
-            )
-        if self.tool == "spack_find":
-            if (
-                self.requested_spec is not None
-                or self.prefix is not None
-                or self.reuse is not None
-                or self.fresh_install_store_root is not None
-                or self.fresh_install_configuration_sha256 is not None
-                or self.fresh_install_configuration_manifest_path is not None
-            ):
-                raise ValueError(
-                    "spack_find must not declare requested_spec, prefix, reuse, "
-                    "or fresh-install configuration expectations"
-                )
-            return self
-        if self.requested_spec is None:
-            raise ValueError(f"{self.tool} requires requested_spec")
-        if self.tool == "spack_locate":
-            if (
-                self.reuse is not None
-                or self.fresh_install_store_root is not None
-                or self.fresh_install_configuration_sha256 is not None
-                or self.fresh_install_configuration_manifest_path is not None
-            ):
-                raise ValueError("spack_locate must not declare reuse or fresh_install_store_root")
-            if not _is_canonical_absolute_posix_path(self.prefix):
-                raise ValueError("spack_locate requires a canonical absolute POSIX prefix")
-        if self.tool == "spack_install":
-            if self.prefix is not None:
-                raise ValueError("spack_install must not declare prefix")
-            if self.reuse is None:
-                raise ValueError("spack_install requires reuse")
-            configuration_fields = (
-                self.fresh_install_store_root,
-                self.fresh_install_configuration_sha256,
-                self.fresh_install_configuration_manifest_path,
-            )
-            if any(value is not None for value in configuration_fields):
-                if not all(value is not None for value in configuration_fields):
-                    raise ValueError(
-                        "fresh install requires store root, configuration SHA-256, and "
-                        "configuration manifest path together"
-                    )
-                if self.reuse is not False:
-                    raise ValueError("fresh_install_store_root requires spack_install reuse=false")
-                if not _is_canonical_absolute_posix_path(self.fresh_install_store_root):
-                    raise ValueError(
-                        "fresh_install_store_root must be a canonical absolute POSIX path"
-                    )
-                if not _is_canonical_absolute_posix_path(
-                    self.fresh_install_configuration_manifest_path
-                ):
-                    raise ValueError(
-                        "fresh_install_configuration_manifest_path must be a canonical "
-                        "absolute POSIX path"
-                    )
-        return self
-
-
-class RemoteMcpSpackTransitionArtifactEvidence(BaseModel):
-    """Bounded identity for one durable artifact in a Spack transition call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    artifact_id: str | None = Field(default=None, max_length=1_024)
-    job_id: str | None = Field(default=None, max_length=1_024)
-    kind: str | None = Field(default=None, max_length=128)
-    sha256: str | None = Field(default=None, max_length=64)
-    uri: str | None = Field(default=None, max_length=4_096)
-
-
-class RemoteMcpSpackTransitionStdioEvidence(BaseModel):
-    """Bounded packaged-stdio proof associated with one transition call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    boundary: str | None = Field(default=None, max_length=128)
-    returncode: int | None = None
-    initialize_passed: bool
-    tools_list_passed: bool
-    call_job_id: str | None = Field(default=None, max_length=1_024)
-
-
-class RemoteMcpSpackConfigurationComponentObservation(BaseModel):
-    """One regular file bound into an observed fresh-install configuration."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    relative_path: str = Field(min_length=1, max_length=1_024)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    size_bytes: int = Field(
-        ge=0,
-        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
-    )
-    regular_file: Literal[True] = True
-
-    @field_validator("relative_path")
-    @classmethod
-    def validate_relative_path(cls, value: str) -> str:
-        """Reject absolute, traversing, or non-canonical component paths."""
-        if not _is_canonical_relative_posix_path(value):
-            raise ValueError("configuration component path must be canonical and relative")
-        return value
-
-
-class RemoteMcpSpackConfigurationObservation(BaseModel):
-    """Independent digest observation of one bounded configuration manifest."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["clio-relay.spack-configuration-observation.v1"] = (
-        "clio-relay.spack-configuration-observation.v1"
-    )
-    phase: Literal["preinstall", "postinstall"]
-    manifest_path: str = Field(min_length=2, max_length=4_096)
-    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    manifest_size_bytes: int = Field(
-        ge=1,
-        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
-    )
-    manifest_regular_file: Literal[True] = True
-    components: list[RemoteMcpSpackConfigurationComponentObservation] = Field(
-        min_length=1,
-        max_length=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
-    )
-
-    @model_validator(mode="after")
-    def validate_manifest(self) -> RemoteMcpSpackConfigurationObservation:
-        """Require an absolute manifest and one canonical, sorted component set."""
-        if not _is_canonical_absolute_posix_path(self.manifest_path):
-            raise ValueError("configuration manifest path must be canonical and absolute")
-        paths = [component.relative_path for component in self.components]
-        if paths != sorted(paths) or len(paths) != len(set(paths)):
-            raise ValueError("configuration component paths must be unique and sorted")
-        return self
-
-
-class RemoteMcpSpackTransitionCallEvidence(BaseModel):
-    """Bounded durable call evidence for one phase of a fresh Spack install."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    phase: Literal["preinstall", "install", "postinstall"]
-    report_passed: bool
-    cluster: str = Field(min_length=1, max_length=255)
-    server_name: str = Field(min_length=1, max_length=255)
-    profile: str = Field(min_length=1, max_length=64)
-    remote_tool_name: str = Field(min_length=1, max_length=64)
-    virtual_alias: str | None = Field(default=None, max_length=64)
-    job_id: str | None = Field(default=None, max_length=1_024)
-    state: str | None = Field(default=None, max_length=128)
-    arguments: JSON = Field(default_factory=dict)
-    artifacts: list[RemoteMcpSpackTransitionArtifactEvidence] = Field(
-        default_factory=lambda: list[RemoteMcpSpackTransitionArtifactEvidence](),
-        max_length=MAX_REMOTE_MCP_TRANSITION_ARTIFACTS_PER_CALL,
-    )
-    artifacts_truncated: bool = False
-    stdio: RemoteMcpSpackTransitionStdioEvidence
-    structured_result: JSON = Field(default_factory=dict)
-
-
-class RemoteMcpSpackInstallTransitionEvidence(BaseModel):
-    """Ordered, machine-readable evidence for a disposable-store Spack install."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["clio-relay.spack-fresh-install-transition.v1"] = (
-        "clio-relay.spack-fresh-install-transition.v1"
-    )
-    cluster: str = Field(min_length=1, max_length=255)
-    server_name: str = Field(min_length=1, max_length=255)
-    profile: str = Field(min_length=1, max_length=64)
-    requested_spec: str = Field(min_length=1, max_length=4_096)
-    package_name: str = Field(min_length=1, max_length=255)
-    dag_hash: str = Field(pattern=r"^[a-z0-9]{32}$")
-    fresh_install_store_root: str = Field(min_length=2, max_length=4_096)
-    fresh_install_configuration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    fresh_install_configuration_manifest_path: str = Field(min_length=2, max_length=4_096)
-    preinstall_configuration: RemoteMcpSpackConfigurationObservation
-    postinstall_configuration: RemoteMcpSpackConfigurationObservation
-    executed_spack_command_path: str | None = Field(default=None, max_length=4_096)
-    executed_spack_command_relative_path: str | None = Field(default=None, max_length=1_024)
-    executed_spack_command_sha256: str | None = Field(
-        default=None,
-        max_length=64,
-    )
-    executed_spack_command_size_bytes: int | None = Field(
-        default=None,
-        ge=0,
-        le=MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
-    )
-    registration_revision: str | None = Field(default=None, max_length=128)
-    cluster_route_revision: str | None = Field(default=None, max_length=128)
-    catalog_revision: str | None = Field(default=None, max_length=128)
-    server_artifact_sha256: str | None = Field(default=None, max_length=64)
-    preinstall: RemoteMcpSpackTransitionCallEvidence
-    install: RemoteMcpSpackTransitionCallEvidence
-    postinstall: RemoteMcpSpackTransitionCallEvidence
-
-    @model_validator(mode="after")
-    def validate_transition_shape(self) -> RemoteMcpSpackInstallTransitionEvidence:
-        """Reject forged phase labels or an unsafe disposable-store root."""
-        if not _is_canonical_absolute_posix_path(self.fresh_install_store_root):
-            raise ValueError("fresh_install_store_root must be a canonical absolute POSIX path")
-        if not _is_canonical_absolute_posix_path(self.fresh_install_configuration_manifest_path):
-            raise ValueError(
-                "fresh_install_configuration_manifest_path must be a canonical absolute POSIX path"
-            )
-        command_identity = (
-            self.executed_spack_command_path,
-            self.executed_spack_command_relative_path,
-            self.executed_spack_command_sha256,
-            self.executed_spack_command_size_bytes,
-        )
-        if any(value is not None for value in command_identity):
-            if not all(value is not None for value in command_identity):
-                raise ValueError("executed Spack command identity must be complete")
-            if not _is_canonical_absolute_posix_path(self.executed_spack_command_path):
-                raise ValueError("executed Spack command path must be canonical and absolute")
-            if not _is_canonical_relative_posix_path(self.executed_spack_command_relative_path):
-                raise ValueError("executed Spack command relative path must be canonical")
-            command_sha256 = cast(str, self.executed_spack_command_sha256)
-            if len(command_sha256) != 64 or any(
-                character not in "0123456789abcdef" for character in command_sha256
-            ):
-                raise ValueError("executed Spack command SHA-256 must be lowercase hexadecimal")
-            if cast(int, self.executed_spack_command_size_bytes) < 1:
-                raise ValueError("executed Spack command size must be positive")
-            expected_path = str(
-                PurePosixPath(self.fresh_install_configuration_manifest_path).parent
-                / cast(str, self.executed_spack_command_relative_path)
-            )
-            if self.executed_spack_command_path != expected_path:
-                raise ValueError(
-                    "executed Spack command path must resolve from the configuration manifest"
-                )
-            relative_path = cast(str, self.executed_spack_command_relative_path)
-            preinstall_components = [
-                component
-                for component in self.preinstall_configuration.components
-                if component.relative_path == relative_path
-            ]
-            postinstall_components = [
-                component
-                for component in self.postinstall_configuration.components
-                if component.relative_path == relative_path
-            ]
-            if len(preinstall_components) != 1 or len(postinstall_components) != 1:
-                raise ValueError(
-                    "executed Spack command must identify one preinstall and postinstall "
-                    "configuration component"
-                )
-            if preinstall_components[0] != postinstall_components[0]:
-                raise ValueError(
-                    "executed Spack command configuration component must remain unchanged"
-                )
-            if (
-                command_sha256 != preinstall_components[0].sha256
-                or self.executed_spack_command_size_bytes != preinstall_components[0].size_bytes
-            ):
-                raise ValueError(
-                    "executed Spack command SHA-256 and size must match its configuration component"
-                )
-        if (
-            self.preinstall_configuration.phase != "preinstall"
-            or self.postinstall_configuration.phase != "postinstall"
-        ):
-            raise ValueError("configuration observations must retain their ordered phases")
-        expected_phases = (
-            (self.preinstall, "preinstall", "spack_find"),
-            (self.install, "install", "spack_install"),
-            (self.postinstall, "postinstall", "spack_locate"),
-        )
-        for call, phase, tool in expected_phases:
-            if call.phase != phase or call.remote_tool_name != tool:
-                raise ValueError(f"{phase} evidence must represent {tool}")
-        return self
-
-
-class RemoteMcpAcceptanceReport(BaseModel):
-    """Machine-readable evidence for one virtual remote MCP acceptance call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: str = "1.0"
-    report_type: str = "clio-relay.remote-mcp-acceptance"
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    cluster: str
-    server_name: str
-    remote_tool_name: str
-    virtual_alias: str | None = None
-    profile: str
-    passed: bool
-    checks: list[RemoteMcpAcceptanceCheck]
-    discovery: JSON = Field(default_factory=dict)
-    call_job: JSON = Field(default_factory=dict)
-    artifacts: list[JSON] = Field(default_factory=lambda: list[JSON]())
-    mcp_stdio: JSON = Field(default_factory=dict)
-    spack_install_transition: RemoteMcpSpackInstallTransitionEvidence | None = None
-
-    def to_live_validation_report(
-        self,
-        *,
-        launcher: str | None = None,
-        install_source: str | None = None,
-        artifact_sha256: str | None = None,
-    ) -> LiveValidationReport:
-        """Convert domain assertions into the canonical release evidence schema."""
-        from clio_relay.validation_report import (
-            EvidenceReference,
-            ValidationCheck,
-            ValidationResource,
-            ValidationStatus,
-            new_live_validation_report,
-        )
-
-        report = new_live_validation_report(
-            scenario="remote-mcp",
-            cluster=self.cluster,
-            launcher=launcher,
-            install_source=install_source,
-            artifact_sha256=artifact_sha256,
-        )
-        report.started_at = self.generated_at
-        report.completed_at = datetime.now(UTC)
-        report.checks = [
-            ValidationCheck(
-                check_id=check.name,
-                summary=check.message,
-                status=(ValidationStatus.PASSED if check.passed else ValidationStatus.FAILED),
-                started_at=self.generated_at,
-                completed_at=report.completed_at,
-                evidence=[
-                    EvidenceReference(
-                        kind="remote_mcp_acceptance",
-                        excerpt=check.message,
-                        metadata=check.evidence,
-                    )
-                ],
-                error=None if check.passed else check.message,
-            )
-            for check in self.checks
-        ]
-        report.status = ValidationStatus.PASSED if self.passed else ValidationStatus.FAILED
-        report.error = None if self.passed else "one or more remote MCP checks failed"
-        call_job_id = self.call_job.get("job_id")
-        if self.spack_install_transition is None and isinstance(call_job_id, str):
-            call_metadata = {
-                **self.call_job,
-                "remote_mcp_server_name": self.server_name,
-                "remote_mcp_tool_name": self.remote_tool_name,
-                "virtual_alias": self.virtual_alias,
-                "profile": self.profile,
-            }
-            result_check = next(
-                (check for check in self.checks if check.name == "remote-mcp.structured-result"),
-                None,
-            )
-            if result_check is not None:
-                call_metadata["structured_result_assertion"] = result_check.evidence
-            catalog_result_check = next(
-                (
-                    check
-                    for check in self.checks
-                    if check.name == "remote-mcp.scientific-catalog-result"
-                ),
-                None,
-            )
-            if catalog_result_check is not None:
-                call_metadata["scientific_catalog_result_assertion"] = catalog_result_check.evidence
-            report.resources.append(
-                ValidationResource(
-                    kind="relay_job",
-                    resource_id=call_job_id,
-                    role="virtual_remote_mcp_call",
-                    cluster=self.cluster,
-                    state=(
-                        str(self.call_job["state"])
-                        if self.call_job.get("state") is not None
-                        else None
-                    ),
-                    metadata=call_metadata,
-                )
-            )
-        raw_provenance = self.discovery.get("provenance")
-        discovery_provenance = (
-            cast(JSON, raw_provenance) if isinstance(raw_provenance, dict) else {}
-        )
-        discovery_job_id = discovery_provenance.get("discovery_job_id")
-        if isinstance(discovery_job_id, str):
-            report.resources.append(
-                ValidationResource(
-                    kind="relay_job",
-                    resource_id=discovery_job_id,
-                    role="remote_mcp_discovery",
-                    cluster=self.cluster,
-                    state="succeeded",
-                    metadata=discovery_provenance,
-                )
-            )
-        discovery_artifact_id = discovery_provenance.get("artifact_id")
-        if isinstance(discovery_artifact_id, str):
-            report.resources.append(
-                ValidationResource(
-                    kind="artifact",
-                    resource_id=discovery_artifact_id,
-                    role="remote_mcp_schema",
-                    cluster=self.cluster,
-                    metadata=discovery_provenance,
-                )
-            )
-        if self.spack_install_transition is None:
-            for artifact in self.artifacts:
-                resource = _acceptance_artifact_resource(self.cluster, artifact)
-                if resource is None:
-                    continue
-                report.resources.append(resource)
-                report.artifacts.append(
-                    EvidenceReference(
-                        kind=resource.role or "artifact",
-                        reference=(
-                            resource.references[0]
-                            if resource.references
-                            else f"relay-artifact://{self.cluster}/{resource.resource_id}"
-                        ),
-                        sha256=(
-                            str(artifact["sha256"])
-                            if isinstance(artifact.get("sha256"), str)
-                            else None
-                        ),
-                    )
-                )
-        else:
-            _append_spack_transition_resources(report, self.spack_install_transition)
-        server_check = next(
-            (check for check in self.checks if check.name == "remote-mcp.server-artifact"),
-            None,
-        )
-        contract_check = next(
-            (
-                check
-                for check in self.checks
-                if check.name
-                in {
-                    "remote-mcp.spack-user-contract",
-                    "remote-mcp.scientific-catalog-user-contract",
-                }
-            ),
-            None,
-        )
-        contract_metadata: JSON = {}
-        if contract_check is not None:
-            contract_id = contract_check.evidence.get("declared_contract")
-            contract_sha256 = contract_check.evidence.get("observed_contract_sha256")
-            if isinstance(contract_id, str):
-                contract_metadata["contract_id"] = contract_id
-            if isinstance(contract_sha256, str):
-                contract_metadata["contract_sha256"] = contract_sha256
-        raw_server_artifact = (
-            server_check.evidence.get("call_server_artifact") if server_check is not None else None
-        )
-        if isinstance(raw_server_artifact, dict):
-            server_artifact = cast(JSON, raw_server_artifact)
-            identity = (
-                str(server_artifact.get("install_spec"))
-                if server_artifact.get("install_spec") is not None
-                else str(server_artifact.get("resolved_executable", self.server_name))
-            )
-            report.resources.append(
-                ValidationResource(
-                    kind="mcp_server",
-                    resource_id=f"{self.server_name}:{identity}",
-                    role="remote_mcp_server",
-                    cluster=self.cluster,
-                    state=(
-                        "verified"
-                        if server_check is not None and server_check.passed
-                        else "unverified"
-                    ),
-                    metadata={
-                        "server_name": self.server_name,
-                        "server_info": discovery_provenance.get("server_info", {}),
-                        "remote_tool_names": self.discovery.get("remote_tool_names", []),
-                        "allowlisted_tool_names": self.discovery.get("allowlisted_tool_names", []),
-                        **server_artifact,
-                        **contract_metadata,
-                    },
-                )
-            )
-        return report
-
-
-def _acceptance_artifact_resource(
-    cluster: str,
-    artifact: JSON,
-) -> ValidationResource | None:
-    from clio_relay.validation_report import ValidationResource
-
-    artifact_id = artifact.get("artifact_id")
-    if not isinstance(artifact_id, str):
-        return None
-    uri = artifact.get("uri")
-    return ValidationResource(
-        kind="artifact",
-        resource_id=artifact_id,
-        role=str(artifact.get("kind", "artifact")),
-        cluster=cluster,
-        references=[str(uri)] if isinstance(uri, str) else [],
-        metadata=artifact,
-    )
-
-
-def _append_spack_transition_resources(
-    report: LiveValidationReport,
-    transition: RemoteMcpSpackInstallTransitionEvidence,
-) -> None:
-    """Append phase-scoped jobs and artifacts without duplicating the install call."""
-    from clio_relay.validation_report import EvidenceReference, ValidationResource
-
-    roles = {
-        "preinstall": "spack_preinstall_find",
-        "install": "spack_fresh_install",
-        "postinstall": "spack_postinstall_locate",
-    }
-    report.resources.append(
-        ValidationResource(
-            kind="configuration_manifest",
-            resource_id=transition.fresh_install_configuration_sha256,
-            role="spack_fresh_install_configuration",
-            cluster=transition.cluster,
-            state="verified",
-            references=[transition.fresh_install_configuration_manifest_path],
-            metadata={
-                "expected_sha256": transition.fresh_install_configuration_sha256,
-                "preinstall": transition.preinstall_configuration.model_dump(mode="json"),
-                "postinstall": transition.postinstall_configuration.model_dump(mode="json"),
-            },
-        )
-    )
-    report.artifacts.append(
-        EvidenceReference(
-            kind="spack_fresh_install_configuration",
-            reference=transition.fresh_install_configuration_manifest_path,
-            sha256=transition.fresh_install_configuration_sha256,
-        )
-    )
-    for call in (transition.preinstall, transition.install, transition.postinstall):
-        role = roles[call.phase]
-        if call.job_id is not None:
-            report.resources.append(
-                ValidationResource(
-                    kind="relay_job",
-                    resource_id=call.job_id,
-                    role=role,
-                    cluster=transition.cluster,
-                    state=call.state,
-                    metadata={
-                        "remote_mcp_server_name": transition.server_name,
-                        "remote_mcp_tool_name": call.remote_tool_name,
-                        "virtual_alias": call.virtual_alias,
-                        "profile": transition.profile,
-                        "arguments": call.arguments,
-                        "stdio": call.stdio.model_dump(mode="json"),
-                        "structured_result": call.structured_result,
-                    },
-                )
-            )
-        for artifact in call.artifacts:
-            if artifact.artifact_id is None:
-                continue
-            artifact_role = f"{role}_{artifact.kind or 'artifact'}"
-            references = [artifact.uri] if artifact.uri is not None else []
-            report.resources.append(
-                ValidationResource(
-                    kind="artifact",
-                    resource_id=artifact.artifact_id,
-                    role=artifact_role,
-                    cluster=transition.cluster,
-                    references=references,
-                    metadata={
-                        **artifact.model_dump(mode="json"),
-                        "transition_phase": call.phase,
-                    },
-                )
-            )
-            report.artifacts.append(
-                EvidenceReference(
-                    kind=artifact_role,
-                    reference=(
-                        artifact.uri
-                        if artifact.uri is not None
-                        else f"relay-artifact://{transition.cluster}/{artifact.artifact_id}"
-                    ),
-                    sha256=artifact.sha256,
-                )
-            )
 
 
 @dataclass(frozen=True)
@@ -1692,165 +643,6 @@ def unavailable_virtual_remote_mcp_catalog(reason: str) -> VirtualRemoteMcpCatal
                 server_name="*",
                 reason=f"remote MCP catalog unavailable: {bounded_reason}",
             ),
-        ),
-    )
-
-
-def default_remote_mcp_cache_path(*, registry_path: Path | None = None) -> Path:
-    """Return the operator-local schema cache path."""
-    configured = os.getenv(REMOTE_MCP_CACHE_ENV)
-    if configured:
-        return Path(configured).expanduser().resolve()
-    resolved_registry = (registry_path or default_registry_path()).expanduser().resolve()
-    return (resolved_registry.parent / "remote-mcp-cache.json").resolve()
-
-
-def remote_mcp_execution_fingerprint(registration: RemoteMcpServerConfig) -> str:
-    """Hash the command and environment references that produced a schema snapshot."""
-    return _stable_digest(
-        {
-            "command": registration.command,
-            "args": registration.args,
-            "env_from": registration.env_from,
-        }
-    )
-
-
-def remote_mcp_registration_revision(registration: RemoteMcpServerConfig) -> str:
-    """Hash the complete operator-controlled registration used for one route."""
-    return _stable_digest({"registration": registration.model_dump(mode="json")})
-
-
-def remote_mcp_schema_digest(tools: list[RemoteMcpToolSchema]) -> str:
-    """Return a stable digest for a discovered tool collection."""
-    return _stable_digest(
-        {
-            "tools": [
-                tool.model_dump(mode="json") for tool in sorted(tools, key=lambda item: item.name)
-            ]
-        }
-    )
-
-
-def remote_mcp_server_artifact_digest(server_artifact: JSON) -> str:
-    """Return the canonical digest used to bind discovery to later execution."""
-    return _stable_digest({"server_artifact": server_artifact})
-
-
-def remote_mcp_server_artifact_binding_verified(
-    server_artifact: object,
-    *,
-    expected_digest: str | None,
-) -> bool:
-    """Verify one immutable registered-server artifact against discovery."""
-    if not isinstance(server_artifact, dict) or not _is_sha256(expected_digest):
-        return False
-    typed = cast(JSON, server_artifact)
-    return (
-        _server_artifact_verified(typed)
-        and _immutable_remote_mcp_install_verified(typed)
-        and _is_sha256(typed.get("install_artifact_sha256"))
-        and hmac.compare_digest(
-            remote_mcp_server_artifact_digest(typed),
-            cast(str, expected_digest).lower(),
-        )
-    )
-
-
-def cache_entry_from_discovery_artifact(
-    *,
-    cluster: str,
-    server_name: str,
-    registration: RemoteMcpServerConfig,
-    discovery_job_id: str,
-    artifact_id: str,
-    artifact_sha256: str | None,
-    artifact_payload: bytes,
-    discovered_at: datetime | None = None,
-) -> RemoteMcpSchemaCacheEntry:
-    """Validate a durable MCP result artifact and convert it to a cache entry."""
-    if len(artifact_payload) > MAX_REMOTE_MCP_DISCOVERY_ARTIFACT_BYTES:
-        raise ValueError(
-            f"remote MCP discovery artifact exceeds {MAX_REMOTE_MCP_DISCOVERY_ARTIFACT_BYTES} bytes"
-        )
-    observed_artifact_sha256 = hashlib.sha256(artifact_payload).hexdigest()
-    if artifact_sha256 is None:
-        raise ValueError("remote MCP discovery requires a durable artifact SHA-256")
-    if not hmac.compare_digest(artifact_sha256.strip().lower(), observed_artifact_sha256):
-        raise ValueError("remote MCP discovery artifact SHA-256 does not match its payload")
-    try:
-        decoded = json.loads(
-            artifact_payload.decode("utf-8-sig"),
-            parse_constant=_reject_nonfinite_json_constant,
-        )
-    except _NonFiniteJsonError as exc:
-        raise ValueError(str(exc)) from exc
-    except RecursionError as exc:
-        raise ValueError(
-            f"remote MCP discovery artifact exceeds {MAX_REMOTE_MCP_JSON_DEPTH} nesting levels"
-        ) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("remote MCP discovery artifact must be valid UTF-8 JSON") from exc
-    if not isinstance(decoded, dict):
-        raise ValueError("remote MCP discovery artifact must be a JSON object")
-    artifact = cast(JSON, decoded)
-    _require_bounded_json_structure(artifact, label="discovery artifact")
-    _require_finite_json(artifact, label="discovery artifact")
-    if artifact.get("operation") != "tools/list":
-        raise ValueError("remote MCP discovery artifact operation must be tools/list")
-    if artifact.get("server") != registration.command:
-        raise ValueError("remote MCP discovery artifact server does not match registration")
-    if artifact.get("server_args") != registration.args:
-        raise ValueError("remote MCP discovery artifact server_args do not match registration")
-    if artifact.get("env_from", {}) != registration.env_from:
-        raise ValueError("remote MCP discovery artifact env_from does not match registration")
-    if artifact.get("returncode") != 0:
-        raise ValueError("remote MCP discovery job did not exit successfully")
-    if artifact.get("timed_out") is True:
-        raise ValueError("remote MCP discovery job timed out")
-    if artifact.get("protocol_error") is not None:
-        raise ValueError(
-            "remote MCP discovery protocol error: "
-            + _bounded_diagnostic(artifact["protocol_error"])
-        )
-    protocol_result = artifact.get("protocol_result")
-    if not isinstance(protocol_result, dict):
-        raise ValueError("remote MCP discovery artifact is missing protocol_result")
-    raw_tools = cast(JSON, protocol_result).get("tools")
-    if not isinstance(raw_tools, list):
-        raise ValueError("remote MCP tools/list result must contain a tools array")
-    typed_raw_tools = cast(list[object], raw_tools)
-    if len(typed_raw_tools) > MAX_REMOTE_MCP_TOOLS_PER_SERVER:
-        raise ValueError(f"remote MCP tools/list exceeds {MAX_REMOTE_MCP_TOOLS_PER_SERVER} tools")
-    tools = [_parse_remote_tool(item) for item in typed_raw_tools]
-    names = [tool.name for tool in tools]
-    if len(names) != len(set(names)):
-        raise ValueError("remote MCP tools/list result contains duplicate tool names")
-    initialized_at = discovered_at or datetime.now(UTC)
-    protocol_version = artifact.get("protocol_version")
-    server_info = artifact.get("server_info", {})
-    server_artifact = artifact.get("server_artifact", {})
-    if protocol_version is not None and not isinstance(protocol_version, str):
-        raise ValueError("remote MCP protocol_version must be a string")
-    if not isinstance(server_info, dict):
-        raise ValueError("remote MCP server_info must be an object")
-    if not isinstance(server_artifact, dict):
-        raise ValueError("remote MCP server_artifact must be an object")
-    return RemoteMcpSchemaCacheEntry(
-        cluster=cluster,
-        server_name=server_name,
-        execution_fingerprint=remote_mcp_execution_fingerprint(registration),
-        discovered_at=initialized_at,
-        expires_at=initialized_at + timedelta(seconds=registration.schema_cache_ttl_seconds),
-        schema_digest=remote_mcp_schema_digest(tools),
-        tools=tools,
-        provenance=RemoteMcpDiscoveryProvenance(
-            discovery_job_id=discovery_job_id,
-            artifact_id=artifact_id,
-            artifact_sha256=observed_artifact_sha256,
-            protocol_version=protocol_version,
-            server_info=cast(JSON, server_info),
-            server_artifact=cast(JSON, server_artifact),
         ),
     )
 
@@ -4374,33 +3166,6 @@ def _spack_package_identity(package: JSON | None) -> JSON:
     }
 
 
-def _is_canonical_absolute_posix_path(value: object) -> bool:
-    """Return whether a value is a normalized absolute POSIX path without traversal."""
-    if (
-        not isinstance(value, str)
-        or not value.startswith("/")
-        or value.startswith("//")
-        or value == "/"
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-    ):
-        return False
-    path = PurePosixPath(value)
-    return ".." not in path.parts and str(path) == value
-
-
-def _is_canonical_relative_posix_path(value: object) -> bool:
-    """Return whether a value is a normalized, non-traversing relative POSIX path."""
-    if (
-        not isinstance(value, str)
-        or value.startswith("/")
-        or value in {"", "."}
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-    ):
-        return False
-    path = PurePosixPath(value)
-    return ".." not in path.parts and str(path) == value
-
-
 CLIO_KIT_SPACK_USER_ANNOTATION_EXPECTATIONS: dict[str, dict[str, bool]] = {
     "spack_find": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "spack_locate": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
@@ -4961,417 +3726,3 @@ def _stdio_call_job_id(evidence: JSON | None) -> str | None:
 
 def _as_json(value: object) -> JSON | None:
     return cast(JSON, value) if isinstance(value, dict) else None
-
-
-def _fsync_cache_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def inject_cluster_argument(input_schema: JSON, *, clusters: list[str]) -> JSON:
-    """Copy a remote input schema and add the local-only relay envelope.
-
-    Closed plain-object contracts remain flat for agent ergonomics. Contracts
-    whose open root, composition, or own local-control field makes flat
-    augmentation unsafe are preserved under an ``arguments`` object instead.
-    """
-    _require_bounded_json_structure(input_schema, label="inputSchema")
-    error = virtual_schema_error(input_schema)
-    if error is not None:
-        raise ValueError(error)
-    cluster_schema: JSON = {
-        "type": "string",
-        "enum": sorted(clusters),
-        "description": "Configured clio-relay cluster target.",
-    }
-    if remote_input_schema_requires_wrapper(input_schema):
-        nested_schema = deepcopy(input_schema)
-        identifier_keyword = _schema_identifier_keyword(nested_schema)
-        if identifier_keyword == "id":
-            _relocate_legacy_local_references(
-                nested_schema,
-                pointer_prefix="/properties/arguments",
-            )
-        elif not _schema_establishes_embedded_resource(
-            nested_schema,
-            identifier_keyword=identifier_keyword,
-        ):
-            nested_schema[identifier_keyword] = (
-                "urn:clio-relay:remote-mcp-schema:" + _stable_digest({"input_schema": input_schema})
-            )
-        wrapper: JSON = {
-            "type": "object",
-            "properties": {
-                "cluster": cluster_schema,
-                "arguments": nested_schema,
-                **deepcopy(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS),
-            },
-            "required": ["cluster", "arguments"],
-            "additionalProperties": False,
-        }
-        dialect = input_schema.get("$schema")
-        if isinstance(dialect, str):
-            wrapper["$schema"] = dialect
-        return wrapper
-    rendered = deepcopy(input_schema)
-    properties = cast(JSON, rendered.setdefault("properties", {}))
-    properties["cluster"] = cluster_schema
-    properties.update(deepcopy(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS))
-    required = cast(list[str], rendered.setdefault("required", []))
-    rendered["required"] = ["cluster", *required]
-    rendered["type"] = "object"
-    return rendered
-
-
-def virtual_schema_error(input_schema: JSON) -> str | None:
-    """Return why a remote input contract cannot be safely virtualized."""
-    schema_type = input_schema.get("type", "object")
-    if schema_type != "object":
-        return "remote inputSchema must have type object"
-    properties = input_schema.get("properties", {})
-    if not isinstance(properties, dict):
-        return "remote inputSchema properties must be an object"
-    required = input_schema.get("required", [])
-    if not isinstance(required, list) or not all(
-        isinstance(item, str) for item in cast(list[object], required)
-    ):
-        return "remote inputSchema required must be a string array"
-    typed_required = cast(list[str], required)
-    if len(typed_required) != len(set(typed_required)):
-        return "remote inputSchema required entries must be unique"
-    return None
-
-
-def remote_input_schema_requires_wrapper(input_schema: JSON) -> bool:
-    """Return whether a remote schema must be nested below local relay fields."""
-    _require_bounded_json_structure(input_schema, label="inputSchema")
-    properties = input_schema.get("properties", {})
-    required = input_schema.get("required", [])
-    property_names = (
-        set(cast(dict[str, object], properties)) if isinstance(properties, dict) else set[str]()
-    )
-    required_names = set(cast(list[str], required)) if isinstance(required, list) else set[str]()
-    root_identifier = input_schema.get("$id")
-    return (
-        (isinstance(root_identifier, str) and bool(root_identifier))
-        or input_schema.get("additionalProperties", True) is not False
-        or any(key in input_schema for key in _COMPOSED_SCHEMA_KEYS)
-        or bool(set(input_schema) - _FLAT_SCHEMA_KEYS)
-        or _contains_document_root_reference(input_schema)
-        or (isinstance(properties, dict) and "cluster" in properties)
-        or (isinstance(required, list) and "cluster" in required)
-        or bool(property_names.intersection(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS))
-        or bool(required_names.intersection(VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS))
-    )
-
-
-def _contains_document_root_reference(value: object) -> bool:
-    """Return whether a nested schema reference depends on the document root."""
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, dict):
-            mapping = cast(dict[object, object], current)
-            for key, item in mapping.items():
-                if (
-                    key in {"$ref", "$dynamicRef", "$recursiveRef"}
-                    and isinstance(item, str)
-                    and (item == "#" or item.startswith("#/"))
-                ):
-                    return True
-                stack.append(item)
-        elif isinstance(current, list):
-            stack.extend(cast(list[object], current))
-    return False
-
-
-def _schema_identifier_keyword(schema: JSON) -> str:
-    """Return the resource identifier keyword for a declared JSON Schema dialect."""
-    dialect = schema.get("$schema")
-    if isinstance(dialect, str) and ("draft-03" in dialect or "draft-04" in dialect):
-        return "id"
-    return "$id"
-
-
-def _schema_establishes_embedded_resource(
-    schema: JSON,
-    *,
-    identifier_keyword: str,
-) -> bool:
-    """Return whether an identifier gives an embedded schema its own resource base."""
-    schema_id = schema.get(identifier_keyword)
-    if not isinstance(schema_id, str):
-        return False
-    return bool(schema_id.partition("#")[0])
-
-
-def _relocate_legacy_local_references(
-    value: object,
-    *,
-    pointer_prefix: str,
-    nested_resource: bool = False,
-    root: bool = True,
-) -> None:
-    """Retarget Draft 3/4 document-root references after schema embedding."""
-    if isinstance(value, dict):
-        mapping = cast(JSON, value)
-        establishes_nested_resource = not root and (
-            isinstance(mapping.get("id"), str) and bool(cast(str, mapping["id"]).partition("#")[0])
-        )
-        rewrite_here = not nested_resource and not establishes_nested_resource
-        child_nested_resource = nested_resource or establishes_nested_resource
-        for key, item in list(mapping.items()):
-            if key == "$ref" and isinstance(item, str) and rewrite_here:
-                if item == "#":
-                    mapping[key] = f"#{pointer_prefix}"
-                elif item.startswith("#/"):
-                    mapping[key] = f"#{pointer_prefix}{item[1:]}"
-                continue
-            _relocate_legacy_local_references(
-                item,
-                pointer_prefix=pointer_prefix,
-                nested_resource=child_nested_resource,
-                root=False,
-            )
-    elif isinstance(value, list):
-        for item in cast(list[object], value):
-            _relocate_legacy_local_references(
-                item,
-                pointer_prefix=pointer_prefix,
-                nested_resource=nested_resource,
-                root=False,
-            )
-
-
-def _validate_json_schema(schema: JSON, *, label: str) -> None:
-    """Reject malformed or unsupported JSON Schema contracts at ingestion."""
-    _require_bounded_json_structure(schema, label=label)
-    declared_dialect = schema.get("$schema")
-    if isinstance(declared_dialect, str):
-        normalized_dialect = declared_dialect.rstrip("#")
-        validator = _JSON_SCHEMA_VALIDATORS.get(normalized_dialect)
-        if validator is None:
-            raise ValueError(f"remote MCP {label} declares an unsupported JSON Schema dialect")
-    else:
-        validator = Draft202012Validator
-    try:
-        validator.check_schema(schema)
-    except RecursionError as exc:
-        raise ValueError(
-            f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_DEPTH} nesting levels"
-        ) from exc
-    except SchemaError as exc:
-        raise ValueError(
-            f"remote MCP {label} is not valid JSON Schema: " + _bounded_diagnostic(exc.message)
-        ) from exc
-
-
-def _require_bounded_json_structure(value: object, *, label: str) -> None:
-    """Bound untrusted JSON before recursive validators or transformations run."""
-    stack: list[tuple[object, int]] = [(value, 0)]
-    node_count = 0
-    while stack:
-        current, depth = stack.pop()
-        node_count += 1
-        if node_count > MAX_REMOTE_MCP_JSON_NODES:
-            raise ValueError(f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_NODES} JSON nodes")
-        if depth > MAX_REMOTE_MCP_JSON_DEPTH:
-            raise ValueError(
-                f"remote MCP {label} exceeds {MAX_REMOTE_MCP_JSON_DEPTH} nesting levels"
-            )
-        if isinstance(current, dict):
-            stack.extend((item, depth + 1) for item in cast(dict[object, object], current).values())
-        elif isinstance(current, list):
-            stack.extend((item, depth + 1) for item in cast(list[object], current))
-
-
-def _require_finite_json(value: object, *, label: str) -> None:
-    """Reject non-finite numbers that cannot round-trip through strict JSON."""
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, float) and not math.isfinite(current):
-            raise ValueError(f"remote MCP {label} contains a non-finite JSON number")
-        if isinstance(current, dict):
-            stack.extend(cast(dict[object, object], current).values())
-        elif isinstance(current, list):
-            stack.extend(cast(list[object], current))
-
-
-def _bounded_diagnostic(value: object) -> str:
-    """Render an untrusted diagnostic without allowing unbounded error output."""
-    rendered = value if isinstance(value, str) else repr(value)
-    if len(rendered) <= MAX_REMOTE_MCP_DIAGNOSTIC_CHARS:
-        return rendered
-    return rendered[:MAX_REMOTE_MCP_DIAGNOSTIC_CHARS] + "... [truncated]"
-
-
-def _reject_nonfinite_json_constant(value: str) -> None:
-    """Reject NaN and infinity tokens accepted by Python's permissive decoder."""
-    raise _NonFiniteJsonError(
-        f"remote MCP discovery artifact contains non-finite JSON token: {value}"
-    )
-
-
-def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:
-    if not isinstance(value, dict):
-        raise ValueError("remote MCP tools/list entries must be objects")
-    tool = cast(JSON, value)
-    name = tool.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("remote MCP tool name must be a non-empty string")
-    input_schema = tool.get("inputSchema")
-    if not isinstance(input_schema, dict):
-        raise ValueError(f"remote MCP tool {name} inputSchema must be an object")
-    title = tool.get("title")
-    description = tool.get("description")
-    output_schema = tool.get("outputSchema")
-    annotations = tool.get("annotations")
-    if title is not None and not isinstance(title, str):
-        raise ValueError(f"remote MCP tool {name} title must be a string")
-    if description is not None and not isinstance(description, str):
-        raise ValueError(f"remote MCP tool {name} description must be a string")
-    if output_schema is not None and not isinstance(output_schema, dict):
-        raise ValueError(f"remote MCP tool {name} outputSchema must be an object")
-    if annotations is not None and not isinstance(annotations, dict):
-        raise ValueError(f"remote MCP tool {name} annotations must be an object")
-    return RemoteMcpToolSchema(
-        name=name,
-        title=title,
-        description=description,
-        input_schema=cast(JSON, input_schema),
-        output_schema=cast(JSON | None, output_schema),
-        annotations=cast(JSON | None, annotations),
-    )
-
-
-def _assign_aliases(
-    grouped: dict[str, list[_Candidate]],
-    *,
-    reserved_names: set[str],
-) -> dict[str, str]:
-    bases: dict[str, list[str]] = {}
-    for identity, candidates in grouped.items():
-        base = _bounded_base_alias(candidates[0].base_alias)
-        bases.setdefault(base, []).append(identity)
-    all_bases = set(bases)
-    assigned: dict[str, str] = {}
-    used = set(reserved_names)
-    for base, identities in sorted(bases.items()):
-        sorted_identities = sorted(identities)
-        if len(sorted_identities) == 1 and base not in used:
-            identity = sorted_identities[0]
-            assigned[identity] = base
-            used.add(base)
-            continue
-        for identity in sorted_identities:
-            alias = _collision_alias(
-                base,
-                identity,
-                blocked=used | all_bases,
-            )
-            assigned[identity] = alias
-            used.add(alias)
-    return assigned
-
-
-def _collision_alias(base: str, identity: str, *, blocked: set[str]) -> str:
-    maximum_suffix_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len("remote_")
-    for length in range(10, min(len(identity), maximum_suffix_length) + 1):
-        candidate = _alias_with_suffix(base, identity[:length])
-        if candidate not in blocked:
-            return candidate
-    for nonce in range(1, len(blocked) + MAX_VIRTUAL_REMOTE_MCP_CANDIDATES + 2):
-        suffix = hashlib.sha256(f"{identity}\0{nonce}".encode("ascii")).hexdigest()[
-            :maximum_suffix_length
-        ]
-        candidate = f"remote_{suffix}"
-        if candidate not in blocked:
-            return candidate
-    raise ValueError("could not assign a unique bounded remote MCP alias")
-
-
-def _bounded_base_alias(base: str) -> str:
-    """Bound one readable generated alias to the MCP interoperability limit."""
-    if len(base) <= MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH:
-        return base
-    suffix = hashlib.sha256(base.encode("utf-8")).hexdigest()[:10]
-    return _alias_with_suffix(base, suffix)
-
-
-def _alias_with_suffix(base: str, suffix: str) -> str:
-    """Append a stable suffix without exceeding the MCP tool-name limit."""
-    head_length = MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH - len(suffix) - 1
-    if head_length < 1:
-        raise ValueError("remote MCP alias suffix leaves no readable prefix")
-    head = base[:head_length].rstrip("_")
-    if not head:
-        head = "remote"[:head_length]
-    return f"{head}_{suffix}"
-
-
-def _profile_allows(profiles: list[RemoteMcpProfile], profile: str) -> bool:
-    if profile == "all":
-        return True
-    normalized = "user" if profile in {"", "agent", "user"} else profile
-    return normalized in profiles
-
-
-def _safe_name(value: str) -> str:
-    normalized = _SAFE_NAME_PATTERN.sub("_", value.strip().lower()).strip("_")
-    if normalized:
-        return normalized
-    return f"unnamed_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:10]}"
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value.lower())
-    )
-
-
-def _server_artifact_verified(server_artifact: JSON) -> bool:
-    return (
-        server_artifact.get("verified") is True
-        and server_artifact.get("server_process_artifact_verified") is True
-        and isinstance(server_artifact.get("executable"), dict)
-    )
-
-
-def _immutable_remote_mcp_install_verified(server_artifact: JSON) -> bool:
-    """Accept immutable wheel launches and wheel-backed persistent uv tools."""
-    install_source = server_artifact.get("install_source")
-    if install_source == "wheel":
-        return True
-    if install_source != "uv-tool":
-        return False
-    install_spec = server_artifact.get("install_spec")
-    python_runtime = server_artifact.get("python_distribution_runtime")
-    if (
-        not isinstance(install_spec, str)
-        or not install_spec.lower().endswith(".whl")
-        or not isinstance(python_runtime, dict)
-        or cast(JSON, python_runtime).get("runtime_closure_verified") is not True
-    ):
-        return False
-    if server_artifact.get("nested_launcher") is not True:
-        return True
-    nested_runtime = server_artifact.get("nested_runtime")
-    return (
-        isinstance(nested_runtime, dict)
-        and cast(JSON, nested_runtime).get("persistent_tool") is True
-        and cast(JSON, nested_runtime).get("locked_runtime_verified") is True
-    )
-
-
-def _stable_digest(value: JSON) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    ).hexdigest()

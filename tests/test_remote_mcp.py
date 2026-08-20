@@ -24,7 +24,13 @@ from pytest import LogCaptureFixture, MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.cli as relay_cli
-from clio_relay import remote_cli, remote_mcp
+from clio_relay import (
+    remote_cli,
+    remote_mcp,
+    remote_mcp_aliasing,
+    remote_mcp_cache,
+    remote_mcp_schema_validation,
+)
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -55,12 +61,6 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.remote_mcp import (
-    MAX_REMOTE_MCP_CACHE_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
-    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
-    MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES,
-    MAX_REMOTE_MCP_TOOLS_PER_SERVER,
     VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
     VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS,
     RemoteMcpAcceptanceReport,
@@ -80,6 +80,13 @@ from clio_relay.remote_mcp import (
     is_remote_mcp_control_query,
     remote_mcp_server_artifact_digest,
 )
+from clio_relay.remote_mcp_acceptance_models import (
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENT_BYTES,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_COMPONENTS,
+    MAX_REMOTE_MCP_SPACK_CONFIGURATION_MANIFEST_BYTES,
+)
+from clio_relay.remote_mcp_cache import MAX_REMOTE_MCP_CACHE_BYTES, MAX_REMOTE_MCP_TOOLS_PER_SERVER
+from clio_relay.remote_mcp_tool_schema import MAX_REMOTE_MCP_TOOL_SCHEMA_BYTES
 from clio_relay.spool import JobSpool
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
@@ -843,7 +850,7 @@ def test_scientific_catalog_result_rejects_overdeep_content_without_traversing()
     dataset_id = "deep-water-impact-2018-yb31-first5"
     structured = _scientific_catalog_describe_result(dataset_id)
     nested: dict[str, object] = {"leaf": True}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"child": nested}
     descriptor = cast(dict[str, object], structured["dataset_descriptor"])
     descriptor["unsafe_test_nesting"] = nested
@@ -1011,7 +1018,7 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     entry = _entry(registration, cluster="alpha", server_name="science")
     path = tmp_path / "remote-mcp-cache.json"
     attempts = 0
-    original_replace = remote_mcp.os.replace
+    original_replace = remote_mcp_cache.os.replace
 
     def sharing_once(
         source: str | os.PathLike[str],
@@ -1026,8 +1033,8 @@ def test_remote_mcp_cache_retries_windows_sharing_violation(
     def no_sleep(_seconds: float) -> None:
         return
 
-    monkeypatch.setattr(remote_mcp.os, "replace", sharing_once)
-    monkeypatch.setattr(remote_mcp.time, "sleep", no_sleep)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", sharing_once)
+    monkeypatch.setattr(remote_mcp_cache.time, "sleep", no_sleep)
 
     RemoteMcpSchemaCache.update_entry(path, entry)
 
@@ -1050,7 +1057,7 @@ def test_remote_mcp_cache_preserves_old_file_when_replace_fails(
         del source, target
         raise OSError("simulated replacement failure")
 
-    monkeypatch.setattr(remote_mcp.os, "replace", fail_replace)
+    monkeypatch.setattr(remote_mcp_cache.os, "replace", fail_replace)
 
     with pytest.raises(OSError, match="simulated replacement failure"):
         RemoteMcpSchemaCache.update_entry(path, replacement)
@@ -1097,7 +1104,7 @@ def test_remote_mcp_discovery_and_schema_sizes_are_bounded() -> None:
 
 def test_remote_mcp_schema_depth_is_bounded_before_recursive_validation() -> None:
     nested: dict[str, object] = {"type": "object"}
-    for _ in range(remote_mcp.MAX_REMOTE_MCP_JSON_DEPTH + 1):
+    for _ in range(remote_mcp_schema_validation.MAX_REMOTE_MCP_JSON_DEPTH + 1):
         nested = {"allOf": [nested]}
 
     with pytest.raises(ValidationError, match="nesting levels"):
@@ -1123,7 +1130,11 @@ def test_remote_mcp_discovery_json_node_count_is_bounded(
     artifact = json.loads(_discovery_artifact(registration, tools=[_tool("inspect")]))
     artifact["server_info"] = {"wide": list(range(200))}
     payload = json.dumps(artifact).encode()
-    monkeypatch.setattr(remote_mcp, "MAX_REMOTE_MCP_JSON_NODES", 100)
+    # MAX_REMOTE_MCP_JSON_NODES is read inside _require_bounded_json_structure,
+    # which now lives in remote_mcp_schema_validation.py (#231) -- patch the
+    # module the guard actually reads its bound from, not remote_mcp's
+    # re-export (moved-symbol patch seam, design doc §4.6).
+    monkeypatch.setattr(remote_mcp_schema_validation, "MAX_REMOTE_MCP_JSON_NODES", 100)
 
     with pytest.raises(ValueError, match="100 JSON nodes"):
         _entry_from_payload(registration, payload)
@@ -1138,7 +1149,8 @@ def test_remote_mcp_protocol_error_diagnostic_is_bounded() -> None:
     with pytest.raises(ValueError) as error:
         _entry_from_payload(registration, payload)
 
-    assert len(str(error.value)) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS + 100
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert len(str(error.value)) <= max_chars + 100
     assert str(error.value).endswith("... [truncated]")
 
 
@@ -1850,7 +1862,8 @@ def test_catalog_aliases_remain_interoperable_for_long_remote_names() -> None:
     assert sorted(first.tools) == sorted(second.tools)
     assert len(first.tools) == 2
     assert all(
-        len(alias) <= remote_mcp.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH for alias in first.tools
+        len(alias) <= remote_mcp_aliasing.MAX_VIRTUAL_REMOTE_MCP_ALIAS_LENGTH
+        for alias in first.tools
     )
     assert all(re.fullmatch(r"[a-z0-9_]+", alias) is not None for alias in first.tools)
 
@@ -4194,7 +4207,8 @@ def test_spack_structured_result_bounds_output_schema_error_evidence() -> None:
     schema_evidence = cast(dict[str, object], check.evidence["output_schema"])
     errors = cast(list[str], schema_evidence["validation_errors"])
     assert len(errors) == remote_mcp.MAX_REMOTE_MCP_RESULT_SCHEMA_ERRORS
-    assert all(len(error) <= remote_mcp.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS for error in errors)
+    max_chars = remote_mcp_schema_validation.MAX_REMOTE_MCP_DIAGNOSTIC_CHARS
+    assert all(len(error) <= max_chars for error in errors)
     assert schema_evidence["validation_errors_truncated"] is True
 
 

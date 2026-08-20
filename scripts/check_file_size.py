@@ -674,7 +674,97 @@ RATCHET_BASELINE: dict[str, int] = {
     # and a WARNING log call at each site. No deletion offsets it -- this is
     # genuinely new structure the owner ruling requires, not a fixable
     # regression. A justified, minimal ratchet-up.
-    "src/clio_relay/remote_mcp.py": 5377,
+    # #231 slice 1 (design doc §4.5/§5): the JSON/JSON-Schema validation
+    # primitives (_validate_json_schema, _require_bounded_json_structure,
+    # _require_finite_json, _bounded_diagnostic, _reject_nonfinite_json_constant,
+    # _NonFiniteJsonError, _JsonSchemaInstanceValidator, the composed/flat
+    # schema-key sets, the per-dialect validator map, and their three bound
+    # constants) moved to the new remote_mcp_schema_validation.py (172 lines,
+    # under DEFAULT_MAX_LINES -- no baseline entry needed). Private helpers
+    # with no external callers, so remote_mcp.py imports them directly rather
+    # than re-exporting. 5377 -> 5255.
+    # #231 slice 2: RemoteMcpToolSchema, RemoteMcpDiscoveryProvenance,
+    # is_remote_mcp_control_query, _parse_remote_tool, and the identity/
+    # verification helpers (_is_sha256, _server_artifact_verified,
+    # _immutable_remote_mcp_install_verified, _stable_digest) moved to the new
+    # remote_mcp_tool_schema.py (222 lines, under DEFAULT_MAX_LINES). The
+    # first three are re-exported under their original names (external
+    # importers across several modules and tests); the rest are private with
+    # no callers outside remote_mcp.py. 5255 -> 5099.
+    # #231 slice 3: the release-acceptance evidence wire model cluster
+    # (RemoteMcpCatalogIssue through RemoteMcpAcceptanceReport, 10 classes;
+    # _acceptance_artifact_resource, _append_spack_transition_resources; the
+    # two path-canonicalization primitives their validators call) moved to
+    # the new remote_mcp_acceptance_models.py (769 lines, under
+    # DEFAULT_MAX_LINES). Every model class remote_mcp.py still references
+    # is re-exported via `from ... import`. Three of the four bound
+    # Spack-configuration constants have no reader left in this file's own
+    # body but cli.py imports them directly, so they are re-exported via
+    # qualified assignment instead (`X = remote_mcp_acceptance_models.X`) --
+    # ruff's unused-import check has no equivalent for a plain module-level
+    # assignment, unlike the `from ... import` it kept stripping as dead
+    # de facto proving those three names really are body-unused now. This
+    # is why the net reduction (5099 -> 4445) is 16 lines short of a
+    # forced-contiguous cut: the qualified-assignment block plus the
+    # explanatory comments are new, real structure this re-export needs.
+    # RemoteMcpSpackConfigurationComponentObservation has no importer at
+    # all (confirmed by ruff F401 and grep), so it alone stays unexported.
+    # The validator *functions* that build these reports
+    # (build_remote_mcp_acceptance_report, the Spack/scientific-catalog
+    # families) stay here -- design doc §4.5 names that cluster as needing
+    # reordering, a separate future slice, not a contiguous cut alongside
+    # the models.
+    # #231 slice 4: the virtual-tool alias assignment/collision-resolution
+    # cluster (_assign_aliases, _collision_alias, _bounded_base_alias,
+    # _alias_with_suffix, _profile_allows, _safe_name, the compiled
+    # _SAFE_NAME_PATTERN, and the two bound alias constants) moved to the
+    # new remote_mcp_aliasing.py (122 lines, under DEFAULT_MAX_LINES). None
+    # have a caller outside remote_mcp.py's own catalog-assembly code
+    # (confirmed by grep), so no re-export is needed -- only
+    # MAX_VIRTUAL_REMOTE_MCP_CANDIDATES is imported back (the
+    # catalog-assembly candidate-limit check still reads it). 4445 -> 4376.
+    # #231 slice 5: the local relay control envelope injection cluster
+    # (inject_cluster_argument, virtual_schema_error,
+    # remote_input_schema_requires_wrapper, _contains_document_root_reference,
+    # _schema_identifier_keyword, _schema_establishes_embedded_resource,
+    # _relocate_legacy_local_references, VIRTUAL_REMOTE_MCP_RELAY_CONTROL_SCHEMAS/
+    # _FIELDS, MAX_VIRTUAL_REMOTE_MCP_LOG_BYTES) moved to the new
+    # remote_mcp_schema_wrapping.py (271 lines, under DEFAULT_MAX_LINES).
+    # inject_cluster_argument and VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS are
+    # re-exported (tests import the former; queue_tasks.py and this file's
+    # own catalog-assembly body import/read the latter). The rest have no
+    # caller outside remote_mcp.py's own body (confirmed by grep), so no
+    # re-export. 4376 -> 4171.
+    # #231 slice 6: the schema discovery cache (RemoteMcpSchemaCacheEntry,
+    # RemoteMcpSchemaCache, _fsync_cache_directory, the digest/fingerprint
+    # helpers, and cache_entry_from_discovery_artifact) moved to the new
+    # remote_mcp_cache.py (428 lines, under DEFAULT_MAX_LINES). Eight of the
+    # nine public names have a real reader elsewhere in this file's own
+    # catalog-assembly/admission-resolution body (confirmed by grep), so
+    # they are imported via a plain `from ... import`, which is also the
+    # re-export cli.py/mcp_server.py/jarvis_mcp.py/jarvis_mcp_validation.py
+    # rely on. remote_mcp_server_artifact_binding_verified has no reader
+    # left in this file's own body -- only endpoint.py and
+    # jarvis_service_runtime.py import it directly -- so it is re-exported
+    # via qualified assignment instead. 4171 -> 3839.
+    # #231 slice 7: the agent-facing JSON-Schema builder cluster
+    # (cluster_route_revision_json_schema, VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA,
+    # jarvis_service_runtime_handoff_json_schema, virtual_jarvis_job_output_schema)
+    # moved to the new remote_mcp_wire_schemas.py (172 lines, under
+    # DEFAULT_MAX_LINES). All four are re-exported -- mcp_server.py,
+    # jarvis_mcp.py, jarvis_mcp_validation.py, and tests import them
+    # directly. VIRTUAL_REMOTE_MCP_JOB_OUTPUT_SCHEMA and
+    # virtual_jarvis_job_output_schema have a real local reader too
+    # (VirtualRemoteMcpTool.definition), so they use a plain `from ...
+    # import`; cluster_route_revision_json_schema and
+    # jarvis_service_runtime_handoff_json_schema have no reader left in
+    # this file's own body (both calls moved into the new module's own
+    # definitions), so they are re-exported via qualified assignment
+    # instead. virtual_jarvis_job_output_schema imports
+    # CLIO_KIT_JARVIS_USER_TOOL_NAMES (a contract-pin constant still here)
+    # at function scope, the proven idiom for the load-order circular
+    # import a module-scope import back would create. 3839 -> 3728.
+    "src/clio_relay/remote_mcp.py": 3728,
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
