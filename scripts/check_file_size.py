@@ -1307,7 +1307,28 @@ RATCHET_BASELINE: dict[str, int] = {
     # §6.4, F4) via `bounded_payload.is_delivery_refusal`, surfacing its
     # own typed code/message instead of the generic "HTTP {status}: {raw
     # json blob}". A justified, minimal ratchet-up.
-    "src/clio_relay/remote_connection.py": 1073,
+    # split/remote-connection-w3: remote_connection.py's pooled-stream wire
+    # mechanics (identity-bound stream open/request/read, the clio-relay#213
+    # stale-stream classifier) move to the new owner module
+    # remote_connection_stream_io.py (203 lines), and the connections-by-
+    # cluster bookkeeping (RemoteConnectionRegistry, the retired-connection
+    # ledger, the process-wide singleton) move to the new owner module
+    # remote_connection_registry.py (181 lines) -- both a MOVE, not a
+    # rewrite, with every existing `from clio_relay.remote_connection import
+    # ...` and `monkeypatch.setattr("clio_relay.remote_connection.<name>",
+    # ...)` call site (verified by a whole-tree grep before the move) still
+    # resolving unchanged: `_is_stale_stream_error`/
+    # `_open_identity_bound_stream`/`_request_json_on_stream` are re-exported
+    # as bare-name imports (each still has a real call site inside
+    # `RemoteConnection`, whose methods stay resident here, so their lookup
+    # still resolves through this file's own globals); `RemoteConnection`
+    # (the class), `RemoteConnectionRegistry`, `connection_registry`, and
+    # `MAX_SESSION_API_RESPONSE_BYTES` are re-exported via ruff's `X as X`
+    # self-alias idiom. `RemoteConnectionRegistry.connection()` imports
+    # `RemoteConnection` at function scope (not module scope) to avoid a
+    # circular import with this file's own top-level re-export of
+    # `RemoteConnectionRegistry`. 1073 -> 682, comfortably under
+    # DEFAULT_MAX_LINES -- entry removed per ground rule 5.
     # #231 R6 review fixes: +11 net lines -- F5,
     # `_control_query_discovery_artifact_bytes` checks is_delivery_refusal
     # on the envelope FIRST and raises the refusal's own message/code,
