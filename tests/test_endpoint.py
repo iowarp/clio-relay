@@ -21,7 +21,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
-from clio_relay import process_containment, queue_artifacts
+from clio_relay import endpoint_runtime_sidecar_anchor, process_containment, queue_artifacts
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -1228,7 +1228,9 @@ def test_execution_sidecar_cleanup_removes_only_owned_non_directory_entries(
             [hostile],
             spool_path=spool,
             expected_anchors={
-                hostile: private._runtime_sidecar_anchor(os.stat(hostile, follow_symlinks=False))
+                hostile: endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
+                    os.stat(hostile, follow_symlinks=False)
+                )
             },
         )
     assert hostile.is_dir()
@@ -1292,7 +1294,7 @@ def test_execution_sidecar_quarantine_restarts_beyond_windows_max_path(
         expected_anchors={source: anchor},
         expected_quarantines={source: quarantine},
     )
-    restarted_anchor = private._runtime_sidecar_anchor(
+    restarted_anchor = endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
         os.stat(internal_filesystem_path(quarantine), follow_symlinks=False)
     )
     second = private._remove_execution_sidecars(
@@ -1541,7 +1543,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
                 [junction],
                 spool_path=spool,
                 expected_anchors={
-                    junction: private._runtime_sidecar_anchor(
+                    junction: endpoint_runtime_sidecar_anchor._runtime_sidecar_anchor(
                         os.stat(junction, follow_symlinks=False)
                     )
                 },

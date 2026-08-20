@@ -337,7 +337,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # _render_progress_log_identity, _open_package_progress_log) move to the
     # new leaf owner module `endpoint_progress_log_io.py` (94 lines). Net:
     # 8653 -> 8590.
-    "src/clio_relay/endpoint.py": 8590,
+    # #231 endpoint split, slice 3: -143 net lines -- the runtime-sidecar
+    # filesystem-anchor lifecycle (_runtime_sidecar_anchor,
+    # _runtime_sidecar_anchor_from_metadata, _validate_runtime_sidecar_stat,
+    # _precreate_runtime_sidecar, _open_owned_sidecar) moves to the new owner
+    # module `endpoint_runtime_sidecar_anchor.py` (183 lines). Net:
+    # 8590 -> 8447.
+    "src/clio_relay/endpoint.py": 8447,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
