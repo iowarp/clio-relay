@@ -1416,9 +1416,9 @@ def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema
     contract_artifact = cast(
         dict[str, object],
         json.loads(
-            (Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json").read_text(
-                encoding="utf-8"
-            )
+            (
+                Path(remote_mcp.__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json"
+            ).read_text(encoding="utf-8")
         ),
     )
     tools = cast(list[dict[str, object]], contract_artifact["tools"])
