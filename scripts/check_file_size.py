@@ -47,14 +47,16 @@ DEFAULT_MAX_LINES = 800
 # in the same change. Paths are relative to the repository root and use
 # forward slashes.
 RATCHET_BASELINE: dict[str, int] = {
-    # #231 R6: +28 net lines -- the T3 record-time head+tail bound (doc §6.4)
-    # applied where _write_mcp_result builds the durable result document:
-    # a bounded_payload import, the bound_stream_capture call pair, and the
-    # two new stdout_truncation/stderr_truncation result fields. No deletion
-    # offsets it -- this is genuinely new structure the doc's own §6.4/§6.5
-    # ledger names as never having existed before R6, not a fixable
-    # regression. A justified, minimal ratchet-up.
-    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 5782,
+    # runner.py split iowarp/clio-relay#231/#775 decomposition wave 3: the
+    # facade is now 535 lines with the implementation moved into twenty
+    # owner modules at the clio_relay top level (clio_kit_wheel_archive.py,
+    # jarvis_artifact_documents.py, progress_bridge.py, session_runtime.py,
+    # and friends -- mirrored here byte-identical to src/clio_relay, per the
+    # isolated-runtime-mirror test), so this entry is removed rather than
+    # ratcheted down. Owner modules live at the clio_relay top level rather
+    # than nested under mcp_call/ because clio_relay.mcp_call is force-
+    # included into the wheel but not part of an editable dev install --
+    # see runner.py's module docstring.
     # process_containment.py split iowarp/clio-relay#231: the facade is now
     # 197 lines with the implementation moved into fifteen
     # process_containment_*.py owner modules (mirrored here byte-identical
