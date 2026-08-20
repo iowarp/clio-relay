@@ -14,6 +14,7 @@ from typing import cast
 import pytest
 
 import clio_relay.installation as installation_module
+import clio_relay.worker_runtime_verification as worker_runtime_verification_module
 from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
 from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
@@ -1453,7 +1454,9 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
     monkeypatch.setattr(installation_module, "installation_info", current_installation)
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
 
     result = worker_runtime_info(
         cluster="ares-p5run2",
@@ -1556,8 +1559,10 @@ def test_worker_runtime_info_expands_home_anchored_pinned_receipt(
 
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(root))
     monkeypatch.setattr(installation_module, "installation_info", current_installation)
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
-    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
+    monkeypatch.setattr(worker_runtime_verification_module.os.path, "expanduser", fake_expanduser)
 
     result = worker_runtime_info(
         cluster="ares-p5run2",
@@ -1595,7 +1600,7 @@ def test_worker_runtime_info_unloadable_home_anchored_pin_refuses_typed(
             return str(fake_home) + value[1:]
         return value
 
-    monkeypatch.setattr(installation_module.os.path, "expanduser", fake_expanduser)
+    monkeypatch.setattr(worker_runtime_verification_module.os.path, "expanduser", fake_expanduser)
 
     with pytest.raises(
         ConfigurationError,
@@ -1650,7 +1655,9 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     def worker_process_matches(_pid: int) -> bool:
         return True
 
-    monkeypatch.setattr(installation_module, "_worker_process_matches", worker_process_matches)
+    monkeypatch.setattr(
+        worker_runtime_verification_module, "_worker_process_matches", worker_process_matches
+    )
 
     def reject_history(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("worker readiness must not scan endpoint history")
