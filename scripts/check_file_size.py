@@ -333,7 +333,17 @@ RATCHET_BASELINE: dict[str, int] = {
     # import account for the delta. A justified, minimal ratchet-up -- the
     # alternative (leaving either call site unguarded) is the silent
     # slot-death and 0-byte-log defect the issue reports.
-    "src/clio_relay/endpoint.py": 8743,
+    # clio-relay#259: the console log stream's wiring into the job-run method
+    # -- a per-job ConsoleLiveTailer local, the _wrap_poll/_tail_console_stream
+    # pair composing the #259 tail step onto the existing on_poll cadence
+    # without touching _poll_running_job's own body, the console.log artifact
+    # append alongside stdout/stderr, and _flush_terminal_console plus its
+    # console_tailer thread-through in _append_optional_result_artifacts /
+    # _append_spool_artifact_once. The bulk of the new logic (resolution,
+    # tailing, terminal flush) lives in the new owner module
+    # console_stream.py, not here -- this is glue only. A justified,
+    # minimal ratchet-up.
+    "src/clio_relay/endpoint.py": 8843,
     # relay#234 adversarial review, finding 1: +24 net lines --
     # `intercept_tool_call`'s conflict handling caught only
     # `TaskInputParkConflictError`/`QueueConflictError`; anything else
@@ -567,7 +577,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # and the bounded result in hand, so it cannot move. A justified, minimal
     # ratchet-up.
     "src/clio_relay/session_lifecycle.py": 7840,
-    "src/clio_relay/spool.py": 964,
+    # clio-relay#259: LOG_STREAM_NAMES/LogStreamName widened the job log-stream
+    # vocabulary from {stdout, stderr} to {stdout, stderr, console} in place
+    # (Literal pins at append_log/read_log/mark_truncation_event_recorded plus
+    # the capture-state loops and validator), and added append_console for
+    # symmetry with append_stdout/append_stderr. A justified, minimal
+    # ratchet-up.
+    "src/clio_relay/spool.py": 1000,
     "src/clio_relay/storage_policy.py": 1826,
     # #231 R9 fix round 2: +11 lines mark storage-policy refusals as public
     # while exposing only StorageDecision.message, never its serialized

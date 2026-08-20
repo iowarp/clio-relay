@@ -53,7 +53,7 @@ def ingest_jarvis_execution_outputs(
     if not isinstance(raw_events, list):
         raise RelayError("terminal JARVIS result omitted artifact declarations")
     owner = resolve_jarvis_run_owner(queue, query_job, execution_id)
-    execution_root = _execution_root_from_record(record)
+    execution_root = execution_root_from_record(record)
     if execution_root is None:
         raise RelayError("terminal JARVIS result omitted an execution root")
 
@@ -190,7 +190,13 @@ def _is_jarvis_run(job: RelayJob, execution_id: str) -> bool:
     return spec.tool == "jarvis_run" and spec.arguments.get("execution_id") == execution_id
 
 
-def _execution_root_from_record(record: dict[str, Any]) -> Path | None:
+def execution_root_from_record(record: dict[str, Any]) -> Path | None:
+    """Derive one JARVIS execution's root directory from its terminal record.
+
+    Shared with :mod:`clio_relay.console_stream` (#259): the terminal
+    ``console`` log flush reuses this exact derivation rather than
+    independently guessing at JARVIS-CD's on-disk layout.
+    """
     raw_metadata: object = record.get("metadata")
     if not isinstance(raw_metadata, dict):
         return None

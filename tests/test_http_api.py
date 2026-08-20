@@ -141,6 +141,63 @@ def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
     assert [response.status_code for response in invalid_log_responses] == [422, 422, 422]
 
 
+def test_get_log_serves_console_stream_like_stdout_and_stderr(tmp_path: Path) -> None:
+    """#259: the door route accepts and serves ``console`` exactly like the
+    other two log streams -- same offset/limit/eof envelope shape, and a
+    stream nothing has written yet reads back empty with ``eof`` rather than
+    404ing or 500ing (point 2c: non-jarvis mcp_call jobs never write console,
+    and must never fail the read)."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-console",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    empty_response = client.get(f"/jobs/{job.job_id}/logs/console")
+    assert empty_response.status_code == 200
+    assert empty_response.json() == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "text": "",
+    }
+
+    console_path = spool / "console.log"
+    console_path.write_bytes(b"thermo: step 0 temp 300.0\n")
+
+    log_response = client.get(f"/jobs/{job.job_id}/logs/console", params={"limit": 6})
+    invalid_stream_response = client.get(f"/jobs/{job.job_id}/logs/bogus-stream")
+
+    assert log_response.status_code == 200
+    body = log_response.json()
+    assert body["stream"] == "console"
+    assert body["text"] == "thermo"
+    assert body["eof"] is False
+    assert body["next_offset"] == 6
+
+    tail_response = client.get(
+        f"/jobs/{job.job_id}/logs/console",
+        params={"offset": body["next_offset"]},
+    )
+    assert tail_response.status_code == 200
+    assert tail_response.json()["text"] == ": step 0 temp 300.0\n"
+    assert tail_response.json()["eof"] is True
+
+    assert invalid_stream_response.status_code == 400
+    assert invalid_stream_response.json()["reason"] == "log_stream_invalid"
+    assert "console" in invalid_stream_response.json()["detail"]
+
+
 def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
     tmp_path: Path,
 ) -> None:

@@ -10,7 +10,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 from urllib.parse import unquote, urlparse
 
 from clio_relay.bounded_payload import JSON, build_delivery_refusal
@@ -39,6 +39,7 @@ from clio_relay.scheduler_status import relay_queue_status
 from clio_relay.spool import (
     ARTIFACT_OWNERSHIP_SCHEMA,
     JobSpool,
+    LogStreamName,
     OwnedFileSizeLimitError,
     read_owned_regular_file_bytes,
 )
@@ -179,11 +180,11 @@ def read_job_log(
     settings: RelaySettings,
     job: RelayJob,
     *,
-    stream_name: Literal["stdout", "stderr"],
+    stream_name: LogStreamName,
     offset: int = 0,
     limit: int = 65536,
 ) -> dict[str, object]:
-    """Read a cursor range from a job stdout/stderr log."""
+    """Read a cursor range from a job stdout/stderr/console log."""
     text, next_offset, eof = JobSpool(settings.spool_dir, job).read_log(
         stream_name,
         offset=offset,
@@ -257,13 +258,15 @@ def read_artifact_bytes(queue: ClioCoreQueue, artifact_id: str) -> dict[str, obj
     }
 
 
-#: Artifact kinds the cursor-based log endpoint (:func:`read_job_log`,
-#: keyed on ``Literal["stdout", "stderr"]``) actually serves. F10 (#231 R6
+#: Artifact kinds the cursor-based log endpoint (:func:`read_job_log`, keyed
+#: on :data:`clio_relay.spool.LogStreamName`) actually serves. F10 (#231 R6
 #: review): the refusal below used to point every over-budget artifact at
 #: that endpoint regardless of kind -- correct for a log stream, actively
 #: wrong for e.g. an oversized ``mcp_result`` artifact, which the log
-#: endpoint has no path to serve at all.
-_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr"})
+#: endpoint has no path to serve at all. ``console`` (#259) joined
+#: ``stdout``/``stderr`` here for the same reason it joined them in
+#: :data:`clio_relay.spool.LOG_STREAM_NAMES`.
+_CURSOR_LOG_SERVED_KINDS = frozenset({"stdout", "stderr", "console"})
 
 
 def _artifact_content_too_large_refusal(artifact: JSON, artifact_id: str) -> JSON:
