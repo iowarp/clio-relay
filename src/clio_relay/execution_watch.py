@@ -319,15 +319,15 @@ def execution_outputs_missing_error_text(outputs_missing: dict[str, object]) -> 
     reason, never a decorated "completed".
     """
     execution_id = outputs_missing.get("execution_id")
-    missing = outputs_missing.get("missing")
-    entries = missing if isinstance(missing, list) else []
+    raw_missing = outputs_missing.get("missing")
+    entries: list[dict[str, object]] = []
+    if isinstance(raw_missing, list):
+        for raw_entry in cast(list[object], raw_missing):
+            if isinstance(raw_entry, dict):
+                entries.append(cast(dict[str, object], raw_entry))
     count = len(entries)
     noun = "output" if count == 1 else "outputs"
-    names = ", ".join(
-        str(entry.get("relative_path"))
-        for entry in cast(list[dict[str, object]], entries)
-        if isinstance(entry, dict)
-    )
+    names = ", ".join(str(entry.get("relative_path")) for entry in entries)
     detail = f": {names}" if names else ""
     return (
         f"JARVIS execution {execution_id} completed but {count} declared {noun} were "

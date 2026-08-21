@@ -16,6 +16,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from clio_relay.console_stream import (
     CONSOLE_STDERR_STREAM,
@@ -67,9 +68,24 @@ from clio_relay.storage_runtime import (
     StorageRuntimeViolation,
 )
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.storage_runtime import StorageRuntime
+
 
 class ProgressIngestMixin:
-    """Mixin: ProgressIngest methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: ProgressIngest methods split from EndpointWorker (clio-relay#231).
+
+    ``queue``/``storage_runtime`` are declared ``TYPE_CHECKING``-only (never
+    assigned here) so strict pyright can resolve ``self.queue``/
+    ``self.storage_runtime`` across this mixin's own methods -- see
+    ``JarvisDispatchMixin``'s identical note in
+    ``endpoint_jarvis_dispatch.py`` for why.
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
+        storage_runtime: StorageRuntime | None
 
     def _ingest_progress_sidecar(
         self,

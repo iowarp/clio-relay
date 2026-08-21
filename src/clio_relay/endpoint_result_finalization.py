@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from clio_relay.console_stream import (
     CONSOLE_STDERR_STREAM,
@@ -37,9 +37,21 @@ from clio_relay.models import (
 )
 from clio_relay.spool import JobSpool, read_owned_regular_file_bytes
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+
 
 class ResultFinalizationMixin:
-    """Mixin: ResultFinalization methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: ResultFinalization methods split from EndpointWorker (clio-relay#231).
+
+    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
+    strict pyright can resolve ``self.queue`` across this mixin's own
+    methods -- see ``JarvisDispatchMixin``'s identical note in
+    ``endpoint_jarvis_dispatch.py`` for why.
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
 
     def _flush_terminal_console(
         self,

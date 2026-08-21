@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from clio_relay import execution_watch
 from clio_relay.console_stream import (
@@ -66,9 +66,25 @@ from clio_relay.runtime_metadata import (
 )
 from clio_relay.spool import JobSpool, read_owned_regular_file_bytes
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+
 
 class JarvisDispatchMixin:
-    """Mixin: JarvisDispatch methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: JarvisDispatch methods split from EndpointWorker (clio-relay#231).
+
+    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
+    strict pyright can resolve ``self.queue`` across this mixin's own
+    methods: the sole composing class, ``EndpointWorker``, is what actually
+    assigns it in ``__init__`` (``endpoint.py``), and a mixin has no
+    ``__init__`` of its own for pyright to see that assignment through. The
+    same pattern this repo's tracked sibling-mixin design gap (#271) will
+    eventually need everywhere else -- scoped here to unblock this mixin's
+    own already-existing ``self.queue`` call sites, not a repo-wide fix.
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
 
     def _jarvis_run_environment_values(
         self,

@@ -70,7 +70,26 @@ from typing import Any, NamedTuple
 # ratchet DOWN: when a change fixes errors, lower this number in the same
 # change. It must never ratchet up except for a reviewed, justified reason
 # recorded here.
-BASELINE_TOTAL = 7843
+#
+# clio-relay#265/#259 merge fixup: the #265 outputs_missing verdict and the
+# #259 stderr-channel residual added 19 new strict-mode errors (7843 -> 7862
+# on CI; 7845 -> 7864 measured locally on Windows, which runs ~2 higher than
+# Linux CI for the same tree -- both offsets agree exactly). All 19 traced to
+# genuinely new `self.queue`/`self.storage_runtime` access and one
+# cross-mixin method-return-type gap in four owner modules
+# (JarvisDispatchMixin, JobExecutionMixin, ProgressIngestMixin,
+# ResultFinalizationMixin) plus one dict-literal-narrowing and one now-
+# redundant cast in files this merge touched. Fixed with real typing (per-
+# mixin ``TYPE_CHECKING``-only attribute stubs for the two composing-class
+# attributes strict pyright cannot otherwise resolve across a mixin split,
+# an explicit ``cast`` at the one cross-mixin method-return call site, an
+# explicit ``dict[str, object]`` test annotation, and one dropped
+# now-unnecessary cast) -- no ignores, no suppressions. Each stub also
+# resolved every OTHER pre-existing `self.queue`/`self.storage_runtime`
+# access already in those same four classes, not just the 19 new ones: net
+# -182 (7845 -> 7663 on Windows). Verified zero new diagnostics anywhere in
+# the repo via a full baseline-vs-fixed diff, not just the total dropping.
+BASELINE_TOTAL = 7663
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

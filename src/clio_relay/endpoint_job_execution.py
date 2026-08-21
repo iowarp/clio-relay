@@ -24,7 +24,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from clio_relay import execution_watch, process_containment
 from clio_relay.command_evidence import bounded_error_detail
@@ -94,9 +94,23 @@ from clio_relay.runtime_metadata import (
 )
 from clio_relay.spool import JobSpool
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+
 
 class JobExecutionMixin:
-    """Mixin: JobExecution methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: JobExecution methods split from EndpointWorker (clio-relay#231).
+
+    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
+    strict pyright can resolve ``self.queue`` across this mixin's own
+    methods -- see ``JarvisDispatchMixin``'s identical note in
+    ``endpoint_jarvis_dispatch.py`` for why (the sole composing class,
+    ``EndpointWorker``, assigns it in ``__init__``; a mixin has none of its
+    own).
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
 
     def _run_job_impl(
         self,
@@ -643,8 +657,18 @@ class JobExecutionMixin:
                 spool.artifact_for(spool.path / "console_stderr.log", kind="console_stderr")
             )
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
-        outputs_missing = self._append_optional_result_artifacts(
-            job, spool, console_tailer=console_tailer
+        # cast (not a bare annotation -- that alone does not stop the RHS's
+        # own Unknown from propagating into the declared variable, verified
+        # empirically): ResultFinalizationMixin is a sibling mixin strict
+        # pyright cannot see through from here (the same cross-mixin gap
+        # `queue`'s TYPE_CHECKING stub above works around, for a returned
+        # value instead of an attribute). The real, already-enforced return
+        # type lives on `_append_optional_result_artifacts`'s own signature
+        # in endpoint_result_finalization.py; this asserts it at the one
+        # call site pyright cannot resolve across the mixin composition.
+        outputs_missing = cast(
+            "dict[str, object] | None",
+            self._append_optional_result_artifacts(job, spool, console_tailer=console_tailer),
         )
         # #266: fold a resolved watch into the pre-#266 outcome logic --
         # see execution_watch.resolve_execution_outcome's own docstring for

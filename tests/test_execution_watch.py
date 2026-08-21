@@ -220,7 +220,11 @@ def test_execution_cancel_unsupported_payload() -> None:
 
 
 def test_execution_outputs_missing_error_text() -> None:
-    detail = {
+    # Explicit dict[str, object] annotation: dict's value-type parameter is
+    # invariant, so the inferred narrower literal type (dict[str, str | int
+    # | list[dict[str, str | int]]]) is not otherwise assignable to the
+    # function's dict[str, object] parameter under strict pyright.
+    detail: dict[str, object] = {
         "schema_version": "clio-relay.execution-outputs-missing.v1",
         "execution_id": "jarvis_exec",
         "declared_count": 2,
