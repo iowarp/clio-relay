@@ -456,6 +456,25 @@ def _watch_env(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
         execution_watch_poll_interval_seconds=0.01,
+        # CI-hang guard (not a production ceiling change -- this settings
+        # instance is test-local; the real DEFAULT_EXECUTION_WATCH_CEILING_
+        # SECONDS, 24h, is untouched everywhere else). Every watch test in
+        # this file except test_watch_ceiling_exceeded_fails_the_job relies
+        # ENTIRELY on its fake's ``states`` list reaching terminal within a
+        # handful of polls -- nothing previously bounded a test whose fake
+        # (present or future, known bug or not) fails to converge. Without
+        # this, `now=utc_now` (the REAL wall clock, unmocked here) plus
+        # ``run_execution_watch``'s ``sleep`` parameter -- which defaults to
+        # the real ``time.sleep`` bound at function-definition time, NOT the
+        # patched one below, since a default argument is evaluated once at
+        # import time and this fixture's own monkeypatch cannot reach back
+        # into it -- means a non-converging fake would tick toward the REAL
+        # 24h default for up to 24 real hours, exactly the CI-hour-hang
+        # symptom this value exists to convert into a fast, loud pytest
+        # failure instead. 10s gives >100x headroom over every test's
+        # actual poll count (<=6) at the 0.01s poll interval above, even
+        # under a slow/loaded CI runner.
+        execution_watch_ceiling_seconds=10,
     )
     queue = ClioCoreQueue(settings.core_dir)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]

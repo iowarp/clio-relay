@@ -78,6 +78,25 @@ jobs:
           printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
           printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
             "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
+      # TEMPORARY (clio-relay#270): validate-local's local.pytest buffers the
+      # WHOLE suite into one silent step, so a hang there gives zero output
+      # for the full 60-minute job timeout (run 32435282870, ae86740). This
+      # step runs just the #265/#259 additions on their own, streamed
+      # (`-v`), with a tight 15-minute step timeout, so a residual hanger
+      # names itself instead of repeating that silent hour. Remove this step
+      # once #270 merges and validate-local's own diagnosability is fixed
+      # (tracked as a follow-up, not part of this step).
+      - name: TEMPORARY -- streamed, bounded pytest for #265/#259 (remove after #270 merges)
+        timeout-minutes: 15
+        run: >-
+          uv run --no-sync pytest
+          tests/test_execution_watch.py
+          tests/test_console_stream.py
+          tests/test_jarvis_execution_artifacts.py
+          tests/test_spool.py
+          tests/test_http_api.py
+          tests/test_artifact_cluster_routing.py
+          -v --maxfail=3
       - name: run the sole artifact-building release gate
         run: >-
           uv run --python 3.12 clio-relay release validate-local
