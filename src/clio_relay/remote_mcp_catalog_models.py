@@ -166,6 +166,10 @@ class VirtualRemoteMcpTool:
             )
         elif exact_v36_routes and self.remote_tool.name == "jarvis_run":
             description += (
+                " Before running, inspect every selected package deployment contract. For each "
+                "unavailable runtime with a Spack provider resolution, locate it and pass the "
+                "returned immutable load_spec in spack_specs; presence in a site store does not "
+                "place the runtime on the execution PATH."
                 " On each genuinely new run identity, relay securely reconciles every tracked "
                 "local-file setting and pins the execution to an immutable input manifest. "
                 "Retrying the same idempotency key reuses that admitted manifest without "

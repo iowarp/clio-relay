@@ -60,6 +60,31 @@ def test_virtual_jarvis_context_teaches_bounded_interactive_waiting() -> None:
     assert "not workload completion" in context
 
 
+def test_virtual_jarvis_context_connects_unavailable_runtimes_to_spack_activation() -> None:
+    """The agent context ties a package's deployment runtime gap to Spack activation."""
+
+    context = render_virtual_jarvis_agent_context()
+
+    assert "satisfy each selected package's deployment runtime requirements" in context
+    assert "Spack provider resolution" in context
+    assert "immutable load_spec in jarvis_run spack_specs" in context
+
+
+def test_virtual_jarvis_run_tool_explains_runtime_activation_obligation() -> None:
+    """The built-in jarvis_run tool description connects package gaps to activation."""
+
+    local_run = next(
+        tool
+        for tool in virtual_jarvis_tool_definitions(clusters=["ares"])
+        if tool["name"] == "jarvis_run"
+    )
+
+    description = cast(str, local_run["description"])
+    assert "inspect every selected package with jarvis_describe" in description
+    assert "provider resolution" in description
+    assert "immutable load_spec in spack_specs" in description
+
+
 def test_virtual_jarvis_control_queries_follow_the_pinned_annotations() -> None:
     """Only read-only, non-destructive JARVIS operations use reserved capacity."""
     assert is_virtual_jarvis_control_query("jarvis_get_execution") is True

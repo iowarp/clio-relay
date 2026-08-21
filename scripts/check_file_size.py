@@ -928,7 +928,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # worker_runtime_verification.py), comfortably under DEFAULT_MAX_LINES
     # with no baseline entry needed.
     "src/clio_relay/jarvis_execution.py": 875,
-    "src/clio_relay/jarvis_mcp.py": 947,
+    # #172 survivors: +9 net lines -- the agent-facing jarvis_run tool
+    # description and render_virtual_jarvis_agent_context both gain the
+    # package-runtime-activation guidance (inspect jarvis_describe's
+    # provider_resolutions, call the Spack locate tool, pass its immutable
+    # load_spec via spack_specs) that a live campaign validated but that
+    # never landed on main when the rest of PR #172 was superseded. No
+    # deletion offsets it -- this is the genuinely missing guidance text
+    # itself, not a fixable regression. A justified, minimal ratchet-up.
+    "src/clio_relay/jarvis_mcp.py": 956,
     # jarvis_mcp_validation.py's own ratchet-baseline entry and history
     # comment (most recently: #231 R6-fix review, A6, the `expected_filters`
     # `content_max_bytes` fix) were removed here (split/jarvis-mcp-validation):

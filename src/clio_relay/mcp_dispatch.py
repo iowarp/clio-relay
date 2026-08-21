@@ -242,6 +242,7 @@ def _call_tool(
             if input_plan is None
             else jarvis_submission_idempotency_key(
                 input_plan,
+                settings=settings,
                 merged_artifact_uses=merged_input_uses,
                 requested_idempotency_key=requested_idempotency_key,
             )

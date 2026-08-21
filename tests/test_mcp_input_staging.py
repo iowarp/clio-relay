@@ -381,6 +381,66 @@ def test_registered_jarvis_input_flows_from_describe_through_run(
     ]
 
 
+def test_registered_jarvis_describe_idempotency_key_is_owner_session_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generated reconciliation key must not collide across owner sessions.
+
+    Two owner sessions describing the identical package previously reduced to
+    one shared "mcp:virtual:reconcile:" key, so the second session's durable
+    submission collided with the first's. The key must now also fold in
+    owner-session identity so distinct sessions never share a key, while one
+    session's repeat of the identical call keeps reusing its own key (that
+    reuse is what makes the call idempotent instead of resubmitting).
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings, definition, catalog, harness = _configured_flow(
+        tmp_path,
+        workspace=workspace,
+    )
+    _patch_flow(
+        monkeypatch,
+        current_catalog={"value": catalog},
+        definition=definition,
+        harness=harness,
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+
+    def describe(selected_settings: RelaySettings) -> None:
+        session = McpSessionState()
+        _advertise(queue, settings=selected_settings, session=session)
+        response = _call(
+            queue,
+            settings=selected_settings,
+            session=session,
+            name=DESCRIBE_ALIAS,
+            arguments={
+                "cluster": "ares",
+                "target": "package",
+                "package_name": "lammps",
+            },
+        )
+        assert "error" not in response, response
+
+    other_session_settings = settings.model_copy(
+        update={
+            "owner_session_id": "other-desktop-session",
+            "owner_session_generation_id": "generation_fedcba9876543210fedcba9876543210",
+        }
+    )
+
+    describe(settings)
+    describe(other_session_settings)
+    describe(settings)
+
+    keys = [cast(str, payload["idempotency_key"]) for payload in harness.submitted_payloads]
+    assert len(keys) == 3
+    assert keys[0] != keys[1], "different owner sessions must not collide on one reconciliation key"
+    assert keys[0] == keys[2], "the same owner session's repeat must reuse its own key"
+
+
 def test_legacy_jarvis_contract_does_not_activate_transparent_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
