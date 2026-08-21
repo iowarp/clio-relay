@@ -1,0 +1,29 @@
+# TEMPORARY (clio-relay#270): the full suite wedges silently inside
+# validate-local's buffered local.pytest check (three 60-minute timeouts:
+# runs 32424124135, 32435282870, 32440541545) and the hanger is NOT in the
+# #265/#259 files (a bounded probe ran those green in 30s). This standalone
+# workflow runs the FULL suite streamed (-v) with faulthandler dumps and a
+# hard step bound so the hanging test NAMES ITSELF in the log. A NEW file on
+# purpose: inserting steps into ci.yml shifts the line-anchored
+# release-identity pin sites (lines 166-168). Delete after #270 merges.
+name: tmp-suite-hunt
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync --python "3.12" --locked --all-groups
+      - name: full suite, streamed, self-naming on hang
+        timeout-minutes: 30
+        run: >-
+          uv run --no-sync pytest tests/ -v
+          -p faulthandler --faulthandler-timeout=300
+          -x
