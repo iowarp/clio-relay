@@ -238,6 +238,26 @@ class JarvisDispatchMixin:
             "execution_record": record,
             "progress": progress,
             "runtime_metadata": runtime,
+            # clio-relay#265: NOT part of jarvis_run's own frozen outputSchema
+            # (only jarvis_get_execution declares artifact_page) -- but this
+            # projected run_result becomes the durable mcp-result.json BOTH
+            # recovery callers write, and jarvis_execution_artifacts.
+            # ingest_jarvis_execution_outputs reads exactly this file to
+            # index #252's declared execution outputs and detect #265's
+            # outputs-missing verdict. Dropping it here (as an earlier
+            # revision did) meant every scheduler-deferred/recovered
+            # jarvis_run silently lost BOTH: no execution-output artifacts
+            # ever indexed and outputs_missing structurally unreachable,
+            # regardless of what JARVIS actually declared. Both callers of
+            # this method dispatch their query with `artifacts` requested
+            # (execution_watch.execution_watch_query_spec's
+            # include_artifacts=True final poll; this module's own
+            # `_recover_jarvis_execution`, "artifacts": {"page_size": 100}),
+            # so `structured["artifact_page"]` is always populated here --
+            # an outputSchema-additive field a schema without
+            # `additionalProperties: false` (verified) tolerates on the
+            # client-facing side.
+            "artifact_page": structured.get("artifact_page"),
         }
         recovered_document: dict[str, object] = {
             **query_document,
