@@ -471,7 +471,10 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "docstring cross-reference",
-        line=2100,
+        # #172 survivors: the new spack-provider-guidance tests inserted
+        # above it pushed this unchanged docstring reference from line
+        # 2100 to line 2125.
+        line=2125,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -501,7 +504,9 @@ PINSITES: tuple[PinSite, ...] = (
         # from line 1406 to line 1407.
         # #231 decomposition: further test additions above it pushed this
         # unchanged reference from line 1407 to line 1421.
-        line=1421,
+        # #172 survivors: the new jarvis_run guidance test inserted above
+        # it pushed this unchanged reference from line 1421 to line 1466.
+        line=1466,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -516,7 +521,9 @@ PINSITES: tuple[PinSite, ...] = (
         # from line 1425 to line 1426.
         # #231 decomposition: further test additions above it pushed this
         # unchanged argument from line 1426 to line 1439.
-        line=1439,
+        # #172 survivors: the new jarvis_run guidance test inserted above
+        # it pushed this unchanged argument from line 1439 to line 1484.
+        line=1484,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),

@@ -207,6 +207,7 @@ def prepare_jarvis_inputs(
 def jarvis_submission_idempotency_key(
     plan: JarvisInputPlan,
     *,
+    settings: RelaySettings,
     merged_artifact_uses: list[ArtifactUse],
     requested_idempotency_key: str | None,
 ) -> str | None:
@@ -224,6 +225,8 @@ def jarvis_submission_idempotency_key(
             "cluster_route_revision": plan.route.cluster_route_revision,
             "registration_revision": plan.route.registration_revision,
             "expected_server_artifact_digest": plan.route.expected_server_artifact_digest,
+            "owner_session_id": settings.owner_session_id,
+            "owner_session_generation_id": settings.owner_session_generation_id,
             "tool": plan.route.remote_tool_name,
             "arguments": plan.arguments,
             "used_artifact_refs": [artifact_use_payload(item) for item in merged_artifact_uses],
