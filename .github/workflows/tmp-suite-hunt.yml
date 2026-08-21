@@ -24,4 +24,4 @@ jobs:
       - name: full suite, streamed, self-naming on hang
         timeout-minutes: 30
         run: >-
-          uv run --no-sync pytest tests/ -v -x
+          uv run --no-sync pytest tests/ -v
