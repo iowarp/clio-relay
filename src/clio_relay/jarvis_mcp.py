@@ -750,6 +750,11 @@ def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> lis
             )
         elif remote_tool == "jarvis_run":
             tool_guidance = (
+                " Before running, inspect every selected package with jarvis_describe. If its "
+                "deployment contract reports an unavailable runtime and advertises a provider "
+                "resolution, call that provider's locate tool and pass the returned immutable "
+                "load_spec in spack_specs. Do not submit until every required runtime is usable "
+                "or explicitly activated."
                 " wait_for_terminal is a clio-relay transport control: it waits only for the "
                 "brief remote MCP dispatch to return the durable execution handle. It never "
                 "waits for workload completion. Use jarvis_get_execution with the returned "
@@ -909,6 +914,10 @@ def render_virtual_jarvis_agent_context() -> str:
         "page without adding another agent tool. Use jarvis_describe with "
         "target='package_search' for bounded package discovery, then describe the "
         "selected canonical package name. "
+        "Before jarvis_run, satisfy each selected package's deployment runtime requirements. "
+        "When an unavailable requirement advertises a Spack provider resolution, call the "
+        "Spack locate tool and pass its exact immutable load_spec in jarvis_run spack_specs; "
+        "do not assume software found in a site store is already on the execution PATH. "
         "For ordinary interactive operations, set wait_for_terminal=true so the bounded MCP "
         "result returns in the current call; leave it false only when intentionally queuing "
         "transport for a later relay_wait. "

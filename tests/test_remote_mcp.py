@@ -1412,6 +1412,51 @@ def test_registered_jarvis_v36_describe_advertises_terminal_reconciliation_defau
     assert "transparently reconciled" in definition["description"]
 
 
+def test_registered_jarvis_run_explains_runtime_activation_obligation() -> None:
+    """The agent-facing run tool connects package requirements to provider activation."""
+    route = remote_mcp.RemoteMcpRoute(
+        cluster="alpha",
+        server_name="jarvis",
+        command="clio-kit",
+        args=("mcp-server", "jarvis"),
+        env_from=(),
+        expected_server_artifact_digest="a" * 64,
+        remote_tool_name="jarvis_run",
+        timeout_seconds=300,
+        contract=remote_mcp.CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+        cluster_route_revision="b" * 64,
+        registration_revision="c" * 64,
+    )
+    virtual = remote_mcp.VirtualRemoteMcpTool(
+        alias="remote_jarvis_jarvis_run",
+        namespace="remote_jarvis",
+        remote_tool=RemoteMcpToolSchema(
+            name="jarvis_run",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pipeline_id": {"type": "string"},
+                    "spack_specs": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["pipeline_id"],
+                "additionalProperties": False,
+            },
+        ),
+        routes={"alpha": route},
+        arguments_wrapped=False,
+    )
+
+    description = cast(str, virtual.definition()["description"])
+
+    assert "inspect every selected package deployment contract" in description
+    assert "immutable load_spec in spack_specs" in description
+
+
 def test_registered_jarvis_get_execution_advertises_exact_runtime_handoff_schema() -> None:
     """An audited registered JARVIS route accepts relay-derived service handoffs."""
     contract_artifact = cast(
