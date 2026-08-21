@@ -464,6 +464,7 @@ def _stage_builtin_jarvis_inputs(
         ]
     staged_idempotency_key = jarvis_submission_idempotency_key(
         plan,
+        settings=settings,
         merged_artifact_uses=merged_input_uses,
         requested_idempotency_key=requested_key,
     )
