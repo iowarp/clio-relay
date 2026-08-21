@@ -9,12 +9,15 @@ from pathlib import Path
 import pytest
 
 from clio_relay.console_stream import (
+    CONSOLE_STDERR_STREAM,
     CONSOLE_STREAM,
     ConsoleLiveTailer,
     ConsoleTailUnavailable,
     console_tailer_for_mcp_call,
     flush_terminal_console,
     flush_terminal_console_from_path,
+    flush_terminal_console_stderr,
+    flush_terminal_console_stderr_from_path,
     newest_execution_dir,
     resolve_jarvis_shared_dir,
 )
@@ -315,6 +318,142 @@ def test_console_live_tailer_stops_after_the_spool_stream_quota_is_hit(
     assert again.reason is None
 
 
+# --- ConsoleLiveTailer: clio-relay#259 residual (stderr) --------------------
+
+
+def test_console_live_tailer_tails_a_growing_stderr_log_across_polls(tmp_path: Path) -> None:
+    """clio-relay#259 residual: the same live-tail treatment stdout gets,
+    mirrored for the application's stderr, into its own stream."""
+    jarvis_root = tmp_path / "jarvis-root"
+    shared_dir = tmp_path / "shared"
+    _write_jarvis_config(jarvis_root, shared_dir=shared_dir)
+    execution_root = _execution_dir(shared_dir, "lammps-melt", "exec-1", mtime=1_000)
+    stderr_log = execution_root / "stderr.log"
+    _write(stderr_log, "WARNING: low disk\n")
+
+    spool = _spool(tmp_path)
+    tailer = ConsoleLiveTailer(
+        spool=spool,
+        pipeline_id="lammps-melt",
+        env={"JARVIS_ROOT": str(jarvis_root)},
+    )
+
+    first = tailer.poll_stderr(now=0.0)
+    assert first.appended is True
+    assert first.reason is None
+
+    idle = tailer.poll_stderr(now=0.5)
+    assert idle.appended is False
+    assert idle.reason is None
+
+    _append(stderr_log, "ERROR: rank 3 segfault\n")
+
+    second = tailer.poll_stderr(now=3.0)
+    assert second.appended is True
+
+    text, _next_offset, eof = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert text == "WARNING: low disk\nERROR: rank 3 segfault\n"
+    assert eof is True
+
+
+def test_console_live_tailer_stdout_and_stderr_channels_are_independent(tmp_path: Path) -> None:
+    """Advancing one channel must never disturb the other's offset, quota,
+    or reason-dedup state -- they are independent byte streams sharing only
+    the locked execution root."""
+    jarvis_root = tmp_path / "jarvis-root"
+    shared_dir = tmp_path / "shared"
+    _write_jarvis_config(jarvis_root, shared_dir=shared_dir)
+    execution_root = _execution_dir(shared_dir, "lammps-melt", "exec-1", mtime=1_000)
+    _write(execution_root / "stdout.log", "Step 0 Temp 300.0\n")
+    # stderr.log does not exist yet -- created lazily by the application.
+
+    spool = _spool(tmp_path)
+    tailer = ConsoleLiveTailer(
+        spool=spool,
+        pipeline_id="lammps-melt",
+        env={"JARVIS_ROOT": str(jarvis_root)},
+    )
+
+    stdout_step = tailer.poll(now=0.0)
+    assert stdout_step.appended is True
+    stderr_step = tailer.poll_stderr(now=0.0)
+    assert stderr_step.reason == "stderr_log_unreadable"
+
+    # The stdout channel is untouched by stderr's failure.
+    text, _, eof = spool.read_log(CONSOLE_STREAM)
+    assert text == "Step 0 Temp 300.0\n"
+    assert eof is True
+
+    # stderr's failure is reported once, then deduplicated, exactly like
+    # stdout's own dedup -- and does not consult stdout's dedup set.
+    again = tailer.poll_stderr(now=3.0)
+    assert again.reason is None
+
+    (execution_root / "stderr.log").write_bytes(b"late stderr\n")
+    recovered = tailer.poll_stderr(now=6.0)
+    assert recovered.appended is True
+    stderr_text, _, _ = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert stderr_text == "late stderr\n"
+
+
+def test_console_live_tailer_reports_a_typed_reason_when_stderr_log_vanishes(
+    tmp_path: Path,
+) -> None:
+    jarvis_root = tmp_path / "jarvis-root"
+    shared_dir = tmp_path / "shared"
+    _write_jarvis_config(jarvis_root, shared_dir=shared_dir)
+    execution_root = _execution_dir(shared_dir, "lammps-melt", "exec-1", mtime=1_000)
+    stderr_log = execution_root / "stderr.log"
+    _write(stderr_log, "warm up\n")
+
+    spool = _spool(tmp_path)
+    tailer = ConsoleLiveTailer(
+        spool=spool,
+        pipeline_id="lammps-melt",
+        env={"JARVIS_ROOT": str(jarvis_root)},
+    )
+    tailer.poll_stderr(now=0.0)
+    stderr_log.unlink()
+
+    step = tailer.poll_stderr(now=3.0)
+
+    assert step.reason == "stderr_log_unreadable"
+    assert step.message is not None
+
+
+def test_console_live_tailer_stderr_stops_after_the_spool_stream_quota_is_hit(
+    tmp_path: Path,
+) -> None:
+    jarvis_root = tmp_path / "jarvis-root"
+    shared_dir = tmp_path / "shared"
+    _write_jarvis_config(jarvis_root, shared_dir=shared_dir)
+    execution_root = _execution_dir(shared_dir, "lammps-melt", "exec-1", mtime=1_000)
+    (execution_root / "stderr.log").write_text("x" * 100, encoding="utf-8")
+
+    spool = JobSpool(
+        tmp_path / "spool",
+        _job(),
+        max_log_bytes_per_stream=10,
+        max_log_bytes_per_job=40,
+    )
+    spool.initialize()
+    tailer = ConsoleLiveTailer(
+        spool=spool,
+        pipeline_id="lammps-melt",
+        env={"JARVIS_ROOT": str(jarvis_root)},
+    )
+
+    first = tailer.poll_stderr(now=0.0)
+    assert tailer.stderr_truncated is True
+    assert tailer.truncated is False  # the STDOUT flag is untouched
+    assert first.reason == "truncated"
+    assert first.message is not None
+
+    again = tailer.poll_stderr(now=3.0)
+    assert again.appended is False
+    assert again.reason is None
+
+
 def test_console_tailer_for_mcp_call_only_binds_the_jarvis_run_tool(tmp_path: Path) -> None:
     spool = _spool(tmp_path)
 
@@ -439,6 +578,114 @@ def test_flush_terminal_console_reflushes_and_reports_a_mismatch(tmp_path: Path)
     assert text == "right execution\n"
 
 
+# --- flush_terminal_console_stderr / _from_path: clio-relay#259 residual ----
+
+
+def test_flush_terminal_console_stderr_flushes_the_full_log_when_no_tailer_ran(
+    tmp_path: Path,
+) -> None:
+    execution_root = tmp_path / "execution"
+    execution_root.mkdir()
+    _write(execution_root / "stderr.log", "WARN 0\nWARN 1\n")
+    spool = _spool(tmp_path)
+
+    outcome = flush_terminal_console_stderr(spool, _result_document(execution_root), tailer=None)
+
+    assert outcome.reason is None
+    assert outcome.appended_bytes == len("WARN 0\nWARN 1\n")
+    text, _, eof = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert text == "WARN 0\nWARN 1\n"
+    assert eof is True
+    # The stdout channel is untouched by a stderr-only flush.
+    stdout_text, _, _ = spool.read_log(CONSOLE_STREAM)
+    assert stdout_text == ""
+
+
+def test_flush_terminal_console_stderr_appends_only_the_remainder_after_a_live_tail(
+    tmp_path: Path,
+) -> None:
+    """Mirrors the stdout terminal-flush reconciliation test, using the
+    tailer's OWN ``stderr_offset`` -- never the stdout ``offset``."""
+    jarvis_root = tmp_path / "jarvis-root"
+    shared_dir = tmp_path / "shared"
+    _write_jarvis_config(jarvis_root, shared_dir=shared_dir)
+    execution_root = _execution_dir(shared_dir, "lammps-melt", "exec-1", mtime=1_000)
+    stderr_log = execution_root / "stderr.log"
+    _write(stderr_log, "WARN 0\n")
+
+    spool = _spool(tmp_path)
+    tailer = ConsoleLiveTailer(
+        spool=spool,
+        pipeline_id="lammps-melt",
+        env={"JARVIS_ROOT": str(jarvis_root)},
+    )
+    tailer.poll_stderr(now=0.0)  # tails "WARN 0\n" live
+
+    _append(stderr_log, "WARN 1\nWARN 2\n")
+
+    outcome = flush_terminal_console_stderr(spool, _result_document(execution_root), tailer=tailer)
+
+    assert outcome.reason is None
+    text, _, eof = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert text == "WARN 0\nWARN 1\nWARN 2\n"
+    assert eof is True
+
+
+def test_flush_terminal_console_stderr_reflushes_and_reports_a_mismatch(tmp_path: Path) -> None:
+    followed_root = tmp_path / "followed"
+    followed_root.mkdir()
+    _write(followed_root / "stderr.log", "wrong execution\n")
+    authoritative_root = tmp_path / "authoritative"
+    authoritative_root.mkdir()
+    _write(authoritative_root / "stderr.log", "right execution\n")
+
+    spool = _spool(tmp_path)
+    tailer = ConsoleLiveTailer(spool=spool, pipeline_id="lammps-melt")
+    tailer.execution_root = followed_root
+    tailer.stderr_offset = 0
+
+    outcome = flush_terminal_console_stderr(
+        spool, _result_document(authoritative_root), tailer=tailer
+    )
+
+    assert outcome.reason == "console_stderr_live_tail_execution_mismatch"
+    assert outcome.message is not None
+    text, _, _ = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert text == "right execution\n"
+
+
+def test_flush_terminal_console_stderr_from_path_reads_a_real_result_document(
+    tmp_path: Path,
+) -> None:
+    execution_root = tmp_path / "execution"
+    execution_root.mkdir()
+    _write(execution_root / "stderr.log", "WARN 0\n")
+    spool = _spool(tmp_path)
+    result_path = spool.path / "mcp-result.json"
+    result_path.write_text(
+        json.dumps(_result_document(execution_root)),
+        encoding="utf-8",
+    )
+
+    outcome = flush_terminal_console_stderr_from_path(spool, result_path, tailer=None)
+
+    assert outcome.reason is None
+    text, _, _ = spool.read_log(CONSOLE_STDERR_STREAM)
+    assert text == "WARN 0\n"
+
+
+def test_flush_terminal_console_stderr_from_path_reports_a_typed_reason_for_invalid_json(
+    tmp_path: Path,
+) -> None:
+    spool = _spool(tmp_path)
+    result_path = spool.path / "mcp-result.json"
+    result_path.write_text("not json", encoding="utf-8")
+
+    outcome = flush_terminal_console_stderr_from_path(spool, result_path, tailer=None)
+
+    assert outcome.reason == "mcp_result_unreadable"
+
+
 def test_flush_terminal_console_reports_a_typed_reason_when_execution_root_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -524,3 +771,37 @@ def test_console_stream_never_mixes_with_the_stdout_stream(tmp_path: Path) -> No
     )
     assert console_text == "Step 0 Temp 300.0\n"
     assert (spool.path / "stdout.log").read_bytes() != (spool.path / "console.log").read_bytes()
+
+
+def test_console_stderr_stream_never_mixes_with_stderr_or_console(tmp_path: Path) -> None:
+    """clio-relay#259 residual sabotage twin: ``console_stderr`` must carry
+    ONLY the application's stderr -- never the MCP jsonrpc wire's ``stderr``
+    (which for a jarvis-backed mcp_call job is a distinct, pre-existing
+    stream), and never bleed into/from the stdout-side ``console`` stream."""
+    spool = _spool(tmp_path)
+
+    spool.append_stderr('{"jsonrpc": "2.0", "id": 1, "error": {}}\n')
+    spool.append_log(CONSOLE_STREAM, "Step 0 Temp 300.0\n")
+    spool.append_log(CONSOLE_STDERR_STREAM, "WARNING: low disk\n")
+    spool.append_stderr('{"jsonrpc": "2.0", "method": "notifications/progress"}\n')
+
+    stderr_text, _, _ = spool.read_log("stderr")
+    console_text, _, _ = spool.read_log(CONSOLE_STREAM)
+    console_stderr_text, _, _ = spool.read_log(CONSOLE_STDERR_STREAM)
+
+    assert "WARNING" not in stderr_text
+    assert "jsonrpc" not in console_stderr_text
+    assert "WARNING" not in console_text
+    assert "Step 0" not in console_stderr_text
+    assert stderr_text == (
+        '{"jsonrpc": "2.0", "id": 1, "error": {}}\n'
+        '{"jsonrpc": "2.0", "method": "notifications/progress"}\n'
+    )
+    assert console_text == "Step 0 Temp 300.0\n"
+    assert console_stderr_text == "WARNING: low disk\n"
+    assert (spool.path / "stderr.log").read_bytes() != (
+        spool.path / "console_stderr.log"
+    ).read_bytes()
+    assert (spool.path / "console.log").read_bytes() != (
+        spool.path / "console_stderr.log"
+    ).read_bytes()

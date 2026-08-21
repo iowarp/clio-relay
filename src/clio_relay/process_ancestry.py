@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, cast
 
@@ -88,25 +89,27 @@ def linux_process_ancestors(pid: int) -> list[tuple[int, Path]]:
     return ancestors
 
 
+class _ProcessEntry32W(ctypes.Structure):
+    """Toolhelp ``PROCESSENTRY32W`` layout (fixed; wintypes imports cross-platform)."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
 def windows_process_ancestors(pid: int) -> list[tuple[int, Path]]:
     """Read a bounded Windows parent chain with Toolhelp and process-image handles."""
     if os.name != "nt":
         return []
-    from ctypes import wintypes
-
-    class ProcessEntry32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", wintypes.WCHAR * 260),
-        ]
 
     loader = cast(Any, ctypes.WinDLL)("kernel32", use_last_error=True)
     create_snapshot = loader.CreateToolhelp32Snapshot
@@ -117,9 +120,9 @@ def windows_process_ancestors(pid: int) -> list[tuple[int, Path]]:
     close_handle = loader.CloseHandle
     create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     create_snapshot.restype = wintypes.HANDLE
-    process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
     process_first.restype = wintypes.BOOL
-    process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
     process_next.restype = wintypes.BOOL
     open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     open_process.restype = wintypes.HANDLE
@@ -138,12 +141,12 @@ def windows_process_ancestors(pid: int) -> list[tuple[int, Path]]:
         return []
     parents: dict[int, int] = {}
     try:
-        entry = ProcessEntry32W()
-        entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
         found = bool(process_first(snapshot, ctypes.byref(entry)))
         while found:
             parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
-            entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
             found = bool(process_next(snapshot, ctypes.byref(entry)))
     finally:
         close_handle(snapshot)
@@ -171,8 +174,6 @@ def windows_process_image(
     close_handle: Any,
 ) -> Path | None:
     """Resolve one Windows process image using a least-privilege query handle."""
-    from ctypes import wintypes
-
     handle = open_process(0x1000, False, pid)
     if not handle:
         return None

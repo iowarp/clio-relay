@@ -198,6 +198,57 @@ def test_get_log_serves_console_stream_like_stdout_and_stderr(tmp_path: Path) ->
     assert "console" in invalid_stream_response.json()["detail"]
 
 
+def test_get_log_serves_console_stderr_stream_like_console(tmp_path: Path) -> None:
+    """clio-relay#259 residual: the door route accepts and serves
+    ``console_stderr`` -- the application's stderr channel, ``console``'s
+    sibling -- with the exact same offset/limit/eof envelope shape, and the
+    same empty-with-eof read for a stream nothing has written yet."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-console-stderr",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    empty_response = client.get(f"/jobs/{job.job_id}/logs/console_stderr")
+    assert empty_response.status_code == 200
+    assert empty_response.json() == {
+        "job_id": job.job_id,
+        "stream": "console_stderr",
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "text": "",
+    }
+
+    console_stderr_path = spool / "console_stderr.log"
+    console_stderr_path.write_bytes(b"WARNING: rank 3 near OOM\n")
+
+    log_response = client.get(f"/jobs/{job.job_id}/logs/console_stderr", params={"limit": 7})
+
+    assert log_response.status_code == 200
+    body = log_response.json()
+    assert body["stream"] == "console_stderr"
+    assert body["text"] == "WARNING"
+    assert body["eof"] is False
+    assert body["next_offset"] == 7
+
+    tail_response = client.get(
+        f"/jobs/{job.job_id}/logs/console_stderr",
+        params={"offset": body["next_offset"]},
+    )
+    assert tail_response.status_code == 200
+    assert tail_response.json()["text"] == ": rank 3 near OOM\n"
+    assert tail_response.json()["eof"] is True
+
+
 def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
     tmp_path: Path,
 ) -> None:

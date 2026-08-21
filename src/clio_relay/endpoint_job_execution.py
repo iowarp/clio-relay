@@ -24,7 +24,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from clio_relay import execution_watch, process_containment
 from clio_relay.command_evidence import bounded_error_detail
@@ -94,9 +94,23 @@ from clio_relay.runtime_metadata import (
 )
 from clio_relay.spool import JobSpool
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+
 
 class JobExecutionMixin:
-    """Mixin: JobExecution methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: JobExecution methods split from EndpointWorker (clio-relay#231).
+
+    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
+    strict pyright can resolve ``self.queue`` across this mixin's own
+    methods -- see ``JarvisDispatchMixin``'s identical note in
+    ``endpoint_jarvis_dispatch.py`` for why (the sole composing class,
+    ``EndpointWorker``, assigns it in ``__init__``; a mixin has none of its
+    own).
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
 
     def _run_job_impl(
         self,
@@ -631,24 +645,44 @@ class JobExecutionMixin:
         self.queue.append_artifact(spool.artifact_for(spool.path / "stdout.log", kind="stdout"))
         self.queue.append_artifact(spool.artifact_for(spool.path / "stderr.log", kind="stderr"))
         if console_tailer is not None:
-            # #259: only a jarvis_run mcp_call ever writes console.log; every
-            # other job kind keeps the artifact list it already had (the log
-            # door itself still serves an empty console stream for them --
-            # JobSpool.read_log treats a missing file as empty+eof).
+            # #259: only a jarvis_run mcp_call ever writes console.log/
+            # console_stderr.log; every other job kind keeps the artifact
+            # list it already had (the log door itself still serves an
+            # empty console/console_stderr stream for them -- JobSpool.
+            # read_log treats a missing file as empty+eof).
             self.queue.append_artifact(
                 spool.artifact_for(spool.path / "console.log", kind="console")
             )
+            self.queue.append_artifact(
+                spool.artifact_for(spool.path / "console_stderr.log", kind="console_stderr")
+            )
         self.queue.append_artifact(spool.artifact_for(spool.log_capture_path, kind="log_capture"))
-        self._append_optional_result_artifacts(job, spool, console_tailer=console_tailer)
+        # cast (not a bare annotation -- that alone does not stop the RHS's
+        # own Unknown from propagating into the declared variable, verified
+        # empirically): ResultFinalizationMixin is a sibling mixin strict
+        # pyright cannot see through from here (the same cross-mixin gap
+        # `queue`'s TYPE_CHECKING stub above works around, for a returned
+        # value instead of an attribute). The real, already-enforced return
+        # type lives on `_append_optional_result_artifacts`'s own signature
+        # in endpoint_result_finalization.py; this asserts it at the one
+        # call site pyright cannot resolve across the mixin composition.
+        outputs_missing = cast(
+            "dict[str, object] | None",
+            self._append_optional_result_artifacts(job, spool, console_tailer=console_tailer),
+        )
         # #266: fold a resolved watch into the pre-#266 outcome logic --
         # see execution_watch.resolve_execution_outcome's own docstring for
         # why a resolved watch always wins over a pending cancellation.
+        # #265: outputs_missing (from the ONE mcp_result ingest just above)
+        # folds the same way -- producing the declared outputs is part of
+        # what "completed" means.
         outcome = execution_watch.resolve_execution_outcome(
             dispatch_recovered=dispatch_recovered,
             watch_resolution=execution_watch_resolution,
             dispatch_refusal_present=dispatch_refusal is not None,
             transport_returncode=result.returncode,
             cancellation_requested=self._job_cancellation_requested(job.job_id),
+            outputs_missing=outputs_missing,
         )
         effective_returncode = outcome.effective_returncode
         cancellation_honored = outcome.cancellation_honored
@@ -711,11 +745,14 @@ class JobExecutionMixin:
             )
             return
         watch_failure = outcome.watch_failure
+        outputs_missing_detail = outcome.outputs_missing
         failure_metadata: dict[str, object] = {"returncode": effective_returncode}
         if dispatch_refusal is not None:
             failure_metadata["jarvis_dispatch_refusal"] = dispatch_refusal.as_payload()
         if watch_failure is not None:
             failure_metadata["execution_watch_failure"] = watch_failure
+        if outputs_missing_detail is not None:
+            failure_metadata["execution_outputs_missing"] = outputs_missing_detail
         self.queue.update_task_state(
             task.task_id,
             JobState.FAILED,
@@ -730,6 +767,12 @@ class JobExecutionMixin:
                 if dispatch_refusal is not None
                 else "JARVIS execution ended in failure"
                 if watch_failure is not None
+                # clio-relay#265 owner ruling: "producing the declared
+                # outputs is PART of what completed means" -- an execution
+                # JARVIS itself reported terminal, but whose declared
+                # outputs are missing or empty, is FAILED here too.
+                else "JARVIS execution completed but declared outputs are missing or empty"
+                if outputs_missing_detail is not None
                 else "Endpoint MCP operation failed"
                 if endpoint_mcp_call
                 else "JARVIS-CD run failed"
@@ -739,6 +782,10 @@ class JobExecutionMixin:
                 if dispatch_refusal is not None
                 else bounded_error_detail(execution_watch.execution_watch_error_text(watch_failure))
                 if watch_failure is not None
+                else bounded_error_detail(
+                    execution_watch.execution_outputs_missing_error_text(outputs_missing_detail)
+                )
+                if outputs_missing_detail is not None
                 else f"exit code {effective_returncode}"
             ),
         )

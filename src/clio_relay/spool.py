@@ -34,9 +34,15 @@ ARTIFACT_OWNERSHIP_SCHEMA = "clio-relay.owned-artifact.v1"
 #: The job log-stream vocabulary. ``console`` (clio-relay#259) carries
 #: APPLICATION output for jarvis-backed mcp_call jobs -- distinct from
 #: ``stdout``/``stderr``, which for those jobs carry the MCP jsonrpc wire of
-#: the launched server subprocess, never application output.
-LogStreamName = Literal["stdout", "stderr", "console"]
-LOG_STREAM_NAMES: tuple[LogStreamName, ...] = ("stdout", "stderr", "console")
+#: the launched server subprocess, never application output. ``console_stderr``
+#: (clio-relay#259 residual) is ``console``'s sibling: the SAME application's
+#: stderr, on its own channel -- never merged into ``console`` (that would
+#: silently interleave two streams JARVIS keeps separate on disk) and never
+#: aliased onto the existing ``stderr`` name (that name is already spoken for
+#: by the MCP jsonrpc wire above; reusing it would be the same stdout/console
+#: mixing bug #259 already fixed once, on the other stream).
+LogStreamName = Literal["stdout", "stderr", "console", "console_stderr"]
+LOG_STREAM_NAMES: tuple[LogStreamName, ...] = ("stdout", "stderr", "console", "console_stderr")
 
 
 class _StreamCaptureState(TypedDict):
@@ -130,7 +136,14 @@ class JobSpool:
             self.job.model_dump_json(indent=2),
             encoding="utf-8",
         )
-        for name in ("events.jsonl", "stdout.log", "stderr.log", "console.log", "artifacts.jsonl"):
+        for name in (
+            "events.jsonl",
+            "stdout.log",
+            "stderr.log",
+            "console.log",
+            "console_stderr.log",
+            "artifacts.jsonl",
+        ):
             target = self._storage_path / name
             if not target.exists():
                 target.write_text("", encoding="utf-8")
@@ -272,6 +285,16 @@ class JobSpool:
         application output.
         """
         return self.append_log("console", text)
+
+    def append_console_stderr(self, text: str) -> LogAppendResult:
+        """Append application stderr within the configured durable byte quotas.
+
+        clio-relay#259 residual: ``console``'s sibling channel -- the same
+        application's stderr, kept on its own stream rather than merged
+        into ``console`` or aliased onto ``stderr`` (already the MCP jsonrpc
+        wire's name for a jarvis-backed mcp_call job).
+        """
+        return self.append_log("console_stderr", text)
 
     def append_log(
         self,

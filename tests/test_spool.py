@@ -132,6 +132,13 @@ def test_spool_enforces_stream_and_job_byte_quotas_without_splitting_utf8(
                 "truncated": False,
                 "truncation_event_recorded": False,
             },
+            "console_stderr": {
+                "observed_bytes": 0,
+                "persisted_bytes": 0,
+                "dropped_bytes": 0,
+                "truncated": False,
+                "truncation_event_recorded": False,
+            },
         },
     }
 

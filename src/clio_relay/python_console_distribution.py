@@ -24,7 +24,7 @@ from typing import Any, cast
 from urllib.parse import unquote, urlsplit
 
 from clio_relay._mcp_call_runner_facade import facade as _facade
-from clio_relay.bounded_file_io import _record_bound_sha256, _urlsafe_sha256_digest
+from clio_relay.bounded_file_io import record_bound_sha256, urlsafe_sha256_digest
 from clio_relay.constants import (
     PYTHON_DISTRIBUTION_MAX_BYTES,
     PYTHON_DISTRIBUTION_MAX_DISTRIBUTIONS,
@@ -234,11 +234,11 @@ def _verify_distribution_record_closure(
             failure["error"] = "Python distribution RECORD byte total exceeded its limit"
             return failure
         path = Path(str(distribution.locate_file(member)))
-        actual_hash = _record_bound_sha256(path, expected_size=expected_size)
+        actual_hash = record_bound_sha256(path, expected_size=expected_size)
         if actual_hash is None:
             failure["error"] = f"Python distribution file was missing or unstable: {normalized}"
             return failure
-        expected_digest = _urlsafe_sha256_digest(expected_hash.value)
+        expected_digest = urlsafe_sha256_digest(expected_hash.value)
         if expected_digest is None or not hmac.compare_digest(actual_hash, expected_digest):
             failure["error"] = f"Python distribution RECORD hash mismatch: {normalized}"
             return failure
@@ -251,7 +251,7 @@ def _verify_distribution_record_closure(
         record_size = record_path.lstat().st_size
     except OSError:
         record_size = -1
-    record_sha256 = _record_bound_sha256(record_path, expected_size=record_size)
+    record_sha256 = record_bound_sha256(record_path, expected_size=record_size)
     if record_sha256 is None:
         failure["error"] = "Python distribution RECORD file was missing"
         return failure

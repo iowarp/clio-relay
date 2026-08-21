@@ -43,7 +43,7 @@ dotted name either (that would import a second, independent, unpatched
 execution of this file). Every owner module whose functions call one of the
 individually-monkeypatched names below therefore goes through
 :mod:`clio_relay._mcp_call_runner_facade` -- this file registers its own live
-``globals()`` there right after its imports (``_register(globals())`` below),
+``globals()`` there right after its imports (``register(globals())`` below),
 and owner modules read through the returned proxy at *call time* via
 ``facade().NAME(...)``. See that module's docstring for the full mechanism.
 
@@ -69,25 +69,25 @@ from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
-from clio_relay._mcp_call_runner_facade import _register as _register_runner_facade
+from clio_relay._mcp_call_runner_facade import register as _register_runner_facade
 from clio_relay.clio_kit_runtime_identity import (
-    _bounded_regular_file_bytes,  # noqa: F401 -- re-exported public surface
     _installed_clio_kit_runtime_identity,  # noqa: F401
-    _is_sha256_text,  # noqa: F401
     _locked_clio_kit_runtime_identity,  # noqa: F401
     _nested_clio_kit_server_name,  # noqa: F401
+    bounded_regular_file_bytes,  # noqa: F401 -- re-exported public surface
+    is_sha256_text,  # noqa: F401
 )
 from clio_relay.clio_kit_wheel_archive import (
-    _bounded_zip_member_chunks,  # noqa: F401
-    _clio_kit_runtime_project_members,  # noqa: F401
     _file_identity,  # noqa: F401 -- monkeypatch target
     _install_spec_source,  # noqa: F401
-    _read_bounded_zip_member,  # noqa: F401
     _sha256_file,  # noqa: F401
-    _validated_wheel_members,  # noqa: F401
-    _verified_wheel_archive,  # noqa: F401
     _zip_member_is_directory,  # noqa: F401
     _zip_member_is_regular,  # noqa: F401
+    bounded_zip_member_chunks,  # noqa: F401
+    clio_kit_runtime_project_members,  # noqa: F401
+    read_bounded_zip_member,  # noqa: F401
+    validated_wheel_members,  # noqa: F401
+    verified_wheel_archive,  # noqa: F401
 )
 from clio_relay.constants import (
     CLIO_KIT_LOCK_MAX_BYTES,  # noqa: F401

@@ -1751,7 +1751,16 @@ RATCHET_BASELINE: dict[str, int] = {
     # the capture-state loops and validator), and added append_console for
     # symmetry with append_stdout/append_stderr. A justified, minimal
     # ratchet-up.
-    "src/clio_relay/spool.py": 1000,
+    # clio-relay#259 residual (stderr channel): LOG_STREAM_NAMES/LogStreamName
+    # widens again to {stdout, stderr, console, console_stderr} -- the SAME
+    # in-place vocabulary change the #259 entry above already made once for
+    # console, applied identically for the application's stderr sibling
+    # channel (never merged into console, never aliased onto the pre-existing
+    # relay-protocol stderr name; see the widened docstring on
+    # LogStreamName). Adds append_console_stderr for symmetry with
+    # append_console, and one more file in initialize()'s created-file list.
+    # A justified, minimal ratchet-up: 1000 -> 1023.
+    "src/clio_relay/spool.py": 1023,
     # split/storage-policy-w2: storage_policy.py's own ratchet-baseline entry
     # (1826) is removed here. The wire types/limits/error vocabulary moved to
     # storage_policy_types.py (280 lines), the ledger content codec to

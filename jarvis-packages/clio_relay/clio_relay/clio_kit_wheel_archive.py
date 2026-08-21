@@ -30,7 +30,7 @@ from clio_relay.constants import (
 
 
 @contextmanager
-def _verified_wheel_archive(
+def verified_wheel_archive(
     path: Path,
     artifact: dict[str, Any] | None,
 ) -> Generator[zipfile.ZipFile]:
@@ -57,7 +57,7 @@ def _verified_wheel_archive(
             raise ValueError("clio-kit wheel changed during runtime verification")
 
 
-def _validated_wheel_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+def validated_wheel_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     """Return unique, normalized wheel members after bounded path validation."""
     infos = archive.infolist()
     if len(infos) > CLIO_KIT_WHEEL_MAX_FILES:
@@ -86,7 +86,7 @@ def _validated_wheel_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipI
     return members
 
 
-def _clio_kit_runtime_project_members(
+def clio_kit_runtime_project_members(
     members: dict[str, zipfile.ZipInfo],
     *,
     prefix: str,
@@ -178,17 +178,17 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_bounded_zip_member(
+def read_bounded_zip_member(
     archive: zipfile.ZipFile,
     name: str,
     *,
     max_bytes: int,
 ) -> bytes:
     """Read one small wheel member after enforcing its decompressed limit."""
-    return b"".join(_bounded_zip_member_chunks(archive, name, max_bytes=max_bytes))
+    return b"".join(bounded_zip_member_chunks(archive, name, max_bytes=max_bytes))
 
 
-def _bounded_zip_member_chunks(
+def bounded_zip_member_chunks(
     archive: zipfile.ZipFile,
     name: str,
     *,

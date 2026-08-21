@@ -19,7 +19,7 @@ from pathlib import Path
 from clio_relay.constants import FILE_HASH_CHUNK_BYTES
 
 
-def _is_sha256_text(value: object) -> bool:
+def is_sha256_text(value: object) -> bool:
     """Return whether a value is one lowercase hexadecimal SHA-256 digest."""
     return (
         isinstance(value, str)
@@ -29,13 +29,13 @@ def _is_sha256_text(value: object) -> bool:
     )
 
 
-def _bounded_regular_file_bytes(path: Path, *, max_bytes: int) -> bytes | None:
+def bounded_regular_file_bytes(path: Path, *, max_bytes: int) -> bytes | None:
     """Read one stable non-link regular file under an explicit byte limit."""
-    snapshot = _bounded_regular_file_snapshot(path, max_bytes=max_bytes)
+    snapshot = bounded_regular_file_snapshot(path, max_bytes=max_bytes)
     return snapshot[0] if snapshot is not None else None
 
 
-def _bounded_regular_file_snapshot(
+def bounded_regular_file_snapshot(
     path: Path,
     *,
     max_bytes: int,
@@ -77,7 +77,7 @@ def _bounded_regular_file_snapshot(
     return payload, identity
 
 
-def _record_bound_sha256(path: Path, *, expected_size: int) -> str | None:
+def record_bound_sha256(path: Path, *, expected_size: int) -> str | None:
     """Hash one non-link regular distribution file and reject path replacement races."""
     try:
         before = path.lstat()
@@ -117,7 +117,7 @@ def _record_bound_sha256(path: Path, *, expected_size: int) -> str | None:
     return digest.hexdigest()
 
 
-def _urlsafe_sha256_digest(value: str) -> str | None:
+def urlsafe_sha256_digest(value: str) -> str | None:
     """Decode an unpadded wheel RECORD SHA-256 value to lowercase hex."""
     try:
         decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))

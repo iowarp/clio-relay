@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from clio_relay import execution_watch
 from clio_relay.console_stream import (
@@ -47,6 +47,7 @@ from clio_relay.jarvis_dispatch_failure import (
     JARVIS_DISPATCH_REFUSAL_RESOLUTION,
     JarvisDispatchRefusal,
 )
+from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs_from_path
 from clio_relay.jarvis_run_environment import (
     jarvis_run_environment_values,
     registered_site_spack_command,
@@ -65,9 +66,25 @@ from clio_relay.runtime_metadata import (
 )
 from clio_relay.spool import JobSpool, read_owned_regular_file_bytes
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+
 
 class JarvisDispatchMixin:
-    """Mixin: JarvisDispatch methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: JarvisDispatch methods split from EndpointWorker (clio-relay#231).
+
+    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
+    strict pyright can resolve ``self.queue`` across this mixin's own
+    methods: the sole composing class, ``EndpointWorker``, is what actually
+    assigns it in ``__init__`` (``endpoint.py``), and a mixin has no
+    ``__init__`` of its own for pyright to see that assignment through. The
+    same pattern this repo's tracked sibling-mixin design gap (#271) will
+    eventually need everywhere else -- scoped here to unblock this mixin's
+    own already-existing ``self.queue`` call sites, not a repo-wide fix.
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
 
     def _jarvis_run_environment_values(
         self,
@@ -221,6 +238,26 @@ class JarvisDispatchMixin:
             "execution_record": record,
             "progress": progress,
             "runtime_metadata": runtime,
+            # clio-relay#265: NOT part of jarvis_run's own frozen outputSchema
+            # (only jarvis_get_execution declares artifact_page) -- but this
+            # projected run_result becomes the durable mcp-result.json BOTH
+            # recovery callers write, and jarvis_execution_artifacts.
+            # ingest_jarvis_execution_outputs reads exactly this file to
+            # index #252's declared execution outputs and detect #265's
+            # outputs-missing verdict. Dropping it here (as an earlier
+            # revision did) meant every scheduler-deferred/recovered
+            # jarvis_run silently lost BOTH: no execution-output artifacts
+            # ever indexed and outputs_missing structurally unreachable,
+            # regardless of what JARVIS actually declared. Both callers of
+            # this method dispatch their query with `artifacts` requested
+            # (execution_watch.execution_watch_query_spec's
+            # include_artifacts=True final poll; this module's own
+            # `_recover_jarvis_execution`, "artifacts": {"page_size": 100}),
+            # so `structured["artifact_page"]` is always populated here --
+            # an outputSchema-additive field a schema without
+            # `additionalProperties: false` (verified) tolerates on the
+            # client-facing side.
+            "artifact_page": structured.get("artifact_page"),
         }
         recovered_document: dict[str, object] = {
             **query_document,
@@ -430,11 +467,25 @@ class JarvisDispatchMixin:
             ("stdout", spool.path / "stdout.log"),
             ("stderr", spool.path / "stderr.log"),
             ("console", spool.path / "console.log"),
+            ("console_stderr", spool.path / "console_stderr.log"),
             ("log_capture", spool.log_capture_path),
             ("mcp_result", spool.path / "mcp-result.json"),
         ):
             if not internal_filesystem_path(path).is_file():
                 raise RelayError(f"recovered JARVIS spool omitted {kind}: {path}")
+            if kind == "mcp_result":
+                # #265: this crash-recovery reconciliation path (a worker
+                # restart finalizing a JARVIS dispatch abandoned mid-run) is
+                # NOT wired into #265's terminal-state fold today -- it never
+                # reaches `_run_job_impl`/`resolve_execution_outcome`, whose
+                # target state this method's own caller already computes
+                # independently (`endpoint_execution_lifecycle.py`). The
+                # ingest still runs so #252's output indexing keeps working
+                # and the typed `jarvis.execution_output_missing`/`_empty`/
+                # `_outputs_missing` events still land on the job's event
+                # log for observability -- only the FORCED-failure fold is
+                # the known, documented gap here.
+                ingest_jarvis_execution_outputs_from_path(self.queue, job, path, spool.path)
             created = self._append_spool_artifact_once(job, spool, path, kind=kind)
             if created and kind == "mcp_result":
                 self.queue.append_event(

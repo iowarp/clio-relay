@@ -219,6 +219,73 @@ def test_execution_cancel_unsupported_payload() -> None:
     assert payload["schema_version"] == execution_watch.EXECUTION_CANCEL_REFUSAL_SCHEMA
 
 
+def test_execution_outputs_missing_error_text() -> None:
+    # Explicit dict[str, object] annotation: dict's value-type parameter is
+    # invariant, so the inferred narrower literal type (dict[str, str | int
+    # | list[dict[str, str | int]]]) is not otherwise assignable to the
+    # function's dict[str, object] parameter under strict pyright.
+    detail: dict[str, object] = {
+        "schema_version": "clio-relay.execution-outputs-missing.v1",
+        "execution_id": "jarvis_exec",
+        "declared_count": 2,
+        "missing": [
+            {
+                "relative_path": "dump.h5",
+                "role": "output",
+                "reason": "absent",
+                "declared_size_bytes": 2048,
+            },
+            {
+                "relative_path": "stdout.log",
+                "role": "log",
+                "reason": "empty",
+                "declared_size_bytes": 0,
+            },
+        ],
+    }
+    text = execution_watch.execution_outputs_missing_error_text(detail)
+    assert "jarvis_exec" in text
+    assert "2 declared outputs" in text
+    assert "dump.h5" in text
+    assert "stdout.log" in text
+
+
+@pytest.mark.parametrize(
+    ("watch_succeeded", "outputs_missing", "expected_returncode", "expected_cancellation"),
+    [
+        # #265: a completed (succeeded) watch is overridden to failure when
+        # outputs are missing -- "producing the declared outputs is PART of
+        # what completed means".
+        (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 1, False),
+        # No outputs_missing verdict: the watch's own success stands.
+        (True, None, 0, False),
+        # A genuinely failed watch stays failed regardless of outputs_missing.
+        (False, None, 1, False),
+    ],
+)
+def test_resolve_execution_outcome_folds_outputs_missing(
+    watch_succeeded: bool,
+    outputs_missing: dict[str, object] | None,
+    expected_returncode: int,
+    expected_cancellation: bool,
+) -> None:
+    resolution = execution_watch.ExecutionWatchResolution(
+        succeeded=watch_succeeded,
+        failure_detail=None if watch_succeeded else {"schema_version": "x"},
+    )
+    outcome = execution_watch.resolve_execution_outcome(
+        dispatch_recovered=False,
+        watch_resolution=resolution,
+        dispatch_refusal_present=False,
+        transport_returncode=0,
+        cancellation_requested=True,
+        outputs_missing=outputs_missing,
+    )
+    assert outcome.effective_returncode == expected_returncode
+    assert outcome.cancellation_honored is expected_cancellation
+    assert outcome.outputs_missing == outputs_missing
+
+
 # --------------------------------------------------------------------------
 # End-to-end EndpointWorker lifecycle coverage.
 # --------------------------------------------------------------------------
@@ -247,6 +314,7 @@ class _WatchTransportProvider(JarvisCdProvider):
         cancel_on_poll_index: int | None = None,
         queue: ClioCoreQueue | None = None,
         job_id: str | None = None,
+        terminal_artifacts: list[dict[str, object]] | None = None,
     ) -> None:
         super().__init__(jarvis_bin="jarvis")
         self.pipeline_id = pipeline_id
@@ -260,6 +328,10 @@ class _WatchTransportProvider(JarvisCdProvider):
         self.cancel_on_poll_index = cancel_on_poll_index
         self.queue = queue
         self.job_id = job_id
+        # clio-relay#265: declared execution-file entries the FINAL,
+        # artifact-bearing poll reports -- None keeps the pre-#265 empty
+        # ``artifacts: []`` default.
+        self.terminal_artifacts = terminal_artifacts
         self.dispatch_count = 0
         self.poll_count = 0
         self.poll_specs: list[McpCallSpec] = []
@@ -334,6 +406,7 @@ class _WatchTransportProvider(JarvisCdProvider):
             server_artifact=self.server_artifact,
             native=self._native(index),
             include_artifacts=include_artifacts,
+            artifacts=self.terminal_artifacts if include_artifacts else None,
         )
         (cwd / "mcp-result.json").write_text(json.dumps(document), encoding="utf-8")
         return subprocess.CompletedProcess(["jarvis-get-execution"], 0, "", "")
@@ -383,6 +456,25 @@ def _watch_env(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
         execution_watch_poll_interval_seconds=0.01,
+        # CI-hang guard (not a production ceiling change -- this settings
+        # instance is test-local; the real DEFAULT_EXECUTION_WATCH_CEILING_
+        # SECONDS, 24h, is untouched everywhere else). Every watch test in
+        # this file except test_watch_ceiling_exceeded_fails_the_job relies
+        # ENTIRELY on its fake's ``states`` list reaching terminal within a
+        # handful of polls -- nothing previously bounded a test whose fake
+        # (present or future, known bug or not) fails to converge. Without
+        # this, `now=utc_now` (the REAL wall clock, unmocked here) plus
+        # ``run_execution_watch``'s ``sleep`` parameter -- which defaults to
+        # the real ``time.sleep`` bound at function-definition time, NOT the
+        # patched one below, since a default argument is evaluated once at
+        # import time and this fixture's own monkeypatch cannot reach back
+        # into it -- means a non-converging fake would tick toward the REAL
+        # 24h default for up to 24 real hours, exactly the CI-hour-hang
+        # symptom this value exists to convert into a fast, loud pytest
+        # failure instead. 10s gives >100x headroom over every test's
+        # actual poll count (<=6) at the 0.01s poll interval above, even
+        # under a slow/loaded CI runner.
+        execution_watch_ceiling_seconds=10,
     )
     queue = ClioCoreQueue(settings.core_dir)
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
@@ -403,6 +495,9 @@ def test_deferred_execution_watched_to_success(
     execution_root = tmp_path / "execution-root"
     execution_root.mkdir()
     (execution_root / "stdout.log").write_bytes(b"application booted\napplication running\n")
+    # clio-relay#259 residual: the application's stderr must be live-tailed
+    # and terminal-flushed the SAME way stdout is, into its own channel.
+    (execution_root / "stderr.log").write_bytes(b"warning: low disk\n")
     created_at = job.created_at.isoformat()
     transport = _WatchTransportProvider(
         pipeline_id="watch-pipeline",
@@ -445,10 +540,19 @@ def test_deferred_execution_watched_to_success(
     assert "execution.running" in events
     assert events.count("execution.watch_resolved") == 1
     artifact_kinds = [artifact.kind for artifact in queue.list_artifacts(job.job_id)]
-    for required_kind in ("mcp_result", "runtime_metadata", "provenance", "console"):
+    for required_kind in (
+        "mcp_result",
+        "runtime_metadata",
+        "provenance",
+        "console",
+        "console_stderr",
+    ):
         assert artifact_kinds.count(required_kind) == 1
     console_bytes = (settings.spool_dir / job.job_id / "console.log").read_bytes()
     assert b"application running" in console_bytes
+    console_stderr_bytes = (settings.spool_dir / job.job_id / "console_stderr.log").read_bytes()
+    assert b"warning: low disk" in console_stderr_bytes
+    assert console_stderr_bytes != console_bytes
     mcp_result = json.loads(
         (settings.spool_dir / job.job_id / "mcp-result.json").read_text(encoding="utf-8")
     )
@@ -499,6 +603,80 @@ def test_deferred_execution_watched_to_failure(
     watch_failure = cast(dict[str, Any], task.metadata["execution_watch_failure"])
     assert watch_failure["state"] == "failed"
     assert watch_failure["reason"] == "application exited with code 137"
+
+
+def test_deferred_execution_completed_with_missing_declared_output_fails_typed(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """clio-relay#265 owner ruling made concrete: JARVIS itself reports the
+    execution ``completed``, but a declared output never landed on disk --
+    "producing the declared outputs is PART of what completed means", so the
+    job must reach FAILED with a typed ``outputs_missing`` reason, never a
+    decorated "completed".
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"application ran to completion\n")
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        states=[
+            ("submitted", False, "9005"),
+            ("running", False, "9005"),
+            ("completed", True, "9005"),
+        ],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.execution",
+                "kind": "execution-file",
+                "role": "output",
+                "location": {"kind": "execution_path", "value": "dump.h5"},
+                "size_bytes": 2048,
+                "checksum": f"sha256:{'b' * 64}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert result.last_error is not None
+    assert "declared" in result.last_error
+    assert "dump.h5" in result.last_error
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.state is JobState.FAILED
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["schema_version"] == "clio-relay.execution-outputs-missing.v1"
+    assert outputs_missing["declared_count"] == 1
+    assert outputs_missing["missing"] == [
+        {
+            "relative_path": "dump.h5",
+            "role": "output",
+            "reason": "absent",
+            "declared_size_bytes": 2048,
+        }
+    ]
+    # JARVIS's own execution record genuinely reached "completed" -- the
+    # watch resolved normally; #265's outputs_missing fold is what turns
+    # that into a failed job, never a fabricated execution-level failure.
+    events = _event_types(queue, job.job_id)
+    assert "execution.watch_resolved" in events
+    assert "jarvis.execution_output_missing" in events
+    assert "jarvis.execution_outputs_missing" in events
 
 
 def test_synchronous_terminal_dispatch_skips_watch(
