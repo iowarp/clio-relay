@@ -57,12 +57,17 @@ from clio_relay.models import McpCallSpec
 from clio_relay.spool import (
     MAX_LOG_READ_BYTES,
     JobSpool,
+    LogStreamName,
     OwnedFileSizeLimitError,
     read_external_log_range,
     read_owned_regular_file_bytes,
 )
 
 CONSOLE_STREAM: Literal["console"] = "console"
+#: clio-relay#259 residual: the application's stderr, ``console``'s sibling
+#: channel -- see :data:`clio_relay.spool.LogStreamName`'s own docstring for
+#: why this is neither merged into ``console`` nor aliased onto ``stderr``.
+CONSOLE_STDERR_STREAM: Literal["console_stderr"] = "console_stderr"
 
 #: Env var jarvis-cd's own ``Jarvis`` singleton reads before defaulting to
 #: ``~/.ppi-jarvis`` (``jarvis_cd.core.config._JARVIS_ROOT_ENVIRONMENT``).
@@ -203,19 +208,38 @@ def newest_execution_dir(shared_dir: Path, pipeline_id: str) -> Path | None:
 
 
 @dataclass
+class _ChannelTailState:
+    """Per-channel mutable tail state (clio-relay#259 residual, stderr).
+
+    stdout and stderr are tailed off the SAME locked execution root but are
+    otherwise fully independent: each has its own byte offset, truncation
+    flag, reason-dedup set, and self-throttle clock, so a stderr-only
+    failure or quota trip can never disturb the stdout channel (or vice
+    versa).
+    """
+
+    offset: int = 0
+    truncated: bool = False
+    reported_reasons: set[str] = field(default_factory=set[str])
+    last_poll_monotonic: float | None = None
+
+
+@dataclass
 class ConsoleLiveTailer:
-    """Poll-driven best-effort tail of one JARVIS execution's ``stdout.log``.
+    """Poll-driven best-effort tail of one JARVIS execution's application output.
 
     Locks onto the first execution directory it finds under
     ``<shared_dir>/<pipeline_id>/executions`` and never switches once
     locked, bounding (not eliminating) exposure to a concurrently reused
     pipeline id picking up a sibling job's directory --
-    :func:`flush_terminal_console` is the correctness guarantee regardless
-    of what this best-effort half finds.
+    :func:`flush_terminal_console` / :func:`flush_terminal_console_stderr`
+    are the correctness guarantee regardless of what this best-effort half
+    finds.
 
-    Call :meth:`poll` from the job's existing subprocess poll cadence (every
-    tick is fine -- this self-throttles to :attr:`min_poll_interval_seconds`
-    internally, so it never hammers the filesystem).
+    Call :meth:`poll` (stdout) AND :meth:`poll_stderr` from the job's
+    existing subprocess poll cadence (every tick is fine -- each
+    self-throttles to :attr:`min_poll_interval_seconds` independently, so
+    neither ever hammers the filesystem).
     """
 
     spool: JobSpool
@@ -223,69 +247,153 @@ class ConsoleLiveTailer:
     env: Mapping[str, str] | None = None
     min_poll_interval_seconds: float = CONSOLE_TAIL_MIN_POLL_INTERVAL_SECONDS
     execution_root: Path | None = field(default=None, init=False)
-    offset: int = field(default=0, init=False)
-    truncated: bool = field(default=False, init=False)
-    _reported_reasons: set[str] = field(default_factory=set[str], init=False)
-    _last_poll_monotonic: float | None = field(default=None, init=False)
+    _stdout: _ChannelTailState = field(default_factory=_ChannelTailState, init=False)
+    _stderr: _ChannelTailState = field(default_factory=_ChannelTailState, init=False)
+
+    @property
+    def offset(self) -> int:
+        """The STDOUT channel's byte offset (pre-#259-stderr public name)."""
+        return self._stdout.offset
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        self._stdout.offset = value
+
+    @property
+    def truncated(self) -> bool:
+        """Whether the STDOUT channel has been truncated (pre-#259-stderr name)."""
+        return self._stdout.truncated
+
+    @truncated.setter
+    def truncated(self, value: bool) -> None:
+        self._stdout.truncated = value
+
+    @property
+    def stderr_offset(self) -> int:
+        """The STDERR channel's own byte offset."""
+        return self._stderr.offset
+
+    @stderr_offset.setter
+    def stderr_offset(self, value: int) -> None:
+        self._stderr.offset = value
+
+    @property
+    def stderr_truncated(self) -> bool:
+        """Whether the STDERR channel has been truncated."""
+        return self._stderr.truncated
+
+    @stderr_truncated.setter
+    def stderr_truncated(self, value: bool) -> None:
+        self._stderr.truncated = value
 
     def poll(self, *, now: float | None = None) -> ConsoleTailStep:
-        """Advance the tail by one increment; safe and cheap to call often.
+        """Advance the STDOUT tail by one increment; safe and cheap to call often.
 
         Never raises -- every failure mode returns a typed reason (reported
         once per distinct reason so the caller does not spam an event per
         poll tick); the job's own execution is never affected by a tailing
         failure.
         """
+        return self._poll_channel(
+            now=now,
+            state=self._stdout,
+            log_filename="stdout.log",
+            stream=CONSOLE_STREAM,
+            unreadable_reason="stdout_log_unreadable",
+        )
+
+    def poll_stderr(self, *, now: float | None = None) -> ConsoleTailStep:
+        """Advance the STDERR tail by one increment (clio-relay#259 residual).
+
+        Mirrors :meth:`poll` exactly -- same self-throttling, same typed/
+        deduplicated failure reasons, same "never raises into the job"
+        guarantee -- but for the application's ``stderr.log`` into its own
+        :data:`CONSOLE_STDERR_STREAM` spool stream.
+        """
+        return self._poll_channel(
+            now=now,
+            state=self._stderr,
+            log_filename="stderr.log",
+            stream=CONSOLE_STDERR_STREAM,
+            unreadable_reason="stderr_log_unreadable",
+        )
+
+    def _poll_channel(
+        self,
+        *,
+        now: float | None,
+        state: _ChannelTailState,
+        log_filename: str,
+        stream: LogStreamName,
+        unreadable_reason: str,
+    ) -> ConsoleTailStep:
         current = time.monotonic() if now is None else now
-        if self.truncated:
+        if state.truncated:
             return ConsoleTailStep(appended=False, reason=None, message=None)
         if (
-            self._last_poll_monotonic is not None
-            and current - self._last_poll_monotonic < self.min_poll_interval_seconds
+            state.last_poll_monotonic is not None
+            and current - state.last_poll_monotonic < self.min_poll_interval_seconds
         ):
             return ConsoleTailStep(appended=False, reason=None, message=None)
-        self._last_poll_monotonic = current
+        state.last_poll_monotonic = current
         if self.execution_root is None:
             try:
                 shared_dir = resolve_jarvis_shared_dir(self.env)
                 located = newest_execution_dir(shared_dir, self.pipeline_id)
             except ConsoleTailUnavailable as exc:
-                return self._reason_step(exc.reason, str(exc))
+                return self._reason_step(state, exc.reason, str(exc))
             if located is None:
                 return ConsoleTailStep(appended=False, reason=None, message=None)
             self.execution_root = located
-        return self._tail_locked_execution()
+        return self._tail_locked_execution(
+            state,
+            log_filename=log_filename,
+            stream=stream,
+            unreadable_reason=unreadable_reason,
+        )
 
-    def _tail_locked_execution(self) -> ConsoleTailStep:
+    def _tail_locked_execution(
+        self,
+        state: _ChannelTailState,
+        *,
+        log_filename: str,
+        stream: LogStreamName,
+        unreadable_reason: str,
+    ) -> ConsoleTailStep:
         assert self.execution_root is not None
-        stdout_path = self.execution_root / "stdout.log"
+        source_path = self.execution_root / log_filename
         try:
             chunk, next_offset, _eof = read_external_log_range(
-                stdout_path,
-                offset=self.offset,
+                source_path,
+                offset=state.offset,
                 limit=CONSOLE_TAIL_CHUNK_BYTES,
             )
         except (OSError, RuntimeError) as exc:
-            return self._reason_step("stdout_log_unreadable", f"{stdout_path}: {exc}")
+            return self._reason_step(state, unreadable_reason, f"{source_path}: {exc}")
         if not chunk:
             return ConsoleTailStep(appended=False, reason=None, message=None)
-        self.offset = next_offset
-        result = self.spool.append_log(CONSOLE_STREAM, chunk)
+        state.offset = next_offset
+        result = self.spool.append_log(stream, chunk)
         if result.truncated:
-            self.truncated = True
+            state.truncated = True
         if result.truncation_event_required:
-            self.spool.mark_truncation_event_recorded(CONSOLE_STREAM)
+            self.spool.mark_truncation_event_recorded(stream)
             return ConsoleTailStep(
                 appended=True,
                 reason="truncated",
-                message=(f"console stream reached its {result.persisted_stream_bytes}-byte quota"),
+                message=(f"{stream} stream reached its {result.persisted_stream_bytes}-byte quota"),
             )
         return ConsoleTailStep(appended=True, reason=None, message=None)
 
-    def _reason_step(self, reason: str, message: str) -> ConsoleTailStep:
-        if reason in self._reported_reasons:
+    def _reason_step(
+        self,
+        state: _ChannelTailState,
+        reason: str,
+        message: str,
+    ) -> ConsoleTailStep:
+        if reason in state.reported_reasons:
             return ConsoleTailStep(appended=False, reason=None, message=None)
-        self._reported_reasons.add(reason)
+        state.reported_reasons.add(reason)
         return ConsoleTailStep(appended=False, reason=reason, message=message)
 
 
@@ -317,6 +425,80 @@ def _same_directory(a: Path, b: Path) -> bool:
         return False
 
 
+def _flush_terminal_channel(
+    spool: JobSpool,
+    result_document: dict[str, Any],
+    *,
+    log_filename: str,
+    stream: LogStreamName,
+    unreadable_reason: str,
+    mismatch_reason: str,
+    tailer_offset: int | None,
+    tailer_execution_root: Path | None,
+) -> ConsoleFlushOutcome:
+    """Shared terminal-flush body :func:`flush_terminal_console` and
+    :func:`flush_terminal_console_stderr` both call, one per channel.
+
+    ``tailer_offset``/``tailer_execution_root`` are the ALREADY-RESOLVED
+    per-channel tailer state (the caller reads ``tailer.offset``/
+    ``tailer.execution_root`` for stdout, ``tailer.stderr_offset`` for
+    stderr -- both channels share the one locked ``execution_root``) so
+    this function stays channel-agnostic.
+    """
+    structured = result_document.get("structured_result")
+    if not isinstance(structured, dict):
+        return ConsoleFlushOutcome(appended_bytes=0, reason=None, message=None)
+    record = cast(dict[str, Any], structured).get("execution_record")
+    if not isinstance(record, dict):
+        return ConsoleFlushOutcome(appended_bytes=0, reason=None, message=None)
+    execution_root = execution_root_from_record(cast(dict[str, Any], record))
+    if execution_root is None:
+        return ConsoleFlushOutcome(
+            appended_bytes=0,
+            reason="execution_root_undeclared",
+            message="terminal JARVIS result omitted an execution root",
+        )
+    source_path = execution_root / log_filename
+    offset = 0
+    reason: str | None = None
+    message: str | None = None
+    if tailer_execution_root is not None:
+        if _same_directory(tailer_execution_root, execution_root):
+            offset = tailer_offset or 0
+        else:
+            reason = mismatch_reason
+            message = (
+                f"live tail followed {tailer_execution_root} but the terminal "
+                f"result named {execution_root}; re-flushing {stream} from the start"
+            )
+    appended_total = 0
+    while True:
+        try:
+            chunk, next_offset, eof = read_external_log_range(
+                source_path,
+                offset=offset,
+                limit=CONSOLE_TAIL_CHUNK_BYTES,
+            )
+        except (OSError, RuntimeError) as exc:
+            if appended_total == 0 and reason is None:
+                reason = unreadable_reason
+                message = f"{source_path}: {exc}"
+            break
+        if not chunk:
+            break
+        result = spool.append_log(stream, chunk)
+        appended_total += result.accepted_bytes
+        offset = next_offset
+        if result.truncation_event_required:
+            spool.mark_truncation_event_recorded(stream)
+            if reason is None:
+                reason = "truncated"
+                message = f"{stream} stream reached its {result.persisted_stream_bytes}-byte quota"
+        if result.truncated or eof:
+            break
+    return ConsoleFlushOutcome(appended_bytes=appended_total, reason=reason, message=message)
+
+
 def flush_terminal_console(
     spool: JobSpool,
     result_document: dict[str, Any],
@@ -339,58 +521,43 @@ def flush_terminal_console(
     never locked onto one at all, the full log is flushed from the start and
     a typed mismatch reason is reported so the discrepancy is visible.
     """
-    structured = result_document.get("structured_result")
-    if not isinstance(structured, dict):
-        return ConsoleFlushOutcome(appended_bytes=0, reason=None, message=None)
-    record = cast(dict[str, Any], structured).get("execution_record")
-    if not isinstance(record, dict):
-        return ConsoleFlushOutcome(appended_bytes=0, reason=None, message=None)
-    execution_root = execution_root_from_record(cast(dict[str, Any], record))
-    if execution_root is None:
-        return ConsoleFlushOutcome(
-            appended_bytes=0,
-            reason="execution_root_undeclared",
-            message="terminal JARVIS result omitted an execution root",
-        )
-    stdout_path = execution_root / "stdout.log"
-    offset = 0
-    reason: str | None = None
-    message: str | None = None
-    if tailer is not None and tailer.execution_root is not None:
-        if _same_directory(tailer.execution_root, execution_root):
-            offset = tailer.offset
-        else:
-            reason = "console_live_tail_execution_mismatch"
-            message = (
-                f"live tail followed {tailer.execution_root} but the terminal "
-                f"result named {execution_root}; re-flushing console from the start"
-            )
-    appended_total = 0
-    while True:
-        try:
-            chunk, next_offset, eof = read_external_log_range(
-                stdout_path,
-                offset=offset,
-                limit=CONSOLE_TAIL_CHUNK_BYTES,
-            )
-        except (OSError, RuntimeError) as exc:
-            if appended_total == 0 and reason is None:
-                reason = "stdout_log_unreadable"
-                message = f"{stdout_path}: {exc}"
-            break
-        if not chunk:
-            break
-        result = spool.append_log(CONSOLE_STREAM, chunk)
-        appended_total += result.accepted_bytes
-        offset = next_offset
-        if result.truncation_event_required:
-            spool.mark_truncation_event_recorded(CONSOLE_STREAM)
-            if reason is None:
-                reason = "truncated"
-                message = f"console stream reached its {result.persisted_stream_bytes}-byte quota"
-        if result.truncated or eof:
-            break
-    return ConsoleFlushOutcome(appended_bytes=appended_total, reason=reason, message=message)
+    return _flush_terminal_channel(
+        spool,
+        result_document,
+        log_filename="stdout.log",
+        stream=CONSOLE_STREAM,
+        unreadable_reason="stdout_log_unreadable",
+        mismatch_reason="console_live_tail_execution_mismatch",
+        tailer_offset=None if tailer is None else tailer.offset,
+        tailer_execution_root=None if tailer is None else tailer.execution_root,
+    )
+
+
+def flush_terminal_console_stderr(
+    spool: JobSpool,
+    result_document: dict[str, Any],
+    *,
+    tailer: ConsoleLiveTailer | None = None,
+) -> ConsoleFlushOutcome:
+    """Guarantee the ``console_stderr`` stream carries the full application log.
+
+    clio-relay#259 residual: the exact same terminal-flush guarantee
+    :func:`flush_terminal_console` gives stdout, mirrored for the
+    application's stderr -- same authoritative execution-root derivation,
+    same tailer-offset reconciliation (using the tailer's OWN
+    ``stderr_offset``/``stderr_truncated`` state, never the stdout one), same
+    typed/non-fatal reasons.
+    """
+    return _flush_terminal_channel(
+        spool,
+        result_document,
+        log_filename="stderr.log",
+        stream=CONSOLE_STDERR_STREAM,
+        unreadable_reason="stderr_log_unreadable",
+        mismatch_reason="console_stderr_live_tail_execution_mismatch",
+        tailer_offset=None if tailer is None else tailer.stderr_offset,
+        tailer_execution_root=None if tailer is None else tailer.execution_root,
+    )
 
 
 def flush_terminal_console_from_path(
@@ -400,6 +567,34 @@ def flush_terminal_console_from_path(
     tailer: ConsoleLiveTailer | None = None,
 ) -> ConsoleFlushOutcome:
     """Read one bounded terminal ``mcp-result.json`` and flush its console log."""
+    document = _terminal_result_document(spool, result_path)
+    if isinstance(document, ConsoleFlushOutcome):
+        return document
+    return flush_terminal_console(spool, document, tailer=tailer)
+
+
+def flush_terminal_console_stderr_from_path(
+    spool: JobSpool,
+    result_path: Path,
+    *,
+    tailer: ConsoleLiveTailer | None = None,
+) -> ConsoleFlushOutcome:
+    """Read one bounded terminal ``mcp-result.json`` and flush its console_stderr log."""
+    document = _terminal_result_document(spool, result_path)
+    if isinstance(document, ConsoleFlushOutcome):
+        return document
+    return flush_terminal_console_stderr(spool, document, tailer=tailer)
+
+
+def _terminal_result_document(
+    spool: JobSpool,
+    result_path: Path,
+) -> dict[str, Any] | ConsoleFlushOutcome:
+    """Read one bounded terminal ``mcp-result.json``, shared by both channels'
+    ``_from_path`` entry points. Returns a typed :class:`ConsoleFlushOutcome`
+    (never raises) when the result cannot be read/parsed -- the caller
+    returns it directly.
+    """
     try:
         snapshot = read_owned_regular_file_bytes(
             result_path,
@@ -427,4 +622,4 @@ def flush_terminal_console_from_path(
             reason="mcp_result_invalid",
             message="terminal JARVIS result must be a JSON object",
         )
-    return flush_terminal_console(spool, cast(dict[str, Any], document), tailer=tailer)
+    return cast(dict[str, Any], document)

@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.cli_jarvis_mcp as cli_jarvis_mcp
-import clio_relay.http_api as http_api_module
+import clio_relay.http_api_routes_session as http_api_routes_session_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
@@ -485,8 +485,11 @@ def test_owned_session_authority_endpoint_reverifies_owned_artifact_before_resol
         observed.update(kwargs)
         return authority
 
+    # split/http-api-w3 (iowarp/clio-relay#231):
+    # resolve_owned_jarvis_runtime_authority moved to
+    # http_api_routes_session.py -- the patch target follows the move.
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_session_module,
         "resolve_local_verified_jarvis_service_runtime_authority",
         resolve_local_verified,
     )
@@ -580,8 +583,11 @@ def test_private_runtime_authority_endpoint_is_unavailable_on_non_owned_api(
     def forbidden(*_args: object, **_kwargs: object) -> Any:
         raise AssertionError("ordinary API must not invoke a private authority resolver")
 
+    # split/http-api-w3 (iowarp/clio-relay#231):
+    # resolve_owned_jarvis_runtime_authority moved to
+    # http_api_routes_session.py -- the patch target follows the move.
     monkeypatch.setattr(
-        http_api_module,
+        http_api_routes_session_module,
         "resolve_local_verified_jarvis_service_runtime_authority",
         forbidden,
     )

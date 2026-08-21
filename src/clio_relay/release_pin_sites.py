@@ -303,31 +303,38 @@ PINSITES: tuple[PinSite, ...] = (
     ),
     _row(
         "jc.models_registered",
-        "src/clio_relay/models.py",
+        "src/clio_relay/models_shared.py",
         _JC,
         _LN,
         "REGISTERED_JARVIS_USER_CONTRACT",
-        line=43,
+        # #231 decomposition: models.py's own definition was extracted into
+        # models_shared.py (mechanical relocation, unchanged value) -- the
+        # old models.py:43 site no longer exists there at all.
+        line=46,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
     _row(
         "jc.models_package_route",
-        "src/clio_relay/models.py",
+        "src/clio_relay/models_jarvis_package.py",
         _JC,
         _LN,
         "JarvisPackageInputRoute.contract Literal + default",
-        line=509,
+        # #231 decomposition: JarvisPackageInputRoute moved out of models.py
+        # into its own module (mechanical relocation, unchanged value).
+        line=34,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
     _row(
         "jc.models_pipeline_route",
-        "src/clio_relay/models.py",
+        "src/clio_relay/models_jarvis_pipeline.py",
         _JC,
         _LN,
         "JarvisPipelineInputRoute.contract Literal + default",
-        line=621,
+        # #231 decomposition: JarvisPipelineInputRoute moved out of models.py
+        # into its own module (mechanical relocation, unchanged value).
+        line=42,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -340,7 +347,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` + module `logger` pushed this
         # unchanged entry from line 129 to line 132.
-        line=132,
+        # #231 decomposition: further growth above it (new constants/imports)
+        # pushed this unchanged entry from line 132 to line 249.
+        line=249,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -389,15 +398,51 @@ PINSITES: tuple[PinSite, ...] = (
     ),
     _row(
         "jc.runner_registered_contract",
-        "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py",
+        "jarvis-packages/clio_relay/clio_relay/constants.py",
         _JC,
         _LN,
         "current member of the supported JARVIS execution query contracts",
-        line=68,
+        # #231 decomposition: _QUERY_CONTRACTS was extracted out of
+        # mcp_call/runner.py (mechanical relocation, unchanged value) into
+        # the vendored package's own constants.py.
+        line=36,
         pattern=re.compile(
             r'^_QUERY_CONTRACTS = \("clio-kit-jarvis-user-v3\.6", '
             r'"clio-kit-jarvis-user-(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)"\)$'
         ),
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.constants_registered_contract",
+        "src/clio_relay/constants.py",
+        _JC,
+        _LN,
+        "current member of the supported JARVIS execution query contracts "
+        "(main-package sibling of the vendored jarvis-packages mirror)",
+        # #231 decomposition: the mcp_call/runner.py monolith split into 20
+        # owner modules that now live in BOTH src/clio_relay (the main
+        # package) AND the vendored jarvis-packages/clio_relay mirror --
+        # what was one _QUERY_CONTRACTS occurrence became two. This site
+        # newly registers the main-package copy (never registered before;
+        # jc.runner_registered_contract already covers the mirror copy).
+        line=36,
+        pattern=re.compile(
+            r'^_QUERY_CONTRACTS = \("clio-kit-jarvis-user-v3\.6", '
+            r'"clio-kit-jarvis-user-(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)"\)$'
+        ),
+        value_group="jarvis_contract_id",
+    ),
+    _row(
+        "jc.execution_watch_docstring",
+        "src/clio_relay/execution_watch.py",
+        _JC,
+        _LN,
+        "module-level comment cross-reference (cancel-refusal rationale)",
+        # #231 decomposition: execution_watch.py is a new module born from
+        # the mcp_call/runner.py split; its own comment naming the current
+        # contract was never registered.
+        line=102,
+        pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
     _row(
@@ -439,7 +484,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` pushed this unchanged tuple from
         # line 135 to line 136.
-        line=136,
+        # #231 decomposition: further test additions above it pushed this
+        # unchanged tuple from line 136 to line 144.
+        line=144,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -452,7 +499,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` pushed this unchanged reference
         # from line 1406 to line 1407.
-        line=1407,
+        # #231 decomposition: further test additions above it pushed this
+        # unchanged reference from line 1407 to line 1421.
+        line=1421,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -465,7 +514,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` pushed this unchanged argument
         # from line 1425 to line 1426.
-        line=1426,
+        # #231 decomposition: further test additions above it pushed this
+        # unchanged argument from line 1426 to line 1439.
+        line=1439,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -485,7 +536,9 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "registered-contract parametrized job spec (#231 A6; -1 from 3140, N15)",
-        line=3139,
+        # #231 decomposition wave (post-A6): further test additions above it
+        # pushed this unchanged entry from line 3139 to line 3172.
+        line=3172,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -495,7 +548,9 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "registered-contract parametrized job spec (#231 A6; -1 from 5963, N15)",
-        line=5962,
+        # #231 decomposition wave (post-A6): further test additions above it
+        # pushed this unchanged entry from line 5962 to line 6006.
+        line=6006,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -627,7 +682,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` + module `logger` pushed this
         # unchanged digest from line 106 to line 109.
-        line=109,
+        # #231 decomposition: further growth above it (new constants/imports)
+        # pushed this unchanged digest from line 109 to line 226.
+        line=226,
         pattern=_HEX,
         value_group="jarvis_contract_sha256",
     ),
@@ -672,7 +729,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` + module `logger` pushed this
         # unchanged digest from line 114 to line 117.
-        line=117,
+        # #231 decomposition: further growth above it (new constants/imports)
+        # pushed this unchanged digest from line 117 to line 234.
+        line=234,
         pattern=_HEX,
         value_group="jarvis_contract_wire_sha256",
     ),
@@ -695,7 +754,9 @@ PINSITES: tuple[PinSite, ...] = (
         # clio-relay#242 dev-mode course correction: mechanical relocation
         # only -- the new `import logging` + module `logger` pushed this
         # unchanged digest from line 122 to line 125.
-        line=125,
+        # #231 decomposition: further growth above it (new constants/imports)
+        # pushed this unchanged digest from line 125 to line 242.
+        line=242,
         pattern=_HEX,
         value_group="jarvis_contract_artifact_sha256",
     ),

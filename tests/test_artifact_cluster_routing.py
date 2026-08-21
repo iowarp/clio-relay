@@ -98,8 +98,11 @@ def _register_remote_execution_output(
             },
         }
     }
-    indexed, truncation = ingest_jarvis_execution_outputs(remote_queue, query, result_document)
+    indexed, truncation, outputs_missing = ingest_jarvis_execution_outputs(
+        remote_queue, query, result_document
+    )
     assert truncation is None
+    assert outputs_missing is None
     assert len(indexed) == 1
     return owner, indexed[0]
 

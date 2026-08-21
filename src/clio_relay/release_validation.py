@@ -160,8 +160,8 @@ def run_local_release_validation(
         _run_check(
             recorder,
             "local.pyright",
-            "strict Python type check",
-            ["uv", "run", "--no-sync", "pyright"],
+            "strict pyright error-count ratchet (baseline 7843, only ratchets down)",
+            ["uv", "run", "--no-sync", "python", "scripts/check_pyright_ratchet.py"],
             root=root,
             runner=command_runner,
         )

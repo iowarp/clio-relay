@@ -29,16 +29,16 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.7.2"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.10.3"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
+    "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
 )
-CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.7.1"
+CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.7.2"
 DEFAULT_JARVIS_MCP_COMMAND = [
     "clio-kit",
     "mcp-server",
@@ -77,7 +77,7 @@ JSON = dict[str, Any]
 # modules carried independent duplicate literals for the same clio-kit
 # contract digest until clio-relay#199 consolidated them to remote_mcp's
 # CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID as the sole source of truth.
-_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.7.1.json"
+_JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.7.2.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
     "jarvis_create_pipeline",

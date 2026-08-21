@@ -196,8 +196,15 @@ def query_result_document(
     server_artifact: dict[str, Any],
     native: dict[str, object],
     include_artifacts: bool,
+    artifacts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Build one ``jarvis_get_execution`` poll's mcp-result.json."""
+    """Build one ``jarvis_get_execution`` poll's mcp-result.json.
+
+    ``artifacts`` lets a caller declare terminal ``execution-file`` entries
+    (clio-relay#265's outputs-missing coverage); it is ignored unless
+    ``include_artifacts`` is also set, matching JARVIS's own contract (the
+    ``artifact_page`` is only ever populated when artifacts were requested).
+    """
     record = cast(dict[str, Any], native["execution_record"])
     structured: dict[str, object] = {
         "schema_version": "clio-kit.jarvis-execution.v2",
@@ -205,7 +212,9 @@ def query_result_document(
         "execution_id": record["execution_id"],
         **native,
         "artifact_page": (
-            {"artifacts": [], "terminal": record["terminal"]} if include_artifacts else None
+            {"artifacts": artifacts or [], "terminal": record["terminal"]}
+            if include_artifacts
+            else None
         ),
         "service_runtimes": None,
     }

@@ -954,23 +954,62 @@ def test_public_error_constructors_never_interpolate_a_caught_exception() -> Non
 # http_api.py wiring: the global exception handler
 # --------------------------------------------------------------------------- #
 
+# split/http-api-w3 (iowarp/clio-relay#231): http_api.py's ~1900-line
+# create_app() (every route body as a nested closure) is now a 165-line
+# facade over a shared RelayApiContext (http_api_context.py) plus the
+# bearer-token/owner-session dependency factories (http_api_auth.py) and six
+# route owner modules -- the code the three tests below count (door_errors.
+# http_problem raise sites, the middleware refusal sites) moved WITH the
+# routes, unchanged. Same call sites, same counts, different files: these
+# tests now scan across the full split module set instead of the single
+# pre-split file.
+_HTTP_API_SPLIT_MODULES = (
+    "http_api.py",
+    "http_api_auth.py",
+    "http_api_context.py",
+    "http_api_routes_session.py",
+    "http_api_routes_jobs.py",
+    "http_api_routes_events.py",
+    "http_api_routes_artifacts.py",
+    "http_api_routes_gateway.py",
+    "http_api_routes_queue.py",
+)
+
+
+def _http_api_split_sources() -> list[tuple[str, str]]:
+    root = Path(__file__).parents[1] / "src" / "clio_relay"
+    return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
+
 
 def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 107 raises plus 15 middleware refusals."""
-    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
-        encoding="utf-8"
-    )
-    tree = ast.parse(source)
-    calls = [
-        node.exc
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Raise)
-        and isinstance(node.exc, ast.Call)
-        and isinstance(node.exc.func, ast.Attribute)
-        and isinstance(node.exc.func.value, ast.Name)
-        and node.exc.func.value.id == "door_errors"
-        and node.exc.func.attr == "http_problem"
-    ]
+    """The R9 inventory is closed: 107 raises plus 15 middleware refusals.
+
+    The middleware refusal count is sourced from http_api_middleware.py
+    alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
+    unsplit unit (clio-relay#231), so its three refusal-counting functions
+    still all live in the one file the pre-split test already walked.
+    """
+    calls: list[ast.Call] = []
+    for _name, source in _http_api_split_sources():
+        tree = ast.parse(source)
+        calls.extend(
+            node.exc
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Attribute)
+            and isinstance(node.exc.func.value, ast.Name)
+            and node.exc.func.value.id == "door_errors"
+            and node.exc.func.attr == "http_problem"
+        )
+        assert not any(
+            isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id in {"HTTPException", "StarletteHTTPException"}
+            for node in ast.walk(tree)
+        )
+        assert 'json.dumps({"detail"' not in source
 
     assert len(calls) == 107
     reasons = {
@@ -982,9 +1021,14 @@ def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reaso
         call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
         for call in calls
     )
+
+    middleware_source = (
+        Path(__file__).parents[1] / "src" / "clio_relay" / "http_api_middleware.py"
+    ).read_text(encoding="utf-8")
+    middleware_tree = ast.parse(middleware_source)
     functions = {
         node.name: node
-        for node in ast.walk(tree)
+        for node in ast.walk(middleware_tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     middleware_direct = sum(
@@ -1008,14 +1052,6 @@ def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reaso
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
     assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 122
-    assert not any(
-        isinstance(node, ast.Raise)
-        and isinstance(node.exc, ast.Call)
-        and isinstance(node.exc.func, ast.Name)
-        and node.exc.func.id in {"HTTPException", "StarletteHTTPException"}
-        for node in ast.walk(tree)
-    )
-    assert 'json.dumps({"detail"' not in source
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1061,20 +1097,19 @@ def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None
     ``message=`` instead of relying on the generic reason title. The
     remaining 56 keep the closed-set discipline this test proves.
     """
-    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
-        encoding="utf-8"
-    )
-    tree = ast.parse(source)
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "http_problem"
-        and any(keyword.arg == "exc" for keyword in node.keywords)
-        and len(node.args) == 1
-        and not any(keyword.arg == "message" for keyword in node.keywords)
-    ]
+    calls: list[ast.Call] = []
+    for _name, source in _http_api_split_sources():
+        tree = ast.parse(source)
+        calls.extend(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "http_problem"
+            and any(keyword.arg == "exc" for keyword in node.keywords)
+            and len(node.args) == 1
+            and not any(keyword.arg == "message" for keyword in node.keywords)
+        )
     assert len(calls) == 56
 
     for index, call in enumerate(calls):
@@ -1088,11 +1123,9 @@ def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None
 
 
 def test_session_binding_course_corrections_are_distinct_at_the_five_sites() -> None:
-    source = (Path(__file__).parents[1] / "src" / "clio_relay" / "http_api.py").read_text(
-        encoding="utf-8"
-    )
     calls = [
         node
+        for _name, source in _http_api_split_sources()
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)

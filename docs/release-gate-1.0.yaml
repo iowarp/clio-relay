@@ -3,9 +3,9 @@
 # registry and may require them for a later release by adding policy requirements;
 # neither action requires a clio-relay code change.
 schema_version: "1.0"
-release_version: "1.6.6"
+release_version: "1.6.8"
 acceptance_matrix_path: examples/release-gate/report-matrix-1.0.json
-acceptance_matrix_sha256: affef812c611feb1e8828a61347c824271f859ed3e74a1969247f8c26037b61e
+acceptance_matrix_sha256: 4d9fab53d0502e816c409c5224a579decd1612d4abc7ba94e133672d095ea73e
 artifact_stage: published
 evidence_trust_model: maintainer_sealed_operator_evidence
 require_released_artifact: true
@@ -128,9 +128,9 @@ requirements:
                 record_schema: jarvis.execution.record.v1
                 progress_schema: jarvis.execution.progress.v1
                 operations: [jarvis_get_execution, jarvis_run]
-                contract_id: clio-kit-jarvis-user-v3.7.1
+                contract_id: clio-kit-jarvis-user-v3.7.2
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849
+                contract_sha256: 52238d942a15e48e4d92984b5c1ca939ac224dcc067452c6828c63247e1dd2e5
             jarvis-cd:
               distribution: jarvis_cd
               distribution_version: "1.8.0"
@@ -317,9 +317,9 @@ requirements:
                 operations:
                   - jarvis_get_execution
                   - jarvis_run
-                contract_id: clio-kit-jarvis-user-v3.7.1
+                contract_id: clio-kit-jarvis-user-v3.7.2
                 contract_schema_version: clio-kit.mcp-user-contract.v1
-                contract_sha256: ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849
+                contract_sha256: 52238d942a15e48e4d92984b5c1ca939ac224dcc067452c6828c63247e1dd2e5
             jarvis-cd:
               distribution: jarvis_cd
               distribution_version: "1.8.0"
@@ -1106,7 +1106,7 @@ requirements:
     evidence_group_resource_kind: gateway_session
 
   - requirement_id: ares-secure-jarvis-runtime
-    description: exercise the authenticated JARVIS v3.7.1 handoff and relay-core browser, reconnect, and preserve-by-default lifecycle on the Ares release-evidence target; UI-adapter acceptance is separate
+    description: exercise the authenticated JARVIS v3.7.2 handoff and relay-core browser, reconnect, and preserve-by-default lifecycle on the Ares release-evidence target; UI-adapter acceptance is separate
     cluster: ares
     scenarios:
       - secure-runtime

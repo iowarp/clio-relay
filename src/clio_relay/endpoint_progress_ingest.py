@@ -16,8 +16,10 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from clio_relay.console_stream import (
+    CONSOLE_STDERR_STREAM,
     CONSOLE_STREAM,
     ConsoleLiveTailer,
 )
@@ -66,9 +68,24 @@ from clio_relay.storage_runtime import (
     StorageRuntimeViolation,
 )
 
+if TYPE_CHECKING:
+    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.storage_runtime import StorageRuntime
+
 
 class ProgressIngestMixin:
-    """Mixin: ProgressIngest methods split from EndpointWorker (clio-relay#231)."""
+    """Mixin: ProgressIngest methods split from EndpointWorker (clio-relay#231).
+
+    ``queue``/``storage_runtime`` are declared ``TYPE_CHECKING``-only (never
+    assigned here) so strict pyright can resolve ``self.queue``/
+    ``self.storage_runtime`` across this mixin's own methods -- see
+    ``JarvisDispatchMixin``'s identical note in
+    ``endpoint_jarvis_dispatch.py`` for why.
+    """
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
+        storage_runtime: StorageRuntime | None
 
     def _ingest_progress_sidecar(
         self,
@@ -179,7 +196,8 @@ class ProgressIngestMixin:
         job: RelayJob,
         console_tailer: ConsoleLiveTailer | None,
     ) -> None:
-        """Advance one #259 live-tail increment; never raises into the job."""
+        """Advance one #259 live-tail increment (stdout AND stderr); never
+        raises into the job."""
         if console_tailer is None:
             return
         step = console_tailer.poll()
@@ -189,6 +207,14 @@ class ProgressIngestMixin:
                 f"console.{step.reason}",
                 step.message or "console live-tail reason",
                 payload={"stream": CONSOLE_STREAM, "reason": step.reason},
+            )
+        stderr_step = console_tailer.poll_stderr()
+        if stderr_step.reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                f"console_stderr.{stderr_step.reason}",
+                stderr_step.message or "console_stderr live-tail reason",
+                payload={"stream": CONSOLE_STDERR_STREAM, "reason": stderr_step.reason},
             )
 
     def _poll_running_job(

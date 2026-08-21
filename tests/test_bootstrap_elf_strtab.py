@@ -21,8 +21,23 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import ModuleType
 
-from clio_relay import bootstrap
+from clio_relay import bootstrap_candidate_uv_install_source, bootstrap_staged_provider_source
+
+
+def _module_source(module: ModuleType) -> str:
+    """Read one owner module's own source text.
+
+    ``ModuleType.__file__`` is typed ``str | None`` (some module kinds
+    genuinely have none) -- an explicit assertion, not a cast, since both
+    modules here are real, statically-imported source files and this is
+    the actual invariant the read below depends on.
+    """
+    file = module.__file__
+    assert file is not None, f"{module.__name__} has no __file__"
+    return Path(file).read_text(encoding="utf-8")
+
 
 # The exact layout measured on ares.
 LOAD_SEGMENTS = [
@@ -78,8 +93,21 @@ def test_segments_that_disagree_are_still_refused() -> None:
 
 
 def test_both_provider_paths_ship_the_spanning_resolution() -> None:
-    """Guard the rendered programs against a regression to whole-table containment."""
-    source = Path(bootstrap.__file__).read_text(encoding="utf-8")
+    """Guard the rendered programs against a regression to whole-table containment.
+
+    #255's renderer decomposition moved bootstrap.py's two embedded
+    rendered-program sources -- one per provider path -- out to their own
+    owner modules (bootstrap_staged_provider_source.py,
+    bootstrap_candidate_uv_install_source.py; pure data, no bootstrap.py
+    dependency). This pin follows the protected content to its current
+    owners rather than the file it used to live in; the invariant itself
+    (both provider paths ship the spanning resolution, neither regresses to
+    whole-table containment) is unchanged.
+    """
+    source = "\n".join(
+        _module_source(module)
+        for module in (bootstrap_staged_provider_source, bootstrap_candidate_uv_install_source)
+    )
     assert source.count("virtual_address <= string_address < virtual_address + file_size") == 2
     assert not re.search(r"string_address \+ string_size <= virtual_address \+ file_size", source)
     # The relaxation is paired with an explicit file bound at both sites.

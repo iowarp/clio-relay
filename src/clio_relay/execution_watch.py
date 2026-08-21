@@ -99,7 +99,7 @@ DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS = 7.0
 DEFAULT_EXECUTION_WATCH_CEILING_SECONDS = 24 * 60 * 60
 
 #: Typed reason recorded when a client asks to cancel a job mid-watch.
-#: JARVIS's registered user contract (``_contracts/jarvis-user-v3.7.1.json``)
+#: JARVIS's registered user contract (``_contracts/jarvis-user-v3.7.2.json``)
 #: exposes no cancel tool alongside ``jarvis_run``/``jarvis_get_execution``
 #: -- owner ruling (#266): relay must never issue a raw ``scancel`` against
 #: a scheduler job JARVIS submitted and owns. Refuse the cancel request
@@ -308,6 +308,33 @@ def execution_watch_error_text(failure_detail: dict[str, object]) -> str:
     return f"JARVIS execution {execution_id} ended in {state}"
 
 
+def execution_outputs_missing_error_text(outputs_missing: dict[str, object]) -> str:
+    """Render one bounded, human-readable error from #265's outputs-missing detail.
+
+    ``outputs_missing`` is
+    :func:`~clio_relay.jarvis_execution_artifacts.ingest_jarvis_execution_outputs`'s
+    typed ``clio-relay.execution-outputs-missing.v1`` payload -- the owner
+    ruling made concrete: an execution JARVIS itself reported terminal, but
+    whose declared outputs are missing or empty, is a FAILED job with this
+    reason, never a decorated "completed".
+    """
+    execution_id = outputs_missing.get("execution_id")
+    raw_missing = outputs_missing.get("missing")
+    entries: list[dict[str, object]] = []
+    if isinstance(raw_missing, list):
+        for raw_entry in cast(list[object], raw_missing):
+            if isinstance(raw_entry, dict):
+                entries.append(cast(dict[str, object], raw_entry))
+    count = len(entries)
+    noun = "output" if count == 1 else "outputs"
+    names = ", ".join(str(entry.get("relative_path")) for entry in entries)
+    detail = f": {names}" if names else ""
+    return (
+        f"JARVIS execution {execution_id} completed but {count} declared {noun} were "
+        f"missing or empty{detail}"
+    )
+
+
 def execution_phase_status_message(
     job_state: str,
     execution_phase: object,
@@ -364,11 +391,16 @@ def deferred_jarvis_execution_from_document(
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutcome:
-    """The three ``_run_job_impl`` terminal-mapping decisions #266 touches."""
+    """The ``_run_job_impl`` terminal-mapping decisions #266/#265 touch."""
 
     effective_returncode: int
     cancellation_honored: bool
     watch_failure: dict[str, object] | None
+    #: clio-relay#265: the typed ``outputs_missing`` verdict from
+    #: ``jarvis_execution_artifacts.ingest_jarvis_execution_outputs`` for
+    #: this job's terminal ``mcp_result``, or ``None`` when nothing was
+    #: declared or every declared output is present and non-empty.
+    outputs_missing: dict[str, object] | None = None
 
 
 def resolve_execution_outcome(
@@ -378,6 +410,7 @@ def resolve_execution_outcome(
     dispatch_refusal_present: bool,
     transport_returncode: int,
     cancellation_requested: bool,
+    outputs_missing: dict[str, object] | None = None,
 ) -> ExecutionOutcome:
     """Fold a resolved watch into ``_run_job_impl``'s existing outcome logic.
 
@@ -387,6 +420,14 @@ def resolve_execution_outcome(
     Reporting the job canceled anyway would contradict that typed refusal
     and hide the real outcome, so a resolved watch always wins over a
     pending cancellation request for terminal-state purposes.
+
+    ``outputs_missing`` is clio-relay#265's owner ruling made concrete:
+    "producing the declared outputs is PART of what completed means" -- a
+    terminal execution whose declared outputs are missing or empty is
+    FAILED regardless of what the scheduler/JARVIS/dispatch path otherwise
+    reported (including an already-recovered dispatch), and a resolved
+    outputs-missing verdict wins over a pending cancellation for the same
+    reason a resolved watch already does: the real outcome was observed.
     """
     if dispatch_recovered:
         effective_returncode = 0
@@ -396,10 +437,15 @@ def resolve_execution_outcome(
         effective_returncode = 1
     else:
         effective_returncode = transport_returncode
+    cancellation_honored = watch_resolution is None and cancellation_requested
+    if outputs_missing is not None:
+        effective_returncode = 1
+        cancellation_honored = False
     return ExecutionOutcome(
         effective_returncode=effective_returncode,
-        cancellation_honored=watch_resolution is None and cancellation_requested,
+        cancellation_honored=cancellation_honored,
         watch_failure=(watch_resolution.failure_detail if watch_resolution is not None else None),
+        outputs_missing=outputs_missing,
     )
 
 
@@ -408,7 +454,9 @@ def _tail_console(
     job: RelayJob,
     console_tailer: ConsoleLiveTailer | None,
 ) -> None:
-    """Advance one #259 console-tail increment; mirrors ``endpoint.py``'s own helper."""
+    """Advance one #259 console-tail increment (stdout AND stderr); mirrors
+    ``endpoint_progress_ingest.py``'s own ``_tail_console_stream`` helper.
+    """
     if console_tailer is None:
         return
     step = console_tailer.poll()
@@ -418,6 +466,14 @@ def _tail_console(
             f"console.{step.reason}",
             step.message or "console live-tail reason",
             payload={"stream": "console", "reason": step.reason},
+        )
+    stderr_step = console_tailer.poll_stderr()
+    if stderr_step.reason is not None:
+        queue.append_event(
+            job.job_id,
+            f"console_stderr.{stderr_step.reason}",
+            stderr_step.message or "console_stderr live-tail reason",
+            payload={"stream": "console_stderr", "reason": stderr_step.reason},
         )
 
 

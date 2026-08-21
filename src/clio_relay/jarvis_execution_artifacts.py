@@ -1,4 +1,23 @@
-"""Register terminal JARVIS execution outputs as bounded relay references."""
+"""Register terminal JARVIS execution outputs as bounded relay references.
+
+Also the single owner of clio-relay#265's "declared outputs" verdict. Owner
+ruling (#265, superseding an earlier ``completed_outputs_missing`` side-channel
+proposal): producing the declared outputs is PART of what "completed" means --
+a jarvis_run whose execution finished but whose declared outputs are missing
+or empty reaches terminal state FAILED with typed reason ``outputs_missing``,
+never a decorated "completed". "Declared outputs" concretely means the
+``execution-file``-kind entries in the terminal ``jarvis_get_execution``
+poll's own ``structured_result.artifact_page.artifacts`` -- the SAME
+declarations :func:`ingest_jarvis_execution_outputs` already parses to index
+artifacts (#252). A ``jarvis_run`` dispatch that completes synchronously
+(never deferred through clio-relay#266's watch) never carries
+``artifact_page`` at all -- it is absent from ``jarvis_run``'s own
+``outputSchema`` entirely (only ``jarvis_get_execution`` declares it) -- so
+that path's absent declaration keeps its current semantics unchanged, per
+the owner's explicit instruction never to invent a heuristic about which
+files "should" exist. Zero declared ``execution-file`` entries is likewise
+untouched (the pre-existing #252 fast return).
+"""
 
 from __future__ import annotations
 
@@ -9,6 +28,7 @@ from typing import Any, cast
 
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
+from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob
 from clio_relay.spool import (
     OwnedFileSizeLimitError,
@@ -18,6 +38,10 @@ from clio_relay.spool import (
 
 EXECUTION_OUTPUT_OWNERSHIP_SCHEMA = "clio-relay.execution-output.v1"
 EXECUTION_OUTPUT_TRUNCATION_SCHEMA = "jarvis.execution-output-truncation.v1"
+#: clio-relay#265: the typed terminal-failure reason/payload schema for one
+#: or more declared execution outputs that turned out missing (absent on
+#: disk) or empty (declared ``size_bytes == 0``) at terminal.
+EXECUTION_OUTPUTS_MISSING_SCHEMA = "clio-relay.execution-outputs-missing.v1"
 MAX_RELAY_EXECUTION_OUTPUTS = 128
 MAX_EXECUTION_RESULT_BYTES = 16 * 1_048_576
 _OUTPUT_ROLES = frozenset({"log", "output", "frame"})
@@ -27,26 +51,37 @@ def ingest_jarvis_execution_outputs(
     queue: ClioCoreQueue,
     query_job: RelayJob,
     result_document: dict[str, Any],
-) -> tuple[list[ArtifactRef], dict[str, object] | None]:
+) -> tuple[list[ArtifactRef], dict[str, object] | None, dict[str, object] | None]:
     """Index declared terminal outputs without copying their bytes.
 
     The query job supplies the authenticated execution result. The artifact is
     owned by the original ``jarvis_run`` job, while its backing path remains in
     the execution directory and is read later through relay's bounded route.
+
+    Returns ``(indexed, truncation, outputs_missing)``. ``outputs_missing`` is
+    clio-relay#265's typed terminal-failure payload
+    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA`) whenever at least one declared
+    ``execution-file`` output is absent on disk or declared empty
+    (``size_bytes == 0``) -- ``None`` when nothing was declared (the pre-
+    existing early returns below) or every declared output is present and
+    non-empty. A missing declared file is recorded typed here rather than
+    left to crash out of ``snapshot_owned_regular_file`` uncaught: this is a
+    real, expected outcome (#265's negative path), not a filesystem-identity
+    violation.
     """
     raw_structured = result_document.get("structured_result")
     if not isinstance(raw_structured, dict):
-        return [], None
+        return [], None, None
     structured = cast(dict[str, Any], raw_structured)
     record = structured.get("execution_record")
     page = structured.get("artifact_page")
     execution_id = structured.get("execution_id")
     if not isinstance(record, dict) or not isinstance(page, dict):
-        return [], None
+        return [], None, None
     record = cast(dict[str, Any], record)
     page = cast(dict[str, Any], page)
     if record.get("terminal") is not True or page.get("terminal") is not True:
-        return [], None
+        return [], None, None
     if not isinstance(execution_id, str) or not execution_id:
         raise RelayError("terminal JARVIS result omitted execution_id")
     raw_events = page.get("artifacts")
@@ -60,6 +95,7 @@ def ingest_jarvis_execution_outputs(
     indexed: list[ArtifactRef] = []
     truncation: dict[str, object] | None = None
     output_count = 0
+    missing_outputs: list[dict[str, object]] = []
     for raw_event in cast(list[object], raw_events):
         if not isinstance(raw_event, dict):
             raise RelayError("JARVIS artifact declaration must be an object")
@@ -91,6 +127,49 @@ def ingest_jarvis_execution_outputs(
             raise RelayError(f"invalid JARVIS execution-output size: {relative}")
         digest = _sha256_from_checksum(checksum)
         path = _safe_execution_path(execution_root, relative)
+        # #265: a declared output whose backing file is genuinely absent is
+        # an expected negative-path outcome, not a filesystem-identity
+        # violation -- gate on reality (a plain existence check) rather than
+        # let it crash out of the owned-file open below uncaught.
+        if not internal_filesystem_path(path).exists():
+            missing_outputs.append(
+                {
+                    "relative_path": relative,
+                    "role": role,
+                    "reason": "absent",
+                    "declared_size_bytes": size,
+                }
+            )
+            queue.append_event(
+                owner.job_id,
+                "jarvis.execution_output_missing",
+                f"Declared JARVIS execution output is missing on disk: {relative}",
+                payload={
+                    "execution_id": execution_id,
+                    "relative_path": relative,
+                    "role": role,
+                },
+            )
+            continue
+        if size == 0:
+            missing_outputs.append(
+                {
+                    "relative_path": relative,
+                    "role": role,
+                    "reason": "empty",
+                    "declared_size_bytes": 0,
+                }
+            )
+            queue.append_event(
+                owner.job_id,
+                "jarvis.execution_output_empty",
+                f"Declared JARVIS execution output is empty: {relative}",
+                payload={
+                    "execution_id": execution_id,
+                    "relative_path": relative,
+                    "role": role,
+                },
+            )
         snapshot = snapshot_owned_regular_file(path, owned_root=execution_root)
         if snapshot.size_bytes != size or snapshot.sha256 != digest:
             raise RelayError(f"JARVIS execution-output declaration changed: {relative}")
@@ -128,7 +207,21 @@ def ingest_jarvis_execution_outputs(
             "JARVIS execution outputs indexed as relay artifacts",
             payload={"execution_id": execution_id, "count": len(indexed)},
         )
-    return indexed, truncation
+    outputs_missing: dict[str, object] | None = None
+    if missing_outputs:
+        outputs_missing = {
+            "schema_version": EXECUTION_OUTPUTS_MISSING_SCHEMA,
+            "execution_id": execution_id,
+            "declared_count": output_count,
+            "missing": missing_outputs,
+        }
+        queue.append_event(
+            owner.job_id,
+            "jarvis.execution_outputs_missing",
+            "JARVIS execution completed but declared outputs are missing or empty",
+            payload=outputs_missing,
+        )
+    return indexed, truncation, outputs_missing
 
 
 def ingest_jarvis_execution_outputs_from_path(
@@ -136,7 +229,7 @@ def ingest_jarvis_execution_outputs_from_path(
     query_job: RelayJob,
     result_path: Path,
     owned_root: Path,
-) -> tuple[list[ArtifactRef], dict[str, object] | None]:
+) -> tuple[list[ArtifactRef], dict[str, object] | None, dict[str, object] | None]:
     """Read one bounded terminal result and ingest its declared outputs."""
     try:
         snapshot = read_owned_regular_file_bytes(

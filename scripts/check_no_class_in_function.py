@@ -45,7 +45,14 @@ from typing import NamedTuple
 # entry once the file reaches zero) in the same change. Paths are relative
 # to the repository root, forward slashes.
 RATCHET_BASELINE: dict[str, int] = {
-    "jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py": 2,
+    # runner.py split iowarp/clio-relay#231/#775 decomposition wave 3: the
+    # facade has zero class-in-function violations; the 2 nested
+    # ctypes.Structure classes (Windows snapshot-cleanup-handle structs,
+    # _ByHandleFileInformation and _FileDispositionInformation) moved
+    # verbatim into wheel_snapshot_identity.py, mirrored here byte-identical
+    # to src/clio_relay.
+    "jarvis-packages/clio_relay/clio_relay/wheel_snapshot_identity.py": 2,
+    "src/clio_relay/wheel_snapshot_identity.py": 2,
     # process_containment.py split iowarp/clio-relay#231: the facade has zero
     # class-in-function violations; the 4 nested ctypes.Structure classes
     # (Windows Job Object accounting/limit structs) moved verbatim into
@@ -53,7 +60,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # src/clio_relay.
     "jarvis-packages/clio_relay/clio_relay/process_containment_windows.py": 4,
     "src/clio_relay/process_containment_windows.py": 4,
-    "src/clio_relay/validation_report.py": 1,
+    # validation_report.py's entry dropped (ratchet-down): its nested class was
+    # extracted by the #231 decomposition and the guard's own advisory demanded
+    # the removal in the same change.
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

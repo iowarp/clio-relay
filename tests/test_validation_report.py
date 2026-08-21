@@ -185,9 +185,7 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(
     parent = tmp_path / "reports"
     parent.mkdir(mode=0o700)
     displaced = tmp_path / "displaced-reports"
-    writer_lock = validation_report_module._acquire_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        parent
-    )
+    writer_lock = validation_writer_lock_module.acquire_validation_writer_lock(parent)
     try:
         parent.rename(displaced)
         if create_replacement:
@@ -199,9 +197,7 @@ def test_posix_validation_writer_rejects_parent_swap_after_lock(
                 writer_lock=writer_lock,
             )
     finally:
-        validation_report_module._release_validation_writer_lock(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            writer_lock
-        )
+        validation_writer_lock_module.release_validation_writer_lock(writer_lock)
 
     assert parent.exists() is create_replacement
     if create_replacement:
@@ -2663,7 +2659,7 @@ def test_default_report_path_sanitizes_cluster_name(tmp_path: Path) -> None:
 def test_repository_release_policy_is_machine_readable() -> None:
     policy = load_release_gate_policy(Path("docs/release-gate-1.0.yaml"))
 
-    assert policy.release_version == "1.6.6"
+    assert policy.release_version == "1.6.8"
     assert policy.acceptance_matrix is not None
     assert policy.acceptance_matrix["report_count_per_stage"] == 19
     assert policy.acceptance_matrix["matrix_sha256"] == policy.acceptance_matrix_sha256
