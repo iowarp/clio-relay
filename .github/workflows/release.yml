@@ -3,9 +3,20 @@ name: validate release tag asynchronously
 on:
   push:
     tags: ["v*"]
+  # Re-publication path: the tag-push run polls for the GitHub Release before
+  # a maintainer has published it, so it can legitimately fail first; a
+  # dispatch with the tag re-runs validation+publication against the exact
+  # published assets (learned cutting v1.6.8, where the rerun also hit a
+  # bare-python import break fixed below).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to validate and publish (e.g. v1.6.8)"
+        required: true
+        type: string
 
 concurrency:
-  group: clio-relay-release-${{ github.ref_name }}
+  group: clio-relay-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -86,7 +97,11 @@ jobs:
   publish-pypi:
     name: publish exact GitHub Release distributions to PyPI
     needs: bind
-    if: github.event_name == 'push' && github.repository == 'iowarp/clio-relay'
+    # needs.bind is skipped (not failed) on dispatch, so `!failure()` lets the
+    # dispatch path publish while a push still requires bind to succeed.
+    if: >-
+      !failure() && !cancelled() && github.repository == 'iowarp/clio-relay'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
@@ -100,20 +115,27 @@ jobs:
       - name: check out the exact release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.tag || github.sha }}
           fetch-depth: 1
           persist-credentials: false
+      - name: install uv for wheel-backed validation
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
       - name: verify the published release identity and download exact assets
         id: identity
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ github.sha }}
-          TAG_NAME: ${{ github.ref_name }}
+          # Empty on dispatch: the checkout above pinned the tag ref, so HEAD
+          # IS the tag's commit and the script derives it from git directly.
+          SOURCE_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          if [ -z "${SOURCE_COMMIT:-}" ]; then
+            SOURCE_COMMIT="$(git rev-parse HEAD)"
+          fi
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 
           for attempt in $(seq 1 20); do
@@ -184,7 +206,12 @@ jobs:
             sha256sum --check --strict SHA256SUMS
           )
           rm dist/SHA256SUMS
-          python src/clio_relay/ci_validation.py distribution-archives \
+          # ci_validation imports the clio_relay package (post-#231 owner-module
+          # split), so bare system python cannot run it. Installing the JUST-
+          # DOWNLOADED wheel to satisfy the import doubles as an install check
+          # of the exact artifact being published (v1.6.8 publish-break fix).
+          uv run --python 3.12 --no-project --with "dist/$wheel" \
+            python src/clio_relay/ci_validation.py distribution-archives \
             --wheel "dist/$wheel" \
             --sdist "dist/$sdist" \
             --project clio-relay \
