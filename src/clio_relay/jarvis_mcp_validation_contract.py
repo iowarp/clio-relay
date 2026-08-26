@@ -31,6 +31,7 @@ from clio_relay.jarvis_mcp import (
 )
 from clio_relay.jarvis_mcp_validation_core import JSON, _is_string_list, _mapping
 from clio_relay.remote_mcp import RemoteMcpToolSchema, remote_mcp_schema_digest
+from clio_relay.remote_mcp_tool_schema import resolve_remote_tool_title
 
 
 def _remote_jarvis_contract(document: JSON | None) -> tuple[JSON, bool]:
@@ -305,6 +306,18 @@ def _schema_option(schema: JSON | None, *, expected_type: str) -> JSON | None:
 
 
 def _remote_contract_tool(tool: JSON) -> RemoteMcpToolSchema:
+    """Parse one live JARVIS ``tools/list`` entry for the contract digest check.
+
+    clio-relay#164: title resolution goes through the shared
+    :func:`resolve_remote_tool_title` helper, the same one
+    ``remote_mcp_tool_schema._parse_remote_tool`` uses for the discovery ->
+    schema-cache -> catalog path. Both are compared against the same pinned
+    ``CLIO_KIT_JARVIS_USER_CONTRACT_SHA256`` digest for the same live
+    server (see ``_remote_jarvis_contract`` below and
+    ``remote_mcp_contract_checks._jarvis_user_contract_check``); an
+    un-shared title resolution would make the two paths silently disagree
+    about that server's schema digest.
+    """
     name = tool.get("name")
     input_schema = _mapping(tool.get("inputSchema"))
     if not isinstance(name, str) or input_schema is None:
@@ -315,7 +328,7 @@ def _remote_contract_tool(tool: JSON) -> RemoteMcpToolSchema:
     annotations = _optional_contract_mapping(tool, "annotations")
     return RemoteMcpToolSchema(
         name=name,
-        title=title,
+        title=resolve_remote_tool_title(title, annotations),
         description=description,
         input_schema=input_schema,
         output_schema=output_schema,

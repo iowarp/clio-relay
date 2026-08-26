@@ -1748,6 +1748,106 @@ def test_catalog_shares_one_alias_across_clusters_with_identical_contracts() -> 
     assert "durable relay job" in virtual.definition()["description"]
 
 
+def test_catalog_forwards_upstream_tool_title_end_to_end(tmp_path: Path) -> None:
+    """clio-relay#164: a discovered title rides discovery -> cache -> projection."""
+    registration = _registration(profiles=["user"])
+    entry = _persist_discovery_entry(
+        tmp_path,
+        registration,
+        cluster="alpha",
+        server_name="science",
+        tools=[_tool("inspect", required=["path"])],
+    )
+    assert entry.tools[0].title == "Inspect science data"
+
+    registry = ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})})
+    catalog = build_virtual_remote_mcp_catalog(
+        registry,
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    virtual = catalog.tools["remote_science_inspect"]
+    assert virtual.definition()["title"] == "Inspect science data"
+
+
+def test_catalog_projects_no_title_field_when_upstream_declared_none() -> None:
+    """No synthesis: an untitled upstream tool must not fabricate a title."""
+    registration = _registration(profiles=["user"])
+    tool = _tool("inspect", required=["path"])
+    del tool["title"]
+    entry = _entry(registration, cluster="alpha", server_name="science", tools=[tool])
+    registry = ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})})
+
+    catalog = build_virtual_remote_mcp_catalog(
+        registry,
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    definition = catalog.tools["remote_science_inspect"].definition()
+    assert "title" not in definition
+
+
+def test_catalog_forwards_2025_03_26_annotations_title_fallback() -> None:
+    """A server that only declared annotations.title still projects a title."""
+    registration = _registration(profiles=["user"])
+    tool = _tool("inspect", required=["path"])
+    del tool["title"]
+    annotations = cast(dict[str, object], tool["annotations"])
+    tool["annotations"] = {**annotations, "title": "Inspect science data"}
+    entry = _entry(registration, cluster="alpha", server_name="science", tools=[tool])
+    registry = ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})})
+
+    catalog = build_virtual_remote_mcp_catalog(
+        registry,
+        RemoteMcpSchemaCache(entries=[entry]),
+        profile="user",
+        now=NOW,
+    )
+
+    definition = catalog.tools["remote_science_inspect"].definition()
+    assert definition["title"] == "Inspect science data"
+
+
+def test_old_cache_entry_without_title_field_loads_and_projects_untitled(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#164 cache compat: title is additive, an older cache file still loads.
+
+    ``title`` was already an optional ``RemoteMcpToolSchema`` field before this
+    change (default ``None``), so a cache entry persisted by an older relay --
+    whose serialized tool objects never carried a ``"title"`` key at all --
+    still validates and loads: Pydantic supplies the field's default for the
+    missing key. No cache version bump is needed for this change; a discovery
+    refresh (the normal TTL-driven expiry/refresh path) simply starts
+    populating ``title`` once it runs again.
+    """
+    registration = _registration(profiles=["user"])
+    tool = _tool("inspect", required=["path"])
+    del tool["title"]
+    entry = _entry(registration, cluster="alpha", server_name="science", tools=[tool])
+    assert entry.tools[0].title is None
+    raw = json.loads(RemoteMcpSchemaCache(entries=[entry]).model_dump_json())
+    # Simulate a genuinely pre-#164 on-disk cache file: the tool object never
+    # had a "title" key serialized at all, not merely a null value.
+    assert "title" in raw["entries"][0]["tools"][0]
+    del raw["entries"][0]["tools"][0]["title"]
+    cache_path = tmp_path / "remote-mcp-cache.json"
+    cache_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = RemoteMcpSchemaCache.load(cache_path)
+
+    loaded_tool = loaded.entries[0].tools[0]
+    assert loaded_tool.title is None
+
+    registry = ClusterRegistry(clusters={"alpha": _cluster("alpha", {"science": registration})})
+    catalog = build_virtual_remote_mcp_catalog(registry, loaded, profile="user", now=NOW)
+    assert "title" not in catalog.tools["remote_science_inspect"].definition()
+
+
 def test_catalog_namespace_unifies_differently_named_cross_cluster_routes() -> None:
     primary = _registration(namespace="Science", profiles=["user"])
     secondary = _registration(namespace="science", profiles=["user"])

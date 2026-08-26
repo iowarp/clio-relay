@@ -22,6 +22,18 @@ and ``_stable_digest`` -- are private helpers with no callers outside
 their own independent, non-imported same-named helpers, the same
 no-shared-import discipline as ``process_containment.py``), so
 ``remote_mcp.py`` imports them directly rather than re-exporting them.
+
+:func:`resolve_remote_tool_title` is the one exception to that no-shared-
+import discipline (iowarp/clio-relay#164 repair round): it has a genuine
+second caller outside this cluster, ``jarvis_mcp_validation_contract.py``'s
+``_remote_contract_tool``, which parses the same untrusted ``tools/list``
+shape into a :class:`RemoteMcpToolSchema` for the JARVIS remote-contract
+check. Both that path and :func:`_parse_remote_tool` below feed
+``remote_mcp_schema_digest`` compared against the same pinned contract sha
+for the same live server, so they must resolve title identically or they
+silently disagree about that server's schema digest. Kept unprefixed and
+imported directly (not re-exported through ``remote_mcp.py``) since it is
+still a narrow, two-caller helper, not a broad public API.
 """
 
 from __future__ import annotations
@@ -142,6 +154,43 @@ class RemoteMcpDiscoveryProvenance(BaseModel):
         return self
 
 
+def resolve_remote_tool_title(title: str | None, annotations: JSON | None) -> str | None:
+    """Resolve a discovered tool's display title across both MCP title eras.
+
+    ``Tool.title`` (MCP 2025-06-18) wins when present. A server that has not
+    adopted the newer field but still declared the pre-2025-06-18
+    ``annotations.title`` (MCP 2025-03-26) has it read verbatim -- provided
+    it is a non-blank string -- rather than dropped. No title anywhere
+    resolves to ``None``; this never synthesizes a title from the tool name.
+
+    Shared by every tools/list ingestion path that builds a
+    :class:`RemoteMcpToolSchema` (clio-relay#164): :func:`_parse_remote_tool`
+    below (live discovery -> schema cache -> catalog projection) and
+    ``jarvis_mcp_validation_contract._remote_contract_tool`` (the JARVIS
+    remote-contract digest check). Both are compared against the same
+    pinned contract sha for the same live server, so an un-shared
+    resolution would let the two paths silently disagree about that
+    server's schema.
+
+    Note the ``.strip()`` check here only governs whether
+    ``RemoteMcpToolSchema.title`` itself gets set -- it does not reach the
+    wire. FastMCP's own ``Tool.to_mcp_tool()`` independently falls back
+    title -> ``annotations.title`` when serializing a listed tool, and that
+    fallback does not strip, so a whitespace-only ``annotations.title`` can
+    still surface as a tool's wire-visible title even when this function
+    resolves ``None`` (clio-relay#164 repair round, defect 4). Annotations
+    are always forwarded byte-for-byte regardless of what this function
+    returns -- fixing that upstream FastMCP behavior is out of scope here.
+    """
+    if title is not None:
+        return title
+    if isinstance(annotations, dict):
+        annotations_title = annotations.get("title")
+        if isinstance(annotations_title, str) and annotations_title.strip():
+            return annotations_title
+    return None
+
+
 def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:
     if not isinstance(value, dict):
         raise ValueError("remote MCP tools/list entries must be objects")
@@ -164,9 +213,10 @@ def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:
         raise ValueError(f"remote MCP tool {name} outputSchema must be an object")
     if annotations is not None and not isinstance(annotations, dict):
         raise ValueError(f"remote MCP tool {name} annotations must be an object")
+    resolved_title = resolve_remote_tool_title(title, cast(JSON | None, annotations))
     return RemoteMcpToolSchema(
         name=name,
-        title=title,
+        title=resolved_title,
         description=description,
         input_schema=cast(JSON, input_schema),
         output_schema=cast(JSON | None, output_schema),
