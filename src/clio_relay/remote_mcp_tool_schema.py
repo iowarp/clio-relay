@@ -164,9 +164,22 @@ def _parse_remote_tool(value: object) -> RemoteMcpToolSchema:
         raise ValueError(f"remote MCP tool {name} outputSchema must be an object")
     if annotations is not None and not isinstance(annotations, dict):
         raise ValueError(f"remote MCP tool {name} annotations must be an object")
+    resolved_title = title
+    if resolved_title is None and isinstance(annotations, dict):
+        # clio-relay#164: MCP 2025-03-26 carried the display title only in
+        # annotations.title; 2025-06-18 promoted it to the top-level
+        # Tool.title field. A server that has not adopted the newer field
+        # still declared a real title, so resolve it from the older location
+        # rather than dropping it. `annotations` itself is forwarded
+        # byte-for-byte below, unmodified -- this only resolves which
+        # already-declared value becomes the schema's own `title`, it never
+        # synthesizes one from the tool name.
+        annotations_title = cast(JSON, annotations).get("title")
+        if isinstance(annotations_title, str) and annotations_title.strip():
+            resolved_title = annotations_title
     return RemoteMcpToolSchema(
         name=name,
-        title=title,
+        title=resolved_title,
         description=description,
         input_schema=cast(JSON, input_schema),
         output_schema=cast(JSON | None, output_schema),

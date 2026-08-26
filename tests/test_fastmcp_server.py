@@ -299,6 +299,68 @@ def test_fastmcp_provider_exposes_dynamic_catalog_revision(
     asyncio.run(scenario())
 
 
+def test_fastmcp_tools_list_forwards_remote_tool_titles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#164: title flows through the real task-capable tools/list wire.
+
+    ``remote_*`` virtual tools are task-capable (not in ``static_mcp_tool_names``),
+    so this exercises the exact SEP-2663 tasks-door tools/list projection the
+    issue asks for, through the production ``create_fastmcp_server`` wiring and
+    an in-memory ``Client`` -- not just the ``.definition()`` dict.
+    """
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    definitions, catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    dynamic_definitions: JSON = {
+        "remote_demo_explicit_title": {
+            "name": "remote_demo_explicit_title",
+            "description": "Declares Tool.title directly.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "title": "Explicit Title",
+        },
+        "remote_demo_annotations_title": {
+            "name": "remote_demo_annotations_title",
+            "description": "Only declares annotations.title (MCP 2025-03-26).",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"title": "Annotated Title", "readOnlyHint": True},
+        },
+        "remote_demo_no_title": {
+            "name": "remote_demo_no_title",
+            "description": "Declares no title anywhere.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    }
+
+    def dynamic_catalog(*, profile: str) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+        assert profile == "user"
+        return (
+            [*definitions, *dynamic_definitions.values()],
+            VirtualRemoteMcpCatalog(revision="c" * 64, tools={}, issues=catalog.issues),
+        )
+
+    monkeypatch.setattr(
+        fastmcp_server_module,
+        "mcp_tool_definitions_and_remote_catalog",
+        dynamic_catalog,
+    )
+
+    async def scenario() -> None:
+        server = create_fastmcp_server(settings=settings, queue=queue)
+        async with Client(server, mode="auto") as client:
+            tools = await client.list_tools()
+        by_name = {tool.name: tool for tool in tools}
+        assert by_name["remote_demo_explicit_title"].title == "Explicit Title"
+        assert by_name["remote_demo_annotations_title"].title == "Annotated Title"
+        assert by_name["remote_demo_no_title"].title is None
+
+    asyncio.run(scenario())
+
+
 def test_fastmcp_factory_tasks_virtual_jarvis_tool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

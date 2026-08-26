@@ -19,6 +19,8 @@ Two concerns:
 
 from __future__ import annotations
 
+from typing import Any
+
 import clio_relay.remote_mcp as remote_mcp
 import clio_relay.remote_mcp_tool_schema as remote_mcp_tool_schema
 from clio_relay.remote_mcp_tool_schema import (
@@ -26,10 +28,13 @@ from clio_relay.remote_mcp_tool_schema import (
     RemoteMcpToolSchema,
     _immutable_remote_mcp_install_verified,
     _is_sha256,
+    _parse_remote_tool,  # pyright: ignore[reportPrivateUsage]
     _server_artifact_verified,
     _stable_digest,
     is_remote_mcp_control_query,
 )
+
+_INPUT_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 
 def test_remote_mcp_reexports_are_identical_objects() -> None:
@@ -104,3 +109,84 @@ def test_stable_digest_is_order_independent_and_deterministic() -> None:
     assert first == second
     assert first == remote_mcp_tool_schema._stable_digest({"a": 1, "b": 2})  # noqa: SLF001
     assert first != _stable_digest({"a": 1, "b": 3})
+
+
+# clio-relay#164: upstream tool titles must ride the discovery parser -- the
+# projection later just forwards whatever RemoteMcpToolSchema.title resolves
+# to, so the fallback precedence (Tool.title, then annotations.title, then
+# absent) belongs here, at the one place raw tools/list JSON becomes typed.
+
+
+def test_parse_remote_tool_forwards_top_level_title_verbatim() -> None:
+    parsed = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "title": "Inspect Science Data",
+            "inputSchema": _INPUT_SCHEMA,
+        }
+    )
+    assert parsed.title == "Inspect Science Data"
+
+
+def test_parse_remote_tool_top_level_title_takes_precedence_over_annotations() -> None:
+    """MCP 2025-06-18's Tool.title wins when a server declares both."""
+    parsed = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "title": "Inspect Science Data",
+            "inputSchema": _INPUT_SCHEMA,
+            "annotations": {"title": "Stale Annotation Title", "readOnlyHint": True},
+        }
+    )
+    assert parsed.title == "Inspect Science Data"
+    # The raw annotations object is preserved byte-for-byte, not rewritten.
+    assert parsed.annotations == {"title": "Stale Annotation Title", "readOnlyHint": True}
+
+
+def test_parse_remote_tool_falls_back_to_annotations_title_when_absent() -> None:
+    """A pre-2025-06-18 server only declared the title in annotations.title."""
+    parsed = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "inputSchema": _INPUT_SCHEMA,
+            "annotations": {"title": "Inspect Science Data", "readOnlyHint": True},
+        }
+    )
+    assert parsed.title == "Inspect Science Data"
+    assert parsed.annotations == {"title": "Inspect Science Data", "readOnlyHint": True}
+
+
+def test_parse_remote_tool_with_no_title_anywhere_stays_none_not_fabricated() -> None:
+    """No synthesis: an upstream tool with no declared title projects none at all."""
+    parsed = _parse_remote_tool({"name": "inspect", "inputSchema": _INPUT_SCHEMA})
+    assert parsed.title is None
+
+    with_annotations = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "inputSchema": _INPUT_SCHEMA,
+            "annotations": {"readOnlyHint": True},
+        }
+    )
+    assert with_annotations.title is None
+
+
+def test_parse_remote_tool_ignores_malformed_annotations_title() -> None:
+    """A non-string or blank annotations.title is advisory server noise, not a title."""
+    blank = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "inputSchema": _INPUT_SCHEMA,
+            "annotations": {"title": "   "},
+        }
+    )
+    assert blank.title is None
+
+    wrong_type = _parse_remote_tool(
+        {
+            "name": "inspect",
+            "inputSchema": _INPUT_SCHEMA,
+            "annotations": {"title": 42},
+        }
+    )
+    assert wrong_type.title is None
