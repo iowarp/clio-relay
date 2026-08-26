@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from clio_relay.command_evidence import command_evidence
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import (
-    WINDOWS_LEGACY_PATH_HEADROOM,
     internal_filesystem_path,
     logical_filesystem_path,
     logical_filesystem_text,
 )
 from clio_relay.identifiers import DurableRecordId
+from clio_relay.release_check_runtime import CommandRunner as ReleaseCommandRunner
+from clio_relay.release_check_runtime import (
+    active_check,
+    default_command_runner,
+)
+from clio_relay.release_command_stream import format_seconds
 from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
@@ -76,18 +79,14 @@ _PYTEST_RELEASE_GATE_ARGUMENTS = (
     "clio_relay.pytest_release_gate",
 )
 
+#: Default per-check deadline / pytest-timeout per-test bound, seconds (clio-relay#275).
+DEFAULT_CHECK_TIMEOUT_SECONDS = 3600.0
+DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS = 300.0
 
-class ReleaseCommandRunner(Protocol):
-    """Injectable command runner for local release checks."""
-
-    def __call__(
-        self,
-        command: list[str],
-        *,
-        cwd: Path,
-    ) -> subprocess.CompletedProcess[str]:
-        """Run one command in the release checkout."""
-        ...
+#: Fixed check id shared by every reference to the sdist smoke check --
+#: recorder.check(), the live-echo prefix, and the evidence failure message
+#: (clio-relay#275 review D11: one source instead of three hardcoded copies).
+_SDIST_SMOKE_CHECK_ID = "local.sdist-smoke"
 
 
 @dataclass(frozen=True)
@@ -100,6 +99,27 @@ class LocalReleaseValidationOptions:
     artifact_dir: Path | None = None
     prebuilt_artifact_dir: Path | None = None
     report_id: DurableRecordId | None = None
+    check_timeout_seconds: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
+    pytest_per_test_timeout_seconds: float = DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        """Refuse timeout values downstream tooling would silently misread.
+
+        The CLI door validates its own option phrasing, but this dataclass is
+        the library entry: without this check a non-positive per-test value
+        reaches pytest-timeout's argv, where it silently means *no bound*
+        (clio-relay#275 review R1 — the guard must live at the single source
+        of truth, not only at one of two doors).
+        """
+        if self.check_timeout_seconds is not None and self.check_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "check_timeout_seconds must be positive or None (None means no bound)"
+            )
+        if self.pytest_per_test_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "pytest_per_test_timeout_seconds must be > 0 (pytest-timeout treats a "
+                "non-positive value as no bound, silently defeating it)"
+            )
 
 
 def run_local_release_validation(
@@ -112,7 +132,9 @@ def run_local_release_validation(
     storage_root = internal_filesystem_path(root, force_extended=True)
     if not (storage_root / "pyproject.toml").is_file():
         raise ConfigurationError(f"release checkout has no pyproject.toml: {root}")
-    command_runner = runner or _run_command
+    command_runner = runner or default_command_runner(
+        check_timeout_seconds=options.check_timeout_seconds
+    )
     report = new_live_validation_report(
         scenario="local-release",
         cluster="local",
@@ -204,10 +226,23 @@ def run_local_release_validation(
                 "pytest",
                 *_PYTEST_RELEASE_GATE_ARGUMENTS,
                 "-ra",
+                # No --timeout-method: pytest-timeout's own per-platform default is
+                # the right choice, not a pinned one (clio-relay#275 review D1).
+                # 'signal' (POSIX, SIGALRM) pytest.fail()s the hung test through the
+                # normal reporting path, so pytest_release_gate's failed-node-id
+                # sentinel still fires and metadata.failed_test_ids names it. The
+                # 'thread' fallback (Windows; no SIGALRM) calls os._exit() on expiry,
+                # skipping that summary entirely -- pinning thread everywhere would
+                # defeat this issue's own "the failure names the test" acceptance
+                # criterion on every POSIX runner.
+                f"--timeout={format_seconds(options.pytest_per_test_timeout_seconds)}",
             ],
             root=root,
             runner=command_runner,
         )
+        # Only local.pytest (above) carries the per-test --timeout; the required-
+        # test checks below run under command_runner's own per-check overall bound
+        # only (clio-relay#275 review D11).
         _run_required_tests(
             recorder,
             check_id="local.containment-hard-crash",
@@ -443,7 +478,7 @@ def _run_check(
     root: Path,
     runner: ReleaseCommandRunner,
 ) -> str:
-    with recorder.check(check_id, summary) as evidence:
+    with recorder.check(check_id, summary) as evidence, active_check(check_id):
         completed = runner(command, cwd=root)
         diagnostic = command_evidence(
             _logicalize_windows_text(completed.stdout),
@@ -472,7 +507,7 @@ def _run_check_sequence(
     root: Path,
     runner: ReleaseCommandRunner,
 ) -> None:
-    with recorder.check(check_id, summary) as evidence:
+    with recorder.check(check_id, summary) as evidence, active_check(check_id):
         for command in commands:
             completed = runner(command, cwd=root)
             diagnostic = command_evidence(
@@ -540,53 +575,54 @@ def _run_sdist_smoke(
     shutil.rmtree(environment, ignore_errors=True)
     build_dir.mkdir(parents=True, exist_ok=True)
     with recorder.check(
-        "local.sdist-smoke",
+        _SDIST_SMOKE_CHECK_ID,
         "build, install, and launch the exact sdist in an isolated runtime environment",
     ) as evidence:
         try:
-            build_command = [
-                "uv",
-                "build",
-                "--no-build-isolation",
-                "--wheel",
-                "--python",
-                sys.executable,
-                "--out-dir",
-                str(build_dir),
-                str(sdist),
-            ]
-            _run_evidenced_command(evidence, build_command, root=root, runner=runner)
-            wheels = sorted(build_dir.glob("*.whl"))
-            if len(wheels) != 1:
-                raise RelayError(
-                    "sdist smoke must build exactly one wheel; "
-                    f"found {[path.name for path in wheels]}"
-                )
-            commands = [
-                ["uv", "venv", "--clear", "--python", sys.executable, str(environment)],
-                [
+            with active_check(_SDIST_SMOKE_CHECK_ID):
+                build_command = [
                     "uv",
-                    "pip",
-                    "sync",
+                    "build",
+                    "--no-build-isolation",
+                    "--wheel",
                     "--python",
-                    str(smoke_python),
-                    "--require-hashes",
-                    str(runtime_requirements),
-                ],
-                [
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    str(smoke_python),
-                    "--no-deps",
-                    str(wheels[0]),
-                ],
-                ["uv", "pip", "freeze", "--python", str(smoke_python)],
-                [str(smoke_executable), "--help"],
-            ]
-            for command in commands:
-                _run_evidenced_command(evidence, command, root=root, runner=runner)
+                    sys.executable,
+                    "--out-dir",
+                    str(build_dir),
+                    str(sdist),
+                ]
+                _run_evidenced_command(evidence, build_command, root=root, runner=runner)
+                wheels = sorted(build_dir.glob("*.whl"))
+                if len(wheels) != 1:
+                    raise RelayError(
+                        "sdist smoke must build exactly one wheel; "
+                        f"found {[path.name for path in wheels]}"
+                    )
+                commands = [
+                    ["uv", "venv", "--clear", "--python", sys.executable, str(environment)],
+                    [
+                        "uv",
+                        "pip",
+                        "sync",
+                        "--python",
+                        str(smoke_python),
+                        "--require-hashes",
+                        str(runtime_requirements),
+                    ],
+                    [
+                        "uv",
+                        "pip",
+                        "install",
+                        "--python",
+                        str(smoke_python),
+                        "--no-deps",
+                        str(wheels[0]),
+                    ],
+                    ["uv", "pip", "freeze", "--python", str(smoke_python)],
+                    [str(smoke_executable), "--help"],
+                ]
+                for command in commands:
+                    _run_evidenced_command(evidence, command, root=root, runner=runner)
         finally:
             shutil.rmtree(environment, ignore_errors=True)
             shutil.rmtree(build_dir, ignore_errors=True)
@@ -614,7 +650,9 @@ def _run_evidenced_command(
         )
     )
     if completed.returncode != 0:
-        raise RelayError(f"release check failed (local.sdist-smoke): {diagnostic.error_detail}")
+        raise RelayError(
+            f"release check failed ({_SDIST_SMOKE_CHECK_ID}): {diagnostic.error_detail}"
+        )
 
 
 def _release_artifacts(artifact_dir: Path) -> list[Path]:
@@ -714,33 +752,6 @@ def _record_release_artifacts(
         recorder.report.artifacts.append(
             EvidenceReference(kind=kind, reference=str(logical_path), sha256=digest)
         )
-
-
-def _run_command(
-    command: list[str],
-    *,
-    cwd: Path,
-) -> subprocess.CompletedProcess[str]:
-    logical_cwd = logical_filesystem_path(cwd)
-    if os.name == "nt":
-        absolute_cwd = os.path.abspath(logical_cwd)
-        if absolute_cwd.startswith("\\\\"):
-            raise ConfigurationError(
-                "release subprocess checkout paths on Windows must not use UNC; "
-                "run the gate from a local checkout path"
-            )
-        if len(absolute_cwd) >= WINDOWS_LEGACY_PATH_HEADROOM:
-            raise ConfigurationError(
-                "release subprocess checkout path exceeds the verified Windows path bound; "
-                "run the gate from a shorter checkout path"
-            )
-    return subprocess.run(
-        command,
-        cwd=logical_cwd,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
 
 
 def _logical_command(command: list[str]) -> list[str]:
