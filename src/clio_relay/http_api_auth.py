@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Header, WebSocket
 
@@ -25,8 +25,23 @@ from clio_relay.job_identity import (
 )
 from clio_relay.pagination import validate_response_page_limit
 
+if TYPE_CHECKING:
+    from clio_relay.http_api_context import RelayApiContext
 
-def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]]:
+
+def _require_api_token(ctx: RelayApiContext) -> Callable[..., Awaitable[None]]:
+    """Build the shared bearer-token/session-binding dependency.
+
+    Also the owned-session client-liveness lease's ONE renewal chokepoint
+    (iowarp/clio-relay#277): every authenticated request to an owned-session
+    API -- attach's status cross-check, ``GET /queue`` polls, job/gateway
+    submissions -- depends on this exact function, so renewing the lease here
+    covers all of them without asking the client for anything new. Renewal
+    happens only after both checks below already passed; an unauthenticated
+    or misbound request never touches the lease.
+    """
+    settings = ctx.resolved
+
     async def dependency(
         authorization: Annotated[str | None, Header()] = None,
         x_clio_relay_token: Annotated[str | None, Header()] = None,
@@ -64,6 +79,13 @@ def _require_api_token(settings: RelaySettings) -> Callable[..., Awaitable[None]
             raise door_errors.http_problem(
                 "session_binding_identity_mismatch",
                 "owner session or generation does not match this API process",
+            )
+        if ctx.owner_session_cluster is not None:
+            ctx.queue.touch_owner_session_lease(
+                expected_session_id,
+                session_generation_id=expected_generation_id,
+                cluster=ctx.owner_session_cluster,
+                ttl_seconds=settings.owner_session_lease_ttl_seconds,
             )
 
     return dependency

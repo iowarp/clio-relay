@@ -23,6 +23,7 @@ from clio_relay.control_channel import (
     OwnedSessionChannelBootstrap,
 )
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.remote_connection_lease import raise_if_lease_expired
 
 if TYPE_CHECKING:
     from clio_relay.remote_connection import RemoteConnection
@@ -46,8 +47,21 @@ def verify_bootstrap(
     rather than staying resident purely to hold ``RemoteConnection`` under
     its own file-size ratchet. Its one call site is
     ``RemoteConnection._establish``.
+
+    iowarp/clio-relay#277 (post-merge adversarial-review fix): the typed
+    lease-expiry check runs FIRST, before the generic checks below --
+    position matters. An expired session also fails the plain
+    ``running is not True`` check right after, so appending the lease check
+    later would silently lose the typed reason behind the generic
+    ``RelayError`` this function raises next.
     """
     status = bootstrap.status
+    raise_if_lease_expired(
+        cluster=definition.name,
+        session_id=session_id,
+        session_generation_id=generation_id,
+        status=status,
+    )
     remote_api_port_reported = status.get("remote_api_port")
     if (
         status.get("owner") != "clio-relay"

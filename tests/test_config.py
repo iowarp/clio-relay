@@ -11,6 +11,7 @@ from clio_relay.config import (
     MAX_INPUT_TOTAL_MAX_BYTES,
     RelaySettings,
 )
+from clio_relay.models_owner_session_lease import DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS
 
 
 def test_relay_settings_load_log_capture_quotas_from_environment(
@@ -84,6 +85,27 @@ def test_relay_settings_load_owner_session_generation_from_environment(
     assert settings.owner_session_cluster == "ares"
     assert settings.resolved_owner_session_cluster() == "ares"
     assert settings.remote_cluster is None
+
+
+def test_relay_settings_owner_session_lease_ttl_defaults_to_thirty_minutes(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#277: TTL is configuration with a sane default, never
+    a hardcoded constant scattered across the renewal/sweep call sites."""
+    settings = RelaySettings.from_env()
+
+    assert settings.owner_session_lease_ttl_seconds == DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS
+    assert settings.owner_session_lease_ttl_seconds == 1800
+
+
+def test_relay_settings_load_owner_session_lease_ttl_from_environment(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_OWNER_SESSION_LEASE_TTL_SECONDS", "600")
+
+    settings = RelaySettings.from_env()
+
+    assert settings.owner_session_lease_ttl_seconds == 600
 
 
 def test_relay_settings_load_explicit_unauthenticated_owned_session_policy(

@@ -63,6 +63,7 @@ cross-cutting ``cli.py`` collaborator (``_run_or_exit``,
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -94,6 +95,8 @@ from clio_relay.session_lifecycle import (
 
 # `cli` (`clio_relay.cli`) is deliberately NOT imported at module level -- see
 # this module's own docstring and `cli_relay_host.py`'s identical discipline.
+
+logger = logging.getLogger(__name__)
 
 
 @cli_session.session_app.command("quiesce-intake", hidden=True)
@@ -205,9 +208,39 @@ def session_recovery_status(
                 core_dir=settings_core_dir,
             )
         )
+        status = _with_owner_session_lease_projection(status, core_dir=settings_core_dir)
         typer.echo(status.model_dump_json(indent=2))
 
     cli._run_or_exit(action)
+
+
+def _with_owner_session_lease_projection(
+    status: OwnedSessionRecoveryStatus,
+    *,
+    core_dir: Path,
+) -> OwnedSessionRecoveryStatus:
+    """Attach the owned-session client-liveness lease as one informational field.
+
+    iowarp/clio-relay#277: a `model_copy` post-processing step onto the
+    unchanged inspection result -- see
+    ``session_recovery_lease_projection.py``'s module docstring for why this
+    lives outside ``session_recovery_inspection.py`` and how it reaches
+    ``RemoteConnection``'s bootstrap verification at zero extra dial cost.
+    Never raises, never gates ``recovery_verified``: a missing/unreadable
+    lease record leaves the status exactly as the inspection returned it.
+    """
+    import clio_relay.session_recovery_lease_projection as session_recovery_lease_projection
+
+    if status.session_generation_id is None:
+        return status
+    lease_status = session_recovery_lease_projection.owner_session_lease_status_projection(
+        core_dir=core_dir,
+        session_id=status.session_id,
+        session_generation_id=status.session_generation_id,
+    )
+    if lease_status is None:
+        return status
+    return status.model_copy(update={"owner_session_lease_status": lease_status})
 
 
 @cli_session.session_app.command("start-status-owned", hidden=True)
@@ -291,9 +324,41 @@ def session_teardown_owned() -> None:
             request = OwnedSessionTeardownRequest.model_validate_json(payload)
         except ValueError as exc:
             raise RelayError(f"owned session teardown request is invalid: {exc}") from exc
-        typer.echo(execute_owned_session_teardown(request).model_dump_json())
+        report = execute_owned_session_teardown(request)
+        _close_owner_session_lease_on_client_teardown(request)
+        typer.echo(report.model_dump_json())
 
     cli._run_or_exit(action)
+
+
+def _close_owner_session_lease_on_client_teardown(request: OwnedSessionTeardownRequest) -> None:
+    """Close the client-liveness lease with the CLIENT_CLOSE typed reason.
+
+    iowarp/clio-relay#277: distinct from the worker sweep's LEASE_EXPIRED
+    closure (``endpoint_owner_session_sweep.py``) -- this is what makes a
+    clean, explicit ``session teardown`` distinguishable from a TTL reap in
+    the durable record. Best-effort and never fatal to the teardown itself:
+    a race against a concurrent sweep that already closed the SAME lease
+    with a DIFFERENT reason is logged, not raised -- the process is already
+    dead and the generation already closed either way, so the only thing at
+    stake is which typed label got there first.
+    """
+    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
+    try:
+        queue.close_owner_session_lease(
+            request.session_id,
+            session_generation_id=request.expected_session_generation_id,
+            reason="client_close",
+        )
+    except RelayError:
+        logger.info(
+            "owner_session.lease_close_raced",
+            extra={
+                "owner_session_id": request.session_id,
+                "session_generation_id": request.expected_session_generation_id,
+            },
+            exc_info=True,
+        )
 
 
 @cli_session.session_app.command("challenge-owned", hidden=True)

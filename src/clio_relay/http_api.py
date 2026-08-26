@@ -123,18 +123,21 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         owner_session_id=resolved.owner_session_id,
         session_generation_id=resolved.owner_session_generation_id,
     )
-    auth_dependency = Depends(_require_api_token(resolved))
-    session_submission_dependency = Depends(_require_session_submission_binding(resolved))
-    job_identity_parameter = cast(
-        JobOwnerSessionIdentity | None,
-        Depends(_job_owner_session_identity()),
-    )
-
     ctx = RelayApiContext(
         queue=queue,
         resolved=resolved,
         owner_session_cluster=owner_session_cluster,
         owner_session_cluster_definition=owner_session_cluster_definition,
+    )
+
+    # auth_dependency is built from ctx (not bare `resolved`) because it is
+    # also the owned-session client-liveness lease's renewal chokepoint
+    # (iowarp/clio-relay#277) -- see http_api_auth._require_api_token.
+    auth_dependency = Depends(_require_api_token(ctx))
+    session_submission_dependency = Depends(_require_session_submission_binding(resolved))
+    job_identity_parameter = cast(
+        JobOwnerSessionIdentity | None,
+        Depends(_job_owner_session_identity()),
     )
 
     register_session_routes(

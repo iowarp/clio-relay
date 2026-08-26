@@ -44,6 +44,7 @@ from clio_relay.control_channel import (
     build_transport,
     owned_session_channel_bootstrap_script,
 )
+from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
@@ -1019,6 +1020,73 @@ def test_session_status_endpoint_requires_the_exact_owner_credentials(
     assert replaced.status_code == 409
 
 
+def test_authenticated_request_creates_and_renews_the_owner_session_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#277: the ONE renewal chokepoint, exercised over the
+    real HTTP app -- no new client obligation, no dedicated lease endpoint."""
+    _bind_authority(monkeypatch, tmp_path)
+    settings = _owned_session_app_settings(tmp_path)
+    client = cast(Any, TestClient(create_app(settings)))
+    headers = {
+        "Authorization": "Bearer session-api-token",
+        OWNER_SESSION_ID_HEADER: "desktop-session-1",
+        SESSION_GENERATION_ID_HEADER: "generation-1",
+    }
+
+    queue = ClioCoreQueue(settings.core_dir)
+    assert (
+        queue.owner_session_lease_status("desktop-session-1", session_generation_id="generation-1")
+        is None
+    )
+
+    first = client.get("/session-status", headers=headers)
+    assert first.status_code == 200
+    lease_after_first = queue.owner_session_lease_status(
+        "desktop-session-1", session_generation_id="generation-1"
+    )
+    assert lease_after_first is not None
+    assert lease_after_first.status == "open"
+    assert lease_after_first.cluster == "test-cluster"
+    assert lease_after_first.ttl_seconds == settings.owner_session_lease_ttl_seconds
+
+    # A DIFFERENT chokepoint (a "poll", not the status endpoint the desktop
+    # would call from `attach`) renews the SAME lease -- there is no
+    # per-route special case, the dependency itself is the renewal point.
+    poll = client.get(
+        "/queue",
+        params={"cluster": "test-cluster"},
+        headers=headers,
+    )
+    assert poll.status_code == 200
+    lease_after_poll = queue.owner_session_lease_status(
+        "desktop-session-1", session_generation_id="generation-1"
+    )
+    assert lease_after_poll is not None
+    assert lease_after_poll.status == "open"
+    assert lease_after_poll.opened_at == lease_after_first.opened_at
+    assert lease_after_poll.last_seen_at >= lease_after_first.last_seen_at
+
+
+def test_unauthenticated_request_never_creates_a_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bind_authority(monkeypatch, tmp_path)
+    settings = _owned_session_app_settings(tmp_path)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get("/session-status")
+    assert response.status_code == 401
+
+    queue = ClioCoreQueue(settings.core_dir)
+    assert (
+        queue.owner_session_lease_status("desktop-session-1", session_generation_id="generation-1")
+        is None
+    )
+
+
 def test_session_status_over_the_held_channel_cross_checks_the_pinned_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1585,6 +1653,69 @@ def test_attach_to_a_torn_down_session_is_refused_as_not_attachable(
     assert excinfo.value.reason == "session_not_attachable"
     # The dial happened -- it is bootstrap VERIFICATION that refused it, not
     # the transport, and the refusal must never silently retry a second dial.
+    assert harness.dials == 1
+
+
+def test_attach_to_an_expired_session_yields_the_typed_lease_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#277: distinguishable from every OTHER not-attachable
+    cause -- ``session recovery-status``'s ``owner_session_lease_status``
+    projection rides the SAME single bootstrap dial (zero extra dials)."""
+    harness = _Harness()
+    _install(monkeypatch, harness)
+
+    def expired_session_factory(argv: list[str], **_kwargs: object) -> _ChannelProcess:
+        document = harness.bootstrap()
+        status = cast(dict[str, object], document["status"])
+        status["running"] = False
+        status["owner_session_lease_status"] = {
+            "schema_version": "clio-relay.owner-session-lease.v1",
+            "owner_session_id": "desktop-session-1",
+            "session_generation_id": harness.generation_id,
+            "cluster": "ares",
+            "ttl_seconds": 1800,
+            "status": "expired",
+            "opened_at": "2026-01-01T00:00:00+00:00",
+            "last_seen_at": "2026-01-01T00:00:00+00:00",
+            "closed_at": "2026-01-01T01:00:00+00:00",
+            "close_reason": "lease_expired",
+            "expired_with_running_jobs": True,
+            "running_job_ids_at_close": ["job_still_running"],
+        }
+        process = _ChannelProcess(document, argv)
+        harness.processes.append(process)
+        return process
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", expired_session_factory)
+
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=harness.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+
+    with pytest.raises(remote_connection.SessionLeaseExpiredError) as excinfo:
+        session_attach.attach_owned_session(
+            definition=definition,
+            settings=settings,
+            record_path=record_path,
+            registry=harness.registry,
+        )
+
+    assert excinfo.value.reason == "owner_session_lease_expired"
+    assert excinfo.value.expired_with_running_jobs is True
+    assert excinfo.value.running_job_ids == ("job_still_running",)
+    assert excinfo.value.cluster == "ares"
+    assert excinfo.value.session_id == "desktop-session-1"
+    # Exactly one dial -- never wrapped into the generic
+    # SessionNotAttachableError, and never silently retried.
     assert harness.dials == 1
 
 
