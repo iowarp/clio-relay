@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
+from clio_relay.control_channel import ChannelDropped
 from clio_relay.errors import RelayError
 from clio_relay.jarvis_mcp import is_virtual_jarvis_control_query
 from clio_relay.models import (
@@ -50,6 +51,7 @@ __all__ = [
     "MAX_SESSION_API_RESPONSE_BYTES",
     "OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS",
     "SESSION_IDENTITY_SCHEMA",
+    "ChannelReconnectRequired",
     "OwnedSessionApiClient",
     "get_owned_session_transform",
     "record_owned_session_transform",
@@ -57,6 +59,36 @@ __all__ = [
     "session_identity_document",
     "submit_owned_session_job",
 ]
+
+
+class ChannelReconnectRequired(RelayError):
+    """The held owned-session channel dropped; only an explicit, user-authorized
+    reconnect may replace it (iowarp/clio-relay#276 B2).
+
+    Raised at the session-API boundary -- :class:`OwnedSessionApiClient`'s
+    ``__enter__`` (bring-up/resume) and ``request_json`` (an in-flight
+    operation that discovers the drop) -- whenever a
+    :class:`~clio_relay.control_channel.ChannelDropped` reaches an
+    owned-session operation. Per the 2FA operating assumption
+    (docs/connection-model.md:141-157) this is never turned into a redial
+    here, or anywhere upstream of an explicit user action: the connection's
+    own :attr:`~clio_relay.remote_connection.RemoteConnection.state` is
+    already ``"authorization_required"`` by the time this is raised (the
+    channel-level ``dropped``/``reestablishing`` events already recorded the
+    typed transition), and the only way past it is the single authorized
+    reconnect ``clio-relay session attach``/``session reconnect`` performs.
+    """
+
+    reason = "authorization_required"
+
+    def __init__(self, *, cluster: str, source: ChannelDropped) -> None:
+        self.cluster = cluster
+        self.source = source
+        super().__init__(
+            f"owned session channel for {cluster!r} dropped; run `clio-relay session "
+            f"attach --cluster {cluster}` (or `session reconnect`) to authorize exactly "
+            "one new transport -- it is never redialed automatically"
+        )
 # Leave part of clio-agent's ordinary 30-second transport budget available for
 # propagating the completed MCP result after this inner long-poll returns.
 OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS: Final = 10.0
@@ -100,13 +132,24 @@ class OwnedSessionApiClient:
         self._connection: RemoteConnection | None = None
 
     def __enter__(self) -> OwnedSessionApiClient:
-        """Bind to the held channel for this cluster, establishing it once."""
+        """Bind to the held channel for this cluster, establishing it once.
+
+        clio-relay#276 B2: a channel that dropped since it was last held
+        surfaces here as :class:`ChannelDropped` (``RemoteConnection.
+        connect()``'s own refusal) -- caught and re-raised as the typed
+        :class:`ChannelReconnectRequired` so every session-API caller sees
+        the same actionable, typed condition instead of a bare internal
+        transport exception. Never redialed here.
+        """
         registry = self._registry or connection_registry()
-        self._connection = registry.connection(
-            definition=self._definition,
-            settings=self._settings,
-            timeout_seconds=self._timeout_seconds,
-        )
+        try:
+            self._connection = registry.connection(
+                definition=self._definition,
+                settings=self._settings,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except ChannelDropped as exc:
+            raise ChannelReconnectRequired(cluster=self._definition.name, source=exc) from exc
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -135,14 +178,22 @@ class OwnedSessionApiClient:
         ``response_timeout_seconds`` changes only the response deadline for this
         request. It never relaxes the channel's bring-up deadlines, and the
         stream's ordinary timeout is restored before a later request reuses it.
+
+        clio-relay#276 B2: a channel that dropped mid-flight (discovered by
+        the connection's own stream acquisition, not by this call) surfaces
+        as :class:`ChannelDropped` here too, and is re-raised the same typed
+        way as ``__enter__`` -- see :class:`ChannelReconnectRequired`.
         """
-        return self.connection.request_json(
-            method=method,
-            path=path,
-            query=query,
-            body=body,
-            response_timeout_seconds=response_timeout_seconds,
-        )
+        try:
+            return self.connection.request_json(
+                method=method,
+                path=path,
+                query=query,
+                body=body,
+                response_timeout_seconds=response_timeout_seconds,
+            )
+        except ChannelDropped as exc:
+            raise ChannelReconnectRequired(cluster=self.connection.cluster, source=exc) from exc
 
 
 def submit_owned_session_job(

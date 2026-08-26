@@ -40,6 +40,7 @@ import clio_relay.session_lifecycle as session_lifecycle
 from clio_relay.cli_session_teardown_state import _TeardownState
 from clio_relay.errors import RelayError
 from clio_relay.models import JobState
+from clio_relay.owned_session_record import clear_owned_session_record
 from clio_relay.session_lifecycle import session_lifecycle_report_sha256
 from clio_relay.validation_report import sha256_file
 
@@ -298,6 +299,12 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
         and closed_recovery.coordinator_report_ref == finalized_reference
     ):
         raise RelayError("cleanup was not authoritatively closed after commit")
+    # iowarp/clio-relay#276 B1: a clean teardown, once authoritatively closed
+    # above, retires the durable "last session for this cluster" record --
+    # `session attach` must never resurrect a session that was deliberately
+    # torn down. `session detach` never reaches this call: it leaves the
+    # remote session running and the record intact on purpose.
+    clear_owned_session_record(cluster)
     closed_report = cli_cleanup_report._verified_finalized_cleanup_report(
         closed_recovery,
         report=report,

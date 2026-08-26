@@ -29,6 +29,7 @@ from clio_relay.models import (
 )
 from clio_relay.remote_connection import RemoteConnectionRegistry
 from clio_relay.session_api import (
+    ChannelReconnectRequired,
     OwnedSessionApiClient,
     session_identity_document,
     submit_owned_session_job,
@@ -726,6 +727,70 @@ def test_owned_session_client_never_reconnects_after_identity_proof(
 
     assert len(transport.connections) == 1
     assert transport.captured[1]["auto_open"] == 0
+
+
+def test_owned_session_client_surfaces_a_dropped_channel_as_reconnect_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#276 B2: a drop discovered at bring-up (``__enter__``)
+    must surface as the typed ``ChannelReconnectRequired``, never a bare
+    ``ChannelDropped`` stack trace -- and it must never redial on its own."""
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    transport = _install_transport(
+        monkeypatch,
+        responses=[_Response(identity), _Response({"ok": True})],
+    )
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    settings = _settings(tmp_path)
+    with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+        client.request_json(method="GET", path="/jobs/job_1/status")
+    assert transport.dials == 1
+
+    transport.processes[0].drop()
+
+    with (
+        pytest.raises(ChannelReconnectRequired, match="session attach") as excinfo,
+        OwnedSessionApiClient(definition=definition, settings=settings) as client,
+    ):
+        client.request_json(method="GET", path="/jobs/job_2/status")
+
+    assert excinfo.value.reason == "authorization_required"
+    assert excinfo.value.cluster == "ares"
+    # Never redialed: the typed refusal costs no new transport.
+    assert transport.dials == 1
+
+
+def test_owned_session_client_surfaces_a_mid_operation_drop_as_reconnect_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drop discovered mid-operation (inside ``request_json``, on an already
+    bound client) is caught at the same boundary."""
+    identity = session_identity_document(
+        owner_token="owner-token",
+        cluster="ares",
+        session_id="desktop-session-1",
+        generation_id="generation-1",
+        nonce="1" * 64,
+    )
+    transport = _install_transport(monkeypatch, responses=[_Response(identity)])
+    definition = ClusterDefinition(name="ares", ssh_host="ares-login")
+    settings = _settings(tmp_path)
+
+    with OwnedSessionApiClient(definition=definition, settings=settings) as client:
+        transport.processes[0].drop()
+        with pytest.raises(ChannelReconnectRequired, match="session attach") as excinfo:
+            client.request_json(method="GET", path="/jobs/job_1/status")
+
+    assert excinfo.value.reason == "authorization_required"
+    assert transport.dials == 1
 
 
 def test_owned_session_client_rejects_replaced_generation_before_credentials(

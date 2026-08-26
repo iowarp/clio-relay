@@ -23,6 +23,9 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
+import clio_relay.core_queue as core_queue
+import clio_relay.owned_session_record as owned_session_record
+import clio_relay.session_attach as session_attach
 from clio_relay import remote_connection
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
@@ -45,6 +48,7 @@ from clio_relay.control_channel import (
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
+from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.remote_connection import (
     DEFAULT_OWNED_SESSION_API_PORT,
     RemoteConnectionRegistry,
@@ -269,6 +273,17 @@ def _settings(tmp_path: Path, *, cluster: str = "ares") -> RelaySettings:
 
 def _definition(name: str = "ares") -> ClusterDefinition:
     return ClusterDefinition(name=name, ssh_host=f"{name}-login")
+
+
+def _attach_settings(tmp_path: Path) -> RelaySettings:
+    """Settings carrying NO session identity -- a fresh process with no
+    inherited ``CLIO_RELAY_OWNER_SESSION_ID``/friends, exactly the shape
+    ``session attach`` must resolve from the durable record alone."""
+    return RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="session-api-token",
+    )
 
 
 def _connect(tmp_path: Path, harness: _Harness) -> Any:
@@ -1154,3 +1169,278 @@ def test_established_link_reports_its_control_endpoint_and_stream_capability(
     # No mode carries multiplexed stream channels yet; the flag says so rather
     # than the capability being absent from the interface.
     assert link.stream_channels is False
+
+
+# --- iowarp/clio-relay#276 B3: crash-vs-clean acceptance (offline) ---------
+#
+# ``_Harness``/``_install`` above already model one local-relay process's own
+# in-memory state (its ``RemoteConnectionRegistry``, its own dial/stream/
+# request bookkeeping) against one simulated remote. Calling ``_install``
+# again with a SECOND, fresh ``_Harness()`` re-points the same production
+# seams (the channel process factory, the HTTP stream factory,
+# ``session_api.connection_registry``) at a brand-new registry that shares
+# NOTHING in memory with the first -- exactly the gap the design calls out
+# ("no new-process-attach fixture"). Both harnesses report the same
+# ``generation_id`` by default, modeling that it is the same remote session,
+# observed by two different local processes in turn.
+
+
+def test_new_process_attach_resumes_a_session_detached_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clean detach (channel closed), close the process, return in a NEW process."""
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    first_process = _install(monkeypatch, _Harness())
+    first_connection = _connect(tmp_path, first_process)
+    first_connection.close()  # the local channel is torn down; the remote session lives on
+
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=first_process.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+
+    second_process = _install(monkeypatch, _Harness())  # a fresh process: empty registry
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+
+    connection, target, channel_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=second_process.registry,
+    )
+
+    assert connection.connected is True
+    assert channel_reestablished is True
+    assert target.identity_source == "durable_record"
+    assert second_process.dials == 1
+
+    report = session_attach.build_attach_report(
+        connection=connection,
+        target=target,
+        channel_reestablished=channel_reestablished,
+        definition=definition,
+        queue=core_queue.ClioCoreQueue(tmp_path / "core"),
+    )
+    assert report.connected is True
+    assert report.running_jobs == []
+
+
+def test_new_process_attach_after_a_crash_keeps_running_job_continuity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kill -9 the client mid-run (no detach); a new process attaches and still
+    tracks the job that kept running remotely the whole time."""
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    first_process = _install(monkeypatch, _Harness())
+    _connect(tmp_path, first_process)
+    queue = core_queue.ClioCoreQueue(tmp_path / "core")
+    running_job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["sleep", "600"]),
+            state=JobState.RUNNING,
+            idempotency_key="crash-continuity-job",
+            metadata={
+                "owner": "clio-relay",
+                "owner_session_id": "desktop-session-1",
+                "owner_session_generation_id": first_process.generation_id,
+            },
+        )
+    )
+    first_process.processes[0].kill()  # crash: no detach, no clean close
+
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=first_process.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+
+    second_process = _install(monkeypatch, _Harness())
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+
+    connection, target, channel_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=second_process.registry,
+    )
+    report = session_attach.build_attach_report(
+        connection=connection,
+        target=target,
+        channel_reestablished=channel_reestablished,
+        definition=definition,
+        queue=queue,
+    )
+
+    assert channel_reestablished is True
+    assert second_process.dials == 1
+    assert [job["job_id"] for job in report.running_jobs] == [running_job.job_id]
+    assert report.running_jobs[0]["state"] == JobState.RUNNING.value
+
+
+def test_attach_with_no_durable_record_and_no_environment_identity_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _install(monkeypatch, _Harness())
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+    record_path = tmp_path / "owned_sessions.json"  # never written
+
+    with pytest.raises(
+        session_attach.NoDurableSessionRecordError,
+        match="no durable session record",
+    ) as excinfo:
+        session_attach.attach_owned_session(
+            definition=definition,
+            settings=settings,
+            record_path=record_path,
+            registry=harness.registry,
+        )
+
+    assert excinfo.value.reason == "no_durable_session_record"
+    assert harness.dials == 0
+
+
+def test_attach_to_a_torn_down_session_is_refused_as_not_attachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _Harness()
+    _install(monkeypatch, harness)
+
+    def dead_session_factory(argv: list[str], **_kwargs: object) -> _ChannelProcess:
+        document = harness.bootstrap()
+        cast(dict[str, object], document["status"])["running"] = False
+        process = _ChannelProcess(document, argv)
+        harness.processes.append(process)
+        return process
+
+    monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", dead_session_factory)
+
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=harness.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+
+    with pytest.raises(
+        session_attach.SessionNotAttachableError,
+        match="ownership-verified generation",
+    ) as excinfo:
+        session_attach.attach_owned_session(
+            definition=definition,
+            settings=settings,
+            record_path=record_path,
+            registry=harness.registry,
+        )
+
+    assert excinfo.value.reason == "session_not_attachable"
+    # The dial happened -- it is bootstrap VERIFICATION that refused it, not
+    # the transport, and the refusal must never silently retry a second dial.
+    assert harness.dials == 1
+
+
+def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The B3.2 dial-budget invariant, exercised through the attach primitive itself."""
+    harness = _install(monkeypatch, _Harness())
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=harness.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+
+    connection, _target, first_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=harness.registry,
+    )
+    assert first_reestablished is True
+    assert harness.dials == 1
+
+    # Already live: resume in place, no new dial ("resume in place").
+    connection_again, _target_again, second_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=harness.registry,
+    )
+    assert connection_again is connection
+    assert second_reestablished is False
+    assert harness.dials == 1
+
+    # Drop, then attach again: exactly +1 dial -- the one authorized reconnect.
+    harness.processes[0].drop()
+    reconnected, _target_reconnected, third_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=harness.registry,
+    )
+    assert third_reestablished is True
+    assert harness.dials == 2
+    assert reconnected.connected is True
+
+
+def test_status_after_reconnect_reflects_current_remote_state_not_a_pre_drop_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#165: a reconnect must never serve a cached pre-drop snapshot."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.responses["/session-status"] = {
+        "schema_version": "clio-relay.owned-session-status.v1",
+        "owner": "clio-relay",
+        "cluster": "ares",
+        "session_id": "desktop-session-1",
+        "session_generation_id": "generation-1",
+        "remote_api_port": DEFAULT_OWNED_SESSION_API_PORT,
+        "running": True,
+        "evidence": "live_api_self_report",
+        "note": "before-drop",
+    }
+
+    before = connection.session_status()
+    assert before["note"] == "before-drop"
+
+    harness.processes[0].drop()
+    with pytest.raises(ChannelDropped):
+        connection.request_json(method="GET", path="/jobs/job_1/status")
+
+    # The remote's own state changes while the client is disconnected.
+    harness.responses["/session-status"] = {
+        **cast(dict[str, object], harness.responses["/session-status"]),
+        "note": "after-reconnect",
+    }
+    connection.reconnect()
+
+    after = connection.session_status()
+    assert after["note"] == "after-reconnect"
+    assert harness.dials == 2

@@ -234,6 +234,26 @@ class RemoteConnection:
         return transport is not None and transport.is_alive()
 
     @property
+    def state(self) -> Literal["connected", "authorization_required", "not_established"]:
+        """Return this connection's typed lifecycle state (iowarp/clio-relay#276 B2).
+
+        A read-only projection of the same transport reference/liveness this
+        class already tracks -- it records no new state of its own.
+        ``"authorization_required"`` means a channel was established at least
+        once and has since dropped: :attr:`connected` is False but this
+        connection still remembers holding a (now-dead) transport, so only an
+        explicit, user-authorized :meth:`reconnect` -- never a background
+        retry -- may replace it (the 2FA doctrine,
+        docs/connection-model.md:141-157). ``"not_established"`` means no
+        channel has ever been held on this connection object.
+        """
+        if self.connected:
+            return "connected"
+        if self._transport is not None:
+            return "authorization_required"
+        return "not_established"
+
+    @property
     def events(self) -> tuple[ChannelEvent, ...]:
         """Return the bounded, typed transport lifecycle record."""
         return tuple(self._events)

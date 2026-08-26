@@ -28,6 +28,7 @@ import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.validation_report as validation_report_module
 from clio_relay.cli_session_teardown_state import _TeardownState
 from clio_relay.errors import RelayError
+from clio_relay.owned_session_record import clear_owned_session_record
 from clio_relay.owner_session_admission import (
     assert_no_unscoped_desktop_admission_state as _assert_no_unscoped_desktop_admission_state,
 )
@@ -241,6 +242,10 @@ def _resolve_teardown_recovery(state: _TeardownState) -> bool:
             raise RelayError("finalized cleanup retry was not authoritatively closed after commit")
         if closed_recovery.coordinator_report_ref != finalized_retry_reference:
             raise RelayError("finalized cleanup report reference changed during closure")
+        # iowarp/clio-relay#276 B1: an already-finalized retry that closes here
+        # is still a clean teardown from the durable-record's point of view --
+        # retire it the same as the primary finalize path does.
+        clear_owned_session_record(cluster)
         closed_report = cli_cleanup_report._verified_finalized_cleanup_report(
             closed_recovery,
             report=finalized_retry_report,
