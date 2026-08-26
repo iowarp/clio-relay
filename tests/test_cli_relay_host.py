@@ -461,6 +461,72 @@ def test_cli_render_frpc_uses_configured_secret_env(
     assert 'secretKey = "env-stcp-secret"' in result.output
 
 
+def test_cli_render_frpc_defaults_proxy_name_to_the_canonical_form(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#279: the `relay-stcp` mismatch trap is closed at the default.
+
+    Before this fix, an operator who rendered this config without an
+    explicit `--proxy-name` got the unrelated literal `"relay-stcp"` --
+    never matching what the desktop `brokered_tcp`/`udp_rendezvous`
+    transports (or a proxy unit installed via `relay-host install-proxy`)
+    resolve for the same cluster. This locks the default at the CLI
+    boundary, on top of `test_frp_proxy_name_conformance.py`'s own
+    module-level proof.
+    """
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "env-frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "env-stcp-secret")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["relay-host", "render-frpc-config", "--cluster", "ares", "--local-port", "8848"],
+    )
+
+    assert result.exit_code == 0
+    assert 'name = "ares-owned-session"' in result.output
+    assert 'name = "relay-stcp"' not in result.output
+
+
+def test_cli_render_frpc_visitor_defaults_server_name_to_the_canonical_form(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """D1 (adversarial review): the desktop VISITOR side had the identical trap.
+
+    ``render-frpc-visitor-config --server-name`` defaulted to the literal
+    ``"relay-stcp"`` while the proxy side (fixed above) now defaults to the
+    canonical ``<cluster>-owned-session`` form -- converting a working
+    default pairing into a guaranteed-broken one. This proves the SAME
+    canonical form comes out of both commands for the same cluster, closing
+    the loop `test_frp_proxy_name_conformance.py` proves at the module
+    level.
+    """
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "env-frp-token")
+    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "env-stcp-secret")
+    runner = CliRunner()
+
+    proxy_result = runner.invoke(
+        app,
+        ["relay-host", "render-frpc-config", "--cluster", "ares", "--local-port", "8848"],
+    )
+    visitor_result = runner.invoke(
+        app,
+        ["relay-host", "render-frpc-visitor-config", "--cluster", "ares", "--bind-port", "18848"],
+    )
+
+    assert proxy_result.exit_code == 0
+    assert visitor_result.exit_code == 0
+    assert 'name = "ares-owned-session"' in proxy_result.output
+    assert 'serverName = "ares-owned-session"' in visitor_result.output
+    assert 'serverName = "relay-stcp"' not in visitor_result.output
+
+
 def test_cli_render_frpc_uses_local_secret_file(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -603,6 +669,189 @@ def test_cli_direct_transport_is_strict_xtcp_by_default(
 
     assert result.exit_code == 0
     assert calls[0]["allow_stcp_fallback"] is False
+
+
+# ---------------------------------------------------------------------------
+# clio-relay#279: cluster-side frpc proxy bring-up commands. Every
+# ``frpc_proxy_bringup`` collaborator is patched module-attribute style,
+# exactly like ``transport_probe`` above -- these three commands never
+# dial anywhere in this test file.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_install_proxy_delegates_to_frpc_proxy_bringup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_install(**kwargs: object) -> object:
+        calls.append(kwargs)
+        from clio_relay.frpc_proxy_receipt import FrpcProxyBringupReceipt
+
+        return FrpcProxyBringupReceipt(
+            cluster="ares",
+            proxy_name="ares-owned-session",
+            unit_name="clio-relay-frpc-proxy-ares.service",
+            toml_path="%h/.config/clio-relay/frpc-proxy-ares.toml",
+            env_path="%h/.config/clio-relay/frpc-proxy-ares.env",
+            config_sha256="a" * 64,
+            enabled=True,
+            active=True,
+            linger=True,
+            persistence="systemd-user-linger",
+            installed_at="2026-08-26T00:00:00Z",
+        )
+
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "install-proxy", "--cluster", "ares"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["cluster"] == "ares"
+    assert calls[0]["ssh_host"] == "ares"
+    assert '"unit_name": "clio-relay-frpc-proxy-ares.service"' in result.output
+
+
+def test_cli_install_proxy_respects_an_ssh_host_override(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_install(**kwargs: object) -> object:
+        calls.append(kwargs)
+        raise RelayError("stop before any real dial -- this test only checks argument wiring")
+
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "install-proxy", "--cluster", "ares", "--ssh-host", "ares-jump"],
+    )
+
+    assert result.exit_code == 1
+    assert calls[0]["ssh_host"] == "ares-jump"
+
+
+def test_cli_teardown_proxy_delegates_to_frpc_proxy_bringup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_teardown(**kwargs: object) -> object:
+        calls.append(kwargs)
+        from clio_relay.frpc_proxy_receipt import FrpcProxyTeardownReceipt
+
+        return FrpcProxyTeardownReceipt(
+            cluster="ares",
+            unit_name="clio-relay-frpc-proxy-ares.service",
+            removed_unit=True,
+            removed_toml=True,
+            removed_env=True,
+            torn_down_at="2026-08-26T00:05:00Z",
+        )
+
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", fake_teardown)
+
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "teardown-proxy", "--cluster", "ares"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["cluster"] == "ares"
+    assert '"removed_unit": true' in result.output
+
+
+def test_cli_proxy_status_delegates_to_frpc_proxy_bringup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_status(**kwargs: object) -> object:
+        calls.append(kwargs)
+        from clio_relay.frpc_proxy_receipt import FrpcProxyStatusDocument
+
+        return FrpcProxyStatusDocument(
+            cluster="ares",
+            unit_name="clio-relay-frpc-proxy-ares.service",
+            installed=True,
+            enabled=True,
+            active=False,
+            restart_looping=False,
+            load_state="loaded",
+            load_state_category="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            journal_tail=["frpc: login to server failed: EOF"],
+            diagnosis="frpc proxy unit is inactive (state=inactive/dead)",
+        )
+
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.frpc_proxy_status_over_ssh", fake_status)
+
+    result = CliRunner().invoke(
+        app,
+        ["relay-host", "proxy-status", "--cluster", "ares"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["cluster"] == "ares"
+    assert "frpc: login to server failed: EOF" in result.output
+
+
+# ---------------------------------------------------------------------------
+# D2 (adversarial review, clio-relay#279): all three verbs used to call
+# `cli._require_cluster` OUTSIDE `_run_or_exit`'s try/except -- a typo'd
+# --cluster raised straight through typer's dispatch as a raw traceback
+# instead of `_run_or_exit`'s clean "error: ..." + exit 1. Moved inside
+# `action()`, matching the seven pre-existing verbs; these prove it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "verb_args",
+    [
+        ["relay-host", "install-proxy", "--cluster", "does-not-exist"],
+        ["relay-host", "teardown-proxy", "--cluster", "does-not-exist"],
+        ["relay-host", "proxy-status", "--cluster", "does-not-exist"],
+    ],
+)
+def test_cli_frpc_proxy_verbs_report_an_unconfigured_cluster_cleanly(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    verb_args: list[str],
+) -> None:
+    """D2: a bad ``--cluster`` must be `_run_or_exit`'s clean error, never a raw traceback."""
+    monkeypatch.chdir(tmp_path)
+    _write_test_cluster(tmp_path)
+
+    def poison(**_kwargs: object) -> object:
+        raise AssertionError("must fail resolving --cluster before any ssh-executing call")
+
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", poison)
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", poison)
+    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.frpc_proxy_status_over_ssh", poison)
+
+    result = CliRunner().invoke(app, verb_args)
+
+    assert result.exit_code == 1
+    assert "error: cluster is not configured: does-not-exist" in result.output
+    assert "Traceback (most recent call last)" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 # ---------------------------------------------------------------------------

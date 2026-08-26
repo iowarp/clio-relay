@@ -2,14 +2,17 @@
 
 ``docs/design/relay-architecture-2026-08.md`` §5's ``relay-host`` command-
 module row names this as the first real command-module extraction off
-``cli.py``: the seven ``relay_host_app`` commands (frps/frpc config
+``cli.py``: the seven original ``relay_host_app`` commands (frps/frpc config
 rendering, the live frpc login check, and the three transport acceptance
 probes) move out of the 19k-line monolith into their own capped module, per
 ground rule 2 (§2) -- ``cli.py`` parses and renders only; this module does
-the same for its own seven commands and nothing more.
+the same for its own commands and nothing more. clio-relay#279 adds three
+more (``install-proxy``/``teardown-proxy``/``proxy-status``): the cluster-
+side frpc proxy bring-up path, the missing product half of #188's TCP
+transport modes -- see ``frpc_unit.py``'s module docstring for the design.
 
-**Domain logic stays where it lives.** The commands below delegate to
-``relay_host.py`` (frp TOML rendering: ``render_frps_config``,
+**Domain logic stays where it lives.** The original seven commands delegate
+to ``relay_host.py`` (frp TOML rendering: ``render_frps_config``,
 ``render_frpc_config``, ``render_frpc_visitor_config``) and
 ``transport_probe.py`` (the three live probes: ``run_frp_http_probe``,
 ``run_frp_direct_http_probe``, ``run_ssh_forward_http_probe``) exactly as
@@ -19,7 +22,11 @@ the work. ``transport_probe`` is imported module-attribute style
 (``import clio_relay.transport_probe as transport_probe``) because it is one
 of R8(i)'s audited patch-seam collaborators (``tests/test_cli_patch_seam.py``);
 ``relay_host``'s renderers are pure, deterministic, and never monkeypatched,
-so they are imported directly.
+so they are imported directly. The three #279 commands delegate to
+``frpc_proxy_bringup.py`` (the ssh-executing bring-up/teardown/status
+functions), imported the SAME module-attribute way as ``transport_probe``
+for the same reason: tests replace its ssh-dialing function with a fake
+rather than ever dialing anywhere.
 
 **What does NOT move here.** Two categories of logic this group's commands
 call are NOT owned by any of the three modules above, and this slice does
@@ -93,8 +100,10 @@ from typing import Annotated
 import typer
 
 import clio_relay.cli_support as cli_support
+import clio_relay.frpc_proxy_bringup as frpc_proxy_bringup
 import clio_relay.transport_probe as transport_probe
 from clio_relay.config import RelaySettings
+from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -165,7 +174,19 @@ def render_frpc(
         str | None,
         typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
     ] = None,
-    proxy_name: Annotated[str, typer.Option(help="stcp proxy name.")] = "relay-stcp",
+    proxy_name: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "stcp proxy name. Defaults to the canonical <cluster>-owned-session "
+                "form (clio-relay#279) -- the SAME name frp_transport.py's desktop "
+                "brokered_tcp/udp_rendezvous transports and `relay-host install-proxy` "
+                "resolve for this cluster. Overriding this without also overriding the "
+                "desktop visitor's --server-name reintroduces the relay-stcp mismatch "
+                "trap this default used to fall into."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Render an frpc config using the cluster's configured frp transport."""
     import clio_relay.cli as cli
@@ -174,6 +195,7 @@ def render_frpc(
         definition = cli._require_cluster(cluster)
         transport = definition.frp_transport
         server_addr = cli._require_frp_server_addr(transport.server_addr, cluster)
+        resolved_proxy_name = proxy_name or canonical_proxy_name(definition, cluster=cluster)
         typer.echo(
             render_frpc_config(
                 FrpcConfig(
@@ -181,7 +203,7 @@ def render_frpc(
                     server_port=transport.server_port,
                     token=cli._resolve_env_secret(token, transport.token_env, "frp token"),
                     transport_protocol=FrpTransportProtocol(transport.protocol),
-                    proxy_name=proxy_name,
+                    proxy_name=resolved_proxy_name,
                     local_port=local_port,
                     secret_key=cli._resolve_env_secret(
                         secret_key,
@@ -304,7 +326,19 @@ def render_frpc_visitor(
         str | None,
         typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
     ] = None,
-    server_name: Annotated[str, typer.Option(help="Cluster-side stcp proxy name.")] = "relay-stcp",
+    server_name: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Cluster-side stcp proxy name. Defaults to the canonical "
+                "<cluster>-owned-session form (clio-relay#279) -- the SAME name "
+                "`install-proxy` and the desktop brokered_tcp/udp_rendezvous "
+                "transports resolve for this cluster. Overriding this without also "
+                "overriding the proxy side's --proxy-name reintroduces the relay-stcp "
+                "mismatch trap this default used to fall into."
+            )
+        ),
+    ] = None,
     visitor_name: Annotated[
         str,
         typer.Option(help="Desktop-side stcp visitor name."),
@@ -321,6 +355,7 @@ def render_frpc_visitor(
         definition = cli._require_cluster(cluster)
         transport = definition.frp_transport
         server_addr = cli._require_frp_server_addr(transport.server_addr, cluster)
+        resolved_server_name = server_name or canonical_proxy_name(definition, cluster=cluster)
         typer.echo(
             render_frpc_visitor_config(
                 FrpcVisitorConfig(
@@ -329,7 +364,7 @@ def render_frpc_visitor(
                     token=cli._resolve_env_secret(token, transport.token_env, "frp token"),
                     transport_protocol=FrpTransportProtocol(transport.protocol),
                     visitor_name=visitor_name,
-                    server_name=server_name,
+                    server_name=resolved_server_name,
                     bind_addr=bind_addr,
                     bind_port=bind_port,
                     secret_key=cli._resolve_env_secret(
@@ -639,3 +674,116 @@ def test_ssh_transport(
             )
         )
     )
+
+
+# --- clio-relay#279: cluster-side frpc proxy bring-up ----------------------
+#
+# The missing product half of #188's TCP transport modes: `relay_host.py`'s
+# renderers produce the frpc proxy TOML, but nothing installed/ran/kept it
+# alive on a cluster. These three commands do that, riding their own single
+# ssh pass each (never a second dial) via `frpc_proxy_bringup.py`.
+
+
+@relay_host_app.command("install-proxy")
+def install_proxy(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
+    ] = None,
+    remote_port: Annotated[
+        int,
+        typer.Option(help="Cluster-local port the frpc proxy exposes (the relay API port)."),
+    ] = frpc_proxy_bringup.DEFAULT_FRPC_PROXY_REMOTE_PORT,
+    require_persistent: Annotated[
+        bool,
+        typer.Option(
+            "--require-persistent/--allow-login-scoped",
+            help=(
+                "Require systemd user lingering so the enabled proxy survives all "
+                "logouts. The login-scoped opt-out is diagnostic and not "
+                "release-gate eligible."
+            ),
+        ),
+    ] = True,
+) -> None:
+    """Render, install, enable, and start the cluster-side frpc proxy unit.
+
+    One ssh pass: writes the proxy TOML (secrets env-templated, never
+    inline), the 0600 secrets env file, and the systemd user unit, then
+    ``daemon-reload``/``enable``/starts and verifies it is active before
+    returning the typed bring-up receipt. Fails (typed, non-zero) rather
+    than reporting success when the unit does not end up genuinely active.
+    """
+    import clio_relay.cli as cli
+
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
+            frpc_proxy_bringup.install_frpc_proxy_over_ssh(
+                cluster=cluster,
+                definition=definition,
+                ssh_host=ssh_host or definition.ssh_host,
+                remote_port=remote_port,
+                require_persistent=require_persistent,
+            ).model_dump_json(indent=2)
+        )
+
+    cli._run_or_exit(action)
+
+
+@relay_host_app.command("teardown-proxy")
+def teardown_proxy(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
+    ] = None,
+) -> None:
+    """Disable, stop, and remove the cluster-side frpc proxy unit, TOML, and env file.
+
+    One ssh pass; self-cleaning regardless of whether the unit was already
+    installed (a not-installed unit is a no-op, not an error).
+    """
+    import clio_relay.cli as cli
+
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
+            frpc_proxy_bringup.teardown_frpc_proxy_over_ssh(
+                cluster=cluster,
+                ssh_host=ssh_host or definition.ssh_host,
+            ).model_dump_json(indent=2)
+        )
+
+    cli._run_or_exit(action)
+
+
+@relay_host_app.command("proxy-status")
+def proxy_status(
+    cluster: Annotated[str, typer.Option(help="Configured cluster name.")],
+    ssh_host: Annotated[
+        str | None,
+        typer.Option(help="Override SSH host alias for this run."),
+    ] = None,
+) -> None:
+    """Report the cluster-side frpc proxy unit's diagnosable status.
+
+    One read-only ssh pass: ``systemctl --user`` load/active/enabled state
+    plus the unit's last journal lines, classified into a typed status
+    document -- frpc down, frps unreachable, and a rejected token all
+    surface here as "installed and enabled but inactive", with the journal
+    tail carrying the actual cause.
+    """
+    import clio_relay.cli as cli
+
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
+            frpc_proxy_bringup.frpc_proxy_status_over_ssh(
+                cluster=cluster,
+                ssh_host=ssh_host or definition.ssh_host,
+            ).model_dump_json(indent=2)
+        )
+
+    cli._run_or_exit(action)
