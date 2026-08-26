@@ -170,15 +170,20 @@ class RemoteConnectionRegistry:
                 held = None
                 if existing is not None:
                     # The pinned identity changed, so this is a different
-                    # connection, not a retry. Retire the old one but keep its
-                    # transport count, or the acceptance measurement loses it.
+                    # connection, not a retry -- pop it now, but defer
+                    # reporting it retired until AFTER it is actually closed
+                    # below (#285 D4: an earlier revision retired it here,
+                    # BEFORE close(), so its terminal `closed` event -- and
+                    # any events close() itself records -- never reached the
+                    # retired report at all).
                     self._connections.pop(definition.name, None)
-                    self._retired.append(_retired_report(existing))
         if held is not None:
             held.connect()
             return held
         if existing is not None:
             existing.close()
+            with self._lock:
+                self._retired.append(_retired_report(existing))
         created = RemoteConnection(
             definition=definition,
             settings=settings,
@@ -192,11 +197,15 @@ class RemoteConnectionRegistry:
         created.connect()
         with self._lock:
             raced = self._connections.get(definition.name)
-            if raced is not None:
+            if raced is None:
+                self._connections[definition.name] = created
+        if raced is not None:
+            # Same D4 ordering fix as above: close the redundant connection
+            # BEFORE reporting it retired, not after.
+            created.close()
+            with self._lock:
                 self._retired.append(_retired_report(created))
-                created.close()
-                return raced
-            self._connections[definition.name] = created
+            return raced
         return created
 
     def get(self, cluster: str) -> RemoteConnection | None:
@@ -219,13 +228,17 @@ class RemoteConnectionRegistry:
         return connection
 
     def disconnect(self, cluster: str) -> None:
-        """Close and forget one cluster's connection."""
+        """Close and forget one cluster's connection.
+
+        Retires AFTER close() (#285 D4 ordering fix), not before -- see
+        ``connection()``'s matching fix and ``_retired_report``'s docstring.
+        """
         with self._lock:
             connection = self._connections.pop(cluster, None)
-            if connection is not None:
-                self._retired.append(_retired_report(connection))
         if connection is not None:
             connection.close()
+            with self._lock:
+                self._retired.append(_retired_report(connection))
 
     def close_all(self, *, at_exit: bool = False) -> None:
         """Close every held connection this local relay owns.
@@ -238,11 +251,13 @@ class RemoteConnectionRegistry:
         connection from being released, nor raise back into an atexit hook.
         The default, ordinary-caller path is unchanged: a close failure
         there still propagates, exactly as before #285.
+
+        Retires every connection AFTER it is closed (#285 D4 ordering fix),
+        not before -- see ``_retired_report``'s docstring.
         """
         with self._lock:
             connections = list(self._connections.values())
             self._connections.clear()
-            self._retired.extend(_retired_report(item) for item in connections)
         for connection in connections:
             if not at_exit:
                 connection.close()
@@ -251,6 +266,8 @@ class RemoteConnectionRegistry:
                 connection.close(at_exit=True)
             except BaseException as exc:  # noqa: BLE001 -- must never raise at exit; see docstring
                 _record_exit_close_failure(connection, detail=str(exc))
+        with self._lock:
+            self._retired.extend(_retired_report(item) for item in connections)
 
     def _ensure_atexit_registered(self) -> None:
         """Register this registry's exit-path close exactly once (#285).
@@ -314,16 +331,27 @@ class RemoteConnectionRegistry:
         }
 
 
-def record_reaped_orphans(connection: RemoteConnection, transport: RelayTransport) -> None:
-    """Record one ``visitor_orphan_reaped`` event per pid THIS spawn reaped (#285).
+def record_reconciliation_events(connection: RemoteConnection, transport: RelayTransport) -> None:
+    """Record every typed event ONE visitor spawn's reconciliation produced (#285).
 
-    Called from ``RemoteConnection._establish`` right after
-    ``transport.establish`` succeeds, before anything later in that method
-    can still fail -- a reap must never be lost from the ledger. Only
-    frp-based transports carry ``reaped_orphan_visitor_pids`` at all
-    (``ssh_forward`` is self-cleaning by construction, so it has no
-    equivalent); a plain optional-attribute read, not an isinstance/mode
-    branch.
+    Called from ``RemoteConnection._establish`` in BOTH outcomes -- right
+    after ``transport.establish`` succeeds, AND (D5 adversarial-review fix)
+    from the except-handler when ``transport.establish`` itself raises.
+    Reconciliation runs as the FIRST action inside ``establish`` (before
+    anything that can fail), so the attributes read below are already
+    populated on ``transport`` by the time either call site reaches them --
+    a reap (or a skipped snapshot, D2) must never be lost from the ledger
+    just because the rest of THIS attempt went on to fail. Only frp-based
+    transports carry these attributes at all (``ssh_forward`` is
+    self-cleaning by construction, so it has no equivalent); plain
+    optional-attribute reads, not an isinstance/mode branch.
+
+    Records one ``visitor_orphan_reaped`` event per reaped pid (``detail``
+    is the pid), and -- when the reconciliation's own process-table
+    snapshot could not be read at all -- one ``visitor_reconciliation_skipped``
+    event naming the typed reason, so a leak that could never even be
+    DETECTED on a PowerShell-constrained host is still visible in the
+    acceptance report (D2).
     """
     reaped_pids = cast("tuple[int, ...]", getattr(transport, "reaped_orphan_visitor_pids", ()))
     for pid in reaped_pids:
@@ -335,6 +363,18 @@ def record_reaped_orphans(connection: RemoteConnection, transport: RelayTranspor
                 attempt=connection._attempt,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
                 reason="prior_cli_exited",
                 detail=str(pid),
+                identity_anchor=connection.identity_anchor,
+            )
+        )
+    skipped_reason = cast("str | None", getattr(transport, "reconciliation_skipped_reason", None))
+    if skipped_reason is not None:
+        connection._record(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            channel_event(
+                cluster=connection.cluster,
+                mode=connection.transport_mode,
+                event="visitor_reconciliation_skipped",
+                attempt=connection._attempt,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                reason=skipped_reason,
                 identity_anchor=connection.identity_anchor,
             )
         )
@@ -368,7 +408,20 @@ def _record_exit_close_failure(connection: RemoteConnection, *, detail: str) -> 
 
 
 def _retired_report(connection: RemoteConnection) -> dict[str, object]:
-    """Keep a retired connection's transport count for the acceptance report."""
+    """Keep a retired connection's transport count AND terminal events (#285 D4).
+
+    Every call site calls this AFTER the connection has already been
+    closed -- an earlier revision called it BEFORE close() at every one of
+    them, so a retired connection's terminal ``closed``/``closed_at_exit``
+    event (and any ``visitor_orphan_reaped``/``visitor_reconciliation_skipped``
+    events its own establish recorded) never reached ``event_report()`` at
+    all once the connection left the live ``clusters`` dict: the count
+    below only ever summed ``established``/``reestablished``, and no
+    ``events`` key existed here at all. Now mirrors the live cluster
+    entry's ``events`` shape exactly, so a caller does not need two
+    different shapes depending on whether a connection is still held or
+    already retired.
+    """
     events = connection.events
     return {
         "cluster": connection.cluster,
@@ -379,6 +432,7 @@ def _retired_report(connection: RemoteConnection) -> dict[str, object]:
         "transport_connections_opened": sum(
             1 for event in events if event.event in {"established", "reestablished"}
         ),
+        "events": [event.model_dump(mode="json") for event in events],
     }
 
 

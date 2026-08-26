@@ -185,6 +185,7 @@ class _FrpChannelTransport:
         # typed visitor_orphan_reaped channel event.
         self._reaped_orphan_visitor_pids: tuple[int, ...] = ()
         self._swept_config_dirs = 0
+        self._reconciliation_skipped_reason: str | None = None
 
     @property
     def mode(self) -> TransportMode:
@@ -209,8 +210,13 @@ class _FrpChannelTransport:
 
     @property
     def swept_stale_config_dirs(self) -> int:
-        """Return the count of empty crash-orphaned visitor config dirs removed (#285)."""
+        """Return the count of stale crash-orphaned visitor config dirs removed (#285)."""
         return self._swept_config_dirs
+
+    @property
+    def reconciliation_skipped_reason(self) -> str | None:
+        """Return why THIS establish's reconciliation snapshot could not run (#285 D2)."""
+        return self._reconciliation_skipped_reason
 
     def establish(self, *, nonce: str) -> ChannelLink:
         """Hold one frp visitor tunnel and fetch the bring-up document over it.
@@ -224,13 +230,18 @@ class _FrpChannelTransport:
         (``RelayTransport``'s own Protocol docstring).
 
         iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
-        reconciliation pass runs for this exact ``frpc_bin`` -- reaping any
-        prior visitor whose owning CLI process is gone (a ``kill -9`` or
-        crash the atexit hook in ``remote_connection_registry.py`` could
-        never have caught) and sweeping empty crash-orphaned config-dir
-        shells. This never blocks a legitimate concurrent CLI's own held
-        visitor (a live parent is never touched) and never raises out of
-        this method (``reconcile_stale_frp_visitors`` is itself best-effort).
+        reconciliation pass runs for this exact ``frpc_bin`` -- re-verified,
+        pid-reuse-safe reaping (D1) of any prior visitor whose owning CLI
+        process is gone (a ``kill -9`` or crash the atexit hook in
+        ``remote_connection_registry.py`` could never have caught), each
+        reap also removing its own secret-bearing config dir (D3), plus a
+        once-per-process sweep (D8) of aged crash-orphaned config dirs
+        regardless of emptiness. This never blocks a legitimate concurrent
+        CLI's own held visitor (a live parent is never touched) and never
+        raises out of this method (``reconcile_stale_frp_visitors`` is
+        itself best-effort; a snapshot it could not read at all surfaces as
+        a typed ``reconciliation_skipped_reason``, D2, rather than silently
+        finding nothing).
         """
         if self._established:
             raise RelayError(f"{self._mode} transport was already established")
@@ -238,6 +249,7 @@ class _FrpChannelTransport:
         reconciliation = reconcile_stale_frp_visitors(frpc_bin=self._frpc_bin)
         self._reaped_orphan_visitor_pids = reconciliation.reaped_pids
         self._swept_config_dirs = reconciliation.swept_config_dirs
+        self._reconciliation_skipped_reason = reconciliation.skipped_reason
         local_bind_port = self._local_bind_port or select_loopback_port(subject="held frp visitor")
         assert_loopback_port_available(local_bind_port, subject="frp visitor")
         config = FrpLinkConfig.from_cluster(

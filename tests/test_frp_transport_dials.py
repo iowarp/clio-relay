@@ -879,6 +879,92 @@ def test_no_orphans_means_no_visitor_orphan_reaped_events(
     assert harness.reconciliation_calls == ["frpc"]
 
 
+def test_a_skipped_snapshot_is_recorded_as_a_typed_channel_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D2 adversarial-review fix: a reconciliation snapshot the OS-native
+    inspection could not read at all must reach the establish path as a
+    typed ``visitor_reconciliation_skipped`` channel event -- never silently
+    indistinguishable from "found no orphans" (a PowerShell-constrained host
+    would otherwise leak forever with zero visible signal).
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.reconciliation_result = ReconciliationResult(
+        reaped_pids=(), swept_config_dirs=0, skipped_reason="snapshot_unavailable:timeout"
+    )
+
+    connection = _connect(tmp_path, harness)
+
+    assert [event.event for event in connection.events] == [
+        "establishing",
+        "visitor_reconciliation_skipped",
+        "established",
+    ]
+    skipped = next(
+        event for event in connection.events if event.event == "visitor_reconciliation_skipped"
+    )
+    assert skipped.reason == "snapshot_unavailable:timeout"
+
+
+def test_event_report_shows_reaped_and_closed_at_exit_for_a_retired_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D4 adversarial-review fix: ``_retired_report`` used to snapshot BEFORE
+    ``close()`` at every call site, so a retired connection's terminal event
+    (and any events recorded during its own establish) never reached
+    ``event_report()`` at all -- the count summed only
+    ``established``/``reestablished``, and no ``events`` key existed at all.
+    Proves both ``visitor_orphan_reaped`` (from establish) and
+    ``closed_at_exit`` (from the atexit close) survive into the retired
+    report's own ``events`` list.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.reconciliation_result = ReconciliationResult(reaped_pids=(7777,), swept_config_dirs=0)
+    _connect(tmp_path, harness)
+
+    harness.registry.close_all(at_exit=True)
+
+    report = harness.registry.event_report()
+    retired = cast("list[dict[str, object]]", report["retired"])
+    assert len(retired) == 1
+    retired_events = cast("list[dict[str, object]]", retired[0]["events"])
+    event_names = [cast(str, event["event"]) for event in retired_events]
+    assert "visitor_orphan_reaped" in event_names
+    assert "closed_at_exit" in event_names
+
+
+def test_reaped_orphans_are_recorded_even_when_establish_later_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D5 adversarial-review fix: reconciliation runs as the FIRST action
+    inside ``transport.establish()``, before the bring-up identity challenge
+    that can still fail -- ``record_reconciliation_events`` must run from the
+    except-handler too, or a reap that happened moments before a later
+    bring-up failure would be silently lost from the ledger. Uses
+    ``rogue_identity`` (same fixture as
+    ``test_identity_first_bring_up_refuses_before_any_authenticated_request``)
+    to fail bring-up AFTER the reap already ran.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.rogue_identity = True
+    harness.reconciliation_result = ReconciliationResult(reaped_pids=(9999,), swept_config_dirs=0)
+    connection = RemoteConnection(definition=_frp_definition(), settings=_settings(tmp_path))
+
+    with pytest.raises(ChannelBootstrapError):
+        connection.connect()
+
+    reaped_events = [event for event in connection.events if event.event == "visitor_orphan_reaped"]
+    assert len(reaped_events) == 1
+    assert reaped_events[0].detail == "9999"
+    assert connection.events[-1].event == "establish_failed"
+
+
 def test_real_interpreter_exit_kills_the_injected_visitor_process(tmp_path: Path) -> None:
     """The one REQUIRED subprocess-based test (#285): a real exit, not a direct call.
 

@@ -98,6 +98,11 @@ ChannelEventName = Literal[
     # frp_visitor_reconciliation.py), carrying that pid in `detail`.
     "closed_at_exit",
     "visitor_orphan_reaped",
+    # D2 adversarial-review fix: a reconciliation snapshot the OS-native
+    # inspection could not read at all (four typed reasons in
+    # frp_visitor_reconciliation.SNAPSHOT_SKIP_*) is surfaced here instead of
+    # being silently indistinguishable from "found no orphans".
+    "visitor_reconciliation_skipped",
 ]
 
 

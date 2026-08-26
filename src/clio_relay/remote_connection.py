@@ -75,7 +75,7 @@ from clio_relay.remote_connection_registry import (
 from clio_relay.remote_connection_registry import (
     connection_registry as connection_registry,
 )
-from clio_relay.remote_connection_registry import record_reaped_orphans, verify_bootstrap
+from clio_relay.remote_connection_registry import record_reconciliation_events, verify_bootstrap
 from clio_relay.remote_connection_stream_io import (
     MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
 )
@@ -579,9 +579,10 @@ class RemoteConnection:
                 )
             )
             link = transport.establish(nonce=nonce)
-            # #285: recorded before anything below can still fail, so a reap
-            # is never lost from the ledger even if this attempt goes on to fail.
-            record_reaped_orphans(self, transport)
+            # #285/D5: the OTHER outcome (establish() itself raising, so
+            # this line is never reached) is covered by the except-handler's
+            # own call below -- never lost from the ledger either way.
+            record_reconciliation_events(self, transport)
             endpoint = link.control_endpoint
             bootstrap = link.bootstrap
             verify_bootstrap(
@@ -599,6 +600,9 @@ class RemoteConnection:
             )
         except BaseException as exc:
             if transport is not None:
+                # D5: covers the case the try-block's own call above never
+                # reaches -- establish() itself raising.
+                record_reconciliation_events(self, transport)
                 transport.close()
             self._record(
                 channel_event(
