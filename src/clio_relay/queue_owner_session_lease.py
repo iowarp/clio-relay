@@ -187,6 +187,8 @@ class QueueOwnerSessionLeaseMixin:
         running_job_ids: list[str] | tuple[str, ...] = (),
         running_job_ids_truncated: bool = False,
         expected_last_seen_at: datetime | None = None,
+        teardown_failed: bool = False,
+        teardown_error: str | None = None,
         now: datetime | None = None,
     ) -> OwnerSessionLease | None:
         """Terminally close one lease with an exact, typed, non-relabelable reason.
@@ -260,6 +262,10 @@ class QueueOwnerSessionLeaseMixin:
                     "expired_with_running_jobs": reason == "lease_expired" and bool(job_ids),
                     "running_job_ids_at_close": job_ids,
                     "running_job_ids_truncated": running_job_ids_truncated,
+                    # Review residual 1: the record must never claim a clean
+                    # reap when the teardown call failed under it.
+                    "teardown_failed": teardown_failed,
+                    "teardown_error": (None if teardown_error is None else teardown_error[:512]),
                 }
             )
             queue_store_write.write_model(self._storage_root, path, closed)

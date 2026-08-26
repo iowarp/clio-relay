@@ -924,6 +924,17 @@ def test_sweep_defaults_to_conservative_policy_when_no_intent_is_recorded(
     assert request.stop_worker is False
     assert request.cancel_jobs is False
     assert request.cancel_scheduler_jobs is False
+    # Review residual 2: bind the op-id on the DOMINANT no-intent path the
+    # way the recorded-intent test binds its own -- the sweep's teardown
+    # request must carry exactly the operation id its OWN quiesce minted (a
+    # reintroduced fresh-uuid regression fails here, independent of any
+    # error swallowing downstream).
+    minted_intent = queue.get_owner_session_cleanup_intent(
+        "desktop-session-1",
+        session_generation_id="generation-1",
+    )
+    assert minted_intent is not None
+    assert request.expected_cleanup_operation_id == minted_intent["operation_id"]
 
 
 def test_sweep_bounds_retries_and_quarantines_instead_of_spinning_forever(

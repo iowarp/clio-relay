@@ -130,6 +130,13 @@ class OwnerSessionLease(BaseModel):
     #: complete one. ``expired_with_running_jobs`` stays accurate either way
     #: (it only needs to know "at least one").
     running_job_ids_truncated: bool = False
+    #: Review residual 1: an expiry whose teardown call FAILED (with the
+    #: owned-session process possibly still alive) must never be recorded as
+    #: a clean reap -- the record itself would overclaim. ``teardown_failed``
+    #: marks the reap as degraded; ``teardown_error`` carries the bounded
+    #: typed reason so a later ``session attach`` projection can surface it.
+    teardown_failed: bool = False
+    teardown_error: str | None = Field(default=None, max_length=512)
     #: BLOCKER 2: how many consecutive sweep attempts have failed for this
     #: still-open lease. Reset implicitly by never incrementing once the
     #: lease reaches a terminal status.

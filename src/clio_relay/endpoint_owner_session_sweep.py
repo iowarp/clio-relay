@@ -373,6 +373,8 @@ def _sweep_one_owner_session_lease(worker: EndpointWorker, lease: OwnerSessionLe
         )
         return False
 
+    teardown_failed = False
+    teardown_error: str | None = None
     try:
         execute_owned_session_teardown(
             OwnedSessionTeardownRequest(
@@ -386,14 +388,20 @@ def _sweep_one_owner_session_lease(worker: EndpointWorker, lease: OwnerSessionLe
             ),
             core_dir=worker.settings.core_dir,
         )
-    except RelayError:
-        # Not fatal to the sweep: the process may already be gone (the
-        # ordinary crash case), or a concurrent path already tore it down.
-        # A precondition mismatch (the guaranteed-no-op BLOCKER 1 bug) is no
-        # longer reachable here -- operation_id and policy both come from
-        # the SAME resolved intent both calls share. The generation-
-        # admission closure below is what actually matters for "no manual
-        # action" -- log the structured reason and continue.
+    except QueueConflictError:
+        # Review residual 1: a precondition refusal here means the sweep is
+        # misprogrammed or the intent moved underneath us -- the process may
+        # be ALIVE. Never record that as a reap: let the per-lease
+        # containment count it toward bounded retries / quarantine.
+        raise
+    except RelayError as exc:
+        # The DOMINANT benign case: the process is already gone (the
+        # ordinary crash) or a concurrent path already tore it down. Still,
+        # the record must not overclaim (review residual 1): mark the reap
+        # degraded and carry the typed reason so `session attach`'s
+        # projection can surface it.
+        teardown_failed = True
+        teardown_error = f"{type(exc).__name__}: {exc}"
         logger.warning(
             "owner_session.lease_expiry_teardown_failed",
             extra={
@@ -422,6 +430,8 @@ def _sweep_one_owner_session_lease(worker: EndpointWorker, lease: OwnerSessionLe
         running_job_ids=running_job_ids,
         running_job_ids_truncated=running_job_ids_truncated,
         expected_last_seen_at=expected_last_seen_at,
+        teardown_failed=teardown_failed,
+        teardown_error=teardown_error,
     )
     if closed is None or closed.status == "open":
         # By this point the process is already dead and admission already
