@@ -140,7 +140,13 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
     late_jobs = [job for job in post_api_jobs if job.job_id not in initial_job_ids]
     if cancel_jobs and late_jobs:
         late_targets = (
-            cli_owned_relay_jobs._cancel_remote_owned_jobs(definition, cluster, late_jobs)
+            cli_owned_relay_jobs._cancel_remote_owned_jobs(
+                definition,
+                cluster,
+                late_jobs,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
+            )
             if remote_execution
             else cli_owned_relay_jobs._cancel_local_owned_jobs(queue, late_jobs)
         )
@@ -200,6 +206,8 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
             cancel_jobs=cancel_jobs,
             cancel_scheduler_jobs=cancel_scheduler_jobs,
             post_operation_jobs=scheduler_jobs,
+            owner_session_id=session_id,
+            owner_session_generation_id=session_generation_id,
         )
     )
     if cancel_jobs and cancel_scheduler_jobs:
@@ -207,6 +215,8 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
             cli_owned_scheduler_cancel._cancel_owned_scheduler_jobs(
                 definition,
                 owned_jobs,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
             )
         )
         report.resources.extend(scheduler_resources)
@@ -215,6 +225,8 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
         cli_owned_scheduler_cancel._scheduler_sentinel_preservation_resources(
             definition,
             scheduler_sentinel_pre_phases,
+            owner_session_id=session_id,
+            owner_session_generation_id=session_generation_id,
         )
     )
     report.resources.extend(sentinel_resources)

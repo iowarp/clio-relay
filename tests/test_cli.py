@@ -34,6 +34,7 @@ import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
 import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
 import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
 import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
 import clio_relay.cli_owned_report_artifact as cli_owned_report_artifact
 import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
@@ -3402,6 +3403,7 @@ def test_cli_session_teardown_reports_success_when_optional_worker_observation_t
         scheduler_job_id: str,
         *,
         provider: str,
+        **_kwargs: object,
     ) -> tuple[str, None]:
         assert scheduler_job_id == "21958"
         assert provider == "slurm"
@@ -3663,8 +3665,8 @@ def test_cli_remote_teardown_writes_closure_only_in_remote_authoritative_core(
         cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", _fake_empty_runtime_cleanup
     )
     monkeypatch.setattr(
-        cli_owned_relay_jobs,
-        "_list_remote_owned_active_cluster_jobs",
+        cli_owned_relay_jobs_remote_listing,
+        "list_remote_owned_active_cluster_jobs",
         _fake_empty_owned_jobs,
     )
 
@@ -5018,6 +5020,8 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
                 ),
                 (conflicting_id,),
                 jobs,
+                owner_session_id="session-1",
+                owner_session_generation_id="generation-1",
             )
 
     assert provider_calls == []
@@ -5135,6 +5139,8 @@ def test_scheduler_sentinel_rejects_unsafe_post_cancel_phase(
     resources, errors = cli_owned_scheduler_cancel._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="ares", ssh_host="ares", scheduler_provider="slurm"),
         {"unrelated-sentinel": "running"},
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
 
     assert len(resources) == 1
@@ -5288,6 +5294,8 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
         provider="slurm",
         timeout_seconds=0.1,
         poll_seconds=0.01,
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
     report = _verified_teardown_report(
         cluster="local",
@@ -5369,6 +5377,8 @@ def test_owned_relay_job_refuses_scheduler_identity_without_bound_proof() -> Non
         location="ares",
         cancel_jobs=True,
         cancel_scheduler_jobs=True,
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
     refused = next(resource for resource in resources if resource.kind == "scheduler_job")
     assert refused.ownership_verified is False
@@ -5410,6 +5420,8 @@ def test_owner_session_teardown_keeps_missing_scheduler_job_without_residual(
         location="ares",
         cancel_jobs=False,
         cancel_scheduler_jobs=False,
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
     report = _verified_teardown_report(
         resources=[*_verified_teardown_report().resources, *resources]
@@ -5481,6 +5493,8 @@ def test_scheduler_phase_batch_uses_one_remote_command(
     observed = cli_owned_scheduler_cancel._scheduler_phases_after_operation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition,
         (("slurm", "101"), ("slurm", "102")),
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
 
     assert len(calls) == 1
@@ -5759,7 +5773,7 @@ def test_remote_owned_job_discovery_never_cancels_unrelated_session(
 
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_remote)
 
-    jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    jobs = cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
         definition,
         "ares",
         owner_session_id="session-1",
@@ -5769,6 +5783,8 @@ def test_remote_owned_job_discovery_never_cancels_unrelated_session(
         definition,
         "ares",
         jobs,
+        owner_session_id="session-1",
+        owner_session_generation_id="generation-1",
     )
 
     assert canceled == ["owned-job"]
@@ -5806,7 +5822,7 @@ def test_remote_owner_session_discovery_refuses_truncated_legacy_coverage(
     monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
 
     with pytest.raises(RelayError, match="bounded source limit"):
-        cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
             ClusterDefinition(name="ares", ssh_host="ares"),
             "ares",
             owner_session_id="session-1",
@@ -6564,7 +6580,14 @@ def test_remote_worker_info_uses_one_total_observation_deadline(
             site_marker_sha256="a" * 64,
         ),
     )
-    clock = iter((100.0, 101.0, 105.0))
+    # clio-relay#179 review M3: the channel path now also reads a deadline-bound
+    # response_timeout_seconds for BOTH requests (worker-info, then target-info)
+    # before falling back to ssh -- two extra clock reads beyond the original
+    # three (initial deadline, worker-info ssh remaining, target-info ssh
+    # remaining). Those two extra reads are unobserved here (no live channel in
+    # this test, so the computed channel timeout is never consumed) but must
+    # still be present in the fake clock.
+    clock = iter((100.0, 100.5, 101.0, 104.5, 105.0))
     observed_timeouts: list[float] = []
     observed_deadlines: list[float | None] = []
 

@@ -628,10 +628,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # Campaign merge: values are the MEASURED merged-tree counts.
     "src/clio_relay/door_error_adapters.py": 170,
     # door_errors.py: clio-relay#221/#259 (D3/D5) added two typed SSE
-    # refusal reasons taking the file 744 -> 750 -- still 50 under the
-    # DEFAULT_MAX_LINES cap, so per ground rule 5 its baseline entry is
-    # REMOVED rather than raised (the gate's own advisory; an entry at 750
-    # would pin the file to zero self-imposed headroom for no reason).
+    # refusal reasons (744 -> 750) and clio-relay#179 added two owned-
+    # session-channel-route reasons with compacted _http_row rows -- still
+    # comfortably under the DEFAULT_MAX_LINES cap either way, so per ground
+    # rule 5 the baseline entry stays REMOVED rather than pinned at a
+    # zero-headroom self-imposed number.
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead

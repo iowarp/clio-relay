@@ -91,9 +91,12 @@ _EXPECTED_REASONS = frozenset(
         "log_offset_beyond_eof",
         "authentication_required",
         "resource_ownership_refused",
+        "scheduler_job_ownership_refused",
         "session_scope_refused",
         "session_identity_unavailable",
         "session_status_unavailable",
+        "session_intake_quiescence_unavailable",
+        "session_admission_status_unavailable",
         "jarvis_runtime_authority_unavailable",
         "input_ingest_unavailable",
         "job_not_found",
@@ -160,11 +163,16 @@ _EXPECTED_R9_HTTP_STATUSES = {
         400,
     ),
     "authentication_required": 401,
-    **dict.fromkeys({"resource_ownership_refused", "session_scope_refused"}, 403),
+    **dict.fromkeys(
+        {"resource_ownership_refused", "scheduler_job_ownership_refused", "session_scope_refused"},
+        403,
+    ),
     **dict.fromkeys(
         {
             "session_identity_unavailable",
             "session_status_unavailable",
+            "session_intake_quiescence_unavailable",
+            "session_admission_status_unavailable",
             "jarvis_runtime_authority_unavailable",
             "input_ingest_unavailable",
             "job_not_found",
@@ -233,7 +241,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 76
+    assert len(door_errors.REASONS) == 79
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -242,7 +250,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 61
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 64
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -986,6 +994,13 @@ _HTTP_API_SPLIT_MODULES = (
     "http_api_routes_artifacts.py",
     "http_api_routes_gateway.py",
     "http_api_routes_queue.py",
+    # clio-relay#179 dial burn-down: three new owned-session-channel route
+    # modules (review M5) -- ten more door_errors.http_problem(...) sites
+    # (2 in owner-session-admin, 2 in worker-probe, 6 in scheduler,
+    # including S1(b)'s server-side ownership gate).
+    "http_api_routes_owner_session_admin.py",
+    "http_api_routes_scheduler.py",
+    "http_api_routes_worker_probe.py",
 )
 
 
@@ -994,8 +1009,8 @@ def _http_api_split_sources() -> list[tuple[str, str]]:
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 113 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 123 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -1020,6 +1035,10 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
     the sibling ``GET /jobs/{job_id}/artifacts`` route, so its own residual
     failures flow through the generic exception path rather than a bespoke
     ``door_errors.http_problem(...)`` call this test would count).
+
+    123 (was 113): clio-relay#179 dial burn-down (review M5): three new
+    owned-session-channel route modules add 10 more raise sites -- see
+    ``_HTTP_API_SPLIT_MODULES``'s own comment for the per-module breakdown.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1043,7 +1062,7 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 113
+    assert len(calls) == 123
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1083,7 +1102,7 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 128
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 138
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1116,7 +1135,7 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
@@ -1133,6 +1152,11 @@ def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None
     filtered-before-count-check fix's honest refusal shape: there is no
     separate ``job_not_found`` site on this route to add a second one)
     keep the closed-set discipline this test proves.
+
+    clio-relay#179 dial burn-down: 5 more ``exc=``-only sites (2 in
+    ``http_api_routes_worker_probe.py``, 3 in ``http_api_routes_
+    scheduler.py``, each a ``ConfigurationError`` re-raised as
+    ``configuration_error``) join the closed set unchanged: 58 -> 63.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1147,7 +1171,7 @@ def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 58
+    assert len(calls) == 63
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])

@@ -247,6 +247,38 @@ class RetentionCollectRequest(BaseModel):
     expected_updated_at: datetime | None = None
 
 
+class OwnerSessionQuiesceIntakeRequest(BaseModel):
+    """HTTP request to quiesce this owned session's intake for teardown.
+
+    clio-relay#179: replaces the per-operation ``ssh ... session
+    quiesce-intake`` dial with a plain request over the held channel.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cleanup_operation_id: str
+    stop_worker: bool
+    cancel_jobs: bool
+    cancel_scheduler_jobs: bool
+
+
+class SchedulerStatusBatchRequest(BaseModel):
+    """HTTP request to read a bounded batch of exact scheduler job statuses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    scheduler_job_ids: list[str] = Field(min_length=1)
+
+
+class SchedulerCancelRequest(BaseModel):
+    """HTTP request to cancel one scheduler job through its provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+
+
 class ProgressUpdateRequest(BaseModel):
     """HTTP request to record a job progress observation."""
 

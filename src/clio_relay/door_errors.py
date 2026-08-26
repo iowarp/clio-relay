@@ -343,13 +343,14 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("log_offset_beyond_eof", 400, "Log offset beyond EOF"),
             _http_row("authentication_required", 401, "Authentication required"),
             _http_row("resource_ownership_refused", 403, "Resource ownership refused"),
+            _http_row("scheduler_job_ownership_refused", 403, "Scheduler job ownership refused"),
             _http_row("session_scope_refused", 403, "Session scope refused"),
             _http_row("session_identity_unavailable", 404, "Session identity unavailable"),
             _http_row("session_status_unavailable", 404, "Session status unavailable"),
+            _http_row("session_intake_quiescence_unavailable", 404, "Session intake unavailable"),
+            _http_row("session_admission_status_unavailable", 404, "Session admission unavailable"),
             _http_row(
-                "jarvis_runtime_authority_unavailable",
-                404,
-                "JARVIS runtime authority unavailable",
+                "jarvis_runtime_authority_unavailable", 404, "JARVIS runtime authority unavailable"
             ),
             _http_row("input_ingest_unavailable", 404, "Input ingest unavailable"),
             _http_row("job_not_found", 404, "Job not found"),

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -41,11 +42,24 @@ def _remote_worker_info(
         args = [*args, "--pinned-install-receipt-path", definition.relay_install_receipt]
     if definition.dev_mode:
         args = [*args, "--dev-mode"]
+    query: dict[str, object] = {"cluster": definition.name}
+    if definition.relay_install_receipt is not None:
+        query["pinned_install_receipt_path"] = definition.relay_install_receipt
+    if definition.dev_mode:
+        query["dev_mode"] = True
     info = cli_remote_collection_pagination._json_output(
-        _run_remote_clio_before_deadline(
-            definition,
-            args,
-            deadline=deadline,
+        remote_channel_dispatch.dial_or_route_string_ambient(
+            definition=definition,
+            operation="remote_worker_info",
+            method="GET",
+            path="/worker-info",
+            query=query,
+            response_timeout_seconds=_channel_response_timeout_seconds(deadline=deadline),
+            ssh_fallback=lambda: _run_remote_clio_before_deadline(
+                definition,
+                args,
+                deadline=deadline,
+            ),
         ),
         "remote clio-relay worker runtime info",
     )
@@ -75,6 +89,26 @@ def _run_remote_clio_before_deadline(
         return remote_cli.run_remote_clio(definition, args)
 
 
+def _channel_response_timeout_seconds(*, deadline: float | None) -> float | None:
+    """Return the channel path's per-request timeout inside a shared deadline.
+
+    Review M3: ``_remote_worker_info``'s optional total deadline (its
+    caller's 20s cleanup bound, ``REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_
+    SECONDS``) now applies to the channel path too, split across its two
+    requests (worker-info, then target-info) the SAME way the ssh fallback
+    already splits it -- ``deadline`` is one shared monotonic clock, and
+    each request reads the remaining time fresh rather than an even
+    up-front half, so a fast first request leaves more budget for the
+    second rather than wasting it.
+    """
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ObservationTimeoutError("remote worker identity observation timed out")
+    return remaining
+
+
 def _remote_target_identity(
     definition: ClusterDefinition,
     *,
@@ -87,15 +121,23 @@ def _remote_target_identity(
             f"cluster {definition.name} has no operator-pinned target_identity"
         )
     remote_target = cli_remote_collection_pagination._json_output(
-        _run_remote_clio_before_deadline(
-            definition,
-            [
-                "endpoint",
-                "target-info",
-                "--scheduler-provider",
-                definition.scheduler_provider,
-            ],
-            deadline=deadline,
+        remote_channel_dispatch.dial_or_route_string_ambient(
+            definition=definition,
+            operation="remote_target_identity",
+            method="GET",
+            path="/target-info",
+            query={"scheduler_provider": definition.scheduler_provider},
+            response_timeout_seconds=_channel_response_timeout_seconds(deadline=deadline),
+            ssh_fallback=lambda: _run_remote_clio_before_deadline(
+                definition,
+                [
+                    "endpoint",
+                    "target-info",
+                    "--scheduler-provider",
+                    definition.scheduler_provider,
+                ],
+                deadline=deadline,
+            ),
         ),
         "remote physical cluster target info",
     )
