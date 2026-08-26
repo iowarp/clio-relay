@@ -373,6 +373,7 @@ def session_detach(
     """Close the desktop attachment while retaining remote work and session processes."""
     import clio_relay.cli as cli
     import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+    import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
     import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
     import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
     import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
@@ -438,7 +439,7 @@ def session_detach(
             session_id=session_id,
         )
         if remote_execution:
-            owned_jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
+            owned_jobs = cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
                 definition,
                 cluster,
                 owner_session_id=session_id,
@@ -461,11 +462,13 @@ def session_detach(
             cancel_scheduler_jobs=False,
         )
         if remote_execution:
-            post_operation_jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
-                definition,
-                cluster,
-                owner_session_id=session_id,
-                owner_session_generation_id=session_generation_id,
+            post_operation_jobs = (
+                cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
+                    definition,
+                    cluster,
+                    owner_session_id=session_id,
+                    owner_session_generation_id=session_generation_id,
+                )
             )
         else:
             post_operation_jobs = cli_owned_relay_jobs._list_owned_active_cluster_jobs(
@@ -498,6 +501,8 @@ def session_detach(
                 cancel_jobs=False,
                 cancel_scheduler_jobs=False,
                 post_operation_jobs=post_operation_jobs,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
             )
         )
         cli_owned_runtime_cleanup._merge_gateway_cleanup_resources(report, gateway_reports)

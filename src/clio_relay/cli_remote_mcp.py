@@ -127,8 +127,21 @@ def _read_remote_mcp_result_artifact(
     definition: ClusterDefinition,
     job_id: str,
 ) -> tuple[dict[str, object], bytes]:
+    """Read one discovery job's mcp_result artifact.
+
+    clio-relay#179: the artifact-listing dial (``_remote_artifact_records``)
+    and the discovery job's own submission/wait (``remote_mcp_refresh``'s
+    durable flow, above) are unchanged -- out of this slice's scope (the
+    listing call lives in ``cli_jarvis_artifact_io.py``, not one of the four
+    burned modules; the submission/wait pair is the designed remote path).
+    Only this artifact CONTENT read rides the held channel
+    (``GET /artifacts/{artifact_id}/content``, keyed by this process's
+    ambient owned-session identity since ``remote-mcp refresh`` carries no
+    caller-explicit session id) when one is live.
+    """
     import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
     import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+    import clio_relay.remote_channel_dispatch as remote_channel_dispatch
 
     artifacts = cli_jarvis_artifact_io._remote_artifact_records(definition, job_id)
     artifact = cli_jarvis_artifact_io._artifact_record(artifacts, kind="mcp_result")
@@ -138,7 +151,15 @@ def _read_remote_mcp_result_artifact(
     if not isinstance(artifact_id, str) or not artifact_id:
         raise RelayError("remote MCP result artifact has no artifact_id")
     envelope = cli_remote_collection_pagination._json_output(
-        remote_cli.run_remote_clio(definition, ["job", "read-artifact", artifact_id]),
+        remote_channel_dispatch.dial_or_route_string_ambient(
+            definition=definition,
+            operation="read_remote_mcp_result_artifact",
+            method="GET",
+            path=f"/artifacts/{artifact_id}/content",
+            ssh_fallback=lambda: remote_cli.run_remote_clio(
+                definition, ["job", "read-artifact", artifact_id]
+            ),
+        ),
         "remote discovery artifact payload",
     )
     return artifact, cli_jarvis_artifact_io._decode_artifact_envelope(envelope)

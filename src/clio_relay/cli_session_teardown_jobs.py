@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import cast
 
 import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
 import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 import clio_relay.core_queue as core_queue
@@ -42,7 +43,7 @@ def _list_owned_jobs(
     include_terminal: bool = False,
 ) -> list[cli_owned_relay_jobs._OwnedRelayJob]:
     if remote_execution:
-        return cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
+        return cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
             definition,
             cluster,
             owner_session_id=session_id,
@@ -70,7 +71,7 @@ def _list_legacy_jobs(
 ) -> list[cli_owned_relay_jobs._OwnedRelayJob]:
     """Discover unversioned records without treating them as this generation's jobs."""
     if remote_execution:
-        return cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(
+        return cli_owned_relay_jobs_remote_listing.list_remote_owned_active_cluster_jobs(
             definition,
             cluster,
             owner_session_id=session_id,
@@ -346,6 +347,8 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
         scheduler_sentinel_ids,
         owned_jobs,
         gateway_scheduler_job_ids=gateway_scheduler_job_ids,
+        owner_session_id=session_id,
+        owner_session_generation_id=session_generation_id,
     )
     state.scheduler_sentinel_pre_phases = scheduler_sentinel_pre_phases
     canceled: list[str] = []
@@ -353,7 +356,13 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
     if cancel_jobs:
         try:
             cancellation_targets = (
-                cli_owned_relay_jobs._cancel_remote_owned_jobs(definition, cluster, owned_jobs)
+                cli_owned_relay_jobs._cancel_remote_owned_jobs(
+                    definition,
+                    cluster,
+                    owned_jobs,
+                    owner_session_id=session_id,
+                    owner_session_generation_id=session_generation_id,
+                )
                 if remote_execution
                 else cli_owned_relay_jobs._cancel_local_owned_jobs(queue, owned_jobs)
             )

@@ -94,6 +94,8 @@ _EXPECTED_REASONS = frozenset(
         "session_scope_refused",
         "session_identity_unavailable",
         "session_status_unavailable",
+        "session_intake_quiescence_unavailable",
+        "session_admission_status_unavailable",
         "jarvis_runtime_authority_unavailable",
         "input_ingest_unavailable",
         "job_not_found",
@@ -165,6 +167,8 @@ _EXPECTED_R9_HTTP_STATUSES = {
         {
             "session_identity_unavailable",
             "session_status_unavailable",
+            "session_intake_quiescence_unavailable",
+            "session_admission_status_unavailable",
             "jarvis_runtime_authority_unavailable",
             "input_ingest_unavailable",
             "job_not_found",
@@ -233,7 +237,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 76
+    assert len(door_errors.REASONS) == 78
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -242,7 +246,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 61
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 63
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES

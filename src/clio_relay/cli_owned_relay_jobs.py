@@ -13,8 +13,8 @@ from datetime import datetime
 from typing import cast
 from uuid import uuid4
 
-import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 import clio_relay.core_queue as core_queue
+import clio_relay.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -107,14 +107,20 @@ def _quiesce_owner_session_intake(
         command.append("--cleanup-cancel-jobs")
     if cancel_scheduler_jobs:
         command.append("--cleanup-cancel-scheduler-jobs")
-    raw_result = cast(
-        object,
-        json.loads(
-            remote_cli.run_remote_clio(
-                definition,
-                command,
-            )
-        ),
+    raw_result = remote_channel_dispatch.dial_or_route_json(
+        definition=definition,
+        owner_session_id=session_id,
+        owner_session_generation_id=session_generation_id,
+        operation="quiesce_owner_session_intake",
+        method="POST",
+        path="/session/quiesce-intake",
+        body={
+            "cleanup_operation_id": cleanup_operation_id,
+            "stop_worker": stop_worker,
+            "cancel_jobs": cancel_jobs,
+            "cancel_scheduler_jobs": cancel_scheduler_jobs,
+        },
+        ssh_fallback=lambda: json.loads(remote_cli.run_remote_clio(definition, command)),
     )
     if not isinstance(raw_result, dict):
         raise RelayError("remote owner-session intake quiescence returned no evidence")
@@ -180,14 +186,27 @@ def _owner_session_admission_status(
     session_id: str,
     session_generation_id: str,
 ) -> dict[str, object]:
-    """Read owner-session intake through the CLI's injectable remote runner."""
+    """Read owner-session intake (clio-relay#179: rides GET /session/admission-status when live)."""
+    remote_cli_runner = remote_cli.run_remote_clio
+    if remote_execution:
+        remote_cli_runner = (
+            remote_channel_dispatch.channel_backed_json_runner(
+                definition=definition,
+                owner_session_id=session_id,
+                owner_session_generation_id=session_generation_id,
+                operation="owner_session_admission_status",
+                method="GET",
+                path="/session/admission-status",
+            )
+            or remote_cli_runner
+        )
     return owner_session_admission_status(
         queue=queue,
         definition=definition,
         remote_execution=remote_execution,
         session_id=session_id,
         session_generation_id=session_generation_id,
-        remote_cli_runner=remote_cli.run_remote_clio,
+        remote_cli_runner=remote_cli_runner,
     )
 
 
@@ -297,105 +316,6 @@ def _list_owned_active_cluster_jobs(
     return owned
 
 
-def _list_remote_owned_active_cluster_jobs(
-    definition: ClusterDefinition,
-    cluster: str,
-    *,
-    owner_session_id: str,
-    owner_session_generation_id: str | None = None,
-    include_terminal: bool = False,
-) -> list[_OwnedRelayJob]:
-    owned: list[_OwnedRelayJob] = []
-    membership_generations = [owner_session_generation_id]
-    for membership_generation in membership_generations:
-        cursor: str | None = None
-        expected_total: int | None = None
-        processed_source = 0
-        while True:
-            command = [
-                "queue",
-                "owner-jobs",
-                "--cluster",
-                cluster,
-                "--owner-session-id",
-                owner_session_id,
-                "--limit",
-                str(MAX_RESPONSE_PAGE_RECORDS),
-            ]
-            if membership_generation is not None:
-                command.extend(["--owner-session-generation-id", membership_generation])
-            if include_terminal:
-                command.append("--include-terminal")
-            if cursor is not None:
-                command.extend(["--cursor", cursor])
-            payload = cli_remote_collection_pagination._json_output(
-                remote_cli.run_remote_clio(definition, command),
-                f"remote owner-session jobs for {cluster}",
-            )
-            raw_jobs = payload.get("jobs")
-            if not isinstance(raw_jobs, list):
-                raise RelayError("remote owner-session membership returned no jobs array")
-            total = payload.get("source_total")
-            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-                raise RelayError("remote owner-session membership returned an invalid total")
-            if total > cli_remote_collection_pagination.MAX_INTERNAL_COLLECTION_RECORDS:
-                raise RelayError(
-                    "remote owner-session membership exceeds the bounded source limit "
-                    f"{cli_remote_collection_pagination.MAX_INTERNAL_COLLECTION_RECORDS}"
-                )
-            if expected_total is not None and total != expected_total:
-                raise RelayError("remote owner-session membership changed during discovery")
-            expected_total = total
-            source_window_count = payload.get("source_window_count")
-            if (
-                isinstance(source_window_count, bool)
-                or not isinstance(source_window_count, int)
-                or source_window_count < 0
-                or source_window_count > MAX_RESPONSE_PAGE_RECORDS
-            ):
-                raise RelayError("remote owner-session membership returned an invalid source count")
-            processed_source += source_window_count
-            for raw_job in cast(list[object], raw_jobs):
-                if not isinstance(raw_job, dict):
-                    raise RelayError("remote owner-session membership returned a non-object job")
-                job_document = {
-                    str(key): value for key, value in cast(dict[object, object], raw_job).items()
-                }
-                if not _job_is_owned_by_session(
-                    job_document,
-                    owner_session_id,
-                    owner_session_generation_id=owner_session_generation_id,
-                ):
-                    raise RelayError("remote owner-session membership target identity mismatch")
-                job_id = job_document.get("job_id")
-                if not isinstance(job_id, str):
-                    raise RelayError("remote owner-session membership omitted job_id")
-                task_documents = cli_remote_collection_pagination._complete_remote_collection(
-                    definition,
-                    ["job", "tasks", job_id],
-                    record_key="tasks",
-                    label=f"remote owner-session tasks for {job_id}",
-                )
-                candidate = _owned_relay_job(
-                    job_document,
-                    task_documents,
-                    scheduler_provider=definition.scheduler_provider,
-                )
-                if include_terminal or _relay_job_needs_cleanup(candidate):
-                    owned.append(candidate)
-            next_cursor = payload.get("source_next_cursor")
-            if next_cursor is None:
-                if processed_source != total:
-                    raise RelayError(
-                        "remote owner-session membership ended before its declared total"
-                    )
-                break
-            if not isinstance(next_cursor, str) or (cursor is not None and next_cursor <= cursor):
-                raise RelayError("remote owner-session membership returned an invalid cursor")
-            cursor = next_cursor
-    return owned
-
-
 def _cancel_local_owned_jobs(
     queue: core_queue.ClioCoreQueue,
     jobs: list[_OwnedRelayJob],
@@ -425,24 +345,26 @@ def _cancel_remote_owned_jobs(
     definition: ClusterDefinition,
     cluster: str,
     jobs: list[_OwnedRelayJob],
+    *,
+    owner_session_id: str,
+    owner_session_generation_id: str,
 ) -> list[str]:
     requested: list[str] = []
     for job in jobs:
         if job.relay_state not in {JobState.QUEUED, JobState.LEASED, JobState.RUNNING}:
             continue
-        raw_result = cast(
-            object,
-            json.loads(
+        raw_result = remote_channel_dispatch.dial_or_route_json(
+            definition=definition,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+            operation="cancel_remote_owned_job",
+            method="POST",
+            path=f"/queue/jobs/{job.job_id}/cancel",
+            body={"cluster": cluster, "cancel_scheduler_job": False},
+            ssh_fallback=lambda job=job: json.loads(
                 remote_cli.run_remote_clio(
                     definition,
-                    [
-                        "queue",
-                        "cancel",
-                        job.job_id,
-                        "--cluster",
-                        cluster,
-                        "--keep-scheduler-job",
-                    ],
+                    ["queue", "cancel", job.job_id, "--cluster", cluster, "--keep-scheduler-job"],
                 )
             ),
         )
@@ -493,9 +415,16 @@ def _read_owned_relay_job(
 ) -> _OwnedRelayJob:
     """Read one exact cancellation target and reverify its owner-session identity."""
     if remote_execution:
-        raw_status = cast(
-            object,
-            json.loads(remote_cli.run_remote_clio(definition, ["job", "status", job_id])),
+        raw_status = remote_channel_dispatch.dial_or_route_json(
+            definition=definition,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
+            operation="read_owned_relay_job",
+            method="GET",
+            path=f"/jobs/{job_id}/status",
+            ssh_fallback=lambda: json.loads(
+                remote_cli.run_remote_clio(definition, ["job", "status", job_id])
+            ),
         )
         if not isinstance(raw_status, dict):
             raise RelayError(f"remote relay cancellation status was not an object: {job_id}")

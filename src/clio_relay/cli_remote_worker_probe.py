@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import (
     ClusterDefinition,
@@ -41,11 +42,23 @@ def _remote_worker_info(
         args = [*args, "--pinned-install-receipt-path", definition.relay_install_receipt]
     if definition.dev_mode:
         args = [*args, "--dev-mode"]
+    query: dict[str, object] = {"cluster": definition.name}
+    if definition.relay_install_receipt is not None:
+        query["pinned_install_receipt_path"] = definition.relay_install_receipt
+    if definition.dev_mode:
+        query["dev_mode"] = True
     info = cli_remote_collection_pagination._json_output(
-        _run_remote_clio_before_deadline(
-            definition,
-            args,
-            deadline=deadline,
+        remote_channel_dispatch.dial_or_route_string_ambient(
+            definition=definition,
+            operation="remote_worker_info",
+            method="GET",
+            path="/worker-info",
+            query=query,
+            ssh_fallback=lambda: _run_remote_clio_before_deadline(
+                definition,
+                args,
+                deadline=deadline,
+            ),
         ),
         "remote clio-relay worker runtime info",
     )
@@ -87,15 +100,22 @@ def _remote_target_identity(
             f"cluster {definition.name} has no operator-pinned target_identity"
         )
     remote_target = cli_remote_collection_pagination._json_output(
-        _run_remote_clio_before_deadline(
-            definition,
-            [
-                "endpoint",
-                "target-info",
-                "--scheduler-provider",
-                definition.scheduler_provider,
-            ],
-            deadline=deadline,
+        remote_channel_dispatch.dial_or_route_string_ambient(
+            definition=definition,
+            operation="remote_target_identity",
+            method="GET",
+            path="/target-info",
+            query={"scheduler_provider": definition.scheduler_provider},
+            ssh_fallback=lambda: _run_remote_clio_before_deadline(
+                definition,
+                [
+                    "endpoint",
+                    "target-info",
+                    "--scheduler-provider",
+                    definition.scheduler_provider,
+                ],
+                deadline=deadline,
+            ),
         ),
         "remote physical cluster target info",
     )

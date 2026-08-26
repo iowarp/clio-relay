@@ -62,8 +62,11 @@ from clio_relay.http_api_routes_artifacts import register_artifact_routes
 from clio_relay.http_api_routes_events import register_event_routes
 from clio_relay.http_api_routes_gateway import register_gateway_routes
 from clio_relay.http_api_routes_jobs import register_job_routes
+from clio_relay.http_api_routes_owner_session_admin import register_owner_session_admin_routes
 from clio_relay.http_api_routes_queue import register_queue_routes
+from clio_relay.http_api_routes_scheduler import register_scheduler_routes
 from clio_relay.http_api_routes_session import register_session_routes
+from clio_relay.http_api_routes_worker_probe import register_worker_probe_routes
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER as OWNER_SESSION_ID_HEADER
 from clio_relay.job_identity import SESSION_GENERATION_ID_HEADER as SESSION_GENERATION_ID_HEADER
 from clio_relay.job_identity import JobOwnerSessionIdentity
@@ -161,6 +164,9 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         session_submission_dependency=session_submission_dependency,
     )
     register_queue_routes(app, ctx, auth_dependency=auth_dependency)
+    register_owner_session_admin_routes(app, ctx, auth_dependency=auth_dependency)
+    register_scheduler_routes(app, ctx, auth_dependency=auth_dependency)
+    register_worker_probe_routes(app, ctx, auth_dependency=auth_dependency)
 
     return app
 

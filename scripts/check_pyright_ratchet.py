@@ -145,11 +145,17 @@ from typing import Any, NamedTuple
 # the root; the ratchet forbids exactly that kind of one-site accounting).
 # Retyped all eight parameters to ``fastapi.params.Depends`` (the real
 # runtime type -- every call site already passes ``Depends(...)``); purely
-# mechanical, no call-site or behavior changes (verified: create_app()
-# still builds and the full http_api/artifact-listing test batteries still
-# pass byte-for-byte). Measured via `uv run --no-sync python scripts/
-# check_pyright_ratchet.py`: 7626 -> 7574.
-BASELINE_TOTAL = 7574
+# mechanical, no call-site or behavior changes. Measured: 7626 -> 7574.
+#
+# clio-relay#179 dial burn-down slice: the new channel-routing modules
+# (remote_channel_dispatch.py, the three new http_api_routes_*.py surfaces,
+# cli_owned_relay_jobs_remote_listing.py) and their two new conformance
+# test files landed fully typed (explicit `fastapi.params.Depends`, typed
+# `def` fakes, one redundant cast dropped) -- its own net -5, measured
+# 7621 on its pre-#278 base. Rebased over #278's -52, the two deltas
+# compound on disjoint sites; re-measured on the merged tree and recorded
+# below.
+BASELINE_TOTAL = 7569
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
