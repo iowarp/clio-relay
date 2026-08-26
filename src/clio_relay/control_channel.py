@@ -90,6 +90,19 @@ ChannelEventName = Literal[
     "reestablished",
     "stream_reproven",
     "closed",
+    # iowarp/clio-relay#285 self-clean doctrine: "closed_at_exit" is the same
+    # release as "closed", stamped by the registry's atexit hook instead of an
+    # explicit caller (remote_connection_registry.py); "visitor_orphan_reaped"
+    # is recorded once per prior-process orphan a NEW visitor's own spawn
+    # reaped before dialing (frp_transport.py, via
+    # frp_visitor_reconciliation.py), carrying that pid in `detail`.
+    "closed_at_exit",
+    "visitor_orphan_reaped",
+    # D2 adversarial-review fix: a reconciliation snapshot the OS-native
+    # inspection could not read at all (four typed reasons in
+    # frp_visitor_reconciliation.SNAPSHOT_SKIP_*) is surfaced here instead of
+    # being silently indistinguishable from "found no orphans".
+    "visitor_reconciliation_skipped",
 ]
 
 

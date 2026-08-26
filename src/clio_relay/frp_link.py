@@ -91,6 +91,8 @@ from clio_relay.relay_host import (
 # so a future change to either is a conscious decision, not silent drift.
 DEFAULT_STDERR_BUFFER_MAX_BYTES: Final = 2_000
 DEFAULT_FRP_VISITOR_HEALTH_TIMEOUT_SECONDS: Final = 30.0
+# Rendered-visitor temp-dir prefix; frp_visitor_reconciliation.py (#285) reuses this.
+VISITOR_CONFIG_DIR_PREFIX: Final = "clio-relay-frp-visitor-"
 
 FrpVisitorType = Literal["stcp", "xtcp"]
 
@@ -630,7 +632,7 @@ class HeldFrpVisitor:
         """Write the visitor TOML to a 0600 temp file and spawn ``frpc -c <toml>``."""
         if self._established:
             raise RelayError("frp visitor was already established")
-        temp_dir = tempfile.TemporaryDirectory(prefix="clio-relay-frp-visitor-")
+        temp_dir = tempfile.TemporaryDirectory(prefix=VISITOR_CONFIG_DIR_PREFIX)
         try:
             config_path = Path(temp_dir.name) / "frpc-visitor.toml"
             rendered = render_visitor_config(
