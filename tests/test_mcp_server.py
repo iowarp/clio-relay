@@ -28,6 +28,9 @@ from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.identifiers import durable_record_id_json_schema
+from clio_relay.mcp_remote_transport import (
+    _owned_job_logs,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
 from clio_relay.mcp_server import (
     McpSessionState,
     handle_request,
@@ -1570,13 +1573,77 @@ def test_mcp_compact_status_observe_wait_and_cancel(tmp_path: Path) -> None:
     assert observed["matches"][0]["source"] == "stdout"
     assert observed["matches"][0]["groupdict"] == {"step": "25"}
     assert "step 25" in observed["logs"]["stdout"]["text"]
+    # clio-relay#221/#259: relay_observe's default (non-until_pattern) log
+    # view now includes console/console_stderr alongside stdout/stderr --
+    # cheap mid-run visibility, independent of the SSE route -- so a polling
+    # caller sees these streams exist even for a job (JARVIS-kind, not an
+    # mcp_call jarvis_run) that never writes them: present, empty, eof.
+    assert observed["logs"]["console"] == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "text": "",
+    }
+    assert observed["logs"]["console_stderr"]["eof"] is True
+    assert observed["logs"]["console_stderr"]["text"] == ""
     assert wait_response is not None
     waited = wait_response["result"]["structuredContent"]
     assert waited["terminal"] is True
     assert waited["observation"]["outcome"] == "terminal"
     assert "finished" in waited["logs"]["stdout"]["text"]
+    assert waited["logs"]["console"]["eof"] is True
+    assert waited["logs"]["console_stderr"]["eof"] is True
     assert cancel_response is not None
     assert cancel_response["result"]["structuredContent"]["job_id"] == job.job_id
+
+
+def test_owned_job_logs_includes_console_streams_alongside_stdout_stderr() -> None:
+    """clio-relay#221/#259: `_owned_job_logs` (the owned-session, remote-
+    cluster half of relay_observe/relay_wait's default log view) requests
+    all four log streams -- the owned-session HTTP door already serves
+    console/console_stderr identically to stdout/stderr
+    (test_get_log_serves_console_stream_like_stdout_and_stderr,
+    test_http_api.py), so a jarvis_run mcp_call job dispatched to a remote
+    cluster via an owned session is just as visible mid-run as a local one.
+    """
+    requested_paths: list[str] = []
+
+    class _FakeOwnedSessionApiClient:
+        def request_json(
+            self,
+            *,
+            method: str,
+            path: str,
+            query: dict[str, object] | None = None,
+            body: dict[str, object] | None = None,
+            response_timeout_seconds: float | None = None,
+        ) -> object:
+            del method, body, response_timeout_seconds
+            requested_paths.append(path)
+            stream = path.rsplit("/", 1)[-1]
+            return {
+                "job_id": "job_1",
+                "stream": stream,
+                "offset": 0,
+                "next_offset": 0,
+                "eof": True,
+                "text": "",
+                "requested_query": query,
+            }
+
+    logs = _owned_job_logs(cast(Any, _FakeOwnedSessionApiClient()), "job_1", limit=65536)
+
+    assert set(logs) == {"stdout", "stderr", "console", "console_stderr"}
+    assert set(requested_paths) == {
+        "/jobs/job_1/logs/stdout",
+        "/jobs/job_1/logs/stderr",
+        "/jobs/job_1/logs/console",
+        "/jobs/job_1/logs/console_stderr",
+    }
+    for stream_name in ("stdout", "stderr", "console", "console_stderr"):
+        assert logs[stream_name]["stream"] == stream_name
 
 
 def test_mcp_wait_omits_logs_unless_explicitly_requested(

@@ -34,6 +34,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.session_api import OwnedSessionApiClient
+from clio_relay.spool import LOG_STREAM_NAMES
 
 JSON = dict[str, Any]
 
@@ -315,6 +316,20 @@ def _owned_job_logs(
     *,
     limit: int,
 ) -> JSON:
+    """Return the current log page for every stream an owned-session job can carry.
+
+    clio-relay#221/#259: includes ``console``/``console_stderr`` alongside
+    ``stdout``/``stderr`` -- the owned-session HTTP door already serves all
+    four identically (``GET /jobs/{id}/logs/{stream}``), so a
+    ``jarvis_run`` mcp_call job dispatched to a remote cluster via an owned
+    session is just as visible mid-run as a local one (`_job_logs`,
+    mcp_job_lifecycle.py). Deliberately NOT mirrored onto `_remote_job_logs`
+    below: that path shells out to the remote ``clio-relay job read-log``
+    CLI, whose ``--stream`` option still rejects anything but
+    stdout/stderr (cli_job_records.py) -- extending its stream set here
+    without first fixing that command would either error loudly for a
+    legacy direct-SSH deployment or, worse, silently mislabel data.
+    """
     return {
         stream: _owned_json(
             client,
@@ -323,5 +338,5 @@ def _owned_job_logs(
             query={"offset": 0, "limit": limit},
             label=f"owned remote {stream} log",
         )
-        for stream in ("stdout", "stderr")
+        for stream in LOG_STREAM_NAMES
     }

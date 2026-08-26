@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
+import time
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -14,6 +17,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from clio_relay import door_errors as door_errors_module
 from clio_relay import http_api as http_api_module
+from clio_relay import http_api_streaming as http_api_streaming_module
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -101,6 +105,36 @@ def _bind_owned_session_cluster_authority(
         cluster_route_revision(bound_definition),
     )
     return bound_definition
+
+
+def _parse_sse_frames(body: str) -> list[dict[str, str]]:
+    """Parse a raw ``text/event-stream`` body into ``{event, data, id}`` frames.
+
+    A minimal test-only parser matching the wire shape
+    :func:`clio_relay.http_api_streaming._log_tail_sse_events` writes:
+    each frame is one ``id:``/``event:``/``data:`` line group terminated by
+    a blank line.
+    """
+    frames: list[dict[str, str]] = []
+    event = "message"
+    data_lines: list[str] = []
+    frame_id = ""
+    for raw_line in body.split("\n"):
+        line = raw_line.rstrip("\r")
+        if line == "":
+            if data_lines:
+                frames.append({"event": event, "data": "\n".join(data_lines), "id": frame_id})
+            event = "message"
+            data_lines = []
+            frame_id = ""
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:") :].removeprefix(" "))
+        elif line.startswith("event:"):
+            event = line[len("event:") :].removeprefix(" ")
+        elif line.startswith("id:"):
+            frame_id = line[len("id:") :].removeprefix(" ")
+    return frames
 
 
 def test_http_monitor_logs_and_artifact_content(tmp_path: Path) -> None:
@@ -247,6 +281,211 @@ def test_get_log_serves_console_stderr_stream_like_console(tmp_path: Path) -> No
     assert tail_response.status_code == 200
     assert tail_response.json()["text"] == ": rank 3 near OOM\n"
     assert tail_response.json()["eof"] is True
+
+
+def test_http_log_sse_streams_chunk_and_ends_on_terminal_eof(tmp_path: Path) -> None:
+    """clio-relay#221/#259: the SSE log-tail route's basic shape -- a
+    ``log_chunk`` event carrying the already-written bytes, then a typed
+    ``end`` event once the owning job is terminal AND the stream is
+    drained, on the SAME auth/stream vocabulary as the byte-range route
+    right above it."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-log-sse",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    (spool / "console.log").write_bytes(b"thermo: step 0 temp 300.0\n")
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.stream(
+        "GET",
+        f"/jobs/{job.job_id}/logs/console/sse",
+        params={"poll_seconds": 0.05},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    written_bytes = len(b"thermo: step 0 temp 300.0\n")
+    frames = _parse_sse_frames(body)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    log_chunk_frames = [frame for frame in frames if frame["event"] == "log_chunk"]
+    end_frames = [frame for frame in frames if frame["event"] == "end"]
+    assert len(log_chunk_frames) == 1
+    assert len(end_frames) == 1
+    chunk_frame = log_chunk_frames[0]
+    end_frame = end_frames[0]
+    chunk_data = json.loads(chunk_frame["data"])
+    assert chunk_data == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "chunk": "thermo: step 0 temp 300.0\n",
+        "offset": written_bytes,
+    }
+    # The `id:` line on the log_chunk frame carries the resumable offset.
+    assert chunk_frame["id"] == str(written_bytes)
+    end_data = json.loads(end_frame["data"])
+    assert end_data == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "state": "succeeded",
+        "offset": written_bytes,
+    }
+    assert frames.index(chunk_frame) < frames.index(end_frame)
+
+
+def test_http_log_sse_resumes_from_offset(tmp_path: Path) -> None:
+    """clio-relay#221/#259: a client reconnecting with a later ``offset``
+    (after a drop, or simply resuming) only receives the remainder -- same
+    byte-offset semantics as the byte-range route's own resume behavior."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-log-sse-resume",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    (spool / "console.log").write_bytes(b"thermo: step 0\nthermo: step 1\n")
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.stream(
+        "GET",
+        f"/jobs/{job.job_id}/logs/console/sse",
+        params={"offset": len("thermo: step 0\n"), "poll_seconds": 0.05},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert "thermo: step 0" not in body
+    assert "thermo: step 1" in body
+    assert "event: end" in body
+
+
+def test_http_log_sse_typed_404_for_missing_job_and_400_for_bad_stream(tmp_path: Path) -> None:
+    """clio-relay#221/#259: nonexistent job -> ``job_not_found`` (404), same
+    reason the byte-range route raises; unknown stream name ->
+    ``log_stream_invalid`` (400), same reason and status too."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-log-sse-404",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    missing_job = client.get("/jobs/does-not-exist/logs/console/sse")
+    bad_stream = client.get(f"/jobs/{job.job_id}/logs/bogus-stream/sse")
+
+    assert missing_job.status_code == 404
+    assert missing_job.json()["reason"] == "job_not_found"
+    assert bad_stream.status_code == 400
+    assert bad_stream.json()["reason"] == "log_stream_invalid"
+
+
+def test_http_log_sse_enforces_configured_token(tmp_path: Path) -> None:
+    """clio-relay#221/#259: the SSE route shares the byte-range route's exact
+    ``auth_dependency`` -- proven directly here rather than only inferred
+    from the general app-wide auth test."""
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        api_token="secret-token",
+    )
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="http-log-sse-auth",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+    path = f"/jobs/{job.job_id}/logs/console/sse"
+
+    missing = client.get(path)
+    with client.stream("GET", path, headers={"Authorization": "Bearer secret-token"}) as authorized:
+        authorized.read()
+
+    assert missing.status_code == 401
+    assert authorized.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_log_tail_sse_events_pushes_appended_chunk_within_follow_interval(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#221/#259: the core latency proof, at the unit the design
+    calls out -- the follow LOOP, not the whole HTTP stack. Drives
+    ``_log_tail_sse_events`` directly on a real ``asyncio`` event loop: a
+    sibling task writes the append only after the generator has entered its
+    first (no-data-yet) ``asyncio.sleep`` wait, so the chunk is genuinely
+    picked up mid-wait, not merely caught up on connect. Timed with
+    ``asyncio.wait_for`` against real wall-clock elapsed time -- never a
+    sleep-then-check race."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-latency",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.RUNNING)
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    console_path = spool / "console.log"
+    console_path.write_bytes(b"")
+
+    async def write_after_first_poll() -> None:
+        # One loop tick is enough: `_log_tail_sse_events`'s first iteration
+        # runs its (synchronous) empty-file read to completion and reaches
+        # its own `await asyncio.sleep(poll_seconds)` before this resumes,
+        # so the write below lands strictly DURING that wait, never before it.
+        await asyncio.sleep(0)
+        console_path.write_bytes(b"thermo: step 0 temp 300.0\n")
+
+    generator = http_api_streaming_module._log_tail_sse_events(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        settings,
+        queue,
+        job.job_id,
+        stream_name="console",
+        offset=0,
+        poll_seconds=0.05,
+    )
+    writer = asyncio.ensure_future(write_after_first_poll())
+    start = time.monotonic()
+    try:
+        first_frame = await asyncio.wait_for(generator.__anext__(), timeout=0.5)
+    finally:
+        await writer
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.5, f"appended chunk arrived after {elapsed:.3f}s"
+    assert "event: log_chunk" in first_frame
+    assert "thermo: step 0 temp 300.0" in first_frame
+    await cast(AsyncGenerator[str, None], generator).aclose()
 
 
 def test_oversized_artifact_content_answers_413_payload_too_large_not_200(
@@ -1571,7 +1810,7 @@ def test_owned_session_api_allows_explicit_unauthenticated_loopback_session(
     response = cast(Any, TestClient(create_app(settings))).get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "auth": False}
+    assert response.json() == {"ok": True, "auth": False, "console_sse": True}
 
 
 def test_owned_session_api_reports_missing_server_generation_identity(
@@ -3523,7 +3762,7 @@ def test_http_healthz_does_not_require_token(tmp_path: Path) -> None:
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "auth": True}
+    assert response.json() == {"ok": True, "auth": True, "console_sse": True}
 
 
 def test_http_cancel_job_records_cancel_request(tmp_path: Path) -> None:

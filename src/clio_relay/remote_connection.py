@@ -32,6 +32,7 @@ import http.client
 import math
 import secrets
 import threading
+from collections.abc import Iterator
 from contextlib import suppress
 from typing import Final, Literal, cast
 
@@ -74,10 +75,12 @@ from clio_relay.remote_connection_registry import (
 from clio_relay.remote_connection_stream_io import (
     MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
 )
+from clio_relay.remote_connection_stream_io import LogStreamChunk as LogStreamChunk
 from clio_relay.remote_connection_stream_io import (
     _is_stale_stream_error,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _open_identity_bound_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _request_json_on_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    _stream_log_chunks_over_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 
 MAX_RECORDED_CHANNEL_EVENTS: Final = 256
@@ -397,6 +400,36 @@ class RemoteConnection:
                 continue
             self._release_stream(stream)
             return document
+
+    def stream_log_chunks(
+        self,
+        *,
+        job_id: str,
+        stream_name: str,
+        offset: int = 0,
+        poll_seconds: float | None = None,
+    ) -> Iterator[LogStreamChunk]:
+        """Follow one job log stream over the held channel, no extra ssh
+        dial (clio-relay#221/#259). A mid-stream failure surfaces as
+        :class:`~clio_relay.control_channel.ChannelDropped`, never retried
+        here -- resuming from the last chunk's ``offset`` is the caller's own
+        choice.
+        """
+        validate_channel_request(method="GET", path=f"/jobs/{job_id}/logs/{stream_name}/sse")
+        stream = self._acquire_stream(reason="log_sse_opened")
+        try:
+            yield from _stream_log_chunks_over_stream(
+                stream=stream,
+                job_id=job_id,
+                stream_name=stream_name,
+                offset=offset,
+                poll_seconds=poll_seconds,
+                api_token=self._api_token,
+                session_id=self._session_id,
+                generation_id=self._generation_id,
+            )
+        finally:
+            self._discard_stream(stream)
 
     def session_status(self) -> dict[str, object]:
         """Read the remote relay session's status over the held channel.

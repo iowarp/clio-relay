@@ -72,6 +72,7 @@ from clio_relay.queue_management import cancel_queue_job
 from clio_relay.relay_ops import job_status, monitor_job, read_job_log
 from clio_relay.remote_cli import remote_command_timeout
 from clio_relay.session_api import OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS
+from clio_relay.spool import LOG_STREAM_NAMES
 
 JSON = dict[str, Any]
 
@@ -583,10 +584,21 @@ def _job_logs(
     *,
     limit: int,
 ) -> JSON:
+    """Return the current log page for every stream a LOCAL job can carry.
+
+    clio-relay#221/#259: includes ``console``/``console_stderr`` alongside
+    ``stdout``/``stderr`` so a polling ``relay_observe`` caller sees mid-run
+    application output exist without opening the SSE log-tail route --
+    cheap and independent of it, per #221's design. A job that never writes
+    those two streams (every mcp_call tool except ``jarvis_run``, and every
+    non-mcp_call job) reads back an empty, ``eof: true`` page for them
+    (``JobSpool.read_log`` never errors on an unwritten stream), so this
+    never turns an ordinary job's observation into a new failure mode.
+    """
     job = queue.get_job(job_id)
     return {
-        "stdout": read_job_log(settings, job, stream_name="stdout", offset=0, limit=limit),
-        "stderr": read_job_log(settings, job, stream_name="stderr", offset=0, limit=limit),
+        stream: read_job_log(settings, job, stream_name=stream, offset=0, limit=limit)
+        for stream in LOG_STREAM_NAMES
     }
 
 

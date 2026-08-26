@@ -16,13 +16,28 @@ dead-pooled-stream signature ``RemoteConnection.request_json`` retries
 exactly once -- deliberately narrow so an HTTP-status failure or a
 slow-but-live server (``ObservationTimeoutError``) never retries under a
 second identity-bound stream.
+
+clio-relay#221/#259: :func:`_stream_sse_frames_on_stream` adds the live-
+console lane's client half -- a fourth step, sibling to
+:func:`_request_json_on_stream`/:func:`read_json_response`, for the one
+owned-session exchange whose response is not one bounded JSON document but
+an unbounded ``text/event-stream`` body. It reuses the exact same
+identity-bound, never-reconnecting ``http.client.HTTPConnection`` those two
+already require -- rides the SAME held channel, opens no new dial -- but
+reads the body incrementally as :class:`SseFrame`\\ s instead of all at once.
+Deliberately never retried the way :func:`_request_json_on_stream` is:
+once frames have started reaching the caller, a transport failure can only
+be reported forward as :class:`~clio_relay.control_channel.ChannelDropped`,
+never silently replayed under a second stream and re-delivered as if
+nothing happened -- resuming (a fresh call with a later offset) is always
+the caller's own explicit choice.
 """
 
-# _is_stale_stream_error/_open_identity_bound_stream/_request_json_on_stream
-# are leaf primitives called only from remote_connection.py's RemoteConnection
-# class (whose methods stay resident there after this split), or from tests --
-# never from within this file -- matching storage_ledger_codec.py's own
-# leaf-primitive precedent.
+# _is_stale_stream_error/_open_identity_bound_stream/_request_json_on_stream/
+# _stream_sse_frames_on_stream are leaf primitives called only from
+# remote_connection.py's RemoteConnection class (whose methods stay resident
+# there after this split), or from tests -- never from within this file --
+# matching storage_ledger_codec.py's own leaf-primitive precedent.
 # pyright: reportUnusedFunction=false
 
 from __future__ import annotations
@@ -31,10 +46,12 @@ import hmac
 import http.client
 import json
 import urllib.parse
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Final, cast
 
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
-from clio_relay.control_channel import ChannelEndpoint
+from clio_relay.control_channel import ChannelDropped, ChannelEndpoint
 from clio_relay.errors import ObservationTimeoutError, RelayError
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
@@ -228,3 +245,202 @@ def verify_session_identity(
         or not hmac.compare_digest(observed_signature, expected_signature)
     ):
         raise RelayError("owned session API server identity HMAC did not verify")
+
+
+@dataclass(frozen=True, slots=True)
+class SseFrame:
+    """One parsed Server-Sent Event frame off an identity-bound stream."""
+
+    event: str
+    data: str
+    id: str | None
+
+
+def _sse_field_value(line: str, *, prefix: str) -> str:
+    """Return one SSE field's value, dropping at most one leading space."""
+    value = line[len(prefix) :]
+    return value[1:] if value.startswith(" ") else value
+
+
+def _stream_sse_frames_on_stream(
+    *,
+    stream: http.client.HTTPConnection,
+    method: str,
+    path: str,
+    query: dict[str, object] | None,
+    api_token: str,
+    session_id: str,
+    generation_id: str,
+) -> Iterator[SseFrame]:
+    """Issue one streaming GET and yield parsed Server-Sent Event frames.
+
+    Same identity-bound, non-reconnecting stream discipline as
+    :func:`_request_json_on_stream` (never lets ``HTTPConnection`` silently
+    redial), but the response body is read line-by-line as SSE frames land
+    instead of being read whole. A frame dispatches on its blank-line
+    terminator, matching the SSE spec's own framing; only frames carrying a
+    ``data:`` field are dispatched (a bare ``id:``/comment-only frame is
+    swallowed, exactly as a browser ``EventSource`` would).
+
+    Raises:
+        RelayError: The request could not be sent, or the initial response
+            was not HTTP 200 -- the same two conditions
+            :func:`_request_json_on_stream` itself would raise for.
+        ChannelDropped: The stream failed -- or the peer closed it -- after
+            the response began, before an ``event: end`` frame was seen. A
+            clean finish is the caller's own ``end`` frame; anything else
+            ending the body is a drop, not a completion, and is never
+            retried here (contrast clio-relay#213's narrow pre-first-byte
+            stale-pooled-stream retry in ``RemoteConnection.request_json``).
+    """
+    encoded_query = "" if query is None else "?" + urllib.parse.urlencode(query)
+    headers = {
+        "Accept": "text/event-stream",
+        "Authorization": f"Bearer {api_token}",
+        OWNER_SESSION_ID_HEADER: session_id,
+        SESSION_GENERATION_ID_HEADER: generation_id,
+    }
+    try:
+        stream.request(method, path + encoded_query, headers=headers)
+        response = stream.getresponse()
+    except (OSError, http.client.HTTPException) as exc:
+        raise RelayError(
+            f"owned session API stream request failed for {method} {path}: {exc}"
+        ) from exc
+    if response.status != 200:
+        document = read_json_response(response, label=f"{method} {path}")
+        detail = json.dumps(document, ensure_ascii=False)[:2_000]
+        raise RelayError(
+            f"owned session API stream request failed: {method} {path}: "
+            f"HTTP {response.status}: {detail}"
+        )
+    event_type = "message"
+    data_lines: list[str] = []
+    event_id: str | None = None
+    try:
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                # The peer closed the body before an explicit `end` frame --
+                # a drop, not a clean finish. A clean finish returns from
+                # this generator normally, right after yielding that frame
+                # below; this is the ONLY other way the loop ends.
+                raise ChannelDropped(
+                    f"owned session API stream closed unexpectedly: {method} {path}"
+                )
+            line = raw_line.decode("utf-8", errors="replace")
+            line = line[:-1] if line.endswith("\n") else line
+            line = line[:-1] if line.endswith("\r") else line
+            if line == "":
+                if data_lines:
+                    yield SseFrame(event=event_type, data="\n".join(data_lines), id=event_id)
+                    if event_type == "end":
+                        return
+                event_type = "message"
+                data_lines = []
+                event_id = None
+                continue
+            if line.startswith(":"):
+                continue  # SSE comment/keepalive line -- never a field.
+            if line.startswith("data:"):
+                data_lines.append(_sse_field_value(line, prefix="data:"))
+            elif line.startswith("event:"):
+                event_type = _sse_field_value(line, prefix="event:")
+            elif line.startswith("id:"):
+                event_id = _sse_field_value(line, prefix="id:")
+    except (OSError, http.client.HTTPException) as exc:
+        raise ChannelDropped(
+            f"owned session API stream read failed for {method} {path}: {exc}"
+        ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class LogStreamChunk:
+    """One decoded increment of a followed job log stream (clio-relay#221/#259)."""
+
+    job_id: str
+    stream: str
+    text: str
+    offset: int
+    end: bool
+    state: str | None = None
+
+
+def _log_stream_chunk_from_frame(
+    frame: SseFrame, *, job_id: str, stream_name: str
+) -> LogStreamChunk:
+    """Decode one :func:`_stream_sse_frames_on_stream` frame into a typed chunk."""
+    try:
+        payload: object = json.loads(frame.data) if frame.data else {}
+    except json.JSONDecodeError as exc:
+        raise RelayError(
+            f"owned session API log stream returned a non-JSON {frame.event} frame"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RelayError(f"owned session API log stream {frame.event} frame was not a JSON object")
+    typed_payload = cast(dict[str, object], payload)
+    if typed_payload.get("job_id") != job_id or typed_payload.get("stream") != stream_name:
+        raise RelayError(
+            "owned session API log stream frame did not match the requested job/stream"
+        )
+    offset_value = typed_payload.get("offset")
+    if not isinstance(offset_value, int):
+        raise RelayError("owned session API log stream frame carried an invalid offset")
+    if frame.event == "end":
+        state = typed_payload.get("state")
+        return LogStreamChunk(
+            job_id=job_id,
+            stream=stream_name,
+            text="",
+            offset=offset_value,
+            end=True,
+            state=state if isinstance(state, str) else None,
+        )
+    if frame.event != "log_chunk":
+        raise RelayError(f"owned session API log stream sent an unexpected frame: {frame.event}")
+    chunk_text = typed_payload.get("chunk")
+    if not isinstance(chunk_text, str):
+        raise RelayError("owned session API log stream frame carried no chunk text")
+    return LogStreamChunk(
+        job_id=job_id,
+        stream=stream_name,
+        text=chunk_text,
+        offset=offset_value,
+        end=False,
+    )
+
+
+def _stream_log_chunks_over_stream(
+    *,
+    stream: http.client.HTTPConnection,
+    job_id: str,
+    stream_name: str,
+    offset: int,
+    poll_seconds: float | None,
+    api_token: str,
+    session_id: str,
+    generation_id: str,
+) -> Iterator[LogStreamChunk]:
+    """Compose the SSE frame reader and chunk decoder for one log-tail follow.
+
+    The one seam :meth:`~clio_relay.remote_connection.RemoteConnection.
+    stream_log_chunks` calls -- it owns only acquiring/discarding the pooled
+    stream around this generator, keeping the SSE wire mechanics
+    (:func:`_stream_sse_frames_on_stream`) and decoding
+    (:func:`_log_stream_chunk_from_frame`) resident here, next to the frame
+    parser they both depend on.
+    """
+    path = f"/jobs/{job_id}/logs/{stream_name}/sse"
+    query: dict[str, object] = {"offset": offset}
+    if poll_seconds is not None:
+        query["poll_seconds"] = poll_seconds
+    for frame in _stream_sse_frames_on_stream(
+        stream=stream,
+        method="GET",
+        path=path,
+        query=query,
+        api_token=api_token,
+        session_id=session_id,
+        generation_id=generation_id,
+    ):
+        yield _log_stream_chunk_from_frame(frame, job_id=job_id, stream_name=stream_name)

@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from clio_relay import door_error_adapters, door_errors
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
@@ -30,6 +30,7 @@ from clio_relay.errors import NotFoundError, RelayError
 from clio_relay.http_api_context import RelayApiContext
 from clio_relay.http_api_models import ProgressUpdateRequest
 from clio_relay.http_api_redaction import _public_model_page, _public_payload, _public_record
+from clio_relay.http_api_streaming import LOG_SSE_FOLLOW_POLL_SECONDS, _log_tail_sse_events
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.models import ProgressRecord
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
@@ -73,6 +74,52 @@ def register_artifact_routes(
             )
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
+
+    @app.get("/jobs/{job_id}/logs/{stream_name}/sse", dependencies=[auth_dependency])
+    def get_log_sse(
+        job_id: DurableRecordId,
+        stream_name: str,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        poll_seconds: float = LOG_SSE_FOLLOW_POLL_SECONDS,
+    ) -> StreamingResponse:
+        """Stream a job log as Server-Sent Events from a byte offset.
+
+        clio-relay#221/#259 live-console lane: the push-side sibling of
+        ``GET /jobs/{job_id}/logs/{stream_name}`` immediately above -- same
+        auth (``dependencies=[auth_dependency]``), same owned-job admission
+        (``ctx.require_owned_job``), and the exact same typed refusal
+        vocabulary (``log_stream_invalid`` for an unknown stream,
+        ``job_not_found`` for a job this session cannot see or that does not
+        exist) -- so a client that already handles the byte-range route's
+        errors needs nothing new to handle this one's. Rides the caller's
+        already-open connection to the door; it opens no ssh dial or
+        transport of its own.
+        """
+        if poll_seconds <= 0:
+            raise door_errors.http_problem("poll_interval_invalid", "poll_seconds must be positive")
+        if stream_name not in LOG_STREAM_NAMES:
+            raise door_errors.http_problem(
+                "log_stream_invalid",
+                message=f"stream must be one of: {', '.join(LOG_STREAM_NAMES)}",
+            )
+        try:
+            ctx.require_owned_job(job_id)
+        except NotFoundError as exc:
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
+        return StreamingResponse(
+            _log_tail_sse_events(
+                ctx.resolved,
+                ctx.queue,
+                job_id,
+                # pyright narrows str -> LogStreamName from the `not in
+                # LOG_STREAM_NAMES` guard above, matching `get_log`'s own
+                # narrowing comment -- no cast needed.
+                stream_name=stream_name,
+                offset=offset,
+                poll_seconds=poll_seconds,
+            ),
+            media_type="text/event-stream",
+        )
 
     @app.get(
         "/jobs/{job_id}/artifacts",
