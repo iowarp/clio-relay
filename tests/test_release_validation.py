@@ -29,7 +29,7 @@ from clio_relay.command_evidence import (
 )
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.release_check_runtime import default_command_runner
+from clio_relay.release_check_runtime import default_command_runner, run_checkout_command
 from clio_relay.release_command_stream import TIMEOUT_RETURNCODE, run_streaming_command
 from clio_relay.release_validation import (
     LocalReleaseValidationOptions,
@@ -63,7 +63,7 @@ def test_release_subprocess_preserves_logical_short_working_directory(
     tmp_path: Path,
 ) -> None:
     """Ordinary subprocesses must not observe a private extended cwd."""
-    completed = release_validation_module._run_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    completed = run_checkout_command(
         [sys.executable, "-c", "import os; print(os.getcwd())"],
         cwd=tmp_path,
     )
@@ -83,7 +83,7 @@ def test_release_subprocess_refuses_unverified_overlong_windows_cwd(
         return
 
     with pytest.raises(ConfigurationError, match="shorter checkout path"):
-        release_validation_module._run_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        run_checkout_command(
             [sys.executable, "-c", "raise SystemExit('must not launch')"],
             cwd=long_cwd,
         )
@@ -97,10 +97,32 @@ def test_release_subprocess_refuses_windows_unc_cwd() -> None:
         return
 
     with pytest.raises(ConfigurationError, match="must not use UNC"):
-        release_validation_module._run_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        run_checkout_command(
             [sys.executable, "-c", "raise SystemExit('must not launch')"],
             cwd=unc_cwd,
         )
+
+
+def test_validation_options_refuse_misread_timeout_values(tmp_path: Path) -> None:
+    """The library entry refuses timeout values pytest-timeout would silently misread."""
+    with pytest.raises(ConfigurationError, match="check_timeout_seconds"):
+        release_validation_module.LocalReleaseValidationOptions(
+            project_root=tmp_path,
+            report_path=tmp_path / "report.json",
+            check_timeout_seconds=0,
+        )
+    with pytest.raises(ConfigurationError, match="pytest_per_test_timeout_seconds"):
+        release_validation_module.LocalReleaseValidationOptions(
+            project_root=tmp_path,
+            report_path=tmp_path / "report.json",
+            pytest_per_test_timeout_seconds=-42,
+        )
+    unbounded = release_validation_module.LocalReleaseValidationOptions(
+        project_root=tmp_path,
+        report_path=tmp_path / "report.json",
+        check_timeout_seconds=None,
+    )
+    assert unbounded.check_timeout_seconds is None
 
 
 def test_long_release_support_paths_keep_reports_and_provenance_logical(

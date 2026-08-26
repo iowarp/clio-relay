@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +20,6 @@ from clio_relay.release_check_runtime import CommandRunner as ReleaseCommandRunn
 from clio_relay.release_check_runtime import (
     active_check,
     default_command_runner,
-    run_checkout_command,
 )
 from clio_relay.release_command_stream import format_seconds
 from clio_relay.validation_report import (
@@ -104,6 +101,25 @@ class LocalReleaseValidationOptions:
     report_id: DurableRecordId | None = None
     check_timeout_seconds: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     pytest_per_test_timeout_seconds: float = DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        """Refuse timeout values downstream tooling would silently misread.
+
+        The CLI door validates its own option phrasing, but this dataclass is
+        the library entry: without this check a non-positive per-test value
+        reaches pytest-timeout's argv, where it silently means *no bound*
+        (clio-relay#275 review R1 — the guard must live at the single source
+        of truth, not only at one of two doors).
+        """
+        if self.check_timeout_seconds is not None and self.check_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "check_timeout_seconds must be positive or None (None means no bound)"
+            )
+        if self.pytest_per_test_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "pytest_per_test_timeout_seconds must be > 0 (pytest-timeout treats a "
+                "non-positive value as no bound, silently defeating it)"
+            )
 
 
 def run_local_release_validation(
@@ -736,22 +752,6 @@ def _record_release_artifacts(
         recorder.report.artifacts.append(
             EvidenceReference(kind=kind, reference=str(logical_path), sha256=digest)
         )
-
-
-def _run_command(  # pyright: ignore[reportUnusedFunction] -- direct-call test seam, see docstring
-    command: list[str],
-    *,
-    cwd: Path,
-    timeout_seconds: float | None = None,
-    echo: Callable[[str], None] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Forward to :func:`release_check_runtime.run_checkout_command`.
-
-    Kept as a thin, direct-call seam (rather than inlined at its one caller)
-    because ``tests/test_release_validation.py`` exercises the Windows
-    checkout-path guard by calling this exact name directly.
-    """
-    return run_checkout_command(command, cwd=cwd, timeout_seconds=timeout_seconds, echo=echo)
 
 
 def _logical_command(command: list[str]) -> list[str]:
