@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import stat
 import subprocess
@@ -18,7 +20,7 @@ import pytest
 
 import clio_relay.endpoint as endpoint_module
 import clio_relay.storage_runtime as storage_runtime_module
-from clio_relay import queue_legacy_audit, queue_startup, worker_lifetime_lock
+from clio_relay import lock_holder_sidecar, queue_legacy_audit, queue_startup, worker_lifetime_lock
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
@@ -56,6 +58,43 @@ lock.release()
     assert process.stdout is not None
     assert process.stdout.readline().strip() == "ready"
     return process
+
+
+def _start_shared_lock_holder_with_reported_pid(
+    core_dir: Path,
+) -> tuple[subprocess.Popen[str], int]:
+    """Start a real shared-lock-holding child, returning its own self-reported pid.
+
+    Some sandboxed process-launch environments remap the parent-observed
+    ``Popen.pid`` away from the child's real OS pid (verified locally: under
+    this harness's PowerShell sandbox, ``Popen.pid`` and the child's own
+    ``os.getpid()`` are different numbers for the same process). The
+    lock-holder sidecar always records ``os.getpid()`` from the holder's own
+    perspective, so a test asserting the diagnostic names "the real holder"
+    must compare against that same self-reported identity, not ``Popen.pid``.
+    """
+    source = """
+from pathlib import Path
+import os
+import sys
+from clio_relay.worker_lifetime_lock import WorkerLifetimeLock
+
+lock = WorkerLifetimeLock(Path(sys.argv[1]), mode="shared").acquire()
+print(f"ready {os.getpid()}", flush=True)
+sys.stdin.readline()
+lock.release()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", source, str(core_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    ready_line = process.stdout.readline().strip()
+    assert ready_line.startswith("ready ")
+    return process, int(ready_line.split(" ", 1)[1])
 
 
 def _release_lock_holder(process: subprocess.Popen[str]) -> None:
@@ -931,3 +970,386 @@ def test_locked_core_descriptor_failure_is_fail_closed(
                 os.close(replacement)
             with suppress(OSError):
                 os.close(descriptor)
+
+
+# --- Lock-holder sidecar diagnostics (iowarp/clio-relay#202) ---------------
+
+
+def _own_holder_file(lock: WorkerLifetimeLock) -> Path:
+    """Return this process's own per-holder file for an acquired lock."""
+    return (
+        lock_holder_sidecar._holders_dir(lock.path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        / f"{os.getpid()}.json"
+    )
+
+
+def test_lock_holder_sidecar_written_on_acquire_and_removed_on_release(
+    tmp_path: Path,
+) -> None:
+    """A successful acquisition records this process; release erases the record."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+    holder_path = _own_holder_file(lock)
+    assert holder_path.is_file()
+    payload = json.loads(holder_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA
+    assert payload["pid"] == os.getpid()
+    assert isinstance(payload["argv_summary"], str)
+    assert isinstance(payload["acquired_at"], str)
+    assert isinstance(payload["hostname"], str)
+
+    lock.release()
+    assert not holder_path.exists()
+
+
+def test_timeout_message_names_the_live_cross_process_holder(tmp_path: Path) -> None:
+    """A bounded exclusive timeout names the real child process holding the shared lock."""
+    core_dir = tmp_path / "core"
+    process, holder_pid = _start_shared_lock_holder_with_reported_pid(core_dir)
+    try:
+        with pytest.raises(WorkerLifetimeLockUnavailable) as excinfo:
+            WorkerLifetimeLock(core_dir, mode="exclusive", timeout_seconds=0).acquire()
+        message = str(excinfo.value)
+        assert "timed out acquiring worker lifetime lock" in message
+        assert f"held by pid {holder_pid}" in message
+        assert "since" in message
+        assert "on host" in message
+        assert excinfo.value.holder_diagnostic is not None
+        assert f"held by pid {holder_pid}" in excinfo.value.holder_diagnostic
+    finally:
+        _release_lock_holder(process)
+
+
+def test_stale_holder_pid_is_rendered_as_dead(tmp_path: Path) -> None:
+    """A holder entry naming a pid that has since exited renders as a stale holder."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        # subprocess.run() blocks until the child exits, and the child reports
+        # its OWN os.getpid() -- the pid asserted dead must be a genuine OS pid
+        # a liveness probe can meaningfully evaluate, not Popen.pid: this
+        # sandbox's process launcher remaps Popen.pid away from the child's
+        # real pid (see _start_shared_lock_holder_with_reported_pid above).
+        completed = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.getpid())"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        dead_pid = int(completed.stdout.strip())
+
+        # This process's own live entry must not be present for a "wholly
+        # dead" render -- remove it first so only the fabricated dead entry
+        # remains (mirrors the review's "no live entries + dead entries ->
+        # the stale render" rule).
+        _own_holder_file(lock).unlink()
+        holders_dir = lock_holder_sidecar._holders_dir(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            lock.path
+        )
+        (holders_dir / f"{dead_pid}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA,
+                    "pid": dead_pid,
+                    "argv_summary": "clio-relay api start --port 8796",
+                    "acquired_at": "2026-01-01T00:00:00+00:00",
+                    "hostname": "test-host",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+        assert diagnostic == (
+            f"stale holder pid {dead_pid} (dead) since 2026-01-01T00:00:00+00:00 -- "
+            "the sidecar was not cleaned up; the lock may be orphaned"
+        )
+    finally:
+        lock.release()
+
+
+def test_no_sidecar_is_rendered_as_no_holder_record(tmp_path: Path) -> None:
+    """A lock with no holder entries explains why no holder is known."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        holder_path = _own_holder_file(lock)
+        assert holder_path.is_file()
+        holder_path.unlink()
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+        assert diagnostic == (
+            "no holder record (lock predates the sidecar or the holder crashed before recording)"
+        )
+    finally:
+        lock.release()
+
+
+def test_corrupt_sidecar_is_rendered_as_unreadable(tmp_path: Path) -> None:
+    """A corrupt or foreign-shaped holder entry cannot crash the diagnostic path."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        holder_path = _own_holder_file(lock)
+
+        holder_path.write_text("{not valid json", encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+
+        holder_path.write_text(json.dumps({"pid": "not-a-pid"}), encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+
+        holder_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+    finally:
+        lock.release()
+
+
+def test_acquisition_survives_an_unwritable_sidecar_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sidecar write failure is a typed log note, never an acquisition failure."""
+    core_dir = tmp_path / "core"
+    # A regular file blocking the holders-dir path: mkdir(parents=True) cannot
+    # create a directory through a path component that is already a file, so
+    # this is a genuinely unwritable target (unlike a merely-missing parent,
+    # which mkdir(parents=True) would just create).
+    blocking_file = tmp_path / "blocking-file"
+    blocking_file.write_bytes(b"not a directory")
+    unwritable_target = blocking_file / "core.lock.holders"
+
+    def _fixed_holders_dir(_lock_path: Path) -> Path:
+        return unwritable_target
+
+    monkeypatch.setattr(lock_holder_sidecar, "_holders_dir", _fixed_holders_dir)
+
+    with caplog.at_level(logging.WARNING, logger="clio_relay.lock_holder_sidecar"):
+        lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        assert lock.acquired is True
+        assert not unwritable_target.exists()
+        assert any(
+            "lock_holder_sidecar_write_failed" in record.message for record in caplog.records
+        )
+    finally:
+        lock.release()
+
+
+def test_describe_lock_holder_survives_a_shared_holder_releasing_first(
+    tmp_path: Path,
+) -> None:
+    """Holder A releasing first must not blind the diagnostic to holder B (#202 D2).
+
+    A single-slot sidecar would have DELETED the shared record when A
+    released, leaving an exclusive requester told "no holder record" while
+    B still legitimately holds the lock -- a proven-false render the review
+    caught. The per-holder directory keeps B's own entry untouched by A's
+    release.
+    """
+    core_dir = tmp_path / "core"
+    process_b, holder_b_pid = _start_shared_lock_holder_with_reported_pid(core_dir)
+    try:
+        holder_a = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+        holder_a.release()  # A releases first; B still holds.
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(holder_a.path)
+        assert f"held by pid {holder_b_pid}" in diagnostic
+        assert "no holder record" not in diagnostic
+    finally:
+        _release_lock_holder(process_b)
+
+
+def test_describe_lock_holder_does_not_claim_orphaned_when_a_live_holder_remains(
+    tmp_path: Path,
+) -> None:
+    """A dead co-holder must not make a live holder's lock look orphaned (#202 D2).
+
+    A single-slot sidecar overwritten by a since-crashed holder B would
+    render "stale... may be orphaned" even while A legitimately holds the
+    lock -- inviting an operator to break a held lock. Dead entries are
+    still named individually, just without the orphan verdict when a live
+    holder remains.
+    """
+    core_dir = tmp_path / "core"
+    holder_a = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.getpid())"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        dead_pid = int(completed.stdout.strip())
+        holders_dir = lock_holder_sidecar._holders_dir(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            holder_a.path
+        )
+        (holders_dir / f"{dead_pid}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA,
+                    "pid": dead_pid,
+                    "argv_summary": "crashed-holder",
+                    "acquired_at": "2026-01-01T00:00:00+00:00",
+                    "hostname": "test-host",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(holder_a.path)
+        assert f"held by pid {os.getpid()}" in diagnostic
+        assert f"stale holder pid {dead_pid} (dead)" in diagnostic
+        assert "may be orphaned" not in diagnostic
+    finally:
+        holder_a.release()
+
+
+def test_release_survives_an_unremovable_holder_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A holder-entry removal failure is a typed log note, never a release failure."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+
+    def _raise(_path: Path) -> None:
+        raise OSError("simulated unremovable holder entry")
+
+    monkeypatch.setattr(lock_holder_sidecar, "_unlink_with_retry", _raise)
+    with caplog.at_level(logging.WARNING, logger="clio_relay.lock_holder_sidecar"):
+        lock.release()  # must not raise
+    assert lock.acquired is False
+    assert any("lock_holder_sidecar_remove_failed" in record.message for record in caplog.records)
+
+
+def test_describe_lock_holder_listing_failure_is_typed_and_unreadable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A holders-directory read failure (not merely 'missing') logs a typed note."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    holders_dir = lock_holder_sidecar._holders_dir(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        lock.path
+    )
+    try:
+        # Replace the holders directory with a plain file: iterdir() on it
+        # raises NotADirectoryError, a genuine read failure distinct from
+        # "the directory does not exist".
+        for entry in holders_dir.iterdir():
+            entry.unlink()
+        holders_dir.rmdir()
+        holders_dir.write_bytes(b"not a directory")
+
+        with caplog.at_level(logging.WARNING, logger="clio_relay.lock_holder_sidecar"):
+            diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+        assert diagnostic == "holder record unreadable"
+        assert any(
+            "lock_holder_sidecar_listing_failed" in record.message for record in caplog.records
+        )
+    finally:
+        holders_dir.unlink(missing_ok=True)
+        lock.release()
+
+
+def test_windows_access_denied_pid_is_treated_as_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ERROR_ACCESS_DENIED means the pid exists but is not inspectable -- alive (#202 D1).
+
+    Proven by the review against a real protected pid (4, "System"):
+    ``_pid_alive(4)`` returned ``False`` with ``GetLastError() == 5`` before
+    this fix, which is exactly backwards -- the pid is alive, just
+    inspection-restricted, mirroring the POSIX ``EPERM`` case.
+    """
+    if os.name != "nt":
+        return
+    error_access_denied = 5
+
+    def _fake_open_process(_pid: int) -> tuple[int, int]:
+        return 0, error_access_denied
+
+    monkeypatch.setattr(lock_holder_sidecar, "_win32_open_process", _fake_open_process)
+    assert lock_holder_sidecar._pid_alive(4) is True  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_windows_invalid_parameter_pid_is_treated_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ERROR_INVALID_PARAMETER means no such pid exists -- dead (#202 D1)."""
+    if os.name != "nt":
+        return
+    error_invalid_parameter = 87
+
+    def _fake_open_process(_pid: int) -> tuple[int, int]:
+        return 0, error_invalid_parameter
+
+    monkeypatch.setattr(lock_holder_sidecar, "_win32_open_process", _fake_open_process)
+    assert (
+        lock_holder_sidecar._pid_alive(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            999_999
+        )
+        is False
+    )
+
+
+def test_windows_unexpected_open_process_error_is_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any other OpenProcess failure is unresolved, never fabricated as dead or alive."""
+    if os.name != "nt":
+        return
+
+    def _fake_open_process(_pid: int) -> tuple[int, int]:
+        return 0, 1234  # not ERROR_ACCESS_DENIED, not ERROR_INVALID_PARAMETER
+
+    monkeypatch.setattr(lock_holder_sidecar, "_win32_open_process", _fake_open_process)
+    assert lock_holder_sidecar._pid_alive(4) is None  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
+def test_oversize_holder_file_is_rejected_by_a_bounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A holder file over the cap is rejected via ONE bounded read, not a full read (#202 D7).
+
+    Proof is via the read-size seam, not memory profiling: the oversize
+    file is written to disk (real bytes), but the assertion is that
+    :func:`_os_read` -- the ONE point the module reads a holder file -- was
+    called exactly once with the bounded size, never with the file's real
+    (larger) size and never more than once.
+    """
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        holder_path = _own_holder_file(lock)
+        oversize_payload = json.dumps(
+            {
+                "schema_version": lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA,
+                "pid": os.getpid(),
+                "argv_summary": "x" * (lock_holder_sidecar.MAX_SIDECAR_READ_BYTES + 4096),
+                "acquired_at": "2026-01-01T00:00:00+00:00",
+                "hostname": "test-host",
+            }
+        ).encode("utf-8")
+        assert len(oversize_payload) > lock_holder_sidecar.MAX_SIDECAR_READ_BYTES
+        holder_path.write_bytes(oversize_payload)
+
+        real_read = lock_holder_sidecar._os_read  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        read_calls: list[int] = []
+
+        def _tracking_read(descriptor: int, size: int) -> bytes:
+            read_calls.append(size)
+            return real_read(descriptor, size)
+
+        monkeypatch.setattr(lock_holder_sidecar, "_os_read", _tracking_read)
+        diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+
+        assert diagnostic == "holder record unreadable"
+        assert read_calls == [lock_holder_sidecar.MAX_SIDECAR_READ_BYTES + 1]
+    finally:
+        lock.release()

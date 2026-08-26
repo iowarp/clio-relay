@@ -113,7 +113,10 @@ def bootstrap_invocation_lock(
     try:
         lock.acquire()
     except WorkerLifetimeLockUnavailable as exc:
-        raise ConfigurationError("timed out acquiring the bootstrap lock") from exc
+        message = "timed out acquiring the bootstrap lock"
+        if exc.holder_diagnostic is not None:
+            message = f"{message}; {exc.holder_diagnostic}"
+        raise ConfigurationError(message) from exc
     except ConfigurationError as exc:
         raise ConfigurationError(f"private bootstrap lock is invalid: {exc}") from exc
     try:
