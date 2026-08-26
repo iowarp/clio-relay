@@ -376,6 +376,14 @@ def _stream_sse_frames_on_stream(
                         f"owned session API stream closed unexpectedly: {method} {path}"
                     )
                 if not raw_line.endswith(b"\n"):
+                    if len(raw_line) < MAX_SESSION_API_RESPONSE_BYTES:
+                        # A short read with no terminator is the body ending
+                        # MID-LINE -- a drop, not a size problem; the size
+                        # message would send an operator hunting a cap that
+                        # was never hit (clio-relay#221 review residual 4).
+                        raise ChannelDropped(
+                            f"owned session API stream closed mid-line: {method} {path}"
+                        )
                     raise RelayError(
                         f"owned session API stream line for {method} {path} exceeded "
                         f"{MAX_SESSION_API_RESPONSE_BYTES} bytes without a terminator"

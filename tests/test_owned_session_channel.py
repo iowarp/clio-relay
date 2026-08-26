@@ -616,11 +616,22 @@ def test_stream_log_chunks_rejects_unterminated_line(
     silently truncated or read forever."""
     harness = _install(monkeypatch, _Harness())
     connection = _connect(tmp_path, harness)
+    from clio_relay.remote_connection_stream_io import MAX_SESSION_API_RESPONSE_BYTES
+
     harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
-        b"this line never ends with a newline",
+        b"x" * MAX_SESSION_API_RESPONSE_BYTES,
     ]
 
     with pytest.raises(RelayError, match="terminator"):
+        list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
+
+    # Residual 4: a SHORT unterminated line is the body ending mid-line --
+    # a drop, never a misleading size message.
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"this short line never ends with a newline",
+    ]
+
+    with pytest.raises(ChannelDropped, match="mid-line"):
         list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
 
 

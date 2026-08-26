@@ -251,16 +251,25 @@ async def _log_tail_sse_events(
             last_activity = time.monotonic()
             text = decoder.decode(chunk_bytes)
             if text:
+                # Advertise the resume point BEHIND any bytes the incremental
+                # decoder is holding back (a split multi-byte character): a
+                # client that drops and resumes at the advertised offset must
+                # re-read those held bytes or the character is lost
+                # (clio-relay#221 review residual 1).
+                held = len(decoder.getstate()[0])
+                advertised_offset = current_offset - held
                 chunk_data = _public_payload(
                     {
                         "job_id": job_id,
                         "stream": stream_name,
                         "chunk": text,
                         "offset": read_offset,
-                        "next_offset": current_offset,
+                        "next_offset": advertised_offset,
                     }
                 )
-                yield f"id: {current_offset}\nevent: log_chunk\ndata: {json.dumps(chunk_data)}\n\n"
+                yield (
+                    f"id: {advertised_offset}\nevent: log_chunk\ndata: {json.dumps(chunk_data)}\n\n"
+                )
             # More may already be waiting past what this one read drained --
             # keep draining, but yield control once first (D2) so a long
             # backlog can never starve the rest of the event loop.

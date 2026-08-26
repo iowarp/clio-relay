@@ -627,14 +627,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # cap so this decomposition cannot silently re-accrete.
     # Campaign merge: values are the MEASURED merged-tree counts.
     "src/clio_relay/door_error_adapters.py": 170,
-    # Pattern-triggered observation adds two typed refusal reasons to the
-    # frozen door registry; the measured post-change owner count is 744.
-    # clio-relay#221/#259 adversarial review (D3/D5): two more typed
-    # refusal reasons for the SSE log-tail route -- log_offset_invalid (an
-    # unparseable Last-Event-ID) and log_offset_beyond_eof (a caller offset
-    # already past the stream's current size). A justified, minimal
-    # ratchet-up: 744 -> 750.
-    "src/clio_relay/door_errors.py": 750,
+    # door_errors.py: clio-relay#221/#259 (D3/D5) added two typed SSE
+    # refusal reasons taking the file 744 -> 750 -- still 50 under the
+    # DEFAULT_MAX_LINES cap, so per ground rule 5 its baseline entry is
+    # REMOVED rather than raised (the gate's own advisory; an entry at 750
+    # would pin the file to zero self-imposed headroom for no reason).
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
