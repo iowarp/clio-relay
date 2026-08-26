@@ -174,3 +174,42 @@ class QueueProgressMixin:
         matched = [item for item in progress if item.job_id == job_id]
         latest = max(matched, key=lambda item: item.created_at, default=None)
         return latest, len(matched), truncated
+
+    def latest_progress_window(self, job_id: str, *, limit: int) -> list[ProgressRecord]:
+        """Return at most the most recent ``limit`` progress records, oldest-first.
+
+        clio-relay#214 review D1: ``list_progress`` reads a job's ENTIRE
+        progress family (unbounded -- proven 1s at 100 records, 10.8s at
+        2000, and it raises ``QueueConflictError`` once a job's history
+        exceeds ``MAX_BOUNDED_SCAN_RECORDS``). A poll-loop consumer that only
+        needs the recent tail (the runtime predictor's trimmed-mean window)
+        must never pay that cost. This reads at most ``limit`` records
+        directly by sequence number through the same per-job order index
+        ``list_progress_page`` already uses -- never a directory scan.
+        Returns an empty list for a job with no recorded progress, or for
+        the rare legacy job with no order index at all (this method never
+        falls back to an unbounded scan the way ``latest_job_progress``'s
+        own no-index branch does).
+        """
+        job_id = queue_layout.QueueLayout.require_durable_record_id(job_id, field="job_id")
+        if limit < 1:
+            raise ValueError("progress window limit must be at least 1")
+        self._store_adapter.initialize()
+        if not self._job_index_exists(job_id):
+            return []
+        index = self._read_job_index(job_id)
+        if index is None:
+            return []
+        total = queue_index_state.index_integer(index, "progress_count")
+        if total <= 0:
+            return []
+        cursor = max(1, total - limit + 1)
+        records, _next_cursor, _total = self._read_ordered_job_page(
+            job_id,
+            family="progress",
+            model=ProgressRecord,
+            cursor=cursor,
+            limit=min(limit, total),
+            count_field="progress_count",
+        )
+        return records
