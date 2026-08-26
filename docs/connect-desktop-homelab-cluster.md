@@ -95,6 +95,61 @@ clio-relay cluster install-endpoint-service `
 The worker reads queued jobs from the relay core and runs them through JARVIS.
 It does not require sudo.
 
+## Bring up the cluster-side frpc proxy (TCP transport modes)
+
+The steps above configure the `ssh_forward` transport (mode (c)): the desktop
+holds one ssh session open for the connection's lifetime. `brokered_tcp`
+(mode (a), stcp) and `udp_rendezvous` (mode (b), xtcp) instead hold a
+persistent `frpc` link through the relay point in "Start the relay host"
+above, with **zero ssh dials while operating** — but that link needs its own
+long-running proxy on the cluster side, which used to be a manual,
+undocumented operation (clio-relay#279). `relay-host install-proxy` renders,
+installs, enables, and starts that proxy as a persistent systemd **user**
+unit in one ssh pass, then verifies it is active before returning:
+
+```powershell
+clio-relay relay-host install-proxy `
+  --cluster my-cluster `
+  --remote-port 8765
+```
+
+This writes three files under `~/.config/clio-relay/` and
+`~/.config/systemd/user/` on the cluster: the frpc proxy TOML (its
+`auth.token`/`secretKey` are frp's own `{{ .Envs.NAME }}` template
+placeholders, never the literal secret), a 0600 `EnvironmentFile=` binding
+the real `CLIO_RELAY_FRP_TOKEN`/`CLIO_RELAY_STCP_SECRET` values, and the unit
+itself (`Restart=on-failure`, survives reboot once the account has systemd
+user lingering enabled — see "Install and start the cluster worker" above
+for the same `loginctl enable-linger` requirement). The command returns the
+typed bring-up receipt (unit name, proxy name, config digest).
+
+Modes (a)/(b) require the cluster to have explicitly opted into the weaker
+`preshared_link_secret` identity anchor first (`relay-architecture-2026-08.md`
+sec 8.3) — `frp_transport.identity_anchor` on the cluster's definition. No
+`cluster add`/`cluster edit` flag exists for this yet; set it by editing the
+`frp_transport.identity_anchor` field of the cluster's entry in
+`.clio-relay/clusters.json` directly (`"preshared_link_secret"`) before
+running `install-proxy`. `install-proxy` refuses with a typed error naming
+this exact requirement if the cluster has not opted in.
+
+Check on it later, or diagnose a connection that will not establish:
+
+```powershell
+clio-relay relay-host proxy-status --cluster my-cluster
+```
+
+This reports `systemctl --user` load/active/enabled state plus the unit's
+last journal lines in one read-only ssh pass. frpc down, frps unreachable,
+and a rejected token all surface as "installed and enabled but inactive" at
+the systemd-property layer — the journal tail is what carries the actual
+cause.
+
+To remove the proxy, its TOML, and its env file entirely:
+
+```powershell
+clio-relay relay-host teardown-proxy --cluster my-cluster
+```
+
 ## Expose relay tools to the remote agent
 
 Render an MCP config that exposes the relay tools:

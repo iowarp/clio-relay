@@ -87,6 +87,7 @@ from clio_relay.frp_link import (
     select_loopback_port,
     validate_channel_nonce,
 )
+from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.session_api import SESSION_IDENTITY_SCHEMA
 
@@ -170,7 +171,7 @@ class _FrpChannelTransport:
         self._process_factory = process_factory
         self._local_bind_port = local_bind_port
         self._ready_timeout_seconds = ready_timeout_seconds
-        self._proxy_name = definition.frp_transport.proxy_name or f"{cluster}-owned-session"
+        self._proxy_name = canonical_proxy_name(definition, cluster=cluster)
         self._visitor: HeldFrpVisitor | None = None
         self._established = False
         self._failure_detail: str | None = None
