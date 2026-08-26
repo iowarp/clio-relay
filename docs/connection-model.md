@@ -176,6 +176,19 @@ Losing the link never loses queue state, job state, session state, or lineage. A
 transport failure must not corrupt or invent durable state, and an observation
 timeout is never proof of a terminal outcome.
 
+`clio-relay session attach --cluster X` (alias: `session reconnect`) is the
+one explicit, user-present action that performs mode (c)'s reconnect. A
+dropped channel is never redialed from inside an owned-session operation: the
+operation fails instead with a typed `authorization_required` refusal naming
+this exact command. Attach also serves the new-process case a bare
+in-process reconnect cannot: a fresh process (after a clean detach, a closed
+terminal, or a crash) has no held channel to reconnect at all, so attach
+resolves the session from the durable last-session record `session start`
+writes, re-verifies it live, and either resumes an already-live channel
+untouched (zero new dials) or performs the one authorized dial -- the same
+"resume in place, or recreate" shape `docs/operations.md`'s detach/reattach
+workflow section documents.
+
 ## One local relay, many remote relays
 
 A single local relay process manages connections to multiple remote relays

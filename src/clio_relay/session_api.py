@@ -89,6 +89,8 @@ class ChannelReconnectRequired(RelayError):
             f"attach --cluster {cluster}` (or `session reconnect`) to authorize exactly "
             "one new transport -- it is never redialed automatically"
         )
+
+
 # Leave part of clio-agent's ordinary 30-second transport budget available for
 # propagating the completed MCP result after this inner long-poll returns.
 OWNED_SESSION_WAIT_RESPONSE_GRACE_SECONDS: Final = 10.0

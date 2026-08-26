@@ -242,6 +242,8 @@ def _resolve_teardown_recovery(state: _TeardownState) -> bool:
             raise RelayError("finalized cleanup retry was not authoritatively closed after commit")
         if closed_recovery.coordinator_report_ref != finalized_retry_reference:
             raise RelayError("finalized cleanup report reference changed during closure")
+        # The already_closed/admission-closed guard above is what makes
+        # clearing safe; only a verified-closed generation reaches here.
         # iowarp/clio-relay#276 B1: an already-finalized retry that closes here
         # is still a clean teardown from the durable-record's point of view --
         # retire it the same as the primary finalize path does.

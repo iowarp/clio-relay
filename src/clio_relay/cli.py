@@ -36,7 +36,7 @@ import clio_relay.cli_remote_mcp as cli_remote_mcp
 import clio_relay.cli_remote_mcp_validate as cli_remote_mcp_validate  # noqa: F401 -- registers remote_mcp_app's validate command
 import clio_relay.cli_scheduler as cli_scheduler
 import clio_relay.cli_session as cli_session
-import clio_relay.cli_session_attach as cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands
+import clio_relay.cli_session_attach as cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
 import clio_relay.cli_session_owned as cli_session_owned  # noqa: F401 -- registers session_app's owned-session commands
 import clio_relay.cli_session_start as cli_session_start  # noqa: F401 -- registers session_app's start command
 import clio_relay.cli_session_teardown as cli_session_teardown  # noqa: F401 -- registers session_app's teardown command

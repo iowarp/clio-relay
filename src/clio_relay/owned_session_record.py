@@ -25,7 +25,34 @@ cluster registry already owns the pattern for, just keyed by cluster instead
 of holding cluster definitions. Reusing the exact same io/Windows-ACL
 primitives (``cluster_config_io.py``, ``cluster_config_windows_paths.py``)
 means this file introduces no new persistence mechanism, only a new record
-shape.
+shape. The lock is bounded at ``timeout=60``, matching
+``owner_session_admission.owner_session_transition_lock`` -- not
+``ClusterRegistry``'s own unbounded lock, which is pre-existing and out of
+scope here.
+
+**Forward compatibility (iowarp/clio-relay#276 review D1).** A raw
+pydantic/json traceback reaching the caller of what is otherwise a
+SUCCESSFUL owned-session bring-up is exactly the failure mode this design
+must not have: ``session start`` must never turn a genuinely successful
+start into a non-zero crash just because a stale, corrupt, or
+newer-version-written durable record file exists on disk, and a caller
+must never see raw parser internals instead of a recovery instruction.
+Two, independent defenses:
+
+1. ``schema_version`` is a versioned literal, and both models tolerate and
+   round-trip unknown fields (``extra="allow"``) rather than rejecting them:
+   an additive field a newer client wrote is preserved through a
+   read-modify-write by an older one instead of being silently dropped or
+   fatal. A genuinely incompatible ``schema_version`` still fails to
+   validate -- deliberately: that is a real, not additive, format change.
+2. Every load/mutate failure -- corrupt JSON, a record missing a required
+   field, an incompatible schema version, a read-integrity refusal from
+   ``read_bounded_configuration_bytes`` -- is normalized to ONE typed
+   :class:`~clio_relay.errors.ConfigurationError` naming the exact file path
+   and the recovery action (delete the file and re-run ``session start``, or
+   restore a known-good backup). ``cli_support._run_or_exit`` already
+   renders a ``ConfigurationError``'s message directly to the operator, so
+   this is what a user actually sees instead of a pydantic stack trace.
 """
 
 from __future__ import annotations
@@ -36,6 +63,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final, Literal
 from uuid import uuid4
 
 from filelock import FileLock
@@ -59,15 +87,29 @@ from clio_relay.errors import ConfigurationError
 MAX_OWNED_SESSION_REGISTRY_BYTES = 256 * 1024
 MAX_TRACKED_CLUSTER_SESSIONS = 512
 CONFIG_REPLACE_ATTEMPTS = 25
+#: Bounded, matching owner_session_admission.owner_session_transition_lock --
+#: this file's own lock must never hang the process indefinitely either.
+FILE_LOCK_TIMEOUT_SECONDS = 60
 
 OWNED_SESSION_REGISTRY_ENV = "CLIO_RELAY_OWNED_SESSION_REGISTRY"
+OWNED_SESSION_RECORD_SCHEMA: Final = "clio-relay.owned-session-record.v1"
+
+_RECOVERY_HINT: Final = (
+    "delete the file and re-run `clio-relay session start --cluster <cluster>` to "
+    "recreate it, or restore a known-good backup"
+)
 
 
 class OwnedSessionRecord(BaseModel):
     """The durable identity of the last owned session brought up for one cluster."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Tolerate and round-trip a field a NEWER client version wrote (see
+    # module docstring point 1) -- forbidding unknown fields here is exactly
+    # what would turn a merely-newer sibling's record into a hard parse
+    # failure for this build.
+    model_config = ConfigDict(extra="allow")
 
+    schema_version: Literal["clio-relay.owned-session-record.v1"] = OWNED_SESSION_RECORD_SCHEMA
     cluster: str = Field(min_length=1, max_length=256)
     session_id: str = Field(min_length=1, max_length=256)
     session_generation_id: str = Field(min_length=1, max_length=256)
@@ -78,7 +120,7 @@ class OwnedSessionRecord(BaseModel):
 class OwnedSessionRecordRegistry(BaseModel):
     """One durable owned-session record per cluster, keyed by cluster name."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     sessions: dict[str, OwnedSessionRecord] = Field(
         default_factory=dict[str, OwnedSessionRecord],
@@ -87,12 +129,12 @@ class OwnedSessionRecordRegistry(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> OwnedSessionRecordRegistry:
-        """Load the registry from disk, or return an empty one when absent."""
-        if not path.exists():
-            return cls()
-        return cls.model_validate_json(
-            read_bounded_configuration_bytes(path, max_bytes=MAX_OWNED_SESSION_REGISTRY_BYTES)
-        )
+        """Load the registry from disk, or return an empty one when absent.
+
+        Any parse/validation failure is a single typed :class:`ConfigurationError`
+        naming ``path`` and the recovery action -- see the module docstring.
+        """
+        return _load_validated(path)
 
     @classmethod
     def mutate(
@@ -100,22 +142,18 @@ class OwnedSessionRecordRegistry(BaseModel):
         path: Path,
         mutation: Callable[[OwnedSessionRecordRegistry], None],
     ) -> OwnedSessionRecordRegistry:
-        """Apply a read-modify-write operation under one exclusive file lock."""
+        """Apply a read-modify-write operation under one exclusive, bounded file lock."""
         ensure_private_configuration_directory(path.parent)
-        with FileLock(f"{path}.lock"):
-            registry = (
-                cls.model_validate_json(
-                    read_bounded_configuration_bytes(
-                        path,
-                        max_bytes=MAX_OWNED_SESSION_REGISTRY_BYTES,
-                    )
-                )
-                if path.exists()
-                else cls()
-            )
+        with FileLock(f"{path}.lock", timeout=FILE_LOCK_TIMEOUT_SECONDS):
+            registry = _load_validated(path)
             mutation(registry)
-            validated = cls.model_validate(registry.model_dump(mode="python"))
-            validated._write_atomic_unlocked(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            try:
+                validated = cls.model_validate(registry.model_dump(mode="python"))
+                validated._write_atomic_unlocked(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            except (ConfigurationError, ValueError, TypeError, OSError) as exc:
+                raise ConfigurationError(
+                    f"owned session record at {path} could not be written ({exc}); {_RECOVERY_HINT}"
+                ) from exc
             return validated
 
     def _write_atomic_unlocked(self, path: Path) -> None:
@@ -142,6 +180,27 @@ class OwnedSessionRecordRegistry(BaseModel):
             _fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _load_validated(path: Path) -> OwnedSessionRecordRegistry:
+    """Load and validate the registry, or raise one typed, actionable refusal.
+
+    Every failure -- corrupt JSON, a record missing a required field, a
+    ``schema_version`` this build does not recognize, or a read-integrity
+    refusal already raised by :func:`read_bounded_configuration_bytes` -- is
+    normalized to one :class:`ConfigurationError` naming the exact file and
+    the recovery action, never a raw parser traceback (module docstring
+    point 2).
+    """
+    if not path.exists():
+        return OwnedSessionRecordRegistry()
+    try:
+        payload = read_bounded_configuration_bytes(path, max_bytes=MAX_OWNED_SESSION_REGISTRY_BYTES)
+        return OwnedSessionRecordRegistry.model_validate_json(payload)
+    except (ConfigurationError, ValueError, TypeError, OSError) as exc:
+        raise ConfigurationError(
+            f"owned session record at {path} is unreadable or invalid ({exc}); {_RECOVERY_HINT}"
+        ) from exc
 
 
 def default_owned_session_record_path() -> Path:
@@ -171,7 +230,9 @@ def save_owned_session_record(
     Called once, at successful owned-session bring-up
     (``cli_session_start.py``, when the start result is ``usable``) -- never
     speculatively, and never for a start attempt that only produced a durable
-    operation handle without an attached, running API.
+    operation handle without an attached, running API. A stale/corrupt
+    pre-existing file surfaces as a typed :class:`ConfigurationError`
+    (see the module docstring) rather than a raw traceback.
     """
     record = OwnedSessionRecord(
         cluster=cluster,

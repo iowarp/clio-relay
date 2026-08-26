@@ -143,6 +143,20 @@ def session_start(
             # session is worth remembering as "the last session for this
             # cluster" -- overwrites any prior record for the same cluster,
             # so `session attach` always finds the newest bring-up.
+            #
+            # `session_generation_id` is typed `DurableRecordId | None` on
+            # OwnedSessionStartResult because a NON-ready result may omit it,
+            # but `usable is (state == "ready")` and that same model's own
+            # validator requires `session_generation_id is not None` whenever
+            # `state == "ready"` (session_wire_models.py's
+            # `_validate_start_result`) -- `result.usable` was just checked
+            # above, so this is a real, already-proven invariant. Narrowed
+            # explicitly here (D1 review) rather than silencing the type
+            # checker on a save call whose failure must stay a real, typed
+            # refusal, not a suppressed one.
+            assert result.session_generation_id is not None, (
+                "a usable owned-session start result always carries its generation id"
+            )
             save_owned_session_record(
                 cluster=cluster,
                 session_id=result.session_id,

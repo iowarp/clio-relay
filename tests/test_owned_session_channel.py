@@ -23,7 +23,6 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-import clio_relay.core_queue as core_queue
 import clio_relay.owned_session_record as owned_session_record
 import clio_relay.session_attach as session_attach
 from clio_relay import remote_connection
@@ -49,6 +48,7 @@ from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
+from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.remote_connection import (
     DEFAULT_OWNED_SESSION_API_PORT,
     RemoteConnectionRegistry,
@@ -111,7 +111,10 @@ class _Stream:
         path = cast(str, self.harness.requests[-1]["path"])
         if path.startswith("/session-identity"):
             return _Response(self.harness.identity_for(self.cluster))
-        return _Response(self.harness.responses.get(path, {"ok": True}))
+        # Keyed on the path alone (query string stripped): GET /queue is the
+        # first caller in this harness to send query parameters, and a fixed
+        # canned response per endpoint is simpler than matching them exactly.
+        return _Response(self.harness.responses.get(path.split("?", 1)[0], {"ok": True}))
 
     def close(self) -> None:
         self.closed = True
@@ -284,6 +287,58 @@ def _attach_settings(tmp_path: Path) -> RelaySettings:
         spool_dir=tmp_path / "spool",
         api_token="session-api-token",
     )
+
+
+def _session_status_response(
+    *,
+    cluster: str = "ares",
+    session_id: str = "desktop-session-1",
+    session_generation_id: str = "generation-1",
+    remote_api_port: int = DEFAULT_OWNED_SESSION_API_PORT,
+    running: bool = True,
+) -> dict[str, object]:
+    """Return the exact ``GET /session-status`` body ``session_status()`` cross-checks."""
+    return {
+        "schema_version": "clio-relay.owned-session-status.v1",
+        "owner": "clio-relay",
+        "cluster": cluster,
+        "session_id": session_id,
+        "session_generation_id": session_generation_id,
+        "remote_api_port": remote_api_port,
+        "running": running,
+        "evidence": "live_api_self_report",
+    }
+
+
+def _fake_queue_page(jobs: list[RelayJob], *, cluster: str = "ares") -> dict[str, object]:
+    """Return the exact owner-scoped ``GET /queue`` page shape
+    ``build_attach_report``'s ``_list_owned_jobs_over_channel`` expects
+    (``http_api_queue_paging.py``'s ``_owned_queue_page``)."""
+    return {
+        "jobs": [
+            {
+                "job": job.model_dump(mode="json"),
+                "relay_queue": {"state": job.state.value, "jobs_ahead": None, "position": None},
+            }
+            for job in jobs
+        ],
+        "count": len(jobs),
+        "cluster": cluster,
+        "state": None,
+        "kind": None,
+        "include_terminal": False,
+        "source_cursor": 1,
+        "source_limit": MAX_RESPONSE_PAGE_RECORDS,
+        "source_next_cursor": None,
+        "source_total": len(jobs),
+        "source_total_semantics": "owner_session_generation_membership",
+        "filters_apply_within_source_window": True,
+        "visibility_filter": "exact_owner_session_generation",
+        "result_truncated": False,
+        "scan_limit": MAX_RESPONSE_PAGE_RECORDS,
+        "scan_count": len(jobs),
+        "scan_truncated": False,
+    }
 
 
 def _connect(tmp_path: Path, harness: _Harness) -> Any:
@@ -1190,7 +1245,6 @@ def test_new_process_attach_resumes_a_session_detached_cleanly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clean detach (channel closed), close the process, return in a NEW process."""
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     first_process = _install(monkeypatch, _Harness())
     first_connection = _connect(tmp_path, first_process)
     first_connection.close()  # the local channel is torn down; the remote session lives on
@@ -1205,6 +1259,10 @@ def test_new_process_attach_resumes_a_session_detached_cleanly(
     )
 
     second_process = _install(monkeypatch, _Harness())  # a fresh process: empty registry
+    second_process.responses["/session-status"] = _session_status_response(
+        session_generation_id=second_process.generation_id
+    )
+    second_process.responses["/queue"] = _fake_queue_page([])
     definition = _definition()
     settings = _attach_settings(tmp_path)
 
@@ -1225,10 +1283,12 @@ def test_new_process_attach_resumes_a_session_detached_cleanly(
         target=target,
         channel_reestablished=channel_reestablished,
         definition=definition,
-        queue=core_queue.ClioCoreQueue(tmp_path / "core"),
     )
     assert report.connected is True
     assert report.running_jobs == []
+    # The report only rode the already-held channel: no new dial for the
+    # session_status() cross-check or the queue listing.
+    assert second_process.dials == 1
 
 
 def test_new_process_attach_after_a_crash_keeps_running_job_continuity(
@@ -1237,24 +1297,8 @@ def test_new_process_attach_after_a_crash_keeps_running_job_continuity(
 ) -> None:
     """kill -9 the client mid-run (no detach); a new process attaches and still
     tracks the job that kept running remotely the whole time."""
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
     first_process = _install(monkeypatch, _Harness())
     _connect(tmp_path, first_process)
-    queue = core_queue.ClioCoreQueue(tmp_path / "core")
-    running_job = queue.submit_job(
-        RelayJob(
-            cluster="ares",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(command=["sleep", "600"]),
-            state=JobState.RUNNING,
-            idempotency_key="crash-continuity-job",
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": "desktop-session-1",
-                "owner_session_generation_id": first_process.generation_id,
-            },
-        )
-    )
     first_process.processes[0].kill()  # crash: no detach, no clean close
 
     record_path = tmp_path / "owned_sessions.json"
@@ -1266,7 +1310,27 @@ def test_new_process_attach_after_a_crash_keeps_running_job_continuity(
         path=record_path,
     )
 
+    running_job = RelayJob(
+        cluster="ares",
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(command=["sleep", "600"]),
+        state=JobState.RUNNING,
+        idempotency_key="crash-continuity-job",
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": "desktop-session-1",
+            "owner_session_generation_id": "generation-1",
+        },
+    )
+
     second_process = _install(monkeypatch, _Harness())
+    second_process.responses["/session-status"] = _session_status_response(
+        session_generation_id=second_process.generation_id
+    )
+    # The remote session kept this job running the whole time the client was
+    # gone -- the attach report must still find it, over the same channel any
+    # other owned-session operation uses (zero new dials, no local queue).
+    second_process.responses["/queue"] = _fake_queue_page([running_job])
     definition = _definition()
     settings = _attach_settings(tmp_path)
 
@@ -1281,13 +1345,14 @@ def test_new_process_attach_after_a_crash_keeps_running_job_continuity(
         target=target,
         channel_reestablished=channel_reestablished,
         definition=definition,
-        queue=queue,
     )
 
     assert channel_reestablished is True
     assert second_process.dials == 1
-    assert [job["job_id"] for job in report.running_jobs] == [running_job.job_id]
-    assert report.running_jobs[0]["state"] == JobState.RUNNING.value
+    assert [job.job_id for job in report.running_jobs] == [running_job.job_id]
+    assert report.running_jobs[0].state == JobState.RUNNING.value
+    assert report.running_jobs[0].cluster == "ares"
+    assert report.running_jobs[0].kind == JobKind.JARVIS.value
 
 
 def test_attach_with_no_durable_record_and_no_environment_identity_is_refused(
@@ -1375,13 +1440,28 @@ def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_rec
         path=record_path,
     )
 
-    connection, _target, first_reestablished = session_attach.attach_owned_session(
+    harness.responses["/session-status"] = _session_status_response(
+        session_generation_id=harness.generation_id
+    )
+    harness.responses["/queue"] = _fake_queue_page([])
+
+    connection, target, first_reestablished = session_attach.attach_owned_session(
         definition=definition,
         settings=settings,
         record_path=record_path,
         registry=harness.registry,
     )
     assert first_reestablished is True
+    assert harness.dials == 1
+
+    # Building the report -- session_status() cross-check + the queue
+    # listing -- rides the already-held channel: zero new dials.
+    session_attach.build_attach_report(
+        connection=connection,
+        target=target,
+        channel_reestablished=first_reestablished,
+        definition=definition,
+    )
     assert harness.dials == 1
 
     # Already live: resume in place, no new dial ("resume in place").
@@ -1406,6 +1486,72 @@ def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_rec
     assert third_reestablished is True
     assert harness.dials == 2
     assert reconnected.connected is True
+
+
+def test_build_attach_report_refuses_a_reused_channel_whose_remote_session_died(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D3: "resume in place" must cross-check the remote, not just process liveness.
+
+    The ssh forward can stay up while the remote owned-session process behind
+    it dies or is torn down; ``existing.connected`` alone (the old check) saw
+    nothing wrong. ``build_attach_report``'s ``session_status()`` cross-check
+    (zero new dials) is what catches it.
+    """
+    harness = _install(monkeypatch, _Harness())
+    definition = _definition()
+    settings = _attach_settings(tmp_path)
+    record_path = tmp_path / "owned_sessions.json"
+    owned_session_record.save_owned_session_record(
+        cluster="ares",
+        session_id="desktop-session-1",
+        session_generation_id=harness.generation_id,
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+        path=record_path,
+    )
+    harness.responses["/session-status"] = _session_status_response(
+        session_generation_id=harness.generation_id
+    )
+
+    connection, _target, first_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=harness.registry,
+    )
+    assert first_reestablished is True
+    assert connection.connected is True  # the ssh forward is still up
+
+    # The forward never dropped, but the remote session itself died.
+    harness.responses["/session-status"] = _session_status_response(
+        session_generation_id=harness.generation_id,
+        running=False,
+    )
+
+    connection_again, target_again, second_reestablished = session_attach.attach_owned_session(
+        definition=definition,
+        settings=settings,
+        record_path=record_path,
+        registry=harness.registry,
+    )
+    assert second_reestablished is False  # resumed in place -- attach itself saw nothing wrong
+    assert harness.dials == 1
+
+    with pytest.raises(
+        session_attach.SessionNotAttachableError,
+        match="exact connected generation",
+    ) as excinfo:
+        session_attach.build_attach_report(
+            connection=connection_again,
+            target=target_again,
+            channel_reestablished=second_reestablished,
+            definition=definition,
+        )
+
+    assert excinfo.value.reason == "session_not_attachable"
+    # The verification failure itself never triggers a redial.
+    assert harness.dials == 1
 
 
 def test_status_after_reconnect_reflects_current_remote_state_not_a_pre_drop_snapshot(

@@ -14,18 +14,18 @@ is therefore exactly the ordinary connection bring-up path, reached with the
 identity resolved from the durable record instead of a session the caller
 already had open in this process.
 
-Three cases, one function (:func:`attach_owned_session`):
+Three cases, one function (:func:`attach_owned_session`), branching on the
+held connection's own typed :attr:`~clio_relay.remote_connection.
+RemoteConnection.state`:
 
 * No connection is held for this cluster yet (a fresh process, or the first
   attach after the previous one exited) -- bring one up. One new SSH dial,
   the ordinary challenge-owned handshake.
-* A connection is held and still alive (nothing was lost since the last
-  operation) -- reuse it untouched. Zero new dials: "resume in place".
-* A connection is held but its channel dropped
-  (:attr:`~clio_relay.remote_connection.RemoteConnection.state` is
-  ``"authorization_required"``) -- this attach call IS the one explicit,
-  user-authorized reconnect the 2FA doctrine requires
-  (docs/connection-model.md:141-157): exactly one new dial via
+* ``state == "connected"`` (nothing was lost since the last operation) --
+  reuse it untouched. Zero new dials: "resume in place".
+* ``state == "authorization_required"`` (the channel dropped) -- this attach
+  call IS the one explicit, user-authorized reconnect the 2FA doctrine
+  requires (docs/connection-model.md:141-157): exactly one new dial via
   :meth:`~clio_relay.remote_connection.RemoteConnectionRegistry.reconnect`,
   never a silent redial from inside an operation.
 
@@ -34,27 +34,42 @@ A remote session that is dead, torn down, or owned by someone else fails
 verification with a typed ``RelayError``; this module re-raises that as the
 one typed refusal callers discriminate on, :class:`SessionNotAttachableError`
 (``reason == "session_not_attachable"``), carrying the underlying detail
-rather than swallowing it (no-silent-fallback).
+rather than swallowing it (no-silent-fallback). :func:`build_attach_report`
+raises the same typed error when a REUSED channel (``channel_reestablished``
+False) fails its own live cross-check: unlike a fresh bring-up or an
+authorized reconnect, "resume in place" never re-runs bootstrap
+verification, so without an explicit check here a forward that stayed open
+to a remote session that had since died or been torn down would be reported
+as live (iowarp/clio-relay#276 review D3).
+
+Job enumeration rides the SAME held channel every other owned-session
+operation does -- ``GET /queue``, which auto-scopes to the owner session
+named by the ``OWNER_SESSION_ID_HEADER``/``SESSION_GENERATION_ID_HEADER``
+headers every channel request already carries
+(``http_api_routes_queue.py:95-125``). There is deliberately no separate
+remote-vs-local branch here (iowarp/clio-relay#276 review D2): a per-page
+``remote_cli`` ssh exec for a report enumeration would be an unbudgeted,
+2FA-visible dial this module's own docstring's "exactly one new dial, never
+more" claim must not quietly violate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.core_queue as core_queue
-import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.models import RelayJob
 from clio_relay.owned_session_record import (
     default_owned_session_record_path,
     load_owned_session_record,
 )
+from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.remote_connection import (
     RemoteConnection,
     RemoteConnectionRegistry,
@@ -81,8 +96,9 @@ class SessionNotAttachableError(RelayError):
 
     Raised for a dead process, a torn-down session, a generation that moved
     on, or any other bring-up/bootstrap-verification failure encountered
-    while attaching -- ``detail`` always carries the exact underlying typed
-    error's message, never a generic replacement (no-silent-fallback).
+    while attaching or while re-verifying a reused channel -- ``detail``
+    always carries the exact underlying typed error's message, never a
+    generic replacement (no-silent-fallback).
     """
 
     reason = "session_not_attachable"
@@ -106,6 +122,17 @@ class AttachTarget:
     identity_source: Literal["environment_override", "durable_record"]
 
 
+class AttachJobRow(BaseModel):
+    """One non-terminal job the attach report found running under this session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    cluster: str
+    kind: str
+    state: str
+
+
 class SessionAttachReport(BaseModel):
     """The typed result ``session attach``/``session reconnect`` prints."""
 
@@ -120,7 +147,7 @@ class SessionAttachReport(BaseModel):
     identity_source: Literal["environment_override", "durable_record"]
     channel_reestablished: bool
     connected: bool
-    running_jobs: list[dict[str, object]]
+    running_jobs: list[AttachJobRow]
 
 
 def _environment_attach_target(
@@ -191,10 +218,12 @@ def attach_owned_session(
 
     Returns the held connection, the resolved attach target, and whether this
     call performed a new SSH dial (``channel_reestablished``): ``False`` only
-    when an already-live channel for the exact resolved identity was reused
-    untouched ("resume in place"); ``True`` for both a brand-new bring-up
-    (fresh process / first attach after a crash) and an explicit reconnect of
-    a dropped channel -- either way, exactly one new dial, never more.
+    when an already-live channel (``state == "connected"``) for the exact
+    resolved identity was reused untouched ("resume in place"); ``True`` for
+    both a brand-new bring-up (fresh process / first attach after a crash)
+    and an explicit reconnect of a dropped channel (``state ==
+    "authorization_required"``) -- either way, exactly one new dial, never
+    more.
     """
     target = resolve_attach_target(
         cluster=definition.name,
@@ -215,9 +244,14 @@ def attach_owned_session(
             settings=effective_settings,
             remote_api_port=target.remote_api_port,
         ):
-            if existing.connected:
+            if existing.state == "connected":
                 return existing, target, False
-            return active_registry.reconnect(definition.name), target, True
+            if existing.state == "authorization_required":
+                return active_registry.reconnect(definition.name), target, True
+            # "not_established" is unreachable for a connection the registry
+            # already holds (RemoteConnectionRegistry.connection() always
+            # calls connect() before recording it) -- fall through to the
+            # ordinary bring-up path below rather than assuming it away.
         connection = active_registry.connection(
             definition=definition,
             settings=effective_settings,
@@ -232,40 +266,104 @@ def attach_owned_session(
         ) from exc
 
 
+def _list_owned_jobs_over_channel(
+    connection: RemoteConnection,
+    *,
+    definition: ClusterDefinition,
+) -> list[AttachJobRow]:
+    """Enumerate the attached session's non-terminal jobs over the held channel.
+
+    ``GET /queue`` auto-scopes to the owner session named by the same
+    ``OWNER_SESSION_ID_HEADER``/``SESSION_GENERATION_ID_HEADER`` headers
+    every request over this channel already carries
+    (``http_api_routes_queue.py:95-125``'s ``ctx.resolved.owner_session_id``
+    branch) -- this rides the SAME pooled stream as any other owned-session
+    operation. Zero new dials, and the identical code path whether this
+    connection is ``ssh_forward`` or a dev-mode transport: there is no
+    separate remote-vs-local branch here (iowarp/clio-relay#276 review D2).
+    """
+    rows: list[AttachJobRow] = []
+    cursor = 1
+    while True:
+        document = connection.request_json(
+            method="GET",
+            path="/queue",
+            query={
+                "cluster": definition.name,
+                "include_terminal": False,
+                "cursor": cursor,
+                "limit": MAX_RESPONSE_PAGE_RECORDS,
+                "scan_limit": MAX_RESPONSE_PAGE_RECORDS,
+            },
+        )
+        if not isinstance(document, dict):
+            raise RelayError("owned session queue listing response is not a JSON object")
+        page = cast(dict[str, object], document)
+        if page.get("visibility_filter") != "exact_owner_session_generation":
+            raise RelayError(
+                "owned session queue listing was not scoped to the attached owner session"
+            )
+        raw_jobs = page.get("jobs")
+        if not isinstance(raw_jobs, list):
+            raise RelayError("owned session queue listing omitted its jobs array")
+        for raw_entry in cast(list[object], raw_jobs):
+            if not isinstance(raw_entry, dict):
+                raise RelayError("owned session queue listing returned a non-object job entry")
+            raw_job = cast(dict[str, object], raw_entry).get("job")
+            if not isinstance(raw_job, dict):
+                raise RelayError("owned session queue listing entry omitted its job")
+            try:
+                job = RelayJob.model_validate(raw_job)
+            except ValidationError as exc:
+                raise RelayError("owned session queue listing returned an invalid job") from exc
+            rows.append(
+                AttachJobRow(
+                    job_id=job.job_id,
+                    cluster=job.cluster,
+                    kind=job.kind.value,
+                    state=job.state.value,
+                )
+            )
+        next_cursor = page.get("source_next_cursor")
+        if next_cursor is None:
+            break
+        if (
+            isinstance(next_cursor, bool)
+            or not isinstance(next_cursor, int)
+            or next_cursor <= cursor
+        ):
+            raise RelayError("owned session queue listing returned an invalid page cursor")
+        cursor = next_cursor
+    return rows
+
+
 def build_attach_report(
     *,
     connection: RemoteConnection,
     target: AttachTarget,
     channel_reestablished: bool,
     definition: ClusterDefinition,
-    queue: core_queue.ClioCoreQueue,
 ) -> SessionAttachReport:
-    """Enumerate the attached session's running jobs and render the attach report.
+    """Cross-check the held channel and enumerate its running jobs.
 
-    Job discovery mirrors ``session detach``'s own local-vs-remote branch
-    (``cli_session.py``'s ``session_detach``): remote execution reads through
-    ``queue owner-jobs`` over the cluster-targeted CLI exec, local/dev-mode
-    execution reads the local queue's
-    :meth:`~clio_relay.queue_jobs.ClioCoreQueue.list_owner_session_jobs_page`
-    directly -- the same primitive the design calls out as "today wired only
-    into teardown", now also wired into attach.
+    ``connection.session_status()`` (zero new dials) cross-checks the exact
+    owner/cluster/session/generation before anything is reported: a fresh
+    bring-up or authorized reconnect already proved this out of band, but a
+    channel reused in place (``channel_reestablished`` False) never did, so
+    this is the one place that verification happens for that path
+    (iowarp/clio-relay#276 review D3). A stale/dead/mismatched remote session
+    surfaces as the same typed :class:`SessionNotAttachableError` a failed
+    bring-up does.
     """
-    remote_execution = remote_cli.should_execute_on_cluster(definition)
-    if remote_execution:
-        owned_jobs = cli_owned_relay_jobs._list_remote_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            definition,
-            definition.name,
-            owner_session_id=target.session_id,
-            owner_session_generation_id=target.session_generation_id,
-        )
-    else:
-        owned_jobs = cli_owned_relay_jobs._list_owned_active_cluster_jobs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            queue,
-            definition.name,
-            owner_session_id=target.session_id,
-            owner_session_generation_id=target.session_generation_id,
-            scheduler_provider=definition.scheduler_provider,
-        )
+    try:
+        connection.session_status()
+    except RelayError as exc:
+        raise SessionNotAttachableError(
+            cluster=definition.name,
+            session_id=target.session_id,
+            detail=str(exc),
+        ) from exc
+    running_jobs = _list_owned_jobs_over_channel(connection, definition=definition)
     return SessionAttachReport(
         cluster=definition.name,
         session_id=target.session_id,
@@ -275,19 +373,13 @@ def build_attach_report(
         identity_source=target.identity_source,
         channel_reestablished=channel_reestablished,
         connected=connection.connected,
-        running_jobs=[
-            {
-                "job_id": job.job_id,
-                "state": job.relay_state.value,
-                "scheduler_job_ids": list(job.scheduler_job_ids),
-            }
-            for job in owned_jobs
-        ],
+        running_jobs=running_jobs,
     )
 
 
 __all__ = [
     "SESSION_ATTACH_REPORT_SCHEMA",
+    "AttachJobRow",
     "AttachTarget",
     "NoDurableSessionRecordError",
     "SessionAttachReport",

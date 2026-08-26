@@ -299,6 +299,8 @@ def _run_teardown_finalize_phase(state: _TeardownState) -> None:
         and closed_recovery.coordinator_report_ref == finalized_reference
     ):
         raise RelayError("cleanup was not authoritatively closed after commit")
+    # The already_closed/admission-closed guard immediately above is what
+    # makes clearing safe; only a verified-closed generation reaches here.
     # iowarp/clio-relay#276 B1: a clean teardown, once authoritatively closed
     # above, retires the durable "last session for this cluster" record --
     # `session attach` must never resurrect a session that was deliberately
