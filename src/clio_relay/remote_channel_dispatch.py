@@ -9,9 +9,12 @@ it. Precedent: :mod:`clio_relay.session_attach`'s ``_list_owned_jobs_over_
 channel`` already rides ``GET /queue`` over the held channel instead of a
 per-page ssh exec (iowarp/clio-relay#276). This module generalizes that
 pattern into the one place cli_owned_relay_jobs.py / cli_owned_scheduler_
-cancel.py / cli_remote_worker_probe.py / cli_remote_mcp.py's dial sites
-route their decision through, instead of each repeating an ad hoc
-channel-or-ssh branch.
+cancel.py / cli_remote_worker_probe.py's dial sites route their decision
+through, instead of each repeating an ad hoc channel-or-ssh branch.
+``cli_remote_mcp.py``'s artifact-content read was dropped from this slice
+(review B1): the discovery job it reads carries no owner metadata, so
+``GET /artifacts/{id}/content`` 403s every time over an owned channel --
+that dial site stays ssh, unconditionally, undisturbed by this module.
 
 :func:`live_matching_connection` never dials anything -- it is
 ``RemoteConnectionRegistry.get()``, read-only. A connection held for a
@@ -34,6 +37,14 @@ remote_connection_registry`). This is a DIFFERENT ledger: the registry
 counts held-channel transport opens; this one counts the ordinary
 per-operation ssh dial each of the four modules above still falls back to
 when no live channel exists. Never conflate the two in a measurement.
+
+Every recorded fallback also carries a typed ``cause`` (review M1),
+distinct from a cold process with no channel at all: a channel HELD for
+this exact identity that has since dropped (``FALLBACK_CAUSE_CHANNEL_
+DROPPED``, the 2FA doctrine's one-authorized-reconnect case) and the
+cross-generation legacy-discovery query (``FALLBACK_CAUSE_CROSS_
+GENERATION_LEGACY_DISCOVERY``) are both distinguishable from the ordinary
+``FALLBACK_CAUSE_NO_LIVE_CHANNEL`` case.
 """
 
 from __future__ import annotations
@@ -54,6 +65,28 @@ from clio_relay.remote_connection import RemoteConnection, connection_registry
 PER_OP_SSH_FALLBACK_REASON: Final = "per_op_ssh_fallback"
 MAX_RECORDED_FALLBACKS: Final = 256
 
+#: No connection is held for this cluster at all, or one is held but for a
+#: different session/generation/token/port -- the ordinary cold-process case.
+FALLBACK_CAUSE_NO_LIVE_CHANNEL: Final = "no_live_channel"
+#: A channel WAS held for this exact identity and has since dropped
+#: (``RemoteConnection.state == "authorization_required"``) -- the 2FA
+#: doctrine's one-authorized-reconnect case, not a cold process.
+FALLBACK_CAUSE_CHANNEL_DROPPED: Final = "channel_dropped_authorization_required"
+#: The query cannot be scoped to one generation (``owner_session_generation_
+#: id=None``, owned-session teardown's cross-generation legacy-job
+#: discovery) -- a channel is pinned to one generation by construction.
+FALLBACK_CAUSE_CROSS_GENERATION_LEGACY_DISCOVERY: Final = "cross_generation_legacy_discovery"
+
+_FALLBACK_CAUSE_DETAIL: Final[dict[str, str]] = {
+    FALLBACK_CAUSE_NO_LIVE_CHANNEL: "no live owned-session channel for this identity",
+    FALLBACK_CAUSE_CHANNEL_DROPPED: (
+        "the held channel for this identity dropped; falling back until an explicit reconnect"
+    ),
+    FALLBACK_CAUSE_CROSS_GENERATION_LEGACY_DISCOVERY: (
+        "cross-generation query cannot be scoped to one held channel"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class PerOperationSshFallback:
@@ -61,12 +94,14 @@ class PerOperationSshFallback:
 
     ``reason`` is always :data:`PER_OP_SSH_FALLBACK_REASON` -- typed so the
     two-sided ssh-dial measurement (clio-relay#179) can count these
-    separately from the held channel's own transport-open events.
+    separately from the held channel's own transport-open events. ``cause``
+    is one of the three ``FALLBACK_CAUSE_*`` constants (review M1).
     """
 
     operation: str
     cluster: str
     detail: str
+    cause: str
     reason: str = PER_OP_SSH_FALLBACK_REASON
     observed_at: float = 0.0
 
@@ -78,9 +113,15 @@ class _PerOperationFallbackLedger:
         self._lock = threading.Lock()
         self._records: list[PerOperationSshFallback] = []
 
-    def record(self, *, operation: str, cluster: str, detail: str) -> PerOperationSshFallback:
+    def record(
+        self, *, operation: str, cluster: str, detail: str, cause: str
+    ) -> PerOperationSshFallback:
         entry = PerOperationSshFallback(
-            operation=operation, cluster=cluster, detail=detail, observed_at=time.time()
+            operation=operation,
+            cluster=cluster,
+            detail=detail,
+            cause=cause,
+            observed_at=time.time(),
         )
         with self._lock:
             self._records.append(entry)
@@ -107,10 +148,53 @@ def per_operation_fallback_ledger() -> _PerOperationFallbackLedger:
 
 
 def record_per_operation_ssh_fallback(
-    *, operation: str, cluster: str, detail: str
+    *, operation: str, cluster: str, cause: str, detail: str | None = None
 ) -> PerOperationSshFallback:
-    """Record one typed, visible per-operation ssh fallback (clio-relay#179)."""
-    return _LEDGER.record(operation=operation, cluster=cluster, detail=detail)
+    """Record one typed, visible per-operation ssh fallback (clio-relay#179).
+
+    ``detail`` defaults to the standard human-readable text for ``cause``
+    (see :data:`_FALLBACK_CAUSE_DETAIL`); pass an explicit ``detail`` only
+    when a caller has something more specific to say.
+    """
+    return _LEDGER.record(
+        operation=operation,
+        cluster=cluster,
+        cause=cause,
+        detail=detail if detail is not None else _FALLBACK_CAUSE_DETAIL[cause],
+    )
+
+
+def live_matching_connection_with_cause(
+    *,
+    definition: ClusterDefinition,
+    owner_session_id: str,
+    owner_session_generation_id: str | None,
+) -> tuple[RemoteConnection | None, str | None]:
+    """:func:`live_matching_connection`, plus WHY no connection was usable.
+
+    Returns ``(connection, None)`` when a live matching channel was found,
+    or ``(None, cause)`` naming exactly why not -- one of the three
+    ``FALLBACK_CAUSE_*`` constants (review M1).
+    """
+    if owner_session_generation_id is None:
+        return None, FALLBACK_CAUSE_CROSS_GENERATION_LEGACY_DISCOVERY
+    settings = RelaySettings.from_env().model_copy(
+        update={
+            "owner_session_id": owner_session_id,
+            "owner_session_generation_id": owner_session_generation_id,
+            "owner_session_cluster": definition.name,
+        }
+    )
+    connection = connection_registry().get(definition.name)
+    if connection is None:
+        return None, FALLBACK_CAUSE_NO_LIVE_CHANNEL
+    if not connection.matches(settings=settings):
+        return None, FALLBACK_CAUSE_NO_LIVE_CHANNEL
+    if connection.state == "authorization_required":
+        return None, FALLBACK_CAUSE_CHANNEL_DROPPED
+    if connection.state != "connected":
+        return None, FALLBACK_CAUSE_NO_LIVE_CHANNEL
+    return connection, None
 
 
 def live_matching_connection(
@@ -127,41 +211,37 @@ def live_matching_connection(
     ``owner_session_generation_id`` is ``None`` (a channel is pinned to one
     generation; it cannot serve a cross-generation query).
     """
-    if owner_session_generation_id is None:
-        return None
-    settings = RelaySettings.from_env().model_copy(
-        update={
-            "owner_session_id": owner_session_id,
-            "owner_session_generation_id": owner_session_generation_id,
-            "owner_session_cluster": definition.name,
-        }
+    connection, _cause = live_matching_connection_with_cause(
+        definition=definition,
+        owner_session_id=owner_session_id,
+        owner_session_generation_id=owner_session_generation_id,
     )
-    connection = connection_registry().get(definition.name)
-    if connection is None or connection.state != "connected":
-        return None
-    if not connection.matches(settings=settings):
-        return None
     return connection
 
 
-def _live_matching_connection_from_ambient_settings(
+def _live_matching_connection_from_ambient_settings_with_cause(
     definition: ClusterDefinition,
-) -> RemoteConnection | None:
-    """:func:`live_matching_connection` using this process's ambient identity.
+) -> tuple[RemoteConnection | None, str | None]:
+    """:func:`live_matching_connection_with_cause` using this process's
+    ambient identity.
 
     For call sites with no caller-explicit ``owner_session_id``/generation
     id to thread (``cli_remote_worker_probe.py``'s worker-info/target-info
-    probes, ``cli_remote_mcp.py``'s discovery-artifact read): reads
-    ``CLIO_RELAY_OWNER_SESSION_ID``/``CLIO_RELAY_SESSION_GENERATION_ID``
-    from the environment instead. Safe when it does not match --
-    :func:`live_matching_connection`'s own identity check still gates
-    whether any returned connection is actually usable; an absent or
-    mismatched ambient identity just means ``None``, the ssh-fallback cue.
+    probes): reads ``CLIO_RELAY_OWNER_SESSION_ID``/``CLIO_RELAY_SESSION_
+    GENERATION_ID`` from the environment instead. Checks cluster equality
+    explicitly (review LOW) rather than overriding ``owner_session_cluster``
+    to ``definition.name`` unconditionally -- an ambient identity scoped to
+    a DIFFERENT cluster than ``definition`` must never be reported as a
+    match just because the override would have made it look like one.
     """
     settings = RelaySettings.from_env()
-    if settings.owner_session_id is None or settings.owner_session_generation_id is None:
-        return None
-    return live_matching_connection(
+    if (
+        settings.owner_session_id is None
+        or settings.owner_session_generation_id is None
+        or settings.resolved_owner_session_cluster() != definition.name
+    ):
+        return None, FALLBACK_CAUSE_NO_LIVE_CHANNEL
+    return live_matching_connection_with_cause(
         definition=definition,
         owner_session_id=settings.owner_session_id,
         owner_session_generation_id=settings.owner_session_generation_id,
@@ -176,6 +256,7 @@ def dial_or_route_string_ambient(
     path: str,
     query: dict[str, object] | None = None,
     body: dict[str, object] | None = None,
+    response_timeout_seconds: float | None = None,
     ssh_fallback: Callable[[], str],
 ) -> str:
     """Ride the held channel (this process's ambient identity), as a JSON string.
@@ -185,13 +266,21 @@ def dial_or_route_string_ambient(
     wherever that call's raw string result feeds an existing ``_json_
     output``-shaped parser unchanged.
     """
-    connection = _live_matching_connection_from_ambient_settings(definition)
+    connection, cause = _live_matching_connection_from_ambient_settings_with_cause(definition)
     if connection is not None:
-        return json.dumps(connection.request_json(method=method, path=path, query=query, body=body))
+        return json.dumps(
+            connection.request_json(
+                method=method,
+                path=path,
+                query=query,
+                body=body,
+                response_timeout_seconds=response_timeout_seconds,
+            )
+        )
     record_per_operation_ssh_fallback(
         operation=operation,
         cluster=definition.name,
-        detail="no live owned-session channel for this process's ambient identity",
+        cause=cause or FALLBACK_CAUSE_NO_LIVE_CHANNEL,
     )
     return ssh_fallback()
 
@@ -206,7 +295,7 @@ def dial_or_route(
     ssh_fallback: Callable[[], object],
 ) -> object:
     """Ride the held channel for one operation, or take the typed ssh fallback."""
-    connection = live_matching_connection(
+    connection, cause = live_matching_connection_with_cause(
         definition=definition,
         owner_session_id=owner_session_id,
         owner_session_generation_id=owner_session_generation_id,
@@ -216,7 +305,7 @@ def dial_or_route(
     record_per_operation_ssh_fallback(
         operation=operation,
         cluster=definition.name,
-        detail="no live owned-session channel for this identity",
+        cause=cause or FALLBACK_CAUSE_NO_LIVE_CHANNEL,
     )
     return ssh_fallback()
 
@@ -231,6 +320,7 @@ def dial_or_route_json(
     path: str,
     query: dict[str, object] | None = None,
     body: dict[str, object] | None = None,
+    response_timeout_seconds: float | None = None,
     ssh_fallback: Callable[[], object],
 ) -> object:
     """:func:`dial_or_route` for the common case: one plain JSON request."""
@@ -240,7 +330,11 @@ def dial_or_route_json(
         owner_session_generation_id=owner_session_generation_id,
         operation=operation,
         channel=lambda connection: connection.request_json(
-            method=method, path=path, query=query, body=body
+            method=method,
+            path=path,
+            query=query,
+            body=body,
+            response_timeout_seconds=response_timeout_seconds,
         ),
         ssh_fallback=ssh_fallback,
     )
@@ -254,6 +348,7 @@ def channel_backed_json_runner(
     operation: str,
     method: str,
     path: str,
+    response_timeout_seconds: float | None = None,
 ) -> Callable[[ClusterDefinition, list[str]], str] | None:
     """Build a ``RemoteCliRunner``-shaped callable riding a live channel, or ``None``.
 
@@ -265,7 +360,7 @@ def channel_backed_json_runner(
     typed ssh-fallback reason and returns ``None`` when no live channel
     matches -- the caller's cue to keep its own ssh-backed runner.
     """
-    connection = live_matching_connection(
+    connection, cause = live_matching_connection_with_cause(
         definition=definition,
         owner_session_id=owner_session_id,
         owner_session_generation_id=owner_session_generation_id,
@@ -274,12 +369,16 @@ def channel_backed_json_runner(
         record_per_operation_ssh_fallback(
             operation=operation,
             cluster=definition.name,
-            detail="no live owned-session channel for this identity",
+            cause=cause or FALLBACK_CAUSE_NO_LIVE_CHANNEL,
         )
         return None
 
     def runner(_definition: ClusterDefinition, _args: list[str]) -> str:
-        return json.dumps(connection.request_json(method=method, path=path))
+        return json.dumps(
+            connection.request_json(
+                method=method, path=path, response_timeout_seconds=response_timeout_seconds
+            )
+        )
 
     return runner
 
@@ -289,6 +388,8 @@ def list_owned_session_jobs_and_tasks_over_channel(
     *,
     cluster: str,
     include_terminal: bool,
+    owner_session_id: str,
+    owner_session_generation_id: str,
 ) -> list[tuple[dict[str, object], list[dict[str, object]]]]:
     """Enumerate this held channel's owned jobs, each with its full task list.
 
@@ -297,6 +398,14 @@ def list_owned_session_jobs_and_tasks_over_channel(
     documents instead of the summary row that report needs -- what
     ``cli_owned_relay_jobs._owned_relay_job``'s ownership/scheduler-job-id
     proof chain requires.
+
+    Review M4: the server's ``visibility_filter ==
+    "exact_owner_session_generation"`` self-declaration is not proof --
+    each returned job's own ``metadata.owner``/``owner_session_id``/
+    ``owner_session_generation_id`` is re-verified client-side against the
+    exact identity the caller asked for (the same check ``cli_owned_relay_
+    jobs._job_is_owned_by_session`` makes on the ssh branch), and a
+    mismatch fails closed rather than silently trusting the page.
     """
     results: list[tuple[dict[str, object], list[dict[str, object]]]] = []
     cursor = 1
@@ -329,6 +438,8 @@ def list_owned_session_jobs_and_tasks_over_channel(
             if not isinstance(raw_job, dict):
                 raise RelayError("owned session queue listing entry omitted its job")
             job_document = {str(k): v for k, v in cast(dict[object, object], raw_job).items()}
+            if not _job_owned_by(job_document, owner_session_id, owner_session_generation_id):
+                raise RelayError("owned session queue listing target identity mismatch")
             job_id = job_document.get("job_id")
             if not isinstance(job_id, str):
                 raise RelayError("owned session queue listing job omitted its job_id")
@@ -346,11 +457,30 @@ def list_owned_session_jobs_and_tasks_over_channel(
     return results
 
 
+def _job_owned_by(
+    job_document: dict[str, object],
+    owner_session_id: str,
+    owner_session_generation_id: str,
+) -> bool:
+    """Re-verify one job document's OWN ownership metadata (review M4)."""
+    metadata = job_document.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    typed_metadata = cast(dict[str, object], metadata)
+    return (
+        typed_metadata.get("owner") == "clio-relay"
+        and typed_metadata.get("owner_session_id") == owner_session_id
+        and typed_metadata.get("owner_session_generation_id") == owner_session_generation_id
+    )
+
+
 def build_owned_jobs_over_channel[T](
     connection: RemoteConnection,
     *,
     cluster: str,
     include_terminal: bool,
+    owner_session_id: str,
+    owner_session_generation_id: str | None,
     build: Callable[[dict[str, object], list[dict[str, object]]], T],
     needs_inclusion: Callable[[T], bool],
 ) -> list[T]:
@@ -359,10 +489,24 @@ def build_owned_jobs_over_channel[T](
     Takes the ``build``/``needs_inclusion`` callbacks instead of importing
     ``cli_owned_relay_jobs._owned_relay_job`` directly, to avoid a circular
     import (that module already imports this one for :func:`dial_or_route`).
+    ``owner_session_generation_id`` is ``str | None`` only because the
+    caller's own outer parameter is; reaching here with ``None`` would mean
+    a channel matched a cross-generation query, which
+    :func:`live_matching_connection` never allows -- fails closed rather
+    than silently narrowing.
     """
+    if owner_session_generation_id is None:
+        raise RelayError(
+            "build_owned_jobs_over_channel requires an exact generation id; a live channel "
+            "match implies one was already resolved"
+        )
     kept: list[T] = []
     for job_document, task_documents in list_owned_session_jobs_and_tasks_over_channel(
-        connection, cluster=cluster, include_terminal=include_terminal
+        connection,
+        cluster=cluster,
+        include_terminal=include_terminal,
+        owner_session_id=owner_session_id,
+        owner_session_generation_id=owner_session_generation_id,
     ):
         candidate = build(job_document, task_documents)
         if include_terminal or needs_inclusion(candidate):
@@ -406,6 +550,9 @@ def _list_job_tasks_over_channel(
 
 
 __all__ = [
+    "FALLBACK_CAUSE_CHANNEL_DROPPED",
+    "FALLBACK_CAUSE_CROSS_GENERATION_LEGACY_DISCOVERY",
+    "FALLBACK_CAUSE_NO_LIVE_CHANNEL",
     "MAX_RECORDED_FALLBACKS",
     "PER_OP_SSH_FALLBACK_REASON",
     "PerOperationSshFallback",
@@ -416,6 +563,7 @@ __all__ = [
     "dial_or_route_string_ambient",
     "list_owned_session_jobs_and_tasks_over_channel",
     "live_matching_connection",
+    "live_matching_connection_with_cause",
     "per_operation_fallback_ledger",
     "record_per_operation_ssh_fallback",
 ]

@@ -165,8 +165,18 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
     )
     register_queue_routes(app, ctx, auth_dependency=auth_dependency)
     register_owner_session_admin_routes(app, ctx, auth_dependency=auth_dependency)
-    register_scheduler_routes(app, ctx, auth_dependency=auth_dependency)
-    register_worker_probe_routes(app, ctx, auth_dependency=auth_dependency)
+    if resolved.owner_session_id is not None:
+        # clio-relay#179 review S1(a)/S2: scheduler status/status-batch/
+        # cancel and worker-info/target-info are never registered on the
+        # global app, where auth is a no-op once --require-token False lets
+        # api_token stay None (proven: unauthenticated cancel). Both only
+        # make sense scoped to one owned session anyway -- unlike
+        # register_owner_session_admin_routes above, which already
+        # self-gates on this exact same condition per request (its own
+        # ctx.resolved.owner_session_id check), these carry no such guard
+        # internally, so the registration itself is the gate.
+        register_scheduler_routes(app, ctx, auth_dependency=auth_dependency)
+        register_worker_probe_routes(app, ctx, auth_dependency=auth_dependency)
 
     return app
 

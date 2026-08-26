@@ -38,7 +38,7 @@ def list_remote_owned_active_cluster_jobs(
     include_terminal: bool = False,
 ) -> list[cli_owned_relay_jobs._OwnedRelayJob]:
     """List active jobs (clio-relay#179: rides GET /queue+tasks when live)."""
-    connection = remote_channel_dispatch.live_matching_connection(
+    connection, cause = remote_channel_dispatch.live_matching_connection_with_cause(
         definition=definition,
         owner_session_id=owner_session_id,
         owner_session_generation_id=owner_session_generation_id,
@@ -48,6 +48,8 @@ def list_remote_owned_active_cluster_jobs(
             connection,
             cluster=cluster,
             include_terminal=include_terminal,
+            owner_session_id=owner_session_id,
+            owner_session_generation_id=owner_session_generation_id,
             build=lambda job_document, task_documents: cli_owned_relay_jobs._owned_relay_job(
                 job_document, task_documents, scheduler_provider=definition.scheduler_provider
             ),
@@ -56,7 +58,7 @@ def list_remote_owned_active_cluster_jobs(
     remote_channel_dispatch.record_per_operation_ssh_fallback(
         operation="list_remote_owned_active_cluster_jobs",
         cluster=cluster,
-        detail="no live owned-session channel matches this exact identity",
+        cause=cause or remote_channel_dispatch.FALLBACK_CAUSE_NO_LIVE_CHANNEL,
     )
     owned: list[cli_owned_relay_jobs._OwnedRelayJob] = []
     membership_generations = [owner_session_generation_id]

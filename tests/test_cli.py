@@ -6580,7 +6580,14 @@ def test_remote_worker_info_uses_one_total_observation_deadline(
             site_marker_sha256="a" * 64,
         ),
     )
-    clock = iter((100.0, 101.0, 105.0))
+    # clio-relay#179 review M3: the channel path now also reads a deadline-bound
+    # response_timeout_seconds for BOTH requests (worker-info, then target-info)
+    # before falling back to ssh -- two extra clock reads beyond the original
+    # three (initial deadline, worker-info ssh remaining, target-info ssh
+    # remaining). Those two extra reads are unobserved here (no live channel in
+    # this test, so the computed channel timeout is never consumed) but must
+    # still be present in the fake clock.
+    clock = iter((100.0, 100.5, 101.0, 104.5, 105.0))
     observed_timeouts: list[float] = []
     observed_deadlines: list[float | None] = []
 

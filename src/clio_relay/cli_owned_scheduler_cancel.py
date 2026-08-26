@@ -17,20 +17,22 @@ import clio_relay.core_queue as core_queue
 import clio_relay.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 import clio_relay.scheduler_providers as scheduler_providers
-from clio_relay.cluster_config import (
-    ClusterDefinition,
-)
+from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
 from clio_relay.models import (
     JobState,
     SchedulerPhase,
     SchedulerStatus,
 )
-from clio_relay.session_lifecycle import (
-    CleanupResource,
-)
+from clio_relay.session_lifecycle import CleanupResource
 
 MAX_SCHEDULER_STATUS_BATCH = 256
+
+#: Review S1(b) compat: the server-side ownership gate on GET /scheduler/
+#: jobs/{id}/status refuses any id this session does not own. Sentinel ids
+#: are UNOWNED by design, so their two pollers pass channel_eligible=False
+#: and record this cause instead of routing over the channel.
+_SCHEDULER_JOB_NOT_OWNED_CAUSE = "scheduler_job_not_owned_by_session"
 
 
 SCHEDULER_SENTINEL_ACTIVE_PHASES = frozenset({"submitted", "pending", "allocated", "running"})
@@ -172,6 +174,7 @@ def _preflight_scheduler_sentinels(
             provider=provider,
             owner_session_id=owner_session_id,
             owner_session_generation_id=owner_session_generation_id,
+            channel_eligible=False,
         )
         normalized_phase = phase.strip().lower() if phase is not None else "unknown"
         if error is not None or normalized_phase not in SCHEDULER_SENTINEL_ACTIVE_PHASES:
@@ -207,6 +210,7 @@ def _scheduler_sentinel_preservation_resources(
             provider=provider,
             owner_session_id=owner_session_id,
             owner_session_generation_id=owner_session_generation_id,
+            channel_eligible=False,
         )
         post_phase = phase.strip().lower() if phase is not None else "unknown"
         preserved = poll_error is None and post_phase in SCHEDULER_SENTINEL_PRESERVED_PHASES
@@ -426,32 +430,47 @@ def _scheduler_phase_after_operation(
     provider: str,
     owner_session_id: str,
     owner_session_generation_id: str,
+    channel_eligible: bool = True,
 ) -> tuple[str | None, str | None]:
+    def ssh_status() -> object:
+        return json.loads(
+            remote_cli.run_remote_clio(
+                definition,
+                [
+                    "scheduler",
+                    "status",
+                    scheduler_job_id,
+                    "--cluster",
+                    definition.name,
+                    "--provider",
+                    provider,
+                ],
+            )
+        )
+
     try:
         if remote_cli.should_execute_on_cluster(definition):
-            raw_status = remote_channel_dispatch.dial_or_route_json(
-                definition=definition,
-                owner_session_id=owner_session_id,
-                owner_session_generation_id=owner_session_generation_id,
-                operation="scheduler_status",
-                method="GET",
-                path=f"/scheduler/jobs/{scheduler_job_id}/status",
-                query={"provider": provider},
-                ssh_fallback=lambda: json.loads(
-                    remote_cli.run_remote_clio(
-                        definition,
-                        [
-                            "scheduler",
-                            "status",
-                            scheduler_job_id,
-                            "--cluster",
-                            definition.name,
-                            "--provider",
-                            provider,
-                        ],
-                    )
-                ),
-            )
+            if channel_eligible:
+                raw_status = remote_channel_dispatch.dial_or_route_json(
+                    definition=definition,
+                    owner_session_id=owner_session_id,
+                    owner_session_generation_id=owner_session_generation_id,
+                    operation="scheduler_status",
+                    method="GET",
+                    path=f"/scheduler/jobs/{scheduler_job_id}/status",
+                    query={"provider": provider},
+                    ssh_fallback=ssh_status,
+                )
+            else:
+                # Review S1(b): sentinel ids are UNOWNED by design -- skip
+                # the channel (it would 403) and record why.
+                remote_channel_dispatch.record_per_operation_ssh_fallback(
+                    operation="scheduler_status",
+                    cluster=definition.name,
+                    cause=_SCHEDULER_JOB_NOT_OWNED_CAUSE,
+                    detail=f"scheduler job {scheduler_job_id} is a preservation sentinel",
+                )
+                raw_status = ssh_status()
             if not isinstance(raw_status, dict):
                 raise RelayError("scheduler status did not return a JSON object")
             phase = cast(dict[str, object], raw_status).get("phase")
@@ -488,7 +507,7 @@ def _scheduler_phases_after_operation(
             for identity in unique_identities
         }
 
-    connection = remote_channel_dispatch.live_matching_connection(
+    connection, cause = remote_channel_dispatch.live_matching_connection_with_cause(
         definition=definition,
         owner_session_id=owner_session_id,
         owner_session_generation_id=owner_session_generation_id,
@@ -497,7 +516,7 @@ def _scheduler_phases_after_operation(
         remote_channel_dispatch.record_per_operation_ssh_fallback(
             operation="scheduler_status_batch",
             cluster=definition.name,
-            detail="no live owned-session channel for this identity",
+            cause=cause or remote_channel_dispatch.FALLBACK_CAUSE_NO_LIVE_CHANNEL,
         )
     by_provider: dict[str, list[str]] = {}
     for provider, scheduler_job_id in unique_identities:
@@ -559,6 +578,14 @@ def _scheduler_phases_after_operation(
     return observations
 
 
+def _cleanup_command_deadline_seconds(deadline: float) -> float:
+    """Bound one remote-cleanup dial by the shared per-job deadline."""
+    return min(
+        cli_owned_relay_jobs.REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
+        max(0.01, deadline - time.monotonic()),
+    )
+
+
 def _cancel_owned_scheduler_jobs(
     definition: ClusterDefinition,
     jobs: list[cli_owned_relay_jobs._OwnedRelayJob],
@@ -607,12 +634,7 @@ def _cancel_owned_scheduler_job(
     deadline = time.monotonic() + timeout_seconds
 
     def bounded_ssh_cancel() -> object:
-        with remote_cli.remote_command_timeout(
-            min(
-                cli_owned_relay_jobs.REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
-                max(0.01, deadline - time.monotonic()),
-            )
-        ):
+        with remote_cli.remote_command_timeout(_cleanup_command_deadline_seconds(deadline)):
             return json.loads(
                 remote_cli.run_remote_clio(
                     definition,
@@ -629,12 +651,7 @@ def _cancel_owned_scheduler_job(
             )
 
     def bounded_ssh_status() -> object:
-        with remote_cli.remote_command_timeout(
-            min(
-                cli_owned_relay_jobs.REMOTE_CLEANUP_COMMAND_TIMEOUT_SECONDS,
-                max(0.01, deadline - time.monotonic()),
-            )
-        ):
+        with remote_cli.remote_command_timeout(_cleanup_command_deadline_seconds(deadline)):
             return json.loads(
                 remote_cli.run_remote_clio(
                     definition,
@@ -662,12 +679,19 @@ def _cancel_owned_scheduler_job(
                 method="POST",
                 path=f"/scheduler/jobs/{scheduler_job_id}/cancel",
                 body={"provider": provider},
+                response_timeout_seconds=_cleanup_command_deadline_seconds(deadline),
                 ssh_fallback=bounded_ssh_cancel,
             )
-            accepted = (
-                isinstance(raw_cancel, dict)
-                and cast(dict[str, object], raw_cancel).get("accepted") is True
-            )
+            # Review M2: mirror the local branch below -- populate cancel_detail
+            # from the channel's {accepted, returncode, stdout, stderr} shape.
+            if isinstance(raw_cancel, dict):
+                cancel_document = cast(dict[str, object], raw_cancel)
+                accepted = cancel_document.get("accepted") is True
+                raw_stderr = cancel_document.get("stderr")
+                raw_stdout = cancel_document.get("stdout")
+                stderr_text = raw_stderr.strip() if isinstance(raw_stderr, str) else ""
+                stdout_text = raw_stdout.strip() if isinstance(raw_stdout, str) else ""
+                cancel_detail = stderr_text or stdout_text or None
         else:
             result = scheduler_providers.provider_for_scheduler(provider).cancel(scheduler_job_id)
             accepted = result.returncode == 0
@@ -687,6 +711,7 @@ def _cancel_owned_scheduler_job(
                     method="GET",
                     path=f"/scheduler/jobs/{scheduler_job_id}/status",
                     query={"provider": provider},
+                    response_timeout_seconds=_cleanup_command_deadline_seconds(deadline),
                     ssh_fallback=bounded_ssh_status,
                 )
                 if not isinstance(raw_status, dict):
