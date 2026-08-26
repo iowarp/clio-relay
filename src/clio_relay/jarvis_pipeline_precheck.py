@@ -38,11 +38,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from clio_relay.endpoint_jarvis_recovery import (
-    _endpoint_mcp_runner_command,
-    _minimal_mcp_runner_environment,
-    _trusted_jarvis_mcp_result,
+    endpoint_mcp_runner_command,
+    minimal_mcp_runner_environment,
+    trusted_jarvis_mcp_result,
 )
-from clio_relay.endpoint_recovery_directory import _write_private_json_file
+from clio_relay.endpoint_recovery_directory import write_private_json_file
 from clio_relay.errors import RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import McpCallSpec
@@ -169,13 +169,13 @@ def dispatch_pipeline_describe_query(
     result_path = query_dir / "mcp-result.json"
     with suppress(FileNotFoundError):
         internal_filesystem_path(result_path).unlink()
-    _write_private_json_file(params_path, query_spec.model_dump(mode="json", exclude_none=True))
+    write_private_json_file(params_path, query_spec.model_dump(mode="json", exclude_none=True))
     try:
         completed = provider.run_command_streaming(
-            _endpoint_mcp_runner_command(params_path),
+            endpoint_mcp_runner_command(params_path),
             process_label="jarvis pipeline precheck query",
             cwd=internal_filesystem_path(query_dir),
-            env=_minimal_mcp_runner_environment(base_spec.env_from),
+            env=minimal_mcp_runner_environment(base_spec.env_from),
             timeout_seconds=PIPELINE_PRECHECK_QUERY_PROCESS_TIMEOUT_SECONDS,
         )
     except (RelayError, OSError, ValueError):
@@ -193,8 +193,8 @@ def dispatch_pipeline_describe_query(
         return PipelinePrecheckResult(
             step_count=None, inconclusive_reason="query_result_unreadable"
         )
-    trusted, _reason = _trusted_jarvis_mcp_result(
-        query_job, document, expected_tool="jarvis_describe"
+    trusted, _reason = trusted_jarvis_mcp_result(
+        query_job, cast(dict[str, object], document), expected_tool="jarvis_describe"
     )
     if not trusted:
         return PipelinePrecheckResult(step_count=None, inconclusive_reason="query_result_untrusted")

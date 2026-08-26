@@ -31,6 +31,22 @@ the two: ``no_outputs_declared`` (zero matching entries in ``artifacts``) vs
 disk -- the pre-existing behavior, unchanged in shape). A run whose terminal
 record carries no ``artifact_page`` at all keeps its original semantics
 (the early return above, unaffected by this revision).
+
+Refinement (adversarial-review Ruling B on the D1 slice above, flagged for
+owner review -- see the "honest verdict" campaign plan, clio-relay#265):
+the D1 revision's *detection* stands exactly as written here (this module
+still computes and returns ``no_outputs_declared`` unchanged), but its
+*consumption* was corrected -- ``no_outputs_declared`` does NOT flow into
+``execution_watch.resolve_execution_outcome`` and does NOT flip a job to
+FAILED (unlike ``declared_outputs_missing``, which still does, unchanged).
+The campaign plan mandates the typed SIGNAL, not an automatic failure: this
+module's own line 17's instruction ("never invent a heuristic about which
+files should exist") applies here too -- a page declaring real artifacts of
+another kind (a ``pipeline-snapshot``, the relay-flushed ``console.log``,
+...) or a pure-stdout application would otherwise be false-failed purely
+for not declaring an ``execution-file`` entry. The signal still reaches the
+durable task record on both outcomes (see ``endpoint_job_execution.py``'s
+success and failure branches) so a run card can render it either way.
 """
 
 from __future__ import annotations
@@ -74,7 +90,7 @@ def ingest_jarvis_execution_outputs(
 
     Returns ``(indexed, truncation, outputs_missing)``. ``outputs_missing`` is
     clio-relay#265's typed terminal-failure payload
-    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA``) whenever the terminal
+    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA`) whenever the terminal
     ``artifact_page`` was present but did NOT prove clean declared outputs --
     either at least one declared ``execution-file`` output is absent on disk
     or declared empty (``size_bytes == 0``, ``reason="declared_outputs_missing"``),

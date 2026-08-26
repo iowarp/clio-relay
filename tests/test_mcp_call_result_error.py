@@ -34,6 +34,7 @@ from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.mcp_call_result_error import (
     DISPATCH_NO_RESULT_DOCUMENT_REASON,
     MCP_CALL_RESULT_ERROR_REASON,
+    MCP_CALL_TIMED_OUT_REASON,
     dispatch_no_result_document_detail,
     mcp_call_dispatch_failure_text,
     mcp_call_result_error,
@@ -73,6 +74,94 @@ def test_typed_structured_error_is_extracted_regardless_of_schema() -> None:
     assert detail["protocol_error"] == "tools/call returned isError=true"
     assert mcp_call_result_error_text_contains(detail, "command_failed")
     assert mcp_call_result_error_text_contains(detail, "spack_install")
+
+
+def test_typed_error_inside_protocol_result_content_text_is_decoded() -> None:
+    """Major 4 (adversarial review): the REAL spack failure shape carries no
+    top-level ``structured_result`` key at all -- only
+    ``protocol_result.content[0].text``, a JSON string of the tool's own
+    typed error, exactly what a remote MCP server that never populates
+    ``structuredContent`` produces. Before this fix the reviewer's e2e probe
+    got ``last_error "MCP call spack_install failed: tools/call returned
+    isError=true"`` with ``code=null`` -- the typed reason was RIGHT THERE
+    in the document and still got thrown away.
+    """
+    structured_error = {
+        "schema_version": "spack.mcp.error.v1",
+        "error": {
+            "code": "command_failed",
+            "detail": "==> Error: No such variant {'osmesa'} for spec hdf5+mpi",
+            "schema_version": "spack.mcp.error.v1",
+        },
+    }
+    document: dict[str, object] = {
+        "tool": "spack_install",
+        "operation": "tools/call",
+        "protocol_result": {
+            "isError": True,
+            "content": [{"type": "text", "text": json.dumps(structured_error, sort_keys=True)}],
+        },
+        # The real live specimen carries NO "structured_result" key at all.
+        "protocol_error": "tools/call returned isError=true",
+        "stderr": "",
+    }
+
+    detail = mcp_call_result_error(document)
+
+    assert detail is not None
+    assert detail["reason"] == MCP_CALL_RESULT_ERROR_REASON
+    assert detail["code"] == "command_failed"
+    assert detail["detail"] == "==> Error: No such variant {'osmesa'} for spec hdf5+mpi"
+    assert detail["tool_error_schema_version"] == "spack.mcp.error.v1"
+    text = mcp_call_dispatch_failure_text(detail)
+    assert "command_failed" in text
+    assert "No such variant" in text
+
+
+def test_content_fallback_ignores_non_text_items_and_missing_error() -> None:
+    """A content list with no ``type: "text"`` item, or one that decodes to
+    something with no ``error`` key, is inconclusive -- never fabricated.
+    """
+    document: dict[str, object] = {
+        "tool": "spack_install",
+        "operation": "tools/call",
+        "protocol_result": {
+            "isError": True,
+            "content": [{"type": "image", "data": "not-text"}],
+        },
+        "protocol_error": None,
+    }
+    detail = mcp_call_result_error(document)
+    assert detail is not None
+    assert detail["code"] is None
+
+
+def test_timed_out_document_is_typed_not_a_bare_exit_code() -> None:
+    """Major 3 (adversarial review): the runner's own ``subprocess.
+    TimeoutExpired`` handler writes ``returncode=124, timed_out=True,
+    protocol_error=None`` -- every OTHER structural signal is empty, so
+    this would otherwise fall through to a bare "exit code 124", the exact
+    defect class this whole module exists to kill.
+    """
+    document: dict[str, object] = {
+        "tool": "spack_install",
+        "protocol_result": None,
+        "structured_result": None,
+        "protocol_error": None,
+        "returncode": 124,
+        "timed_out": True,
+        "stderr": "partial output before the timeout\n",
+    }
+
+    detail = mcp_call_result_error(document)
+
+    assert detail is not None
+    assert detail["reason"] == MCP_CALL_TIMED_OUT_REASON
+    assert detail["returncode"] == 124
+    assert detail["stderr_tail"] == "partial output before the timeout\n"
+    text = mcp_call_dispatch_failure_text(detail)
+    assert "timed out" in text
+    assert "124" in text
 
 
 def mcp_call_result_error_text_contains(detail: dict[str, object], needle: str) -> bool:
@@ -289,6 +378,59 @@ def test_spack_install_typed_error_reaches_the_durable_job(tmp_path: Path) -> No
     assert dispatch_failure["tool_error_schema_version"] == "spack.mcp.error.v1"
     events, _ = queue.drain_events(Cursor(job_id=job.job_id), limit=200)
     assert any(event.event_type == "mcp.dispatch_result_error" for event in events)
+
+
+def test_real_spack_shape_with_no_structured_result_key_still_reaches_the_durable_job(
+    tmp_path: Path,
+) -> None:
+    """Major 4 (adversarial review): the REAL live document has no top-level
+    ``structured_result`` key at all -- only ``protocol_result.content[0].
+    text``. Before this fix the reviewer's e2e probe got
+    ``last_error "MCP call spack_install failed: tools/call returned
+    isError=true"`` with ``code=null``; this proves the typed code/detail
+    now reach both ``last_error`` and ``mcp_dispatch_failure``.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = _submit_generic_mcp_call(queue, tool="spack_install")
+    structured_error = {
+        "schema_version": "spack.mcp.error.v1",
+        "error": {
+            "code": "command_failed",
+            "detail": "==> Error: No such variant {'osmesa'} for spec hdf5+mpi",
+            "schema_version": "spack.mcp.error.v1",
+        },
+    }
+    document: dict[str, object] = {
+        "server": "registered-spack-mcp",
+        "server_args": ["--stdio"],
+        "tool": "spack_install",
+        "operation": "tools/call",
+        "arguments": {"spec": "hdf5+mpi"},
+        "protocol_result": {
+            "content": [{"type": "text", "text": json.dumps(structured_error, sort_keys=True)}],
+            "isError": True,
+        },
+        # No "structured_result" key at all -- the real live shape.
+        "protocol_error": "tools/call returned isError=true",
+        "returncode": 1,
+        "timed_out": False,
+        "stderr": "",
+    }
+    provider = _GenericMcpCallProvider(document=document, returncode=1)
+
+    result = _worker(settings, queue, provider).run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert result.last_error is not None
+    assert "command_failed" in result.last_error
+    assert "No such variant" in result.last_error
+    assert result.last_error != "MCP call spack_install failed: tools/call returned isError=true"
+    task = queue.list_tasks(job.job_id)[0]
+    dispatch_failure = cast(dict[str, Any], task.metadata["mcp_dispatch_failure"])
+    assert dispatch_failure["code"] == "command_failed"
+    assert dispatch_failure["tool_error_schema_version"] == "spack.mcp.error.v1"
 
 
 def test_dispatch_with_no_result_document_carries_stderr_tail(tmp_path: Path) -> None:

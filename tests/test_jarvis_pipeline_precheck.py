@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pytest import MonkeyPatch
 
 from clio_relay import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
@@ -231,7 +232,7 @@ def _submit_pipeline_job(
 @pytest.fixture
 def _precheck_env(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: MonkeyPatch,
 ) -> tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str]:
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)

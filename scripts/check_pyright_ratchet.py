@@ -101,7 +101,24 @@ from typing import Any, NamedTuple
 # bootstrap family) for the two cross-module bootstrap-family constants
 # this slice's script composer borrows -- net -5 (7663 -> 7658 on
 # Windows), not a regression to absorb.
-BASELINE_TOTAL = 7658
+#
+# clio-relay#265/#183/#162/#248 "honest verdict" slice, adversarial-review
+# fix round: the new cross-mixin `self.provider`/`_refuse_empty_jarvis_
+# pipeline` call sites (endpoint_jarvis_dispatch.py/endpoint_job_
+# execution.py) added 5 new strict-mode errors (7663 -> 7668) -- fixed with
+# the same real-typing precedent as the #265/#259 note above (TYPE_CHECKING
+# stubs + a call-site cast, no ignores). While in there, #271's own
+# direction was applied to the four private names this slice's new
+# jarvis_pipeline_precheck.py imports (`_trusted_jarvis_mcp_result`,
+# `_minimal_mcp_runner_environment`, `_endpoint_mcp_runner_command` in
+# endpoint_jarvis_recovery.py; `_write_private_json_file` in
+# endpoint_recovery_directory.py): every caller across the endpoint
+# decomposition already imports them, so the leading underscore was pure
+# reportPrivateUsage noise, not a real privacy boundary -- promoted to
+# public and every import site (including execution_watch.py, which shares
+# all four, and endpoint.py's forward re-exports) repointed. Net: 7663 ->
+# 7636, verified via a full baseline-vs-fixed diff.
+BASELINE_TOTAL = 7636
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

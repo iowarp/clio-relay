@@ -160,11 +160,22 @@ def _response_result(stdout: str, *, response_id: str) -> dict[str, Any] | None:
     return matched
 
 
-def _structured_result(
+def structured_result_from_protocol_result(
     protocol_result: dict[str, Any] | None,
     *,
     operation: str,
 ) -> dict[str, Any] | None:
+    """Decode one ``tools/call`` protocol result into its structured content.
+
+    Public (clio-relay#271 direction): reused by ``mcp_call_result_error.py``
+    (clio-relay#183 residual + #248) to structurally decode a typed tool
+    error from ``protocol_result.content[*].text`` when the durable
+    ``mcp-result.json`` document carries no top-level ``structured_result``
+    key at all -- the exact shape a remote MCP server that never populates
+    ``structuredContent`` (only the MCP-required ``content`` text item)
+    produces. Only items carrying ``type: "text"`` are ever decoded, per
+    the MCP content-block contract.
+    """
     if operation != "tools/call" or protocol_result is None:
         return None
     structured = protocol_result.get("structuredContent")

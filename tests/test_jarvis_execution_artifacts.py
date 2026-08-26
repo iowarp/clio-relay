@@ -101,6 +101,16 @@ def test_terminal_outputs_are_referenced_fetched_and_produced_by_lineage(
 
 
 def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Path) -> None:
+    """Original fixture shape restored (adversarial review): this isolates
+    the truncation-detection code path with ONLY the truncation marker
+    declared, deliberately zero real ``execution-file`` entries. D1's own
+    zero-declared check is unaffected by this fixture's isolated shape --
+    it legitimately reports ``no_outputs_declared`` here too (asserted
+    below), exactly as it would for any page declaring no execution-file
+    entries; Ruling B is what keeps that SIGNAL from failing the job, a
+    concern one layer up (``resolve_execution_outcome``), not this
+    function's.
+    """
     queue = ClioCoreQueue(tmp_path / "core")
     execution_id = "execution-truncated"
     owner = queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
@@ -109,13 +119,6 @@ def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Pat
     )
     execution_root = tmp_path / "execution"
     execution_root.mkdir()
-    # A real truncation always co-occurs with real declared entries up to the
-    # cap (never zero) -- one present+valid entry alongside the marker keeps
-    # this fixture realistic post-#265-D1 (a genuinely zero-declared page is
-    # covered by its own dedicated test below).
-    payload = b"log line\n"
-    (execution_root / "stdout.log").write_bytes(payload)
-    digest = hashlib.sha256(payload).hexdigest()
     result: dict[str, Any] = {
         "structured_result": {
             "execution_id": execution_id,
@@ -128,14 +131,6 @@ def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Pat
                 "artifacts": [
                     {
                         "package_id": "jarvis.execution",
-                        "kind": "execution-file",
-                        "role": "log",
-                        "location": {"kind": "execution_path", "value": "stdout.log"},
-                        "size_bytes": len(payload),
-                        "checksum": f"sha256:{digest}",
-                    },
-                    {
-                        "package_id": "jarvis.execution",
                         "kind": "execution-output-truncation",
                         "metadata": {
                             "schema_version": "jarvis.execution-output-truncation.v1",
@@ -143,7 +138,7 @@ def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Pat
                             "observed_count": 65,
                             "omitted_count": 1,
                         },
-                    },
+                    }
                 ],
             },
         }
@@ -151,14 +146,15 @@ def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Pat
 
     indexed, truncation, outputs_missing = ingest_jarvis_execution_outputs(queue, query, result)
 
-    assert len(indexed) == 1
+    assert indexed == []
     assert truncation == {
         "schema_version": "jarvis.execution-output-truncation.v1",
         "limit": 64,
         "observed_count": 65,
         "omitted_count": 1,
     }
-    assert outputs_missing is None
+    assert outputs_missing is not None
+    assert outputs_missing["reason"] == "no_outputs_declared"
     events, _ = queue.drain_events(Cursor(job_id=owner.job_id), limit=100)
     assert any(
         event.event_type == "jarvis.execution_outputs_truncated"

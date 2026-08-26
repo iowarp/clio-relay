@@ -152,6 +152,12 @@ def test_execution_phase_job_metadata_shape() -> None:
         ("running", False, None, None, "unknown", "execution_not_terminal"),
         (None, None, None, None, "unknown", "execution_not_terminal"),
         ("a_future_jarvis_state", True, 0, None, "unknown", "jarvis_state:a_future_jarvis_state"),
+        # Adversarial-review Ruling A: state says "completed" (launcher
+        # exited cleanly) but returncode disagrees -- a self-contradiction
+        # loose/legacy metadata can produce (the strict native-document
+        # contract's own cross-field validator forbids this shape outright
+        # on the main watched path). Must never read as "success".
+        ("completed", True, 3, None, "failed", "returncode_conflict"),
     ],
 )
 def test_application_verdict_for_metadata_is_distinct_from_scheduler_state(
@@ -294,13 +300,31 @@ def test_execution_outputs_missing_error_text() -> None:
     assert "stdout.log" in text
 
 
+def _clean_verdict(status: str = "success") -> dict[str, object]:
+    """A non-conflicting application_verdict for outputs_missing-focused cases."""
+    return {
+        "schema_version": execution_watch.APPLICATION_VERDICT_SCHEMA,
+        "status": status,
+        "application_returncode": 0 if status == "success" else 1,
+        "reason": None if status == "success" else "application exited nonzero",
+    }
+
+
 @pytest.mark.parametrize(
     ("watch_succeeded", "outputs_missing", "expected_returncode", "expected_cancellation"),
     [
-        # #265: a completed (succeeded) watch is overridden to failure when
-        # outputs are missing -- "producing the declared outputs is PART of
-        # what completed means".
+        # Legacy/pre-Ruling-B shape (no "reason" key at all) fails closed,
+        # unchanged from develop.
         (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 1, False),
+        # declared_outputs_missing: one or more DECLARED outputs were found
+        # missing/empty -- still forces failure ("producing the declared
+        # outputs is PART of what completed means").
+        (True, {"reason": "declared_outputs_missing"}, 1, False),
+        # Ruling B (adversarial review, flagged for owner sign-off):
+        # no_outputs_declared is a SURFACED SIGNAL only -- it must NOT flip
+        # a genuinely successful run (a pipeline-snapshot-only page, a
+        # pure-stdout application, ...) to FAILED.
+        (True, {"reason": "no_outputs_declared"}, 0, False),
         # No outputs_missing verdict: the watch's own success stands.
         (True, None, 0, False),
         # A genuinely failed watch stays failed regardless of outputs_missing.
@@ -316,6 +340,7 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     resolution = execution_watch.ExecutionWatchResolution(
         succeeded=watch_succeeded,
         failure_detail=None if watch_succeeded else {"schema_version": "x"},
+        application_verdict=_clean_verdict("success" if watch_succeeded else "failed"),
     )
     outcome = execution_watch.resolve_execution_outcome(
         dispatch_recovered=False,
@@ -328,6 +353,60 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     assert outcome.effective_returncode == expected_returncode
     assert outcome.cancellation_honored is expected_cancellation
     assert outcome.outputs_missing == outputs_missing
+
+
+def test_resolve_execution_outcome_folds_returncode_conflict() -> None:
+    """Ruling A: a returncode_conflict verdict fails the job even though the
+    watch's own state-only ``succeeded`` said otherwise -- defense-in-depth
+    for loose/legacy metadata.
+    """
+    resolution = execution_watch.ExecutionWatchResolution(
+        succeeded=True,
+        failure_detail=None,
+        application_verdict={
+            "schema_version": execution_watch.APPLICATION_VERDICT_SCHEMA,
+            "status": "failed",
+            "application_returncode": 3,
+            "reason": execution_watch.RETURNCODE_CONFLICT_REASON,
+        },
+    )
+    outcome = execution_watch.resolve_execution_outcome(
+        dispatch_recovered=False,
+        watch_resolution=resolution,
+        dispatch_refusal_present=False,
+        transport_returncode=0,
+        cancellation_requested=True,
+        outputs_missing=None,
+    )
+    assert outcome.effective_returncode == 1
+    assert outcome.cancellation_honored is False
+
+
+def test_execution_phase_status_message_names_a_failed_application_verdict() -> None:
+    """Ruling A: a run card polling mid-run sees the application's own
+    trouble, not only the scheduler phase.
+    """
+    phase_ok = {
+        "phase": "running",
+        "application_verdict": _clean_verdict("success"),
+    }
+    assert execution_watch.execution_phase_status_message("running", phase_ok) == (
+        "Relay job is running; jarvis execution is running"
+    )
+    phase_conflicted = {
+        "phase": "running",
+        "application_verdict": {
+            "schema_version": execution_watch.APPLICATION_VERDICT_SCHEMA,
+            "status": "failed",
+            "application_returncode": 3,
+            "reason": execution_watch.RETURNCODE_CONFLICT_REASON,
+        },
+    }
+    message = execution_watch.execution_phase_status_message("running", phase_conflicted)
+    assert message == (
+        "Relay job is running; jarvis execution is running; application failed "
+        "(returncode_conflict)"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -755,6 +834,70 @@ def test_deferred_execution_completed_with_missing_declared_output_fails_typed(
     events = _event_types(queue, job.job_id)
     assert "execution.watch_resolved" in events
     assert "jarvis.execution_output_missing" in events
+    assert "jarvis.execution_outputs_missing" in events
+
+
+def test_deferred_execution_with_only_a_pipeline_snapshot_artifact_succeeds(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """Adversarial-review Ruling B probe case (flagged for owner review): a
+    terminal page declaring one real, non-execution-file artifact (a
+    pipeline snapshot -- the same shape the relay-flushed console.log or a
+    pure-stdout application's page would take) and ZERO execution-file
+    entries must still SUCCEED. no_outputs_declared is a typed signal, not
+    an automatic failure -- #265's own "never invent a heuristic about
+    which files should exist" instruction (jarvis_execution_artifacts.py)
+    forbids treating "declared no execution-file outputs" as proof nothing
+    real happened.
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"application ran to completion\n")
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        states=[
+            ("submitted", False, "9006"),
+            ("running", False, "9006"),
+            ("completed", True, "9006"),
+        ],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.pipeline",
+                "kind": "pipeline-snapshot",
+                "role": "log",
+                "location": {"kind": "execution_path", "value": "pipeline.yaml"},
+                "size_bytes": 512,
+                "checksum": f"sha256:{'c' * 64}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.state is JobState.SUCCEEDED
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["schema_version"] == "clio-relay.execution-outputs-missing.v1"
+    assert outputs_missing["reason"] == "no_outputs_declared"
+    assert outputs_missing["declared_count"] == 0
+    events = _event_types(queue, job.job_id)
+    assert "execution.watch_resolved" in events
     assert "jarvis.execution_outputs_missing" in events
 
 

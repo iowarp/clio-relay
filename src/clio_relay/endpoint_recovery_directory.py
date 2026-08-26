@@ -473,13 +473,18 @@ def _private_json_payload(value: object) -> bytes:
     return payload
 
 
-def _write_private_json_file(
+def write_private_json_file(
     path: Path,
     value: object,
     *,
     directory_anchor: _RecoveryDirectoryAnchor | None = None,
 ) -> None:
-    """Atomically write private JSON without following or truncating hostile links."""
+    """Atomically write private JSON without following or truncating hostile links.
+
+    Public (clio-relay#271 direction): every owner module across the
+    endpoint decomposition imports this, so the leading underscore was
+    pure reportPrivateUsage noise, not a real privacy boundary.
+    """
     payload = _private_json_payload(value)
     storage_path = internal_filesystem_path(path)
     parent = internal_filesystem_path(path.parent)

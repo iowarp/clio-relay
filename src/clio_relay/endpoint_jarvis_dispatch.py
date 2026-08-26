@@ -28,11 +28,11 @@ from clio_relay.console_stream import (
 from clio_relay.endpoint_jarvis_recovery import (
     _attributed_jarvis_dispatch_refusal,
     _durable_jarvis_execution_recovery,
-    _trusted_jarvis_mcp_result,
     _trusted_jarvis_mcp_route,
+    trusted_jarvis_mcp_result,
 )
 from clio_relay.endpoint_recovery_directory import (
-    _write_private_json_file,
+    write_private_json_file,
 )
 from clio_relay.endpoint_scheduler_metadata import (
     _runtime_metadata_is_native,
@@ -71,23 +71,28 @@ from clio_relay.spool import JobSpool, read_owned_regular_file_bytes
 
 if TYPE_CHECKING:
     from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.jarvis_provider import JarvisCdProvider
 
 
 class JarvisDispatchMixin:
     """Mixin: JarvisDispatch methods split from EndpointWorker (clio-relay#231).
 
-    ``queue`` is declared ``TYPE_CHECKING``-only (never assigned here) so
-    strict pyright can resolve ``self.queue`` across this mixin's own
-    methods: the sole composing class, ``EndpointWorker``, is what actually
-    assigns it in ``__init__`` (``endpoint.py``), and a mixin has no
-    ``__init__`` of its own for pyright to see that assignment through. The
-    same pattern this repo's tracked sibling-mixin design gap (#271) will
-    eventually need everywhere else -- scoped here to unblock this mixin's
-    own already-existing ``self.queue`` call sites, not a repo-wide fix.
+    ``queue``/``provider`` are declared ``TYPE_CHECKING``-only (never
+    assigned here) so strict pyright can resolve ``self.queue``/
+    ``self.provider`` across this mixin's own methods: the sole composing
+    class, ``EndpointWorker``, is what actually assigns them in
+    ``__init__`` (``endpoint.py``), and a mixin has no ``__init__`` of its
+    own for pyright to see that assignment through. The same pattern this
+    repo's tracked sibling-mixin design gap (#271) will eventually need
+    everywhere else -- scoped here to unblock this mixin's own
+    already-existing ``self.queue`` call sites plus ``_refuse_empty_
+    jarvis_pipeline``'s (clio-relay#162) new ``self.provider`` one, not a
+    repo-wide fix.
     """
 
     if TYPE_CHECKING:
         queue: ClioCoreQueue
+        provider: JarvisCdProvider
 
     def _jarvis_run_environment_values(
         self,
@@ -371,11 +376,11 @@ class JarvisDispatchMixin:
                 "source_result_sha256": recovery_result_sha256,
             },
         }
-        trusted, reason = _trusted_jarvis_mcp_result(job, recovered_document)
+        trusted, reason = trusted_jarvis_mcp_result(job, recovered_document)
         if not trusted:
             raise RelayError(f"recovered JARVIS run result was not trusted: {reason}")
         destination = spool.path / "mcp-result.json"
-        _write_private_json_file(destination, recovered_document)
+        write_private_json_file(destination, recovered_document)
         self.queue.append_event(
             job.job_id,
             "mcp.dispatch_recovered",
@@ -467,7 +472,7 @@ class JarvisDispatchMixin:
             raise SchedulerSubmissionUnresolvedError(
                 f"resolved JARVIS result could not be reloaded: {exc}"
             ) from exc
-        trusted, reason = _trusted_jarvis_mcp_result(job, document)
+        trusted, reason = trusted_jarvis_mcp_result(job, document)
         if not trusted:
             raise SchedulerSubmissionUnresolvedError(
                 f"resolved JARVIS result was not trusted: {reason}"

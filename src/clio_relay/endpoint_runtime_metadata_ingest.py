@@ -17,8 +17,8 @@ from typing import Any, cast
 
 from clio_relay.endpoint_jarvis_recovery import (
     _attributed_jarvis_dispatch_refusal,
-    _trusted_jarvis_mcp_result,
     _trusted_jarvis_mcp_route,
+    trusted_jarvis_mcp_result,
 )
 from clio_relay.endpoint_scheduler_metadata import (
     _durable_scheduler_submission_intent,
@@ -225,7 +225,7 @@ class RuntimeMetadataIngestMixin:
                 f"MCP runtime result could not be read: {exc}",
             )
             return McpRuntimeIngestOutcome(ingested=False)
-        trusted, reason = _trusted_jarvis_mcp_result(job, result_document)
+        trusted, reason = trusted_jarvis_mcp_result(job, result_document)
         if not trusted:
             refusal = _attributed_jarvis_dispatch_refusal(job, result_document)
             self.queue.append_event(

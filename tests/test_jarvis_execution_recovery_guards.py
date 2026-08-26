@@ -20,9 +20,9 @@ from clio_relay.endpoint import (
     _durable_jarvis_execution_recovery,  # pyright: ignore[reportPrivateUsage]
     _jarvis_execution_recovery_intent,  # pyright: ignore[reportPrivateUsage]
     _jarvis_execution_recovery_retry_due,  # pyright: ignore[reportPrivateUsage]
-    _minimal_mcp_runner_environment,  # pyright: ignore[reportPrivateUsage]
     _open_or_create_recovery_directory,  # pyright: ignore[reportPrivateUsage]
     _read_owned_recovery_result,  # pyright: ignore[reportPrivateUsage]
+    minimal_mcp_runner_environment,
 )
 from clio_relay.endpoint_sidecar_types import MCP_RUNNER_BASE_ENV_NAMES
 from clio_relay.errors import ConfigurationError, RelayError
@@ -309,7 +309,7 @@ def test_minimal_recovery_environment_exposes_only_base_and_referenced_sources(
     monkeypatch.setenv("UNRELATED_RECOVERY_SECRET", "must-not-leak")
     monkeypatch.setenv("EXPLICIT_RECOVERY_TOKEN", "allowed")
 
-    environment = _minimal_mcp_runner_environment({"REMOTE_TOKEN": "EXPLICIT_RECOVERY_TOKEN"})
+    environment = minimal_mcp_runner_environment({"REMOTE_TOKEN": "EXPLICIT_RECOVERY_TOKEN"})
     expected_names = {name for name in MCP_RUNNER_BASE_ENV_NAMES if name in os.environ} | {
         "EXPLICIT_RECOVERY_TOKEN"
     }
