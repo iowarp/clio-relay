@@ -2574,6 +2574,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "job_has_pending_execution_cleanup",
     "latest_job_event",
     "latest_job_progress",
+    "latest_progress_window",
     "lease_admission_capacity_snapshot",
     "list_artifact_users_page",
     "list_artifacts",

@@ -3,46 +3,42 @@ to real terminal (clio-relay#266).
 
 Run 14's live evidence: a scheduler-backed ``jarvis_run`` dispatch returns
 in seconds carrying a *queued/submitted* execution -- the JARVIS MCP tool
-call answers as soon as the workload is handed to the scheduler, not when
-it finishes. Pre-#266 the relay job went terminal on that dispatch
-response, so #259's console tailer covered only the dispatch's own
-lifetime and the client had no single task spanning the real run.
+answers as soon as the workload is handed to the scheduler, not when it
+finishes. Pre-#266 the relay job went terminal on that dispatch response,
+so #259's console tailer covered only the dispatch's own lifetime and the
+client had no single task spanning the real run.
 
-This module is the owner of the *typed* decisions this fixes:
+This module owns the *typed* decisions this fixes:
 
 * :func:`deferred_jarvis_execution` -- is a trusted dispatch result a
-  scheduler execution that has not reached terminal yet? The only signal
-  is JARVIS's own ``execution_record.terminal`` (via the already-validated
+  scheduler execution not yet at terminal? The only signal is JARVIS's own
+  ``execution_record.terminal`` (via the already-validated
   :class:`~clio_relay.runtime_metadata.JarvisRuntimeMetadata`) -- never a
   keyword/phrase match on prose.
 * :func:`execution_phase_for_state` -- JARVIS's own execution-state
-  vocabulary (the closed set validated in ``runtime_metadata.py``) mapped
-  into the small typed phase the job record and ``tasks/get`` surface.
-  Owner ruling (#266): the phase is JARVIS's state mapped through, not a
-  relay-side scheduler (squeue/sacct) read -- JARVIS owns the scheduler
-  handle it submitted, relay only watches JARVIS's own execution record
-  (the same one ``jarvis_get_execution`` reports).
+  vocabulary mapped into the small typed phase the job record and
+  ``tasks/get`` surface. Owner ruling (#266): the phase is JARVIS's state
+  mapped through, not a relay-side scheduler (squeue/sacct) read -- JARVIS
+  owns the scheduler handle it submitted.
 * :func:`execution_watch_query_spec` -- the bounded ``jarvis_get_execution``
   poll request, reusing the exact MCP dispatch contract
   ``endpoint_jarvis_recovery`` already proved for its lost-response
   recovery query, but WITHOUT that module's crash-recovery durable-intent
-  state machine -- this is not a lost response, it is the ordinary
-  in-progress case, and needs none of the pending/resolved bookkeeping
-  ``_durable_jarvis_execution_recovery`` enforces for the outage it owns.
-* Ceiling and cancellation-refusal helpers -- see
-  :class:`ExecutionWatchCeilingExceeded` and
+  state machine -- this is the ordinary in-progress case, not a lost
+  response.
+* Ceiling/cancellation-refusal helpers -- :class:`ExecutionWatchCeilingExceeded`,
   :data:`CANCEL_UNSUPPORTED_REASON`.
 
 :func:`run_execution_watch` is the poll loop itself (subprocess dispatch,
-console tailing, lease renewal, typed phase/event bookkeeping). It lives
-here -- not on ``EndpointWorker`` -- per the cleanup program's
-owner-module/no-accretion rule (``scripts/check_file_size.py``, #774/#775):
-``endpoint.py`` is already over its ratcheted baseline and may not regrow.
-The handful of operations that are genuinely endpoint-worker state (lease
-renewal, and materializing the terminal result through the already-tested
-``_write_recovered_jarvis_run_result``) are injected as callbacks; every
-MCP dispatch/trust/parse step is a plain, directly testable call into
-``endpoint_jarvis_recovery``/``runtime_metadata`` from here.
+console tailing, lease renewal, typed phase/event bookkeeping, and the
+#214 runtime-prediction tracker). It lives here -- not on
+``EndpointWorker`` -- per the cleanup program's owner-module/no-accretion
+rule (``scripts/check_file_size.py``, #774/#775): ``endpoint.py`` is
+already over its ratcheted baseline. The handful of genuinely
+endpoint-worker operations (lease renewal, materializing the terminal
+result) are injected as callbacks; every MCP dispatch/trust/parse step is
+a plain, directly testable call into ``endpoint_jarvis_recovery``/
+``runtime_metadata`` from here.
 """
 
 from __future__ import annotations
@@ -50,7 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -68,6 +64,7 @@ from clio_relay.endpoint_jarvis_recovery import (
 from clio_relay.endpoint_recovery_directory import write_private_json_file
 from clio_relay.endpoint_scheduler_metadata import _runtime_metadata_is_native
 from clio_relay.errors import RelayError
+from clio_relay.execution_watch_prediction import ExecutionWatchPredictionTracker
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import McpCallSpec
 from clio_relay.runtime_metadata import runtime_metadata_from_mcp_result_document
@@ -76,7 +73,7 @@ if TYPE_CHECKING:
     from clio_relay.console_stream import ConsoleLiveTailer
     from clio_relay.core_queue import ClioCoreQueue
     from clio_relay.jarvis_provider import JarvisCdProvider
-    from clio_relay.models import ProgressRecord, RelayJob
+    from clio_relay.models import RelayJob
     from clio_relay.runtime_metadata import JarvisRuntimeMetadata
 
 #: MCP timeouts for one watch poll -- matches the existing lost-response
@@ -101,19 +98,18 @@ application_verdict_for_metadata = application_verdict.application_verdict_for_m
 #: existing lost-response recovery query's page size
 #: (``endpoint.py::_recover_jarvis_execution``); #252's
 #: ``ingest_jarvis_execution_outputs`` truncates beyond
-#: ``MAX_RELAY_EXECUTION_OUTPUTS`` (128) the same way regardless of caller.
+#: ``MAX_RELAY_EXECUTION_OUTPUTS`` (128) regardless of caller.
 EXECUTION_WATCH_TERMINAL_ARTIFACT_PAGE_SIZE = 100
 
 DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS = 7.0
 DEFAULT_EXECUTION_WATCH_CEILING_SECONDS = 24 * 60 * 60
 
 #: Typed reason recorded when a client asks to cancel a job mid-watch.
-#: JARVIS's registered user contract (``_contracts/jarvis-user-v3.7.2.json``)
-#: exposes no cancel tool alongside ``jarvis_run``/``jarvis_get_execution``
-#: -- owner ruling (#266): relay must never issue a raw ``scancel`` against
-#: a scheduler job JARVIS submitted and owns. Refuse the cancel request
-#: with this typed reason and keep watching, so the job's terminal state
-#: stays faithful to what actually happened on the cluster.
+#: JARVIS's registered user contract exposes no cancel tool alongside
+#: ``jarvis_run``/``jarvis_get_execution`` -- owner ruling (#266): relay
+#: must never issue a raw ``scancel`` against a scheduler job JARVIS
+#: submitted and owns. Refuse the cancel request with this typed reason
+#: and keep watching, so the job's terminal state stays faithful.
 CANCEL_UNSUPPORTED_REASON = "execution_cancel_unsupported"
 
 #: JARVIS's own non-terminal execution states
@@ -154,12 +150,10 @@ class ExecutionWatchResolution:
 
     succeeded: bool
     failure_detail: dict[str, object] | None
-    #: clio-relay#265 Ruling A: the #265 application-level verdict for this
-    #: same terminal metadata (:func:`application_verdict_for_metadata`) --
-    #: a REAL consumer, not a dead field: :func:`resolve_execution_outcome`
-    #: folds a ``returncode_conflict`` verdict into the job's terminal
-    #: outcome even when ``succeeded`` (JARVIS's own state-only answer)
-    #: says otherwise.
+    #: clio-relay#265 Ruling A: a REAL consumer, not a dead field --
+    #: :func:`resolve_execution_outcome` folds a ``returncode_conflict``
+    #: verdict into the job's terminal outcome even when ``succeeded``
+    #: (JARVIS's own state-only answer) says otherwise.
     application_verdict: dict[str, object]
 
 
@@ -168,16 +162,13 @@ def deferred_jarvis_execution(
 ) -> DeferredJarvisExecution | None:
     """Return the watch target, or ``None`` when today's fast path applies.
 
-    ``metadata`` must already be a *trusted*, native runtime snapshot --
-    see ``trusted_jarvis_mcp_result`` and
-    ``runtime_metadata_from_mcp_result_document`` in ``endpoint.py``, both
-    called by the caller before this function ever runs. This makes no
-    trust decision of its own: it is a pure typed-state read.
-    ``terminal.terminal is False`` (a scheduler-backed submission still in
-    flight) is the ONLY condition that starts a watch -- a synchronous or
-    already-terminal dispatch (today's behavior) returns ``None``
-    unchanged, exactly satisfying design constraint 1 (scope the extended
-    lifetime to deferred executions only).
+    ``metadata`` must already be a *trusted*, native runtime snapshot (see
+    ``trusted_jarvis_mcp_result``/``runtime_metadata_from_mcp_result_document``
+    in ``endpoint.py``, both called by the caller first) -- a pure typed-state
+    read, no trust decision of its own. ``terminal.terminal is False`` (a
+    scheduler-backed submission still in flight) is the ONLY condition that
+    starts a watch; a synchronous or already-terminal dispatch returns
+    ``None`` unchanged.
     """
     if metadata.execution_id is None or metadata.pipeline_id is None:
         return None
@@ -201,15 +192,16 @@ def execution_phase_job_metadata(
     *,
     poll_count: int,
     observed_at: datetime,
-    progress_history: Sequence[ProgressRecord] = (),
+    runtime_prediction: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the typed payload merged into ``job.metadata["execution_phase"]``.
 
     Carried on the durable job record the door serves (``RelayJob.metadata``,
     merged via ``ClioCoreQueue.update_job_metadata``) so a run card can read
     a queued/running phase without polling the console or task events.
-    ``progress_history`` (default none) grounds the #214 runtime prediction
-    below; omitted, it reports the typed ``no_progress_observations`` absence.
+    ``runtime_prediction`` is an already-computed #214 prediction dict (see
+    ``execution_watch_prediction.ExecutionWatchPredictionTracker``); omitted,
+    it reports the typed ``no_progress_observations`` absence.
     """
     state = metadata.terminal.state
     return {
@@ -229,9 +221,9 @@ def execution_phase_job_metadata(
         "application_verdict": application_verdict_for_metadata(metadata),
         # clio-relay#214: additive, typed, never fabricated -- see docstring.
         "application_runtime_prediction": (
-            application_runtime_prediction.application_runtime_prediction_for_progress(
-                progress_history
-            )
+            runtime_prediction
+            if runtime_prediction is not None
+            else application_runtime_prediction.application_runtime_prediction_for_progress(())
         ),
     }
 
@@ -247,12 +239,11 @@ def execution_watch_query_spec(
     """Build one bounded ``jarvis_get_execution`` poll request.
 
     ``include_artifacts`` is set ONLY on the final, terminal poll: #252's
-    ``ingest_jarvis_execution_outputs`` reads
-    ``structured_result.artifact_page``, which JARVIS populates only when
-    ``artifacts`` is requested. Every intermediate poll omits it -- cheaper
-    per tick, and it lets each intermediate response be checked with
-    ``_trusted_jarvis_execution_query_validation``'s fixed
-    ``artifacts_requested is False`` expectation.
+    ``ingest_jarvis_execution_outputs`` reads ``structured_result.artifact_
+    page``, which JARVIS populates only when ``artifacts`` is requested.
+    Every intermediate poll omits it -- cheaper per tick, and each
+    intermediate response is checked with ``_trusted_jarvis_execution_
+    query_validation``'s fixed ``artifacts_requested is False`` expectation.
     """
     arguments: dict[str, object] = {
         "pipeline_id": pipeline_id,
@@ -374,14 +365,13 @@ def execution_phase_status_message(
     """Render the one honest ``tasks/get`` ``statusMessage`` slot (SEP-2663).
 
     ``GetTaskResult``'s schema reserves ``result`` for the ``completed``
-    status and forbids additionalProperties on the task arm
-    (``fastmcp_tasks.models._TaskFields``) -- so ``statusMessage`` is the
-    only place left to surface the typed ``execution_phase`` while a job
-    is still working. ``execution_phase`` is expected to be
-    ``job.metadata.get("execution_phase")`` (a dict shaped by
-    :func:`execution_phase_job_metadata`, or ``None``/anything else before
-    the first poll); this stays a thin string render of an already-typed
-    value, never a keyword/phrase decision of its own.
+    status and forbids additionalProperties on the task arm -- so
+    ``statusMessage`` is the only place left to surface the typed
+    ``execution_phase`` while a job is still working. ``execution_phase``
+    is expected to be ``job.metadata.get("execution_phase")`` (a dict
+    shaped by :func:`execution_phase_job_metadata`, or ``None`` before the
+    first poll); a thin string render of an already-typed value, never a
+    keyword/phrase decision of its own.
 
     Adversarial-review Ruling A ("give it real consumers"): when the
     carried ``application_verdict`` reports ``status == "failed"`` (a real
@@ -672,11 +662,10 @@ def run_execution_watch(
 ) -> ExecutionWatchResolution:
     """Poll ``jarvis_get_execution`` until JARVIS's own record is terminal.
 
-    The console tailer keeps advancing and the lease keeps renewing on
-    every tick -- the job's (now correct) lifetime -- and a typed
-    ceiling/cancellation-refusal reason is recorded rather than ever
-    hanging the worker slot or issuing a raw scheduler cancel (JARVIS owns
-    the scheduler handle it submitted; see :data:`CANCEL_UNSUPPORTED_REASON`).
+    The console tailer and lease keep advancing every tick -- the job's
+    (now correct) lifetime -- and a typed ceiling/cancellation-refusal
+    reason is recorded rather than hanging the worker slot or issuing a
+    raw scheduler cancel (see :data:`CANCEL_UNSUPPORTED_REASON`).
     ``write_terminal_result`` is called exactly once, with the raw terminal
     ``jarvis_get_execution`` document and its sha256, to materialize the
     job's ``mcp-result.json`` before this returns.
@@ -697,6 +686,7 @@ def run_execution_watch(
     poll_count = 0
     cancel_refusal_reported = False
     last_reported_phase: str | None = None
+    prediction_tracker = ExecutionWatchPredictionTracker()  # clio-relay#214 D1/D2/D5
     while True:
         if now() >= deadline:
             queue.append_event(
@@ -737,22 +727,31 @@ def run_execution_watch(
         )
         _tail_console(queue, job, console_tailer)
         renew_lease()
-        phase_metadata = execution_phase_job_metadata(
-            metadata,
-            poll_count=poll_count,
-            observed_at=now(),
-            progress_history=queue.list_progress(job.job_id),  # clio-relay#214
+        phase = execution_phase_for_state(metadata.terminal.state)
+        phase_changed = phase != last_reported_phase
+        prediction, prediction_changed = prediction_tracker.refresh(  # clio-relay#214 D2
+            queue, job.job_id, force=phase_changed
         )
-        phase = cast(str, phase_metadata["phase"])
-        if phase != last_reported_phase:
-            last_reported_phase = phase
-            queue.update_job_metadata(job.job_id, {"execution_phase": phase_metadata})
-            queue.append_event(
-                job.job_id,
-                f"execution.{phase}",
-                f"jarvis execution {deferred.execution_id} is {phase}",
-                payload=phase_metadata,
+        if phase_changed or prediction_changed:
+            phase_metadata = execution_phase_job_metadata(
+                metadata,
+                poll_count=poll_count,
+                observed_at=now(),
+                runtime_prediction=prediction,
             )
+            queue.update_job_metadata(job.job_id, {"execution_phase": phase_metadata})
+            if phase_changed:
+                last_reported_phase = phase
+                event_type, event_message = (
+                    f"execution.{phase}",
+                    f"jarvis execution {deferred.execution_id} is {phase}",
+                )
+            else:
+                event_type, event_message = (
+                    "execution.runtime_prediction_updated",
+                    f"jarvis execution {deferred.execution_id} runtime prediction updated",
+                )
+            queue.append_event(job.job_id, event_type, event_message, payload=phase_metadata)
         if metadata.terminal.terminal is True:
             break
         sleep(poll_interval_seconds)
@@ -774,11 +773,14 @@ def run_execution_watch(
         hashlib.sha256(final_payload).hexdigest(),
     )
     _tail_console(queue, job, console_tailer)
+    final_prediction, _final_prediction_changed = prediction_tracker.refresh(
+        queue, job.job_id, force=True
+    )
     final_phase_metadata = execution_phase_job_metadata(
         final_metadata,
         poll_count=poll_count + 1,
         observed_at=now(),
-        progress_history=queue.list_progress(job.job_id),
+        runtime_prediction=final_prediction,
     )
     queue.update_job_metadata(job.job_id, {"execution_phase": final_phase_metadata})
     queue.append_event(

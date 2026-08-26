@@ -163,27 +163,37 @@ def test_execution_phase_job_metadata_composes_runtime_prediction_from_progress(
     above already covers.
     """
     metadata = _metadata(state="running", terminal=False)
+    epoch = datetime(2026, 8, 20, tzinfo=UTC).timestamp()
     progress_history = [
         ProgressRecord(
             job_id="job-execphase-prediction",
             label="timestep",
             current=step,
             total=100,
-            created_at=datetime(2026, 8, 20, 0, 0, step, tzinfo=UTC),
+            # clio-relay#214 review D3: created_at is a batch-persistence
+            # instant here (all identical); the source-reported
+            # progress_observed_at_epoch is the real, spread-out clock.
+            created_at=datetime(2026, 8, 20, tzinfo=UTC),
+            metadata={"progress_observed_at_epoch": epoch + step},
         )
         for step in (0, 10, 20, 30, 40)
     ]
+    runtime_prediction = application_runtime_prediction.application_runtime_prediction_for_progress(
+        progress_history
+    )
     payload = execution_watch.execution_phase_job_metadata(
         metadata,
         poll_count=5,
         observed_at=datetime(2026, 8, 20, tzinfo=UTC),
-        progress_history=progress_history,
+        runtime_prediction=runtime_prediction,
     )
     prediction = cast(dict[str, Any], payload["application_runtime_prediction"])
     assert prediction["status"] == "predicted"
     assert prediction["reason"] is None
     assert prediction["predicted_remaining_seconds"] == 60.0
     assert prediction["confidence"] == "observed"
+    basis = cast(dict[str, Any], prediction["basis"])
+    assert basis["clock"] == "progress_observed_at_epoch"
     # application_verdict is still present and unaffected by the addition.
     assert cast(dict[str, Any], payload["application_verdict"])["status"] == "unknown"
 
@@ -782,10 +792,11 @@ def test_deferred_execution_watched_to_success(
     final_phase = cast(dict[str, Any], queue.get_job(job.job_id).metadata["execution_phase"])
     assert final_phase["jarvis_state"] == "completed"
     assert final_phase["terminal"] is True
-    # clio-relay#214: the real end-to-end watch loop reaches queue.list_progress
-    # without error; this fake job never appends progress, so a typed absence
-    # (not a crash, not a fabricated number) is what a real deferred job with
-    # no progress adapter wired in yet gets today.
+    # clio-relay#214: the real end-to-end watch loop reaches the bounded
+    # ExecutionWatchPredictionTracker without error; this fake job never
+    # appends progress, so a typed absence (not a crash, not a fabricated
+    # number) is what a real deferred job with no progress adapter wired
+    # in yet gets today.
     prediction = cast(dict[str, Any], final_phase["application_runtime_prediction"])
     assert prediction["status"] == "absent"
     assert prediction["reason"] == application_runtime_prediction.NO_PROGRESS_OBSERVATIONS_REASON
@@ -794,6 +805,11 @@ def test_deferred_execution_watched_to_success(
     assert "execution.queued" in events
     assert "execution.running" in events
     assert events.count("execution.watch_resolved") == 1
+    # clio-relay#214 review D2: an unchanging (still-absent) prediction
+    # across polls is never material -- the tracker's cheap probe skips
+    # recompute entirely once nothing has changed, so this event never
+    # fires for a job with no progress history at all.
+    assert "execution.runtime_prediction_updated" not in events
     artifact_kinds = [artifact.kind for artifact in queue.list_artifacts(job.job_id)]
     for required_kind in (
         "mcp_result",
