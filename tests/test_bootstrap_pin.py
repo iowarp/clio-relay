@@ -1,8 +1,10 @@
-"""Unit tests for the bootstrap runtime-pin reconciliation (clio-relay#158)."""
+"""Unit tests for bootstrap pin reconciliation (#158) and the one-pass identity gate (#209)."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
 
 from clio_relay.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
@@ -10,8 +12,10 @@ from clio_relay.bootstrap_pin import (
     PIN_RECONCILIATION_SCHEMA,
     pin_reconciliation_lines,
     reconcile_cluster_runtime_pin,
+    verify_one_pass_target_identity_against_pin,
 )
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
+from clio_relay.errors import ConfigurationError
 
 
 def _registry(tmp_path: Path, **overrides: object) -> Path:
@@ -152,3 +156,75 @@ def test_a_repoint_is_always_announced(tmp_path: Path) -> None:
         f"relay_executable_repointed={BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE}",
         f"relay_install_receipt_repointed={BOOTSTRAP_PRODUCED_INSTALL_RECEIPT}",
     ]
+
+
+_PIN = ClusterTargetIdentity(
+    hostnames=["ares", "ares-login-1.example.test"],
+    ssh_host_key_sha256=["SHA256:pinned-key"],
+    scheduler_cluster_name=None,
+    site_marker_sha256="a" * 64,
+)
+
+
+def _verify(
+    *,
+    target_identity: ClusterTargetIdentity = _PIN,
+    observed_hostnames: list[str] | None = None,
+    observed_site_marker_sha256: str | None = "a" * 64,
+    ssh_host_key_sha256: list[str] | None = None,
+) -> dict[str, object]:
+    return verify_one_pass_target_identity_against_pin(
+        target_identity=target_identity,
+        observed_hostnames=(
+            observed_hostnames if observed_hostnames is not None else ["ares-login-1.example.test"]
+        ),
+        observed_site_marker_sha256=observed_site_marker_sha256,
+        ssh_host_key_sha256=(
+            ssh_host_key_sha256 if ssh_host_key_sha256 is not None else ["SHA256:pinned-key"]
+        ),
+    )
+
+
+def test_matching_observation_verifies_and_records_both_sides() -> None:
+    """The happy path returns the full observed-vs-expected evidence record."""
+    result = _verify()
+    assert result["verified"] is True
+    assert result["source"] == "one_pass_observation"
+    assert result["expected_hostnames"] == _PIN.hostnames
+    assert result["scheduler_cluster_name_note"] == "unpinned; not checked"
+
+
+def test_hostname_swap_is_refused() -> None:
+    """An observation from a host outside the pin (host swap) must refuse."""
+    with pytest.raises(ConfigurationError, match="hostname does not match"):
+        _verify(observed_hostnames=["impostor.example.test"])
+
+
+def test_host_key_mismatch_is_refused() -> None:
+    """A rebuilt or MITM'd host key that never intersects the pin must refuse."""
+    with pytest.raises(ConfigurationError, match="host keys do not match"):
+        _verify(ssh_host_key_sha256=["SHA256:different-key"])
+
+
+def test_site_marker_mismatch_is_refused() -> None:
+    """A differing site marker must refuse."""
+    with pytest.raises(ConfigurationError, match="site marker does not match"):
+        _verify(observed_site_marker_sha256="b" * 64)
+
+
+def test_missing_site_marker_while_pin_asserts_one_is_refused() -> None:
+    """No observed marker while the pin asserts one is a mismatch, not a skip."""
+    with pytest.raises(ConfigurationError, match="site marker does not match"):
+        _verify(observed_site_marker_sha256=None)
+
+
+def test_pinned_scheduler_cluster_name_refuses_local_verification() -> None:
+    """A pin asserting scheduler_cluster_name is outside this gate's authority."""
+    pinned = ClusterTargetIdentity(
+        hostnames=["ares"],
+        ssh_host_key_sha256=["SHA256:pinned-key"],
+        scheduler_cluster_name="ares-slurm",
+        site_marker_sha256=None,
+    )
+    with pytest.raises(ConfigurationError, match="scheduler_cluster_name"):
+        _verify(target_identity=pinned)

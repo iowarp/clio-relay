@@ -96,8 +96,9 @@ from typing import Any, NamedTuple
 # the extended test_bootstrap_preflight_transport.py/test_cli_cluster_
 # deploy.py suites) landed with explicit annotations on every previously-
 # untyped dict literal and lambda strict pyright flagged, plus the
-# established `# pyright: ignore[reportPrivateUsage]  # noqa: SLF001`
-# per-import pragma for the two cross-module bootstrap-family constants
+# established per-import private-usage pragma (the reportPrivateUsage
+# ignore paired with the SLF001 suppression, as used elsewhere in the
+# bootstrap family) for the two cross-module bootstrap-family constants
 # this slice's script composer borrows -- net -5 (7663 -> 7658 on
 # Windows), not a regression to absorb.
 BASELINE_TOTAL = 7658

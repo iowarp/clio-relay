@@ -279,9 +279,21 @@ def run_bounded_process(
         error = BoundedProcessError(f"process stdin could not be written: {command[0]}")
         error.__cause__ = stdin_errors[0]
         raise error
+    stderr_text = bytes(stderr.value).decode("utf-8", errors="replace")
+    if stdin_errors and process.returncode == 0:
+        # A child that exits 0 WITHOUT having consumed its whole stdin is an
+        # anomaly worth a structured trace even though the call "succeeded":
+        # every framed-response caller would catch a truncated exchange
+        # downstream, but the reason must not vanish (clio-relay#209 review
+        # residual R2 -- no silent fallback, even on the success path).
+        note = (
+            "bounded-process note: child exited 0 before its stdin was fully "
+            f"written ({type(stdin_errors[0]).__name__}: {stdin_errors[0]})"
+        )
+        stderr_text = f"{stderr_text}\n{note}" if stderr_text else note
     return subprocess.CompletedProcess(
         args=command,
         returncode=process.returncode,
         stdout=bytes(stdout.value).decode("utf-8", errors="replace"),
-        stderr=bytes(stderr.value).decode("utf-8", errors="replace"),
+        stderr=stderr_text,
     )

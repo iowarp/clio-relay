@@ -458,6 +458,11 @@ def cluster_bootstrap(
                                     "ssh_host_key_sha256": ssh_host_key_sha256,
                                     "fingerprint_source": fingerprint_source,
                                     "site_marker_sha256": observed_site_marker_sha256,
+                                    # The eyeball line must also say what was
+                                    # NOT checked (#209 review residual R3).
+                                    "scheduler_cluster_name": (
+                                        "unpinned; not observed by the one-pass install"
+                                    ),
                                 },
                                 sort_keys=True,
                             ),
