@@ -136,10 +136,9 @@ clio_relay_frpc_proxy_partial_cleanup() {{
   status=$?
   if [ "$status" != 0 ] && [ "$ENV_FILE_WRITTEN" = "1" ]; then
     rm -f -- "{paths.env_shell_path}" 2>/dev/null || true
-    echo "frpc proxy install failed partway; removed the secrets env file it had " \
-"already written" >&2
-    printf 'FrpcProxyPartialInstall=unit=%s toml_written=true env_removed=true ' \
-'next=teardown-proxy\\n' {quoted_unit} >&2
+    echo "frpc proxy install failed partway; removed the secrets env file it wrote" >&2
+    printf 'FrpcProxyPartialInstall=unit=%s toml_written=true '\
+'env_removed=true next=teardown-proxy\\n' {quoted_unit} >&2
   fi
   exit "$status"
 }}

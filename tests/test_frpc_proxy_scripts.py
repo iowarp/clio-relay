@@ -480,8 +480,15 @@ def test_install_script_runs_under_a_real_shell_and_reports_a_clean_failure() ->
         stderr = result.stderr.decode("utf-8", errors="replace")
         assert "frpc proxy unit did not become active" in stderr
         assert "frpc proxy install failed partway" in stderr
-        assert "FrpcProxyPartialInstall=" in stderr
-        assert "teardown-proxy" in stderr
+        # Verification-pass fix: assert the marker's SHAPE, not substrings --
+        # a malformed printf (two shell words recycling the format) previously
+        # emitted the record twice with unit= carrying the remediation hint
+        # and no trailing newline, while both substrings still matched.
+        assert stderr.count("FrpcProxyPartialInstall=") == 1
+        assert (
+            "FrpcProxyPartialInstall=unit=clio-relay-frpc-proxy-ares.service "
+            "toml_written=true env_removed=true next=teardown-proxy\n"
+        ) in stderr
         stdout = result.stdout.decode("utf-8", errors="replace")
         assert "FrpcProxyReceiptSchema=" not in stdout
 
@@ -529,7 +536,11 @@ def test_install_script_active_recheck_catches_a_flip_the_activation_helper_miss
         assert result.returncode == 1
         stderr = result.stderr.decode("utf-8", errors="replace")
         assert "frpc proxy unit is not active after install" in stderr
-        assert "FrpcProxyPartialInstall=" in stderr
+        assert stderr.count("FrpcProxyPartialInstall=") == 1
+        assert (
+            "FrpcProxyPartialInstall=unit=clio-relay-frpc-proxy-ares.service "
+            "toml_written=true env_removed=true next=teardown-proxy\n"
+        ) in stderr
         stdout = result.stdout.decode("utf-8", errors="replace")
         assert "FrpcProxyReceiptSchema=" not in stdout
         assert "FrpcProxyActive=" not in stdout
