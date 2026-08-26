@@ -26,7 +26,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint_jarvis_recovery, execution_watch
+from clio_relay import application_runtime_prediction, endpoint_jarvis_recovery, execution_watch
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -37,6 +37,7 @@ from clio_relay.models import (
     JobKind,
     JobState,
     McpCallSpec,
+    ProgressRecord,
     RelayJob,
     deterministic_jarvis_execution_id,
 )
@@ -141,6 +142,50 @@ def test_execution_phase_job_metadata_shape() -> None:
     assert verdict["schema_version"] == execution_watch.APPLICATION_VERDICT_SCHEMA
     assert verdict["status"] == "unknown"
     assert verdict["reason"] == "execution_not_terminal"
+    # clio-relay#214: the restored runtime-prediction capability rides beside
+    # application_verdict on the same payload; no progress_history was
+    # supplied, so it is a typed absence, never an error or a fabrication.
+    prediction = cast(dict[str, Any], payload["application_runtime_prediction"])
+    assert (
+        prediction["schema_version"]
+        == application_runtime_prediction.APPLICATION_RUNTIME_PREDICTION_SCHEMA
+    )
+    assert prediction["status"] == "absent"
+    assert prediction["reason"] == application_runtime_prediction.NO_PROGRESS_OBSERVATIONS_REASON
+
+
+def test_execution_phase_job_metadata_composes_runtime_prediction_from_progress() -> None:
+    """A job's own structured progress history, when supplied, grounds a real prediction.
+
+    clio-relay#214: the runtime prediction is composed onto the SAME phase
+    payload as ``application_verdict`` -- additive, never replacing the
+    phase/jarvis_state fields ``test_execution_phase_job_metadata_shape``
+    above already covers.
+    """
+    metadata = _metadata(state="running", terminal=False)
+    progress_history = [
+        ProgressRecord(
+            job_id="job-execphase-prediction",
+            label="timestep",
+            current=step,
+            total=100,
+            created_at=datetime(2026, 8, 20, 0, 0, step, tzinfo=UTC),
+        )
+        for step in (0, 10, 20, 30, 40)
+    ]
+    payload = execution_watch.execution_phase_job_metadata(
+        metadata,
+        poll_count=5,
+        observed_at=datetime(2026, 8, 20, tzinfo=UTC),
+        progress_history=progress_history,
+    )
+    prediction = cast(dict[str, Any], payload["application_runtime_prediction"])
+    assert prediction["status"] == "predicted"
+    assert prediction["reason"] is None
+    assert prediction["predicted_remaining_seconds"] == 60.0
+    assert prediction["confidence"] == "observed"
+    # application_verdict is still present and unaffected by the addition.
+    assert cast(dict[str, Any], payload["application_verdict"])["status"] == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -737,6 +782,13 @@ def test_deferred_execution_watched_to_success(
     final_phase = cast(dict[str, Any], queue.get_job(job.job_id).metadata["execution_phase"])
     assert final_phase["jarvis_state"] == "completed"
     assert final_phase["terminal"] is True
+    # clio-relay#214: the real end-to-end watch loop reaches queue.list_progress
+    # without error; this fake job never appends progress, so a typed absence
+    # (not a crash, not a fabricated number) is what a real deferred job with
+    # no progress adapter wired in yet gets today.
+    prediction = cast(dict[str, Any], final_phase["application_runtime_prediction"])
+    assert prediction["status"] == "absent"
+    assert prediction["reason"] == application_runtime_prediction.NO_PROGRESS_OBSERVATIONS_REASON
     events = _event_types(queue, job.job_id)
     assert events.count("execution.watch_started") == 1
     assert "execution.queued" in events

@@ -2000,12 +2000,15 @@ SWEET_SPOT_LINES = 500
 DISTRIBUTION_TARGET_PERCENT = 90.0
 
 #: Recorded percentage of src-family files under SWEET_SPOT_LINES, floored to
-#: two decimals at measurement time (478/619 = 77.22% when first recorded).
-#: May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 77.22
+#: two decimals at measurement time (478/619 = 77.22% when first recorded;
+#: clio-relay#214 added application_runtime_prediction.py, 195 lines,
+#: raising it to 479/620 = 77.25%). May only RISE.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 77.25
 
 #: Same guard for tests/ with its own (much lower) starting point
-#: (126/203 = 62.06% floored when first recorded). May only RISE.
+#: (126/203 = 62.06% when first recorded; clio-relay#214 added
+#: test_application_runtime_prediction.py, raising it to 127/204 = 62.25%).
+#: May only RISE.
 TESTS_DISTRIBUTION_BASELINE_PERCENT = 62.25
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)

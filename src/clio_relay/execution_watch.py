@@ -50,14 +50,14 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from clio_relay import application_verdict
+from clio_relay import application_runtime_prediction, application_verdict
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.endpoint_jarvis_recovery import (
     _trusted_jarvis_execution_query_validation,
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from clio_relay.console_stream import ConsoleLiveTailer
     from clio_relay.core_queue import ClioCoreQueue
     from clio_relay.jarvis_provider import JarvisCdProvider
-    from clio_relay.models import RelayJob
+    from clio_relay.models import ProgressRecord, RelayJob
     from clio_relay.runtime_metadata import JarvisRuntimeMetadata
 
 #: MCP timeouts for one watch poll -- matches the existing lost-response
@@ -201,12 +201,15 @@ def execution_phase_job_metadata(
     *,
     poll_count: int,
     observed_at: datetime,
+    progress_history: Sequence[ProgressRecord] = (),
 ) -> dict[str, object]:
     """Build the typed payload merged into ``job.metadata["execution_phase"]``.
 
     Carried on the durable job record the door serves (``RelayJob.metadata``,
     merged via ``ClioCoreQueue.update_job_metadata``) so a run card can read
     a queued/running phase without polling the console or task events.
+    ``progress_history`` (default none) grounds the #214 runtime prediction
+    below; omitted, it reports the typed ``no_progress_observations`` absence.
     """
     state = metadata.terminal.state
     return {
@@ -224,6 +227,12 @@ def execution_phase_job_metadata(
         # verdict, never conflated with execution_watch_succeeded's own
         # scheduler-rc-only answer -- see application_verdict_for_metadata.
         "application_verdict": application_verdict_for_metadata(metadata),
+        # clio-relay#214: additive, typed, never fabricated -- see docstring.
+        "application_runtime_prediction": (
+            application_runtime_prediction.application_runtime_prediction_for_progress(
+                progress_history
+            )
+        ),
     }
 
 
@@ -732,6 +741,7 @@ def run_execution_watch(
             metadata,
             poll_count=poll_count,
             observed_at=now(),
+            progress_history=queue.list_progress(job.job_id),  # clio-relay#214
         )
         phase = cast(str, phase_metadata["phase"])
         if phase != last_reported_phase:
@@ -768,6 +778,7 @@ def run_execution_watch(
         final_metadata,
         poll_count=poll_count + 1,
         observed_at=now(),
+        progress_history=queue.list_progress(job.job_id),
     )
     queue.update_job_metadata(job.job_id, {"execution_phase": final_phase_metadata})
     queue.append_event(
