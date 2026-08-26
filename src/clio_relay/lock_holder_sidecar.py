@@ -232,7 +232,9 @@ def write_lock_holder_sidecar(lock_path: Path) -> None:
     pid = os.getpid()
     try:
         holders_dir = _holders_dir(lock_path)
-        holders_dir.mkdir(parents=True, exist_ok=True)
+        # 0o700 matches the private core-dir discipline (house standard; the
+        # default umask mode was flagged in review residual 4). No-op on NT.
+        holders_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = holders_dir / f"{pid}.json"
         temporary = holders_dir / f".{pid}.{uuid4().hex}.tmp"
         payload = _record_to_bytes(_record_now())
@@ -344,27 +346,33 @@ def _read_bounded_no_follow(path: Path) -> bytes | None:
     return raw
 
 
-def _read_holder_record(path: Path) -> LockHolderRecord | None:
+def _read_holder_record(path: Path) -> tuple[LockHolderRecord | None, str]:
     """Read and parse one holder file, tolerating disappearance and corruption.
 
-    Returns ``None`` for anything that is not a clean, parseable record --
-    the caller (:func:`_describe_lock_holder`) simply omits it, and reports
-    "holder record unreadable" only if EVERY candidate file failed this way.
+    Returns ``(record, "ok")`` for a clean record, ``(None, "vanished")`` when
+    the file disappeared between listing and read (the holder released
+    mid-scan -- counted toward "no holder record", NOT "unreadable"), and
+    ``(None, "unreadable")`` for a corrupt/oversize/unreadable file
+    (clio-relay#202 review residual 2: the two absences mean different
+    things to an operator).
     """
     try:
         raw = _read_bounded_no_follow(path)
     except FileNotFoundError:
-        return None
+        return None, "vanished"
     except OSError as exc:
         logger.warning(
             "clio-relay: lock_holder_sidecar_read_failed lock=%s reason=%s",
             path,
             exc,
         )
-        return None
+        return None, "unreadable"
     if raw is None:
-        return None
-    return _parse_record(raw)
+        return None, "unreadable"
+    record = _parse_record(raw)
+    if record is None:
+        return None, "unreadable"
+    return record, "ok"
 
 
 def _posix_pid_alive(pid: int) -> bool | None:
@@ -550,9 +558,14 @@ def _describe_lock_holder(lock_path: Path) -> str:
     dead_fragments: list[str] = []
     unresolved_fragments: list[str] = []
     readable_count = 0
+    unreadable_count = 0
     for holder_file in candidate_files:
-        record = _read_holder_record(holder_file)
+        record, outcome = _read_holder_record(holder_file)
         if record is None:
+            if outcome == "unreadable":
+                unreadable_count += 1
+            # "vanished" = the holder released mid-scan; counts toward the
+            # no-record verdict below, never toward "unreadable".
             continue
         readable_count += 1
         liveness = _pid_alive(record.pid)
@@ -564,6 +577,8 @@ def _describe_lock_holder(lock_path: Path) -> str:
             unresolved_fragments.append(_unresolved_fragment(record))
 
     if readable_count == 0:
+        if unreadable_count == 0:
+            return _NO_HOLDER_RECORD_MESSAGE
         return "holder record unreadable"
 
     truncation_note = " (+more not shown)" if truncated else ""

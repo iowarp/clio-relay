@@ -313,6 +313,7 @@ class WorkerLifetimeLock:
             lock_name=self.lock_name,
         )
         lock_path = canonical_core / self.lock_name
+        holder_entry_written = False
         try:
             if os.name == "nt":
                 overlapped = _acquire_windows_lock(
@@ -329,15 +330,17 @@ class WorkerLifetimeLock:
                     timeout_seconds=effective_timeout,
                     lock_path=lock_path,
                 )
+            holder_entry_written = True
         except BaseException:
-            # A successful OS-level acquire always writes the holder entry
-            # BEFORE returning (lock_holder_sidecar.write_lock_holder_sidecar),
-            # so an exception reaching here after that point (e.g. an async
-            # KeyboardInterrupt landing between the acquire call and this
-            # frame) must not leave a false "this pid holds it" entry behind
-            # for a lock this object is about to release via os.close
-            # (clio-relay#202 D8).
-            remove_lock_holder_sidecar(lock_path)
+            # Remove the holder entry ONLY when THIS attempt wrote one (the
+            # platform acquire returned, i.e. an async exception landed
+            # between it and self._fd assignment). A failed/timed-out acquire
+            # never wrote an entry, and unconditionally removing here would
+            # delete a SIBLING lock instance's live entry for the same pid --
+            # re-introducing the false "no holder record" render
+            # (clio-relay#202 review residual 3).
+            if holder_entry_written:
+                remove_lock_holder_sidecar(lock_path)
             os.close(fd)
             raise
         self._fd = fd
