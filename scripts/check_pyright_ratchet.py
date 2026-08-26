@@ -155,7 +155,21 @@ from typing import Any, NamedTuple
 # 7621 on its pre-#278 base. Rebased over #278's -52, the two deltas
 # compound on disjoint sites; re-measured on the merged tree and recorded
 # below.
-BASELINE_TOTAL = 7569
+#
+# clio-relay#277 owned-session-lease manifest-drift fix: the #277 merge
+# (6306fb6) added QueueOwnerSessionLeaseMixin without registering it in
+# tests/test_core_queue_split_architecture.py's pinned owner tables --
+# fixed by registering its rank/budget/facade methods there (no src/
+# change). While closing the same red baseline,
+# tests/test_service_runtime.py's ``relay_cli._attach_verified_remote_
+# worker``/``relay_cli._write_remote_verified_report`` monkeypatch/call
+# seams, stale since the 1.6.7 release moved both into
+# cli_remote_worker_attach.py, were repointed at the module that actually
+# holds them now -- removing the one real ``reportAttributeAccessIssue``
+# (a static attribute access on a name that no longer exists on
+# ``clio_relay.cli``) plus one adjacent count movement. Net -2, measured
+# 7569 -> 7567.
+BASELINE_TOTAL = 7567
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

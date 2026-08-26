@@ -84,7 +84,33 @@ from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
 _TESTS_ROOT = Path(__file__).parent
-_NON_OWNER_QUEUE_MODULES = frozenset({"queue_management", "queue_validation"})
+_NON_OWNER_QUEUE_MODULES = frozenset(
+    {
+        "queue_management",
+        "queue_validation",
+        # The "queue diagnosis" surface (queue_diagnosis.py's own module
+        # docstring: "listing, diagnosis, stale recovery, worker status"):
+        # read-only introspection/simulation built ON TOP of the fully
+        # assembled ``ClioCoreQueue`` facade -- every one of these six
+        # imports ``clio_relay.core_queue.ClioCoreQueue`` directly and takes
+        # a live queue instance as a parameter, the opposite direction of an
+        # owner (an owner is composed INTO the facade; these consume it
+        # after composition). None defines a ``*Mixin`` class (verified by
+        # check 2 below), so none can structurally join the MRO. Present,
+        # unregistered, since before the 1.6.7 release baseline (predates
+        # #277) -- registered honestly here rather than forced into the
+        # owner-rank/budget system a same-name-prefix coincidence does not
+        # actually make them part of.
+        "queue_admission_simulation",
+        "queue_admission_snapshot",
+        "queue_diagnosis",
+        "queue_diagnosis_constants",
+        "queue_listing",
+        "queue_stale_recovery",
+        "queue_worker_capacity",
+        "queue_worker_status",
+    }
+)
 _OWNER_RANK = {
     "queue_context": 0,
     "queue_jarvis_inputs": 1,
@@ -188,6 +214,19 @@ _OWNER_RANK = {
     "queue_startup": 43,
     "queue_index_migration": 44,
     "queue_transitions": 45,
+    # #277: queue_owner_session_lease (the owned-session client-liveness
+    # lease record -- touch/status/close/sweep-failure/due-scan/prune) lands
+    # last, appended honestly at its real landing point rather than backdated
+    # into the CQ1-19 sequence above. Its own imports are exactly
+    # queue_context (rank 0), queue_layout (rank 2), and queue_store_write
+    # (rank 5) -- see queue_owner_session_lease.py's own imports -- so any
+    # rank past 5 satisfies the topology; nothing among the other 46 owners
+    # self-calls or imports it (an empty-edges search against every other
+    # owner confirms zero inbound edges), so there is no tighter upper bound
+    # to place it against. Sibling to, and deliberately independent of,
+    # queue_owner_session_lifecycle (rank 16) per its own module docstring --
+    # this is not a predecessor/successor of that owner, just unrelated.
+    "queue_owner_session_lease": 46,
 }
 _OWNER_BUDGETS = {
     "queue_context": 70,
@@ -225,7 +264,9 @@ _OWNER_BUDGETS = {
     "queue_execution_cleanup": 380,
     "queue_jobs": 800,
     "queue_input_ingest": 715,
-    "queue_progress": 190,
+    # 190 -> 220: clio-relay#214 added latest_progress_window (the bounded,
+    # index-ordered prediction window read) -- measured 215 at merge.
+    "queue_progress": 220,
     "queue_tasks": 420,
     "queue_execution_cleanup_markers": 360,
     "queue_lease_indexes": 620,
@@ -246,6 +287,10 @@ _OWNER_BUDGETS = {
     "queue_startup": 550,
     "queue_index_migration": 720,
     "queue_transitions": 280,
+    # #277: measured 486 lines at landing; 500 keeps it at the file-size
+    # sweet-spot ceiling (clio-relay#280's ratcheting floor) instead of
+    # granting arbitrary headroom.
+    "queue_owner_session_lease": 500,
 }
 _CQ4_CODEC_OWNERS = frozenset(
     {
@@ -1158,7 +1203,23 @@ def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None
     """
     # 1. The exemption set is pinned to its exact, reviewed contents -- a
     #    change to the source constant must show as a diff on this line too.
-    assert frozenset({"queue_management", "queue_validation"}) == _NON_OWNER_QUEUE_MODULES
+    assert (
+        frozenset(
+            {
+                "queue_management",
+                "queue_validation",
+                "queue_admission_simulation",
+                "queue_admission_snapshot",
+                "queue_diagnosis",
+                "queue_diagnosis_constants",
+                "queue_listing",
+                "queue_stale_recovery",
+                "queue_worker_capacity",
+                "queue_worker_status",
+            }
+        )
+        == _NON_OWNER_QUEUE_MODULES
+    )
 
     # 2. Every exempted module is substantively non-owner: it composes no
     #    ``*Mixin`` class, so it structurally cannot join ClioCoreQueue's
@@ -2520,7 +2581,7 @@ def _callable_member_names(klass: type, *, public: bool) -> set[str]:
 # over every public method before deleting the last body"). The full public
 # surface is pinned by NAME, not just count (N11: a same-count swap -- one
 # method renamed while another moved on -- would slip past a bare
-# ``len(...) == 128`` check unnoticed).
+# ``len(...) == 134`` check unnoticed).
 _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "acknowledge_execution_cleanup",
     "acknowledge_job_cancellation",
@@ -2541,6 +2602,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "claim_scheduler_cancel_confirmation",
     "clear_owner_session_closing",
     "close_gateway_session",
+    "close_owner_session_lease",
     "collect_terminal_job",
     "complete_gateway_browser_attachment",
     "complete_input_ingest",
@@ -2548,6 +2610,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "create_gateway_session",
     "drain_events",
     "drain_task_events",
+    "due_expired_owner_session_leases",
     "ensure_scheduler_cancel_pending",
     "fail_input_ingest",
     "finalize_scheduler_cancel_identities",
@@ -2600,10 +2663,12 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "mirror_owner_session_generation_open",
     "owner_session_generation_status",
     "owner_session_is_closing",
+    "owner_session_lease_status",
     "plan_terminal_job_gc",
     "prepare_gateway_browser_attachment",
     "prepare_gateway_teardown_intent",
     "prepare_owner_session_start",
+    "prune_terminal_owner_session_leases",
     "put_jarvis_package_input_contract",
     "put_jarvis_run_input_manifest",
     "put_mcp_task",
@@ -2611,6 +2676,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "readiness_info",
     "reconcile_input_artifact",
     "reconcile_pending_transitions",
+    "record_owner_session_lease_sweep_failure",
     "record_scheduler_cancel_attempt",
     "record_scheduler_cancel_observation",
     "record_transform_ref",
@@ -2643,6 +2709,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "stage_execution_cleanup_sidecar",
     "submit_and_acquire_job",
     "submit_job",
+    "touch_owner_session_lease",
     "update_gateway_session",
     "update_jarvis_pipeline_input_bindings",
     "update_job_metadata",
@@ -2659,7 +2726,13 @@ def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
     public_methods = _callable_member_names(ClioCoreQueue, public=True)
 
     assert public_methods == set(_FACADE_PUBLIC_METHOD_NAMES)
-    assert len(_FACADE_PUBLIC_METHOD_NAMES) == 128
+    # 128-method base + 6 (#277: touch/status/close/sweep-failure/due-scan/
+    # prune on the owned-session client-liveness lease -- see
+    # queue_owner_session_lease.py) + 1 (#214: latest_progress_window, the
+    # bounded prediction window read -- see queue_progress.py) = 135. This is
+    # the count assertion doing its job: the additions are DELIBERATE, named
+    # individually above, not a silent regrowth.
+    assert len(_FACADE_PUBLIC_METHOD_NAMES) == 135
 
 
 # The two facade-legitimate exceptions to "every public method resolves to a
@@ -2739,7 +2812,7 @@ def _owner_module_name(klass: type) -> str:
 def test_every_public_method_resolves_to_an_owner_mixin_or_the_pinned_allowlist() -> None:
     """CQ20's MRO proof: the facade composes owners, it does not implement them.
 
-    Walks every public method on the pinned 128-method surface (``test_
+    Walks every public method on the pinned 134-method surface (``test_
     facade_public_method_set_stays_at_the_128_method_base``) and asserts
     each one's real defining class -- found by walking ``ClioCoreQueue.
     __mro__`` in resolution order, the same lookup Python itself performs --
