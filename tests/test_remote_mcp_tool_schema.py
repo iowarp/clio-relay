@@ -21,8 +21,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+import clio_relay.jarvis_mcp_validation_contract as jarvis_mcp_validation_contract
 import clio_relay.remote_mcp as remote_mcp
 import clio_relay.remote_mcp_tool_schema as remote_mcp_tool_schema
+from clio_relay.remote_mcp import remote_mcp_schema_digest
 from clio_relay.remote_mcp_tool_schema import (
     RemoteMcpDiscoveryProvenance,
     RemoteMcpToolSchema,
@@ -32,6 +36,7 @@ from clio_relay.remote_mcp_tool_schema import (
     _server_artifact_verified,
     _stable_digest,
     is_remote_mcp_control_query,
+    resolve_remote_tool_title,
 )
 
 _INPUT_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
@@ -172,7 +177,20 @@ def test_parse_remote_tool_with_no_title_anywhere_stays_none_not_fabricated() ->
 
 
 def test_parse_remote_tool_ignores_malformed_annotations_title() -> None:
-    """A non-string or blank annotations.title is advisory server noise, not a title."""
+    """A non-string or blank annotations.title does not populate the SCHEMA's title.
+
+    Scoped to ``RemoteMcpToolSchema.title`` only -- this is not a user-visible
+    guarantee. ``annotations`` is forwarded byte-for-byte regardless of this
+    resolution (unchanged, by design), and FastMCP's own
+    ``Tool.to_mcp_tool()`` independently falls back title -> annotations.title
+    at the wire layer without stripping. So a degenerate server that declares
+    only a whitespace-only ``annotations.title`` still has that string appear
+    as the tool's wire-visible title in ``tools/list`` -- the schema-level
+    guard here is bypassed downstream by FastMCP's own fallback (clio-relay#164
+    repair round, defect 4). Fixing that upstream FastMCP behavior is out of
+    scope; this test only pins the schema layer, which is the layer clio-relay
+    owns and the layer ``remote_mcp_schema_digest`` hashes.
+    """
     blank = _parse_remote_tool(
         {
             "name": "inspect",
@@ -190,3 +208,72 @@ def test_parse_remote_tool_ignores_malformed_annotations_title() -> None:
         }
     )
     assert wrong_type.title is None
+
+
+# clio-relay#164 repair round, defect 2: `_parse_remote_tool` (discovery ->
+# schema cache -> catalog) and `_remote_contract_tool` (JARVIS live
+# remote-contract digest check) are two independent tools/list ingestion
+# paths that both build a RemoteMcpToolSchema and both feed
+# remote_mcp_schema_digest compared against the same pinned contract sha for
+# the same live server. Before this fix, only the discovery path resolved
+# annotations.title as a title fallback -- an annotations-only-title server
+# would make the two paths disagree about that server's digest. Both now
+# route through the shared resolve_remote_tool_title helper.
+
+
+def test_resolve_remote_tool_title_precedence_and_absence() -> None:
+    assert resolve_remote_tool_title("Explicit", {"title": "Stale"}) == "Explicit"
+    assert resolve_remote_tool_title(None, {"title": "Annotated"}) == "Annotated"
+    assert resolve_remote_tool_title(None, {"title": "   "}) is None
+    assert resolve_remote_tool_title(None, {"title": 42}) is None
+    assert resolve_remote_tool_title(None, None) is None
+    assert resolve_remote_tool_title(None, {}) is None
+
+
+@pytest.mark.parametrize(
+    "raw_tool",
+    [
+        pytest.param(
+            {
+                "name": "inspect",
+                "title": "Inspect Science Data",
+                "inputSchema": _INPUT_SCHEMA,
+            },
+            id="top_level_title",
+        ),
+        pytest.param(
+            {
+                "name": "inspect",
+                "inputSchema": _INPUT_SCHEMA,
+                "annotations": {"title": "Inspect Science Data", "readOnlyHint": True},
+            },
+            id="annotations_only_title",
+        ),
+        pytest.param(
+            {
+                "name": "inspect",
+                "inputSchema": _INPUT_SCHEMA,
+            },
+            id="no_title",
+        ),
+    ],
+)
+def test_parse_remote_tool_and_remote_contract_tool_agree_on_title_and_digest(
+    raw_tool: dict[str, Any],
+) -> None:
+    """The two live tools/list ingestion paths must resolve one identical title.
+
+    ``_parse_remote_tool`` (remote_mcp_tool_schema.py, this module) and
+    ``_remote_contract_tool`` (jarvis_mcp_validation_contract.py) parse the
+    exact same untrusted wire shape. If they disagreed on title, they would
+    silently disagree on ``remote_mcp_schema_digest`` for the identical live
+    server -- both are compared against the same pinned contract sha
+    (``CLIO_KIT_JARVIS_USER_CONTRACT_SHA256`` / ``_BY_ID``).
+    """
+    from_discovery = _parse_remote_tool(raw_tool)
+    from_contract = jarvis_mcp_validation_contract._remote_contract_tool(  # pyright: ignore[reportPrivateUsage]
+        raw_tool
+    )
+
+    assert from_discovery.title == from_contract.title
+    assert remote_mcp_schema_digest([from_discovery]) == remote_mcp_schema_digest([from_contract])
