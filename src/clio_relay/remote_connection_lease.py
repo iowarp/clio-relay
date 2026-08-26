@@ -25,11 +25,14 @@ class SessionLeaseExpiredError(RelayError):
     torn down for an ordinary reason; the worker's own TTL sweep reaped it
     after this desktop stopped renewing its lease (crash, network loss, or
     an ordinary walk-away). Raised by
-    :meth:`~clio_relay.remote_connection.RemoteConnection._verify_bootstrap`
-    from the SAME single-dial bootstrap document every bring-up already
-    reads (``session recovery-status``'s ``owner_session_lease_status``
-    projection, embedded via ``control_channel.
-    owned_session_channel_bootstrap_script`` -- zero extra dials).
+    :func:`~clio_relay.remote_connection_registry.verify_bootstrap` (as its
+    FIRST statement -- position matters: an expired session also fails the
+    generic ``running is not True`` check right after it, so appending this
+    check later would silently lose the typed reason) from the SAME
+    single-dial bootstrap document every bring-up already reads (``session
+    recovery-status``'s ``owner_session_lease_status`` projection, embedded
+    via ``control_channel.owned_session_channel_bootstrap_script`` -- zero
+    extra dials).
 
     When ``expired_with_running_jobs`` is true, at least one relay job was
     still non-terminal at sweep time; leases never kill jobs (they are owned
@@ -54,9 +57,12 @@ class SessionLeaseExpiredError(RelayError):
         self.session_generation_id = session_generation_id
         self.expired_with_running_jobs = expired_with_running_jobs
         self.running_job_ids = running_job_ids
+        generation_detail = (
+            f" (generation {session_generation_id!r})" if session_generation_id else ""
+        )
         detail = (
-            f"owned session {session_id!r} on cluster {cluster!r} was reaped by its "
-            "client-liveness lease TTL after this desktop stopped talking to it"
+            f"owned session {session_id!r}{generation_detail} on cluster {cluster!r} was reaped "
+            "by its client-liveness lease TTL after this desktop stopped talking to it"
         )
         if expired_with_running_jobs:
             detail += (
@@ -75,12 +81,13 @@ def raise_if_lease_expired(
 ) -> None:
     """Raise :class:`SessionLeaseExpiredError` before the generic verification failure.
 
-    Called from :meth:`~clio_relay.remote_connection.RemoteConnection.
-    _verify_bootstrap` with the SAME bootstrap ``status`` document it already
-    verifies. iowarp/clio-relay#277: an expired lease already means the
-    process is gone and the generation already closed -- the generic checks
-    right after this call would fail anyway, just with a reason that does
-    not say WHY. Scoped to exactly the given connection identity so a status
+    Called as the FIRST statement of
+    :func:`~clio_relay.remote_connection_registry.verify_bootstrap`, with the
+    SAME bootstrap ``status`` document that function goes on to verify.
+    iowarp/clio-relay#277: an expired lease already means the process is
+    gone and the generation already closed -- the generic checks right
+    after this call would fail anyway, just with a reason that does not say
+    WHY. Scoped to exactly the given connection identity so a status
     document that does not even claim to describe this session/cluster falls
     through to the ordinary generic verification unchanged (a no-op return).
     """

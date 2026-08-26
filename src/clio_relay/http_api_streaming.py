@@ -36,6 +36,7 @@ from typing import cast
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError
+from clio_relay.http_api_owner_session_lease_renewal import renew_owner_session_lease
 from clio_relay.http_api_redaction import _public_payload
 from clio_relay.models import TERMINAL_STATES
 from clio_relay.pagination import validate_response_page_limit
@@ -51,6 +52,7 @@ async def _monitor_sse_events(
     limit: int,
     poll_seconds: float,
     stop_on_terminal: bool,
+    settings: RelaySettings | None = None,
 ) -> AsyncIterator[str]:
     async for payload in _monitor_stream_payloads(
         queue,
@@ -59,6 +61,7 @@ async def _monitor_sse_events(
         limit=limit,
         poll_seconds=poll_seconds,
         stop_on_terminal=stop_on_terminal,
+        settings=settings,
     ):
         yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], default=str)}\n\n"
 
@@ -71,6 +74,7 @@ async def _task_sse_events(
     limit: int,
     poll_seconds: float,
     stop_after_replay: bool,
+    settings: RelaySettings | None = None,
 ) -> AsyncIterator[str]:
     async for payload in _task_stream_payloads(
         queue,
@@ -79,6 +83,7 @@ async def _task_sse_events(
         limit=limit,
         poll_seconds=poll_seconds,
         stop_after_replay=stop_after_replay,
+        settings=settings,
     ):
         yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], default=str)}\n\n"
 
@@ -91,10 +96,23 @@ async def _task_stream_payloads(
     limit: int,
     poll_seconds: float,
     stop_after_replay: bool = False,
+    settings: RelaySettings | None = None,
 ) -> AsyncIterator[dict[str, object]]:
+    """Poll task-timeline events forever (or once, for ``stop_after_replay``).
+
+    ``settings``, when given, renews the owned-session lease on every poll
+    tick (adversarial-review HIGH 4): the auth dependency that would
+    otherwise renew it evaluates only ONCE per stream, so a long-lived
+    SSE/WebSocket consumer watching a job longer than the lease TTL would
+    otherwise be reaped mid-stream. ``None`` (the default, and every
+    existing non-owned-session caller) skips renewal entirely -- purely
+    additive, no behavior change for anything that does not pass it.
+    """
     limit = validate_response_page_limit(limit)
     next_cursor = cursor
     while True:
+        if settings is not None:
+            renew_owner_session_lease(settings, queue)
         events, next_cursor = queue.drain_task_events(
             task_id,
             cursor=next_cursor,
@@ -126,10 +144,18 @@ async def _monitor_stream_payloads(
     limit: int,
     poll_seconds: float,
     stop_on_terminal: bool,
+    settings: RelaySettings | None = None,
 ) -> AsyncIterator[dict[str, object]]:
+    """Poll job-monitor updates until terminal (or forever, if not stopping).
+
+    ``settings`` renews the owned-session lease on every poll tick -- see
+    :func:`_task_stream_payloads`'s docstring for why.
+    """
     limit = validate_response_page_limit(limit)
     next_cursor = cursor
     while True:
+        if settings is not None:
+            renew_owner_session_lease(settings, queue)
         payload = monitor_job(queue, job_id, cursor=next_cursor, limit=limit)
         raw_next_cursor = payload["next_cursor"]
         if not isinstance(raw_next_cursor, int):
@@ -219,11 +245,18 @@ async def _log_tail_sse_events(
     with ``state: "gone"`` instead of leaking an unhandled 500 after
     headers were already sent (which a client would see as a truncated 200,
     misread as a channel drop).
+
+    iowarp/clio-relay#277 (adversarial-review HIGH 4): renews the owned-
+    session lease on every poll tick -- the auth dependency that would
+    otherwise renew it evaluates only ONCE per stream, so a console session
+    followed longer than the lease TTL would otherwise be reaped
+    mid-stream.
     """
     current_offset = offset
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     last_activity = time.monotonic()
     while True:
+        renew_owner_session_lease(settings, queue)
         try:
             job = queue.get_job(job_id)
         except NotFoundError:

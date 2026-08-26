@@ -45,7 +45,7 @@ from clio_relay.control_channel import (
     owned_session_channel_bootstrap_script,
 )
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
@@ -1087,6 +1087,39 @@ def test_unauthenticated_request_never_creates_a_lease(
     )
 
 
+def test_lease_renewal_failure_never_500s_a_valid_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MEDIUM 5: a bookkeeping failure in the renewal chokepoint must never
+    turn a valid, correctly authenticated client request into a 500 -- it
+    is logged with a typed reason and swallowed, never fatal."""
+    _bind_authority(monkeypatch, tmp_path)
+    settings = _owned_session_app_settings(tmp_path)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    def _broken_touch(*_args: object, **_kwargs: object) -> None:
+        raise QueueConflictError("simulated lease-storage failure")
+
+    monkeypatch.setattr(ClioCoreQueue, "touch_owner_session_lease", _broken_touch)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="clio_relay.http_api_owner_session_lease_renewal"):
+        response = client.get(
+            "/session-status",
+            headers={
+                "Authorization": "Bearer session-api-token",
+                OWNER_SESSION_ID_HEADER: "desktop-session-1",
+                SESSION_GENERATION_ID_HEADER: "generation-1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert any("owner_session.lease_renewal_failed" in record.message for record in caplog.records)
+
+
 def test_session_status_over_the_held_channel_cross_checks_the_pinned_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1714,6 +1747,10 @@ def test_attach_to_an_expired_session_yields_the_typed_lease_reason(
     assert excinfo.value.running_job_ids == ("job_still_running",)
     assert excinfo.value.cluster == "ares"
     assert excinfo.value.session_id == "desktop-session-1"
+    assert excinfo.value.session_generation_id == harness.generation_id
+    # MINOR (adversarial review): the message itself names the generation,
+    # not just the exception's structured attributes.
+    assert harness.generation_id in str(excinfo.value)
     # Exactly one dial -- never wrapped into the generic
     # SessionNotAttachableError, and never silently retried.
     assert harness.dials == 1

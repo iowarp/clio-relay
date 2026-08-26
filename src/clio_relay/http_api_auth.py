@@ -16,6 +16,7 @@ from fastapi import Header, WebSocket
 
 from clio_relay import door_error_adapters, door_errors
 from clio_relay.config import RelaySettings
+from clio_relay.http_api_owner_session_lease_renewal import renew_owner_session_lease
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
@@ -32,13 +33,19 @@ if TYPE_CHECKING:
 def _require_api_token(ctx: RelayApiContext) -> Callable[..., Awaitable[None]]:
     """Build the shared bearer-token/session-binding dependency.
 
-    Also the owned-session client-liveness lease's ONE renewal chokepoint
-    (iowarp/clio-relay#277): every authenticated request to an owned-session
-    API -- attach's status cross-check, ``GET /queue`` polls, job/gateway
-    submissions -- depends on this exact function, so renewing the lease here
-    covers all of them without asking the client for anything new. Renewal
-    happens only after both checks below already passed; an unauthenticated
-    or misbound request never touches the lease.
+    Also the owned-session client-liveness lease's ONE per-request renewal
+    chokepoint (iowarp/clio-relay#277): every authenticated request to an
+    owned-session API -- attach's status cross-check, ``GET /queue`` polls,
+    job/gateway submissions -- depends on this exact function, so renewing
+    the lease here covers all of them without asking the client for
+    anything new. Renewal happens only after both checks below already
+    passed; an unauthenticated or misbound request never touches the lease.
+
+    A long-lived SSE/WebSocket stream evaluates this dependency exactly
+    ONCE at connection open, not per poll tick -- ``http_api_streaming.py``'s
+    poll loops call the SAME shared ``renew_owner_session_lease`` helper on
+    every iteration so a stream held open longer than the TTL is not reaped
+    mid-stream (adversarial-review HIGH 4).
     """
     settings = ctx.resolved
 
@@ -80,13 +87,7 @@ def _require_api_token(ctx: RelayApiContext) -> Callable[..., Awaitable[None]]:
                 "session_binding_identity_mismatch",
                 "owner session or generation does not match this API process",
             )
-        if ctx.owner_session_cluster is not None:
-            ctx.queue.touch_owner_session_lease(
-                expected_session_id,
-                session_generation_id=expected_generation_id,
-                cluster=ctx.owner_session_cluster,
-                ttl_seconds=settings.owner_session_lease_ttl_seconds,
-            )
+        renew_owner_session_lease(settings, ctx.queue)
 
     return dependency
 

@@ -170,6 +170,7 @@ def register_event_routes(
                 limit=limit,
                 poll_seconds=poll_seconds,
                 stop_after_replay=stop_after_replay,
+                settings=ctx.resolved,
             ),
             media_type="text/event-stream",
         )
@@ -205,6 +206,7 @@ def register_event_routes(
                 cursor=cursor,
                 limit=limit,
                 poll_seconds=poll_seconds,
+                settings=ctx.resolved,
             ):
                 await websocket.send_json(payload)
         except WebSocketDisconnect:
@@ -249,6 +251,7 @@ def register_event_routes(
                 limit=limit,
                 poll_seconds=poll_seconds,
                 stop_on_terminal=stop_on_terminal,
+                settings=ctx.resolved,
             ),
             media_type="text/event-stream",
         )
@@ -286,6 +289,7 @@ def register_event_routes(
                 limit=limit,
                 poll_seconds=poll_seconds,
                 stop_on_terminal=stop_on_terminal,
+                settings=ctx.resolved,
             ):
                 await websocket.send_json(payload)
                 if payload["event"] == "terminal":
