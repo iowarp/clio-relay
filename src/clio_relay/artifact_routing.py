@@ -30,6 +30,11 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.identifiers import validate_durable_record_id
+from clio_relay.jarvis_execution_artifacts import (
+    owns_local_job,
+    resolve_jarvis_run_owner_by_execution_id,
+)
+from clio_relay.models import validate_jarvis_execution_id
 from clio_relay.pagination import (
     DEFAULT_RESPONSE_PAGE_RECORDS,
     validate_record_cursor,
@@ -54,33 +59,73 @@ def list_artifacts(
     settings: RelaySettings,
     target: ClusterDefinition | None,
 ) -> JSON:
-    """Return one artifact page for a job, routed to the cluster that ran it."""
-    job_id = validate_durable_record_id(_required_str(arguments, "job_id"))
+    """Return one artifact page for a job, routed to the cluster that ran it.
+
+    clio-relay#278: ``execution_id`` is an alternative to ``job_id`` -- the
+    id ``jarvis_run``/``jarvis_get_execution`` hand back, which the old
+    cluster-operator pack's prompt taught the model to reverse-engineer into
+    a job id. Exactly one of the two must be given; both or neither is a
+    typed ``artifact_scope_ambiguous`` refusal, mirroring
+    ``relay_artifact_lineage``'s established job_id/artifact_id idiom (its
+    definition sits immediately below ``relay_list_artifacts`` in the same
+    tool catalog). A bare ``execution_id`` resolves through the same
+    ``jarvis_execution_artifacts.resolve_jarvis_run_owner_by_execution_id``
+    the door's ``GET /executions/{execution_id}/artifacts`` route and the
+    CLI's ``--execution-id`` flag both use -- never a second, invented
+    resolution path.
+
+    Remote-cluster routing forwards whichever id the caller gave rather than
+    resolving locally first: a job dispatched to a configured remote cluster
+    is durable only in *that cluster's* core (this module's own docstring),
+    so a bare execution_id can only be resolved against the remote door's
+    own queue, exactly as a job_id-keyed call already only resolves there.
+    """
+    job_id_argument = _optional_str(arguments, "job_id")
+    execution_id_argument = _optional_str(arguments, "execution_id")
+    if (job_id_argument is None) == (execution_id_argument is None):
+        raise ValueError("artifact_scope_ambiguous: pass exactly one of job_id or execution_id")
+    if execution_id_argument is not None:
+        # clio-relay#278 D4: validate BEFORE any routing decision -- garbage
+        # forwarded to a remote cluster (over SSH or the owned-session HTTP
+        # client) fails opaquely there instead of as a typed local refusal.
+        try:
+            validate_jarvis_execution_id(execution_id_argument)
+        except ValueError as exc:
+            raise ValueError(f"execution_not_found: {exc}") from exc
     cursor = validate_record_cursor(arguments.get("cursor", 1))
     limit = validate_response_page_limit(arguments.get("limit", DEFAULT_RESPONSE_PAGE_RECORDS))
     if target is not None and should_execute_on_cluster(target):
         if settings.owner_session_id is not None:
             with OwnedSessionApiClient(definition=target, settings=settings) as client:
+                path = (
+                    f"/jobs/{validate_durable_record_id(job_id_argument)}/artifacts"
+                    if job_id_argument is not None
+                    else f"/executions/{execution_id_argument}/artifacts"
+                )
                 payload = client.request_json(
                     method="GET",
-                    path=f"/jobs/{job_id}/artifacts",
+                    path=path,
                     query={"cursor": cursor, "limit": limit},
                 )
         else:
-            payload = _remote_json(
-                target,
-                [
-                    "job",
-                    "list-artifacts",
-                    job_id,
-                    "--cursor",
-                    str(cursor),
-                    "--limit",
-                    str(limit),
-                ],
-                "remote artifact list",
-            )
+            remote_args = ["job", "list-artifacts"]
+            if job_id_argument is not None:
+                remote_args.append(validate_durable_record_id(job_id_argument))
+            else:
+                remote_args.extend(["--execution-id", cast(str, execution_id_argument)])
+            remote_args.extend(["--cursor", str(cursor), "--limit", str(limit)])
+            payload = _remote_json(target, remote_args, "remote artifact list")
         return _require_json_object(payload, "remote artifact list")
+    if job_id_argument is not None:
+        job_id = validate_durable_record_id(job_id_argument)
+    else:
+        owner = resolve_jarvis_run_owner_by_execution_id(
+            queue,
+            cast(str, execution_id_argument),
+            cluster=target.name if target is not None else None,
+            owns_job=lambda job: owns_local_job(settings, job),
+        )
+        job_id = owner.job_id
     _require_local_job_cluster(queue, job_id, target)
     artifacts, next_cursor, total = queue.list_artifacts_page(job_id, cursor=cursor, limit=limit)
     return {
@@ -151,6 +196,15 @@ def _required_str(arguments: JSON, key: str) -> str:
     value = arguments.get(key)
     if not isinstance(value, str) or not value:
         raise ValueError(f"{key} is required")
+    return value
+
+
+def _optional_str(arguments: JSON, key: str) -> str | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{key} must be a non-empty string")
     return value
 
 

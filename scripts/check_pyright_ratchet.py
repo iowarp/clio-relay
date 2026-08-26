@@ -132,7 +132,24 @@ from typing import Any, NamedTuple
 # Post-rebase onto develop (which carries #209's own -5): the two deltas
 # compound independently (disjoint files); re-measured on the rebased tree
 # at 7626 and ratcheted down accordingly.
-BASELINE_TOTAL = 7626
+#
+# clio-relay#278 adversarial-review fix round (D3): the six ``register_*_
+# routes(..., auth_dependency: object, ...)`` signatures across http_api_
+# routes_{artifacts,jobs,queue,session,events,gateway}.py (two of which --
+# session.py, gateway.py -- also carry a ``session_submission_dependency:
+# object`` parameter) were the root cause of every "Argument of type
+# list[object] cannot be assigned to parameter dependencies of type
+# Sequence[Depends] | None" reportArgumentType error on this surface -- 50
+# instances total, not just the one #278's own new execution-scoped route
+# added (which had been suppressed with a scoped ignore instead of fixing
+# the root; the ratchet forbids exactly that kind of one-site accounting).
+# Retyped all eight parameters to ``fastapi.params.Depends`` (the real
+# runtime type -- every call site already passes ``Depends(...)``); purely
+# mechanical, no call-site or behavior changes (verified: create_app()
+# still builds and the full http_api/artifact-listing test batteries still
+# pass byte-for-byte). Measured via `uv run --no-sync python scripts/
+# check_pyright_ratchet.py`: 7626 -> 7574.
+BASELINE_TOTAL = 7574
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

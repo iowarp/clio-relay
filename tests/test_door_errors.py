@@ -100,6 +100,7 @@ _EXPECTED_REASONS = frozenset(
         "task_not_found",
         "gateway_not_found",
         "artifact_not_found",
+        "execution_not_found",
         "session_generation_identity_unavailable",
         "session_intake_closed",
         "session_binding_headers_required",
@@ -170,6 +171,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
             "task_not_found",
             "gateway_not_found",
             "artifact_not_found",
+            "execution_not_found",
         },
         404,
     ),
@@ -231,7 +233,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 75
+    assert len(door_errors.REASONS) == 76
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -240,7 +242,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 60
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 61
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -992,8 +994,8 @@ def _http_api_split_sources() -> list[tuple[str, str]]:
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_127_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 112 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 113 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -1005,6 +1007,19 @@ def test_http_api_rewrites_exactly_127_deliberate_sites_through_registered_reaso
     poll_interval_invalid, log_stream_invalid, job_not_found (the route
     itself), plus log_offset_invalid and log_offset_beyond_eof (the
     adversarial-review D3/D5 fixes).
+
+    113 (was 112): clio-relay#278's new execution-scoped artifact-listing
+    route (``GET /executions/{execution_id}/artifacts``,
+    http_api_routes_artifacts.py) adds exactly ONE site --
+    ``execution_not_found``, the route's own resolution failure.
+    Adversarial-review D1/D2 fix: resolution is ownership-filtered BEFORE
+    its exactly-one-owner check, so "unknown" and "resolves to a job this
+    session cannot see" collapse into the SAME ``execution_not_found``
+    refusal -- there is no second, job_not_found branch here (the route's
+    own ``ctx.require_owned_job`` call below stays unguarded, exactly like
+    the sibling ``GET /jobs/{job_id}/artifacts`` route, so its own residual
+    failures flow through the generic exception path rather than a bespoke
+    ``door_errors.http_problem(...)`` call this test would count).
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1028,7 +1043,7 @@ def test_http_api_rewrites_exactly_127_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 112
+    assert len(calls) == 113
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1068,7 +1083,7 @@ def test_http_api_rewrites_exactly_127_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 127
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 128
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1101,7 +1116,7 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_57_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_58_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
@@ -1112,7 +1127,11 @@ def test_all_57_exception_backed_http_sites_use_stable_public_messages() -> None
     conflicting idempotency_key and the retry-with-a-new-key move; the
     refresh-discovery move), so they now pass an explicit, reviewed
     ``message=`` instead of relying on the generic reason title. 56 (now 57
-    with clio-relay#221/#259's ``get_log_sse`` -> ``job_not_found`` site)
+    with clio-relay#221/#259's ``get_log_sse`` -> ``job_not_found`` site, and
+    58 with clio-relay#278's execution-scoped listing route's own
+    ``execution_not_found`` site -- exactly one, per the D1/D2 ownership-
+    filtered-before-count-check fix's honest refusal shape: there is no
+    separate ``job_not_found`` site on this route to add a second one)
     keep the closed-set discipline this test proves.
     """
     calls: list[ast.Call] = []
@@ -1128,7 +1147,7 @@ def test_all_57_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 57
+    assert len(calls) == 58
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])

@@ -28,6 +28,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.params import Depends
 
 from clio_relay import door_errors
 from clio_relay.cluster_config import ClusterRegistry, default_registry_path
@@ -78,7 +79,7 @@ def register_job_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
+    auth_dependency: Depends,
     job_identity_parameter: JobOwnerSessionIdentity | None,
 ) -> None:
     """Register the job-submission and job/transform/status read routes."""

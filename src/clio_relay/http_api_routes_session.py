@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import FastAPI, Query
+from fastapi.params import Depends
 
 from clio_relay import door_errors
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
@@ -55,8 +56,8 @@ def register_session_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
-    session_submission_dependency: object,
+    auth_dependency: Depends,
+    session_submission_dependency: Depends,
 ) -> None:
     """Register the healthz/session-identity/storage/JARVIS-authority/ingest routes."""
 

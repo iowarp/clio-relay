@@ -112,6 +112,27 @@ class NotFoundError(PublicMessageError, RelayError):
     """Raised when a requested record is missing."""
 
 
+class ExecutionOwnerNotFoundError(NotFoundError):
+    """A caller-supplied ``execution_id`` resolved to no unique owning job.
+
+    clio-relay#278: the artifact-listing surfaces (``relay_list_artifacts``'s
+    ``execution_id`` branch, the door's ``GET /executions/{execution_id}/
+    artifacts`` route, and the CLI's ``job list-artifacts --execution-id``
+    flag) resolve a bare JARVIS execution id to its owning relay job via
+    ``jarvis_execution_artifacts.resolve_jarvis_run_owner_by_execution_id``.
+    An execution id no local job admitted (or, pathologically, more than one
+    did) is ordinary, expected caller input -- an agent that mistyped the id
+    or is asking about a job on another cluster -- never a bare crash or an
+    empty page pretending success (the #278 design's own "gate on reality"
+    requirement). A distinct subtype from the base :class:`NotFoundError`,
+    rather than a message/keyword match, is what lets each surface classify
+    it specifically as ``execution_not_found`` instead of the generic
+    ``not_found``/``job_not_found`` reasons already claimed by other typed
+    call sites -- the same discrimination-by-type idiom this module's other
+    typed subclasses already use (see e.g. :class:`RemoteExecutableMissingError`).
+    """
+
+
 SHELL_COMMAND_NOT_FOUND_STATUS = 127
 """POSIX shell exit status for "command not found".
 

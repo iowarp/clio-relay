@@ -356,6 +356,13 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("task_not_found", 404, "Task not found"),
             _http_row("gateway_not_found", 404, "Gateway not found"),
             _http_row("artifact_not_found", 404, "Artifact not found"),
+            # clio-relay#278: a bare execution_id (the artifact-listing
+            # surfaces' alternative to job_id) that resolved to no unique
+            # owning jarvis_run job -- distinct from job_not_found/
+            # artifact_not_found so a caller can tell "the execution id
+            # itself is unknown" apart from "the job/artifact id is
+            # unknown" without re-parsing message text.
+            _http_row("execution_not_found", 404, "Execution not found"),
             _http_row(
                 "session_generation_identity_unavailable",
                 409,

@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
 
@@ -57,7 +57,17 @@ import clio_relay.core_queue as core_queue
 import clio_relay.relay_ops as relay_ops
 from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.config import RelaySettings
-from clio_relay.models import Cursor, ProgressRecord, TaskEventStatus, TaskTimelineEvent
+from clio_relay.jarvis_execution_artifacts import (
+    owns_local_job,
+    resolve_jarvis_run_owner_by_execution_id,
+)
+from clio_relay.models import (
+    Cursor,
+    ProgressRecord,
+    TaskEventStatus,
+    TaskTimelineEvent,
+    validate_jarvis_execution_id,
+)
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import monitor_job, read_artifact_bytes, read_job_log
@@ -404,7 +414,19 @@ def job_read_artifact(
 
 @cli_job.job_app.command("list-artifacts")
 def job_list_artifacts(
-    job_id: str,
+    job_id: Annotated[
+        str | None,
+        typer.Argument(help="Relay job id. Alternative to --execution-id; pass exactly one."),
+    ] = None,
+    execution_id: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "JARVIS execution id (from jarvis_run/jarvis_get_execution). Alternative "
+                "to JOB_ID; pass exactly one."
+            ),
+        ),
+    ] = None,
     cluster: Annotated[
         str | None,
         typer.Option(help="Configured cluster to inspect over SSH."),
@@ -422,25 +444,53 @@ def job_list_artifacts(
         ),
     ] = DEFAULT_RESPONSE_PAGE_RECORDS,
 ) -> None:
-    """List one stable page of artifact references for a job as JSON."""
+    """List one stable page of artifact references for a job as JSON.
+
+    clio-relay#278: pass either JOB_ID or ``--execution-id`` (the id
+    ``jarvis_run``/``jarvis_get_execution`` hand back), never both or
+    neither -- an execution id resolves to its owning job through the same
+    ``resolve_jarvis_run_owner_by_execution_id`` the door's execution-scoped
+    route and the MCP tool's ``execution_id`` branch both use, filtered to
+    jobs this CLI invocation's own owner session admitted (adversarial-
+    review D1) before that resolution's exactly-one-owner check ever runs.
+    """
     import clio_relay.cli as cli
 
-    if cli._try_remote_cluster_passthrough(
-        cluster,
-        [
-            "job",
-            "list-artifacts",
-            job_id,
-            "--cursor",
-            str(cursor),
-            "--limit",
-            str(limit),
-        ],
-    ):
+    if (job_id is None) == (execution_id is None):
+        raise typer.BadParameter(
+            "artifact_scope_ambiguous: pass exactly one of JOB_ID or --execution-id"
+        )
+    if execution_id is not None:
+        # clio-relay#278 D4: validate BEFORE any SSH passthrough -- garbage
+        # forwarded to a remote cluster fails opaquely there instead of as
+        # a typed local refusal.
+        try:
+            validate_jarvis_execution_id(execution_id)
+        except ValueError as exc:
+            raise typer.BadParameter(f"execution_not_found: {exc}") from exc
+    remote_args = ["job", "list-artifacts"]
+    if job_id is not None:
+        remote_args.append(job_id)
+    else:
+        remote_args.extend(["--execution-id", cast(str, execution_id)])
+    remote_args.extend(["--cursor", str(cursor), "--limit", str(limit)])
+    if cli._try_remote_cluster_passthrough(cluster, remote_args):
         return
-    artifacts, next_cursor, total = core_queue.ClioCoreQueue(
-        RelaySettings.from_env().core_dir
-    ).list_artifacts_page(job_id, cursor=cursor, limit=limit)
+    settings = RelaySettings.from_env()
+    queue = core_queue.ClioCoreQueue(settings.core_dir)
+    resolved_job_id = (
+        job_id
+        if job_id is not None
+        else resolve_jarvis_run_owner_by_execution_id(
+            queue,
+            cast(str, execution_id),
+            cluster=cluster,
+            owns_job=lambda job: owns_local_job(settings, job),
+        ).job_id
+    )
+    artifacts, next_cursor, total = queue.list_artifacts_page(
+        resolved_job_id, cursor=cursor, limit=limit
+    )
     typer.echo(
         json.dumps(
             _record_page_payload(

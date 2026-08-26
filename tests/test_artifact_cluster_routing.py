@@ -132,9 +132,19 @@ def _fake_remote_cli(remote_queue: ClioCoreQueue) -> Any:
     def run_remote_clio(_definition: ClusterDefinition, args: list[str]) -> str:
         assert args[0] == "job"
         if args[1] == "list-artifacts":
-            job_id = args[2]
             cursor = int(args[args.index("--cursor") + 1])
             limit = int(args[args.index("--limit") + 1])
+            if "--execution-id" in args:
+                # clio-relay#278: mirrors job_list_artifacts's own
+                # --execution-id resolution on the remote CLI.
+                from clio_relay.jarvis_execution_artifacts import (
+                    resolve_jarvis_run_owner_by_execution_id,
+                )
+
+                execution_id = args[args.index("--execution-id") + 1]
+                job_id = resolve_jarvis_run_owner_by_execution_id(remote_queue, execution_id).job_id
+            else:
+                job_id = args[2]
             artifacts, next_cursor, total = remote_queue.list_artifacts_page(
                 job_id, cursor=cursor, limit=limit
             )
@@ -203,6 +213,111 @@ def test_relay_list_artifacts_routes_to_the_cluster_that_ran_a_jarvis_execution(
     assert structured["cluster"] == "ares"
     returned_ids = {item["artifact_id"] for item in structured["artifacts"]}
     assert returned_ids == {artifact.artifact_id}
+
+
+def test_relay_list_artifacts_by_execution_id_routes_to_the_cluster_that_ran_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#278: the execution_id branch forwards the bare id remotely.
+
+    A job dispatched to a configured remote cluster is durable only in that
+    cluster's own core (this module's docstring) -- the door process
+    serving MCP tools cannot resolve a bare execution_id to a job id
+    locally, so it must forward the id itself and let the remote CLI (here,
+    the faked stand-in) resolve it against its own queue, exactly as a
+    job_id-keyed call already only resolves there.
+    """
+    remote_queue = ClioCoreQueue(tmp_path / "ares_core")
+    definition = _bind_remote_cluster(monkeypatch, tmp_path, cluster="ares")
+    owner, artifact = _register_remote_execution_output(
+        remote_queue, cluster="ares", execution_root=tmp_path / "execution"
+    )
+
+    door_settings = RelaySettings(
+        core_dir=tmp_path / "door_core", spool_dir=tmp_path / "door_spool"
+    )
+    door_queue = ClioCoreQueue(door_settings.core_dir)
+
+    monkeypatch.setattr(
+        "clio_relay.artifact_routing.run_remote_clio",
+        _fake_remote_cli(remote_queue),
+    )
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_artifacts",
+                "arguments": {
+                    "execution_id": "execution-ares-264",
+                    "cluster": "ares",
+                    "route_revision": cluster_route_revision(definition),
+                },
+            },
+        },
+        queue=door_queue,
+        settings=door_settings,
+        profile="user",
+    )
+
+    assert response is not None
+    assert "error" not in response, response
+    structured = response["result"]["structuredContent"]
+    assert structured["total"] == 1
+    assert structured["cluster"] == "ares"
+    returned_ids = {item["artifact_id"] for item in structured["artifacts"]}
+    assert returned_ids == {artifact.artifact_id}
+    # Never a job the door itself resolved -- proves the id was forwarded,
+    # not resolved against the (empty) local queue.
+    assert owner.job_id not in [job.job_id for job in door_queue.list_jobs()]
+
+
+def test_relay_list_artifacts_rejects_a_malformed_execution_id_before_remote_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#278 D4: shape validation happens BEFORE the routing
+    decision, so a malformed execution_id never even reaches the remote
+    CLI/SSH transport as an opaque failure -- ``run_remote_clio`` is
+    monkeypatched to assert-fail if it is ever invoked at all.
+    """
+    definition = _bind_remote_cluster(monkeypatch, tmp_path, cluster="ares")
+
+    def _must_not_be_called(_definition: ClusterDefinition, _args: list[str]) -> str:
+        raise AssertionError("run_remote_clio must not be reached for a malformed execution_id")
+
+    monkeypatch.setattr("clio_relay.artifact_routing.run_remote_clio", _must_not_be_called)
+
+    door_settings = RelaySettings(
+        core_dir=tmp_path / "door_core", spool_dir=tmp_path / "door_spool"
+    )
+    door_queue = ClioCoreQueue(door_settings.core_dir)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_artifacts",
+                "arguments": {
+                    "execution_id": "has a space",
+                    "cluster": "ares",
+                    "route_revision": cluster_route_revision(definition),
+                },
+            },
+        },
+        queue=door_queue,
+        settings=door_settings,
+        profile="user",
+    )
+
+    assert response is not None
+    assert "error" in response
+    assert "execution_not_found" in response["error"]["message"]
 
 
 def test_relay_read_artifact_routes_to_the_cluster_that_ran_a_jarvis_execution(

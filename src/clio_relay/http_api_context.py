@@ -54,6 +54,7 @@ from clio_relay.identifiers import DurableRecordId
 from clio_relay.job_identity import (
     JobOwnerSessionIdentity,
     OwnerSessionIdentityError,
+    job_owned_by_session,
     require_job_owner_session_identity,
 )
 from clio_relay.models import (
@@ -177,15 +178,10 @@ class RelayApiContext:
             )
 
     def owns_job(self, job: RelayJob) -> bool:
-        from clio_relay.dev_mode import dev_mode_enabled
-
-        if dev_mode_enabled():
-            return True
-        return self.resolved.owner_session_id is None or (
-            job.metadata.get("owner") == "clio-relay"
-            and job.metadata.get("owner_session_id") == self.resolved.owner_session_id
-            and job.metadata.get("owner_session_generation_id")
-            == self.resolved.owner_session_generation_id
+        return job_owned_by_session(
+            job,
+            owner_session_id=self.resolved.owner_session_id,
+            owner_session_generation_id=self.resolved.owner_session_generation_id,
         )
 
     def require_owned_job(self, job_id: DurableRecordId) -> RelayJob:

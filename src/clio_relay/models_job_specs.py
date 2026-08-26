@@ -286,8 +286,17 @@ def is_owned_jarvis_run_spec(kind: JobKind, spec: JobSpec) -> bool:
     )
 
 
-def _validate_jarvis_execution_id(value: object) -> str:
-    """Validate the portable execution-id contract exposed by JARVIS-CD."""
+def validate_jarvis_execution_id(value: object) -> str:
+    """Validate the portable execution-id contract exposed by JARVIS-CD.
+
+    clio-relay#278: also the one shape check every caller-facing surface
+    that resolves a bare ``execution_id`` (the door's execution-scoped
+    route, ``relay_list_artifacts``'s ``execution_id`` branch, and the
+    CLI's ``--execution-id`` flag) applies before doing anything with it --
+    an O(all local jobs) resolution scan on obvious garbage, or an opaque
+    remote-transport failure on a value containing e.g. a space or ``#``,
+    is a worse failure mode than a typed local refusal.
+    """
     if (
         not isinstance(value, str)
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None

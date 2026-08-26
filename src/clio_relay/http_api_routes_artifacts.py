@@ -23,11 +23,12 @@ import math
 from typing import Annotated
 
 from fastapi import FastAPI, Header, Query
+from fastapi.params import Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from clio_relay import door_error_adapters, door_errors
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
-from clio_relay.errors import NotFoundError, RelayError
+from clio_relay.errors import ExecutionOwnerNotFoundError, NotFoundError, RelayError
 from clio_relay.http_api_context import RelayApiContext
 from clio_relay.http_api_models import ProgressUpdateRequest
 from clio_relay.http_api_redaction import _public_model_page, _public_payload, _public_record
@@ -37,6 +38,7 @@ from clio_relay.http_api_streaming import (
     _log_tail_sse_events,
 )
 from clio_relay.identifiers import DurableRecordId
+from clio_relay.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
 from clio_relay.models import ProgressRecord
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import external_progress_metadata
@@ -48,7 +50,7 @@ def register_artifact_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
+    auth_dependency: Depends,
 ) -> None:
     """Register the log/artifact/progress read, progress-write, and content routes."""
 
@@ -183,6 +185,67 @@ def register_artifact_routes(
         ctx.require_owned_job(job_id)
         artifacts, next_cursor, total = ctx.queue.list_artifacts_page(
             job_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        return _public_payload(
+            _public_model_page(
+                "artifacts",
+                artifacts,
+                cursor=cursor,
+                limit=limit,
+                next_cursor=next_cursor,
+                total=total,
+            )
+        )
+
+    @app.get(
+        "/executions/{execution_id}/artifacts",
+        dependencies=[auth_dependency],
+    )
+    def get_artifacts_by_execution(
+        execution_id: str,
+        cursor: Annotated[int, Query(ge=1)] = 1,
+        limit: Annotated[int, Query(ge=1, le=MAX_RESPONSE_PAGE_RECORDS)] = (
+            DEFAULT_RESPONSE_PAGE_RECORDS
+        ),
+    ) -> dict[str, object]:
+        """List one artifact page for the job that admitted a JARVIS execution.
+
+        clio-relay#278: an alternative to ``GET /jobs/{job_id}/artifacts``
+        for a caller holding the execution id ``jarvis_run``/
+        ``jarvis_get_execution`` hand back rather than the owning relay job
+        id -- the old job-id-guessing workaround this closes. Resolved
+        through the same ``resolve_jarvis_run_owner_by_execution_id`` the
+        MCP tool's ``execution_id`` branch and the CLI's ``--execution-id``
+        flag both use, so all three surfaces answer identically.
+
+        ``owns_job=ctx.owns_job`` is applied INSIDE resolution, before its
+        exactly-one-owner check (adversarial-review D1): without it, a
+        second owner session's job admitting the same bare execution_id
+        would silently turn this session's own legitimate single match
+        into an ambiguous one. That same filter is what makes the refusal
+        shape honest (D2): a job this session cannot see is excluded from
+        the candidate set entirely, so "unknown execution id" and "resolves
+        to a job I cannot see" are structurally the SAME
+        ``execution_not_found`` refusal here -- there is no separate
+        ownership branch to reach once resolution itself is
+        ownership-filtered, exactly like every other owned-resource route
+        on this surface (``ctx.require_owned_job`` below still exists for
+        the sibling ``GET /jobs/{job_id}/artifacts`` route's benefit and as
+        a defensive re-check against a resolve-then-GC race; anything it
+        raises flows through this route exactly as unguarded as the
+        sibling route lets it, never a second bespoke branch here).
+        """
+        try:
+            owner = resolve_jarvis_run_owner_by_execution_id(
+                ctx.queue, execution_id, owns_job=ctx.owns_job
+            )
+        except ExecutionOwnerNotFoundError as exc:
+            raise door_errors.http_problem("execution_not_found", exc=exc) from exc
+        job = ctx.require_owned_job(owner.job_id)
+        artifacts, next_cursor, total = ctx.queue.list_artifacts_page(
+            job.job_id,
             cursor=cursor,
             limit=limit,
         )

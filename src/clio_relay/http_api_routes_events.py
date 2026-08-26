@@ -25,6 +25,7 @@ import math
 from typing import Annotated
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.params import Depends
 from fastapi.responses import StreamingResponse
 
 from clio_relay import door_error_adapters, door_errors
@@ -49,7 +50,7 @@ def register_event_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
+    auth_dependency: Depends,
 ) -> None:
     """Register the job/task event, monitor, and streaming routes."""
 
