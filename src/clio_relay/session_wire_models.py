@@ -387,6 +387,14 @@ class OwnedSessionRecoveryStatus(BaseModel):
     api_release_identity_verified: bool = False
     ownership_token_present: bool = False
     admission_status: dict[str, object] | None = None
+    # iowarp/clio-relay#277: the owned-session client-liveness lease
+    # projected as a plain dict (mirrors admission_status's own shape), so
+    # `session recovery-status`'s stdout -- and therefore the SAME single-dial
+    # channel bootstrap script that already embeds this whole document
+    # (control_channel.py:owned_session_channel_bootstrap_script) -- carries
+    # it with zero extra plumbing. Present only when a lease record exists;
+    # see queue_owner_session_lease.owner_session_lease_status.
+    owner_session_lease_status: dict[str, object] | None = None
     start_state: Literal[
         "unknown",
         "starting",

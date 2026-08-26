@@ -66,6 +66,9 @@ from clio_relay.errors import ConfigurationError, RelayError
 # session_api.py and tests import them directly from here), so they use the
 # `X as X` self-alias idiom ruff/pyflakes recognizes as an intentional
 # re-export instead of a `from ... import` it would otherwise flag unused.
+from clio_relay.remote_connection_lease import (
+    SessionLeaseExpiredError as SessionLeaseExpiredError,
+)
 from clio_relay.remote_connection_registry import (
     RemoteConnectionRegistry as RemoteConnectionRegistry,
 )

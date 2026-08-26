@@ -16,6 +16,7 @@ from clio_relay.execution_watch import (
     DEFAULT_EXECUTION_WATCH_POLL_INTERVAL_SECONDS,
 )
 from clio_relay.identifiers import DurableRecordId
+from clio_relay.models_owner_session_lease import DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS
 from clio_relay.spool import (
     DEFAULT_MAX_LOG_BYTES_PER_JOB,
     DEFAULT_MAX_LOG_BYTES_PER_STREAM,
@@ -138,6 +139,11 @@ class RelaySettings(BaseModel):
     owner_session_generation_id: DurableRecordId | None = None
     owner_session_cluster: str | None = None
     owner_session_api_port: int | None = Field(default=None, gt=0, le=65_535)
+    owner_session_lease_ttl_seconds: int = Field(
+        default=DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
+        ge=30,
+        le=86_400,
+    )
     remote_transport_mode: TransportMode = DEFAULT_REMOTE_TRANSPORT_MODE
     remote_transport_interactive: bool = True
     remote_cluster: str | None = None
@@ -328,6 +334,10 @@ class RelaySettings(BaseModel):
             owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
             owner_session_api_port=_optional_positive_int_env(
                 "CLIO_RELAY_OWNER_SESSION_API_PORT",
+            ),
+            owner_session_lease_ttl_seconds=_positive_int_env(
+                "CLIO_RELAY_OWNER_SESSION_LEASE_TTL_SECONDS",
+                DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
             ),
             remote_transport_mode=_transport_mode_env(),
             remote_transport_interactive=_boolean_env(

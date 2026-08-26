@@ -74,6 +74,7 @@ from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.remote_connection import (
     RemoteConnection,
     RemoteConnectionRegistry,
+    SessionLeaseExpiredError,
     connection_registry,
     resolve_remote_api_port,
 )
@@ -269,6 +270,15 @@ def attach_owned_session(
             remote_api_port=target.remote_api_port,
         )
         return connection, target, True
+    except SessionLeaseExpiredError:
+        # iowarp/clio-relay#277: propagate the typed lease-expiry reason
+        # unwrapped -- NOT folded into the generic SessionNotAttachableError
+        # every other bootstrap failure becomes. A caller (the CLI, an MCP
+        # surface) that wants to distinguish "reaped by its own TTL sweep,
+        # possibly with jobs still running" from "dead/torn-down for some
+        # other reason" needs the distinct type, not a string it would have
+        # to pattern-match out of `detail`.
+        raise
     except ChannelDropped as exc:
         # A drop in the narrow window between the state read and the dial is
         # a distinct cause from an unattachable session: name it, and name

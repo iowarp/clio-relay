@@ -26,6 +26,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 from filelock import FileLock, Timeout
 
@@ -38,6 +39,7 @@ from clio_relay.endpoint_execution_sidecar_cleanup import (
 from clio_relay.endpoint_jarvis_recovery import (
     _jarvis_execution_recovery_is_pending,
 )
+from clio_relay.endpoint_owner_session_sweep import sweep_expired_owner_session_leases
 from clio_relay.endpoint_sidecar_types import (
     EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS,
     SchedulerSubmissionUnresolvedError,
@@ -88,6 +90,22 @@ class ServeLoopMixin:
         endpoint = self.endpoint or self.register()
         self.endpoint = self.queue.register_endpoint(endpoint)
         self.queue.recover_stale_jobs(cluster=self.cluster)
+        # iowarp/clio-relay#277: joins the SAME per-cycle sweep the job-lease
+        # recovery above already runs through -- every worker cycle,
+        # including the first one after a restart, reaps owned-session
+        # leases nobody has renewed for a full TTL. See
+        # endpoint_owner_session_sweep.py for the full design.
+        #
+        # Deferred import + cast: EndpointWorker (endpoint.py) composes THIS
+        # mixin, so a module-scope import back would cycle -- same deferred-
+        # import discipline _serve_worker_slot below already uses. The cast
+        # (not a bare `self`) is what resolves `worker.cluster` to a known
+        # `str` instead of another `Cannot access attribute "cluster" for
+        # class "ServeLoopMixin*"` diagnostic alongside the real one.
+        from clio_relay.endpoint import EndpointWorker
+
+        worker = cast(EndpointWorker, self)
+        sweep_expired_owner_session_leases(worker, cluster=worker.cluster)
         workload_lane = mcp_admission_class is McpAdmissionClass.WORKLOAD
         if workload_lane:
             self._reconcile_canceled_scheduler_jobs()

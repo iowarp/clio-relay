@@ -599,6 +599,138 @@ async def test_log_tail_sse_events_treats_vanished_job_as_typed_end_state_gone(
         await generator.__anext__()
 
 
+def _owned_session_settings(tmp_path: Path) -> RelaySettings:
+    return RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        owner_session_id="desktop-session-1",
+        owner_session_generation_id="generation-1",
+        owner_session_cluster="test-cluster",
+        api_token="session-api-token",
+        session_owner_token="o" * 32,
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_tail_sse_events_renews_the_owned_session_lease_on_each_poll_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#277 adversarial-review HIGH 4: the auth dependency
+    that would otherwise renew the lease evaluates only ONCE per stream --
+    a console session followed longer than the lease TTL would otherwise be
+    reaped mid-stream. The "vanished job" shape bounds this to one poll
+    tick deterministically (real timing, no sleep-based race)."""
+    settings = _owned_session_settings(tmp_path)
+    queue = ClioCoreQueue(settings.core_dir)
+
+    def vanished(_job_id: str) -> RelayJob:
+        raise NotFoundError(f"job vanished mid-stream: {_job_id}")
+
+    monkeypatch.setattr(queue, "get_job", vanished)
+    generator = http_api_streaming_module._log_tail_sse_events(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        settings,
+        queue,
+        "job-does-not-matter",
+        stream_name="console",
+        offset=0,
+        poll_seconds=0.05,
+    )
+    await asyncio.wait_for(generator.__anext__(), timeout=2.0)
+
+    lease = queue.owner_session_lease_status(
+        "desktop-session-1", session_generation_id="generation-1"
+    )
+    assert lease is not None
+    assert lease.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_task_stream_payloads_renews_the_owned_session_lease(tmp_path: Path) -> None:
+    """Renewal is the FIRST statement of the loop, before ``drain_task_events``
+    -- proven by it having already happened even though a nonexistent task
+    id makes that very next line raise ``NotFoundError``."""
+    settings = _owned_session_settings(tmp_path)
+    queue = ClioCoreQueue(settings.core_dir)
+
+    with pytest.raises(NotFoundError):
+        async for _payload in http_api_streaming_module._task_stream_payloads(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue,
+            "task-does-not-matter",
+            cursor=1,
+            limit=100,
+            poll_seconds=0.05,
+            stop_after_replay=True,
+            settings=settings,
+        ):
+            pass
+
+    lease = queue.owner_session_lease_status(
+        "desktop-session-1", session_generation_id="generation-1"
+    )
+    assert lease is not None
+    assert lease.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_monitor_stream_payloads_renews_the_owned_session_lease(tmp_path: Path) -> None:
+    settings = _owned_session_settings(tmp_path)
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="monitor-lease-renewal",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+
+    payloads = [
+        payload
+        async for payload in http_api_streaming_module._monitor_stream_payloads(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue,
+            job.job_id,
+            cursor=1,
+            limit=100,
+            poll_seconds=0.05,
+            stop_on_terminal=True,
+            settings=settings,
+        )
+    ]
+
+    assert any(payload.get("event") == "terminal" for payload in payloads)
+    lease = queue.owner_session_lease_status(
+        "desktop-session-1", session_generation_id="generation-1"
+    )
+    assert lease is not None
+    assert lease.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_stream_payload_generators_skip_renewal_when_settings_is_none(
+    tmp_path: Path,
+) -> None:
+    """Purely additive: every pre-existing caller that does not pass
+    ``settings`` (an unowned/local API, or a test that predates #277) must
+    see zero behavior change -- no lease is ever created."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    with pytest.raises(NotFoundError):
+        async for _payload in http_api_streaming_module._task_stream_payloads(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            queue,
+            "task-does-not-matter",
+            cursor=1,
+            limit=100,
+            poll_seconds=0.05,
+            stop_after_replay=True,
+        ):
+            pass
+
+    assert queue.owner_session_lease_status("desktop-session-1") is None
+
+
 @pytest.mark.asyncio
 async def test_log_tail_sse_events_decodes_utf8_character_straddling_read_boundary(
     tmp_path: Path,
