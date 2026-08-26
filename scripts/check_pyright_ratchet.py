@@ -128,7 +128,11 @@ from typing import Any, NamedTuple
 # reviewer's own prediction, confirmed to match it) via
 # `uv run --no-sync python scripts/check_pyright_ratchet.py` from the
 # synced worktree venv: 7636 -> 7631.
-BASELINE_TOTAL = 7631
+#
+# Post-rebase onto develop (which carries #209's own -5): the two deltas
+# compound independently (disjoint files); re-measured on the rebased tree
+# at 7626 and ratcheted down accordingly.
+BASELINE_TOTAL = 7626
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
