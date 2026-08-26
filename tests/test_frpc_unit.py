@@ -7,12 +7,17 @@ style.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 import pytest
 
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.control_channel import TransportIdentityAnchorRequired
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frpc_unit import (
+    _env_file_line,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    escape_env_file_value,
     frpc_proxy_config_digest,
     frpc_proxy_paths,
     render_frpc_proxy_env_file,
@@ -56,7 +61,6 @@ def test_frpc_proxy_paths_are_deterministic_and_namespaced_from_the_worker_unit(
     assert paths.toml_unit_path.startswith("%h/.config/clio-relay/")
     assert paths.toml_shell_path.startswith("$HOME/.config/clio-relay/")
     assert paths.env_shell_path.endswith(".env")
-    assert paths.receipt_shell_path.endswith("-receipt.json")
 
 
 def test_frpc_proxy_paths_are_stable_across_repeated_calls() -> None:
@@ -178,9 +182,8 @@ def test_env_file_binds_the_real_secrets_the_toml_template_references() -> None:
 
     env_text = render_frpc_proxy_env_file(definition, cluster="ares")
 
-    assert (
-        env_text
-        == "CLIO_RELAY_FRP_TOKEN=TOKEN-VALUE-ABC\nCLIO_RELAY_STCP_SECRET=SECRET-VALUE-XYZ\n"
+    assert env_text == (
+        'CLIO_RELAY_FRP_TOKEN="TOKEN-VALUE-ABC"\nCLIO_RELAY_STCP_SECRET="SECRET-VALUE-XYZ"\n'
     )
 
 
@@ -270,3 +273,157 @@ def test_config_digest_changes_when_the_rendered_toml_changes() -> None:
     second = render_frpc_proxy_toml(definition, cluster="ares", local_port=9999)
 
     assert frpc_proxy_config_digest(first) != frpc_proxy_config_digest(second)
+
+
+# --- D4 (adversarial review, clio-relay#279): env-file quoting/escaping -----
+#
+# Two independent defenses tested separately: the ESCAPING ALGORITHM itself
+# (byte-exact, matching what the review verified round-trips on real
+# systemd) via `escape_env_file_value` directly, and the REFUSAL that makes
+# a quote/backslash/control-character secret unreachable through the public
+# `render_frpc_proxy_env_file` path (frp's own env-template substitution is
+# not proven TOML-string-safe -- see that function's own docstring).
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_escaped"),
+    [
+        ("plain-value-123", "plain-value-123"),
+        ("value with spaces", "value with spaces"),
+        ("value$with$dollars", "value$with$dollars"),
+        ("value`with`backticks", "value`with`backticks"),
+        ("value#with#hash", "value#with#hash"),
+        ("value'with'singlequotes", "value'with'singlequotes"),
+    ],
+)
+def test_escape_env_file_value_passes_through_ordinary_characters_unchanged(
+    raw: str, expected_escaped: str
+) -> None:
+    assert escape_env_file_value(raw) == expected_escaped
+
+
+def test_escape_env_file_value_escapes_backslash_and_double_quote() -> None:
+    """The escaping algorithm itself, decoupled from the refusal gate.
+
+    A secret containing `\\`/`"` never reaches this through
+    ``render_frpc_proxy_env_file`` (refused upstream, see below), but the
+    algorithm must still be provably correct on its own -- this is exactly
+    what the adversarial review verified byte-exact on real systemd.
+    """
+    assert escape_env_file_value('has "quotes" inside') == 'has \\"quotes\\" inside'
+    assert escape_env_file_value("has\\backslash\\inside") == "has\\\\backslash\\\\inside"
+    assert escape_env_file_value('back\\slash then "quote') == 'back\\\\slash then \\"quote'
+
+
+def _resolved_bash() -> str | None:
+    return shutil.which("bash")
+
+
+def _real_systemd_user_reachable(bash: str) -> bool:
+    probe = subprocess.run(
+        [
+            bash,
+            "-c",
+            "command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running",
+        ],
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    return probe.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "plain-value-123",
+        "value with spaces",
+        "value$with$dollars",
+        "value`with`backticks",
+        "value#with#hash",
+        "value'with'singlequotes",
+    ],
+)
+def test_env_file_line_round_trips_byte_exact_through_real_systemd_environmentfile_parsing(
+    raw: str,
+) -> None:
+    """Prove the rendered ``NAME="value"`` line is what systemd's own parser reads back.
+
+    ``systemd-run --user --pipe --wait --collect --property=EnvironmentFile=``
+    starts a real, throwaway transient unit whose environment is populated
+    by systemd's OWN ``EnvironmentFile=`` parser -- the exact directive
+    ``render_frpc_proxy_unit`` puts in the persistent proxy unit -- then
+    ``--pipe`` streams the child's stdout back here and ``--collect``
+    garbage-collects the transient unit once it exits. This is the same
+    proof shape the adversarial review ran against real systemd; it is
+    skipped, never failed, when a real systemd user instance is
+    unavailable (this sandbox has one; CI need not). A plain ``/tmp`` root
+    generated here (never pytest's Windows ``tmp_path``) matches this
+    module's siblings: a WSL-hosted ``bash.exe`` cannot resolve a
+    ``C:\\...`` path.
+    """
+    bash = _resolved_bash()
+    if bash is None or not _real_systemd_user_reachable(bash):
+        pytest.skip("requires a reachable systemd --user instance with systemd-run")
+
+    from uuid import uuid4
+
+    root = f"/tmp/clio-relay-env-roundtrip-test_{uuid4().hex}"
+    line = f'CLIO_RELAY_ENV_ROUNDTRIP_TEST="{escape_env_file_value(raw)}"'
+    harness = (
+        f'mkdir -p "{root}"\n'
+        f"cat > \"{root}/roundtrip.env\" <<'__ROUNDTRIP_ENV__'\n"
+        f"{line}\n"
+        "__ROUNDTRIP_ENV__\n"
+        f"systemd-run --user --pipe --wait --collect "
+        f'--property="EnvironmentFile={root}/roundtrip.env" -- '
+        '/bin/sh -c \'printf "%s" "$CLIO_RELAY_ENV_ROUNDTRIP_TEST"\'\n'
+    )
+    try:
+        result = subprocess.run(
+            [bash, "-s"],
+            input=harness.encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert raw in stdout
+    finally:
+        subprocess.run(
+            [bash, "-c", f'rm -rf -- "{root}"'], capture_output=True, check=False, timeout=15
+        )
+
+
+# --- refusal: quote/backslash/control characters -----------------------
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        'has "a quote" in it',
+        "has\\a backslash",
+        "has\ta tab",
+        "has\x01a control char",
+    ],
+)
+def test_env_file_refuses_a_secret_frps_template_substitution_could_not_toml_escape(
+    secret: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", secret)
+
+    with pytest.raises(RelayError, match="double quote|backslash|control character"):
+        render_frpc_proxy_env_file(_definition(), cluster="ares")
+
+
+def test_env_file_refuses_an_empty_secret() -> None:
+    """Exercise ``_env_file_line``'s own empty-value check directly.
+
+    An upstream env-binding check (``_require_env_binding``) already refuses
+    a genuinely-unset/empty declared secret before this is ever reached
+    through the public ``render_frpc_proxy_env_file`` path -- this proves
+    the module's own belt-and-suspenders check in isolation.
+    """
+    with pytest.raises(RelayError):
+        _env_file_line("CLIO_RELAY_FRP_TOKEN", "")

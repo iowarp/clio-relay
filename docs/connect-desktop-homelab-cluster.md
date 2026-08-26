@@ -113,15 +113,24 @@ clio-relay relay-host install-proxy `
   --remote-port 8765
 ```
 
-This writes three files under `~/.config/clio-relay/` and
-`~/.config/systemd/user/` on the cluster: the frpc proxy TOML (its
-`auth.token`/`secretKey` are frp's own `{{ .Envs.NAME }}` template
-placeholders, never the literal secret), a 0600 `EnvironmentFile=` binding
-the real `CLIO_RELAY_FRP_TOKEN`/`CLIO_RELAY_STCP_SECRET` values, and the unit
-itself (`Restart=on-failure`, survives reboot once the account has systemd
-user lingering enabled — see "Install and start the cluster worker" above
-for the same `loginctl enable-linger` requirement). The command returns the
-typed bring-up receipt (unit name, proxy name, config digest).
+Like `cluster install-endpoint-service` above, `install-proxy` requires
+systemd user lingering by default and refuses (exit 78, with the exact
+`loginctl enable-linger` command to run) before writing anything if it is
+not enabled — pass `--allow-login-scoped` only when a login-scoped proxy
+that stops at logout is explicitly acceptable. On success this writes three
+files under `~/.config/clio-relay/` and `~/.config/systemd/user/` on the
+cluster: the frpc proxy TOML (its `auth.token`/`secretKey` are frp's own
+`{{ .Envs.NAME }}` template placeholders, never the literal secret), a 0600
+`EnvironmentFile=` binding the real
+`CLIO_RELAY_FRP_TOKEN`/`CLIO_RELAY_STCP_SECRET` values, and the unit itself
+(`Restart=on-failure`). If anything fails partway after the env file is
+written (no user D-Bus session to `enable` against is the proven case), the
+same pass removes the secret-bearing env file before exiting — the TOML and
+unit are left for inspection, and the typed error names
+`relay-host teardown-proxy` as the cleanup path. The command returns the
+typed bring-up receipt (unit name, proxy name, config digest, linger and
+persistence mode) only for a unit it independently re-verified is active —
+never for one the reused activation observer merely believed was active.
 
 Modes (a)/(b) require the cluster to have explicitly opted into the weaker
 `preshared_link_secret` identity anchor first (`relay-architecture-2026-08.md`
@@ -139,10 +148,22 @@ clio-relay relay-host proxy-status --cluster my-cluster
 ```
 
 This reports `systemctl --user` load/active/enabled state plus the unit's
-last journal lines in one read-only ssh pass. frpc down, frps unreachable,
-and a rejected token all surface as "installed and enabled but inactive" at
-the systemd-property layer — the journal tail is what carries the actual
-cause.
+last journal lines in one read-only ssh pass, and a typed `restart_looping`
+flag when the unit is mid-crash-loop (`SubState=auto-restart`). What is
+observable depends on when the failure happened:
+
+- **frpc never came up** (frps unreachable or the token rejected at
+  install/start time): the unit fails to reach an active state at all, or
+  crash-loops — surfaced as inactive/restart-looping, with the journal tail
+  carrying frpc's own login/connect diagnostic.
+- **frps drops mid-session**, after frpc was already connected and healthy:
+  this is NOT guaranteed to flip the systemd unit to inactive. frpc's own
+  reconnect logic can keep the process (and therefore `ActiveState=active`)
+  running while the underlying tunnel is actually broken. `proxy-status` is
+  a **one-time snapshot**, not a continuous observer: it reports the unit's
+  state and journal at the moment it is called, not a live claim about frps
+  reachability. Read the journal tail for frpc's own connection-state lines
+  when a connection reports trouble but the unit still looks active.
 
 To remove the proxy, its TOML, and its env file entirely:
 

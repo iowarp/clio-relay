@@ -64,7 +64,13 @@ def _fake_run(captured: _Captured, *, stdout: str, returncode: int = 0) -> Any:
 
 
 def _bringup_stdout(
-    paths: Any, *, cluster: str = "ares", proxy_name: str = "ares-owned-session"
+    paths: Any,
+    *,
+    cluster: str = "ares",
+    proxy_name: str = "ares-owned-session",
+    active: str = "true",
+    linger: str = "yes",
+    persistence: str = "systemd-user-linger",
 ) -> str:
     return "\n".join(
         [
@@ -76,7 +82,9 @@ def _bringup_stdout(
             f"FrpcProxyEnvPath={paths.env_unit_path}",
             f"FrpcProxyConfigSha256={'a' * 64}",
             "FrpcProxyEnabled=true",
-            "FrpcProxyActive=true",
+            f"FrpcProxyActive={active}",
+            f"FrpcProxyLinger={linger}",
+            f"FrpcProxyPersistence={persistence}",
             "FrpcProxyInstalledAt=2026-08-26T00:00:00Z",
             "",
         ]
@@ -122,6 +130,8 @@ def test_install_dials_exactly_once_over_stdin_and_returns_the_typed_receipt(
     assert receipt.unit_name == paths.unit_name
     assert receipt.enabled is True
     assert receipt.active is True
+    assert receipt.linger is True
+    assert receipt.persistence == "systemd-user-linger"
 
 
 def test_install_never_puts_the_script_in_argv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,6 +221,93 @@ def test_install_propagates_a_missing_identity_anchor_before_any_dial(
         frpc_proxy_bringup.install_frpc_proxy_over_ssh(
             cluster="ares", definition=definition, ssh_host="ares-login"
         )
+
+
+# --- D6 (Python layer): never trust rc==0 + a parsed receipt alone --------
+
+
+def test_install_raises_when_the_receipt_reports_an_inactive_unit_despite_rc_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D6 blocker: exit-0-with-active=false must never be reported as success.
+
+    The script's own D6 guard (``frpc_proxy_scripts.py``) already refuses to
+    print a receipt for an inactive unit, but this is a SECOND, independent
+    check: if a receipt somehow reaches here with ``active=false`` anyway
+    (an older script, a future regression), this must raise -- never return
+    the receipt as if it were a success -- and the message must carry the
+    receipt's own content so the journal pointer survives.
+    """
+    definition = _definition()
+    paths = frpc_proxy_paths("ares")
+    captured = _Captured()
+    monkeypatch.setattr(
+        frpc_proxy_bringup.subprocess,
+        "run",
+        _fake_run(captured, stdout=_bringup_stdout(paths, active="false")),
+    )
+
+    with pytest.raises(RelayError, match="not active") as excinfo:
+        frpc_proxy_bringup.install_frpc_proxy_over_ssh(
+            cluster="ares", definition=definition, ssh_host="ares-login"
+        )
+
+    assert "proxy-status" in str(excinfo.value)
+    assert paths.unit_name in str(excinfo.value)
+    # The receipt's own content survives in the message (journal pointer).
+    assert '"active":false' in str(excinfo.value)
+
+
+def test_install_succeeds_when_the_receipt_reports_a_genuinely_active_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _definition()
+    paths = frpc_proxy_paths("ares")
+    captured = _Captured()
+    monkeypatch.setattr(
+        frpc_proxy_bringup.subprocess,
+        "run",
+        _fake_run(captured, stdout=_bringup_stdout(paths, active="true")),
+    )
+
+    receipt = frpc_proxy_bringup.install_frpc_proxy_over_ssh(
+        cluster="ares", definition=definition, ssh_host="ares-login"
+    )
+
+    assert receipt.active is True
+
+
+# --- D3: timeout must exceed the reused activation observer's own bound ----
+
+
+def test_install_default_timeout_exceeds_the_activation_observers_own_bound() -> None:
+    """D3 blocker: a local ssh bound shorter than the observer's own bound kills
+
+    ssh mid-script in exactly the slow case the observer exists to ride out,
+    leaving unbounded partial remote state and no receipt at all.
+    """
+    from clio_relay.deployment_activation import ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS
+
+    assert (
+        frpc_proxy_bringup.FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS
+        > ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS
+    )
+    assert frpc_proxy_bringup.FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS == 420.0
+
+
+def test_install_uses_the_derived_timeout_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    definition = _definition()
+    paths = frpc_proxy_paths("ares")
+    captured = _Captured()
+    monkeypatch.setattr(
+        frpc_proxy_bringup.subprocess, "run", _fake_run(captured, stdout=_bringup_stdout(paths))
+    )
+
+    frpc_proxy_bringup.install_frpc_proxy_over_ssh(
+        cluster="ares", definition=definition, ssh_host="ares-login"
+    )
+
+    assert captured.timeout == frpc_proxy_bringup.FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS
 
 
 # --- teardown -------------------------------------------------------------

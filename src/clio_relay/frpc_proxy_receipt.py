@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -38,6 +38,8 @@ _ENABLED_UNIT_FILE_STATES: Final = frozenset(
     {"enabled", "enabled-runtime", "linked", "linked-runtime"}
 )
 _MAX_JOURNAL_TAIL_LINES: Final = 40
+
+FrpcProxyPersistenceMode = Literal["systemd-user-linger", "login-scoped", "unknown"]
 
 
 class FrpcProxyBringupReceipt(BaseModel):
@@ -54,6 +56,8 @@ class FrpcProxyBringupReceipt(BaseModel):
     config_sha256: str
     enabled: bool
     active: bool
+    linger: bool | None
+    persistence: FrpcProxyPersistenceMode
     installed_at: str
 
 
@@ -71,6 +75,9 @@ class FrpcProxyTeardownReceipt(BaseModel):
     torn_down_at: str
 
 
+FrpcProxyLoadStateCategory = Literal["loaded", "not_found", "masked", "error", "other"]
+
+
 class FrpcProxyStatusDocument(BaseModel):
     """The typed, diagnosable status ``relay-host proxy-status`` reports."""
 
@@ -82,7 +89,9 @@ class FrpcProxyStatusDocument(BaseModel):
     installed: bool
     enabled: bool
     active: bool
+    restart_looping: bool
     load_state: str
+    load_state_category: FrpcProxyLoadStateCategory
     active_state: str
     sub_state: str
     journal_tail: list[str]
@@ -110,7 +119,11 @@ def _parse_prefixed_key_value_lines(
         properties[key] = value
     if properties.keys() != required:
         missing = sorted(required - properties.keys())
-        raise RelayError(f"frpc proxy receipt output is incomplete; missing: {missing}")
+        extra = sorted(properties.keys() - required)
+        raise RelayError(
+            "frpc proxy receipt output is incomplete or unexpected; "
+            f"missing: {missing}; unexpected: {extra}"
+        )
     return properties
 
 
@@ -132,8 +145,30 @@ _BRINGUP_KEYS: Final = {
     "FrpcProxyConfigSha256",
     "FrpcProxyEnabled",
     "FrpcProxyActive",
+    "FrpcProxyLinger",
+    "FrpcProxyPersistence",
     "FrpcProxyInstalledAt",
 }
+
+_PERSISTENCE_VALUES: Final = {"systemd-user-linger", "login-scoped", "unknown"}
+
+
+def _parse_linger(value: str) -> bool | None:
+    if value == "yes":
+        return True
+    if value == "no":
+        return False
+    if value == "unknown":
+        return None
+    raise RelayError(
+        f"frpc proxy receipt field 'FrpcProxyLinger' was not yes/no/unknown: {value!r}"
+    )
+
+
+def _parse_persistence(value: str) -> FrpcProxyPersistenceMode:
+    if value not in _PERSISTENCE_VALUES:
+        raise RelayError(f"frpc proxy receipt field 'FrpcProxyPersistence' is invalid: {value!r}")
+    return cast(FrpcProxyPersistenceMode, value)
 
 
 def parse_frpc_proxy_bringup_receipt(lines: list[str]) -> FrpcProxyBringupReceipt:
@@ -150,6 +185,8 @@ def parse_frpc_proxy_bringup_receipt(lines: list[str]) -> FrpcProxyBringupReceip
         config_sha256=properties["FrpcProxyConfigSha256"],
         enabled=_parse_bool(properties["FrpcProxyEnabled"], field="FrpcProxyEnabled"),
         active=_parse_bool(properties["FrpcProxyActive"], field="FrpcProxyActive"),
+        linger=_parse_linger(properties["FrpcProxyLinger"]),
+        persistence=_parse_persistence(properties["FrpcProxyPersistence"]),
         installed_at=properties["FrpcProxyInstalledAt"],
     )
 
@@ -203,6 +240,33 @@ def parse_frpc_proxy_status_properties(output: str) -> dict[str, str]:
     return properties
 
 
+_MASKED_LOAD_STATES: Final = frozenset({"masked", "masked-runtime"})
+_ERROR_LOAD_STATES: Final = frozenset({"error", "bad-setting"})
+_LOOPING_SUB_STATES: Final = frozenset({"auto-restart"})
+
+
+def _classify_load_state(load_state: str) -> FrpcProxyLoadStateCategory:
+    """Map a raw ``LoadState`` into one of a small, typed set of categories.
+
+    Adversarial review minor: ``masked``/``error``/``bad-setting`` are NOT
+    "not installed" -- a masked unit is present but administratively
+    disabled, and a malformed unit file is present but unparsable. Neither
+    is fixed by re-running ``install-proxy`` the way a genuinely missing
+    unit is (masked in particular refuses to start no matter how many times
+    the unit file is rewritten), so folding both into "not installed; run
+    install-proxy" was actively wrong advice.
+    """
+    if load_state == "loaded":
+        return "loaded"
+    if load_state == "not-found":
+        return "not_found"
+    if load_state in _MASKED_LOAD_STATES:
+        return "masked"
+    if load_state in _ERROR_LOAD_STATES:
+        return "error"
+    return "other"
+
+
 def build_frpc_proxy_status_document(
     *,
     cluster: str,
@@ -214,14 +278,19 @@ def build_frpc_proxy_status_document(
     active_state = properties["ActiveState"] or "unknown"
     sub_state = properties["SubState"] or "unknown"
     unit_file_state = properties["UnitFileState"] or "unknown"
-    installed = load_state == "loaded"
+    load_state_category = _classify_load_state(load_state)
+    installed = load_state_category == "loaded"
     enabled = unit_file_state in _ENABLED_UNIT_FILE_STATES
     active = active_state == "active"
+    restart_looping = sub_state in _LOOPING_SUB_STATES
     journal_tail = _decode_journal_tail(properties["JournalTailBase64"])
     diagnosis = _diagnose_frpc_proxy(
+        load_state=load_state,
+        load_state_category=load_state_category,
         installed=installed,
         enabled=enabled,
         active=active,
+        restart_looping=restart_looping,
         active_state=active_state,
         sub_state=sub_state,
         unit_name=unit_name,
@@ -232,7 +301,9 @@ def build_frpc_proxy_status_document(
         installed=installed,
         enabled=enabled,
         active=active,
+        restart_looping=restart_looping,
         load_state=load_state,
+        load_state_category=load_state_category,
         active_state=active_state,
         sub_state=sub_state,
         journal_tail=journal_tail,
@@ -252,24 +323,48 @@ def _decode_journal_tail(encoded: str) -> list[str]:
 
 def _diagnose_frpc_proxy(
     *,
+    load_state: str,
+    load_state_category: FrpcProxyLoadStateCategory,
     installed: bool,
     enabled: bool,
     active: bool,
+    restart_looping: bool,
     active_state: str,
     sub_state: str,
     unit_name: str,
 ) -> str:
     """Return the one-line, operator-facing reason for the observed state.
 
-    Deliberately typed discrimination on the three booleans, not a message
-    match -- frpc down / frps unreachable / token rejected all surface here
-    as "installed and enabled but inactive", with the journal tail (fetched
-    in the SAME ssh pass) carrying the actual frpc-reported cause.
+    Deliberately typed discrimination, not a message match -- frpc down /
+    frps unreachable / token rejected all surface here as "installed and
+    enabled but inactive", with the journal tail (fetched in the SAME ssh
+    pass) carrying the actual frpc-reported cause. Note the documented
+    limitation: this is a ONE-TIME snapshot taken at status-read time, not a
+    continuous observer -- a frps outage that starts and ends between two
+    ``proxy-status`` calls is not guaranteed to be caught mid-flight; what
+    IS observable here is the unit's state and its journal AT THIS MOMENT
+    (including any auto-restart looping from a still-ongoing outage), not a
+    live claim about frps reachability.
     """
+    if load_state_category == "masked":
+        return (
+            "frpc proxy unit is masked (administratively disabled); run "
+            f"`systemctl --user unmask {unit_name}` before install-proxy can start it"
+        )
+    if load_state_category == "error":
+        return (
+            f"frpc proxy unit file is malformed (LoadState={load_state}); re-run "
+            "`clio-relay relay-host install-proxy` to rewrite it"
+        )
     if not installed:
         return "frpc proxy unit is not installed; run `clio-relay relay-host install-proxy`"
     if not enabled:
         return "frpc proxy unit is installed but not enabled"
+    if restart_looping:
+        return (
+            f"frpc proxy unit is restart-looping (state={active_state}/{sub_state}); see "
+            f"journalctl --user --unit={unit_name} --lines=50 --no-pager"
+        )
     if active:
         return "frpc proxy unit is active"
     return (

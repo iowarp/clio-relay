@@ -4,16 +4,22 @@ clio-relay#279 design point 2: ``frp_transport.py``'s desktop-side
 ``brokered_tcp``/``udp_rendezvous`` transports and ``frpc_unit.py``'s
 cluster-side proxy TOML/unit renderer must resolve the EXACT same stcp/xtcp
 proxy name for the same cluster, or the two ends of one pairing silently
-diverge. Both now call the single owner, ``frp_link.canonical_proxy_name``;
-this module proves that composition, not just that the shared function
-exists.
+diverge. Both now call the single owner,
+``frp_proxy_naming.canonical_proxy_name`` (a dedicated module, not
+``frp_link.py``: that file sits at the file-size ratchet cap and this
+promotion did not have room to land there); this module proves that
+composition, not just that the shared function exists.
 
 The one thing this file deliberately reproduces is the ORIGINAL trap
 (``cli_relay_host.py``'s ``render-frpc-config --proxy-name`` used to default
 to the unrelated literal ``"relay-stcp"``): a dedicated test proves that
 literal no longer equals the canonical name for an ordinary cluster, so a
 future regression that reintroduces a hardcoded default would be caught
-here even without touching the CLI layer.
+here even without touching the CLI layer. A companion fix in the SAME
+adversarial review pass (D1) closed the identical trap on the desktop
+VISITOR side (``render-frpc-visitor-config --server-name`` used to default
+to the same stale literal); ``tests/test_cli_relay_host.py`` extends this
+module's proof through that CLI boundary too.
 """
 
 from __future__ import annotations

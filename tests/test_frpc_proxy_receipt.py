@@ -32,6 +32,8 @@ _BRINGUP_LINES = [
     "FrpcProxyConfigSha256=" + "a" * 64,
     "FrpcProxyEnabled=true",
     "FrpcProxyActive=true",
+    "FrpcProxyLinger=yes",
+    "FrpcProxyPersistence=systemd-user-linger",
     "FrpcProxyInstalledAt=2026-08-26T00:00:00Z",
 ]
 
@@ -58,13 +60,64 @@ def test_bringup_receipt_parses_well_formed_evidence() -> None:
     assert receipt.enabled is True
     assert receipt.active is True
     assert receipt.config_sha256 == "a" * 64
+    assert receipt.linger is True
+    assert receipt.persistence == "systemd-user-linger"
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("yes", True), ("no", False), ("unknown", None)])
+def test_bringup_receipt_parses_every_linger_value(raw: str, expected: bool | None) -> None:
+    lines = [
+        line if not line.startswith("FrpcProxyLinger=") else f"FrpcProxyLinger={raw}"
+        for line in _BRINGUP_LINES
+    ]
+
+    receipt = parse_frpc_proxy_bringup_receipt(lines)
+
+    assert receipt.linger is expected
+
+
+def test_bringup_receipt_rejects_an_invalid_linger_value() -> None:
+    lines = [
+        line if not line.startswith("FrpcProxyLinger=") else "FrpcProxyLinger=maybe"
+        for line in _BRINGUP_LINES
+    ]
+
+    with pytest.raises(RelayError, match="FrpcProxyLinger"):
+        parse_frpc_proxy_bringup_receipt(lines)
+
+
+def test_bringup_receipt_rejects_an_invalid_persistence_value() -> None:
+    lines = [
+        line
+        if not line.startswith("FrpcProxyPersistence=")
+        else "FrpcProxyPersistence=somewhere-else"
+        for line in _BRINGUP_LINES
+    ]
+
+    with pytest.raises(RelayError, match="FrpcProxyPersistence"):
+        parse_frpc_proxy_bringup_receipt(lines)
 
 
 def test_bringup_receipt_rejects_a_missing_field() -> None:
     lines = [line for line in _BRINGUP_LINES if not line.startswith("FrpcProxyActive=")]
 
-    with pytest.raises(RelayError, match="incomplete"):
+    with pytest.raises(RelayError, match="incomplete") as excinfo:
         parse_frpc_proxy_bringup_receipt(lines)
+    assert "FrpcProxyActive" in str(excinfo.value)
+
+
+def test_bringup_receipt_rejects_an_unexpected_extra_field_and_names_it() -> None:
+    """The missing/extra fix: an extra key must be named, not silently reported
+
+    as an empty missing-list (the original bug -- `properties.keys() !=
+    required` can fail purely because of an EXTRA key, and the old message
+    only ever computed `required - observed`, which is empty in that case).
+    """
+    lines = [*_BRINGUP_LINES, "FrpcProxyUnexpectedField=surprise"]
+
+    with pytest.raises(RelayError, match="unexpected") as excinfo:
+        parse_frpc_proxy_bringup_receipt(lines)
+    assert "FrpcProxyUnexpectedField" in str(excinfo.value)
 
 
 def test_bringup_receipt_rejects_no_framing_at_all() -> None:
@@ -181,6 +234,81 @@ def test_status_document_classifies_a_not_installed_proxy() -> None:
     assert document.installed is False
     assert "not installed" in document.diagnosis
     assert "install-proxy" in document.diagnosis
+
+
+def test_status_document_classifies_a_masked_proxy_distinctly_not_as_not_installed() -> None:
+    """Minor fix: masked must NOT say "not installed; run install-proxy".
+
+    That advice is actively wrong for a masked unit -- systemd refuses to
+    start a masked unit no matter how many times the unit file is
+    rewritten; the real fix is `systemctl --user unmask`.
+    """
+    document = build_frpc_proxy_status_document(
+        cluster="ares",
+        unit_name="clio-relay-frpc-proxy-ares.service",
+        properties=_status_properties(
+            load_state="masked", active_state="inactive", sub_state="dead"
+        ),
+    )
+
+    assert document.installed is False
+    assert document.load_state_category == "masked"
+    assert "not installed" not in document.diagnosis
+    assert "run `clio-relay relay-host install-proxy`" not in document.diagnosis
+    assert "unmask" in document.diagnosis
+
+
+def test_status_document_classifies_a_malformed_unit_distinctly_not_as_not_installed() -> None:
+    document = build_frpc_proxy_status_document(
+        cluster="ares",
+        unit_name="clio-relay-frpc-proxy-ares.service",
+        properties=_status_properties(
+            load_state="error", active_state="inactive", sub_state="dead"
+        ),
+    )
+
+    assert document.installed is False
+    assert document.load_state_category == "error"
+    assert "not installed; run" not in document.diagnosis
+    assert "malformed" in document.diagnosis
+    assert "install-proxy" in document.diagnosis  # reinstalling IS the fix here, unlike masked
+
+
+def test_status_document_classifies_a_genuinely_not_found_unit() -> None:
+    document = build_frpc_proxy_status_document(
+        cluster="ares",
+        unit_name="clio-relay-frpc-proxy-ares.service",
+        properties=_status_properties(
+            load_state="not-found", active_state="inactive", sub_state="dead"
+        ),
+    )
+
+    assert document.load_state_category == "not_found"
+    assert document.installed is False
+    assert "not installed" in document.diagnosis
+
+
+def test_status_document_flags_restart_looping_as_a_typed_field() -> None:
+    """Minor fix: restart-looping is a typed field, not only prose."""
+    document = build_frpc_proxy_status_document(
+        cluster="ares",
+        unit_name="clio-relay-frpc-proxy-ares.service",
+        properties=_status_properties(active_state="activating", sub_state="auto-restart"),
+    )
+
+    assert document.restart_looping is True
+    assert "restart-looping" in document.diagnosis
+    assert document.active is False
+
+
+def test_status_document_does_not_flag_restart_looping_for_a_healthy_proxy() -> None:
+    document = build_frpc_proxy_status_document(
+        cluster="ares",
+        unit_name="clio-relay-frpc-proxy-ares.service",
+        properties=_status_properties(),
+    )
+
+    assert document.restart_looping is False
 
 
 def test_status_document_classifies_an_installed_but_disabled_proxy() -> None:

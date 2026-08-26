@@ -80,7 +80,6 @@ class FrpcProxyPaths:
     env_unit_path: str
     env_shell_path: str
     unit_shell_path: str
-    receipt_shell_path: str
 
 
 def frpc_proxy_paths(cluster: str) -> FrpcProxyPaths:
@@ -102,7 +101,6 @@ def frpc_proxy_paths(cluster: str) -> FrpcProxyPaths:
         env_unit_path=f"{_CONFIG_DIR_UNIT}/{stem}.env",
         env_shell_path=f"{_CONFIG_DIR_SHELL}/{stem}.env",
         unit_shell_path=f"{_UNIT_DIR_SHELL}/{unit_name}",
-        receipt_shell_path=f"{_CONFIG_DIR_SHELL}/{stem}-receipt.json",
     )
 
 
@@ -254,11 +252,17 @@ def frpc_proxy_config_digest(toml_text: str) -> str:
 
 def _env_template(name: str) -> str:
     """Return frp's own ``{{ .Envs.NAME }}`` template placeholder for one env binding."""
-    _validate_env_name(name)
+    validate_env_binding_name(name)
     return "{{ .Envs." + name + " }}"
 
 
-def _validate_env_name(name: str) -> None:
+def validate_env_binding_name(name: str) -> None:
+    """Refuse a declared env-binding name that is unsafe to embed in a shell script.
+
+    Public (not module-private): ``frpc_proxy_scripts.py`` reuses this SAME
+    check before embedding a cluster's declared ``token_env``/``stcp_secret_env``
+    name as a bash variable reference (``$NAME``) in its empty-secret guard.
+    """
     if (
         not name
         or name[0].isdigit()
@@ -268,10 +272,60 @@ def _validate_env_name(name: str) -> None:
 
 
 def _env_file_line(name: str, value: str) -> str:
-    _validate_env_name(name)
-    if not value or "\n" in value or "\r" in value or "\x00" in value:
-        raise RelayError(f"unsafe value for env-file binding {name!r}")
-    return f"{name}={value}"
+    """Render one ``EnvironmentFile=`` assignment, quoted and escaped.
+
+    Two independent defenses, not one (adversarial review, clio-relay#279):
+
+    1. **Refuse** a value containing ``"``, ``\\``, or a control character
+       outright. This module's TOML never carries the raw secret -- only
+       frp's own ``{{ .Envs.NAME }}`` template placeholder
+       (:func:`_env_template`) -- so the raw value is substituted by frpc
+       ITSELF when frpc parses its config, not by anything this codebase
+       controls or has verified is TOML-string-escaping-aware. A secret
+       containing an unescaped quote or backslash could render a
+       permanently malformed, crash-looping frpc config the moment frpc
+       starts; refusing it here, before it ever reaches the cluster, is
+       strictly safer than trusting frp's own substitution to escape it.
+    2. **Quote and escape** the systemd ``EnvironmentFile=`` line itself
+       (``NAME="value"``, backslash and double-quote escaped) for defense
+       in depth even though (1) means neither character should ever reach
+       here. The unquoted bare ``NAME=value`` form this module used before
+       is not safe in general: systemd's ``EnvironmentFile=`` grammar
+       treats a trailing unescaped backslash as a line continuation that
+       silently swallows the NEXT line, and strips leading/trailing
+       whitespace -- both proven to corrupt or entirely drop a real secret
+       on real systemd.
+    """
+    validate_env_binding_name(name)
+    _validate_env_file_value(value)
+    return f'{name}="{escape_env_file_value(value)}"'
+
+
+def escape_env_file_value(value: str) -> str:
+    """Escape one value for the body of a quoted ``systemd.EnvironmentFile=`` assignment.
+
+    Public and separate from :func:`_env_file_line`'s refusal gate so the
+    escaping algorithm itself is directly testable against the byte-exact
+    round-trip real systemd was verified against (clio-relay#279 adversarial
+    review D4) -- independent of whether ``_env_file_line``'s upstream
+    refusal currently makes a backslash/quote input unreachable through the
+    public rendering path.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _validate_env_file_value(value: str) -> None:
+    if not value:
+        raise RelayError("env-file binding value must not be empty")
+    if '"' in value or "\\" in value:
+        raise RelayError(
+            "frp proxy secret must not contain a double quote or backslash: frp's "
+            "{{ .Envs.NAME }} template substitution is not proven TOML-string-safe, "
+            "so such a secret would render a permanently malformed, crash-looping "
+            "frpc config on the cluster"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise RelayError("frp proxy secret must not contain a control character")
 
 
 def _escape_unit_value(value: str) -> str:

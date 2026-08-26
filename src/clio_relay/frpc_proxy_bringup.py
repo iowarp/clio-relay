@@ -15,6 +15,31 @@ targets script composition directly, or these functions with
 ``subprocess.run`` replaced by a fake -- exactly like
 ``deployment_ssh.py``/``endpoint_service_status.py``'s own test siblings and
 ``test_bootstrap_preflight_transport.py``'s harness pattern.
+
+**Timeout derivation (adversarial review D3).** ``install_frpc_proxy_over_ssh``
+runs the SAME ``clio_relay_endpoint_activate_bounded`` observer the worker
+endpoint unit's install path does, whose default budget is
+``deployment_activation.ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS``
+(330s). A local ssh-level timeout SHORTER than that observer's own bound
+kills the ssh session mid-script in exactly the slow case the observer
+exists to ride out -- leaving unbounded partial remote state and no receipt
+at all. ``FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS`` reuses
+``deployment_activation.ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS`` (420s = the
+observer's 330s plus the SAME 90s setup margin the worker precedent uses)
+as ``install_frpc_proxy_over_ssh``'s default, rather than the shorter
+120s default that remains correct for teardown/status (neither rides the
+slow activation observer).
+
+**Active-after-install re-check (adversarial review D6, Python layer).**
+``install_frpc_proxy_over_ssh`` never trusts ``rc == 0`` plus a parsed
+receipt alone: even though the install script's own
+``if [ "$service_active" != "active" ]`` gate (``frpc_proxy_scripts.py``)
+already refuses to print a success receipt for an inactive unit, this is a
+SECOND, independent check on the exact same fact -- if a receipt somehow
+carries ``active=false`` (an older script, a future edit that weakens the
+shell-side gate), this raises a typed error rather than returning a
+misleadingly "successful" receipt, with the receipt's own content folded
+into the message so the journal pointer survives.
 """
 
 from __future__ import annotations
@@ -24,6 +49,7 @@ import subprocess
 from typing import Final
 
 from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.deployment_activation import ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS
 from clio_relay.errors import RelayError
 from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.frpc_proxy_receipt import (
@@ -48,6 +74,11 @@ from clio_relay.frpc_unit import (
 )
 
 FRPC_PROXY_SSH_TIMEOUT_SECONDS: Final = 120.0
+"""Bound for teardown/status: neither rides the slow activation observer."""
+
+FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS: Final = ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS
+"""Bound for install: MUST exceed the reused activation observer's own bound (D3)."""
+
 DEFAULT_FRPC_PROXY_REMOTE_PORT: Final = 8765
 
 
@@ -59,12 +90,19 @@ def install_frpc_proxy_over_ssh(
     remote_port: int = DEFAULT_FRPC_PROXY_REMOTE_PORT,
     local_ip: str = "127.0.0.1",
     frpc_bin: str = "%h/.local/bin/frpc",
-    timeout_seconds: float = FRPC_PROXY_SSH_TIMEOUT_SECONDS,
+    require_persistent: bool = True,
+    timeout_seconds: float = FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS,
 ) -> FrpcProxyBringupReceipt:
-    """Render, install, enable, and start the cluster's frpc proxy in ONE ssh pass."""
+    """Render, install, enable, and start the cluster's frpc proxy in ONE ssh pass.
+
+    Raises a typed :class:`RelayError` -- never returns a "successful"
+    receipt -- when the parsed receipt reports the unit as not genuinely
+    active (D6's Python-layer re-check; see module docstring).
+    """
     _validate_ssh_destination(ssh_host)
     paths = frpc_proxy_paths(cluster)
     proxy_name = canonical_proxy_name(definition, cluster=cluster)
+    transport = definition.frp_transport
     toml_text = render_frpc_proxy_toml(
         definition, cluster=cluster, local_port=remote_port, local_ip=local_ip
     )
@@ -77,11 +115,21 @@ def install_frpc_proxy_over_ssh(
         toml_text=toml_text,
         env_text=env_text,
         unit_text=unit_text,
+        token_env=transport.token_env,
+        secret_env=transport.stcp_secret_env,
+        require_persistent=require_persistent,
     )
     lines = _run_frpc_proxy_script(
         ssh_host, script, timeout_seconds=timeout_seconds, operation="install"
     )
-    return parse_frpc_proxy_bringup_receipt(lines)
+    receipt = parse_frpc_proxy_bringup_receipt(lines)
+    if not receipt.active:
+        raise RelayError(
+            "frpc proxy install reported success but the receipt shows the unit is "
+            f"not active for cluster {cluster!r}; diagnose with `clio-relay relay-host "
+            f"proxy-status --cluster {cluster}` -- receipt: {receipt.model_dump_json()}"
+        )
+    return receipt
 
 
 def teardown_frpc_proxy_over_ssh(

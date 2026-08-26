@@ -326,7 +326,19 @@ def render_frpc_visitor(
         str | None,
         typer.Option(help="stcp shared secret. Defaults to cluster stcp_secret_env."),
     ] = None,
-    server_name: Annotated[str, typer.Option(help="Cluster-side stcp proxy name.")] = "relay-stcp",
+    server_name: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Cluster-side stcp proxy name. Defaults to the canonical "
+                "<cluster>-owned-session form (clio-relay#279) -- the SAME name "
+                "`install-proxy` and the desktop brokered_tcp/udp_rendezvous "
+                "transports resolve for this cluster. Overriding this without also "
+                "overriding the proxy side's --proxy-name reintroduces the relay-stcp "
+                "mismatch trap this default used to fall into."
+            )
+        ),
+    ] = None,
     visitor_name: Annotated[
         str,
         typer.Option(help="Desktop-side stcp visitor name."),
@@ -343,6 +355,7 @@ def render_frpc_visitor(
         definition = cli._require_cluster(cluster)
         transport = definition.frp_transport
         server_addr = cli._require_frp_server_addr(transport.server_addr, cluster)
+        resolved_server_name = server_name or canonical_proxy_name(definition, cluster=cluster)
         typer.echo(
             render_frpc_visitor_config(
                 FrpcVisitorConfig(
@@ -351,7 +364,7 @@ def render_frpc_visitor(
                     token=cli._resolve_env_secret(token, transport.token_env, "frp token"),
                     transport_protocol=FrpTransportProtocol(transport.protocol),
                     visitor_name=visitor_name,
-                    server_name=server_name,
+                    server_name=resolved_server_name,
                     bind_addr=bind_addr,
                     bind_port=bind_port,
                     secret_key=cli._resolve_env_secret(
@@ -682,27 +695,41 @@ def install_proxy(
         int,
         typer.Option(help="Cluster-local port the frpc proxy exposes (the relay API port)."),
     ] = frpc_proxy_bringup.DEFAULT_FRPC_PROXY_REMOTE_PORT,
+    require_persistent: Annotated[
+        bool,
+        typer.Option(
+            "--require-persistent/--allow-login-scoped",
+            help=(
+                "Require systemd user lingering so the enabled proxy survives all "
+                "logouts. The login-scoped opt-out is diagnostic and not "
+                "release-gate eligible."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Render, install, enable, and start the cluster-side frpc proxy unit.
 
     One ssh pass: writes the proxy TOML (secrets env-templated, never
     inline), the 0600 secrets env file, and the systemd user unit, then
     ``daemon-reload``/``enable``/starts and verifies it is active before
-    returning the typed bring-up receipt.
+    returning the typed bring-up receipt. Fails (typed, non-zero) rather
+    than reporting success when the unit does not end up genuinely active.
     """
     import clio_relay.cli as cli
 
-    definition = cli._require_cluster(cluster)
-    cli._run_or_exit(
-        lambda: typer.echo(
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
             frpc_proxy_bringup.install_frpc_proxy_over_ssh(
                 cluster=cluster,
                 definition=definition,
                 ssh_host=ssh_host or definition.ssh_host,
                 remote_port=remote_port,
+                require_persistent=require_persistent,
             ).model_dump_json(indent=2)
         )
-    )
+
+    cli._run_or_exit(action)
 
 
 @relay_host_app.command("teardown-proxy")
@@ -720,15 +747,16 @@ def teardown_proxy(
     """
     import clio_relay.cli as cli
 
-    definition = cli._require_cluster(cluster)
-    cli._run_or_exit(
-        lambda: typer.echo(
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
             frpc_proxy_bringup.teardown_frpc_proxy_over_ssh(
                 cluster=cluster,
                 ssh_host=ssh_host or definition.ssh_host,
             ).model_dump_json(indent=2)
         )
-    )
+
+    cli._run_or_exit(action)
 
 
 @relay_host_app.command("proxy-status")
@@ -749,12 +777,13 @@ def proxy_status(
     """
     import clio_relay.cli as cli
 
-    definition = cli._require_cluster(cluster)
-    cli._run_or_exit(
-        lambda: typer.echo(
+    def action() -> None:
+        definition = cli._require_cluster(cluster)
+        typer.echo(
             frpc_proxy_bringup.frpc_proxy_status_over_ssh(
                 cluster=cluster,
                 ssh_host=ssh_host or definition.ssh_host,
             ).model_dump_json(indent=2)
         )
-    )
+
+    cli._run_or_exit(action)
