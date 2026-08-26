@@ -275,6 +275,51 @@ def test_relay_list_artifacts_by_execution_id_routes_to_the_cluster_that_ran_it(
     assert owner.job_id not in [job.job_id for job in door_queue.list_jobs()]
 
 
+def test_relay_list_artifacts_rejects_a_malformed_execution_id_before_remote_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#278 D4: shape validation happens BEFORE the routing
+    decision, so a malformed execution_id never even reaches the remote
+    CLI/SSH transport as an opaque failure -- ``run_remote_clio`` is
+    monkeypatched to assert-fail if it is ever invoked at all.
+    """
+    definition = _bind_remote_cluster(monkeypatch, tmp_path, cluster="ares")
+
+    def _must_not_be_called(_definition: ClusterDefinition, _args: list[str]) -> str:
+        raise AssertionError("run_remote_clio must not be reached for a malformed execution_id")
+
+    monkeypatch.setattr("clio_relay.artifact_routing.run_remote_clio", _must_not_be_called)
+
+    door_settings = RelaySettings(
+        core_dir=tmp_path / "door_core", spool_dir=tmp_path / "door_spool"
+    )
+    door_queue = ClioCoreQueue(door_settings.core_dir)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_artifacts",
+                "arguments": {
+                    "execution_id": "has a space",
+                    "cluster": "ares",
+                    "route_revision": cluster_route_revision(definition),
+                },
+            },
+        },
+        queue=door_queue,
+        settings=door_settings,
+        profile="user",
+    )
+
+    assert response is not None
+    assert "error" in response
+    assert "execution_not_found" in response["error"]["message"]
+
+
 def test_relay_read_artifact_routes_to_the_cluster_that_ran_a_jarvis_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

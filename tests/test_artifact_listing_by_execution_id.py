@@ -25,10 +25,17 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from clio_relay.cli import app
+from clio_relay.cluster_config import (
+    CLUSTER_REGISTRY_ENV,
+    ClusterDefinition,
+    ClusterRegistry,
+    cluster_route_revision,
+)
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.http_api import create_app
 from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs
+from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob
 
@@ -304,6 +311,174 @@ def test_http_get_artifacts_by_execution_rejects_unknown_execution_id(tmp_path: 
     assert document["reason"] == "execution_not_found"
 
 
+def _bind_owned_session_cluster_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    cluster: str = "test-cluster",
+) -> ClusterDefinition:
+    """Bind one exact test cluster definition as owned-session process authority.
+
+    Minimal local copy of ``test_http_api.py``'s own helper of the same
+    name/shape -- ``RelaySettings.owner_session_id`` requires this env-var
+    binding (``http_api_context._bound_owner_session_cluster_definition``)
+    or ``create_app()`` refuses to build at all.
+    """
+    definition = ClusterDefinition(name=cluster, ssh_host=cluster)
+    registry_path = tmp_path / "session-authority" / "clusters.json"
+    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
+    payload = registry_path.read_bytes()
+    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
+    monkeypatch.setenv("CLIO_RELAY_SESSION_REGISTRY_SHA256", hashlib.sha256(payload).hexdigest())
+    monkeypatch.setenv("CLIO_RELAY_SESSION_ROUTE_REVISION", cluster_route_revision(definition))
+    return definition
+
+
+def _owned_jarvis_run_job(
+    *, cluster: str, execution_id: str, key: str, owner_session_id: str, owner_generation: str
+) -> RelayJob:
+    return RelayJob(
+        cluster=cluster,
+        kind=JobKind.MCP_CALL,
+        spec=McpCallSpec(
+            server="jarvis-mcp", tool="jarvis_run", arguments={"execution_id": execution_id}
+        ),
+        idempotency_key=key,
+        metadata={
+            "owner": "clio-relay",
+            "owner_session_id": owner_session_id,
+            "owner_session_generation_id": owner_generation,
+        },
+    )
+
+
+def test_shadowing_execution_id_across_owner_sessions_does_not_404_the_owning_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adversarial-review D1 (BLOCKER) regression.
+
+    Before the fix, resolution scanned every locally known job ownership-
+    blind and applied the owner check only AFTER its exactly-one-owner
+    test. A second owner session's job that happened to admit the SAME
+    bare execution_id (``_is_jarvis_run`` matches any admitted jarvis_run
+    spec, trusted or legacy -- session identity plays no part in the match)
+    turned session A's legitimate single match into an ambiguous one --
+    proven live as B1 (200) -> B2 (404) for session A's OWN artifacts, with
+    nothing session A did wrong. The fix filters candidates by
+    ``owns_job`` BEFORE the count check, so a second session's colliding
+    job is simply invisible to session A's scan.
+    """
+    definition = _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    execution_id = "execution-278-shadow"
+    core_dir = tmp_path / "shared-core"
+    spool_dir = tmp_path / "shared-spool"
+    queue = ClioCoreQueue(core_dir)
+
+    session_a_job = queue.submit_job(
+        _owned_jarvis_run_job(
+            cluster=definition.name,
+            execution_id=execution_id,
+            key="session-a-run",
+            owner_session_id="session-a",
+            owner_generation="gen-a",
+        )
+    )
+    artifact_path = tmp_path / "session-a-output.log"
+    artifact_path.write_bytes(b"session a output\n")
+    artifact = queue.append_artifact(
+        ArtifactRef(job_id=session_a_job.job_id, uri=artifact_path.as_uri(), kind="stdout")
+    )
+
+    session_a_settings = RelaySettings(
+        core_dir=core_dir,
+        spool_dir=spool_dir,
+        owner_session_id="session-a",
+        owner_session_generation_id="gen-a",
+        owner_session_cluster=definition.name,
+        session_owner_token="o" * 32,
+        allow_unauthenticated_owned_session=True,
+    )
+    client = cast(Any, TestClient(create_app(session_a_settings)))
+    session_a_headers = {
+        OWNER_SESSION_ID_HEADER: "session-a",
+        SESSION_GENERATION_ID_HEADER: "gen-a",
+    }
+
+    # B1: session A alone -- resolves and lists its own artifact.
+    b1 = client.get(f"/executions/{execution_id}/artifacts", headers=session_a_headers)
+    assert b1.status_code == 200, b1.json()
+    assert b1.json()["total"] == 1
+    assert b1.json()["artifacts"][0]["artifact_id"] == artifact.artifact_id
+
+    # A second owner session's job admits the exact same bare execution_id.
+    queue.submit_job(
+        _owned_jarvis_run_job(
+            cluster=definition.name,
+            execution_id=execution_id,
+            key="session-b-run",
+            owner_session_id="session-b",
+            owner_generation="gen-b",
+        )
+    )
+
+    # B2: session A's own artifacts must still resolve -- the RAW match
+    # count is now 2 (session A's + session B's), but exactly one is OWNED
+    # by session A, so the ownership-filtered scan still sees exactly one.
+    b2 = client.get(f"/executions/{execution_id}/artifacts", headers=session_a_headers)
+    assert b2.status_code == 200, b2.json()
+    assert b2.json()["total"] == 1
+    assert b2.json()["artifacts"][0]["artifact_id"] == artifact.artifact_id
+
+
+def test_execution_not_found_covers_both_unknown_and_not_owned_identically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adversarial-review D2: the honest refusal shape.
+
+    With D1's ownership filter applied before the count check, "no job
+    anywhere admitted this execution" and "a job admitted it, but not one
+    THIS session can see" are structurally the SAME outcome -- both answer
+    the identical typed ``execution_not_found`` refusal, never a
+    distinguishing 403/404 oracle that would leak whether an id merely
+    belongs to someone else.
+    """
+    definition = _bind_owned_session_cluster_authority(monkeypatch, tmp_path)
+    core_dir = tmp_path / "core"
+    spool_dir = tmp_path / "spool"
+    queue = ClioCoreQueue(core_dir)
+    queue.submit_job(
+        _owned_jarvis_run_job(
+            cluster=definition.name,
+            execution_id="execution-not-mine",
+            key="session-b-run",
+            owner_session_id="session-b",
+            owner_generation="gen-b",
+        )
+    )
+    session_a_settings = RelaySettings(
+        core_dir=core_dir,
+        spool_dir=spool_dir,
+        owner_session_id="session-a",
+        owner_session_generation_id="gen-a",
+        owner_session_cluster=definition.name,
+        session_owner_token="o" * 32,
+        allow_unauthenticated_owned_session=True,
+    )
+    client = cast(Any, TestClient(create_app(session_a_settings)))
+    session_a_headers = {
+        OWNER_SESSION_ID_HEADER: "session-a",
+        SESSION_GENERATION_ID_HEADER: "gen-a",
+    }
+
+    not_mine = client.get("/executions/execution-not-mine/artifacts", headers=session_a_headers)
+    unknown = client.get("/executions/execution-truly-unknown/artifacts", headers=session_a_headers)
+
+    assert not_mine.status_code == unknown.status_code == 404
+    assert not_mine.json()["reason"] == unknown.json()["reason"] == "execution_not_found"
+
+
 # --------------------------------------------------------------------------- #
 # CLI surface (job list-artifacts --execution-id)
 # --------------------------------------------------------------------------- #
@@ -371,3 +546,65 @@ def test_cli_list_artifacts_rejects_neither_job_id_nor_execution_id(
 
     assert result.exit_code != 0
     assert "artifact_scope_ambiguous" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# D4: malformed execution_id is a typed local refusal at every surface, never
+# an O(all jobs) scan on garbage or an opaque remote-transport failure.
+# --------------------------------------------------------------------------- #
+
+
+def test_mcp_list_artifacts_rejects_a_malformed_execution_id(tmp_path: Path) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+
+    response = handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "relay_list_artifacts",
+                "arguments": {"execution_id": "has a space"},
+            },
+        },
+        queue=queue,
+        settings=settings,
+        profile="user",
+    )
+
+    assert "execution_not_found" in _mcp_error_message(response)
+
+
+def test_cli_list_artifacts_rejects_a_malformed_execution_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    ClioCoreQueue(settings.core_dir)
+    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(settings.core_dir))
+    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(settings.spool_dir))
+    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["job", "list-artifacts", "--execution-id", "bad#id"])
+
+    assert result.exit_code != 0
+    assert "execution_not_found" in result.output
+
+
+def test_http_get_artifacts_by_execution_rejects_a_malformed_execution_id(
+    tmp_path: Path,
+) -> None:
+    """A shape pyright/FastAPI's own path-param decoding lets through (an
+    embedded space, once URL-decoded) must still be a typed local refusal,
+    not an O(all local jobs) scan against garbage.
+    """
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    ClioCoreQueue(settings.core_dir)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get("/executions/has%20a%20space/artifacts")
+
+    assert response.status_code == 404
+    assert response.json()["reason"] == "execution_not_found"

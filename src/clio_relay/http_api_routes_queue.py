@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import FastAPI, Query
+from fastapi.params import Depends
 
 from clio_relay import door_errors
 from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
@@ -46,7 +47,7 @@ def register_queue_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
+    auth_dependency: Depends,
 ) -> None:
     """Register the cancel/queue/retention/stale/worker/monitor-rule routes."""
 

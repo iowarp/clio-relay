@@ -53,13 +53,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ExecutionOwnerNotFoundError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob
+from clio_relay.job_identity import job_owned_by_session
+from clio_relay.models import (
+    ArtifactRef,
+    JobKind,
+    McpCallSpec,
+    RelayJob,
+    validate_jarvis_execution_id,
+)
 from clio_relay.spool import (
     OwnedFileSizeLimitError,
     read_owned_regular_file_bytes,
@@ -345,6 +354,7 @@ def resolve_jarvis_run_owner_by_execution_id(
     execution_id: str,
     *,
     cluster: str | None = None,
+    owns_job: Callable[[RelayJob], bool] | None = None,
 ) -> RelayJob:
     """Resolve the unique relay job that admitted an execution, id alone.
 
@@ -363,11 +373,39 @@ def resolve_jarvis_run_owner_by_execution_id(
     caller-asserted routing decision, made separately by the caller before
     this is reached).
 
+    ``owns_job``, when given, filters scan candidates BEFORE the exactly-
+    one-owner check (adversarial-review D1 fix): ``_is_jarvis_run`` matches
+    ANY admitted ``jarvis_run`` spec sharing the id, trusted or legacy,
+    with no notion of which owner session submitted it. Without this
+    filter, a second owner session's job that happens to match the same
+    bare execution_id turns a legitimate single match into an ambiguous
+    one -- silently 404ing the FIRST session's own artifacts the moment
+    the raw match count stops being exactly one, even though that session
+    could see its own job all along. Every caller-facing surface (the door
+    route, the MCP tool, the CLI verb) passes its own ``owns_job`` (e.g.
+    ``RelayApiContext.owns_job`` at the door, or
+    ``jarvis_execution_artifacts.owns_local_job`` built from
+    ``RelaySettings`` at the MCP/CLI surfaces); the ingest path
+    (:func:`resolve_jarvis_run_owner`) has no caller-identity boundary to
+    enforce and does not filter by ownership at all.
+
     Raises :class:`~clio_relay.errors.ExecutionOwnerNotFoundError` -- never
-    an empty page pretending success -- when zero or more than one locally
-    known job admitted the execution.
+    an empty page pretending success, and structurally indistinguishable
+    from "no job anywhere admitted this id" -- both when zero locally known
+    OWNED job admitted the execution and when more than one did (an
+    execution id another session's job happens to share is invisible to
+    this scan, never a distinguishing 403/404 oracle) -- and for a
+    malformed ``execution_id`` (clio-relay#278 D4: validated up front via
+    :func:`~clio_relay.models_job_specs.validate_jarvis_execution_id`
+    against JARVIS-CD's own portable-id contract, so garbage input is a
+    typed local refusal rather than an O(all jobs) scan or, at the remote-
+    routing surfaces, an opaque transport failure).
     """
-    matches = _jarvis_run_matches(queue, execution_id, cluster=cluster)
+    try:
+        validate_jarvis_execution_id(execution_id)
+    except ValueError as exc:
+        raise ExecutionOwnerNotFoundError(f"execution_not_found: {exc}") from exc
+    matches = _jarvis_run_matches(queue, execution_id, cluster=cluster, owns_job=owns_job)
     if len(matches) != 1:
         raise ExecutionOwnerNotFoundError(
             f"execution_not_found: no unique jarvis_run job admitted execution "
@@ -376,22 +414,46 @@ def resolve_jarvis_run_owner_by_execution_id(
     return matches[0]
 
 
+def owns_local_job(settings: RelaySettings, job: RelayJob) -> bool:
+    """Return whether ``settings``'s owner session may see one local job.
+
+    The MCP/CLI-surface counterpart of ``RelayApiContext.owns_job`` (which
+    already wraps the SAME shared
+    :func:`~clio_relay.job_identity.job_owned_by_session` predicate) --
+    clio-relay#278 D1: the local (non-door) callers of
+    :func:`resolve_jarvis_run_owner_by_execution_id` have a
+    :class:`~clio_relay.config.RelaySettings` but no
+    ``RelayApiContext``, so this is the thin adapter that lets them build
+    the same ``owns_job`` predicate the door passes.
+    """
+    return job_owned_by_session(
+        job,
+        owner_session_id=settings.owner_session_id,
+        owner_session_generation_id=settings.owner_session_generation_id,
+    )
+
+
 def _jarvis_run_matches(
     queue: ClioCoreQueue,
     execution_id: str,
     *,
     cluster: str | None,
+    owns_job: Callable[[RelayJob], bool] | None = None,
 ) -> list[RelayJob]:
     """Return every locally known job whose own jarvis_run admitted ``execution_id``.
 
     The one scan+predicate :func:`resolve_jarvis_run_owner` and
     :func:`resolve_jarvis_run_owner_by_execution_id` both build on
     (clio-relay#278) -- never duplicated between the two entry points.
+    ``owns_job``, when given, is applied here -- BEFORE either caller's
+    exactly-one-match check -- never after (adversarial-review D1).
     """
     return [
         job
         for job in queue.list_jobs()
-        if (cluster is None or job.cluster == cluster) and _is_jarvis_run(job, execution_id)
+        if (cluster is None or job.cluster == cluster)
+        and (owns_job is None or owns_job(job))
+        and _is_jarvis_run(job, execution_id)
     ]
 
 

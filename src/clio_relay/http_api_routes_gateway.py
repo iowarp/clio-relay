@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import FastAPI, Query
+from fastapi.params import Depends
 
 from clio_relay import door_errors
 from clio_relay.errors import NotFoundError, QueueConflictError
@@ -36,8 +37,8 @@ def register_gateway_routes(
     app: FastAPI,
     ctx: RelayApiContext,
     *,
-    auth_dependency: object,
-    session_submission_dependency: object,
+    auth_dependency: Depends,
+    session_submission_dependency: Depends,
 ) -> None:
     """Register the gateway-session create/list/get/update/close routes."""
 

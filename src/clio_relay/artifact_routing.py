@@ -30,7 +30,11 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
+from clio_relay.jarvis_execution_artifacts import (
+    owns_local_job,
+    resolve_jarvis_run_owner_by_execution_id,
+)
+from clio_relay.models import validate_jarvis_execution_id
 from clio_relay.pagination import (
     DEFAULT_RESPONSE_PAGE_RECORDS,
     validate_record_cursor,
@@ -80,6 +84,14 @@ def list_artifacts(
     execution_id_argument = _optional_str(arguments, "execution_id")
     if (job_id_argument is None) == (execution_id_argument is None):
         raise ValueError("artifact_scope_ambiguous: pass exactly one of job_id or execution_id")
+    if execution_id_argument is not None:
+        # clio-relay#278 D4: validate BEFORE any routing decision -- garbage
+        # forwarded to a remote cluster (over SSH or the owned-session HTTP
+        # client) fails opaquely there instead of as a typed local refusal.
+        try:
+            validate_jarvis_execution_id(execution_id_argument)
+        except ValueError as exc:
+            raise ValueError(f"execution_not_found: {exc}") from exc
     cursor = validate_record_cursor(arguments.get("cursor", 1))
     limit = validate_response_page_limit(arguments.get("limit", DEFAULT_RESPONSE_PAGE_RECORDS))
     if target is not None and should_execute_on_cluster(target):
@@ -111,6 +123,7 @@ def list_artifacts(
             queue,
             cast(str, execution_id_argument),
             cluster=target.name if target is not None else None,
+            owns_job=lambda job: owns_local_job(settings, job),
         )
         job_id = owner.job_id
     _require_local_job_cluster(queue, job_id, target)

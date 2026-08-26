@@ -21,9 +21,9 @@ from clio_relay.models_enums import TERMINAL_STATES, JobGcPhase, JobKind, JobSta
 from clio_relay.models_job_specs import (
     JobSpec,
     McpCallSpec,
-    _validate_jarvis_execution_id,
     deterministic_jarvis_execution_id,
     is_owned_jarvis_run_spec,
+    validate_jarvis_execution_id,
 )
 from clio_relay.models_shared import new_id, utc_now
 
@@ -147,7 +147,7 @@ def prepare_owned_jarvis_run_submission(job: RelayJob) -> RelayJob:
     )
     supplied_execution_id = job.spec.arguments.get("execution_id")
     if supplied_execution_id is not None:
-        validated_execution_id = _validate_jarvis_execution_id(supplied_execution_id)
+        validated_execution_id = validate_jarvis_execution_id(supplied_execution_id)
         if validated_execution_id != expected_execution_id:
             raise ValueError(
                 "trusted jarvis_run execution_id must match the relay-owned "

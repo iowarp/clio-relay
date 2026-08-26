@@ -57,8 +57,17 @@ import clio_relay.core_queue as core_queue
 import clio_relay.relay_ops as relay_ops
 from clio_relay.bounded_payload import is_delivery_refusal
 from clio_relay.config import RelaySettings
-from clio_relay.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
-from clio_relay.models import Cursor, ProgressRecord, TaskEventStatus, TaskTimelineEvent
+from clio_relay.jarvis_execution_artifacts import (
+    owns_local_job,
+    resolve_jarvis_run_owner_by_execution_id,
+)
+from clio_relay.models import (
+    Cursor,
+    ProgressRecord,
+    TaskEventStatus,
+    TaskTimelineEvent,
+    validate_jarvis_execution_id,
+)
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import monitor_job, read_artifact_bytes, read_job_log
@@ -441,7 +450,9 @@ def job_list_artifacts(
     ``jarvis_run``/``jarvis_get_execution`` hand back), never both or
     neither -- an execution id resolves to its owning job through the same
     ``resolve_jarvis_run_owner_by_execution_id`` the door's execution-scoped
-    route and the MCP tool's ``execution_id`` branch both use.
+    route and the MCP tool's ``execution_id`` branch both use, filtered to
+    jobs this CLI invocation's own owner session admitted (adversarial-
+    review D1) before that resolution's exactly-one-owner check ever runs.
     """
     import clio_relay.cli as cli
 
@@ -449,6 +460,14 @@ def job_list_artifacts(
         raise typer.BadParameter(
             "artifact_scope_ambiguous: pass exactly one of JOB_ID or --execution-id"
         )
+    if execution_id is not None:
+        # clio-relay#278 D4: validate BEFORE any SSH passthrough -- garbage
+        # forwarded to a remote cluster fails opaquely there instead of as
+        # a typed local refusal.
+        try:
+            validate_jarvis_execution_id(execution_id)
+        except ValueError as exc:
+            raise typer.BadParameter(f"execution_not_found: {exc}") from exc
     remote_args = ["job", "list-artifacts"]
     if job_id is not None:
         remote_args.append(job_id)
@@ -457,12 +476,16 @@ def job_list_artifacts(
     remote_args.extend(["--cursor", str(cursor), "--limit", str(limit)])
     if cli._try_remote_cluster_passthrough(cluster, remote_args):
         return
-    queue = core_queue.ClioCoreQueue(RelaySettings.from_env().core_dir)
+    settings = RelaySettings.from_env()
+    queue = core_queue.ClioCoreQueue(settings.core_dir)
     resolved_job_id = (
         job_id
         if job_id is not None
         else resolve_jarvis_run_owner_by_execution_id(
-            queue, cast(str, execution_id), cluster=cluster
+            queue,
+            cast(str, execution_id),
+            cluster=cluster,
+            owns_job=lambda job: owns_local_job(settings, job),
         ).job_id
     )
     artifacts, next_cursor, total = queue.list_artifacts_page(

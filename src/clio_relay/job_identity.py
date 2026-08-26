@@ -6,9 +6,10 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import PublicMessageError, RelayError
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.models import JobKind
+from clio_relay.models import JobKind, RelayJob
 
 OWNER_SESSION_ID_HEADER: Final = "X-Clio-Relay-Owner-Session-Id"
 SESSION_GENERATION_ID_HEADER: Final = "X-Clio-Relay-Session-Generation-Id"
@@ -97,3 +98,40 @@ def require_job_owner_session_identity(
             message=f"{kind.value} submissions require owner-session identity headers",
         )
     return identity
+
+
+def job_owned_by_session(
+    job: RelayJob,
+    *,
+    owner_session_id: str | None,
+    owner_session_generation_id: str | None,
+) -> bool:
+    """Return whether an owner session may see one durable job record.
+
+    The one read-time ownership predicate every caller-facing surface that
+    resolves a job by SCANNING a shared local core (rather than a direct,
+    already-authorized-by-construction lookup) must apply -- promoted out
+    of ``RelayApiContext.owns_job`` (the door's own owned-resource
+    boundary, ``http_api_context.py``, now a thin wrapper over this
+    function) so clio-relay#278's ``resolve_jarvis_run_owner_by_
+    execution_id`` can filter scan candidates by the SAME rule before its
+    exactly-one-owner check, at the MCP tool and CLI surfaces too, not just
+    the door. Without this, a second owner session's job that happens to
+    match the same bare execution_id (``jarvis_execution_artifacts.
+    _is_jarvis_run`` matches any admitted ``jarvis_run`` spec, trusted or
+    legacy) silently 404s the FIRST session's own, legitimately-owned
+    artifacts the moment the match count stops being exactly one --
+    ownership must gate the candidate set, never run only after resolution
+    already succeeded or failed on an unfiltered scan.
+
+    ``owner_session_id is None`` (no owned-session API configured) or dev
+    mode being enabled both mean every locally known job is visible, same
+    as the door's own long-standing ``owns_job`` semantics.
+    """
+    if dev_mode_enabled():
+        return True
+    return owner_session_id is None or (
+        job.metadata.get("owner") == "clio-relay"
+        and job.metadata.get("owner_session_id") == owner_session_id
+        and job.metadata.get("owner_session_generation_id") == owner_session_generation_id
+    )
