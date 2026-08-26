@@ -173,14 +173,18 @@ def _monitoring_and_artifact_tool_definitions() -> list[JSON]:
         {
             "name": "relay_list_artifacts",
             "description": (
-                "List one stable page of artifact references indexed for a job. Pass the "
-                "cluster and route_revision from that job's own submission receipt to list "
-                "artifacts for a job that ran on a configured remote cluster."
+                "List one stable page of artifact references indexed for a job. Pass "
+                "execution_id instead of job_id to list artifacts by the JARVIS execution id "
+                "jarvis_run/jarvis_get_execution hand back; the server resolves it to the "
+                "owning job. Pass the cluster and route_revision from that job's own "
+                "submission receipt to list artifacts for a job that ran on a configured "
+                "remote cluster."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": durable_record_id_json_schema(),
+                    "execution_id": {"type": "string", "minLength": 1},
                     "cluster": {"type": "string"},
                     "route_revision": cluster_route_revision_json_schema(),
                     "cursor": {"type": "integer", "default": 1, "minimum": 1},
@@ -191,7 +195,9 @@ def _monitoring_and_artifact_tool_definitions() -> list[JSON]:
                         "maximum": MAX_RESPONSE_PAGE_RECORDS,
                     },
                 },
-                "required": ["job_id"],
+                "if": {"required": ["job_id"]},
+                "then": {"not": {"required": ["execution_id"]}},
+                "else": {"required": ["execution_id"]},
                 "dependentRequired": {
                     "cluster": ["route_revision"],
                     "route_revision": ["cluster"],

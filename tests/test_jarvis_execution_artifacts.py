@@ -5,11 +5,15 @@ import hashlib
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.errors import ExecutionOwnerNotFoundError
 from clio_relay.jarvis_execution_artifacts import (
     EXECUTION_OUTPUTS_MISSING_SCHEMA,
     ingest_jarvis_execution_outputs,
+    resolve_jarvis_run_owner_by_execution_id,
 )
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import Cursor, JobKind, McpCallSpec, RelayJob
@@ -376,3 +380,80 @@ def test_no_artifact_page_keeps_current_semantics(tmp_path: Path) -> None:
     assert indexed == []
     assert truncation is None
     assert outputs_missing is None
+
+
+def test_resolve_jarvis_run_owner_by_execution_id_finds_the_admitting_job(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#278: the bare-execution_id entry point finds the same job.
+
+    ``resolve_jarvis_run_owner_by_execution_id`` has no incumbent query job
+    (unlike ``resolve_jarvis_run_owner``'s ingest-path caller) -- it must
+    still land on the exact job whose own ``jarvis_run`` call admitted the
+    execution.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    execution_id = "execution-resolve-by-id"
+    owner = queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
+    # A second, unrelated jarvis_run on the same queue must not confuse the scan.
+    queue.submit_job(_call_job(tool="jarvis_run", execution_id="execution-unrelated", key="other"))
+
+    resolved = resolve_jarvis_run_owner_by_execution_id(queue, execution_id)
+
+    assert resolved.job_id == owner.job_id
+
+
+def test_resolve_jarvis_run_owner_by_execution_id_raises_when_unknown(tmp_path: Path) -> None:
+    """clio-relay#278: an execution id no job admitted is a typed refusal.
+
+    Never a bare crash, and never resolved to the wrong job -- the design's
+    own "gate on reality" requirement (no empty page pretending success).
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    queue.submit_job(_call_job(tool="jarvis_run", execution_id="execution-known", key="run"))
+
+    with pytest.raises(ExecutionOwnerNotFoundError):
+        resolve_jarvis_run_owner_by_execution_id(queue, "execution-never-admitted")
+
+
+def test_resolve_jarvis_run_owner_by_execution_id_scopes_by_cluster(tmp_path: Path) -> None:
+    """clio-relay#278: an explicit ``cluster`` disambiguates a colliding id.
+
+    Mirrors ``resolve_jarvis_run_owner``'s own cluster scoping (by its query
+    job's cluster) -- here the caller supplies the cluster directly (e.g. an
+    MCP ``target``'s name) since there is no incumbent job to read it from.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    execution_id = "execution-collides-across-clusters"
+    ares_owner = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server="jarvis-mcp",
+                tool="jarvis_run",
+                arguments={"execution_id": execution_id},
+            ),
+            idempotency_key="ares-run",
+        )
+    )
+    queue.submit_job(
+        RelayJob(
+            cluster="polaris",
+            kind=JobKind.MCP_CALL,
+            spec=McpCallSpec(
+                server="jarvis-mcp",
+                tool="jarvis_run",
+                arguments={"execution_id": execution_id},
+            ),
+            idempotency_key="polaris-run",
+        )
+    )
+
+    resolved = resolve_jarvis_run_owner_by_execution_id(queue, execution_id, cluster="ares")
+    assert resolved.job_id == ares_owner.job_id
+
+    # Unscoped (cluster=None), the scan sees both clusters' jobs -- two
+    # matches is exactly as unresolvable as zero, per the shared invariant.
+    with pytest.raises(ExecutionOwnerNotFoundError):
+        resolve_jarvis_run_owner_by_execution_id(queue, execution_id)

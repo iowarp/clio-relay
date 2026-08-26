@@ -57,7 +57,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError
+from clio_relay.errors import ExecutionOwnerNotFoundError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob
 from clio_relay.spool import (
@@ -315,19 +315,84 @@ def resolve_jarvis_run_owner(
     query_job: RelayJob,
     execution_id: str,
 ) -> RelayJob:
-    """Resolve the unique relay job that admitted the execution."""
+    """Resolve the unique relay job that admitted the execution.
+
+    Scoped to jobs sharing ``query_job``'s cluster: this is the ingest path
+    (:func:`ingest_jarvis_execution_outputs`), which always has an in-flight
+    query job at hand and treats a resolution failure here as an internal
+    invariant violation (an uncaught, generic :class:`RelayError` -- this
+    job's own execution result failed to self-identify its admitting job,
+    never legitimate caller input). clio-relay#278's bare-``execution_id``
+    listing surfaces have no such incumbent job and are CALLER-facing (an
+    unresolved id is ordinary, expected input) -- they use
+    :func:`resolve_jarvis_run_owner_by_execution_id` instead, which shares
+    the exact same match predicate and exactly-one-owner invariant via
+    :func:`_jarvis_run_matches` but raises the typed, catchable
+    :class:`~clio_relay.errors.ExecutionOwnerNotFoundError`.
+    """
     if _is_jarvis_run(query_job, execution_id):
         return query_job
-    matches = [
-        job
-        for job in queue.list_jobs()
-        if job.cluster == query_job.cluster and _is_jarvis_run(job, execution_id)
-    ]
+    matches = _jarvis_run_matches(queue, execution_id, cluster=query_job.cluster)
     if len(matches) != 1:
         raise RelayError(
             f"expected one owning jarvis_run for execution {execution_id}, found {len(matches)}"
         )
     return matches[0]
+
+
+def resolve_jarvis_run_owner_by_execution_id(
+    queue: ClioCoreQueue,
+    execution_id: str,
+    *,
+    cluster: str | None = None,
+) -> RelayJob:
+    """Resolve the unique relay job that admitted an execution, id alone.
+
+    clio-relay#278: the artifact-listing surfaces that accept a bare
+    ``execution_id`` as an alternative to ``job_id`` -- the door's
+    ``GET /executions/{execution_id}/artifacts`` route, ``relay_list_
+    artifacts``'s ``execution_id`` branch, and the CLI's ``job list-
+    artifacts --execution-id`` flag -- have no incumbent query job to scope
+    from, unlike :func:`resolve_jarvis_run_owner`'s ingest-path caller.
+    ``cluster``, when given (the caller's asserted cluster, e.g. an MCP
+    ``target``'s name), scopes the scan exactly as
+    :func:`resolve_jarvis_run_owner` scopes by its query job's own cluster;
+    ``None`` (the default) scans every locally known job regardless of
+    cluster, matching how the job_id-keyed listing routes apply no cluster
+    check of their own either (cluster identity only matters for the
+    caller-asserted routing decision, made separately by the caller before
+    this is reached).
+
+    Raises :class:`~clio_relay.errors.ExecutionOwnerNotFoundError` -- never
+    an empty page pretending success -- when zero or more than one locally
+    known job admitted the execution.
+    """
+    matches = _jarvis_run_matches(queue, execution_id, cluster=cluster)
+    if len(matches) != 1:
+        raise ExecutionOwnerNotFoundError(
+            f"execution_not_found: no unique jarvis_run job admitted execution "
+            f"{execution_id} (found {len(matches)})"
+        )
+    return matches[0]
+
+
+def _jarvis_run_matches(
+    queue: ClioCoreQueue,
+    execution_id: str,
+    *,
+    cluster: str | None,
+) -> list[RelayJob]:
+    """Return every locally known job whose own jarvis_run admitted ``execution_id``.
+
+    The one scan+predicate :func:`resolve_jarvis_run_owner` and
+    :func:`resolve_jarvis_run_owner_by_execution_id` both build on
+    (clio-relay#278) -- never duplicated between the two entry points.
+    """
+    return [
+        job
+        for job in queue.list_jobs()
+        if (cluster is None or job.cluster == cluster) and _is_jarvis_run(job, execution_id)
+    ]
 
 
 def _is_jarvis_run(job: RelayJob, execution_id: str) -> bool:
