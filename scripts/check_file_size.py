@@ -1976,6 +1976,72 @@ RATCHET_BASELINE: dict[str, int] = {
 # (tests/, jarvis-packages/clio_relay/*/tests, ...) are intentionally excluded.
 SRC_ROOTS: tuple[str, ...] = ("src/clio_relay", "jarvis-packages/clio_relay")
 
+# ---------------------------------------------------------------------------
+# Distribution guard (iowarp/clio-relay#280, v1.7.0 campaign lane R-G G2).
+#
+# The per-file ratchet above stops INDIVIDUAL files regrowing, but a tree can
+# stay "green" while its median file marches toward the cap. Owner ruling:
+# 90% of files under 500 lines is the accountability bar. Enforced as a
+# RATCHETING baseline per root family: the recorded percentage may only rise
+# (toward, then holding at, DISTRIBUTION_TARGET_PERCENT); CI fails when the
+# measured percentage drops below its recorded baseline. When a change
+# improves the distribution, the advisory tells the committer to raise the
+# recorded number in the same change -- identical discipline to
+# RATCHET_BASELINE, pointed at the distribution instead of one file.
+# ---------------------------------------------------------------------------
+
+#: The sweet-spot bound the distribution is measured against (files strictly
+#: under this line count are "healthy"). The 800 hard cap above is the
+#: backstop, never a license.
+SWEET_SPOT_LINES = 500
+
+#: The standing target the baselines ratchet toward. Not enforced directly --
+#: the enforced number is each family's recorded baseline below.
+DISTRIBUTION_TARGET_PERCENT = 90.0
+
+#: Recorded percentage of src-family files under SWEET_SPOT_LINES, floored to
+#: two decimals at measurement time (478/619 = 77.22% when first recorded).
+#: May only RISE.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 77.22
+
+#: Same guard for tests/ with its own (much lower) starting point
+#: (126/203 = 62.06% floored when first recorded). May only RISE.
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 62.06
+
+TESTS_ROOTS: tuple[str, ...] = ("tests",)
+
+#: How many of the largest over-sweet-spot files to name in reports, so the
+#: next fix target is named, not hunted.
+DISTRIBUTION_WORST_FILES = 10
+
+
+class DistributionResult(NamedTuple):
+    """Outcome of one root family's distribution measurement."""
+
+    label: str
+    total_files: int
+    files_under: int
+    percent: float  # exact, un-floored
+    baseline_percent: float
+    worst: list[tuple[str, int]]  # (rel, line_count), largest first
+
+    @property
+    def regressed(self) -> bool:
+        """True when the measured percentage fell below the recorded baseline."""
+        # The baseline is recorded FLOORED to two decimals, so an unchanged
+        # tree always measures >= its own baseline; the epsilon only guards
+        # float representation, never masks a real one-file regression (one
+        # file crossing the bound moves the percentage by >= 100/total_files,
+        # orders of magnitude above it).
+        return self.percent + 1e-9 < self.baseline_percent
+
+    @property
+    def improved_floor(self) -> float:
+        """The floored-to-2-decimals value to record when the tree improved."""
+        import math
+
+        return math.floor(self.percent * 100) / 100
+
 
 class Failure(NamedTuple):
     """A file (or baseline entry) that breaks the ratchet (fails the check)."""
@@ -2075,6 +2141,81 @@ def check_file_size(
     return Result(failures=failures, ratchet_downs=ratchet_downs)
 
 
+def check_size_distribution(
+    scan_roots: Sequence[Path],
+    *,
+    label: str,
+    rel_to: Path | None = None,
+    sweet_spot: int = SWEET_SPOT_LINES,
+    baseline_percent: float,
+) -> DistributionResult:
+    """Measure one root family's percentage of files under ``sweet_spot``.
+
+    Args:
+        scan_roots: Directory trees to walk for ``*.py`` files. Must be
+            non-empty.
+        label: Family name used in reports (``"src"``/``"tests"``).
+        rel_to: Base for the relative paths named in the worst-offender list.
+        sweet_spot: The healthy line-count bound (strictly under).
+        baseline_percent: The recorded ratchet floor for this family.
+
+    Returns:
+        The measured :class:`DistributionResult` (judgment is the caller's,
+        via :attr:`DistributionResult.regressed`).
+
+    Raises:
+        ValueError: If ``scan_roots`` is empty or contains no ``*.py`` files
+            (a distribution over nothing is meaningless and would mask a
+            mis-pointed scan root as 100% healthy).
+    """
+    if not scan_roots:
+        raise ValueError("check_size_distribution requires at least one scan root")
+    base = rel_to if rel_to is not None else scan_roots[0]
+    counts: list[tuple[str, int]] = []
+    for scan_root in scan_roots:
+        for path in sorted(scan_root.rglob("*.py")):
+            counts.append((path.relative_to(base).as_posix(), _count_lines(path)))
+    if not counts:
+        raise ValueError(f"no *.py files under the {label} distribution scan roots")
+    files_under = sum(1 for _rel, count in counts if count < sweet_spot)
+    worst = sorted(
+        (entry for entry in counts if entry[1] >= sweet_spot),
+        key=lambda entry: -entry[1],
+    )[:DISTRIBUTION_WORST_FILES]
+    return DistributionResult(
+        label=label,
+        total_files=len(counts),
+        files_under=files_under,
+        percent=files_under / len(counts) * 100,
+        baseline_percent=baseline_percent,
+        worst=worst,
+    )
+
+
+def _print_distribution_report(result: DistributionResult, *, sweet_spot: int) -> None:
+    """Print one family's distribution verdict (regression fails the build)."""
+    summary = (
+        f"{result.label}: {result.files_under}/{result.total_files} files "
+        f"({result.percent:.2f}%) under {sweet_spot} lines "
+        f"(ratchet floor {result.baseline_percent:.2f}%, "
+        f"target {DISTRIBUTION_TARGET_PERCENT:.0f}%)"
+    )
+    if result.regressed:
+        print(f"FAIL (distribution): {summary}")
+        print("  the percentage fell below its recorded floor -- largest offenders:")
+        for rel, count in result.worst:
+            print(f"  {count:6d} {rel}")
+    elif result.improved_floor > result.baseline_percent:
+        print(
+            f"OK (distribution ratchet up available): {summary} -- raise "
+            f"{result.label.upper()}_DISTRIBUTION_BASELINE_PERCENT to "
+            f"{result.improved_floor:.2f} in scripts/check_file_size.py in this "
+            "same change."
+        )
+    else:
+        print(f"OK (distribution): {summary}")
+
+
 def _print_report(result: Result, max_lines: int) -> None:
     """Print the ratchet report (failures then advisory ratchet-downs)."""
     for entry in result.ratchet_downs:
@@ -2133,7 +2274,24 @@ def main(argv: list[str] | None = None) -> int:
         max_lines=args.max,
     )
     _print_report(result, args.max)
-    return 1 if result.failures else 0
+
+    # #280: the distribution guard runs alongside the per-file ratchet --
+    # both must hold.
+    distribution_failed = False
+    for label, roots, floor in (
+        ("src", SRC_ROOTS, SRC_DISTRIBUTION_BASELINE_PERCENT),
+        ("tests", TESTS_ROOTS, TESTS_DISTRIBUTION_BASELINE_PERCENT),
+    ):
+        distribution = check_size_distribution(
+            [repo_root / root for root in roots],
+            label=label,
+            rel_to=repo_root,
+            baseline_percent=floor,
+        )
+        _print_distribution_report(distribution, sweet_spot=SWEET_SPOT_LINES)
+        distribution_failed = distribution_failed or distribution.regressed
+
+    return 1 if (result.failures or distribution_failed) else 0
 
 
 if __name__ == "__main__":

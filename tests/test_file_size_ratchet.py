@@ -155,3 +155,94 @@ def test_baseline_entries_all_exist_in_the_real_tree() -> None:
 def test_default_max_lines_matches_the_documented_cap() -> None:
     """Guard against the cap silently drifting away from the documented 800."""
     assert DEFAULT_MAX_LINES == 800
+
+
+# ---------------------------------------------------------------------------
+# Distribution guard (iowarp/clio-relay#280, lane R-G G2)
+# ---------------------------------------------------------------------------
+
+
+def test_distribution_regression_trips(tmp_path: Path) -> None:
+    """A tree whose under-sweet-spot percentage falls below its floor fails."""
+    from scripts.check_file_size import check_size_distribution
+
+    _write(tmp_path, "small.py", 10)
+    _write(tmp_path, "large.py", 600)
+
+    result = check_size_distribution([tmp_path], label="src", baseline_percent=75.0, sweet_spot=500)
+
+    assert result.percent == 50.0
+    assert result.regressed is True
+    assert result.worst == [("large.py", 600)]
+
+
+def test_distribution_exactly_at_floor_passes(tmp_path: Path) -> None:
+    """A tree measuring exactly its recorded floored baseline passes."""
+    from scripts.check_file_size import check_size_distribution
+
+    _write(tmp_path, "a.py", 10)
+    _write(tmp_path, "b.py", 10)
+    _write(tmp_path, "c.py", 10)
+    _write(tmp_path, "big.py", 600)
+
+    result = check_size_distribution([tmp_path], label="src", baseline_percent=75.0, sweet_spot=500)
+
+    assert result.percent == 75.0
+    assert result.regressed is False
+
+
+def test_distribution_improvement_offers_the_raised_floor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An improved tree passes and names the exact new floor to record."""
+    from scripts.check_file_size import (
+        _print_distribution_report,  # pyright: ignore[reportPrivateUsage]  # noqa: PLC2701
+        check_size_distribution,
+    )
+
+    _write(tmp_path, "a.py", 10)
+    _write(tmp_path, "b.py", 10)
+    _write(tmp_path, "big.py", 600)
+
+    result = check_size_distribution([tmp_path], label="src", baseline_percent=50.0, sweet_spot=500)
+
+    assert result.regressed is False
+    assert result.improved_floor == 66.66
+    _print_distribution_report(result, sweet_spot=500)
+    out = capsys.readouterr().out
+    assert "ratchet up available" in out
+    assert "66.66" in out
+
+
+def test_distribution_over_an_empty_root_is_refused(tmp_path: Path) -> None:
+    """A scan finding zero files is a mis-pointed root, never 100% healthy."""
+    from scripts.check_file_size import check_size_distribution
+
+    with pytest.raises(ValueError, match="no \\*.py files"):
+        check_size_distribution([tmp_path], label="src", baseline_percent=50.0)
+
+
+def test_real_tree_holds_at_recorded_distribution_floors() -> None:
+    """The live tree passes both recorded distribution floors (regression pin)."""
+    from scripts.check_file_size import (
+        SRC_DISTRIBUTION_BASELINE_PERCENT,
+        TESTS_DISTRIBUTION_BASELINE_PERCENT,
+        TESTS_ROOTS,
+        check_size_distribution,
+    )
+
+    repo_root = Path(__file__).resolve().parents[1]
+    for label, roots, floor in (
+        ("src", SRC_ROOTS, SRC_DISTRIBUTION_BASELINE_PERCENT),
+        ("tests", TESTS_ROOTS, TESTS_DISTRIBUTION_BASELINE_PERCENT),
+    ):
+        result = check_size_distribution(
+            [repo_root / root for root in roots],
+            label=label,
+            rel_to=repo_root,
+            baseline_percent=floor,
+        )
+        assert result.regressed is False, (
+            f"{label} distribution regressed: {result.percent:.2f}% < {floor:.2f}%; "
+            f"worst offenders: {result.worst}"
+        )
