@@ -88,6 +88,7 @@ from clio_relay.frp_link import (
     validate_channel_nonce,
 )
 from clio_relay.frp_proxy_naming import canonical_proxy_name
+from clio_relay.frp_visitor_reconciliation import reconcile_stale_frp_visitors
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.session_api import SESSION_IDENTITY_SCHEMA
 
@@ -175,6 +176,15 @@ class _FrpChannelTransport:
         self._visitor: HeldFrpVisitor | None = None
         self._established = False
         self._failure_detail: str | None = None
+        # iowarp/clio-relay#285: populated by the reconciliation pass at the
+        # START of establish(), before this instance's own new visitor is
+        # even rendered. RemoteConnection._establish reads
+        # reaped_orphan_visitor_pids back (a plain optional attribute check --
+        # SshForwardTransport carries no equivalent, since ssh_forward is
+        # self-cleaning by construction) to fold each pid into its own
+        # typed visitor_orphan_reaped channel event.
+        self._reaped_orphan_visitor_pids: tuple[int, ...] = ()
+        self._swept_config_dirs = 0
 
     @property
     def mode(self) -> TransportMode:
@@ -192,6 +202,16 @@ class _FrpChannelTransport:
         """
         return False
 
+    @property
+    def reaped_orphan_visitor_pids(self) -> tuple[int, ...]:
+        """Return prior orphaned visitor pids reaped during this establish (#285)."""
+        return self._reaped_orphan_visitor_pids
+
+    @property
+    def swept_stale_config_dirs(self) -> int:
+        """Return the count of empty crash-orphaned visitor config dirs removed (#285)."""
+        return self._swept_config_dirs
+
     def establish(self, *, nonce: str) -> ChannelLink:
         """Hold one frp visitor tunnel and fetch the bring-up document over it.
 
@@ -202,10 +222,22 @@ class _FrpChannelTransport:
         ``establish`` is callable once, full stop -- a failed attempt is
         replaced by building a NEW transport, never retried in place
         (``RelayTransport``'s own Protocol docstring).
+
+        iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
+        reconciliation pass runs for this exact ``frpc_bin`` -- reaping any
+        prior visitor whose owning CLI process is gone (a ``kill -9`` or
+        crash the atexit hook in ``remote_connection_registry.py`` could
+        never have caught) and sweeping empty crash-orphaned config-dir
+        shells. This never blocks a legitimate concurrent CLI's own held
+        visitor (a live parent is never touched) and never raises out of
+        this method (``reconcile_stale_frp_visitors`` is itself best-effort).
         """
         if self._established:
             raise RelayError(f"{self._mode} transport was already established")
         validate_channel_nonce(nonce)
+        reconciliation = reconcile_stale_frp_visitors(frpc_bin=self._frpc_bin)
+        self._reaped_orphan_visitor_pids = reconciliation.reaped_pids
+        self._swept_config_dirs = reconciliation.swept_config_dirs
         local_bind_port = self._local_bind_port or select_loopback_port(subject="held frp visitor")
         assert_loopback_port_available(local_bind_port, subject="frp visitor")
         config = FrpLinkConfig.from_cluster(

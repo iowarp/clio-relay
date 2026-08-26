@@ -75,7 +75,7 @@ from clio_relay.remote_connection_registry import (
 from clio_relay.remote_connection_registry import (
     connection_registry as connection_registry,
 )
-from clio_relay.remote_connection_registry import verify_bootstrap
+from clio_relay.remote_connection_registry import record_reaped_orphans, verify_bootstrap
 from clio_relay.remote_connection_stream_io import (
     MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
 )
@@ -460,7 +460,7 @@ class RemoteConnection:
             )
         return status
 
-    def close(self) -> None:
+    def close(self, *, at_exit: bool = False) -> None:
         """Release the held channel and record the closure.
 
         ``transport.failure_detail()`` is read AFTER ``_release_locked``
@@ -470,6 +470,11 @@ class RemoteConnection:
         #231 R5 opus review item R3) -- a normal close leaves it ``None`` and
         the event is unchanged, but a residual is never silently dropped from
         the ledger.
+
+        ``at_exit=True`` (iowarp/clio-relay#285) records ``closed_at_exit``
+        instead of ``closed`` -- the identical release, distinguishing the
+        registry's atexit self-clean hook from an explicit caller-driven
+        close in the acceptance report.
         """
         with self._lock:
             if self._transport is None:
@@ -481,7 +486,7 @@ class RemoteConnection:
                 channel_event(
                     cluster=self.cluster,
                     mode=self._transport_mode,
-                    event="closed",
+                    event="closed_at_exit" if at_exit else "closed",
                     attempt=self._attempt,
                     reason="config_cleanup_error" if residual_detail else None,
                     detail=residual_detail,
@@ -574,6 +579,9 @@ class RemoteConnection:
                 )
             )
             link = transport.establish(nonce=nonce)
+            # #285: recorded before anything below can still fail, so a reap
+            # is never lost from the ledger even if this attempt goes on to fail.
+            record_reaped_orphans(self, transport)
             endpoint = link.control_endpoint
             bootstrap = link.bootstrap
             verify_bootstrap(

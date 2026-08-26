@@ -17,13 +17,14 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from clio_relay import frp_link
+from clio_relay import frp_link, remote_connection_registry
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
@@ -34,6 +35,7 @@ from clio_relay.control_channel import (
 )
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_transport import BrokeredTcpTransport, TransportPunchFailed
+from clio_relay.frp_visitor_reconciliation import ReconciliationResult
 from clio_relay.remote_connection import (
     DEFAULT_OWNED_SESSION_API_PORT,
     RemoteConnection,
@@ -47,6 +49,157 @@ from clio_relay.session_api import (
 
 NONCE = "1" * 64
 OWNER_TOKEN = "owner-token"
+
+# iowarp/clio-relay#285: the one REQUIRED subprocess-based exit-kill test
+# (test_real_interpreter_exit_kills_the_injected_visitor_process below) runs
+# this as a real child interpreter -- a minimal, self-contained clone of this
+# file's own injected-factory harness (fake frpc process + fake identity-
+# bound HTTP stream), since a fresh `python -c` process has no pytest
+# monkeypatch fixture to reuse the real one through. It establishes one
+# brokered_tcp connection and then falls off the end WITHOUT closing
+# anything, so the only thing that can print "VISITOR_TERMINATED" is the
+# registry's own atexit hook actually firing at real interpreter exit.
+_EXIT_KILL_SUBPROCESS_SOURCE = """
+import json
+import os
+import sys
+from pathlib import Path
+
+from clio_relay import control_channel, frp_link, frp_transport, remote_connection
+from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
+from clio_relay.config import RelaySettings
+from clio_relay.frp_visitor_reconciliation import ReconciliationResult
+from clio_relay.remote_connection import RemoteConnectionRegistry
+from clio_relay.session_api import session_identity_document
+
+NONCE = "1" * 64
+
+
+class _FakeProcess:
+    def __init__(self, argv):
+        self.argv = argv
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+        print("VISITOR_TERMINATED", flush=True)
+
+    def kill(self):
+        self.returncode = -9
+        print("VISITOR_KILLED", flush=True)
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def _process_factory(argv, **kwargs):
+    return _FakeProcess(argv)
+
+
+class _FakeResponse:
+    def __init__(self, document):
+        self._payload = json.dumps(document).encode("utf-8")
+        self.status = 200
+        self.will_close = False
+
+    def read(self, _amount):
+        return self._payload
+
+
+class _FakeStream:
+    def __init__(self, *args, **kwargs):
+        self.sock = None
+        self._path = ""
+
+    def connect(self):
+        self.sock = object()
+
+    def request(self, method, path, body=None, headers=None):
+        self._path = path
+
+    def getresponse(self):
+        if self._path.startswith("/session-identity"):
+            document = session_identity_document(
+                owner_token="owner-token",
+                cluster="ares",
+                session_id="desktop-session-1",
+                generation_id="generation-1",
+                nonce=NONCE,
+            )
+        else:
+            document = {
+                "owner": "clio-relay",
+                "cluster": "ares",
+                "session_id": "desktop-session-1",
+                "session_generation_id": "generation-1",
+                "remote_api_port": 8765,
+                "running": True,
+                "ownership_verified": True,
+            }
+        return _FakeResponse(document)
+
+    def close(self):
+        self.sock = None
+
+
+def _fixed_nonce(_size):
+    return NONCE
+
+
+def _skip_health(*args, **kwargs):
+    return None
+
+
+def _no_reconciliation(**kwargs):
+    return ReconciliationResult(reaped_pids=(), swept_config_dirs=0)
+
+
+frp_link.spawn_frp_process = _process_factory
+control_channel.spawn_channel_process = _process_factory
+frp_link.wait_for_channel_health = _skip_health
+remote_connection.secrets.token_hex = _fixed_nonce
+remote_connection.http.client.HTTPConnection = _FakeStream
+frp_transport.http.client.HTTPConnection = _FakeStream
+frp_transport.reconcile_stale_frp_visitors = _no_reconciliation
+
+os.environ["CLIO_RELAY_FRP_TOKEN"] = "frp-token-from-env"
+os.environ["CLIO_RELAY_STCP_SECRET"] = "stcp-secret-from-env"
+
+root = Path(sys.argv[1])
+definition = ClusterDefinition(
+    name="ares",
+    ssh_host="ares-login",
+    frp_transport=FrpTransportConfig(
+        server_addr="relay.example.org",
+        identity_anchor="preshared_link_secret",
+    ),
+)
+settings = RelaySettings(
+    core_dir=root / "core",
+    spool_dir=root / "spool",
+    api_token="session-api-token",
+    owner_session_id="desktop-session-1",
+    owner_session_generation_id="generation-1",
+    owner_session_cluster="ares",
+    remote_transport_mode="brokered_tcp",
+    remote_transport_interactive=False,
+)
+
+registry = RemoteConnectionRegistry()
+connection = registry.connection(definition=definition, settings=settings)
+assert connection.connected is True
+print("ESTABLISHED", flush=True)
+# Deliberately no close()/close_all() -- the atexit hook the registry armed
+# on connection() above must do it when this interpreter exits normally.
+"""
 
 
 class _Response:
@@ -182,6 +335,14 @@ class _Harness:
         self.requests: list[dict[str, object]] = []
         self.responses: dict[str, object] = {}
         self.registry = RemoteConnectionRegistry()
+        # iowarp/clio-relay#285: every establish() calls the stale-visitor
+        # reconciliation pass. Defaulted to a no-op empty result (see
+        # _install below) so every OTHER test in this file stays hermetic --
+        # no real process-table scan, no real subprocess -- and its pinned
+        # event lists are unaffected; reconciliation-specific tests set
+        # `reconciliation_result` before connecting to prove the wiring.
+        self.reconciliation_calls: list[str] = []
+        self.reconciliation_result = ReconciliationResult(reaped_pids=(), swept_config_dirs=0)
 
     @property
     def ssh_dials(self) -> int:
@@ -265,6 +426,17 @@ def _install(
     def fixed_nonce(_size: int) -> str:
         return NONCE
 
+    def reconcile(*, frpc_bin: str, **_kwargs: object) -> ReconciliationResult:
+        """No real process-table scan or subprocess in this file's tests (#285).
+
+        Records the exact ``frpc_bin`` each establish() reconciled for, and
+        returns whatever the current test staged on
+        ``harness.reconciliation_result`` -- the empty default for every
+        test that does not care, an injected fake result for the ones that do.
+        """
+        harness.reconciliation_calls.append(frpc_bin)
+        return harness.reconciliation_result
+
     monkeypatch.setattr("clio_relay.frp_link.spawn_frp_process", process_factory)
     monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
     if skip_health_wait:
@@ -272,6 +444,7 @@ def _install(
     monkeypatch.setattr("clio_relay.remote_connection.secrets.token_hex", fixed_nonce)
     monkeypatch.setattr("clio_relay.remote_connection.http.client.HTTPConnection", stream_factory)
     monkeypatch.setattr("clio_relay.frp_transport.http.client.HTTPConnection", stream_factory)
+    monkeypatch.setattr("clio_relay.frp_transport.reconcile_stale_frp_visitors", reconcile)
     monkeypatch.setattr("clio_relay.session_api.connection_registry", lambda: harness.registry)
     return harness
 
@@ -535,6 +708,200 @@ def test_close_surfaces_a_residual_config_cleanup_error_as_a_typed_event(
     assert closed.reason == "config_cleanup_error"
     assert closed.detail is not None
     assert "token/secret" in closed.detail
+
+
+def test_closed_at_exit_is_a_distinct_typed_event_from_an_ordinary_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#285 part 1: the registry's exit-path close.
+
+    ``RemoteConnectionRegistry.close_all(at_exit=True)`` is what the atexit
+    hook calls; exercised directly here (no interpreter exit needed) to prove
+    the visitor still gets killed and its config still gets removed, and that
+    the recorded event is ``closed_at_exit`` -- distinct from the ordinary
+    ``closed`` pinned above -- so the acceptance report can tell the two
+    apart.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    config_path = harness.visitor_config_paths[-1]
+    assert config_path.exists()
+
+    harness.registry.close_all(at_exit=True)
+
+    assert connection.connected is False
+    assert harness.processes[-1].terminated is True
+    assert not config_path.exists()
+    closed = connection.events[-1]
+    assert closed.event == "closed_at_exit"
+    assert closed.reason is None
+    assert closed.detail is None
+    # The registry itself forgets the connection, exactly like an ordinary close.
+    assert harness.registry.get("ares") is None
+
+
+def test_atexit_hook_can_be_invoked_directly_and_closes_every_held_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered atexit callback itself, called directly (no real exit).
+
+    ``remote_connection_registry._atexit_close_all_connections`` is the exact
+    callable ``atexit.register`` is armed with
+    (``RemoteConnectionRegistry._ensure_atexit_registered``); this proves it
+    end to end without waiting for a real interpreter shutdown -- the
+    subprocess test below proves the OTHER half, that a real exit actually
+    invokes it.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+
+    remote_connection_registry._atexit_close_all_connections(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        harness.registry
+    )
+
+    assert connection.connected is False
+    assert harness.processes[-1].terminated is True
+    assert connection.events[-1].event == "closed_at_exit"
+    assert harness.registry.clusters == ()
+
+
+def test_ensure_atexit_registered_arms_the_hook_exactly_once_per_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idempotent, lazy registration (#285): one hook per registry, not per connection."""
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    registered: list[tuple[object, ...]] = []
+
+    def fake_register(*args: object) -> None:
+        registered.append(args)
+
+    monkeypatch.setattr(remote_connection_registry.atexit, "register", fake_register)
+
+    _connect(tmp_path, harness)
+    _connect(tmp_path, harness)  # a second connection() call -- reuses the held one
+
+    assert len(registered) == 1
+    hook = remote_connection_registry._atexit_close_all_connections  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert registered[0][0] is hook
+    assert registered[0][1] is harness.registry
+
+
+def test_atexit_hook_never_raises_and_records_a_typed_failure_for_a_broken_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-silent-fallback house rule applies to the atexit path too (#285).
+
+    SABOTAGE: one connection's own ``close`` is replaced with a raiser. The
+    hook must still (a) never propagate that exception, (b) still fold the
+    failure into that connection's own ``closed_at_exit`` event instead of
+    losing the terminal event, and (c) still release the registry's hold on
+    it (the exception happens INSIDE ``RemoteConnection.close``, which -- per
+    ``_release_locked`` -- already cleared the transport reference before the
+    part that raised, so the connection is genuinely torn down even though
+    its own event never got recorded by the normal path).
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+
+    def raising_close(*, at_exit: bool = False) -> None:
+        del at_exit
+        raise RuntimeError("simulated: close itself failed")
+
+    monkeypatch.setattr(connection, "close", raising_close)
+
+    remote_connection_registry._atexit_close_all_connections(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        harness.registry
+    )
+
+    assert harness.registry.clusters == ()
+    failure = connection.events[-1]
+    assert failure.event == "closed_at_exit"
+    assert failure.reason == "close_failed"
+    assert failure.detail is not None
+    assert "simulated" in failure.detail
+
+
+def test_visitor_orphan_reap_is_recorded_as_a_typed_channel_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#285 part 2: the reconciliation-at-spawn wiring.
+
+    Injects a fake reconciliation result (this file's own
+    ``reconcile_stale_frp_visitors`` seam, patched by ``_install``) reporting
+    two reaped pids, and proves each becomes its own typed
+    ``visitor_orphan_reaped`` event on THIS connection's ledger, carrying the
+    reaped pid in ``detail`` -- the acceptance criterion's "next invocation
+    reaps the orphan with the typed event", exercised without a real orphan
+    process or a real process-table scan.
+    """
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+    harness.reconciliation_result = ReconciliationResult(
+        reaped_pids=(4321, 4322), swept_config_dirs=1
+    )
+
+    connection = _connect(tmp_path, harness)
+
+    assert [event.event for event in connection.events] == [
+        "establishing",
+        "visitor_orphan_reaped",
+        "visitor_orphan_reaped",
+        "established",
+    ]
+    reaped_events = [event for event in connection.events if event.event == "visitor_orphan_reaped"]
+    assert {event.detail for event in reaped_events} == {"4321", "4322"}
+    assert all(event.reason == "prior_cli_exited" for event in reaped_events)
+    # And the reconciliation pass really did run at THIS visitor's own spawn,
+    # for the exact configured frpc binary -- not some other invocation.
+    assert harness.reconciliation_calls == ["frpc"]
+
+
+def test_no_orphans_means_no_visitor_orphan_reaped_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sabotage twin: an empty reconciliation result adds nothing to the ledger."""
+    _set_frp_env(monkeypatch)
+    harness = _install(monkeypatch, _Harness())
+
+    connection = _connect(tmp_path, harness)
+
+    assert [event.event for event in connection.events] == ["establishing", "established"]
+    assert harness.reconciliation_calls == ["frpc"]
+
+
+def test_real_interpreter_exit_kills_the_injected_visitor_process(tmp_path: Path) -> None:
+    """The one REQUIRED subprocess-based test (#285): a real exit, not a direct call.
+
+    Every test above proves the hook's own logic by calling it directly --
+    that only shows the function works, never that Python's interpreter
+    actually invokes it unprompted at real process exit. This spawns a real
+    child interpreter that establishes one brokered_tcp connection over the
+    exact injected-factory pattern this file's own harness uses (a fake
+    ``frpc`` process recording terminate()/kill() by printing a marker), lets
+    the script fall off the end WITHOUT calling close()/close_all() itself,
+    and asserts the marker still appears -- proof the atexit hook the
+    registry armed on that connection's own creation actually ran.
+    """
+    script = _EXIT_KILL_SUBPROCESS_SOURCE
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+    assert "ESTABLISHED" in completed.stdout
+    assert "VISITOR_TERMINATED" in completed.stdout, completed.stdout
 
 
 def test_visitor_exit_message_prefixes_mode_visitor_type_and_cluster(
