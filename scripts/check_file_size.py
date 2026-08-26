@@ -2006,7 +2006,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 77.22
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% floored when first recorded). May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 62.06
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 62.25
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

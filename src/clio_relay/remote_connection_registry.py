@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 CHANNEL_EVENT_REPORT_SCHEMA: Final = "clio-relay.control-channel-report.v1"
 
+# The evidence class the live owned-session API stamps on its own
+# ``/session-status`` self-report (``http_api_routes_session.py``). Kept as a
+# named constant here because :func:`verify_bootstrap` branches on it.
+LIVE_API_SELF_REPORT_EVIDENCE: Final = "live_api_self_report"
+
 
 def verify_bootstrap(
     bootstrap: OwnedSessionChannelBootstrap,
@@ -54,6 +59,17 @@ def verify_bootstrap(
     ``running is not True`` check right after, so appending the lease check
     later would silently lose the typed reason behind the generic
     ``RelayError`` this function raises next.
+
+    Verification is evidence-class aware. The ssh-carried status executor
+    performs the cluster-local filesystem/process ownership audit and reports
+    ``ownership_verified``; the brokered modes fetch the live API's
+    ``/session-status`` self-report instead (``evidence:
+    live_api_self_report``), which deliberately does NOT claim that audit --
+    for that evidence class the audit fact is not demanded here, because the
+    responder's identity is proven by the identity-first challenge plus the
+    identity-bound stream re-proof establishment always runs. Every other
+    fact (owner, cluster, session, generation, running, port) is demanded of
+    both classes, and the refusal names exactly which check(s) failed.
     """
     status = bootstrap.status
     raise_if_lease_expired(
@@ -63,20 +79,35 @@ def verify_bootstrap(
         status=status,
     )
     remote_api_port_reported = status.get("remote_api_port")
-    if (
-        status.get("owner") != "clio-relay"
-        or status.get("cluster") != definition.name
-        or status.get("session_id") != session_id
-        or status.get("session_generation_id") != generation_id
-        or status.get("running") is not True
-        or status.get("ownership_verified") is not True
-        or isinstance(remote_api_port_reported, bool)
-        or not isinstance(remote_api_port_reported, int)
-        or not 1 <= remote_api_port_reported <= 65_535
-    ):
+    checks: list[tuple[str, bool]] = [
+        ("owner", status.get("owner") == "clio-relay"),
+        ("cluster", status.get("cluster") == definition.name),
+        ("session_id", status.get("session_id") == session_id),
+        ("session_generation_id", status.get("session_generation_id") == generation_id),
+        ("running", status.get("running") is True),
+        (
+            "remote_api_port",
+            not isinstance(remote_api_port_reported, bool)
+            and isinstance(remote_api_port_reported, int)
+            and 1 <= remote_api_port_reported <= 65_535,
+        ),
+    ]
+    # Evidence-class-aware ownership check: ``ownership_verified`` is a
+    # cluster-local filesystem/process audit fact that only the ssh-carried
+    # status executor can produce. The brokered modes' status document is the
+    # live API describing itself (``http_api_routes_session.py``'s
+    # ``/session-status``, ``evidence: live_api_self_report``) -- it honestly
+    # refuses to claim the audit it cannot perform, and its identity is proven
+    # instead by the identity-first challenge plus the identity-bound stream
+    # re-proof that establishment always runs. Demanding the audit fact of the
+    # self-report evidence class made brokered attach permanently unverifiable.
+    if status.get("evidence") != LIVE_API_SELF_REPORT_EVIDENCE:
+        checks.append(("ownership_verified", status.get("ownership_verified") is True))
+    failed_checks = [name for name, passed in checks if not passed]
+    if failed_checks:
         raise RelayError(
             "remote relay session is not the active, ownership-verified generation requested "
-            f"for {definition.name}/{session_id}"
+            f"for {definition.name}/{session_id}; failed check(s): {', '.join(failed_checks)}"
         )
     if remote_api_port_reported != remote_api_port:
         raise RelayError(
