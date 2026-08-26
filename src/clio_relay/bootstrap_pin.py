@@ -21,7 +21,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-from clio_relay.cluster_config import ClusterRegistry
+from clio_relay.cluster_config import ClusterRegistry, ClusterTargetIdentity
+from clio_relay.errors import ConfigurationError
 
 BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE = "$HOME/.local/bin/clio-relay"
 """Stable launcher published by bootstrap (``uv tool dir --bin``/clio-relay).
@@ -136,4 +137,133 @@ def reconcile_cluster_runtime_pin(
             "before": previous_receipt,
             "after": definition.relay_install_receipt,
         },
+    }
+
+
+TARGET_IDENTITY_PIN_SCHEMA = "clio-relay.bootstrap-target-identity-pin.v1"
+
+
+def pin_cluster_target_identity_from_one_pass_observation(
+    *,
+    cluster: str,
+    registry_path: Path,
+    observed_hostnames: list[str],
+    observed_site_marker_sha256: str | None,
+    ssh_host_key_sha256: list[str],
+) -> dict[str, object]:
+    """Pin a physical target identity a cold one-pass bootstrap just observed.
+
+    clio-relay#209: closes the ``cluster pin-target`` manual-entry gap. Only
+    fills a MISSING pin -- an operator-pinned identity that already exists is
+    never overwritten by an in-session observation (the same
+    proven-before-repaired discipline ``reconcile_cluster_runtime_pin``
+    documents: an existing value is deliberate until proven otherwise, not
+    merely different). When a pin already exists this is a no-op; the
+    caller's existing ``cli_remote_worker_probe._remote_target_identity``
+    verification-only dial still runs for that case.
+
+    ``observed_hostnames`` should already be the UNION of what the remote
+    observation reported and the operator's own configured ssh alias/cluster
+    name for this cluster (clio-relay#209 M2) -- freezing the pin to only
+    whatever ONE login node happened to answer with can lock an operator out
+    the next time a round-robin cluster routes them to a different node; the
+    caller composes that union, this function just persists it.
+
+    ``ssh_host_key_sha256`` must already be resolved by the caller from
+    locally cached host keys (``ssh-keyscan``/``ssh-keygen`` against
+    ``~/.ssh/known_hosts`` -- never authenticates against the target, so it
+    never costs a dial); this function performs no I/O beyond the registry
+    mutation.
+    """
+    before: dict[str, object] = {}
+
+    def update(registry: ClusterRegistry) -> None:
+        definition = registry.require(cluster)
+        if definition.target_identity is not None:
+            before["action"] = "unchanged"
+            return
+        before["action"] = "pinned"
+        definition.target_identity = ClusterTargetIdentity(
+            hostnames=observed_hostnames,
+            ssh_host_key_sha256=ssh_host_key_sha256,
+            scheduler_cluster_name=None,
+            site_marker_sha256=observed_site_marker_sha256,
+        )
+
+    registry = ClusterRegistry.mutate(registry_path, update)
+    definition = registry.require(cluster)
+    return {
+        "schema_version": TARGET_IDENTITY_PIN_SCHEMA,
+        "cluster": cluster,
+        "action": before["action"],
+        "target_identity": (
+            definition.target_identity.model_dump(mode="json")
+            if definition.target_identity is not None
+            else None
+        ),
+    }
+
+
+def verify_one_pass_target_identity_against_pin(
+    *,
+    target_identity: ClusterTargetIdentity,
+    observed_hostnames: list[str],
+    observed_site_marker_sha256: str | None,
+    ssh_host_key_sha256: list[str],
+) -> dict[str, object]:
+    """Verify a fresh one-pass observation against an operator's EXISTING pin, locally.
+
+    clio-relay#209 M1: with a cluster ALREADY pinned (the documented steady
+    state ``cluster pin-target`` produces), a cold bootstrap used to still
+    dial ``cli_remote_worker_probe._remote_target_identity`` a THIRD time to
+    re-derive evidence the one-pass script had already observed in the SAME
+    session. Every field this observation can prove is compared locally
+    instead -- hostnames, ssh host keys (resolved by the caller from cached
+    ``known_hosts``/``ssh-keyscan``, never a dial), and the site marker when
+    pinned -- so a cold bootstrap costs exactly two ssh dials whether or not
+    the cluster is already pinned.
+
+    Caller contract: only call this when
+    ``target_identity.scheduler_cluster_name is None``. A pinned
+    ``scheduler_cluster_name`` cannot be verified from this observation (it
+    needs the full scheduler-provider registry, unavailable to a raw shell)
+    -- the caller must fall back to the dial-based
+    ``_remote_target_identity`` re-verification in that case, which can
+    check it, rather than silently skip a field the operator explicitly
+    pinned.
+
+    Raises:
+        ConfigurationError: If any field this function CAN check disagrees
+            with the pin.
+    """
+    if target_identity.scheduler_cluster_name is not None:
+        raise ConfigurationError(
+            "local one-pass verification cannot check a pinned scheduler_cluster_name "
+            "-- the caller must use the dial-based re-verification for this cluster"
+        )
+    if not set(observed_hostnames).intersection(target_identity.hostnames):
+        raise ConfigurationError(
+            "observed hostname does not match the operator-pinned cluster identity: "
+            f"observed={sorted(observed_hostnames)!r} expected={target_identity.hostnames!r}"
+        )
+    if not set(ssh_host_key_sha256).intersection(target_identity.ssh_host_key_sha256):
+        raise ConfigurationError(
+            "observed SSH host keys do not match the operator-pinned cluster target identity"
+        )
+    if (
+        target_identity.site_marker_sha256 is not None
+        and observed_site_marker_sha256 != target_identity.site_marker_sha256
+    ):
+        raise ConfigurationError("observed site marker does not match cluster target identity")
+    return {
+        "verified": True,
+        "source": "one_pass_observation",
+        "observed_hostnames": observed_hostnames,
+        "observed_ssh_host_key_sha256": ssh_host_key_sha256,
+        "observed_site_marker_sha256": observed_site_marker_sha256,
+        "expected_hostnames": target_identity.hostnames,
+        "expected_ssh_host_key_sha256": target_identity.ssh_host_key_sha256,
+        "expected_site_marker_sha256": target_identity.site_marker_sha256,
+        "scheduler_cluster_name": None,
+        "scheduler_cluster_name_note": "unpinned; not checked",
     }

@@ -163,7 +163,15 @@ RATCHET_BASELINE: dict[str, int] = {
     # activation_staging.py/bootstrap_acceptance.py/bootstrap_provider_
     # build_info.py family -- still above DEFAULT_MAX_LINES (800), so the
     # entry stays, ratcheted down from 8379.
-    "src/clio_relay/bootstrap.py": 925,
+    # clio-relay#209 one-pass cold bootstrap (adversarial-review L4):
+    # +1 line importing BOOTSTRAP_PERSISTENT_RECEIPT_PATH from
+    # bootstrap_constants.py so `_verify_persistent_bootstrap_receipt`'s
+    # `cat` target and the new one-pass script's own in-session re-read
+    # (bootstrap_one_pass_script.py) name the identical remote path from
+    # ONE source of truth, instead of the same literal duplicated in two
+    # files with no guard against them drifting apart. A justified,
+    # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
+    "src/clio_relay/bootstrap.py": 926,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     #

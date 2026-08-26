@@ -155,6 +155,47 @@ def test_bounded_process_preserves_output_limit_while_large_stdin_is_blocked() -
         )
 
 
+def test_bounded_process_surfaces_real_exit_status_when_child_exits_mid_stdin_write() -> None:
+    """clio-relay#209 H1: an early child exit must not mask its own exit status.
+
+    A large stdin payload (the one-pass cold bootstrap script routinely runs
+    to tens of megabytes) streams through a writer thread. If the child
+    fails fast -- reads only a small prefix and exits with an error -- the
+    writer thread's remaining write() hits a broken pipe. Before this fix
+    that broken pipe was reported as a generic
+    "process stdin could not be written" `BoundedProcessError`, discarding
+    the child's real exit code AND its already-drained stderr explaining
+    WHY (proven against bootstrap_one_pass_script.py's caller: a mkdir
+    collision on the remote end was reported to the operator as an opaque
+    transport failure instead of "mkdir: File exists"). The fix: once the
+    child has already exited, a stdin write failure is a SYMPTOM, not an
+    independent failure -- fall through to the real returncode/stderr.
+    """
+    payload = b"x" * (32 * 1024 * 1024)
+    source = (
+        "import sys\n"
+        "sys.stdin.buffer.read(64)\n"
+        "sys.stderr.write('simulated early remote failure: mkdir: File exists')\n"
+        "sys.exit(37)\n"
+    )
+
+    result = run_bounded_process(
+        [sys.executable, "-c", source],
+        input_bytes=payload,
+        timeout_seconds=30,
+        stdout_maximum_bytes=1024,
+        stderr_maximum_bytes=1024,
+        require_enforceable=sys.platform == "win32",
+    )
+
+    # The exact numeric code is platform-containment-dependent (Windows job-
+    # object/broker wrapping can translate it); what matters -- and what was
+    # lost before this fix, replaced by a generic BoundedProcessError -- is
+    # that SOME real failure status and the child's own stderr both survive.
+    assert result.returncode != 0
+    assert "simulated early remote failure: mkdir: File exists" in result.stderr
+
+
 def test_bounded_process_does_not_hide_failed_startup_cleanup(
     monkeypatch: MonkeyPatch,
 ) -> None:

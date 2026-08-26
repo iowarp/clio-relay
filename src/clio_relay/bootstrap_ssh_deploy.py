@@ -3,8 +3,7 @@
 Split from bootstrap.py (clio-relay#255). ``_bootstrap_preflight_over_ssh``
 asks an already-installed relay to verify/repair its exact desired state
 without a payload; ``bootstrap_cluster_over_ssh`` is the full
-install-or-reconcile round trip (preflight, archive/script build, upload,
-remote execute, receipt verify). Both call back into ``clio_relay.bootstrap``
+install-or-reconcile round trip. Both call back into ``clio_relay.bootstrap``
 via a *qualified*, call-time module attribute lookup
 (``bootstrap.<name>(...)``) for every collaborator bootstrap.py's own test
 suite monkeypatches (``_run``, ``create_bootstrap_archive``,
@@ -17,6 +16,28 @@ or that simply still live there (``bootstrap_relay_identity``,
 ``monkeypatch.setattr(bootstrap, "X", ...)`` in the existing test suite keeps
 reaching the real call site. This is the same forwarder idiom cli.py's
 R8(ii) decomposition established.
+
+**One-pass cold install (clio-relay#209).** When preflight reports
+``payload_required`` -- a cold target -- the archive build, install-script
+render, and the actual remote install used to cost SIX further separate ssh/
+scp dials (mkdir staging, two scp uploads, the remote script invocation, a
+receipt-``cat`` verification, and a cleanup ``rm -rf``); on a 2FA-gated
+cluster that is six more authentications for what the ssh-budget doctrine
+(docs/connection-model.md:141-157) caps at one combined setup pass. Those six
+steps are now composed as ONE ``bash -s`` stdin script by
+``bootstrap_one_pass_script.render_one_pass_cold_bootstrap_script`` (payloads
+travel inline as base64 blocks, never a second dial) and issued as a single
+``bootstrap._run([...])`` call; its framed stdout is parsed by
+``bootstrap_one_pass_script.parse_one_pass_persistent_receipt``/
+``parse_one_pass_target_identity``, which also fold in what used to be the
+receipt-``cat`` dial and a separate target-identity probe dial. A cold
+bootstrap therefore costs exactly two ssh dials end to end: the preflight
+discovery dial (unchanged, needed to tell warm from cold) and this one
+combined install pass -- see ``tests/test_bootstrap_preflight_transport.py``'s
+dial-count conformance test. The warm no-op fast path (below,
+``preflight_receipt is not None``) is untouched and stays at its existing two
+dials (preflight + the unchanged ``_verify_persistent_bootstrap_receipt``
+re-verification).
 """
 
 from __future__ import annotations
@@ -39,6 +60,11 @@ from clio_relay.bootstrap_constants import (
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
     FRP_VERSION,
+)
+from clio_relay.bootstrap_one_pass_script import (
+    parse_one_pass_persistent_receipt,
+    parse_one_pass_target_identity,
+    render_one_pass_cold_bootstrap_script,
 )
 from clio_relay.bootstrap_receipt_classifier_source import (
     _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE,
@@ -311,8 +337,8 @@ def bootstrap_cluster_over_ssh(
         relay_wheel=relay_wheel,
         relay_artifact_sha256=relay_artifact_sha256,
     )
-    if shutil.which("ssh") is None or shutil.which("scp") is None:
-        raise ConfigurationError("ssh and scp are required for remote bootstrap")
+    if shutil.which("ssh") is None:
+        raise ConfigurationError("ssh is required for remote bootstrap")
     expected_desired_state = bootstrap._bootstrap_desired_state(
         identity=planned_identity,
         cluster=cluster,
@@ -408,121 +434,106 @@ def bootstrap_cluster_over_ssh(
             raise ConfigurationError("relay bootstrap wheel SHA-256 does not match its pin")
     remote_root = f"/tmp/clio-relay-{invocation_id}"
     remote_archive = f"{remote_root}/clio-relay-head.tar"
-    remote_script = f"{remote_root}/clio-relay-bootstrap.sh"
-    remote_created = False
-    primary_error: BaseException | None = None
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        archive = temp_path / "clio-relay-head.tar"
+        deployment = bootstrap.create_bootstrap_archive(
+            source_root=source_root,
+            archive=archive,
+            relay_wheel=relay_wheel,
+        )
+        rebound_identity = bootstrap.bootstrap_relay_identity(
+            source_root=source_root,
+            relay_wheel=relay_wheel,
+            relay_artifact_sha256=relay_artifact_sha256,
+        )
+        if rebound_identity != planned_identity or (
+            deployment.install_spec != planned_identity.transport_install_spec
+        ):
+            raise ConfigurationError(
+                "bootstrap source identity changed between preflight and payload build"
+            )
+        source_archive_sha256 = bootstrap._sha256_regular_file(deployment.archive)
+        install_script = bootstrap.render_linux_user_bootstrap_script(
+            frp_version=frp_version,
+            cluster=cluster,
+            core_dir=core_dir,
+            spool_dir=spool_dir,
+            agent_adapter=agent_adapter,
+            agent_npm_package=agent_npm_package,
+            agent_npm_bin=agent_npm_bin,
+            agent_args=agent_args or [],
+            jarvis_resource_graph_profile=jarvis_resource_graph_profile,
+            allow_jarvis_resource_graph_build=allow_jarvis_resource_graph_build,
+            relay_install_spec=deployment.install_spec,
+            relay_deployment_install_spec=planned_identity.install_spec,
+            relay_artifact_sha256=planned_identity.deployment_artifact_sha256,
+            relay_source_identity=planned_identity.source_identity,
+            invocation_id=invocation_id,
+            source_archive=remote_archive,
+            source_archive_sha256=source_archive_sha256,
+        )
+        archive_bytes = deployment.archive.read_bytes()
+    # clio-relay#209: mkdir staging, the two scp uploads, the remote install
+    # invocation, the receipt-cat verification, and the staging cleanup are
+    # now ONE combined ssh dial -- the payloads travel inline on this same
+    # stdin pass, never a second connection. The remote script self-cleans
+    # its own staging directory via an EXIT trap on any outcome.
+    one_pass_script = render_one_pass_cold_bootstrap_script(
+        remote_root=remote_root,
+        archive_bytes=archive_bytes,
+        install_script=install_script,
+    )
+    result = bootstrap._run(
+        ["ssh", ssh_host, "bash", "-s"],
+        input_bytes=one_pass_script.encode("utf-8"),
+        timeout_seconds=BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS,
+    )
+    output_lines = result.stdout.splitlines()
+    receipt_lines = [
+        line.removeprefix("bootstrap_receipt_json=")
+        for line in output_lines
+        if line.startswith("bootstrap_receipt_json=")
+    ]
+    if len(receipt_lines) != 1:
+        raise RelayError(
+            "bootstrap output must contain exactly one current invocation receipt, "
+            f"observed {len(receipt_lines)}"
+        )
+    if len(receipt_lines[0].encode("utf-8")) > 1024 * 1024:
+        raise RelayError("bootstrap stdout receipt exceeds the bounded size")
     try:
-        bootstrap._run(
-            [
-                "ssh",
-                ssh_host,
-                "bash",
-                "-c",
-                f"umask 077; mkdir -- {shlex.quote(remote_root)}; "
-                f"chmod 700 -- {shlex.quote(remote_root)}",
-            ]
-        )
-        remote_created = True
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            archive = temp_path / "clio-relay-head.tar"
-            script_path = temp_path / "clio-relay-bootstrap.sh"
-            deployment = bootstrap.create_bootstrap_archive(
-                source_root=source_root,
-                archive=archive,
-                relay_wheel=relay_wheel,
-            )
-            rebound_identity = bootstrap.bootstrap_relay_identity(
-                source_root=source_root,
-                relay_wheel=relay_wheel,
-                relay_artifact_sha256=relay_artifact_sha256,
-            )
-            if rebound_identity != planned_identity or (
-                deployment.install_spec != planned_identity.transport_install_spec
-            ):
-                raise ConfigurationError(
-                    "bootstrap source identity changed between preflight and payload build"
-                )
-            source_archive_sha256 = bootstrap._sha256_regular_file(deployment.archive)
-            bootstrap._run(["scp", str(deployment.archive), f"{ssh_host}:{remote_archive}"])
-            script_path.write_text(
-                bootstrap.render_linux_user_bootstrap_script(
-                    frp_version=frp_version,
-                    cluster=cluster,
-                    core_dir=core_dir,
-                    spool_dir=spool_dir,
-                    agent_adapter=agent_adapter,
-                    agent_npm_package=agent_npm_package,
-                    agent_npm_bin=agent_npm_bin,
-                    agent_args=agent_args or [],
-                    jarvis_resource_graph_profile=jarvis_resource_graph_profile,
-                    allow_jarvis_resource_graph_build=allow_jarvis_resource_graph_build,
-                    relay_install_spec=deployment.install_spec,
-                    relay_deployment_install_spec=planned_identity.install_spec,
-                    relay_artifact_sha256=planned_identity.deployment_artifact_sha256,
-                    relay_source_identity=planned_identity.source_identity,
-                    invocation_id=invocation_id,
-                    source_archive=remote_archive,
-                    source_archive_sha256=source_archive_sha256,
-                ),
-                encoding="utf-8",
-                newline="\n",
-            )
-            bootstrap._run(["scp", str(script_path), f"{ssh_host}:{remote_script}"])
-        result = bootstrap._run(
-            ["ssh", ssh_host, "bash", remote_script],
-            timeout_seconds=BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS,
-        )
-        receipt_lines = [
-            line.removeprefix("bootstrap_receipt_json=")
-            for line in result.stdout.splitlines()
-            if line.startswith("bootstrap_receipt_json=")
-        ]
-        if len(receipt_lines) != 1:
-            raise RelayError(
-                "bootstrap output must contain exactly one current invocation receipt, "
-                f"observed {len(receipt_lines)}"
-            )
-        if len(receipt_lines[0].encode("utf-8")) > 1024 * 1024:
-            raise RelayError("bootstrap stdout receipt exceeds the bounded size")
-        try:
-            raw_receipt = cast(object, json.loads(receipt_lines[0]))
-        except json.JSONDecodeError as exc:
-            raise RelayError(f"bootstrap receipt was not valid JSON: {exc}") from exc
-        if not isinstance(raw_receipt, dict):
-            raise RelayError("bootstrap receipt was not a JSON object")
-        receipt = cast(dict[str, object], raw_receipt)
-        if receipt.get("invocation_id") != invocation_id:
-            raise RelayError("bootstrap receipt does not match the completed invocation")
-        bootstrap_receipt_validation.validate_bootstrap_receipt(
-            receipt,
-            bootstrap_profile=bootstrap_profile,
-            relay_install_spec=planned_identity.install_spec,
-            desired_fingerprint=expected_desired_state.fingerprint,
-            expected_jarvis_resource_graph_profile=(
-                expected_desired_state.jarvis_resource_graph_profile
-            ),
-            expected_allow_jarvis_resource_graph_build=(
-                expected_desired_state.allow_jarvis_resource_graph_build
-            ),
-            expected_worker_service=(
-                endpoint_user_service_name(cluster) if cluster is not None else None
-            ),
-        )
-        bootstrap._verify_persistent_bootstrap_receipt(
-            ssh_host=ssh_host,
-            receipt=receipt,
-            timeout_seconds=10,
-        )
-        return result.stdout.splitlines()
-    except BaseException as error:
-        primary_error = error
-        raise
-    finally:
-        if remote_created:
-            try:
-                bootstrap._run(["ssh", ssh_host, "rm", "-rf", "--", remote_root])
-            except RelayError as cleanup_error:
-                if primary_error is None:
-                    raise
-                primary_error.add_note(f"remote bootstrap staging cleanup failed: {cleanup_error}")
+        raw_receipt = cast(object, json.loads(receipt_lines[0]))
+    except json.JSONDecodeError as exc:
+        raise RelayError(f"bootstrap receipt was not valid JSON: {exc}") from exc
+    if not isinstance(raw_receipt, dict):
+        raise RelayError("bootstrap receipt was not a JSON object")
+    receipt = cast(dict[str, object], raw_receipt)
+    if receipt.get("invocation_id") != invocation_id:
+        raise RelayError("bootstrap receipt does not match the completed invocation")
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
+        receipt,
+        bootstrap_profile=bootstrap_profile,
+        relay_install_spec=planned_identity.install_spec,
+        desired_fingerprint=expected_desired_state.fingerprint,
+        expected_jarvis_resource_graph_profile=(
+            expected_desired_state.jarvis_resource_graph_profile
+        ),
+        expected_allow_jarvis_resource_graph_build=(
+            expected_desired_state.allow_jarvis_resource_graph_build
+        ),
+        expected_worker_service=(
+            endpoint_user_service_name(cluster) if cluster is not None else None
+        ),
+    )
+    # Folds in what used to be a separate `ssh ... cat bootstrap-receipt.json`
+    # dial: the one-pass script already re-read the persistent file itself,
+    # in the same session, and framed it on stdout.
+    parse_one_pass_persistent_receipt(output_lines, receipt=receipt)
+    # Folds in what used to be a separate target-identity probe dial
+    # (`cli_remote_worker_probe._remote_target_identity`): the physical
+    # identity is observed here, inside the same session that just installed
+    # the relay. Returned to the caller as an extra framed line so it can be
+    # pinned into the cluster registry without a further dial.
+    parse_one_pass_target_identity(output_lines)
+    return output_lines

@@ -230,6 +230,28 @@ effective `UserKnownHostsFile` entries from `ssh -G` (including hashed entries
 and nondefault ports), then uses a bounded `ssh-keyscan` only when no configured
 key is available.
 
+A COLD `cluster bootstrap` (nothing pinned yet) fills a missing target-identity
+pin automatically from the same one-pass install session, instead of requiring
+`pin-target` first: this is trust-on-first-use over the one authenticated
+session that just installed the relay, not a verification, and the receipt and
+registry both mark it that way (`trust: first_use`, never `verified`) rather
+than reusing the verified state a real re-check produces. The bootstrap output
+names exactly what got pinned -- hostnames, SSH host-key fingerprints, and the
+site marker -- so the operator can compare it out-of-band before trusting it
+further; the fingerprint source is also reported, since a fingerprint already
+present in `known_hosts` (the operator's own ssh client already accepted it) is
+materially more trustworthy than one observed fresh through a bare
+`ssh-keyscan` fallback, which does not authenticate the host at all. The pinned
+hostnames are the union of what the remote observed and the cluster's own
+configured ssh alias/name, so a round-robin cluster's next login node cannot
+lock the operator out of their own pin. An identity ALREADY pinned (by
+`pin-target`, or by an earlier bootstrap's first-use pin) is never silently
+replaced by a later observation -- run `cluster pin-target` explicitly to
+assert a different identity out-of-band. `scheduler_cluster_name` is never
+learned this way (it needs the full scheduler-provider registry, unavailable
+from inside the remote install session) and stays unpinned until an operator
+sets it directly with `pin-target`.
+
 ### manage system software and external application plugins
 
 The generic `linux-user` bootstrap installs relay, transport, JARVIS, and

@@ -386,6 +386,18 @@ recognize the shape.
   `event_report()`, and `close_all()` exist and are covered by tests, but no
   door calls them, so a dropped channel surfaces as a typed failure rather than
   a recovery a user can authorize.
+- **A cold `cluster bootstrap` still costs two ssh dials, not the one deploy
+  connection mode (c)'s budget assumes for the deploy step.**
+  [#209](https://github.com/iowarp/clio-relay/issues/209) folded the six
+  dials a cold install used to open after preflight (mkdir staging, two scp
+  uploads, the remote install invocation, a receipt-cat verification, and a
+  cleanup) — plus a separate target-identity probe — into ONE combined
+  `ssh ... bash -s` pass; that pass still runs alongside the pre-existing,
+  separate lightweight preflight dial that tells warm from cold, so a cold
+  bootstrap is two ssh sessions on its own, before the one held forward this
+  page's mode (c) budget adds on top. #209's remaining scope is folding
+  discovery into the same single pass so the whole deploy step fits the one
+  connection this budget was written for.
 - **`brokered_tcp`/`udp_rendezvous`'s identity anchor is weaker than an
   ssh-authenticated bring-up.** Mode (c) carries its bring-up identity document
   over the ssh-authenticated act that establishes the channel; modes (a)/(b)

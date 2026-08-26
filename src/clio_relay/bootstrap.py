@@ -36,6 +36,7 @@ from clio_relay.bootstrap_candidate_uv_install_source import (
     _bootstrap_candidate_package_sources,
 )
 from clio_relay.bootstrap_constants import (
+    BOOTSTRAP_PERSISTENT_RECEIPT_PATH,
     BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS,  # noqa: F401 -- re-exported facade surface
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
@@ -309,7 +310,7 @@ def _verify_persistent_bootstrap_receipt(
             "ssh",
             ssh_host,
             "cat",
-            "$HOME/.local/share/clio-relay/bootstrap-receipt.json",
+            BOOTSTRAP_PERSISTENT_RECEIPT_PATH,
         ],
         timeout_seconds=min(10, timeout_seconds),
         stdout_maximum_bytes=1024 * 1024,
