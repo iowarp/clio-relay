@@ -45,6 +45,7 @@ from __future__ import annotations
 import hmac
 import http.client
 import json
+import logging
 import urllib.parse
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -58,7 +59,22 @@ from clio_relay.job_identity import (
     SESSION_GENERATION_ID_HEADER,
 )
 
+logger = logging.getLogger(__name__)
+
 MAX_SESSION_API_RESPONSE_BYTES: Final = 8 * 1024 * 1024
+
+#: clio-relay#221/#259 adversarial review (D1): a job quiet for as long as
+#: the connection's ordinary bring-up/request timeout (proven live at 30s)
+#: previously tripped the pooled stream's socket timeout mid-SSE-read,
+#: surfacing as a false ChannelDropped -> a 2FA reconnect prompt over a
+#: channel that was never actually gone. The server side now emits a
+#: keepalive comment at least every 10s
+#: (``http_api_streaming.LOG_SSE_KEEPALIVE_INTERVAL_SECONDS``); this is
+#: widened well past that -- generous margin for network jitter -- but
+#: still bounded (never an unbounded/None timeout), so a GENUINELY dead
+#: connection is still caught, just not mistaken for one during an
+#: ordinary quiet stretch.
+LOG_SSE_STREAM_TIMEOUT_SECONDS: Final = 60.0
 
 # clio-relay#213: the closed set of exceptions `_request_json_on_stream` wraps and
 # chains that mean the *stream* died at the OS level (idle-closed, reset, a bad
@@ -280,12 +296,31 @@ def _stream_sse_frames_on_stream(
     instead of being read whole. A frame dispatches on its blank-line
     terminator, matching the SSE spec's own framing; only frames carrying a
     ``data:`` field are dispatched (a bare ``id:``/comment-only frame is
-    swallowed, exactly as a browser ``EventSource`` would).
+    swallowed, exactly as a browser ``EventSource`` would -- this is also
+    how the server's own ``: keepalive`` comments (D1) are tolerated: they
+    never reach ``data:``, so they never dispatch a frame at all).
+
+    clio-relay#221/#259 adversarial review (D1): widens the stream's socket
+    timeout to :data:`LOG_SSE_STREAM_TIMEOUT_SECONDS` for the duration of
+    this read, using the identical save/restore-in-``finally`` discipline
+    :func:`_request_json_on_stream` already uses for its own
+    ``response_timeout_seconds`` -- the connection's ordinary bring-up
+    timeout is far too tight for a job that is merely quiet.
+
+    clio-relay#221/#259 adversarial review (D8): each line is read with
+    :data:`MAX_SESSION_API_RESPONSE_BYTES` as a hard cap
+    (``response.readline(limit)``); a line that reaches the cap without a
+    terminator is a typed :class:`RelayError`, never silently truncated or
+    read forever. The bytes accumulated across one frame's ``data:`` lines
+    are capped the same way, mirroring the same byte-budget discipline
+    :func:`read_json_response` already applies to a whole JSON response.
 
     Raises:
-        RelayError: The request could not be sent, or the initial response
-            was not HTTP 200 -- the same two conditions
-            :func:`_request_json_on_stream` itself would raise for.
+        RelayError: The request could not be sent, the initial response was
+            not HTTP 200 (the same two conditions
+            :func:`_request_json_on_stream` itself would raise for), a line
+            exceeded its byte cap without a terminator, or one frame's
+            accumulated ``data:`` bytes exceeded their cap.
         ChannelDropped: The stream failed -- or the peer closed it -- after
             the response began, before an ``event: end`` frame was seen. A
             clean finish is the caller's own ``end`` frame; anything else
@@ -300,58 +335,94 @@ def _stream_sse_frames_on_stream(
         OWNER_SESSION_ID_HEADER: session_id,
         SESSION_GENERATION_ID_HEADER: generation_id,
     }
+    proven_socket = stream.sock
+    prior_connection_timeout = stream.timeout
+    prior_socket_timeout: float | None = None
+    timeout_widened = False
     try:
-        stream.request(method, path + encoded_query, headers=headers)
-        response = stream.getresponse()
-    except (OSError, http.client.HTTPException) as exc:
-        raise RelayError(
-            f"owned session API stream request failed for {method} {path}: {exc}"
-        ) from exc
-    if response.status != 200:
-        document = read_json_response(response, label=f"{method} {path}")
-        detail = json.dumps(document, ensure_ascii=False)[:2_000]
-        raise RelayError(
-            f"owned session API stream request failed: {method} {path}: "
-            f"HTTP {response.status}: {detail}"
-        )
-    event_type = "message"
-    data_lines: list[str] = []
-    event_id: str | None = None
-    try:
-        while True:
-            raw_line = response.readline()
-            if not raw_line:
-                # The peer closed the body before an explicit `end` frame --
-                # a drop, not a clean finish. A clean finish returns from
-                # this generator normally, right after yielding that frame
-                # below; this is the ONLY other way the loop ends.
-                raise ChannelDropped(
-                    f"owned session API stream closed unexpectedly: {method} {path}"
-                )
-            line = raw_line.decode("utf-8", errors="replace")
-            line = line[:-1] if line.endswith("\n") else line
-            line = line[:-1] if line.endswith("\r") else line
-            if line == "":
-                if data_lines:
-                    yield SseFrame(event=event_type, data="\n".join(data_lines), id=event_id)
-                    if event_type == "end":
-                        return
-                event_type = "message"
-                data_lines = []
-                event_id = None
-                continue
-            if line.startswith(":"):
-                continue  # SSE comment/keepalive line -- never a field.
-            if line.startswith("data:"):
-                data_lines.append(_sse_field_value(line, prefix="data:"))
-            elif line.startswith("event:"):
-                event_type = _sse_field_value(line, prefix="event:")
-            elif line.startswith("id:"):
-                event_id = _sse_field_value(line, prefix="id:")
-    except (OSError, http.client.HTTPException) as exc:
-        raise ChannelDropped(
-            f"owned session API stream read failed for {method} {path}: {exc}"
-        ) from exc
+        if proven_socket is not None:
+            prior_socket_timeout = proven_socket.gettimeout()
+            stream.timeout = LOG_SSE_STREAM_TIMEOUT_SECONDS
+            proven_socket.settimeout(LOG_SSE_STREAM_TIMEOUT_SECONDS)
+            timeout_widened = True
+        try:
+            stream.request(method, path + encoded_query, headers=headers)
+            response = stream.getresponse()
+        except (OSError, http.client.HTTPException) as exc:
+            raise RelayError(
+                f"owned session API stream request failed for {method} {path}: {exc}"
+            ) from exc
+        if response.status != 200:
+            document = read_json_response(response, label=f"{method} {path}")
+            detail = json.dumps(document, ensure_ascii=False)[:2_000]
+            raise RelayError(
+                f"owned session API stream request failed: {method} {path}: "
+                f"HTTP {response.status}: {detail}"
+            )
+        event_type = "message"
+        data_lines: list[str] = []
+        data_bytes = 0
+        event_id: str | None = None
+        try:
+            while True:
+                raw_line = response.readline(MAX_SESSION_API_RESPONSE_BYTES)
+                if not raw_line:
+                    # The peer closed the body before an explicit `end`
+                    # frame -- a drop, not a clean finish. A clean finish
+                    # returns from this generator normally, right after
+                    # yielding that frame below; this is the ONLY other way
+                    # the loop ends.
+                    raise ChannelDropped(
+                        f"owned session API stream closed unexpectedly: {method} {path}"
+                    )
+                if not raw_line.endswith(b"\n"):
+                    raise RelayError(
+                        f"owned session API stream line for {method} {path} exceeded "
+                        f"{MAX_SESSION_API_RESPONSE_BYTES} bytes without a terminator"
+                    )
+                line = raw_line.decode("utf-8", errors="replace")
+                line = line[:-1]
+                line = line[:-1] if line.endswith("\r") else line
+                if line == "":
+                    if data_lines:
+                        yield SseFrame(event=event_type, data="\n".join(data_lines), id=event_id)
+                        if event_type == "end":
+                            return
+                    event_type = "message"
+                    data_lines = []
+                    data_bytes = 0
+                    event_id = None
+                    continue
+                if line.startswith(":"):
+                    continue  # SSE comment/keepalive line -- never a field.
+                if line.startswith("data:"):
+                    value = _sse_field_value(line, prefix="data:")
+                    data_bytes += len(value.encode("utf-8"))
+                    if data_bytes > MAX_SESSION_API_RESPONSE_BYTES:
+                        raise RelayError(
+                            f"owned session API stream frame for {method} {path} exceeded "
+                            f"{MAX_SESSION_API_RESPONSE_BYTES} accumulated data bytes"
+                        )
+                    data_lines.append(value)
+                elif line.startswith("event:"):
+                    event_type = _sse_field_value(line, prefix="event:")
+                elif line.startswith("id:"):
+                    event_id = _sse_field_value(line, prefix="id:")
+        except (OSError, http.client.HTTPException) as exc:
+            raise ChannelDropped(
+                f"owned session API stream read failed for {method} {path}: {exc}"
+            ) from exc
+    finally:
+        if timeout_widened:
+            stream.timeout = prior_connection_timeout
+            if stream.sock is proven_socket and proven_socket is not None:
+                try:
+                    proven_socket.settimeout(prior_socket_timeout)
+                except OSError:
+                    # The response may have closed the proven socket. Never
+                    # let HTTPConnection reconnect it under the
+                    # authenticated client.
+                    stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,8 +439,25 @@ class LogStreamChunk:
 
 def _log_stream_chunk_from_frame(
     frame: SseFrame, *, job_id: str, stream_name: str
-) -> LogStreamChunk:
-    """Decode one :func:`_stream_sse_frames_on_stream` frame into a typed chunk."""
+) -> LogStreamChunk | None:
+    """Decode one SSE frame into a typed chunk, or ``None`` to skip an unknown one.
+
+    clio-relay#221/#259 adversarial review (D10): an event type outside
+    ``{"log_chunk", "end"}`` is logged and SKIPPED, never a hard failure --
+    a future server addition to the SSE vocabulary must not retroactively
+    break every already-deployed client reading this same route. Its
+    payload shape is not assumed at all in that case (an unrecognized type
+    could carry anything), so no field validation runs for it.
+    """
+    if frame.event not in {"log_chunk", "end"}:
+        logger.warning(
+            "clio-relay: owned session log stream sent an unrecognized SSE event "
+            "type %r for job %s stream %s -- skipped",
+            frame.event,
+            job_id,
+            stream_name,
+        )
+        return None
     try:
         payload: object = json.loads(frame.data) if frame.data else {}
     except json.JSONDecodeError as exc:
@@ -383,9 +471,14 @@ def _log_stream_chunk_from_frame(
         raise RelayError(
             "owned session API log stream frame did not match the requested job/stream"
         )
-    offset_value = typed_payload.get("offset")
+    # clio-relay#221/#259 adversarial review (D4): the wire now carries BOTH
+    # `offset` (where this read started) and `next_offset` (the resumable
+    # position, matching the frame's own `id:` line) -- `LogStreamChunk.
+    # offset` reads `next_offset`, preserving its original "where to
+    # resume from" meaning now that the two are no longer the same field.
+    offset_value = typed_payload.get("next_offset")
     if not isinstance(offset_value, int):
-        raise RelayError("owned session API log stream frame carried an invalid offset")
+        raise RelayError("owned session API log stream frame carried an invalid next_offset")
     if frame.event == "end":
         state = typed_payload.get("state")
         return LogStreamChunk(
@@ -396,8 +489,6 @@ def _log_stream_chunk_from_frame(
             end=True,
             state=state if isinstance(state, str) else None,
         )
-    if frame.event != "log_chunk":
-        raise RelayError(f"owned session API log stream sent an unexpected frame: {frame.event}")
     chunk_text = typed_payload.get("chunk")
     if not isinstance(chunk_text, str):
         raise RelayError("owned session API log stream frame carried no chunk text")
@@ -443,4 +534,6 @@ def _stream_log_chunks_over_stream(
         session_id=session_id,
         generation_id=generation_id,
     ):
-        yield _log_stream_chunk_from_frame(frame, job_id=job_id, stream_name=stream_name)
+        chunk = _log_stream_chunk_from_frame(frame, job_id=job_id, stream_name=stream_name)
+        if chunk is not None:
+            yield chunk

@@ -67,7 +67,7 @@ from clio_relay.remote_mcp import (
     VirtualRemoteMcpTool,
     remote_mcp_registration_revision,
 )
-from clio_relay.spool import JobSpool
+from clio_relay.spool import CONSOLE_OBSERVE_TAIL_LIMIT_BYTES, JobSpool
 
 
 class _SchemaValidator(Protocol):
@@ -1644,6 +1644,17 @@ def test_owned_job_logs_includes_console_streams_alongside_stdout_stderr() -> No
     }
     for stream_name in ("stdout", "stderr", "console", "console_stderr"):
         assert logs[stream_name]["stream"] == stream_name
+    # clio-relay#221/#259 adversarial review (D12): console/console_stderr
+    # are capped at CONSOLE_OBSERVE_TAIL_LIMIT_BYTES regardless of the
+    # caller's much larger requested `limit` -- this default view is "does
+    # output exist", never full-content review -- while stdout/stderr keep
+    # the caller's own limit unchanged.
+    for stream_name, document in logs.items():
+        query = document["requested_query"]
+        if stream_name in ("stdout", "stderr"):
+            assert query["limit"] == 65536
+        else:
+            assert query["limit"] == CONSOLE_OBSERVE_TAIL_LIMIT_BYTES
 
 
 def test_mcp_wait_omits_logs_unless_explicitly_requested(

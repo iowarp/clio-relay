@@ -17,13 +17,59 @@ from typing import TYPE_CHECKING, Final, cast
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings, TransportMode
-from clio_relay.control_channel import ChannelEventSink, ChannelProcessFactory
-from clio_relay.errors import ConfigurationError
+from clio_relay.control_channel import (
+    ChannelEventSink,
+    ChannelProcessFactory,
+    OwnedSessionChannelBootstrap,
+)
+from clio_relay.errors import ConfigurationError, RelayError
 
 if TYPE_CHECKING:
     from clio_relay.remote_connection import RemoteConnection
 
 CHANNEL_EVENT_REPORT_SCHEMA: Final = "clio-relay.control-channel-report.v1"
+
+
+def verify_bootstrap(
+    bootstrap: OwnedSessionChannelBootstrap,
+    *,
+    definition: ClusterDefinition,
+    session_id: str,
+    generation_id: str,
+    remote_api_port: int,
+) -> None:
+    """Require the remote relay to be the exact, live, owned generation.
+
+    clio-relay#221/#259 adversarial review (D13, file-size housekeeping):
+    moved out of ``RemoteConnection`` -- this check carries no state beyond
+    its arguments, so it moves as a free function to a module with headroom
+    rather than staying resident purely to hold ``RemoteConnection`` under
+    its own file-size ratchet. Its one call site is
+    ``RemoteConnection._establish``.
+    """
+    status = bootstrap.status
+    remote_api_port_reported = status.get("remote_api_port")
+    if (
+        status.get("owner") != "clio-relay"
+        or status.get("cluster") != definition.name
+        or status.get("session_id") != session_id
+        or status.get("session_generation_id") != generation_id
+        or status.get("running") is not True
+        or status.get("ownership_verified") is not True
+        or isinstance(remote_api_port_reported, bool)
+        or not isinstance(remote_api_port_reported, int)
+        or not 1 <= remote_api_port_reported <= 65_535
+    ):
+        raise RelayError(
+            "remote relay session is not the active, ownership-verified generation requested "
+            f"for {definition.name}/{session_id}"
+        )
+    if remote_api_port_reported != remote_api_port:
+        raise RelayError(
+            "remote relay session reported owned API port "
+            f"{remote_api_port_reported}, but the held channel maps {remote_api_port}; "
+            "configure CLIO_RELAY_OWNER_SESSION_API_PORT for this connection"
+        )
 
 
 class RemoteConnectionRegistry:

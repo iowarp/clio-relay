@@ -334,6 +334,13 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 "Observation pattern unsafe",
             ),
             _http_row("log_stream_invalid", 400, "Log stream invalid"),
+            # clio-relay#221/#259 adversarial review (D3/D5): the SSE log-tail
+            # route's own typed refusals -- an unparseable Last-Event-ID/
+            # offset, and a caller-supplied offset already past the stream's
+            # CURRENT size at request time (silently affirmed with a clean
+            # `end` before this fix, per the review's D5 finding).
+            _http_row("log_offset_invalid", 400, "Log offset invalid"),
+            _http_row("log_offset_beyond_eof", 400, "Log offset beyond EOF"),
             _http_row("authentication_required", 401, "Authentication required"),
             _http_row("resource_ownership_refused", 403, "Resource ownership refused"),
             _http_row("session_scope_refused", 403, "Session scope refused"),

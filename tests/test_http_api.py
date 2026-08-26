@@ -28,7 +28,7 @@ from clio_relay.cluster_config import (
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.dev_mode import DEV_MODE_ENV, VerificationFindings
-from clio_relay.errors import ConfigurationError
+from clio_relay.errors import ConfigurationError, NotFoundError
 from clio_relay.http_api import create_app
 from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
@@ -327,7 +327,8 @@ def test_http_log_sse_streams_chunk_and_ends_on_terminal_eof(tmp_path: Path) -> 
         "job_id": job.job_id,
         "stream": "console",
         "chunk": "thermo: step 0 temp 300.0\n",
-        "offset": written_bytes,
+        "offset": 0,
+        "next_offset": written_bytes,
     }
     # The `id:` line on the log_chunk frame carries the resumable offset.
     assert chunk_frame["id"] == str(written_bytes)
@@ -337,6 +338,7 @@ def test_http_log_sse_streams_chunk_and_ends_on_terminal_eof(tmp_path: Path) -> 
         "stream": "console",
         "state": "succeeded",
         "offset": written_bytes,
+        "next_offset": written_bytes,
     }
     assert frames.index(chunk_frame) < frames.index(end_frame)
 
@@ -441,7 +443,20 @@ async def test_log_tail_sse_events_pushes_appended_chunk_within_follow_interval(
     first (no-data-yet) ``asyncio.sleep`` wait, so the chunk is genuinely
     picked up mid-wait, not merely caught up on connect. Timed with
     ``asyncio.wait_for`` against real wall-clock elapsed time -- never a
-    sleep-then-check race."""
+    sleep-then-check race.
+
+    Adversarial review (review item 9): drives the route's DEFAULT
+    ``poll_seconds`` (never a hand-picked fast literal) and asserts the
+    constant's own value directly, so a regression toward the old 2.0s
+    capture-side floor fails HERE, at the source, not only via a generous
+    downstream elapsed bound. ``wait_for``'s own timeout is comfortably
+    ABOVE the elapsed assertion's bound, so a slow-but-passing run cannot be
+    misreported as a timeout instead of a bound failure.
+    """
+    assert http_api_streaming_module.LOG_SSE_FOLLOW_POLL_SECONDS <= 0.5, (
+        "the default follow interval regressed toward the old capture-side "
+        "floor -- this would blow the live-console lane's <=2s acceptance budget"
+    )
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
@@ -472,20 +487,286 @@ async def test_log_tail_sse_events_pushes_appended_chunk_within_follow_interval(
         job.job_id,
         stream_name="console",
         offset=0,
-        poll_seconds=0.05,
+        poll_seconds=http_api_streaming_module.LOG_SSE_FOLLOW_POLL_SECONDS,
     )
     writer = asyncio.ensure_future(write_after_first_poll())
     start = time.monotonic()
     try:
-        first_frame = await asyncio.wait_for(generator.__anext__(), timeout=0.5)
+        first_frame = await asyncio.wait_for(generator.__anext__(), timeout=2.0)
     finally:
         await writer
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.5, f"appended chunk arrived after {elapsed:.3f}s"
+    assert elapsed < 1.0, f"appended chunk arrived after {elapsed:.3f}s"
     assert "event: log_chunk" in first_frame
     assert "thermo: step 0 temp 300.0" in first_frame
     await cast(AsyncGenerator[str, None], generator).aclose()
+
+
+@pytest.mark.asyncio
+async def test_log_tail_sse_events_emits_keepalive_within_interval_while_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D1): a job that is RUNNING but
+    quiet (no new bytes) emits an SSE comment keepalive at least every
+    ``LOG_SSE_KEEPALIVE_INTERVAL_SECONDS``, so a client's own socket read
+    never times out against a merely-quiet job. The interval is
+    monkeypatched tiny so this stays a fast unit test -- never a real 10s
+    wait -- and the keepalive line is proven to never dispatch as a frame
+    (the client's own SSE parser already treats ``:``-prefixed lines as
+    comments, never a field)."""
+    monkeypatch.setattr(http_api_streaming_module, "LOG_SSE_KEEPALIVE_INTERVAL_SECONDS", 0.05)
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-keepalive",
+        )
+    )
+    queue.update_job_state(job.job_id, JobState.RUNNING)
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+
+    generator = http_api_streaming_module._log_tail_sse_events(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        settings,
+        queue,
+        job.job_id,
+        stream_name="console",
+        offset=0,
+        poll_seconds=0.02,
+    )
+    try:
+        frame = await asyncio.wait_for(generator.__anext__(), timeout=2.0)
+    finally:
+        await cast(AsyncGenerator[str, None], generator).aclose()
+
+    assert frame == ": keepalive\n\n"
+
+
+@pytest.mark.asyncio
+async def test_log_tail_sse_events_treats_vanished_job_as_typed_end_state_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D7): a job record that
+    vanishes mid-stream (``queue.get_job`` raising ``NotFoundError`` on a
+    LATER poll, after the route's own upfront admission check already
+    passed) closes with a typed ``end`` carrying ``state: "gone"`` instead
+    of leaking an unhandled 500 after headers were already sent -- which a
+    client would see as a truncated 200, misread as a channel drop."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-vanish",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+
+    def vanished(_job_id: str) -> RelayJob:
+        raise NotFoundError(f"job vanished mid-stream: {_job_id}")
+
+    monkeypatch.setattr(queue, "get_job", vanished)
+
+    generator = http_api_streaming_module._log_tail_sse_events(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        settings,
+        queue,
+        job.job_id,
+        stream_name="console",
+        offset=0,
+        poll_seconds=0.05,
+    )
+    frame = await asyncio.wait_for(generator.__anext__(), timeout=2.0)
+
+    assert "event: end" in frame
+    end_data = json.loads(frame.splitlines()[1].removeprefix("data: "))
+    assert end_data == {
+        "job_id": job.job_id,
+        "stream": "console",
+        "state": "gone",
+        "offset": 0,
+        "next_offset": 0,
+    }
+    with pytest.raises(StopAsyncIteration):
+        await generator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_log_tail_sse_events_decodes_utf8_character_straddling_read_boundary(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D9), the reviewer's own live
+    probe reproduced as a fast unit test: a multi-byte UTF-8 character
+    written exactly straddling a 1 MiB read-chunk boundary must decode
+    correctly across two reads, never as two U+FFFD replacement
+    characters. Proven by holding one incremental decoder across both
+    ``__anext__()`` calls, exactly as the generator itself does."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-utf8-boundary",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    # "é" encodes to two UTF-8 bytes (0xC3 0xA9). Padding it to exactly
+    # straddle the 1 MiB (MAX_LOG_READ_BYTES) read boundary means the FIRST
+    # read ends with only the first byte of "é", and the SECOND read starts
+    # with its remaining byte.
+    max_read_bytes = http_api_streaming_module.MAX_LOG_READ_BYTES
+    padding = "a" * (max_read_bytes - 1)
+    multibyte_character = "é"
+    (spool / "console.log").write_bytes(
+        (padding + multibyte_character).encode("utf-8") + b"\ntail\n"
+    )
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+
+    generator = http_api_streaming_module._log_tail_sse_events(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        settings,
+        queue,
+        job.job_id,
+        stream_name="console",
+        offset=0,
+        poll_seconds=0.05,
+    )
+    collected_text = ""
+    try:
+        async for frame in generator:
+            if "event: log_chunk" not in frame:
+                continue
+            chunk_data = json.loads(frame.splitlines()[2].removeprefix("data: "))
+            collected_text += chunk_data["chunk"]
+    finally:
+        await cast(AsyncGenerator[str, None], generator).aclose()
+
+    assert "�" not in collected_text
+    assert collected_text == padding + multibyte_character + "\ntail\n"
+
+
+def test_http_log_sse_prefers_last_event_id_over_offset_query_param(tmp_path: Path) -> None:
+    """clio-relay#221/#259 adversarial review (D3): a spec-compliant
+    ``EventSource`` reconnects with its own ``Last-Event-ID`` header, not a
+    caller-managed ``?offset=`` -- previously accepted and silently
+    ignored (restarting at 0, re-delivering already-seen bytes). When
+    present and a parseable non-negative integer, it is now preferred."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-last-event-id",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    (spool / "console.log").write_bytes(b"thermo: step 0\nthermo: step 1\n")
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    client = cast(Any, TestClient(create_app(settings)))
+
+    with client.stream(
+        "GET",
+        f"/jobs/{job.job_id}/logs/console/sse",
+        params={"offset": 0, "poll_seconds": 0.05},
+        headers={"Last-Event-ID": str(len(b"thermo: step 0\n"))},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert "thermo: step 0" not in body
+    assert "thermo: step 1" in body
+
+
+def test_http_log_sse_rejects_garbage_last_event_id(tmp_path: Path) -> None:
+    """clio-relay#221/#259 adversarial review (D3): an unparseable or
+    negative ``Last-Event-ID`` is a typed 400, never silently ignored or
+    treated as offset 0."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-bad-last-event-id",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    garbage = client.get(
+        f"/jobs/{job.job_id}/logs/console/sse", headers={"Last-Event-ID": "not-a-number"}
+    )
+    negative = client.get(f"/jobs/{job.job_id}/logs/console/sse", headers={"Last-Event-ID": "-1"})
+
+    for response in (garbage, negative):
+        assert response.status_code == 400
+        assert response.json()["reason"] == "log_offset_invalid"
+
+
+def test_http_log_sse_rejects_offset_past_current_eof(tmp_path: Path) -> None:
+    """clio-relay#221/#259 adversarial review (D5): an offset already past
+    the stream's CURRENT size at request time is a typed refusal, not a
+    silently-affirmed clean ``end`` as if the offset had ever been valid."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-beyond-eof",
+        )
+    )
+    spool = settings.spool_dir / job.job_id
+    spool.mkdir(parents=True)
+    (spool / "console.log").write_bytes(b"only ten\n")
+    client = cast(Any, TestClient(create_app(settings)))
+
+    response = client.get(f"/jobs/{job.job_id}/logs/console/sse", params={"offset": 10_000})
+
+    assert response.status_code == 400
+    assert response.json()["reason"] == "log_offset_beyond_eof"
+
+
+def test_http_log_sse_rejects_non_finite_and_oversized_poll_seconds(tmp_path: Path) -> None:
+    """clio-relay#221/#259 adversarial review (D6): ``poll_seconds`` is
+    guarded against nan/inf and pathologically large values, the same
+    shape ``RemoteConnection.request_json`` already uses for its own
+    timeout guard -- never a wedged follow loop."""
+    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    queue = ClioCoreQueue(settings.core_dir)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="test-cluster",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: generic\npkgs: []\n"),
+            idempotency_key="log-sse-poll-guard",
+        )
+    )
+    client = cast(Any, TestClient(create_app(settings)))
+
+    responses = [
+        client.get(f"/jobs/{job.job_id}/logs/console/sse", params={"poll_seconds": "nan"}),
+        client.get(f"/jobs/{job.job_id}/logs/console/sse", params={"poll_seconds": "inf"}),
+        client.get(f"/jobs/{job.job_id}/logs/console/sse", params={"poll_seconds": 999}),
+        client.get(f"/jobs/{job.job_id}/logs/console/sse", params={"poll_seconds": 0}),
+    ]
+
+    for response in responses:
+        assert response.status_code == 400, response.text
+        assert response.json()["reason"] == "poll_interval_invalid"
 
 
 def test_oversized_artifact_content_answers_413_payload_too_large_not_200(

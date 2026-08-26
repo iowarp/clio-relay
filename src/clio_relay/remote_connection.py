@@ -72,6 +72,7 @@ from clio_relay.remote_connection_registry import (
 from clio_relay.remote_connection_registry import (
     connection_registry as connection_registry,
 )
+from clio_relay.remote_connection_registry import verify_bootstrap
 from clio_relay.remote_connection_stream_io import (
     MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
 )
@@ -572,7 +573,13 @@ class RemoteConnection:
             link = transport.establish(nonce=nonce)
             endpoint = link.control_endpoint
             bootstrap = link.bootstrap
-            self._verify_bootstrap(bootstrap)
+            verify_bootstrap(
+                bootstrap,
+                definition=self._definition,
+                session_id=self._session_id,
+                generation_id=self._generation_id,
+                remote_api_port=self._remote_api_port,
+            )
             stream = _open_identity_bound_stream(
                 endpoint=endpoint,
                 nonce=nonce,
@@ -611,32 +618,6 @@ class RemoteConnection:
                 identity_anchor=self.identity_anchor,
             )
         )
-
-    def _verify_bootstrap(self, bootstrap: OwnedSessionChannelBootstrap) -> None:
-        """Require the remote relay to be the exact, live, owned generation."""
-        status = bootstrap.status
-        remote_api_port = status.get("remote_api_port")
-        if (
-            status.get("owner") != "clio-relay"
-            or status.get("cluster") != self._definition.name
-            or status.get("session_id") != self._session_id
-            or status.get("session_generation_id") != self._generation_id
-            or status.get("running") is not True
-            or status.get("ownership_verified") is not True
-            or isinstance(remote_api_port, bool)
-            or not isinstance(remote_api_port, int)
-            or not 1 <= remote_api_port <= 65_535
-        ):
-            raise RelayError(
-                "remote relay session is not the active, ownership-verified generation requested "
-                f"for {self._definition.name}/{self._session_id}"
-            )
-        if remote_api_port != self._remote_api_port:
-            raise RelayError(
-                "remote relay session reported owned API port "
-                f"{remote_api_port}, but the held channel maps {self._remote_api_port}; "
-                "configure CLIO_RELAY_OWNER_SESSION_API_PORT for this connection"
-            )
 
     def _acquire_stream(
         self,

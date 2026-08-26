@@ -89,7 +89,7 @@ class _Response:
     def read(self, _amount: int) -> bytes:
         return self._payload
 
-    def readline(self) -> bytes:
+    def readline(self, _limit: int = -1) -> bytes:
         if not self._sse_lines:
             return b""
         return self._sse_lines.pop(0)
@@ -519,10 +519,12 @@ def test_stream_log_chunks_reads_over_the_held_channel_with_no_extra_dial(
     harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
         b"id: 5\n",
         b"event: log_chunk\n",
-        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", "offset": 5}\n',
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
         b"\n",
         b"event: end\n",
-        b'data: {"job_id": "job_1", "stream": "console", "state": "succeeded", "offset": 5}\n',
+        b'data: {"job_id": "job_1", "stream": "console", "state": "succeeded", '
+        b'"offset": 5, "next_offset": 5}\n',
         b"\n",
     ]
 
@@ -555,7 +557,8 @@ def test_stream_log_chunks_surfaces_channel_dropped_mid_stream(
     harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
         b"id: 5\n",
         b"event: log_chunk\n",
-        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", "offset": 5}\n',
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
         b"\n",
         # No `end` frame -- the canned body simply runs out here, simulating
         # the peer closing the connection mid-stream.
@@ -569,6 +572,56 @@ def test_stream_log_chunks_surfaces_channel_dropped_mid_stream(
     assert len(chunks) == 1
     assert chunks[0].text == "hello"
     assert harness.dials == 1
+
+
+def test_stream_log_chunks_skips_unrecognized_event_type_and_keeps_going(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D10): an SSE event type this
+    client does not recognize is logged and SKIPPED -- never a hard
+    failure that would retroactively break every already-deployed client
+    the moment the server adds a new event kind to this route's
+    vocabulary. Subsequent, recognized frames still arrive normally."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"event: future_kind\n",
+        b'data: {"something": "this client has never heard of"}\n',
+        b"\n",
+        b"id: 5\n",
+        b"event: log_chunk\n",
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
+        b"\n",
+        b"event: end\n",
+        b'data: {"job_id": "job_1", "stream": "console", "state": "succeeded", '
+        b'"offset": 5, "next_offset": 5}\n',
+        b"\n",
+    ]
+
+    chunks = list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
+
+    assert len(chunks) == 2
+    assert chunks[0].text == "hello"
+    assert chunks[1].end is True
+
+
+def test_stream_log_chunks_rejects_unterminated_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D8): a line that reaches its
+    byte cap without a ``\\n`` terminator is a typed refusal, never
+    silently truncated or read forever."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"this line never ends with a newline",
+    ]
+
+    with pytest.raises(RelayError, match="terminator"):
+        list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
 
 
 def test_broken_http_stream_is_reproven_over_the_same_channel_without_a_new_dial(
