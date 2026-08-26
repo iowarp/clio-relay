@@ -15,8 +15,22 @@ artifacts (#252). A ``jarvis_run`` dispatch that completes synchronously
 ``outputSchema`` entirely (only ``jarvis_get_execution`` declares it) -- so
 that path's absent declaration keeps its current semantics unchanged, per
 the owner's explicit instruction never to invent a heuristic about which
-files "should" exist. Zero declared ``execution-file`` entries is likewise
-untouched (the pre-existing #252 fast return).
+files "should" exist.
+
+Revision (#265 D1 slice, live-evidence-driven): zero declared
+``execution-file`` entries on a run that DOES carry an ``artifact_page`` is
+no longer silently clean. Owner ruling was previously "untouched (the
+pre-existing #252 fast return)" -- that undercounted a real defect family: a
+COMPLETED run whose artifact page declares NO ``execution-file`` outputs at
+all (as opposed to declaring some and then finding them missing/empty on
+disk) read as plain "completed", exactly the "0-step run" / "empty-output
+run" shape #265's own issue text names as a false-green case. The typed
+``outputs_missing`` payload now carries a top-level ``reason`` distinguishing
+the two: ``no_outputs_declared`` (zero matching entries in ``artifacts``) vs
+``declared_outputs_missing`` (one or more declared entries absent/empty on
+disk -- the pre-existing behavior, unchanged in shape). A run whose terminal
+record carries no ``artifact_page`` at all keeps its original semantics
+(the early return above, unaffected by this revision).
 """
 
 from __future__ import annotations
@@ -60,14 +74,20 @@ def ingest_jarvis_execution_outputs(
 
     Returns ``(indexed, truncation, outputs_missing)``. ``outputs_missing`` is
     clio-relay#265's typed terminal-failure payload
-    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA`) whenever at least one declared
-    ``execution-file`` output is absent on disk or declared empty
-    (``size_bytes == 0``) -- ``None`` when nothing was declared (the pre-
-    existing early returns below) or every declared output is present and
-    non-empty. A missing declared file is recorded typed here rather than
-    left to crash out of ``snapshot_owned_regular_file`` uncaught: this is a
-    real, expected outcome (#265's negative path), not a filesystem-identity
-    violation.
+    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA``) whenever the terminal
+    ``artifact_page`` was present but did NOT prove clean declared outputs --
+    either at least one declared ``execution-file`` output is absent on disk
+    or declared empty (``size_bytes == 0``, ``reason="declared_outputs_missing"``),
+    or the page declared ZERO matching ``execution-file`` entries at all
+    (``reason="no_outputs_declared"`` -- the #265 D1 revision: a completed
+    run that produced no declared outputs is exactly as false-green as one
+    whose declared outputs are missing). ``outputs_missing`` is ``None`` only
+    when the terminal record carries no ``artifact_page`` at all (the
+    pre-existing early returns below -- a synchronous dispatch's own
+    semantics, unchanged) or every declared output is present and non-empty.
+    A missing declared file is recorded typed here rather than left to crash
+    out of ``snapshot_owned_regular_file`` uncaught: this is a real, expected
+    outcome (#265's negative path), not a filesystem-identity violation.
     """
     raw_structured = result_document.get("structured_result")
     if not isinstance(raw_structured, dict):
@@ -211,6 +231,7 @@ def ingest_jarvis_execution_outputs(
     if missing_outputs:
         outputs_missing = {
             "schema_version": EXECUTION_OUTPUTS_MISSING_SCHEMA,
+            "reason": "declared_outputs_missing",
             "execution_id": execution_id,
             "declared_count": output_count,
             "missing": missing_outputs,
@@ -219,6 +240,24 @@ def ingest_jarvis_execution_outputs(
             owner.job_id,
             "jarvis.execution_outputs_missing",
             "JARVIS execution completed but declared outputs are missing or empty",
+            payload=outputs_missing,
+        )
+    elif output_count == 0:
+        # #265 D1: the terminal artifact page WAS present (the early returns
+        # above already ruled out "no artifact_page at all") but declared
+        # ZERO execution-file outputs -- a 0-step/empty-output run reading as
+        # plain "completed" is exactly the false-green shape #265 names.
+        outputs_missing = {
+            "schema_version": EXECUTION_OUTPUTS_MISSING_SCHEMA,
+            "reason": "no_outputs_declared",
+            "execution_id": execution_id,
+            "declared_count": 0,
+            "missing": [],
+        }
+        queue.append_event(
+            owner.job_id,
+            "jarvis.execution_outputs_missing",
+            "JARVIS execution completed with zero declared outputs",
             payload=outputs_missing,
         )
     return indexed, truncation, outputs_missing
