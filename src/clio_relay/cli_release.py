@@ -87,6 +87,20 @@ from clio_relay.validation_report import (
 release_app = typer.Typer(no_args_is_help=True)
 
 
+def _validate_release_validate_local_timeouts(
+    check_timeout_seconds: float,
+    pytest_per_test_timeout_seconds: float,
+) -> None:
+    """Reject invalid timeout options before any report is seeded (clio-relay#275)."""
+    if check_timeout_seconds < 0:
+        raise ConfigurationError("--check-timeout-seconds must be >= 0 (0 means no bound)")
+    if pytest_per_test_timeout_seconds <= 0:
+        raise ConfigurationError(
+            "--pytest-per-test-timeout-seconds must be > 0 (pytest-timeout treats "
+            "a non-positive value as no bound, silently defeating the option)"
+        )
+
+
 @release_app.command("validate-local")
 @cli_support._acceptance_report_command
 def release_validate_local(
@@ -118,12 +132,13 @@ def release_validate_local(
     check_timeout_seconds: Annotated[
         float,
         typer.Option(
+            min=0,
             help=(
                 "Overall wall-clock deadline for each check, in seconds. A wedged "
                 "check's whole process tree is killed and the failure is recorded "
-                "with a typed check_timeout reason instead of hanging silently "
-                "(clio-relay#275)."
-            )
+                "with a typed check_timeout reason instead of hanging silently. "
+                "0 means no bound (clio-relay#275)."
+            ),
         ),
     ] = DEFAULT_CHECK_TIMEOUT_SECONDS,
     pytest_per_test_timeout_seconds: Annotated[
@@ -131,14 +146,28 @@ def release_validate_local(
         typer.Option(
             help=(
                 "Per-test timeout, in seconds, for the local.pytest battery "
-                "(pytest-timeout, thread method). On expiry the report names "
-                "the hanging test instead of a bare nonzero exit."
+                "(pytest-timeout). Must be > 0 -- pytest-timeout itself treats a "
+                "non-positive value as no bound, which would silently defeat this "
+                "option. On expiry the report names the hanging test instead of a "
+                "bare nonzero exit."
             )
         ),
     ] = DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS,
 ) -> None:
     """Run the complete local release gate and persist evidence on failure."""
     import clio_relay.cli as cli
+
+    # Validated at the true entry boundary -- before any report is seeded --
+    # so a bad value never leaves a seeded report behind it (clio-relay#275
+    # review D5). typer's own `min=0` above already refuses a negative
+    # --check-timeout-seconds at the argument-parsing layer; this covers the
+    # positivity rule typer's simple `min=` cannot express and stays the
+    # single source of truth for both rules.
+    cli._run_or_exit(
+        lambda: _validate_release_validate_local_timeouts(
+            check_timeout_seconds, pytest_per_test_timeout_seconds
+        )
+    )
 
     report_path = report or default_report_path("local")
     seed_report = new_live_validation_report(
@@ -157,7 +186,9 @@ def release_validate_local(
                     artifact_dir=artifact_dir,
                     prebuilt_artifact_dir=prebuilt_artifact_dir,
                     report_id=seed_report.report_id,
-                    check_timeout_seconds=check_timeout_seconds,
+                    check_timeout_seconds=(
+                        None if check_timeout_seconds == 0 else check_timeout_seconds
+                    ),
                     pytest_per_test_timeout_seconds=pytest_per_test_timeout_seconds,
                 )
             )

@@ -29,6 +29,7 @@ from clio_relay.command_evidence import (
 )
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
+from clio_relay.release_check_runtime import default_command_runner
 from clio_relay.release_command_stream import TIMEOUT_RETURNCODE, run_streaming_command
 from clio_relay.release_validation import (
     LocalReleaseValidationOptions,
@@ -508,10 +509,13 @@ def test_local_pytest_command_carries_per_test_timeout_arguments_only(
     assert len(pytest_commands) == 6
     local_pytest_command, *required_test_commands = pytest_commands
     assert "--timeout=45" in local_pytest_command
-    assert "--timeout-method=thread" in local_pytest_command
+    # No --timeout-method: pytest-timeout picks its own per-platform default
+    # rather than a pinned one (clio-relay#275 review D1) -- pinning 'thread'
+    # everywhere would skip pytest's normal reporting on POSIX and defeat
+    # this issue's own "the failure names the test" acceptance criterion.
+    assert not any(argument.startswith("--timeout-method") for argument in local_pytest_command)
     for command in required_test_commands:
-        assert not any(argument.startswith("--timeout=") for argument in command)
-        assert "--timeout-method=thread" not in command
+        assert not any(argument.startswith("--timeout") for argument in command)
 
 
 def test_local_pytest_command_uses_default_per_test_timeout(tmp_path: Path) -> None:
@@ -569,6 +573,77 @@ def test_local_release_validation_persists_typed_check_timeout_failure(
     excerpt = failed.evidence[0].excerpt
     assert excerpt is not None
     assert "check_timeout after 0.5s" in excerpt
+
+
+def test_local_pytest_default_runner_names_the_hanging_test(tmp_path: Path) -> None:
+    """clio-relay#275 review D10, production-path proof: a REAL hanging test
+    (not a synthetic time.sleep stand-in) run through the DEFAULT streaming
+    runner is killed at the per-test bound, and the failure names the test.
+
+    On POSIX, pytest-timeout's per-platform default is 'signal' (SIGALRM
+    exists), which pytest.fail()s the hung test through the normal reporting
+    path, so pytest_release_gate's own JSON sentinel still fires and
+    metadata.failed_test_ids names it structurally. On Windows there is no
+    SIGALRM, so pytest-timeout falls back to 'thread', which calls
+    os._exit() on expiry -- skipping that summary/sentinel entirely (exactly
+    why clio-relay#275 review D1 refuses to pin --timeout-method=thread
+    everywhere). The hang is then named only by the thread/stack-dump text
+    pytest-timeout writes to the live transcript before exiting, so the
+    assertion below is platform-conditional: structured metadata on POSIX,
+    the recorded excerpt/output on Windows.
+    """
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    (tmp_path / "test_hang_target.py").write_text(
+        "import time\n\n\ndef test_hangs_forever():\n    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.json"
+
+    def runner(
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["uv", "run", "--no-sync", "pytest"]:
+            # Reuse the EXACT plugin/-ra/--timeout tail run_local_release_
+            # validation composed (proving the real command-construction
+            # wiring), only swapping the "uv run" launcher for this worktree's
+            # own interpreter, which already has clio_relay's pytest plugins
+            # installed -- avoids depending on `uv run --no-sync` resolving a
+            # throwaway tmp_path with no lock/venv of its own.
+            real_pytest_command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                *command[4:],
+                str(tmp_path / "test_hang_target.py"),
+            ]
+            return default_command_runner(check_timeout_seconds=15.0)(real_pytest_command, cwd=cwd)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    with pytest.raises(RelayError, match=r"release check failed \(local\.pytest\)"):
+        run_local_release_validation(
+            LocalReleaseValidationOptions(
+                project_root=tmp_path,
+                report_path=report_path,
+                pytest_per_test_timeout_seconds=2.0,
+            ),
+            runner=runner,
+        )
+
+    report = load_validation_report(report_path)
+    assert report.status is ValidationStatus.FAILED
+    failed = next(check for check in report.checks if check.check_id == "local.pytest")
+    assert failed.status is ValidationStatus.FAILED
+    assert len(failed.evidence) == 1
+    metadata = failed.evidence[0].metadata
+    excerpt = failed.evidence[0].excerpt or ""
+    if os.name != "nt":
+        failed_test_ids = metadata.get("failed_test_ids")
+        assert isinstance(failed_test_ids, list)
+        assert "test_hang_target.py::test_hangs_forever" in failed_test_ids
+    else:
+        assert "test_hangs_forever" in excerpt
 
 
 @pytest.mark.parametrize(

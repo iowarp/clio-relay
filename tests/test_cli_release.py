@@ -26,8 +26,16 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
+import clio_relay.release_validation as release_validation
 from clio_relay.cli import app
-from clio_relay.validation_report import LiveValidationReport
+from clio_relay.release_validation import LocalReleaseValidationOptions
+from clio_relay.validation_report import (
+    EvidenceReference,
+    LiveValidationReport,
+    ValidationRecorder,
+    new_live_validation_report,
+    write_validation_report,
+)
 from tests.test_cli import _write_passing_validation_report
 
 
@@ -73,3 +81,92 @@ def test_release_validate_local_replaces_stale_success_on_preflight_failure(
     assert current.status.value == "failed"
     assert current.checks[-1].check_id == "local-release.completed"
     assert "has no pyproject.toml" in (current.error or "")
+
+
+def test_release_validate_local_rejects_negative_check_timeout_before_seeding(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#275 review D5: a negative --check-timeout-seconds is refused
+    by typer's own min=0 at the parsing boundary, before any report exists."""
+    report_path = tmp_path / "local-release.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "release",
+            "validate-local",
+            "--check-timeout-seconds",
+            "-5",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not report_path.exists()
+
+
+def test_release_validate_local_rejects_non_positive_pytest_timeout_before_seeding(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#275 review D5: pytest-timeout treats a non-positive value as
+    no bound, silently defeating the option -- refused explicitly instead,
+    before any report is seeded."""
+    report_path = tmp_path / "local-release.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "release",
+            "validate-local",
+            "--pytest-per-test-timeout-seconds",
+            "0",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must be > 0" in result.output
+    assert not report_path.exists()
+
+
+def test_release_validate_local_maps_zero_check_timeout_to_unbounded(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#275 review D5: 0 is the documented CLI spelling for "no
+    bound", translated to the internal None (the only value that actually
+    reaches an unbounded ``run_streaming_command`` call)."""
+    captured: list[LocalReleaseValidationOptions] = []
+
+    def fake_run(
+        options: LocalReleaseValidationOptions,
+        *,
+        runner: object = None,
+    ) -> LiveValidationReport:
+        del runner
+        captured.append(options)
+        report = new_live_validation_report(
+            scenario="local-release",
+            cluster="local",
+            report_id=options.report_id,
+        )
+        recorder = ValidationRecorder(report)
+        with recorder.check("acceptance.completed", "complete acceptance command") as evidence:
+            evidence.append(EvidenceReference(kind="test", excerpt="acceptance completed"))
+        recorder.finish()
+        write_validation_report(report, options.report_path)
+        return report
+
+    monkeypatch.setattr(release_validation, "run_local_release_validation", fake_run)
+    report_path = tmp_path / "local-release.json"
+
+    result = CliRunner().invoke(
+        app,
+        ["release", "validate-local", "--check-timeout-seconds", "0", "--report", str(report_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    assert captured[0].check_timeout_seconds is None

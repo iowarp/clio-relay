@@ -6,23 +6,25 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from clio_relay.command_evidence import command_evidence
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import (
-    WINDOWS_LEGACY_PATH_HEADROOM,
     internal_filesystem_path,
     logical_filesystem_path,
     logical_filesystem_text,
 )
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.release_command_stream import run_streaming_command
+from clio_relay.release_check_runtime import CommandRunner as ReleaseCommandRunner
+from clio_relay.release_check_runtime import (
+    active_check,
+    default_command_runner,
+    run_checkout_command,
+)
+from clio_relay.release_command_stream import format_seconds
 from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
@@ -84,31 +86,10 @@ _PYTEST_RELEASE_GATE_ARGUMENTS = (
 DEFAULT_CHECK_TIMEOUT_SECONDS = 3600.0
 DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS = 300.0
 
-#: Check id read by ``_default_command_runner`` to prefix each live-echoed line.
-_active_check_id: ContextVar[str] = ContextVar("_active_check_id", default="")
-
-
-@contextmanager
-def _active_check(check_id: str) -> Generator[None]:
-    """Publish ``check_id`` for the block's duration (live-echo prefixing)."""
-    token = _active_check_id.set(check_id)
-    try:
-        yield
-    finally:
-        _active_check_id.reset(token)
-
-
-class ReleaseCommandRunner(Protocol):
-    """Injectable command runner for local release checks."""
-
-    def __call__(
-        self,
-        command: list[str],
-        *,
-        cwd: Path,
-    ) -> subprocess.CompletedProcess[str]:
-        """Run one command in the release checkout."""
-        ...
+#: Fixed check id shared by every reference to the sdist smoke check --
+#: recorder.check(), the live-echo prefix, and the evidence failure message
+#: (clio-relay#275 review D11: one source instead of three hardcoded copies).
+_SDIST_SMOKE_CHECK_ID = "local.sdist-smoke"
 
 
 @dataclass(frozen=True)
@@ -121,7 +102,7 @@ class LocalReleaseValidationOptions:
     artifact_dir: Path | None = None
     prebuilt_artifact_dir: Path | None = None
     report_id: DurableRecordId | None = None
-    check_timeout_seconds: float = DEFAULT_CHECK_TIMEOUT_SECONDS
+    check_timeout_seconds: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     pytest_per_test_timeout_seconds: float = DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS
 
 
@@ -135,7 +116,7 @@ def run_local_release_validation(
     storage_root = internal_filesystem_path(root, force_extended=True)
     if not (storage_root / "pyproject.toml").is_file():
         raise ConfigurationError(f"release checkout has no pyproject.toml: {root}")
-    command_runner = runner or _default_command_runner(
+    command_runner = runner or default_command_runner(
         check_timeout_seconds=options.check_timeout_seconds
     )
     report = new_live_validation_report(
@@ -229,12 +210,23 @@ def run_local_release_validation(
                 "pytest",
                 *_PYTEST_RELEASE_GATE_ARGUMENTS,
                 "-ra",
-                f"--timeout={options.pytest_per_test_timeout_seconds:g}",
-                "--timeout-method=thread",
+                # No --timeout-method: pytest-timeout's own per-platform default is
+                # the right choice, not a pinned one (clio-relay#275 review D1).
+                # 'signal' (POSIX, SIGALRM) pytest.fail()s the hung test through the
+                # normal reporting path, so pytest_release_gate's failed-node-id
+                # sentinel still fires and metadata.failed_test_ids names it. The
+                # 'thread' fallback (Windows; no SIGALRM) calls os._exit() on expiry,
+                # skipping that summary entirely -- pinning thread everywhere would
+                # defeat this issue's own "the failure names the test" acceptance
+                # criterion on every POSIX runner.
+                f"--timeout={format_seconds(options.pytest_per_test_timeout_seconds)}",
             ],
             root=root,
             runner=command_runner,
         )
+        # Only local.pytest (above) carries the per-test --timeout; the required-
+        # test checks below run under command_runner's own per-check overall bound
+        # only (clio-relay#275 review D11).
         _run_required_tests(
             recorder,
             check_id="local.containment-hard-crash",
@@ -470,7 +462,7 @@ def _run_check(
     root: Path,
     runner: ReleaseCommandRunner,
 ) -> str:
-    with recorder.check(check_id, summary) as evidence, _active_check(check_id):
+    with recorder.check(check_id, summary) as evidence, active_check(check_id):
         completed = runner(command, cwd=root)
         diagnostic = command_evidence(
             _logicalize_windows_text(completed.stdout),
@@ -499,7 +491,7 @@ def _run_check_sequence(
     root: Path,
     runner: ReleaseCommandRunner,
 ) -> None:
-    with recorder.check(check_id, summary) as evidence, _active_check(check_id):
+    with recorder.check(check_id, summary) as evidence, active_check(check_id):
         for command in commands:
             completed = runner(command, cwd=root)
             diagnostic = command_evidence(
@@ -567,11 +559,11 @@ def _run_sdist_smoke(
     shutil.rmtree(environment, ignore_errors=True)
     build_dir.mkdir(parents=True, exist_ok=True)
     with recorder.check(
-        "local.sdist-smoke",
+        _SDIST_SMOKE_CHECK_ID,
         "build, install, and launch the exact sdist in an isolated runtime environment",
     ) as evidence:
         try:
-            with _active_check("local.sdist-smoke"):
+            with active_check(_SDIST_SMOKE_CHECK_ID):
                 build_command = [
                     "uv",
                     "build",
@@ -642,7 +634,9 @@ def _run_evidenced_command(
         )
     )
     if completed.returncode != 0:
-        raise RelayError(f"release check failed (local.sdist-smoke): {diagnostic.error_detail}")
+        raise RelayError(
+            f"release check failed ({_SDIST_SMOKE_CHECK_ID}): {diagnostic.error_detail}"
+        )
 
 
 def _release_artifacts(artifact_dir: Path) -> list[Path]:
@@ -744,51 +738,20 @@ def _record_release_artifacts(
         )
 
 
-def _default_command_runner(*, check_timeout_seconds: float) -> ReleaseCommandRunner:
-    """Streaming runner: check-id-prefixed live echo, bounded so a wedged
-    check self-terminates with a typed reason (clio-relay#275)."""
-
-    def runner(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-        check_id = _active_check_id.get()
-        prefix = f"[{check_id}] " if check_id else ""
-
-        def echo(line: str) -> None:
-            print(f"{prefix}{line}", file=sys.stderr, flush=True)
-
-        return _run_command(command, cwd=cwd, timeout_seconds=check_timeout_seconds, echo=echo)
-
-    return runner
-
-
-def _run_command(
+def _run_command(  # pyright: ignore[reportUnusedFunction] -- direct-call test seam, see docstring
     command: list[str],
     *,
     cwd: Path,
     timeout_seconds: float | None = None,
     echo: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one release-gate command, streaming output and capturing it all.
+    """Forward to :func:`release_check_runtime.run_checkout_command`.
 
-    ``timeout_seconds=None`` waits indefinitely (pre-#275 behavior); a
-    timeout's typed reason is folded into stderr, never a bare nonzero exit.
+    Kept as a thin, direct-call seam (rather than inlined at its one caller)
+    because ``tests/test_release_validation.py`` exercises the Windows
+    checkout-path guard by calling this exact name directly.
     """
-    logical_cwd = logical_filesystem_path(cwd)
-    if os.name == "nt":
-        absolute_cwd = os.path.abspath(logical_cwd)
-        if absolute_cwd.startswith("\\\\"):
-            raise ConfigurationError(
-                "release subprocess checkout paths on Windows must not use UNC; "
-                "run the gate from a local checkout path"
-            )
-        if len(absolute_cwd) >= WINDOWS_LEGACY_PATH_HEADROOM:
-            raise ConfigurationError(
-                "release subprocess checkout path exceeds the verified Windows path bound; "
-                "run the gate from a shorter checkout path"
-            )
-    result = run_streaming_command(
-        command, cwd=logical_cwd, timeout_seconds=timeout_seconds, echo=echo
-    )
-    return result.to_completed_process()
+    return run_checkout_command(command, cwd=cwd, timeout_seconds=timeout_seconds, echo=echo)
 
 
 def _logical_command(command: list[str]) -> list[str]:
