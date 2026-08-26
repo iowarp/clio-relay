@@ -83,7 +83,15 @@ import clio_relay.cli_cluster as cli_cluster
 import clio_relay.cli_support as cli_support
 import clio_relay.deployment as deployment
 import clio_relay.endpoint_service_status as endpoint_service_status
-from clio_relay.bootstrap_pin import pin_reconciliation_lines, reconcile_cluster_runtime_pin
+from clio_relay.bootstrap_one_pass_script import (
+    ONE_PASS_TARGET_IDENTITY_MARKER,
+    parse_one_pass_target_identity,
+)
+from clio_relay.bootstrap_pin import (
+    pin_cluster_target_identity_from_one_pass_observation,
+    pin_reconciliation_lines,
+    reconcile_cluster_runtime_pin,
+)
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, WorkerCapacityPolicy
 from clio_relay.cluster_probe import pinned_runtime_present, probe_cluster_runtime
 from clio_relay.deployment import render_endpoint_user_service
@@ -376,7 +384,42 @@ def cluster_bootstrap(
                     if ssh_host is not None
                     else definition
                 )
-                target_identity = cli_remote_worker_probe._remote_target_identity(target_definition)
+                observation_lines = [
+                    line for line in lines if line.startswith(ONE_PASS_TARGET_IDENTITY_MARKER)
+                ]
+                if observation_lines and target_definition.target_identity is None:
+                    # clio-relay#209: a cold one-pass bootstrap already OBSERVED
+                    # the physical identity inside the same session that
+                    # installed the relay -- pin it (closing the `cluster
+                    # pin-target` manual-entry gap) instead of dialing again
+                    # to re-derive what was just learned for free. An
+                    # ALREADY-pinned identity is never overwritten this way
+                    # (falls through to the verify-only dial below), matching
+                    # `reconcile_cluster_runtime_pin`'s proven-before-repaired
+                    # discipline.
+                    observed = parse_one_pass_target_identity(lines)
+                    ssh_host_key_sha256 = cli_remote_worker_probe._ssh_host_key_fingerprints(
+                        target_definition.ssh_host
+                    )
+                    pin_result = pin_cluster_target_identity_from_one_pass_observation(
+                        cluster=cluster,
+                        registry_path=cli_cluster.default_registry_path(),
+                        observed_hostnames=cast(list[str], observed["hostnames"]),
+                        observed_site_marker_sha256=cast(
+                            "str | None", observed.get("site_marker_sha256")
+                        ),
+                        ssh_host_key_sha256=ssh_host_key_sha256,
+                    )
+                    target_identity: dict[str, object] = {
+                        "verified": True,
+                        "source": "one_pass_observation",
+                        "pin_reconciliation": pin_result,
+                        **observed,
+                    }
+                else:
+                    target_identity = cli_remote_worker_probe._remote_target_identity(
+                        target_definition
+                    )
                 target_evidence.append(
                     EvidenceReference(
                         kind="cluster_target",

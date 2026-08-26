@@ -56,7 +56,7 @@ from clio_relay.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
 )
 from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -300,6 +300,182 @@ def test_cluster_bootstrap_repoints_a_stale_relay_executable_pin(
     assert saved.relay_install_receipt == BOOTSTRAP_PRODUCED_INSTALL_RECEIPT
     # The repoint must be announced, never silent.
     assert "relay_executable_repointed" in result.output
+
+
+def test_cluster_bootstrap_pins_a_freshly_observed_target_identity(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#209: a cold one-pass bootstrap's observation pins the identity.
+
+    Closes the ``cluster pin-target`` manual-entry gap: an unpinned cluster
+    that just went through the one-pass cold install gets its physical
+    identity pinned from that SAME session's observation -- never a further
+    ssh dial (``_remote_target_identity`` is poisoned here to prove it).
+    """
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry(
+        clusters={"ares": ClusterDefinition(name="ares", ssh_host="ares")}
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+
+    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
+        receipt = {
+            "schema_version": "clio-relay.bootstrap-receipt.v2",
+            "outcome": "installed",
+            "invocation_id": "bootstrap_test",
+            "bootstrap_profile": "linux-user",
+            "relay_install_spec": "clio-relay==1.0.0",
+            "install_receipt_sha256": "a" * 64,
+            "completed_at": "2026-08-26T00:00:00Z",
+        }
+        identity = {
+            "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
+            "hostnames": ["ares-login-1", "ares-login-1.example.test"],
+            "site_marker_sha256": "c" * 64,
+        }
+        return [
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+            "bootstrap_persistent_receipt_json=" + json.dumps(receipt, sort_keys=True),
+            "bootstrap_target_identity_json=" + json.dumps(identity, sort_keys=True),
+        ]
+
+    def fake_ssh_host_key_fingerprints(ssh_host: str, **_kwargs: object) -> list[str]:
+        assert ssh_host == "ares"
+        return ["SHA256:fresh-fingerprint"]
+
+    def poisoned_remote_target_identity(_definition: ClusterDefinition) -> dict[str, object]:
+        raise AssertionError(
+            "clio-relay#209: a fresh one-pass observation must never fall through "
+            "to the separate re-verification dial"
+        )
+
+    def fake_bootstrap_reuse_acceptance_evidence(
+        receipt: dict[str, object],
+        *,
+        elapsed_seconds: float | int,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
+            "outcome": receipt["outcome"],
+            "elapsed_seconds": float(elapsed_seconds),
+            "maximum_seconds": 30.0,
+            "payload_free": True,
+            "scheduler_untouched": True,
+            "jarvis_preserved": True,
+            "component_actions": {},
+            "service_operations": {},
+        }
+
+    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_ssh_host_key_fingerprints", fake_ssh_host_key_fingerprints
+    )
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", poisoned_remote_target_identity
+    )
+    monkeypatch.setattr(
+        bootstrap_acceptance,
+        "bootstrap_reuse_acceptance_evidence",
+        fake_bootstrap_reuse_acceptance_evidence,
+    )
+
+    result = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
+
+    assert result.exit_code == 0, result.output
+    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
+    assert saved.target_identity is not None
+    assert saved.target_identity.hostnames == ["ares-login-1", "ares-login-1.example.test"]
+    assert saved.target_identity.ssh_host_key_sha256 == ["SHA256:fresh-fingerprint"]
+    assert saved.target_identity.site_marker_sha256 == "c" * 64
+
+
+def test_cluster_bootstrap_never_overwrites_an_existing_target_identity_pin(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An operator-pinned identity is never silently replaced by an observation.
+
+    Falls through to the existing verify-only dial instead -- the same
+    proven-before-repaired discipline ``reconcile_cluster_runtime_pin``
+    already applies to the runtime pin.
+    """
+    monkeypatch.chdir(tmp_path)
+    ClusterRegistry(
+        clusters={
+            "ares": ClusterDefinition(
+                name="ares",
+                ssh_host="ares",
+                target_identity=ClusterTargetIdentity(
+                    hostnames=["operator-pinned-hostname"],
+                    ssh_host_key_sha256=["SHA256:operator-pinned"],
+                ),
+            )
+        }
+    ).save(tmp_path / ".clio-relay" / "clusters.json")
+
+    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
+        receipt = {
+            "schema_version": "clio-relay.bootstrap-receipt.v2",
+            "outcome": "installed",
+            "invocation_id": "bootstrap_test",
+            "bootstrap_profile": "linux-user",
+            "relay_install_spec": "clio-relay==1.0.0",
+            "install_receipt_sha256": "a" * 64,
+            "completed_at": "2026-08-26T00:00:00Z",
+        }
+        identity = {
+            "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
+            "hostnames": ["ares-login-1"],
+            "site_marker_sha256": None,
+        }
+        return [
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
+            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
+            "bootstrap_persistent_receipt_json=" + json.dumps(receipt, sort_keys=True),
+            "bootstrap_target_identity_json=" + json.dumps(identity, sort_keys=True),
+        ]
+
+    verify_calls: list[ClusterDefinition] = []
+
+    def fake_remote_target_identity(definition: ClusterDefinition) -> dict[str, object]:
+        verify_calls.append(definition)
+        return {"verified": True}
+
+    def fake_bootstrap_reuse_acceptance_evidence(
+        receipt: dict[str, object],
+        *,
+        elapsed_seconds: float | int,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "clio-relay.bootstrap-reuse-acceptance.v1",
+            "outcome": receipt["outcome"],
+            "elapsed_seconds": float(elapsed_seconds),
+            "maximum_seconds": 30.0,
+            "payload_free": True,
+            "scheduler_untouched": True,
+            "jarvis_preserved": True,
+            "component_actions": {},
+            "service_operations": {},
+        }
+
+    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
+    monkeypatch.setattr(
+        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
+    )
+    monkeypatch.setattr(
+        bootstrap_acceptance,
+        "bootstrap_reuse_acceptance_evidence",
+        fake_bootstrap_reuse_acceptance_evidence,
+    )
+
+    result = CliRunner().invoke(app, ["cluster", "bootstrap", "--cluster", "ares"])
+
+    assert result.exit_code == 0, result.output
+    assert len(verify_calls) == 1
+    saved = ClusterRegistry.load(tmp_path / ".clio-relay" / "clusters.json").require("ares")
+    assert saved.target_identity is not None
+    assert saved.target_identity.hostnames == ["operator-pinned-hostname"]
 
 
 def test_cluster_bootstrap_preserves_a_valid_custom_pin(

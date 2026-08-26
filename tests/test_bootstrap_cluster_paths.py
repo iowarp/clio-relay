@@ -22,6 +22,10 @@ from clio_relay.bootstrap import (
     BootstrapArchive,
     render_linux_user_bootstrap_script,
 )
+from clio_relay.bootstrap_one_pass_script import (
+    ONE_PASS_PERSISTENT_RECEIPT_MARKER,
+    ONE_PASS_TARGET_IDENTITY_MARKER,
+)
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError
@@ -1186,23 +1190,41 @@ def test_bootstrap_over_ssh_forwards_configured_data_directories(
         "completed_at": "2026-07-14T00:00:00Z",
     }
 
+    identity = {
+        "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
+        "hostnames": ["cluster.example.test"],
+        "site_marker_sha256": None,
+    }
+
     def fake_run(
         command: list[str],
         *,
+        input_bytes: bytes | None = None,
         timeout_seconds: float | None = None,
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         del timeout_seconds
-        # The preflight delivers its script on stdin, so it is identified by
-        # its argv shape rather than by script content in argv (#158). This
-        # branch must precede the script-file branch below, which would
-        # otherwise also match on its trailing "bash".
-        if command[0] == "ssh" and command[-2:] == ["bash", "-s"]:
+        # clio-relay#209: both the preflight discovery dial and the combined
+        # cold-install pass share the same ["ssh", host, "bash", "-s"] argv
+        # shape (the payload always rides stdin, never argv, #158) -- they
+        # are told apart by the one-pass staging-root marker in stdin.
+        if command[0] != "ssh" or command[-2:] != ["bash", "-s"]:
+            raise AssertionError(f"unexpected remote command, no such dial should exist: {command}")
+        script = (input_bytes or b"").decode("utf-8")
+        if "CLIO_RELAY_ONE_PASS_ROOT=" not in script:
             stdout = "bootstrap_preflight_unsupported=not_installed\n"
-        elif command[0] == "ssh" and command[-2].endswith("bash"):
-            stdout = "bootstrap_receipt_json=" + json.dumps(receipt) + "\n"
         else:
-            stdout = ""
+            stdout = (
+                "bootstrap_receipt_json="
+                + json.dumps(receipt)
+                + "\n"
+                + ONE_PASS_PERSISTENT_RECEIPT_MARKER
+                + json.dumps(receipt)
+                + "\n"
+                + ONE_PASS_TARGET_IDENTITY_MARKER
+                + json.dumps(identity)
+                + "\n"
+            )
         return subprocess.CompletedProcess(command, 0, stdout, "")
 
     def validate_receipt(*_args: object, **_kwargs: object) -> None:

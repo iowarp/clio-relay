@@ -42,6 +42,11 @@ from clio_relay.bootstrap import (
     install_local_frp,
     render_linux_user_bootstrap_script,
 )
+from clio_relay.bootstrap_one_pass_script import (
+    ONE_PASS_PERSISTENT_RECEIPT_MARKER,
+    ONE_PASS_TARGET_IDENTITY_MARKER,
+    extract_one_pass_payloads,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from tests.plugin_fakes import FakeEntryPoint, FakeEntryPoints
 
@@ -581,10 +586,13 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """clio-relay#209: a cold install is exactly two ssh dials -- preflight,
+    then one combined pass carrying the payload, install, receipt
+    re-verification, and target-identity observation. No mkdir/scp/cat/rm
+    dials remain."""
     from clio_relay import bootstrap, bootstrap_receipt_validation
 
     calls: list[list[str]] = []
-    uploaded_scripts: list[str] = []
     receipt_document: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-receipt.v1",
         "invocation_id": "bootstrap_abc",
@@ -592,6 +600,11 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         "relay_install_spec": f"clio-relay=={__version__}",
         "install_receipt_sha256": "a" * 64,
         "completed_at": "2026-07-11T00:00:00Z",
+    }
+    identity_document = {
+        "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
+        "hostnames": ["ares-login-1", "ares-login-1.example.test"],
+        "site_marker_sha256": "e" * 64,
     }
 
     def fake_create_bootstrap_archive(
@@ -609,50 +622,45 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         )
 
     observed_timeouts: list[float | None] = []
+    observed_one_pass_scripts: list[str] = []
 
     def fake_run(
         command: list[str],
         *,
+        input_bytes: bytes | None = None,
         timeout_seconds: float | None = None,
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
         observed_timeouts.append(timeout_seconds)
-        # Preflight now delivers its script on stdin, so it is identified by
-        # its argv shape rather than by script content in argv (#158).
-        if command[0] == "ssh" and command[-2:] == ["bash", "-s"]:
+        is_bash_stdin = command[0] == "ssh" and command[-2:] == ["bash", "-s"]
+        if not is_bash_stdin:
+            raise AssertionError(f"unexpected remote command, no dial should exist here: {command}")
+        assert input_bytes is not None
+        script = input_bytes.decode("utf-8")
+        if "CLIO_RELAY_ONE_PASS_ROOT=" not in script:
+            # The lightweight preflight discovery dial (#158): reports cold.
             return subprocess.CompletedProcess(
                 command,
                 0,
                 "bootstrap_preflight_unsupported=not_installed\n",
                 "",
             )
-        if command[0] == "scp" and command[-1].endswith("/clio-relay-bootstrap.sh"):
-            uploaded_scripts.append(Path(command[1]).read_text(encoding="utf-8"))
-        if command[-2:] == [
-            "bash",
-            "/tmp/clio-relay-bootstrap_abc/clio-relay-bootstrap.sh",
-        ]:
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                (
-                    "bootstrap_receipt="
-                    "/home/test/.local/share/clio-relay/bootstrap-receipt.json\n"
-                    "bootstrap_receipt_json="
-                    + json.dumps(receipt_document, sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                ),
-                "",
-            )
-        if command[-2:] == ["cat", "$HOME/.local/share/clio-relay/bootstrap-receipt.json"]:
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps(receipt_document),
-                "",
-            )
-        return subprocess.CompletedProcess(command, 0, "", "")
+        # The single combined cold-install pass.
+        observed_one_pass_scripts.append(script)
+        stdout = (
+            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json\n"
+            "bootstrap_receipt_json="
+            + json.dumps(receipt_document, sort_keys=True, separators=(",", ":"))
+            + "\n"
+            + ONE_PASS_PERSISTENT_RECEIPT_MARKER
+            + json.dumps(receipt_document, sort_keys=True, separators=(",", ":"))
+            + "\n"
+            + ONE_PASS_TARGET_IDENTITY_MARKER
+            + json.dumps(identity_document, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout, "")
 
     def validate_receipt(
         receipt: dict[str, object],
@@ -683,31 +691,23 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         jarvis_resource_graph_profile="ares",
     )
 
+    # Exactly two ssh dials for the whole cold bootstrap: preflight discovery
+    # and the one combined install pass. No mkdir/scp/cat/rm dial exists.
+    assert len(calls) == 2
+    assert all(command[0] == "ssh" and command[-2:] == ["bash", "-s"] for command in calls)
+    assert not any(command[0] == "scp" for command in calls)
+
     assert lines[0].startswith("bootstrap_receipt=")
     receipt_line = next(line for line in lines if line.startswith("bootstrap_receipt_json="))
     receipt = json.loads(receipt_line.partition("=")[2])
     assert receipt["invocation_id"] == "bootstrap_abc"
-    assert [
-        "ssh",
-        "ares",
-        "cat",
-        "$HOME/.local/share/clio-relay/bootstrap-receipt.json",
-    ] in calls
-    assert calls[-1] == [
-        "ssh",
-        "ares",
-        "rm",
-        "-rf",
-        "--",
-        "/tmp/clio-relay-bootstrap_abc",
-    ]
-    assert any(
-        command[-1] == "ares:/tmp/clio-relay-bootstrap_abc/clio-relay-head.tar" for command in calls
-    )
-    assert uploaded_scripts
-    remote_script_call = calls.index(
-        ["ssh", "ares", "bash", "/tmp/clio-relay-bootstrap_abc/clio-relay-bootstrap.sh"]
-    )
+    identity_line = next(line for line in lines if line.startswith(ONE_PASS_TARGET_IDENTITY_MARKER))
+    assert json.loads(identity_line.partition("=")[2]) == identity_document
+
+    # Both dials share the exact same ["ssh", host, "bash", "-s"] argv shape
+    # (#158 -- the payload always rides stdin, never argv), so the one-pass
+    # call is identified by position, not list equality.
+    remote_script_call = 1
     assert (
         observed_timeouts[remote_script_call] == bootstrap.BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS
     )
@@ -715,15 +715,25 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
         bootstrap.BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS
         >= deployment.ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS + 60
     )
+
+    assert len(observed_one_pass_scripts) == 1
+    one_pass_script = observed_one_pass_scripts[0]
+    archive_bytes, install_script = extract_one_pass_payloads(one_pass_script)
+    assert archive_bytes == b"bootstrap archive"
     assert (
         'descriptor = os.open("bootstrap.lock", flags, 0o600, dir_fd=directory_descriptor)'
-        in uploaded_scripts[0]
+        in install_script
     )
-    assert "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)" in uploaded_scripts[0]
-    assert "sha256sum --check --strict" in uploaded_scripts[0]
-    assert "/tmp/clio-relay-head.tar" not in uploaded_scripts[0]
+    assert "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)" in install_script
+    assert "sha256sum --check --strict" in install_script
+    assert "/tmp/clio-relay-head.tar" not in install_script
+    # The staging directory self-cleans via a remote EXIT trap: no separate
+    # rm -rf dial exists to assert on.
+    assert "trap clio_relay_one_pass_cleanup EXIT" in one_pass_script
+    assert 'rm -rf -- "$CLIO_RELAY_ONE_PASS_ROOT"' in one_pass_script
 
     receipt_document["relay_install_spec"] = "unreviewed-source"
+    calls_before_failure = len(calls)
     with pytest.raises(RelayError, match="relay_install_spec"):
         bootstrap.bootstrap_cluster_over_ssh(
             bootstrap_profile="linux-user",
@@ -732,7 +742,9 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
             relay_artifact_sha256="a" * 64,
             jarvis_resource_graph_profile="ares",
         )
-    assert calls[-1][-1] == "/tmp/clio-relay-bootstrap_abc"
+    # The failed attempt cost exactly two more dials -- no extra cleanup
+    # dial: a failed pass self-cleans remotely via its own trap.
+    assert len(calls) == calls_before_failure + 2
 
 
 def test_bootstrap_over_ssh_rejects_option_like_destination(tmp_path: Path) -> None:

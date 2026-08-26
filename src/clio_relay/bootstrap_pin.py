@@ -137,3 +137,62 @@ def reconcile_cluster_runtime_pin(
             "after": definition.relay_install_receipt,
         },
     }
+
+
+TARGET_IDENTITY_PIN_SCHEMA = "clio-relay.bootstrap-target-identity-pin.v1"
+
+
+def pin_cluster_target_identity_from_one_pass_observation(
+    *,
+    cluster: str,
+    registry_path: Path,
+    observed_hostnames: list[str],
+    observed_site_marker_sha256: str | None,
+    ssh_host_key_sha256: list[str],
+) -> dict[str, object]:
+    """Pin a physical target identity a cold one-pass bootstrap just observed.
+
+    clio-relay#209: closes the ``cluster pin-target`` manual-entry gap. Only
+    fills a MISSING pin -- an operator-pinned identity that already exists is
+    never overwritten by an in-session observation (the same
+    proven-before-repaired discipline ``reconcile_cluster_runtime_pin``
+    documents: an existing value is deliberate until proven otherwise, not
+    merely different). When a pin already exists this is a no-op; the
+    caller's existing ``cli_remote_worker_probe._remote_target_identity``
+    verification-only dial still runs for that case.
+
+    ``ssh_host_key_sha256`` must already be resolved by the caller from
+    locally cached host keys (``ssh-keyscan``/``ssh-keygen`` against
+    ``~/.ssh/known_hosts`` -- never authenticates against the target, so it
+    never costs a dial); this function performs no I/O beyond the registry
+    mutation.
+    """
+    from clio_relay.cluster_config import ClusterRegistry, ClusterTargetIdentity
+
+    before: dict[str, object] = {}
+
+    def update(registry: ClusterRegistry) -> None:
+        definition = registry.require(cluster)
+        if definition.target_identity is not None:
+            before["action"] = "unchanged"
+            return
+        before["action"] = "pinned"
+        definition.target_identity = ClusterTargetIdentity(
+            hostnames=observed_hostnames,
+            ssh_host_key_sha256=ssh_host_key_sha256,
+            scheduler_cluster_name=None,
+            site_marker_sha256=observed_site_marker_sha256,
+        )
+
+    registry = ClusterRegistry.mutate(registry_path, update)
+    definition = registry.require(cluster)
+    return {
+        "schema_version": TARGET_IDENTITY_PIN_SCHEMA,
+        "cluster": cluster,
+        "action": before["action"],
+        "target_identity": (
+            definition.target_identity.model_dump(mode="json")
+            if definition.target_identity is not None
+            else None
+        ),
+    }

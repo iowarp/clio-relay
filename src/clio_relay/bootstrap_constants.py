@@ -36,3 +36,15 @@ MAX_RELAY_WHEEL_METADATA_BYTES = 1024 * 1024
 BOOTSTRAP_REMOTE_SCRIPT_TIMEOUT_SECONDS = 1800.0
 BOOTSTRAP_PUBLIC_EXACT_DEADLINE_SECONDS = 29.0
 BOOTSTRAP_PUBLIC_REPAIR_DEADLINE_SECONDS = 58.0
+BOOTSTRAP_PERSISTENT_RECEIPT_PATH = "$HOME/.local/share/clio-relay/bootstrap-receipt.json"
+"""Stable receipt path bootstrap publishes after every successful install.
+
+Used by the cold one-pass script's own in-session re-read
+(``bootstrap_one_pass_script.py``, clio-relay#209), which folds what used to
+be a standalone ``ssh ... cat`` verification dial into the same combined
+pass. ``bootstrap.py``'s ``_verify_persistent_bootstrap_receipt`` (the warm
+path's still-separate re-verification dial) names the identical path as its
+own literal rather than importing this constant, to avoid growing that
+file's line count past its size-ratchet baseline (#231/#775) for a
+same-value rename; keep both in sync if this path ever changes.
+"""
