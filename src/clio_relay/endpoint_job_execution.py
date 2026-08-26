@@ -1,18 +1,18 @@
 """The job execution orchestrator: ``_run_job_impl``.
 
-Owner module for iowarp/clio-relay#231's endpoint decomposition. ``_run_job_impl`` (~645
-lines) is one sequential procedure -- launch setup, sidecar precreation, streaming
-execution, progress/runtime ingest, ownership resolution, and terminal-state recording
--- that threads roughly thirty local variables through nested closures (``on_stdout``,
+Owner module for iowarp/clio-relay#231's endpoint decomposition. ``_run_job_impl`` is one
+sequential procedure -- launch setup, sidecar precreation, streaming execution,
+progress/runtime ingest, ownership resolution, and terminal-state recording -- that
+threads roughly thirty local variables through nested closures (``on_stdout``,
 ``on_poll``, ...) passed into ``self._run_execution_streaming``. Splitting it further
 would mean rewriting that closure capture, not moving it, so unlike its sibling owner
 modules it stays a single method per the sweet-spot exception already established for
 ``bootstrap_reconcile_activation_paths.py`` (548 lines) and
-``jarvis_mcp_validation_report.py`` (797 lines) in this same ratchet.
+``jarvis_mcp_validation_report.py`` (797 lines) in this same ratchet. Terminal-verdict
+rendering lives in ``job_terminal_verdict.py``/``mcp_call_result_error.py`` instead --
+extracted because this file has no headroom of its own (#265/#183/#162/#248).
 
-Its thin caller, ``_run_job`` (sidecar cleanup around this method on either success or
-failure), stays with ``run_once`` in ``endpoint_serve_loop.py`` instead -- the pairing
-that keeps both files under the 800-line cap.
+Its thin caller, ``_run_job``, stays with ``run_once`` in ``endpoint_serve_loop.py``.
 """
 
 from __future__ import annotations
@@ -727,8 +727,7 @@ class JobExecutionMixin:
             self.queue.acknowledge_job_cancellation(job.job_id)
             return
         if effective_returncode == 0:
-            # Ruling B: a signal-only outputs_missing verdict never fails a
-            # genuinely successful run, but still reaches the task record.
+            # Ruling B: the signal never fails a success, but still reaches the record.
             success_metadata: dict[str, object] = {
                 "returncode": effective_returncode,
                 "mcp_dispatch_recovered": dispatch_recovered,
@@ -751,8 +750,7 @@ class JobExecutionMixin:
             return
         watch_failure = outcome.watch_failure
         application_verdict_failure = outcome.application_verdict_failure
-        outputs_missing_detail = outcome.outputs_missing
-        # clio-relay#183 residual + #248: owner logic lives in mcp_call_result_error.py.
+        outputs_missing_failure = outcome.outputs_missing_failure  # Ruling B: GATED, not raw.
         mcp_dispatch_failure = mcp_call_dispatch_failure_detail(
             self.queue,
             job,
@@ -762,14 +760,14 @@ class JobExecutionMixin:
             dispatch_refusal_present=dispatch_refusal is not None,
             watch_failure_present=watch_failure is not None,
             application_verdict_failure_present=application_verdict_failure is not None,
-            outputs_missing_present=outputs_missing_detail is not None,
+            outputs_missing_failure_present=outputs_missing_failure is not None,
         )
         failure_metadata = job_terminal_verdict.terminal_failure_metadata(
             effective_returncode=effective_returncode,
             dispatch_refusal=dispatch_refusal,
             watch_failure=watch_failure,
             application_verdict_failure=application_verdict_failure,
-            outputs_missing_detail=outputs_missing_detail,
+            outputs_missing_signal=outcome.outputs_missing,
             mcp_dispatch_failure=mcp_dispatch_failure,
         )
         self.queue.update_task_state(
@@ -778,7 +776,6 @@ class JobExecutionMixin:
             message=f"Task failed: {task.name}",
             metadata=failure_metadata,
         )
-        # Rendering owned by job_terminal_verdict.py (extracted, #774/#775).
         self.queue.update_job_state(
             job.job_id,
             JobState.FAILED,
@@ -786,14 +783,14 @@ class JobExecutionMixin:
                 dispatch_refusal=dispatch_refusal,
                 watch_failure=watch_failure,
                 application_verdict_failure=application_verdict_failure,
-                outputs_missing_detail=outputs_missing_detail,
+                outputs_missing_failure=outputs_missing_failure,
                 endpoint_mcp_call=endpoint_mcp_call,
             ),
             error=job_terminal_verdict.terminal_failure_error_text(
                 dispatch_refusal=dispatch_refusal,
                 watch_failure=watch_failure,
                 application_verdict_failure=application_verdict_failure,
-                outputs_missing_detail=outputs_missing_detail,
+                outputs_missing_failure=outputs_missing_failure,
                 mcp_dispatch_failure=mcp_dispatch_failure,
                 effective_returncode=effective_returncode,
             ),

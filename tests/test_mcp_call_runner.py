@@ -43,6 +43,34 @@ class McpCallRunnerModule(Protocol):
         ...
 
 
+def test_packaged_runner_module_imports_cleanly() -> None:
+    """Import-smoke guard: closes the HOLE CLASS, not just one instance.
+
+    ``jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py`` is the ONE
+    file the endpoint worker actually launches for every real
+    jarvis_run/spack_install/execution-watch/#162-precheck dispatch --
+    ``src/clio_relay/mcp_call/`` does not exist as an editable-install
+    package, so ``endpoint_mcp_runner_command`` falls through to this
+    vendored jarvis-packages copy. Every OTHER test in this repo fakes the
+    runner subprocess entirely (a ``JarvisCdProvider`` double that never
+    execs the real file), so a broken top-level import here is invisible
+    to the rest of the suite -- proven live: promoting ``protocol_
+    messages._structured_result`` to the public ``structured_result_from_
+    protocol_result`` (clio-relay#271 direction) updated both
+    ``protocol_messages.py`` copies but missed this file's own import of
+    it, an ``ImportError`` every real dispatch would hit at startup.
+    ``_load_runner()`` (below) execs the packaged module exactly the way
+    the shipped wheel does; this test's only job is to prove THAT always
+    succeeds, so any future rename/move in a module this runner imports
+    from that isn't mirrored here fails HERE, fast and by name, instead of
+    silently on a live cluster.
+    """
+    module = _load_runner()
+    assert callable(module.run_mcp_call_from_params)
+    assert callable(module.run_mcp_call_request_file)
+    assert callable(module.structured_result_from_protocol_result)
+
+
 def _jarvis_cd_uv_lock(
     *,
     version: str = JARVIS_CD_VERSION,
@@ -732,7 +760,7 @@ for line in sys.stdin:
         result.stdout,
         response_id="clio-relay-mcp-call",
     )
-    structured = cast(Any, runner)._structured_result(
+    structured = cast(Any, runner).structured_result_from_protocol_result(
         protocol_result,
         operation="tools/call",
     )
@@ -3072,7 +3100,7 @@ for line in sys.stdin:
         process.stdout,
         response_id="clio-relay-mcp-call",
     )
-    structured_result = cast(Any, runner)._structured_result(
+    structured_result = cast(Any, runner).structured_result_from_protocol_result(
         protocol_result,
         operation="tools/call",
     )

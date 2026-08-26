@@ -118,7 +118,17 @@ from typing import Any, NamedTuple
 # public and every import site (including execution_watch.py, which shares
 # all four, and endpoint.py's forward re-exports) repointed. Net: 7663 ->
 # 7636, verified via a full baseline-vs-fixed diff.
-BASELINE_TOTAL = 7636
+#
+# Third-round adversarial-review verification pass (item 4): the
+# jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py blocker fix
+# (importing structured_result_from_protocol_result instead of the
+# renamed-away _structured_result) plus the two test call-site fixes and
+# the new import-smoke guard test removed 5 more reportPrivateUsage-
+# adjacent errors than they added. Measured (not hardcoded from the
+# reviewer's own prediction, confirmed to match it) via
+# `uv run --no-sync python scripts/check_pyright_ratchet.py` from the
+# synced worktree venv: 7636 -> 7631.
+BASELINE_TOTAL = 7631
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

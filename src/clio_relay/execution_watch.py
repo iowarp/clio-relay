@@ -434,20 +434,31 @@ class ExecutionOutcome:
     effective_returncode: int
     cancellation_honored: bool
     watch_failure: dict[str, object] | None
-    #: clio-relay#265: the typed ``outputs_missing`` verdict from
-    #: ``jarvis_execution_artifacts.ingest_jarvis_execution_outputs`` for
-    #: this job's terminal ``mcp_result``, or ``None`` when nothing was
-    #: declared or every declared output is present and non-empty.
+    #: clio-relay#265: the PURE, unconditional ``outputs_missing`` signal
+    #: (or ``None``), regardless of whether it drove this outcome's FAILED
+    #: state. Callers folding the signal into a durable record
+    #: unconditionally (e.g. the success branch) read this. Callers
+    #: deciding WHY a job failed must use :attr:`outputs_missing_failure`
+    #: instead -- see that field's own docstring.
     outputs_missing: dict[str, object] | None = None
-    #: Ruling A: populated with the resolved watch's own ``application_
-    #: verdict`` ONLY when it is the reason this outcome is FAILED
+    #: Ruling A: the resolved watch's own ``application_verdict`` ONLY
+    #: when it is the reason this outcome is FAILED
     #: (``RETURNCODE_CONFLICT_REASON``) and ``watch_failure`` is not --
-    #: otherwise a returncode_conflict failure would render as a bare exit
-    #: code, the exact defect class this campaign kills. Mutually exclusive
-    #: with ``watch_failure`` by construction (a resolved watch's own
-    #: ``succeeded`` is what gates whether ``execution_watch_failure_
-    #: detail`` was ever computed at all).
+    #: otherwise a returncode_conflict failure renders as a bare exit
+    #: code, the exact defect class this campaign kills. Mutually
+    #: exclusive with ``watch_failure`` by construction.
     application_verdict_failure: dict[str, object] | None = None
+    #: Ruling B (adversarial-review fix, mirrors ``application_verdict_
+    #: failure``): :attr:`outputs_missing` ONLY when :func:`_outputs_
+    #: missing_forces_failure` says so (``declared_outputs_missing``,
+    #: never the signal-only ``no_outputs_declared``). Proven live:
+    #: threading the RAW signal into the renderers/guard instead of this
+    #: gated field let a present-but-non-forcing signal hijack an
+    #: unrelated real failure (rendered "completed but declared zero
+    #: outputs" and suppressed the #183/#248 tier entirely). Callers
+    #: rendering "why did this job fail" must use THIS field, never the
+    #: raw :attr:`outputs_missing`.
+    outputs_missing_failure: dict[str, object] | None = None
 
 
 #: clio-relay#265 D1 revision (adversarial-review Ruling B -- flag for
@@ -504,9 +515,14 @@ def resolve_execution_outcome(
     (Ruling B) -- only a genuinely missing/empty DECLARED output is FAILED
     regardless of what the scheduler/JARVIS/dispatch path otherwise
     reported (including an already-recovered dispatch); the signal-only
-    ``no_outputs_declared`` reason never does. A forced failure (either
-    source) wins over a pending cancellation for the same reason a resolved
-    watch already does: the real outcome was observed.
+    ``no_outputs_declared`` reason never does, and never populates
+    :attr:`ExecutionOutcome.outputs_missing_failure` either -- only that
+    gated field, never the raw :attr:`ExecutionOutcome.outputs_missing`
+    signal, may drive a "why did this job fail" decision (mirrors
+    :attr:`ExecutionOutcome.application_verdict_failure`'s own split).
+    A forced failure (either source) wins over a pending cancellation for
+    the same reason a resolved watch already does: the real outcome was
+    observed.
     """
     if dispatch_recovered:
         effective_returncode = 0
@@ -525,15 +541,18 @@ def resolve_execution_outcome(
         effective_returncode = 1
         cancellation_honored = False
         application_verdict_failure = watch_resolution.application_verdict
+    outputs_missing_failure: dict[str, object] | None = None
     if _outputs_missing_forces_failure(outputs_missing):
         effective_returncode = 1
         cancellation_honored = False
+        outputs_missing_failure = outputs_missing
     return ExecutionOutcome(
         effective_returncode=effective_returncode,
         cancellation_honored=cancellation_honored,
         watch_failure=(watch_resolution.failure_detail if watch_resolution is not None else None),
         outputs_missing=outputs_missing,
         application_verdict_failure=application_verdict_failure,
+        outputs_missing_failure=outputs_missing_failure,
     )
 
 

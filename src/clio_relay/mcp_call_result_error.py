@@ -279,7 +279,7 @@ def mcp_call_dispatch_failure_detail(
     dispatch_refusal_present: bool,
     watch_failure_present: bool,
     application_verdict_failure_present: bool,
-    outputs_missing_present: bool,
+    outputs_missing_failure_present: bool,
 ) -> dict[str, object] | None:
     """Resolve #183/#248's residual typed reason for a failed ``mcp_call`` dispatch.
 
@@ -288,14 +288,18 @@ def mcp_call_dispatch_failure_detail(
     line-count ratchet ceiling, #774/#775) -- ``None`` whenever this is not
     an endpoint-owned ``mcp_call`` at all, or one of the higher-priority
     typed reasons (JARVIS dispatch refusal, #266 execution-watch failure,
-    Ruling A returncode_conflict, #265 outputs-missing) already applied.
+    Ruling A returncode_conflict, Ruling B outputs-missing) already
+    applied. ``outputs_missing_failure_present`` MUST be the caller's
+    GATED ``ExecutionOutcome.outputs_missing_failure`` (adversarial-review
+    fix), never the raw ``outputs_missing`` signal -- a present-but-non-
+    forcing ``no_outputs_declared`` signal must never suppress this tier.
     """
     if (
         not endpoint_mcp_call
         or dispatch_refusal_present
         or watch_failure_present
         or application_verdict_failure_present
-        or outputs_missing_present
+        or outputs_missing_failure_present
     ):
         return None
     result_path = spool.path / "mcp-result.json"

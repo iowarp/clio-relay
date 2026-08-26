@@ -311,24 +311,33 @@ def _clean_verdict(status: str = "success") -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    ("watch_succeeded", "outputs_missing", "expected_returncode", "expected_cancellation"),
+    (
+        "watch_succeeded",
+        "outputs_missing",
+        "expected_returncode",
+        "expected_cancellation",
+        "expected_forces",
+    ),
     [
         # Legacy/pre-Ruling-B shape (no "reason" key at all) fails closed,
         # unchanged from develop.
-        (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 1, False),
+        (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 1, False, True),
         # declared_outputs_missing: one or more DECLARED outputs were found
         # missing/empty -- still forces failure ("producing the declared
         # outputs is PART of what completed means").
-        (True, {"reason": "declared_outputs_missing"}, 1, False),
+        (True, {"reason": "declared_outputs_missing"}, 1, False, True),
         # Ruling B (adversarial review, flagged for owner sign-off):
         # no_outputs_declared is a SURFACED SIGNAL only -- it must NOT flip
         # a genuinely successful run (a pipeline-snapshot-only page, a
-        # pure-stdout application, ...) to FAILED.
-        (True, {"reason": "no_outputs_declared"}, 0, False),
+        # pure-stdout application, ...) to FAILED, and must NOT populate
+        # the GATED outputs_missing_failure field either (adversarial-
+        # review fix: that field, not the raw signal, is what a renderer
+        # may use to explain a failure).
+        (True, {"reason": "no_outputs_declared"}, 0, False, False),
         # No outputs_missing verdict: the watch's own success stands.
-        (True, None, 0, False),
+        (True, None, 0, False, False),
         # A genuinely failed watch stays failed regardless of outputs_missing.
-        (False, None, 1, False),
+        (False, None, 1, False, False),
     ],
 )
 def test_resolve_execution_outcome_folds_outputs_missing(
@@ -336,6 +345,7 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     outputs_missing: dict[str, object] | None,
     expected_returncode: int,
     expected_cancellation: bool,
+    expected_forces: bool,
 ) -> None:
     resolution = execution_watch.ExecutionWatchResolution(
         succeeded=watch_succeeded,
@@ -352,7 +362,10 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     )
     assert outcome.effective_returncode == expected_returncode
     assert outcome.cancellation_honored is expected_cancellation
+    # The RAW signal is always carried, regardless of whether it forces failure.
     assert outcome.outputs_missing == outputs_missing
+    # The GATED field only carries it when it actually drove the failure.
+    assert outcome.outputs_missing_failure == (outputs_missing if expected_forces else None)
 
 
 def test_resolve_execution_outcome_folds_returncode_conflict() -> None:
@@ -438,6 +451,7 @@ class _WatchTransportProvider(JarvisCdProvider):
         queue: ClioCoreQueue | None = None,
         job_id: str | None = None,
         terminal_artifacts: list[dict[str, object]] | None = None,
+        dispatch_returncode: int = 0,
     ) -> None:
         super().__init__(jarvis_bin="jarvis")
         self.pipeline_id = pipeline_id
@@ -455,6 +469,13 @@ class _WatchTransportProvider(JarvisCdProvider):
         # artifact-bearing poll reports -- None keeps the pre-#265 empty
         # ``artifacts: []`` default.
         self.terminal_artifacts = terminal_artifacts
+        # clio-relay#265 item 2 (adversarial-review): the OUTER transport
+        # returncode (this subprocess's own exit code) is a SEPARATE concept
+        # from the document-internal ``return_code`` above -- the document
+        # can be a trusted, terminal, successful native execution while the
+        # dispatch subprocess itself still exits nonzero. Defaults to 0
+        # (today's behavior) for every other test using this fixture.
+        self.dispatch_returncode = dispatch_returncode
         self.dispatch_count = 0
         self.poll_count = 0
         self.poll_specs: list[McpCallSpec] = []
@@ -511,12 +532,36 @@ class _WatchTransportProvider(JarvisCdProvider):
                 server_artifact=self.server_artifact,
                 native=self._native(0),
             )
+            dispatch_record = cast(dict[str, Any], self._native(0)["execution_record"])
+            if self.terminal_artifacts is not None and dispatch_record["terminal"]:
+                # clio-relay#265 item 2 (adversarial-review failing-first
+                # coverage): a real ``jarvis_run`` dispatch response never
+                # carries ``artifact_page`` (only ``jarvis_get_execution``
+                # declares it -- see jarvis_execution_artifacts.py's own
+                # module docstring), so this branch is normally dead for
+                # every OTHER test using this fixture (``terminal_artifacts``
+                # is ``None`` there). Injecting it here, ONLY when a test
+                # opts in, proves ``ingest_jarvis_execution_outputs`` /
+                # ``resolve_execution_outcome`` / the renderers handle a
+                # synchronously-terminal dispatch (``watch_resolution is
+                # None``, so ``effective_returncode`` comes from the
+                # TRANSPORT returncode, not any watch/application verdict)
+                # that ALSO happens to declare a terminal artifact page --
+                # the one combination that lets a nonzero transport
+                # returncode and a present-but-non-forcing
+                # ``no_outputs_declared`` signal coexist, which is exactly
+                # the shape the proven Ruling B hijack bug needed.
+                structured_result = cast(dict[str, object], document["structured_result"])
+                structured_result["artifact_page"] = {
+                    "artifacts": self.terminal_artifacts,
+                    "terminal": True,
+                }
             (cwd / "mcp-result.json").write_text(json.dumps(document), encoding="utf-8")
             if on_stdout is not None:
                 on_stdout("jarvis_run accepted; execution submitted\n")
             if on_poll is not None:
                 on_poll()
-            return subprocess.CompletedProcess(["jarvis-run"], 0, "", "")
+            return subprocess.CompletedProcess(["jarvis-run"], self.dispatch_returncode, "", "")
         assert process_label == "jarvis execution watch query"
         params = json.loads((cwd / "params.json").read_text(encoding="utf-8"))
         query_spec = McpCallSpec.model_validate(params)
@@ -898,6 +943,99 @@ def test_deferred_execution_with_only_a_pipeline_snapshot_artifact_succeeds(
     assert outputs_missing["declared_count"] == 0
     events = _event_types(queue, job.job_id)
     assert "execution.watch_resolved" in events
+    assert "jarvis.execution_outputs_missing" in events
+
+
+def test_transport_failure_with_signal_only_outputs_missing_names_the_real_reason(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """Failing-first e2e for the proven Ruling B hijack (adversarial-review
+    item 2): a nonzero TRANSPORT returncode is only ever consulted by
+    ``resolve_execution_outcome`` when no watch resolution exists (the
+    synchronous-terminal-dispatch fast path -- ``test_synchronous_terminal_
+    dispatch_skips_watch``'s own twin), and that is the ONE combination
+    that lets a present-but-non-forcing ``no_outputs_declared`` signal sit
+    alongside a real, unrelated FAILED verdict it must not hijack. Proven
+    live (2026-08-26): the pre-fix code rendered ``last_error`` as
+    "completed but declared zero outputs are missing or empty" -- naming
+    the SIGNAL, not the actual transport failure -- and suppressed the
+    #183/#248 ``mcp_call_result_error`` tier's own guard from ever running.
+
+    The fixed code must instead: (1) never let the raw signal win priority
+    over the real, lower-tier reason (here, the bare "exit code 1" last
+    resort -- structurally correct, since this fabricated document itself
+    carries no MCP-protocol-level error to name more specifically, see
+    ``mcp_call_result_error``'s own docstring on what it can and cannot
+    invent), and (2) still fold the raw signal into task metadata
+    unconditionally, so it is never silently lost.
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"ran and finished synchronously\n")
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        # A single, already-terminal state: the dispatch's OWN document
+        # reports success (state=="completed", return_code=0, no Ruling A
+        # conflict) -- the watch never engages (mirrors ``test_synchronous_
+        # terminal_dispatch_skips_watch``), so ``resolve_execution_outcome``
+        # falls through to ``effective_returncode = transport_returncode``.
+        states=[("completed", True, "9100")],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        # The TRANSPORT-level dispatch subprocess itself exits nonzero --
+        # independent of the document-internal fields above, see
+        # ``dispatch_returncode``'s own docstring on this fixture.
+        dispatch_returncode=1,
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.pipeline",
+                "kind": "pipeline-snapshot",
+                "role": "log",
+                "location": {"kind": "execution_path", "value": "pipeline.yaml"},
+                "size_bytes": 512,
+                "checksum": f"sha256:{'d' * 64}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert transport.dispatch_count == 1
+    assert transport.poll_count == 0  # the watch never engaged
+    assert result.last_error is not None
+    # The real reason (a bare transport exit code -- no structural MCP
+    # error exists in this document to name more specifically) must
+    # survive, never overwritten by a "completed"/"declared zero outputs"
+    # message the signal-only reason must not drive.
+    assert result.last_error == "exit code 1"
+    assert "declared" not in result.last_error
+    assert "completed" not in result.last_error
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.state is JobState.FAILED
+    assert "mcp_dispatch_failure" not in task.metadata
+    assert "application_verdict_failure" not in task.metadata
+    assert "execution_watch_failure" not in task.metadata
+    # The raw signal itself is NEVER lost -- folded into the durable
+    # record unconditionally, exactly as the success branch already does.
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["schema_version"] == "clio-relay.execution-outputs-missing.v1"
+    assert outputs_missing["reason"] == "no_outputs_declared"
+    assert outputs_missing["declared_count"] == 0
+    events = _event_types(queue, job.job_id)
     assert "jarvis.execution_outputs_missing" in events
 
 
