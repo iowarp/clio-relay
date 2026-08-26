@@ -234,6 +234,38 @@ class RemoteConnection:
         return transport is not None and transport.is_alive()
 
     @property
+    def state(self) -> Literal["connected", "authorization_required", "not_established"]:
+        """Return this connection's typed lifecycle state (iowarp/clio-relay#276 B2).
+
+        A read-only projection of the same transport reference/liveness this
+        class already tracks -- it records no new state of its own.
+        ``"authorization_required"`` means a channel was established at least
+        once and has since dropped: the transport is not alive, but this
+        connection still remembers holding a (now-dead) transport, so only an
+        explicit, user-authorized :meth:`reconnect` -- never a background
+        retry -- may replace it (the 2FA doctrine,
+        docs/connection-model.md:141-157). ``"not_established"`` means no
+        channel has ever been held on this connection object. ``session_attach.
+        attach_owned_session`` branches on this exact literal to decide
+        between resuming a live channel in place and performing the one
+        authorized reconnect.
+
+        The transport reference is read exactly ONCE, under :attr:`_lock`:
+        reading it via two separate unlocked calls (``self.connected`` then
+        ``self._transport``) could observe two different transport states
+        across a concurrent ``close()``/``reconnect()`` racing this read,
+        misreporting ``not_established`` for a connection that was actually
+        ``authorization_required`` a moment earlier.
+        """
+        with self._lock:
+            transport = self._transport
+            if transport is not None and transport.is_alive():
+                return "connected"
+            if transport is not None:
+                return "authorization_required"
+            return "not_established"
+
+    @property
     def events(self) -> tuple[ChannelEvent, ...]:
         """Return the bounded, typed transport lifecycle record."""
         return tuple(self._events)

@@ -1183,8 +1183,28 @@ For detach and reattach workflows:
 clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
 clio-relay session status --cluster my-cluster --session-id desktop-session
 clio-relay session detach --cluster my-cluster --session-id desktop-session
+clio-relay session attach --cluster my-cluster
 clio-relay session teardown --cluster my-cluster --session-id desktop-session
 ```
+
+`session start` writes a durable last-session record for the cluster (session
+id, generation id, remote API port); `session attach` reads it back, so a new
+process -- after a clean detach, after closing the terminal, or after the
+desktop process itself crashed -- finds its way back to the same remote
+session without re-supplying `--session-id`. Attach re-verifies the exact
+session/generation before reporting it live and prints the session's still-running
+jobs. `session detach` never clears this record (the remote session is left
+running on purpose); only an authoritatively closed `session teardown` does.
+
+`session attach` is also how a dropped SSH-forwarded channel is
+re-established: per the 2FA operating assumption above, a dropped channel is
+never redialed automatically from inside an operation. An owned-session
+operation that discovers the drop fails with a typed
+`authorization_required` refusal naming the recovery command; running
+`clio-relay session attach --cluster my-cluster` (or its alias, `clio-relay
+session reconnect --cluster my-cluster`) is the one explicit, user-present
+action that performs that single new dial. An already-live channel is reused
+untouched -- zero new dials.
 
 For a recorder or other client that must survive loss of the initiating process,
 run `session plan-start` first and persist its JSON. Pass the plan's operation id,
