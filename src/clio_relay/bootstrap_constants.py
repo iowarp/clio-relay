@@ -39,12 +39,9 @@ BOOTSTRAP_PUBLIC_REPAIR_DEADLINE_SECONDS = 58.0
 BOOTSTRAP_PERSISTENT_RECEIPT_PATH = "$HOME/.local/share/clio-relay/bootstrap-receipt.json"
 """Stable receipt path bootstrap publishes after every successful install.
 
-Used by the cold one-pass script's own in-session re-read
-(``bootstrap_one_pass_script.py``, clio-relay#209), which folds what used to
+Shared by the warm re-verification dial (``bootstrap._verify_persistent_
+bootstrap_receipt``) and the cold one-pass script's own in-session re-read
+(``bootstrap_one_pass_script.py``, clio-relay#209 -- which folds what used to
 be a standalone ``ssh ... cat`` verification dial into the same combined
-pass. ``bootstrap.py``'s ``_verify_persistent_bootstrap_receipt`` (the warm
-path's still-separate re-verification dial) names the identical path as its
-own literal rather than importing this constant, to avoid growing that
-file's line count past its size-ratchet baseline (#231/#775) for a
-same-value rename; keep both in sync if this path ever changes.
+pass), so both name the exact same file from one source of truth.
 """

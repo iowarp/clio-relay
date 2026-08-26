@@ -208,3 +208,15 @@ them:
   host directly instead of riding this channel via the cluster relay.
 - `--wait-seconds` is a wire-compatibility break against cluster relays older
   than this release: it fails loudly, but without naming the version mismatch.
+- a COLD `cluster bootstrap` still opens two SSH connections of its own
+  (the lightweight preflight dial that tells warm from cold, plus one
+  combined install pass), not the single deploy connection
+  `connection-model.md`'s mode (c) budget assumes for the deploy step; see
+  that page's "Known deviations" and
+  [#209](https://github.com/iowarp/clio-relay/issues/209). Closed by the same
+  work: the six dials that combined pass used to cost after preflight
+  (mkdir/scp/scp/exec/cat/rm) and the separate target-identity probe
+  dial -- a cold bootstrap no longer opens eight-plus connections, and a
+  cluster with an identity already pinned costs the same two dials as an
+  unpinned one (the pin is verified from the same one-pass observation
+  locally, not re-derived over a third dial).

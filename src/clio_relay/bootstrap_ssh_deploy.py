@@ -337,8 +337,8 @@ def bootstrap_cluster_over_ssh(
         relay_wheel=relay_wheel,
         relay_artifact_sha256=relay_artifact_sha256,
     )
-    if shutil.which("ssh") is None or shutil.which("scp") is None:
-        raise ConfigurationError("ssh and scp are required for remote bootstrap")
+    if shutil.which("ssh") is None:
+        raise ConfigurationError("ssh is required for remote bootstrap")
     expected_desired_state = bootstrap._bootstrap_desired_state(
         identity=planned_identity,
         cluster=cluster,

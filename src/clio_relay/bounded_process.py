@@ -192,8 +192,21 @@ def run_bounded_process(
                     f"process stdin exceeded {timeout_seconds:g} seconds: {command[0]}"
                 )
             elif stdin_errors:
-                failure = BoundedProcessError(f"process stdin could not be written: {command[0]}")
-                failure.__cause__ = stdin_errors[0]
+                # This branch is only reached after the loop above exited
+                # because `process.poll() is not None` -- the child has
+                # ALREADY terminated. A write failure here (almost always a
+                # broken pipe: the child closed stdin, or exited, before the
+                # writer finished a large payload) is a SYMPTOM of the
+                # child's own exit, not an independent transport failure.
+                # Raising a generic "stdin could not be written" error here
+                # discards the real exit status and whatever the child
+                # already wrote to stderr explaining why -- fall through
+                # instead and let the normal completion path below build a
+                # CompletedProcess from the real returncode and drained
+                # stderr, so the caller's own `returncode != 0` handling
+                # (bootstrap._run: "command failed (...): <stderr>") reports
+                # the actual remote failure instead of a masked one.
+                pass
         if failure is not None:
             try:
                 terminate_owned_process(cast(subprocess.Popen[str], process))
@@ -257,7 +270,12 @@ def run_bounded_process(
         )
     if stdout.errors or stderr.errors:
         raise BoundedProcessError(f"process output could not be read: {command[0]}")
-    if stdin_errors:
+    if stdin_errors and process.poll() is None:
+        # A stdin write failure while the child is STILL RUNNING is a real,
+        # independent transport failure (never observed to be reachable
+        # given the loop above already resolves the "child already exited"
+        # case without raising -- kept as a defense-in-depth backstop, not
+        # dead code removed on the strength of that analysis alone).
         error = BoundedProcessError(f"process stdin could not be written: {command[0]}")
         error.__cause__ = stdin_errors[0]
         raise error

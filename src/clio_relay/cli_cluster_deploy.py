@@ -91,6 +91,7 @@ from clio_relay.bootstrap_pin import (
     pin_cluster_target_identity_from_one_pass_observation,
     pin_reconciliation_lines,
     reconcile_cluster_runtime_pin,
+    verify_one_pass_target_identity_against_pin,
 )
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, WorkerCapacityPolicy
 from clio_relay.cluster_probe import pinned_runtime_present, probe_cluster_runtime
@@ -377,7 +378,7 @@ def cluster_bootstrap(
                 )
             with recorder.check(
                 "worker.target-identity",
-                "verify the bootstrapped physical cluster against the operator pin",
+                "verify or pin the bootstrapped physical cluster identity",
             ) as target_evidence:
                 target_definition = (
                     definition.model_copy(update={"ssh_host": ssh_host})
@@ -387,39 +388,94 @@ def cluster_bootstrap(
                 observation_lines = [
                     line for line in lines if line.startswith(ONE_PASS_TARGET_IDENTITY_MARKER)
                 ]
-                if observation_lines and target_definition.target_identity is None:
-                    # clio-relay#209: a cold one-pass bootstrap already OBSERVED
-                    # the physical identity inside the same session that
-                    # installed the relay -- pin it (closing the `cluster
-                    # pin-target` manual-entry gap) instead of dialing again
-                    # to re-derive what was just learned for free. An
-                    # ALREADY-pinned identity is never overwritten this way
-                    # (falls through to the verify-only dial below), matching
-                    # `reconcile_cluster_runtime_pin`'s proven-before-repaired
-                    # discipline.
+                existing_identity = target_definition.target_identity
+                # clio-relay#209 M1: with a cluster ALREADY pinned, verify this
+                # session's own fresh one-pass observation locally instead of
+                # dialing a third time to re-derive it -- UNLESS the pin also
+                # asserts a scheduler_cluster_name, which a raw shell cannot
+                # observe or verify; that residual case still needs the
+                # dial-based re-verification, which can check it.
+                can_verify_locally = (
+                    existing_identity is not None
+                    and existing_identity.scheduler_cluster_name is None
+                )
+                if observation_lines and (existing_identity is None or can_verify_locally):
                     observed = parse_one_pass_target_identity(lines)
-                    ssh_host_key_sha256 = cli_remote_worker_probe._ssh_host_key_fingerprints(
-                        target_definition.ssh_host
+                    observed_hostnames = cast(list[str], observed["hostnames"])
+                    observed_site_marker_sha256 = cast(
+                        "str | None", observed.get("site_marker_sha256")
                     )
-                    pin_result = pin_cluster_target_identity_from_one_pass_observation(
-                        cluster=cluster,
-                        registry_path=cli_cluster.default_registry_path(),
-                        observed_hostnames=cast(list[str], observed["hostnames"]),
-                        observed_site_marker_sha256=cast(
-                            "str | None", observed.get("site_marker_sha256")
-                        ),
-                        ssh_host_key_sha256=ssh_host_key_sha256,
+                    ssh_host_key_sha256, fingerprint_source = (
+                        cli_remote_worker_probe._ssh_host_key_fingerprints_with_trust_source(
+                            target_definition.ssh_host
+                        )
                     )
-                    target_identity: dict[str, object] = {
-                        "verified": True,
-                        "source": "one_pass_observation",
-                        "pin_reconciliation": pin_result,
-                        **observed,
-                    }
+                    if existing_identity is None:
+                        # clio-relay#209 H3: this is trust-on-first-use, NOT a
+                        # verification -- nothing was compared against an
+                        # operator-supplied value. Marked and reported as
+                        # such (never "verified"), and the pinned hostnames
+                        # (M2) are the UNION of the observation and the
+                        # cluster's own configured ssh alias/name, so a
+                        # round-robin cluster's next login node does not
+                        # lock the operator out of their own pin.
+                        pinned_hostnames = sorted(
+                            {*observed_hostnames, target_definition.ssh_host, cluster}
+                        )
+                        pin_result = pin_cluster_target_identity_from_one_pass_observation(
+                            cluster=cluster,
+                            registry_path=cli_cluster.default_registry_path(),
+                            observed_hostnames=pinned_hostnames,
+                            observed_site_marker_sha256=observed_site_marker_sha256,
+                            ssh_host_key_sha256=ssh_host_key_sha256,
+                        )
+                        target_identity: dict[str, object] = {
+                            "verified": False,
+                            "trust": "first_use",
+                            "fingerprint_source": fingerprint_source,
+                            "source": "one_pass_observation",
+                            "pin_reconciliation": pin_result,
+                            "observed_hostnames": observed_hostnames,
+                            "pinned_hostnames": pinned_hostnames,
+                            "ssh_host_key_sha256": ssh_host_key_sha256,
+                            "site_marker_sha256": observed_site_marker_sha256,
+                            "scheduler_cluster_name": None,
+                            "scheduler_cluster_name_note": (
+                                "unpinned; not observed by the one-pass install"
+                            ),
+                        }
+                        target_state = "pinned_first_use"
+                        # H3(b): a loud, explicit stdout line naming exactly
+                        # what was pinned, so the operator can compare it
+                        # out-of-band -- never silently trusted.
+                        lines = [
+                            *lines,
+                            "bootstrap_target_identity_pinned="
+                            + json.dumps(
+                                {
+                                    "trust": "first_use",
+                                    "hostnames": pinned_hostnames,
+                                    "ssh_host_key_sha256": ssh_host_key_sha256,
+                                    "fingerprint_source": fingerprint_source,
+                                    "site_marker_sha256": observed_site_marker_sha256,
+                                },
+                                sort_keys=True,
+                            ),
+                        ]
+                    else:
+                        target_identity = verify_one_pass_target_identity_against_pin(
+                            target_identity=existing_identity,
+                            observed_hostnames=observed_hostnames,
+                            observed_site_marker_sha256=observed_site_marker_sha256,
+                            ssh_host_key_sha256=ssh_host_key_sha256,
+                        )
+                        target_identity["fingerprint_source"] = fingerprint_source
+                        target_state = "verified"
                 else:
                     target_identity = cli_remote_worker_probe._remote_target_identity(
                         target_definition
                     )
+                    target_state = "verified"
                 target_evidence.append(
                     EvidenceReference(
                         kind="cluster_target",
@@ -433,7 +489,7 @@ def cluster_bootstrap(
                     resource_id=f"target:{cluster}",
                     role="physical_cluster_target",
                     cluster=cluster,
-                    state="verified",
+                    state=target_state,
                     provider=definition.scheduler_provider,
                     metadata=target_identity,
                 )

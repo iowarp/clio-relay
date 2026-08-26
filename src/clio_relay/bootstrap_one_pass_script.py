@@ -54,8 +54,8 @@ from typing import cast
 
 from clio_relay.bootstrap_constants import BOOTSTRAP_PERSISTENT_RECEIPT_PATH
 from clio_relay.bootstrap_staged_provider_source import (
-    _POSIX_REMOTE_SHELL_STARTUP_ENVIRONMENT_NAMES,
-    _STAGED_PROVIDER_ENVIRONMENT_SANITIZER,
+    _POSIX_REMOTE_SHELL_STARTUP_ENVIRONMENT_NAMES,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    _STAGED_PROVIDER_ENVIRONMENT_SANITIZER,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 from clio_relay.errors import RelayError
 
@@ -71,6 +71,12 @@ ONE_PASS_ARCHIVE_HEREDOC_DELIMITER = "__CLIO_RELAY_ONE_PASS_ARCHIVE__"
 ONE_PASS_SCRIPT_HEREDOC_DELIMITER = "__CLIO_RELAY_ONE_PASS_SCRIPT__"
 ONE_PASS_STAGING_ROOT_ASSIGNMENT_PREFIX = "CLIO_RELAY_ONE_PASS_ROOT="
 ONE_PASS_CLEANUP_TRAP_MARKER = "trap clio_relay_one_pass_cleanup EXIT"
+# Set immediately after `mkdir` of the staging root succeeds. The cleanup
+# trap only `rm -rf`s when this is "1" -- it is armed BEFORE the mkdir (so a
+# failure inside mkdir itself is still handled by the same trap), but must
+# never delete a pre-existing directory the script did not create (a mkdir
+# collision reported as if this run owned that path).
+ONE_PASS_CREATED_FLAG_NAME = "CLIO_RELAY_ONE_PASS_CREATED"
 
 _MAX_FRAMED_PAYLOAD_BYTES = 1024 * 1024
 
@@ -90,9 +96,19 @@ except OSError as exc:
 if not receipt_bytes.strip():
     print("persistent bootstrap receipt is empty", file=sys.stderr)
     raise SystemExit(1)
+try:
+    # The real writer (write_bootstrap_receipt -> _atomic_json) pretty-prints
+    # multi-line JSON (indent=2). Framing is one key=value line on stdout, so
+    # this MUST be re-serialized compactly here -- printing the raw bytes
+    # verbatim would split the receipt across many unframed lines and the
+    # desktop parser would see only its opening brace.
+    persistent_receipt = json.loads(receipt_bytes.decode("utf-8", errors="strict"))
+except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    print(f"persistent bootstrap receipt was not valid JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1) from None
 print(
     "bootstrap_persistent_receipt_json="
-    + receipt_bytes.decode("utf-8", errors="strict").strip()
+    + json.dumps(persistent_receipt, sort_keys=True, separators=(",", ":"))
 )
 
 hostnames = sorted({name for name in (socket.gethostname(), socket.getfqdn()) if name})
@@ -149,15 +165,23 @@ def render_one_pass_cold_bootstrap_script(
         [
             "set -eu",
             f"{ONE_PASS_STAGING_ROOT_ASSIGNMENT_PREFIX}{quoted_root}",
+            f"{ONE_PASS_CREATED_FLAG_NAME}=0",
             "clio_relay_one_pass_cleanup() {",
             "  status=$?",
-            '  rm -rf -- "$CLIO_RELAY_ONE_PASS_ROOT" 2>/dev/null || true',
+            f'  if [ "${{{ONE_PASS_CREATED_FLAG_NAME}}}" = "1" ]; then',
+            '    rm -rf -- "$CLIO_RELAY_ONE_PASS_ROOT" 2>/dev/null || true',
+            "  fi",
             '  exit "$status"',
             "}",
             ONE_PASS_CLEANUP_TRAP_MARKER,
             "umask 077",
             'mkdir -- "$CLIO_RELAY_ONE_PASS_ROOT"',
+            f"{ONE_PASS_CREATED_FLAG_NAME}=1",
             'chmod 700 -- "$CLIO_RELAY_ONE_PASS_ROOT"',
+            "if ! command -v base64 >/dev/null 2>&1; then",
+            '  echo "base64 is required to decode the bootstrap payload" >&2',
+            "  exit 1",
+            "fi",
             (
                 'base64 -d > "$CLIO_RELAY_ONE_PASS_ROOT/clio-relay-head.tar" '
                 f"<<'{ONE_PASS_ARCHIVE_HEREDOC_DELIMITER}'"
@@ -170,12 +194,20 @@ def render_one_pass_cold_bootstrap_script(
             ),
             encoded_script,
             ONE_PASS_SCRIPT_HEREDOC_DELIMITER,
-            'bash "$CLIO_RELAY_ONE_PASS_ROOT/clio-relay-bootstrap.sh"',
+            # </dev/null is load-bearing, not defensive style: the WHOLE
+            # combined script -- including everything after this line --
+            # still travels on the SAME stdin stream this `bash -s` process
+            # is reading its own source from. Without this redirect the
+            # install script inherits that same fd 0, and any stdin-
+            # consuming step inside it (`read`, a bare `cat`, an installer
+            # piped through `sh`) eats bytes meant for OUR remaining script
+            # text -- silently truncating everything after this call.
+            'bash "$CLIO_RELAY_ONE_PASS_ROOT/clio-relay-bootstrap.sh" </dev/null',
             "if ! command -v python3 >/dev/null 2>&1; then",
             '  echo "python3 is required to observe the physical target identity" >&2',
             "  exit 1",
             "fi",
-            f'if [ ! -e {quoted_receipt_path} ] && [ ! -L {quoted_receipt_path} ]; then',
+            f"if [ ! -e {quoted_receipt_path} ] && [ ! -L {quoted_receipt_path} ]; then",
             '  echo "bootstrap did not publish its persistent receipt" >&2',
             "  exit 1",
             "fi",

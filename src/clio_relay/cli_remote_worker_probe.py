@@ -11,6 +11,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Literal
 
 import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
 import clio_relay.remote_cli as remote_cli
@@ -145,12 +146,40 @@ def _remote_target_identity(
     }
 
 
+FingerprintSource = Literal["known_hosts", "keyscan_fallback"]
+
+
 def _ssh_host_key_fingerprints(
     ssh_host: str,
     *,
     deadline: float | None = None,
 ) -> list[str]:
     """Return trusted SHA-256 host-key fingerprints for a configured SSH target."""
+    fingerprints, _source = _ssh_host_key_fingerprints_with_trust_source(
+        ssh_host, deadline=deadline
+    )
+    return fingerprints
+
+
+def _ssh_host_key_fingerprints_with_trust_source(
+    ssh_host: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[list[str], FingerprintSource]:
+    """Same as :func:`_ssh_host_key_fingerprints`, plus where they came from.
+
+    clio-relay#209 H3(c): the two sources carry very different trust
+    weight. ``"known_hosts"`` means the operator's own ssh client already
+    accepted these keys at some prior connection (an entry in
+    ``~/.ssh/known_hosts`` or an equivalent configured file) -- that
+    acceptance already happened, outside this process, and this call is
+    just reading it back. ``"keyscan_fallback"`` means no matching
+    known_hosts entry existed and these were observed fresh via a bare
+    ``ssh-keyscan``, which does NOT authenticate the host at all -- this is
+    the only genuinely un-verified case, and callers pinning a fresh
+    identity must say so out loud rather than reporting both sources as
+    equally trustworthy "verified" evidence.
+    """
     resolved_host = ssh_host
     resolved_port = "22"
     host_key_alias: str | None = None
@@ -210,7 +239,7 @@ def _ssh_host_key_fingerprints(
             break
         fingerprints.update(_ssh_fingerprints_from_key_lines(found.stdout))
     if fingerprints:
-        return sorted(fingerprints)
+        return sorted(fingerprints), "known_hosts"
 
     try:
         scanned = subprocess.run(
@@ -233,7 +262,7 @@ def _ssh_host_key_fingerprints(
     if not fingerprints:
         detail = "; ".join(item for item in diagnostics if item) or "no host keys returned"
         raise ConfigurationError(f"could not observe SSH host keys for {ssh_host}: {detail}")
-    return sorted(fingerprints)
+    return sorted(fingerprints), "keyscan_fallback"
 
 
 def _remote_observation_subprocess_timeout(

@@ -22,7 +22,9 @@ stdin -- the same shape ``session_remote_scripts._ssh_script`` already uses.
 
 from __future__ import annotations
 
+import base64
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, cast
@@ -37,6 +39,7 @@ from clio_relay.bootstrap_constants import BOOTSTRAP_PERSISTENT_RECEIPT_PATH
 from clio_relay.bootstrap_one_pass_script import (
     ONE_PASS_ARCHIVE_HEREDOC_DELIMITER,
     ONE_PASS_CLEANUP_TRAP_MARKER,
+    ONE_PASS_CREATED_FLAG_NAME,
     ONE_PASS_PERSISTENT_RECEIPT_MARKER,
     ONE_PASS_SCRIPT_HEREDOC_DELIMITER,
     ONE_PASS_TARGET_IDENTITY_MARKER,
@@ -210,11 +213,41 @@ def test_one_pass_script_composes_inline_payloads_and_self_cleaning_trap() -> No
     mkdir_index = script.index('mkdir -- "$CLIO_RELAY_ONE_PASS_ROOT"')
     assert trap_index < mkdir_index, "the trap must be armed before anything it must clean up"
 
+    # M3: the trap is armed before mkdir (so a failing mkdir is still
+    # handled), but must never rm -rf a pre-existing directory it did not
+    # create. The created-flag is declared 0 before the trap, set to 1 only
+    # AFTER mkdir succeeds, and the trap's own rm -rf is gated on it.
+    assert f"{ONE_PASS_CREATED_FLAG_NAME}=0" in script
+    assert f"{ONE_PASS_CREATED_FLAG_NAME}=1" in script
+    flag_zeroed_index = script.index(f"{ONE_PASS_CREATED_FLAG_NAME}=0")
+    flag_set_index = script.index(f"{ONE_PASS_CREATED_FLAG_NAME}=1")
+    assert flag_zeroed_index < trap_index < mkdir_index < flag_set_index
+    guard_line = f'if [ "${{{ONE_PASS_CREATED_FLAG_NAME}}}" = "1" ]; then'
+    assert guard_line in script
+    # The guard lives INSIDE the cleanup function body, which is defined
+    # (and so appears in the text) before the `trap ... EXIT` statement that
+    # arms it -- the meaningful ordering is that the guard gates the rm -rf
+    # that follows it in that same function body.
+    guard_index = script.index(guard_line)
+    assert guard_index < trap_index
+    assert guard_index < script.index('rm -rf -- "$CLIO_RELAY_ONE_PASS_ROOT"')
+
+    # L3: base64 availability is checked with the same explicit, named
+    # failure as the python3 check below it -- never a bare "command not
+    # found" from the decode step itself.
+    assert "command -v base64" in script
+    assert script.index("command -v base64") < script.index(ONE_PASS_ARCHIVE_HEREDOC_DELIMITER)
+
     # No argv element may be script-sized: only stdin heredoc bodies carry
     # the payload (the same truncation hazard the preflight script documents,
     # #158). The rendered script must never be handed to ssh as a `bash -c`
     # argument -- the caller sends it whole, over stdin, to `bash -s`.
     assert "bash -c" not in script
+
+    # L1: the script is always joined with bare "\n" and ships to a POSIX
+    # shell over stdin -- a stray "\r" (e.g. from a Windows-edited template)
+    # would corrupt heredoc delimiters and shebang-adjacent lines silently.
+    assert "\r" not in script
 
 
 def test_one_pass_script_payload_size_is_not_argv_bound() -> None:
@@ -233,6 +266,11 @@ def test_one_pass_script_payload_size_is_not_argv_bound() -> None:
     # own base64 text ever needs to be a single shell word.
     assert ONE_PASS_ARCHIVE_HEREDOC_DELIMITER in script
     assert ONE_PASS_SCRIPT_HEREDOC_DELIMITER in script
+
+
+def _identity_which(executable: str) -> str:
+    """Model ``shutil.which`` finding every tool already on PATH, unchanged."""
+    return executable
 
 
 def _resolved_bash() -> str:
@@ -262,26 +300,51 @@ def _staging_dir_exists(bash: str, remote_root: str) -> bool:
     return probe.returncode == 0
 
 
-def test_one_pass_script_runs_end_to_end_under_a_real_shell() -> None:
+def test_one_pass_script_runs_end_to_end_under_a_real_shell(tmp_path: Path) -> None:
     """A real bash proves mkdir/decode/install/receipt-reread/identity/cleanup.
 
     Entirely local: no ssh anywhere. Only exercises the SCRIPT the desktop
     would send over stdin, run by a real interpreter against a synthetic
     HOME, matching the embedded-script driver pattern already established by
     this module's siblings (test_bootstrap_cluster_paths.py).
+
+    The persistent receipt the fake install script "writes" is captured from
+    the REAL production writer (``write_bootstrap_receipt`` ->
+    ``_atomic_json``, which pretty-prints multi-line ``indent=2`` JSON) --
+    not a hand-written single-line literal. A hand-written fixture is exactly
+    how the B1 regression (the post-install step framing the receipt file's
+    raw multi-line bytes as one key=value line, corrupting every real cold
+    bootstrap at desktop parse) passed every test while still being broken:
+    every fixture agreed with itself, and none of them matched the real
+    writer's actual output shape. Capturing real bytes here means any future
+    drift in that writer's format is caught here too.
     """
+    from clio_relay.bootstrap_reconcile_receipt import write_bootstrap_receipt
+
     bash = _resolved_bash()
     remote_root = f"/tmp/clio-relay-bootstrap_test_{uuid4().hex}"
 
+    receipt: dict[str, object] = {"invocation_id": "bootstrap_e2e", "outcome": "installed"}
+    captured_receipt_path = tmp_path / "captured-real-receipt.json"
+    write_bootstrap_receipt(captured_receipt_path, receipt)
+    real_receipt_bytes = captured_receipt_path.read_bytes()
+    assert real_receipt_bytes.count(b"\n") > 1, (
+        "the real writer must still be pretty-printing multi-line JSON -- "
+        "if this fails, the writer changed shape and B1's regression guard "
+        "is no longer proving anything"
+    )
+    encoded_receipt = base64.b64encode(real_receipt_bytes).decode("ascii")
+
     fake_install_script = (
         'mkdir -p "$HOME/.local/share/clio-relay"\n'
-        'cat > "$HOME/.local/share/clio-relay/bootstrap-receipt.json" <<\'RECEIPT\'\n'
-        '{"invocation_id": "bootstrap_e2e", "outcome": "installed"}\n'
-        "RECEIPT\n"
+        'base64 -d > "$HOME/.local/share/clio-relay/bootstrap-receipt.json" '
+        "<<'RECEIPT_B64'\n" + encoded_receipt + "\n"
+        "RECEIPT_B64\n"
         "printf 'bootstrap_receipt=%s\\n' "
         '"$HOME/.local/share/clio-relay/bootstrap-receipt.json"\n'
-        'printf \'bootstrap_receipt_json=%s\\n\' '
-        '\'{"invocation_id": "bootstrap_e2e", "outcome": "installed"}\'\n'
+        "printf 'bootstrap_receipt_json=%s\\n' "
+        + shlex.quote(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+        + "\n"
     )
     script = render_one_pass_cold_bootstrap_script(
         remote_root=remote_root,
@@ -305,9 +368,7 @@ def test_one_pass_script_runs_end_to_end_under_a_real_shell() -> None:
     stdout = result.stdout.decode("utf-8", errors="replace")
     assert "bootstrap_receipt_json=" in stdout
     persistent_line = next(
-        line
-        for line in stdout.splitlines()
-        if line.startswith(ONE_PASS_PERSISTENT_RECEIPT_MARKER)
+        line for line in stdout.splitlines() if line.startswith(ONE_PASS_PERSISTENT_RECEIPT_MARKER)
     )
     assert json.loads(persistent_line.partition("=")[2]) == {
         "invocation_id": "bootstrap_e2e",
@@ -349,8 +410,149 @@ def test_one_pass_script_self_cleans_on_a_failed_install() -> None:
     assert not _staging_dir_exists(bash, remote_root)
 
 
+def test_one_pass_script_never_deletes_a_pre_existing_staging_directory() -> None:
+    """M3: a mkdir collision must not vanish a directory the script did not create.
+
+    Before the created-flag guard, the trap is armed before `mkdir` (on
+    purpose -- a failing mkdir must still be handled), which meant a
+    pre-existing directory at the SAME path failed `mkdir` (no `-p`) and the
+    trap then `rm -rf`'d that directory anyway: a mkdir collision reported to
+    the operator as a transport failure while actually deleting unrelated
+    state.
+    """
+    bash = _resolved_bash()
+    remote_root = f"/tmp/clio-relay-bootstrap_test_{uuid4().hex}"
+
+    script = render_one_pass_cold_bootstrap_script(
+        remote_root=remote_root,
+        archive_bytes=b"archive bytes",
+        install_script="true\n",
+    )
+    sentinel_marker = "sentinel-not-created-by-this-run"
+    harness = (
+        f'export HOME="$(mktemp -d)"\n'
+        f'mkdir -- "{remote_root}"\n'
+        f'echo "{sentinel_marker}" > "{remote_root}/sentinel"\n'
+        f"{script}"
+    )
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode != 0, "a pre-existing staging directory must fail, not proceed"
+    # The directory -- and the caller's unrelated file inside it -- must
+    # still exist: the created-flag guard means the trap never ran rm -rf
+    # against a path this run did not create.
+    still_present = subprocess.run(
+        [bash, "-c", f'cat -- "{remote_root}/sentinel"'],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert still_present.returncode == 0
+    assert sentinel_marker in still_present.stdout.decode("utf-8", errors="replace")
+
+    # Cleanup: this test creates real /tmp state on purpose to prove the
+    # trap did NOT remove it; remove it ourselves now that the proof is done.
+    subprocess.run([bash, "-c", f'rm -rf -- "{remote_root}"'], check=False, timeout=10)
+
+
+def _stdin_guard_receipt_script(body: str) -> str:
+    """A fake install script that writes a receipt after ``body`` runs first.
+
+    ``body`` is a stdin-consuming step (``read``, a bare ``cat``) that would
+    eat the REST of the outer combined script if the install step were not
+    isolated from it -- proving H2 requires the post-install steps to still
+    run correctly afterward, not just that the install step itself survives.
+    """
+    return (
+        f"{body}\n"
+        'mkdir -p "$HOME/.local/share/clio-relay"\n'
+        "cat > \"$HOME/.local/share/clio-relay/bootstrap-receipt.json\" <<'RECEIPT'\n"
+        '{"invocation_id": "bootstrap_stdin_guard", "outcome": "installed"}\n'
+        "RECEIPT\n"
+        "printf 'bootstrap_receipt=%s\\n' "
+        '"$HOME/.local/share/clio-relay/bootstrap-receipt.json"\n'
+        "printf 'bootstrap_receipt_json=%s\\n' "
+        '\'{"invocation_id": "bootstrap_stdin_guard", "outcome": "installed"}\'\n'
+    )
+
+
+def test_one_pass_script_install_step_reading_stdin_does_not_truncate_the_rest() -> None:
+    """H2: an install step doing `read` must not eat the outer script's tail.
+
+    Before the `</dev/null` fix, the install child shared fd 0 with the
+    outer `bash -s` process still parsing its own remaining source from that
+    SAME stream -- a `read` inside the install script silently consumed the
+    post-install python step's own text, and the run failed downstream with
+    a misleading "python3 is required" (the consumed bytes, not a missing
+    interpreter).
+    """
+    bash = _resolved_bash()
+    remote_root = f"/tmp/clio-relay-bootstrap_test_{uuid4().hex}"
+
+    script = render_one_pass_cold_bootstrap_script(
+        remote_root=remote_root,
+        archive_bytes=b"archive bytes",
+        install_script=_stdin_guard_receipt_script("read -r clio_relay_test_unused || true"),
+    )
+    harness = f'export HOME="$(mktemp -d)"\n{script}'
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    assert any(line.startswith(ONE_PASS_PERSISTENT_RECEIPT_MARKER) for line in stdout.splitlines())
+    assert any(line.startswith(ONE_PASS_TARGET_IDENTITY_MARKER) for line in stdout.splitlines())
+    assert not _staging_dir_exists(bash, remote_root)
+
+
+def test_one_pass_script_install_step_draining_stdin_does_not_truncate_the_rest() -> None:
+    """H2: an install step that drains ALL of stdin (a bare `cat`) is equally isolated.
+
+    A worse case than a single `read`: `cat` with no arguments reads until
+    EOF, which -- without `</dev/null` -- would consume every remaining byte
+    of the outer script, silently skipping every post-install step (no
+    receipt re-verification, no identity observation) with no error at all.
+    """
+    bash = _resolved_bash()
+    remote_root = f"/tmp/clio-relay-bootstrap_test_{uuid4().hex}"
+
+    script = render_one_pass_cold_bootstrap_script(
+        remote_root=remote_root,
+        archive_bytes=b"archive bytes",
+        install_script=_stdin_guard_receipt_script("cat >/dev/null"),
+    )
+    harness = f'export HOME="$(mktemp -d)"\n{script}'
+
+    result = subprocess.run(
+        [bash, "-s"],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    assert any(line.startswith(ONE_PASS_PERSISTENT_RECEIPT_MARKER) for line in stdout.splitlines())
+    assert any(line.startswith(ONE_PASS_TARGET_IDENTITY_MARKER) for line in stdout.splitlines())
+    assert not _staging_dir_exists(bash, remote_root)
+
+
 def test_one_pass_persistent_receipt_parsing_accepts_matching_evidence() -> None:
-    receipt = {"invocation_id": "bootstrap_ok", "outcome": "installed"}
+    receipt: dict[str, object] = {"invocation_id": "bootstrap_ok", "outcome": "installed"}
     lines = [
         "some install diagnostic line",
         ONE_PASS_PERSISTENT_RECEIPT_MARKER + json.dumps(receipt, sort_keys=True),
@@ -360,7 +562,7 @@ def test_one_pass_persistent_receipt_parsing_accepts_matching_evidence() -> None
 
 
 def test_one_pass_persistent_receipt_parsing_rejects_mismatched_evidence() -> None:
-    receipt = {"invocation_id": "bootstrap_ok", "outcome": "installed"}
+    receipt: dict[str, object] = {"invocation_id": "bootstrap_ok", "outcome": "installed"}
     persisted = {"invocation_id": "bootstrap_ok", "outcome": "different"}
     lines = [ONE_PASS_PERSISTENT_RECEIPT_MARKER + json.dumps(persisted, sort_keys=True)]
 
@@ -374,7 +576,7 @@ def test_one_pass_persistent_receipt_parsing_rejects_missing_marker() -> None:
 
 
 def test_one_pass_persistent_receipt_parsing_rejects_duplicate_marker() -> None:
-    receipt = {"invocation_id": "bootstrap_ok"}
+    receipt: dict[str, object] = {"invocation_id": "bootstrap_ok"}
     line = ONE_PASS_PERSISTENT_RECEIPT_MARKER + json.dumps(receipt)
     with pytest.raises(RelayError, match="exactly one persistent receipt"):
         parse_one_pass_persistent_receipt([line, line], receipt=receipt)
@@ -430,7 +632,7 @@ def test_one_pass_target_identity_parsing_rejects_wrong_schema() -> None:
 
 
 def test_one_pass_target_identity_parsing_rejects_empty_hostnames() -> None:
-    identity = {
+    identity: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
         "hostnames": [],
         "site_marker_sha256": None,
@@ -517,7 +719,7 @@ def test_cold_bootstrap_costs_exactly_two_ssh_dials(
     (the held link is a later, separate phase and is not one of these two).
     This test must fail the moment any code path adds a third dial back.
     """
-    receipt = {
+    receipt: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-receipt.v1",
         "invocation_id": "bootstrap_budget",
         "bootstrap_profile": "linux-user",
@@ -525,7 +727,7 @@ def test_cold_bootstrap_costs_exactly_two_ssh_dials(
         "install_receipt_sha256": "a" * 64,
         "completed_at": "2026-08-26T00:00:00Z",
     }
-    identity = {
+    identity: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-one-pass-target-identity.v1",
         "hostnames": ["ares-login-1"],
         "site_marker_sha256": None,
@@ -561,7 +763,7 @@ def test_cold_bootstrap_costs_exactly_two_ssh_dials(
         _cold_bootstrap_fake_run(receipt=receipt, identity=identity, calls=calls, scripts=scripts),
     )
     monkeypatch.setattr(bootstrap, "uuid4", lambda: type("Uuid", (), {"hex": "budget"})())
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(bootstrap.shutil, "which", _identity_which)
 
     bootstrap.bootstrap_cluster_over_ssh(
         bootstrap_profile="linux-user",
@@ -591,7 +793,7 @@ def test_warm_bootstrap_still_costs_exactly_two_ssh_dials(
     a warm bootstrap adds, and that the one-pass cold-install path is never
     reached.
     """
-    receipt = {
+    receipt: dict[str, object] = {
         "schema_version": "clio-relay.bootstrap-receipt.v1",
         "invocation_id": "bootstrap_warm",
         "bootstrap_profile": "linux-user",
@@ -633,7 +835,7 @@ def test_warm_bootstrap_still_costs_exactly_two_ssh_dials(
         bootstrap_receipt_validation, "validate_bootstrap_receipt", validate_receipt
     )
     monkeypatch.setattr(bootstrap, "_run", fake_run)
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(bootstrap.shutil, "which", _identity_which)
 
     lines = bootstrap.bootstrap_cluster_over_ssh(
         bootstrap_profile="linux-user",

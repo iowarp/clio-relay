@@ -89,7 +89,18 @@ from typing import Any, NamedTuple
 # access already in those same four classes, not just the 19 new ones: net
 # -182 (7845 -> 7663 on Windows). Verified zero new diagnostics anywhere in
 # the repo via a full baseline-vs-fixed diff, not just the total dropping.
-BASELINE_TOTAL = 7663
+#
+# clio-relay#209 one-pass cold bootstrap (adversarial-review B3 fix): the
+# new files (bootstrap_one_pass_script.py, the cli_cluster_deploy.py/
+# bootstrap_pin.py/cli_remote_worker_probe.py target-identity additions,
+# the extended test_bootstrap_preflight_transport.py/test_cli_cluster_
+# deploy.py suites) landed with explicit annotations on every previously-
+# untyped dict literal and lambda strict pyright flagged, plus the
+# established `# pyright: ignore[reportPrivateUsage]  # noqa: SLF001`
+# per-import pragma for the two cross-module bootstrap-family constants
+# this slice's script composer borrows -- net -5 (7663 -> 7658 on
+# Windows), not a regression to absorb.
+BASELINE_TOTAL = 7658
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
