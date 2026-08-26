@@ -27,6 +27,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
@@ -5740,7 +5741,10 @@ def test_gateway_start_runtime_cli_uses_service_runtime_spec(
         )
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
-    monkeypatch.setattr("clio_relay.cli._attach_verified_remote_worker", fake_worker_identity)
+    monkeypatch.setattr(
+        "clio_relay.cli_remote_worker_attach._attach_verified_remote_worker",
+        fake_worker_identity,
+    )
     validation_report = tmp_path / "gateway-validation.json"
     result = CliRunner().invoke(
         app,
@@ -5818,7 +5822,9 @@ def test_gateway_start_runtime_cli_returns_resumable_pending_report(
         pytest.fail("pending runtime must return before worker provenance observation")
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
-    monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", forbid_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", forbid_worker_identity
+    )
     report_path = tmp_path / "gateway-pending.json"
 
     result = CliRunner().invoke(
@@ -6099,7 +6105,9 @@ def test_owned_gateway_start_holds_transition_lock_through_runtime_start(
         assert observed_worker_info is None
         return
 
-    monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", skip_worker_identity)
+    monkeypatch.setattr(
+        cli_remote_worker_attach, "_attach_verified_remote_worker", skip_worker_identity
+    )
     monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
     result = CliRunner().invoke(
         app,
@@ -6414,7 +6422,7 @@ def test_gateway_detach_runtime_default_report_requires_verified_retention(
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "detach", return_detach_result)
     monkeypatch.setattr(
-        relay_cli,
+        cli_remote_worker_attach,
         "_attach_verified_remote_worker",
         record_worker_verification,
     )
@@ -6461,11 +6469,11 @@ def test_gateway_report_fails_when_remote_worker_identity_does_not_match(
         assert observed_worker_info is None
         raise RelayError("remote installation receipt mismatch")
 
-    monkeypatch.setattr(relay_cli, "_attach_verified_remote_worker", fail_identity)
+    monkeypatch.setattr(cli_remote_worker_attach, "_attach_verified_remote_worker", fail_identity)
     destination = tmp_path / "gateway-worker-mismatch.json"
 
     with pytest.raises(RelayError, match="receipt mismatch"):
-        relay_cli._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_remote_worker_attach._write_remote_verified_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             report,
             _definition(),
             destination,
