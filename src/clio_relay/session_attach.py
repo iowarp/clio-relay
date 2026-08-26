@@ -63,6 +63,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
+from clio_relay.control_channel import ChannelDropped
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import RelayJob
 from clio_relay.owned_session_record import (
@@ -213,6 +214,7 @@ def attach_owned_session(
     settings: RelaySettings,
     record_path: Path | None = None,
     registry: RemoteConnectionRegistry | None = None,
+    target: AttachTarget | None = None,
 ) -> tuple[RemoteConnection, AttachTarget, bool]:
     """Resume or re-establish this cluster's owned-session channel.
 
@@ -224,12 +226,21 @@ def attach_owned_session(
     and an explicit reconnect of a dropped channel (``state ==
     "authorization_required"``) -- either way, exactly one new dial, never
     more.
+
+    ``target`` lets a caller that already resolved (and locked on) an attach
+    target pin THIS call to that exact identity: the CLI keys its
+    ``owner_session_transition_lock`` on the resolved session id, so an
+    internal re-resolution here could race a concurrent ``session start
+    --replace`` into working on a session the lock does not cover
+    (iowarp/clio-relay#276 review residual 2). When omitted, the target is
+    resolved here.
     """
-    target = resolve_attach_target(
-        cluster=definition.name,
-        settings=settings,
-        record_path=record_path,
-    )
+    if target is None:
+        target = resolve_attach_target(
+            cluster=definition.name,
+            settings=settings,
+            record_path=record_path,
+        )
     effective_settings = settings.model_copy(
         update={
             "owner_session_id": target.session_id,
@@ -258,6 +269,19 @@ def attach_owned_session(
             remote_api_port=target.remote_api_port,
         )
         return connection, target, True
+    except ChannelDropped as exc:
+        # A drop in the narrow window between the state read and the dial is
+        # a distinct cause from an unattachable session: name it, and name
+        # the recovery (re-running attach IS the one authorized reconnect).
+        raise SessionNotAttachableError(
+            cluster=definition.name,
+            session_id=target.session_id,
+            detail=(
+                "the held channel dropped while attaching; re-run "
+                "'clio-relay session attach' to authorize one reconnect "
+                f"({exc})"
+            ),
+        ) from exc
     except RelayError as exc:
         raise SessionNotAttachableError(
             cluster=definition.name,
@@ -357,6 +381,20 @@ def build_attach_report(
     """
     try:
         connection.session_status()
+    except ChannelDropped as exc:
+        # Distinguish the true cause: the channel died between the reuse
+        # decision and this cross-check. The remote session may be fine --
+        # the recovery is the one authorized reconnect, not teardown
+        # (iowarp/clio-relay#276 review residual 4).
+        raise SessionNotAttachableError(
+            cluster=definition.name,
+            session_id=target.session_id,
+            detail=(
+                "the held channel dropped during attach verification; re-run "
+                "'clio-relay session attach' to authorize one reconnect "
+                f"({exc})"
+            ),
+        ) from exc
     except RelayError as exc:
         raise SessionNotAttachableError(
             cluster=definition.name,

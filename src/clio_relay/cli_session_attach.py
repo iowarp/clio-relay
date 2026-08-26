@@ -33,8 +33,9 @@ def _run_attach(cluster: str) -> None:
     SSH dial and a 2FA prompt for a refusal that never had a session left to
     attach to (iowarp/clio-relay#276 review D4). Resolving the target BEFORE
     acquiring the lock (to learn which session to key it on) is a read-only
-    lookup; ``attach_owned_session`` re-resolves it again, inside the lock,
-    before doing anything that could dial.
+    lookup; the resolved target is then passed INTO ``attach_owned_session``
+    so the dial-capable work is pinned to exactly the identity the lock
+    covers.
     """
     import clio_relay.cli as cli
 
@@ -47,10 +48,15 @@ def _run_attach(cluster: str) -> None:
             cluster=cluster,
             session_id=target.session_id,
         ):
+            # Pin the attach to the exact target the lock is keyed on -- an
+            # internal re-resolution could race a concurrent `session start
+            # --replace` into working on a session this lock does not cover
+            # (iowarp/clio-relay#276 review residual 2).
             connection, resolved_target, channel_reestablished = (
                 session_attach.attach_owned_session(
                     definition=definition,
                     settings=settings,
+                    target=target,
                 )
             )
             report = session_attach.build_attach_report(

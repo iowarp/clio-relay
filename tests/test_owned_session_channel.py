@@ -51,6 +51,7 @@ from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.remote_connection import (
     DEFAULT_OWNED_SESSION_API_PORT,
+    RemoteConnection,
     RemoteConnectionRegistry,
     resolve_remote_api_port,
 )
@@ -1445,6 +1446,22 @@ def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_rec
     )
     harness.responses["/queue"] = _fake_queue_page([])
 
+    # All three RemoteConnection.state literals, asserted directly (#276
+    # review residual 1): a never-connected connection reports
+    # "not_established"...
+    fresh = RemoteConnection(
+        definition=definition,
+        settings=settings.model_copy(
+            update={
+                "owner_session_id": "desktop-session-1",
+                "owner_session_generation_id": harness.generation_id,
+                "owner_session_cluster": "ares",
+            }
+        ),
+        remote_api_port=DEFAULT_OWNED_SESSION_API_PORT,
+    )
+    assert fresh.state == "not_established"
+
     connection, target, first_reestablished = session_attach.attach_owned_session(
         definition=definition,
         settings=settings,
@@ -1453,6 +1470,8 @@ def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_rec
     )
     assert first_reestablished is True
     assert harness.dials == 1
+    # ...a live channel reports "connected"...
+    assert connection.state == "connected"
 
     # Building the report -- session_status() cross-check + the queue
     # listing -- rides the already-held channel: zero new dials.
@@ -1477,6 +1496,8 @@ def test_attach_dial_budget_is_zero_when_live_and_exactly_one_per_authorized_rec
 
     # Drop, then attach again: exactly +1 dial -- the one authorized reconnect.
     harness.processes[0].drop()
+    # ...and a dropped channel reports "authorization_required".
+    assert connection.state == "authorization_required"
     reconnected, _target_reconnected, third_reestablished = session_attach.attach_owned_session(
         definition=definition,
         settings=settings,
