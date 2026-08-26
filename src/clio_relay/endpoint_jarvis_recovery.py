@@ -13,11 +13,14 @@ execution-recovery attempt end to end:
   machine's own shape guard.
 - ``_jarvis_execution_recovery_is_pending`` is the one-line pending check
   callers use instead of re-deriving intent state.
-- ``_jarvis_mcp_result_identity_matches``/``_trusted_jarvis_mcp_result``
+- ``_jarvis_mcp_result_identity_matches``/``trusted_jarvis_mcp_result``
   verify one MCP result document actually came from this job's pinned
   route (identity is independent of outcome -- a tool-error answer still
-  proves which route produced it) and, for ``_trusted_jarvis_mcp_result``,
-  that the call completed successfully with a persisted result.
+  proves which route produced it) and, for ``trusted_jarvis_mcp_result``,
+  that the call completed successfully with a persisted result. Public
+  (clio-relay#271 direction): every owner module across the endpoint
+  decomposition imports it, so the leading underscore was pure
+  reportPrivateUsage noise, not a real privacy boundary.
 - ``_attributed_jarvis_dispatch_refusal`` returns the typed refusal only
   when the result's identity is proven to be this job's own.
 - ``_durable_jarvis_dispatch_refusal_detail`` renders the typed refusal
@@ -26,9 +29,9 @@ execution-recovery attempt end to end:
   snapshot (and its content digest) used for transition checks.
 - ``_trusted_jarvis_execution_query_validation`` requires the bundled
   runner's exact native execution-query attestation shape.
-- ``_minimal_mcp_runner_environment``/``_endpoint_mcp_runner_command`` build
+- ``minimal_mcp_runner_environment``/``endpoint_mcp_runner_command`` build
   the subprocess environment and command used to invoke the packaged relay
-  MCP runner for a recovery query.
+  MCP runner for a recovery query. Also public, same #271 reasoning.
 
 Depends on ``endpoint_sidecar_types.py`` (schema/byte-budget constants) and
 ``endpoint_recovery_directory.py`` (``_recovery_timestamp``,
@@ -454,7 +457,7 @@ def _jarvis_mcp_result_identity_matches(
     return True, "configured JARVIS MCP command and durable route matched"
 
 
-def _trusted_jarvis_mcp_result(
+def trusted_jarvis_mcp_result(
     job: RelayJob,
     document: object,
     *,
@@ -517,7 +520,7 @@ def _trusted_jarvis_execution_query_validation(
     )
 
 
-def _minimal_mcp_runner_environment(env_from: dict[str, str]) -> dict[str, str]:
+def minimal_mcp_runner_environment(env_from: dict[str, str]) -> dict[str, str]:
     """Expose only runtime basics and explicitly referenced MCP source variables."""
     environment = {
         name: os.environ[name] for name in MCP_RUNNER_BASE_ENV_NAMES if name in os.environ
@@ -531,7 +534,7 @@ def _minimal_mcp_runner_environment(env_from: dict[str, str]) -> dict[str, str]:
     return environment
 
 
-def _endpoint_mcp_runner_command(request_path: Path) -> list[str]:
+def endpoint_mcp_runner_command(request_path: Path) -> list[str]:
     """Return the packaged relay runner command for one endpoint-owned request."""
     package_root = Path(__file__).resolve().parent
     candidates = (

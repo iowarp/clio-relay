@@ -172,6 +172,31 @@ RATCHET_BASELINE: dict[str, int] = {
     # files with no guard against them drifting apart. A justified,
     # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
     "src/clio_relay/bootstrap.py": 926,
+    # clio-relay#265/#183/#248/#162 "honest verdict" slice, adversarial-
+    # review fix round (item 2): the first version of this slice added a
+    # NEW baseline entry here at 819 for a file that measured 791 with NO
+    # entry on develop (9 under DEFAULT_MAX_LINES) -- a first-time-crossing
+    # file getting an exemption, which this guard's own docstring forbids
+    # ("A file not in RATCHET_BASELINE may not exceed DEFAULT_MAX_LINES --
+    # a brand-new god-file fails the check"). Fixed by extraction instead:
+    # the two 5-branch terminal-verdict rendering chains (message=/error=)
+    # moved to the new owner module job_terminal_verdict.py, and mcp_call_
+    # result_error.py's mcp_call_dispatch_failure_detail absorbed its own
+    # priority guard instead of `_run_job_impl` computing it inline.
+    # Second-round adversarial-review fix batch (Ruling B: gate the
+    # outputs_missing failure verdict the same way application_verdict_
+    # failure already is) trimmed a further ~9 lines to keep real margin
+    # below the cap after its own +11 net. Third-round verification pass
+    # (item 3: this comment itself had drifted from the script's own
+    # measurement) re-measured with this script's own _count_lines, not
+    # eyeballed: endpoint_job_execution.py is 786, execution_watch.py (a
+    # sibling file this same round also touched) is 708 -- both comfortably
+    # back under the cap, entry stays removed. See execution_watch.py's own
+    # recent history in this table for the god-file-exemption fix it
+    # needed first, at 833 -> 754 (application_verdict.py extraction) ->
+    # 708 (this round's own Ruling B additions plus later docstring
+    # trimming; the item-2 failing-first e2e test lives entirely in
+    # tests/test_execution_watch.py, not subject to this cap).
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     #

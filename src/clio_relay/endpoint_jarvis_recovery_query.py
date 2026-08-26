@@ -26,9 +26,9 @@ from filelock import FileLock, Timeout
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.endpoint_jarvis_recovery import (
     _durable_jarvis_execution_recovery,
-    _minimal_mcp_runner_environment,
     _trusted_jarvis_execution_query_validation,
-    _trusted_jarvis_mcp_result,
+    minimal_mcp_runner_environment,
+    trusted_jarvis_mcp_result,
 )
 from clio_relay.endpoint_recovery_directory import (
     _close_recovery_directory_anchor,
@@ -38,7 +38,7 @@ from clio_relay.endpoint_recovery_directory import (
     _remove_owned_recovery_output,
     _validate_recovery_directory_path,
     _validate_recovery_process_cwd,
-    _write_private_json_file,
+    write_private_json_file,
 )
 from clio_relay.endpoint_scheduler_metadata import (
     _native_runtime_created_at,
@@ -180,7 +180,7 @@ class JarvisRecoveryQueryMixin:
                 "artifact-pinned JARVIS execution recovery result is unavailable"
             ) from exc
         result_sha256 = hashlib.sha256(result_payload).hexdigest()
-        trusted, reason = _trusted_jarvis_mcp_result(
+        trusted, reason = trusted_jarvis_mcp_result(
             recovery_job,
             document,
             expected_tool="jarvis_get_execution",
@@ -342,7 +342,7 @@ class JarvisRecoveryQueryMixin:
                 result_path,
                 directory_anchor=anchor,
             )
-            _write_private_json_file(
+            write_private_json_file(
                 params_path,
                 recovery_spec.model_dump(mode="json", exclude_none=True),
                 directory_anchor=anchor,
@@ -375,7 +375,7 @@ class JarvisRecoveryQueryMixin:
                 completed = self.provider.run_command_streaming(
                     command,
                     cwd=internal_filesystem_path(recovery_directory),
-                    env=_minimal_mcp_runner_environment(job.spec.env_from),
+                    env=minimal_mcp_runner_environment(job.spec.env_from),
                     on_start=record_started,
                     timeout_seconds=MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS,
                     on_timeout=lambda: self._record_jarvis_recovery_query_timeout(

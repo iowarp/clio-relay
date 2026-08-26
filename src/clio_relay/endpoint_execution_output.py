@@ -17,7 +17,7 @@ from typing import Any, cast
 
 from clio_relay import process_containment
 from clio_relay.endpoint_jarvis_recovery import (
-    _endpoint_mcp_runner_command,
+    endpoint_mcp_runner_command,
 )
 from clio_relay.endpoint_progress_log_io import (
     _validated_native_subprocess_cwd,
@@ -92,7 +92,7 @@ class ExecutionOutputMixin:
         if endpoint_mcp_call:
             provider_metadata = {
                 "name": "clio-relay-endpoint-mcp",
-                "runner": str(Path(_endpoint_mcp_runner_command(pipeline_path)[1])),
+                "runner": str(Path(endpoint_mcp_runner_command(pipeline_path)[1])),
                 "process_containment": process_containment.containment_capability(),
                 "outer_jarvis_pipeline": False,
             }
@@ -204,7 +204,7 @@ class ExecutionOutputMixin:
                 else timeout_seconds + MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS
             )
             return self.provider.run_command_streaming(
-                _endpoint_mcp_runner_command(pipeline_path),
+                endpoint_mcp_runner_command(pipeline_path),
                 process_label="endpoint MCP operation",
                 cwd=runtime_cwd,
                 env=env,

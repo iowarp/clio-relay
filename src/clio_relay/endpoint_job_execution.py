@@ -1,18 +1,18 @@
 """The job execution orchestrator: ``_run_job_impl``.
 
-Owner module for iowarp/clio-relay#231's endpoint decomposition. ``_run_job_impl`` (~645
-lines) is one sequential procedure -- launch setup, sidecar precreation, streaming
-execution, progress/runtime ingest, ownership resolution, and terminal-state recording
--- that threads roughly thirty local variables through nested closures (``on_stdout``,
+Owner module for iowarp/clio-relay#231's endpoint decomposition. ``_run_job_impl`` is one
+sequential procedure -- launch setup, sidecar precreation, streaming execution,
+progress/runtime ingest, ownership resolution, and terminal-state recording -- that
+threads roughly thirty local variables through nested closures (``on_stdout``,
 ``on_poll``, ...) passed into ``self._run_execution_streaming``. Splitting it further
 would mean rewriting that closure capture, not moving it, so unlike its sibling owner
 modules it stays a single method per the sweet-spot exception already established for
 ``bootstrap_reconcile_activation_paths.py`` (548 lines) and
-``jarvis_mcp_validation_report.py`` (797 lines) in this same ratchet.
+``jarvis_mcp_validation_report.py`` (797 lines) in this same ratchet. Terminal-verdict
+rendering lives in ``job_terminal_verdict.py``/``mcp_call_result_error.py`` instead --
+extracted because this file has no headroom of its own (#265/#183/#162/#248).
 
-Its thin caller, ``_run_job`` (sidecar cleanup around this method on either success or
-failure), stays with ``run_once`` in ``endpoint_serve_loop.py`` instead -- the pairing
-that keeps both files under the 800-line cap.
+Its thin caller, ``_run_job``, stays with ``run_once`` in ``endpoint_serve_loop.py``.
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from clio_relay import execution_watch, process_containment
-from clio_relay.command_evidence import bounded_error_detail
+from clio_relay import execution_watch, job_terminal_verdict, process_containment
 from clio_relay.console_stream import (
     ConsoleLiveTailer,
     console_tailer_for_mcp_call,
@@ -38,7 +37,7 @@ from clio_relay.endpoint_execution_sidecar_cleanup import (
 )
 from clio_relay.endpoint_jarvis_recovery import (
     _jarvis_execution_recovery_intent,
-    _minimal_mcp_runner_environment,
+    minimal_mcp_runner_environment,
 )
 from clio_relay.endpoint_progress_log_io import (
     _normalize_package_progress_log_path,
@@ -46,7 +45,7 @@ from clio_relay.endpoint_progress_log_io import (
 from clio_relay.endpoint_recovery_directory import (
     _close_recovery_directory_anchor,
     _open_or_create_recovery_directory,
-    _write_private_json_file,
+    write_private_json_file,
 )
 from clio_relay.endpoint_runtime_sidecar_anchor import (
     _precreate_runtime_sidecar,
@@ -74,6 +73,7 @@ from clio_relay.filesystem_paths import (
     internal_filesystem_path,
 )
 from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
+from clio_relay.mcp_call_result_error import mcp_call_dispatch_failure_detail
 from clio_relay.models import (
     JobKind,
     JobState,
@@ -151,6 +151,9 @@ class JobExecutionMixin:
         spool.initialize()
         runtime_spools.append(spool)
         self._check_runtime_storage(job, spool, force_job_scan=True)
+        # clio-relay#162: refuse an empty pipeline before scheduler submission.
+        if cast(bool, self._refuse_empty_jarvis_pipeline(job, task=task, spool=spool)):
+            return
         endpoint_mcp_call = job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec)
         pipeline_name = None if endpoint_mcp_call else _jarvis_pipeline_name(job)
         configured_scheduler_provider = _configured_scheduler_provider_name(self.scheduler_provider)
@@ -164,7 +167,7 @@ class JobExecutionMixin:
             console_tailer = console_tailer_for_mcp_call(job.spec, spool=spool)
             yaml_text = None
             pipeline_path = spool.path / "mcp-request.json"
-            _write_private_json_file(
+            write_private_json_file(
                 pipeline_path,
                 job.spec.model_dump(mode="json", exclude_none=True),
             )
@@ -398,7 +401,7 @@ class JobExecutionMixin:
         scheduler_cancel_attempted = [False]
         if endpoint_mcp_call:
             assert isinstance(job.spec, McpCallSpec)
-            execution_environment_values = _minimal_mcp_runner_environment(job.spec.env_from)
+            execution_environment_values = minimal_mcp_runner_environment(job.spec.env_from)
             execution_environment_values.update(
                 self._jarvis_run_environment_values(job, task_id=task.task_id)
             )
@@ -724,35 +727,49 @@ class JobExecutionMixin:
             self.queue.acknowledge_job_cancellation(job.job_id)
             return
         if effective_returncode == 0:
+            # Ruling B: the signal never fails a success, but still reaches the record.
+            success_metadata: dict[str, object] = {
+                "returncode": effective_returncode,
+                "mcp_dispatch_recovered": dispatch_recovered,
+                "mcp_transport_returncode": result.returncode,
+            }
+            if outcome.outputs_missing is not None:
+                success_metadata["execution_outputs_missing"] = outcome.outputs_missing
             self.queue.update_task_state(
                 task.task_id,
                 JobState.SUCCEEDED,
                 message=f"Task succeeded: {task.name}",
-                metadata={
-                    "returncode": effective_returncode,
-                    "mcp_dispatch_recovered": dispatch_recovered,
-                    "mcp_transport_returncode": result.returncode,
-                },
+                metadata=success_metadata,
             )
-            self.queue.update_job_state(
-                job.job_id,
-                JobState.SUCCEEDED,
-                message=(
-                    "Endpoint MCP operation succeeded"
-                    if endpoint_mcp_call
-                    else "JARVIS-CD run succeeded"
-                ),
+            succeeded_message = (
+                "Endpoint MCP operation succeeded"
+                if endpoint_mcp_call
+                else "JARVIS-CD run succeeded"
             )
+            self.queue.update_job_state(job.job_id, JobState.SUCCEEDED, message=succeeded_message)
             return
         watch_failure = outcome.watch_failure
-        outputs_missing_detail = outcome.outputs_missing
-        failure_metadata: dict[str, object] = {"returncode": effective_returncode}
-        if dispatch_refusal is not None:
-            failure_metadata["jarvis_dispatch_refusal"] = dispatch_refusal.as_payload()
-        if watch_failure is not None:
-            failure_metadata["execution_watch_failure"] = watch_failure
-        if outputs_missing_detail is not None:
-            failure_metadata["execution_outputs_missing"] = outputs_missing_detail
+        application_verdict_failure = outcome.application_verdict_failure
+        outputs_missing_failure = outcome.outputs_missing_failure  # Ruling B: GATED, not raw.
+        mcp_dispatch_failure = mcp_call_dispatch_failure_detail(
+            self.queue,
+            job,
+            spool=spool,
+            returncode=effective_returncode,
+            endpoint_mcp_call=endpoint_mcp_call,
+            dispatch_refusal_present=dispatch_refusal is not None,
+            watch_failure_present=watch_failure is not None,
+            application_verdict_failure_present=application_verdict_failure is not None,
+            outputs_missing_failure_present=outputs_missing_failure is not None,
+        )
+        failure_metadata = job_terminal_verdict.terminal_failure_metadata(
+            effective_returncode=effective_returncode,
+            dispatch_refusal=dispatch_refusal,
+            watch_failure=watch_failure,
+            application_verdict_failure=application_verdict_failure,
+            outputs_missing_signal=outcome.outputs_missing,
+            mcp_dispatch_failure=mcp_dispatch_failure,
+        )
         self.queue.update_task_state(
             task.task_id,
             JobState.FAILED,
@@ -762,30 +779,19 @@ class JobExecutionMixin:
         self.queue.update_job_state(
             job.job_id,
             JobState.FAILED,
-            message=(
-                "JARVIS run failed"
-                if dispatch_refusal is not None
-                else "JARVIS execution ended in failure"
-                if watch_failure is not None
-                # clio-relay#265 owner ruling: "producing the declared
-                # outputs is PART of what completed means" -- an execution
-                # JARVIS itself reported terminal, but whose declared
-                # outputs are missing or empty, is FAILED here too.
-                else "JARVIS execution completed but declared outputs are missing or empty"
-                if outputs_missing_detail is not None
-                else "Endpoint MCP operation failed"
-                if endpoint_mcp_call
-                else "JARVIS-CD run failed"
+            message=job_terminal_verdict.terminal_failure_message(
+                dispatch_refusal=dispatch_refusal,
+                watch_failure=watch_failure,
+                application_verdict_failure=application_verdict_failure,
+                outputs_missing_failure=outputs_missing_failure,
+                endpoint_mcp_call=endpoint_mcp_call,
             ),
-            error=(
-                bounded_error_detail(dispatch_refusal.as_error_detail())
-                if dispatch_refusal is not None
-                else bounded_error_detail(execution_watch.execution_watch_error_text(watch_failure))
-                if watch_failure is not None
-                else bounded_error_detail(
-                    execution_watch.execution_outputs_missing_error_text(outputs_missing_detail)
-                )
-                if outputs_missing_detail is not None
-                else f"exit code {effective_returncode}"
+            error=job_terminal_verdict.terminal_failure_error_text(
+                dispatch_refusal=dispatch_refusal,
+                watch_failure=watch_failure,
+                application_verdict_failure=application_verdict_failure,
+                outputs_missing_failure=outputs_missing_failure,
+                mcp_dispatch_failure=mcp_dispatch_failure,
+                effective_returncode=effective_returncode,
             ),
         )

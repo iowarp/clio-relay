@@ -101,7 +101,38 @@ from typing import Any, NamedTuple
 # bootstrap family) for the two cross-module bootstrap-family constants
 # this slice's script composer borrows -- net -5 (7663 -> 7658 on
 # Windows), not a regression to absorb.
-BASELINE_TOTAL = 7658
+#
+# clio-relay#265/#183/#162/#248 "honest verdict" slice, adversarial-review
+# fix round: the new cross-mixin `self.provider`/`_refuse_empty_jarvis_
+# pipeline` call sites (endpoint_jarvis_dispatch.py/endpoint_job_
+# execution.py) added 5 new strict-mode errors (7663 -> 7668) -- fixed with
+# the same real-typing precedent as the #265/#259 note above (TYPE_CHECKING
+# stubs + a call-site cast, no ignores). While in there, #271's own
+# direction was applied to the four private names this slice's new
+# jarvis_pipeline_precheck.py imports (`_trusted_jarvis_mcp_result`,
+# `_minimal_mcp_runner_environment`, `_endpoint_mcp_runner_command` in
+# endpoint_jarvis_recovery.py; `_write_private_json_file` in
+# endpoint_recovery_directory.py): every caller across the endpoint
+# decomposition already imports them, so the leading underscore was pure
+# reportPrivateUsage noise, not a real privacy boundary -- promoted to
+# public and every import site (including execution_watch.py, which shares
+# all four, and endpoint.py's forward re-exports) repointed. Net: 7663 ->
+# 7636, verified via a full baseline-vs-fixed diff.
+#
+# Third-round adversarial-review verification pass (item 4): the
+# jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py blocker fix
+# (importing structured_result_from_protocol_result instead of the
+# renamed-away _structured_result) plus the two test call-site fixes and
+# the new import-smoke guard test removed 5 more reportPrivateUsage-
+# adjacent errors than they added. Measured (not hardcoded from the
+# reviewer's own prediction, confirmed to match it) via
+# `uv run --no-sync python scripts/check_pyright_ratchet.py` from the
+# synced worktree venv: 7636 -> 7631.
+#
+# Post-rebase onto develop (which carries #209's own -5): the two deltas
+# compound independently (disjoint files); re-measured on the rebased tree
+# at 7626 and ratcheted down accordingly.
+BASELINE_TOTAL = 7626
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

@@ -101,6 +101,16 @@ def test_terminal_outputs_are_referenced_fetched_and_produced_by_lineage(
 
 
 def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Path) -> None:
+    """Original fixture shape restored (adversarial review): this isolates
+    the truncation-detection code path with ONLY the truncation marker
+    declared, deliberately zero real ``execution-file`` entries. D1's own
+    zero-declared check is unaffected by this fixture's isolated shape --
+    it legitimately reports ``no_outputs_declared`` here too (asserted
+    below), exactly as it would for any page declaring no execution-file
+    entries; Ruling B is what keeps that SIGNAL from failing the job, a
+    concern one layer up (``resolve_execution_outcome``), not this
+    function's.
+    """
     queue = ClioCoreQueue(tmp_path / "core")
     execution_id = "execution-truncated"
     owner = queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
@@ -143,7 +153,8 @@ def test_declared_truncation_is_typed_and_emitted_as_a_relay_event(tmp_path: Pat
         "observed_count": 65,
         "omitted_count": 1,
     }
-    assert outputs_missing is None
+    assert outputs_missing is not None
+    assert outputs_missing["reason"] == "no_outputs_declared"
     events, _ = queue.drain_events(Cursor(job_id=owner.job_id), limit=100)
     assert any(
         event.event_type == "jarvis.execution_outputs_truncated"
@@ -238,6 +249,7 @@ def test_declared_and_missing_output_is_typed_outputs_missing(tmp_path: Path) ->
     assert indexed == []
     assert outputs_missing is not None
     assert outputs_missing["schema_version"] == EXECUTION_OUTPUTS_MISSING_SCHEMA
+    assert outputs_missing["reason"] == "declared_outputs_missing"
     assert outputs_missing["execution_id"] == execution_id
     assert outputs_missing["declared_count"] == 1
     assert outputs_missing["missing"] == [
@@ -286,6 +298,7 @@ def test_declared_and_empty_output_is_typed_outputs_missing(tmp_path: Path) -> N
     # also typed as an outputs-missing reason (#265: empty counts too).
     assert len(indexed) == 1
     assert outputs_missing is not None
+    assert outputs_missing["reason"] == "declared_outputs_missing"
     assert outputs_missing["missing"] == [
         {
             "relative_path": "stdout.log",
@@ -298,17 +311,65 @@ def test_declared_and_empty_output_is_typed_outputs_missing(tmp_path: Path) -> N
     assert any(event.event_type == "jarvis.execution_output_empty" for event in events)
 
 
-def test_nothing_declared_keeps_current_semantics(tmp_path: Path) -> None:
-    """clio-relay#265: an execution that declares zero outputs is untouched."""
+def test_zero_declared_outputs_is_typed_outputs_missing(tmp_path: Path) -> None:
+    """clio-relay#265 D1: a completed run declaring ZERO outputs is not silently clean.
+
+    Revises the pre-D1 "nothing declared keeps current semantics" ruling: a
+    terminal artifact page that IS present but declares no execution-file
+    entries at all (a 0-step/empty-output run) is exactly the false-green
+    shape #265's own issue text names, distinct from "some declared outputs
+    were found missing/empty" (reason=declared_outputs_missing, covered by
+    the two tests above).
+    """
     queue = ClioCoreQueue(tmp_path / "core")
     execution_id = "execution-nothing-declared"
     query = queue.submit_job(
         _call_job(tool="jarvis_get_execution", execution_id=execution_id, key="query")
     )
-    queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
+    owner = queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
     execution_root = tmp_path / "execution"
     execution_root.mkdir()
     result = _terminal_result(execution_id, execution_root, artifacts=[])
+
+    indexed, truncation, outputs_missing = ingest_jarvis_execution_outputs(queue, query, result)
+
+    assert indexed == []
+    assert truncation is None
+    assert outputs_missing is not None
+    assert outputs_missing["schema_version"] == EXECUTION_OUTPUTS_MISSING_SCHEMA
+    assert outputs_missing["reason"] == "no_outputs_declared"
+    assert outputs_missing["execution_id"] == execution_id
+    assert outputs_missing["declared_count"] == 0
+    assert outputs_missing["missing"] == []
+    events, _ = queue.drain_events(Cursor(job_id=owner.job_id), limit=100)
+    assert any(
+        event.event_type == "jarvis.execution_outputs_missing"
+        and event.payload.get("reason") == "no_outputs_declared"
+        for event in events
+    )
+
+
+def test_no_artifact_page_keeps_current_semantics(tmp_path: Path) -> None:
+    """clio-relay#265: a synchronous dispatch with no artifact_page at all is untouched.
+
+    Distinct from zero DECLARED outputs (above): here the terminal record
+    carries no artifact_page key whatsoever (jarvis_run's own outputSchema
+    never declares one on a synchronous/non-#266-watched dispatch), so the
+    pre-existing early return applies unchanged -- this is not a case #265
+    can verify either way.
+    """
+    queue = ClioCoreQueue(tmp_path / "core")
+    execution_id = "execution-no-artifact-page"
+    query = queue.submit_job(
+        _call_job(tool="jarvis_get_execution", execution_id=execution_id, key="query")
+    )
+    queue.submit_job(_call_job(tool="jarvis_run", execution_id=execution_id, key="run"))
+    result: dict[str, Any] = {
+        "structured_result": {
+            "execution_id": execution_id,
+            "execution_record": {"terminal": True, "metadata": {}},
+        }
+    }
 
     indexed, truncation, outputs_missing = ingest_jarvis_execution_outputs(queue, query, result)
 

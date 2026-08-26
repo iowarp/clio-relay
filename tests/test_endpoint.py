@@ -219,10 +219,10 @@ def test_recovered_jarvis_run_result_nulls_stale_stream_truncation_records(
             return True, "test"
 
         # endpoint_jarvis_dispatch.py owns _write_recovered_jarvis_run_result
-        # (and its _trusted_jarvis_mcp_result call) now (clio-relay#231
-        # endpoint split); a bare-name call only observes a patch on the
-        # module its own globals resolve through.
-        monkeypatch.setattr(endpoint_jarvis_dispatch, "_trusted_jarvis_mcp_result", _always_trusted)
+        # (and its trusted_jarvis_mcp_result call, public per #271) now
+        # (clio-relay#231 endpoint split); a bare-name call only observes a
+        # patch on the module its own globals resolve through.
+        monkeypatch.setattr(endpoint_jarvis_dispatch, "trusted_jarvis_mcp_result", _always_trusted)
 
         cast(Any, worker)._write_recovered_jarvis_run_result(
             job,
@@ -3205,6 +3205,12 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never answers
+                # it, so the precheck is always INCONCLUSIVE and the
+                # progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -3320,6 +3326,12 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -3429,6 +3441,12 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -3624,7 +3642,27 @@ def _native_mcp_result_document(
         "updated_at": "2026-07-12T10:00:01Z",
         "return_code": None if submitted else 0,
         "error": None,
-        "metadata": {"submission": submission} if submission is not None else {},
+        # Adversarial-review Major 6 continued: jarvis_execution_artifacts.
+        # execution_root_from_record reads metadata.script_path (or
+        # .pipeline_snapshot_path) directly at THIS level -- the same shape
+        # execution_watch_fakes.py's native_execution_documents already
+        # carries -- not nested one level deeper under "submission" the way
+        # this older helper had it. A caller that reaches the terminal
+        # artifact-ingest path with no top-level script_path crashed on
+        # "terminal JARVIS result omitted an execution root" once the
+        # execution_id gap above was closed. Mirrors runtime_metadata's own
+        # "script_path if submitted else None" exactly below -- the native
+        # document contract's own cross-check (_validate_native_runtime_
+        # projection) requires the runtime projection's script_path to
+        # match the authoritative execution documents' own value.
+        "metadata": (
+            {
+                "script_path": f"/runs/{pipeline_id}/submit.sh",
+                "submission": submission,
+            }
+            if submitted
+            else {}
+        ),
     }
     progress: dict[str, object] = {
         "schema_version": "jarvis.execution.progress.v1",
@@ -3635,6 +3673,18 @@ def _native_mcp_result_document(
         "packages": [],
     }
     structured: dict[str, object] = {
+        # Adversarial-review Major 6 (root-caused fixture drift, not a
+        # product defect): jarvis_execution_artifacts.ingest_jarvis_
+        # execution_outputs (#252/#265) reads execution_id/pipeline_id at
+        # this TOP level of structured_result -- the same shape
+        # tests/execution_watch_fakes.py's query_result_document already
+        # carries. This older helper predates that contract and never
+        # carried them, so any caller that also injects a terminal
+        # artifact_page (as both currently-failing callers below do)
+        # crashed on "terminal JARVIS result omitted execution_id" the
+        # instant that ingest path was reached.
+        "execution_id": execution_id,
+        "pipeline_id": pipeline_id,
         "execution_handle": handle,
         "execution_record": record,
         "progress": progress,
@@ -6038,6 +6088,12 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             del command, env, credential_payload, on_stderr, should_cancel
             del on_poll, timeout_seconds, on_timeout
             assert cwd is not None
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the runtime-metadata behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             if on_start is not None:
                 on_start(700)
             if process_label == "endpoint MCP operation":
@@ -6253,6 +6309,12 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
         ) -> subprocess.CompletedProcess[str]:
             del command, env, credential_payload, on_stderr, should_cancel, on_poll
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the runtime behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
@@ -6345,7 +6407,7 @@ def test_worker_refuses_runtime_identity_from_unconfigured_jarvis_named_tool() -
         ),
         idempotency_key="untrusted-jarvis-named-tool",
     )
-    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(
+    trusted, reason = cast(Any, endpoint_module).trusted_jarvis_mcp_result(
         job,
         {
             "server": "untrusted-mcp",
@@ -6409,6 +6471,12 @@ def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
             del command, env, credential_payload, on_stdout, on_stderr
             del should_cancel, on_poll
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the result-handling behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
@@ -6489,7 +6557,7 @@ def test_trusted_jarvis_mcp_result_requires_content_derived_server_digest(
         "protocol_result": {"structuredContent": {"runtime_metadata": {}}},
     }
 
-    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(job, document)
+    trusted, reason = cast(Any, endpoint_module).trusted_jarvis_mcp_result(job, document)
 
     assert trusted is False
     assert reason == "MCP result server artifact identity is not the exact relay release pin"
@@ -6541,7 +6609,7 @@ def test_worker_refuses_result_with_mismatched_jarvis_lock_marker(
         idempotency_key="mismatched-jarvis-lock-result",
     )
 
-    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(
+    trusted, reason = cast(Any, endpoint_module).trusted_jarvis_mcp_result(
         job,
         {
             "server": command[0],
@@ -6590,7 +6658,7 @@ def test_worker_refuses_runtime_identity_when_result_arguments_do_not_match(
         idempotency_key="mismatched-jarvis-result",
     )
 
-    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(
+    trusted, reason = cast(Any, endpoint_module).trusted_jarvis_mcp_result(
         job,
         cast(
             object,
@@ -6642,7 +6710,7 @@ def test_worker_refuses_stdout_only_jarvis_mcp_runtime_identity(
         idempotency_key="stdout-only-jarvis-result",
     )
 
-    trusted, reason = cast(Any, endpoint_module)._trusted_jarvis_mcp_result(
+    trusted, reason = cast(Any, endpoint_module).trusted_jarvis_mcp_result(
         job,
         {
             "server": command[0],

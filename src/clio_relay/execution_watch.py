@@ -57,14 +57,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from clio_relay import application_verdict
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.endpoint_jarvis_recovery import (
-    _endpoint_mcp_runner_command,
-    _minimal_mcp_runner_environment,
     _trusted_jarvis_execution_query_validation,
-    _trusted_jarvis_mcp_result,
+    endpoint_mcp_runner_command,
+    minimal_mcp_runner_environment,
+    trusted_jarvis_mcp_result,
 )
-from clio_relay.endpoint_recovery_directory import _write_private_json_file
+from clio_relay.endpoint_recovery_directory import write_private_json_file
 from clio_relay.endpoint_scheduler_metadata import _runtime_metadata_is_native
 from clio_relay.errors import RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
@@ -87,6 +88,14 @@ EXECUTION_WATCH_QUERY_PROCESS_TIMEOUT_SECONDS = 75
 EXECUTION_PHASE_SCHEMA = "clio-relay.execution-phase.v1"
 EXECUTION_CANCEL_REFUSAL_SCHEMA = "clio-relay.execution-cancel-refusal.v1"
 EXECUTION_WATCH_FAILURE_SCHEMA = "clio-relay.execution-watch-failure.v1"
+# clio-relay#265 + #183 residual, split to application_verdict.py
+# (adversarial-review item 2: this module's own line-count ratchet ceiling,
+# #774/#775) -- re-exported under their original names so every existing
+# execution_watch.APPLICATION_VERDICT_SCHEMA / .RETURNCODE_CONFLICT_REASON /
+# .application_verdict_for_metadata access keeps resolving unchanged.
+APPLICATION_VERDICT_SCHEMA = application_verdict.APPLICATION_VERDICT_SCHEMA
+RETURNCODE_CONFLICT_REASON = application_verdict.RETURNCODE_CONFLICT_REASON
+application_verdict_for_metadata = application_verdict.application_verdict_for_metadata
 
 #: Page size for the ONE terminal, artifact-bearing poll -- matches the
 #: existing lost-response recovery query's page size
@@ -145,6 +154,13 @@ class ExecutionWatchResolution:
 
     succeeded: bool
     failure_detail: dict[str, object] | None
+    #: clio-relay#265 Ruling A: the #265 application-level verdict for this
+    #: same terminal metadata (:func:`application_verdict_for_metadata`) --
+    #: a REAL consumer, not a dead field: :func:`resolve_execution_outcome`
+    #: folds a ``returncode_conflict`` verdict into the job's terminal
+    #: outcome even when ``succeeded`` (JARVIS's own state-only answer)
+    #: says otherwise.
+    application_verdict: dict[str, object]
 
 
 def deferred_jarvis_execution(
@@ -153,7 +169,7 @@ def deferred_jarvis_execution(
     """Return the watch target, or ``None`` when today's fast path applies.
 
     ``metadata`` must already be a *trusted*, native runtime snapshot --
-    see ``_trusted_jarvis_mcp_result`` and
+    see ``trusted_jarvis_mcp_result`` and
     ``runtime_metadata_from_mcp_result_document`` in ``endpoint.py``, both
     called by the caller before this function ever runs. This makes no
     trust decision of its own: it is a pure typed-state read.
@@ -204,6 +220,10 @@ def execution_phase_job_metadata(
         "scheduler_job_id": metadata.scheduler_job_id,
         "poll_count": poll_count,
         "observed_at": observed_at.isoformat(),
+        # clio-relay#265 + #183 residual: a DISTINCT application-level
+        # verdict, never conflated with execution_watch_succeeded's own
+        # scheduler-rc-only answer -- see application_verdict_for_metadata.
+        "application_verdict": application_verdict_for_metadata(metadata),
     }
 
 
@@ -315,10 +335,13 @@ def execution_outputs_missing_error_text(outputs_missing: dict[str, object]) -> 
     :func:`~clio_relay.jarvis_execution_artifacts.ingest_jarvis_execution_outputs`'s
     typed ``clio-relay.execution-outputs-missing.v1`` payload -- the owner
     ruling made concrete: an execution JARVIS itself reported terminal, but
-    whose declared outputs are missing or empty, is a FAILED job with this
-    reason, never a decorated "completed".
+    whose declared outputs are missing or empty (or whose page declared NONE
+    at all, ``reason="no_outputs_declared"`` -- the #265 D1 revision), is a
+    FAILED job with this reason, never a decorated "completed".
     """
     execution_id = outputs_missing.get("execution_id")
+    if outputs_missing.get("reason") == "no_outputs_declared":
+        return f"JARVIS execution {execution_id} completed but declared zero outputs"
     raw_missing = outputs_missing.get("missing")
     entries: list[dict[str, object]] = []
     if isinstance(raw_missing, list):
@@ -350,14 +373,29 @@ def execution_phase_status_message(
     :func:`execution_phase_job_metadata`, or ``None``/anything else before
     the first poll); this stays a thin string render of an already-typed
     value, never a keyword/phrase decision of its own.
+
+    Adversarial-review Ruling A ("give it real consumers"): when the
+    carried ``application_verdict`` reports ``status == "failed"`` (a real
+    application failure OR a :data:`RETURNCODE_CONFLICT_REASON`
+    self-contradiction), that is named here too -- a caller polling mid-run
+    sees the application's own trouble, not only the scheduler phase.
     """
     base = f"Relay job is {job_state}"
     if not isinstance(execution_phase, dict):
         return base
-    phase = cast(dict[str, object], execution_phase).get("phase")
-    if not isinstance(phase, str) or not phase:
-        return base
-    return f"{base}; jarvis execution is {phase}"
+    typed_phase = cast(dict[str, object], execution_phase)
+    message = base
+    phase = typed_phase.get("phase")
+    if isinstance(phase, str) and phase:
+        message = f"{message}; jarvis execution is {phase}"
+    raw_verdict = typed_phase.get("application_verdict")
+    if isinstance(raw_verdict, dict):
+        verdict = cast(dict[str, object], raw_verdict)
+        if verdict.get("status") == "failed":
+            reason = verdict.get("reason")
+            suffix = f" ({reason})" if isinstance(reason, str) and reason else ""
+            message = f"{message}; application failed{suffix}"
+    return message
 
 
 def execution_phase_status_message_for_job(job: RelayJob) -> str:
@@ -378,7 +416,7 @@ def deferred_jarvis_execution_from_document(
     path applies unchanged: not a trusted result, not native, or already
     terminal.
     """
-    trusted, _reason = _trusted_jarvis_mcp_result(job, document)
+    trusted, _reason = trusted_jarvis_mcp_result(job, document)
     if not trusted:
         return None
     metadata = runtime_metadata_from_mcp_result_document(
@@ -396,11 +434,55 @@ class ExecutionOutcome:
     effective_returncode: int
     cancellation_honored: bool
     watch_failure: dict[str, object] | None
-    #: clio-relay#265: the typed ``outputs_missing`` verdict from
-    #: ``jarvis_execution_artifacts.ingest_jarvis_execution_outputs`` for
-    #: this job's terminal ``mcp_result``, or ``None`` when nothing was
-    #: declared or every declared output is present and non-empty.
+    #: clio-relay#265: the PURE, unconditional ``outputs_missing`` signal
+    #: (or ``None``), regardless of whether it drove this outcome's FAILED
+    #: state. Callers folding the signal into a durable record
+    #: unconditionally (e.g. the success branch) read this. Callers
+    #: deciding WHY a job failed must use :attr:`outputs_missing_failure`
+    #: instead -- see that field's own docstring.
     outputs_missing: dict[str, object] | None = None
+    #: Ruling A: the resolved watch's own ``application_verdict`` ONLY
+    #: when it is the reason this outcome is FAILED
+    #: (``RETURNCODE_CONFLICT_REASON``) and ``watch_failure`` is not --
+    #: otherwise a returncode_conflict failure renders as a bare exit
+    #: code, the exact defect class this campaign kills. Mutually
+    #: exclusive with ``watch_failure`` by construction.
+    application_verdict_failure: dict[str, object] | None = None
+    #: Ruling B (adversarial-review fix, mirrors ``application_verdict_
+    #: failure``): :attr:`outputs_missing` ONLY when :func:`_outputs_
+    #: missing_forces_failure` says so (``declared_outputs_missing``,
+    #: never the signal-only ``no_outputs_declared``). Proven live:
+    #: threading the RAW signal into the renderers/guard instead of this
+    #: gated field let a present-but-non-forcing signal hijack an
+    #: unrelated real failure (rendered "completed but declared zero
+    #: outputs" and suppressed the #183/#248 tier entirely). Callers
+    #: rendering "why did this job fail" must use THIS field, never the
+    #: raw :attr:`outputs_missing`.
+    outputs_missing_failure: dict[str, object] | None = None
+
+
+#: clio-relay#265 D1 revision (adversarial-review Ruling B -- flag for
+#: owner review): this ONE outputs_missing reason is a typed, SURFACED
+#: SIGNAL only -- it reaches the phase payload/task record/door metadata
+#: (see :mod:`jarvis_execution_artifacts`'s own module docstring) but never
+#: forces a job to FAILED on its own; the approved campaign plan mandates
+#: the signal, not an automatic failure (a page declaring one
+#: pipeline-snapshot artifact and zero execution-file entries, or a pure-
+#: stdout application, must still SUCCEED). Every other reason (today just
+#: "declared_outputs_missing": one or more DECLARED outputs were found
+#: missing/empty on disk) still fails the job, unchanged from develop --
+#: and an older/legacy outputs_missing dict shape carrying no "reason" key
+#: at all fails closed the same way it always has (``.get`` returns
+#: ``None``, which is not the signal-only sentinel either).
+_OUTPUTS_MISSING_SIGNAL_ONLY_REASON = "no_outputs_declared"
+
+
+def _outputs_missing_forces_failure(outputs_missing: dict[str, object] | None) -> bool:
+    """Ruling B: only a genuinely missing/empty DECLARED output fails the job."""
+    return (
+        outputs_missing is not None
+        and outputs_missing.get("reason") != _OUTPUTS_MISSING_SIGNAL_ONLY_REASON
+    )
 
 
 def resolve_execution_outcome(
@@ -421,13 +503,26 @@ def resolve_execution_outcome(
     and hide the real outcome, so a resolved watch always wins over a
     pending cancellation request for terminal-state purposes.
 
-    ``outputs_missing`` is clio-relay#265's owner ruling made concrete:
-    "producing the declared outputs is PART of what completed means" -- a
-    terminal execution whose declared outputs are missing or empty is
-    FAILED regardless of what the scheduler/JARVIS/dispatch path otherwise
-    reported (including an already-recovered dispatch), and a resolved
-    outputs-missing verdict wins over a pending cancellation for the same
-    reason a resolved watch already does: the real outcome was observed.
+    A resolved watch's own :attr:`ExecutionWatchResolution.application_
+    verdict` also wins over ``succeeded`` when it reports
+    :data:`RETURNCODE_CONFLICT_REASON` (adversarial-review Ruling A,
+    defense-in-depth for loose/legacy runtime metadata the strict native-
+    document contract's cross-field validator does not cover on the main
+    path): JARVIS's own returncode field disagreeing with its state must
+    never read as success.
+
+    ``outputs_missing`` folds per :func:`_outputs_missing_forces_failure`
+    (Ruling B) -- only a genuinely missing/empty DECLARED output is FAILED
+    regardless of what the scheduler/JARVIS/dispatch path otherwise
+    reported (including an already-recovered dispatch); the signal-only
+    ``no_outputs_declared`` reason never does, and never populates
+    :attr:`ExecutionOutcome.outputs_missing_failure` either -- only that
+    gated field, never the raw :attr:`ExecutionOutcome.outputs_missing`
+    signal, may drive a "why did this job fail" decision (mirrors
+    :attr:`ExecutionOutcome.application_verdict_failure`'s own split).
+    A forced failure (either source) wins over a pending cancellation for
+    the same reason a resolved watch already does: the real outcome was
+    observed.
     """
     if dispatch_recovered:
         effective_returncode = 0
@@ -438,14 +533,26 @@ def resolve_execution_outcome(
     else:
         effective_returncode = transport_returncode
     cancellation_honored = watch_resolution is None and cancellation_requested
-    if outputs_missing is not None:
+    application_verdict_failure: dict[str, object] | None = None
+    if (
+        watch_resolution is not None
+        and watch_resolution.application_verdict.get("reason") == RETURNCODE_CONFLICT_REASON
+    ):
         effective_returncode = 1
         cancellation_honored = False
+        application_verdict_failure = watch_resolution.application_verdict
+    outputs_missing_failure: dict[str, object] | None = None
+    if _outputs_missing_forces_failure(outputs_missing):
+        effective_returncode = 1
+        cancellation_honored = False
+        outputs_missing_failure = outputs_missing
     return ExecutionOutcome(
         effective_returncode=effective_returncode,
         cancellation_honored=cancellation_honored,
         watch_failure=(watch_resolution.failure_detail if watch_resolution is not None else None),
         outputs_missing=outputs_missing,
+        application_verdict_failure=application_verdict_failure,
+        outputs_missing_failure=outputs_missing_failure,
     )
 
 
@@ -499,12 +606,12 @@ def dispatch_execution_watch_query(
     result_path = watch_dir / "mcp-result.json"
     with suppress(FileNotFoundError):
         internal_filesystem_path(result_path).unlink()
-    _write_private_json_file(params_path, query_spec.model_dump(mode="json", exclude_none=True))
+    write_private_json_file(params_path, query_spec.model_dump(mode="json", exclude_none=True))
     completed = provider.run_command_streaming(
-        _endpoint_mcp_runner_command(params_path),
+        endpoint_mcp_runner_command(params_path),
         process_label="jarvis execution watch query",
         cwd=internal_filesystem_path(watch_dir),
-        env=_minimal_mcp_runner_environment(base_spec.env_from),
+        env=minimal_mcp_runner_environment(base_spec.env_from),
         timeout_seconds=EXECUTION_WATCH_QUERY_PROCESS_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
@@ -512,7 +619,7 @@ def dispatch_execution_watch_query(
         raise RelayError(f"jarvis execution watch query exited {completed.returncode}: {detail}")
     payload = internal_filesystem_path(result_path).read_bytes()
     document = json.loads(payload.decode("utf-8"))
-    trusted, reason = _trusted_jarvis_mcp_result(
+    trusted, reason = trusted_jarvis_mcp_result(
         query_job,
         document,
         expected_tool="jarvis_get_execution",
@@ -671,4 +778,8 @@ def run_execution_watch(
     )
     succeeded = execution_watch_succeeded(final_metadata)
     failure_detail = None if succeeded else execution_watch_failure_detail(final_metadata)
-    return ExecutionWatchResolution(succeeded=succeeded, failure_detail=failure_detail)
+    return ExecutionWatchResolution(
+        succeeded=succeeded,
+        failure_detail=failure_detail,
+        application_verdict=cast("dict[str, object]", final_phase_metadata["application_verdict"]),
+    )

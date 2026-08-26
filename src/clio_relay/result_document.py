@@ -28,7 +28,11 @@ from clio_relay.bounded_payload import (
     bound_stream_capture,
 )
 from clio_relay.constants import _TOOLS_LIST_PAGINATION_KEY
-from clio_relay.protocol_messages import _response_id, _response_result, _structured_result
+from clio_relay.protocol_messages import (
+    _response_id,
+    _response_result,
+    structured_result_from_protocol_result,
+)
 
 
 def _write_mcp_result(
@@ -111,7 +115,9 @@ def _write_mcp_result(
         "arguments": arguments,
         "input_reconciliation": jarvis_input_manifest,
         "protocol_result": protocol_result,
-        "structured_result": _structured_result(protocol_result, operation=operation),
+        "structured_result": structured_result_from_protocol_result(
+            protocol_result, operation=operation
+        ),
         "protocol_version": protocol_version,
         "server_info": server_info,
         "server_artifact": server_artifact,

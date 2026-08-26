@@ -73,25 +73,25 @@ from clio_relay.endpoint_jarvis_recovery import (
     _durable_runtime_recovery_state as _durable_runtime_recovery_state,
 )
 from clio_relay.endpoint_jarvis_recovery import (
-    _endpoint_mcp_runner_command as _endpoint_mcp_runner_command,
-)
-from clio_relay.endpoint_jarvis_recovery import (
     _jarvis_execution_recovery_intent as _jarvis_execution_recovery_intent,
 )
 from clio_relay.endpoint_jarvis_recovery import (
     _jarvis_execution_recovery_is_pending as _jarvis_execution_recovery_is_pending,
 )
 from clio_relay.endpoint_jarvis_recovery import (
-    _minimal_mcp_runner_environment as _minimal_mcp_runner_environment,
-)
-from clio_relay.endpoint_jarvis_recovery import (
     _trusted_jarvis_execution_query_validation as _trusted_jarvis_execution_query_validation,
 )
 from clio_relay.endpoint_jarvis_recovery import (
-    _trusted_jarvis_mcp_result as _trusted_jarvis_mcp_result,
+    _trusted_jarvis_mcp_route as _trusted_jarvis_mcp_route,
 )
 from clio_relay.endpoint_jarvis_recovery import (
-    _trusted_jarvis_mcp_route as _trusted_jarvis_mcp_route,
+    endpoint_mcp_runner_command as endpoint_mcp_runner_command,
+)
+from clio_relay.endpoint_jarvis_recovery import (
+    minimal_mcp_runner_environment as minimal_mcp_runner_environment,
+)
+from clio_relay.endpoint_jarvis_recovery import (
+    trusted_jarvis_mcp_result as trusted_jarvis_mcp_result,
 )
 from clio_relay.endpoint_jarvis_recovery_bookkeeping import JarvisRecoveryBookkeepingMixin
 from clio_relay.endpoint_jarvis_recovery_query import JarvisRecoveryQueryMixin
@@ -155,7 +155,7 @@ from clio_relay.endpoint_recovery_directory import (
     _validate_recovery_process_cwd as _validate_recovery_process_cwd,
 )
 from clio_relay.endpoint_recovery_directory import (
-    _write_private_json_file as _write_private_json_file,
+    write_private_json_file as write_private_json_file,
 )
 from clio_relay.endpoint_result_finalization import ResultFinalizationMixin
 from clio_relay.endpoint_runtime_metadata_ingest import RuntimeMetadataIngestMixin

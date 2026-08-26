@@ -14,7 +14,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint as endpoint_module
+from clio_relay import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
@@ -61,6 +61,14 @@ class _LostRunResponseProvider(JarvisCdProvider):
     ) -> subprocess.CompletedProcess[str]:
         """Return a failed direct MCP transport without fabricating a result."""
         del command, cwd, credential_payload, should_cancel, timeout_seconds, on_timeout
+        if process_label == "jarvis pipeline precheck query":
+            # clio-relay#162: every jarvis_run dispatch is preceded by a
+            # pipeline-emptiness precheck query. This fake never answers it
+            # (no mcp-result.json written, nonzero returncode), so the
+            # precheck is always INCONCLUSIVE and the lost-response recovery
+            # behavior below -- what this fixture exists to test -- is
+            # unaffected.
+            return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
         self.dispatch_count += 1
         assert process_label == "endpoint MCP operation"
         assert env is not None
@@ -297,7 +305,11 @@ def test_lost_run_response_converges_after_scheduler_assigns_native_id(
     if registered:
         server_artifact = {**server_artifact, "install_spec": "/releases/clio-kit.whl"}
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to #265/#183/#162/#248): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all).
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     submission = RelayJob(
         cluster="research-cluster",
         kind=JobKind.MCP_CALL,
@@ -307,7 +319,9 @@ def test_lost_run_response_converges_after_scheduler_assigns_native_id(
             expected_server_artifact_digest=digest,
             expected_registered_contract=("clio-kit-jarvis-user-v3.6" if registered else None),
             expected_jarvis_cd_lock_binding=(
-                None if registered else endpoint_module.jarvis_cd_lock_binding_expectation()
+                None
+                if registered
+                else endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
             ),
             tool="jarvis_run",
             arguments={"pipeline_id": "durable-science"},
@@ -499,7 +513,11 @@ def test_prelaunch_crash_never_queries_or_adopts_remote_execution(
     command = ["locked-clio-kit", "mcp-server", "jarvis"]
     server_artifact = verified_jarvis_server_artifact()
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to #265/#183/#162/#248): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all).
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = queue.submit_job(
         RelayJob(
             cluster="research-cluster",
@@ -509,7 +527,7 @@ def test_prelaunch_crash_never_queries_or_adopts_remote_execution(
                 server_args=command[1:],
                 expected_server_artifact_digest=digest,
                 expected_jarvis_cd_lock_binding=(
-                    endpoint_module.jarvis_cd_lock_binding_expectation()
+                    endpoint_jarvis_recovery.jarvis_cd_lock_binding_expectation()
                 ),
                 tool="jarvis_run",
                 arguments={"pipeline_id": "never-released"},

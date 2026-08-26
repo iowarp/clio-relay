@@ -211,9 +211,9 @@ from clio_relay.protocol_messages import (
     _response_result,
     _StreamEvent,  # noqa: F401
     _StreamLimit,  # noqa: F401
-    _structured_result,
     _text_output,
     _tools_list_message,  # noqa: F401
+    structured_result_from_protocol_result,
 )
 from clio_relay.python_console_distribution import (
     _direct_distribution_source_identity,  # noqa: F401
@@ -430,7 +430,9 @@ def run_mcp_call_from_params(params: dict[str, Any]) -> int:
                 str(process.stdout or ""),
                 response_id=_response_id(operation),
             )
-            structured_result = _structured_result(protocol_result, operation=operation)
+            structured_result = structured_result_from_protocol_result(
+                protocol_result, operation=operation
+            )
             try:
                 if _is_validated_jarvis_execution_query(
                     operation=operation,
