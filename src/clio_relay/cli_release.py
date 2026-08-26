@@ -68,7 +68,11 @@ import clio_relay.release_validation as release_validation
 import clio_relay.validation_report as validation_report_module
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.release_pins import render_preflight, run_preflight
-from clio_relay.release_validation import LocalReleaseValidationOptions
+from clio_relay.release_validation import (
+    DEFAULT_CHECK_TIMEOUT_SECONDS,
+    DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS,
+    LocalReleaseValidationOptions,
+)
 from clio_relay.validation_report import (
     default_report_path,
     evaluate_release_gate,
@@ -111,6 +115,27 @@ def release_validate_local(
             )
         ),
     ] = None,
+    check_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Overall wall-clock deadline for each check, in seconds. A wedged "
+                "check's whole process tree is killed and the failure is recorded "
+                "with a typed check_timeout reason instead of hanging silently "
+                "(clio-relay#275)."
+            )
+        ),
+    ] = DEFAULT_CHECK_TIMEOUT_SECONDS,
+    pytest_per_test_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Per-test timeout, in seconds, for the local.pytest battery "
+                "(pytest-timeout, thread method). On expiry the report names "
+                "the hanging test instead of a bare nonzero exit."
+            )
+        ),
+    ] = DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS,
 ) -> None:
     """Run the complete local release gate and persist evidence on failure."""
     import clio_relay.cli as cli
@@ -132,6 +157,8 @@ def release_validate_local(
                     artifact_dir=artifact_dir,
                     prebuilt_artifact_dir=prebuilt_artifact_dir,
                     report_id=seed_report.report_id,
+                    check_timeout_seconds=check_timeout_seconds,
+                    pytest_per_test_timeout_seconds=pytest_per_test_timeout_seconds,
                 )
             )
             current_report = cli._load_current_acceptance_report(

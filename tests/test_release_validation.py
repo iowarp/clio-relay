@@ -29,6 +29,7 @@ from clio_relay.command_evidence import (
 )
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
+from clio_relay.release_command_stream import TIMEOUT_RETURNCODE, run_streaming_command
 from clio_relay.release_validation import (
     LocalReleaseValidationOptions,
     run_local_release_validation,
@@ -457,6 +458,117 @@ def test_local_release_validation_persists_structured_pytest_gate_failure(
     assert failed.error is not None
     assert "first causal failure: WinError 206" in failed.error
     assert "release gate rejected outcomes" in failed.error
+
+
+def _stub_wheel_build_runner(
+    tmp_path: Path,
+    commands: list[list[str]],
+) -> release_validation_module.ReleaseCommandRunner:
+    """Return an injected runner that fabricates a wheel/sdist so the full
+    local release gate can pass end-to-end, recording every composed command."""
+
+    def runner(
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        assert cwd == tmp_path.resolve()
+        commands.append(command)
+        if command[:2] == ["uv", "build"]:
+            output_dir = Path(command[command.index("--out-dir") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "clio_relay-1.0.0-py3-none-any.whl").write_bytes(b"wheel")
+            (output_dir / "clio_relay-1.0.0.tar.gz").write_bytes(b"sdist")
+        return subprocess.CompletedProcess(command, 0, stdout="250 passed", stderr="")
+
+    return runner
+
+
+def test_local_pytest_command_carries_per_test_timeout_arguments_only(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#275: only the local.pytest check gets the pytest-timeout args."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    report_path = tmp_path / "report.json"
+    commands: list[list[str]] = []
+
+    result = run_local_release_validation(
+        LocalReleaseValidationOptions(
+            project_root=tmp_path,
+            report_path=report_path,
+            pytest_per_test_timeout_seconds=45.0,
+        ),
+        runner=_stub_wheel_build_runner(tmp_path, commands),
+    )
+
+    assert result.status is ValidationStatus.PASSED
+    pytest_commands = [
+        command for command in commands if command[:4] == ["uv", "run", "--no-sync", "pytest"]
+    ]
+    assert len(pytest_commands) == 6
+    local_pytest_command, *required_test_commands = pytest_commands
+    assert "--timeout=45" in local_pytest_command
+    assert "--timeout-method=thread" in local_pytest_command
+    for command in required_test_commands:
+        assert not any(argument.startswith("--timeout=") for argument in command)
+        assert "--timeout-method=thread" not in command
+
+
+def test_local_pytest_command_uses_default_per_test_timeout(tmp_path: Path) -> None:
+    """The default matches ``LocalReleaseValidationOptions``' own documented default."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    report_path = tmp_path / "report.json"
+    commands: list[list[str]] = []
+
+    run_local_release_validation(
+        LocalReleaseValidationOptions(project_root=tmp_path, report_path=report_path),
+        runner=_stub_wheel_build_runner(tmp_path, commands),
+    )
+
+    local_pytest_command = next(
+        command for command in commands if command[:4] == ["uv", "run", "--no-sync", "pytest"]
+    )
+    assert "--timeout=300" in local_pytest_command
+    assert release_validation_module.DEFAULT_PYTEST_PER_TEST_TIMEOUT_SECONDS == 300.0
+
+
+def test_local_release_validation_persists_typed_check_timeout_failure(
+    tmp_path: Path,
+) -> None:
+    """A wedged local.pytest run is killed and named by a typed reason, not a
+    bare nonzero exit (clio-relay#275 acceptance)."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    report_path = tmp_path / "timeout-failed.json"
+
+    def runner(
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        if "pytest" in command:
+            hanging_child = [sys.executable, "-c", "import time; time.sleep(60)"]
+            streamed = run_streaming_command(hanging_child, cwd=cwd, timeout_seconds=0.5)
+            assert streamed.timed_out is True
+            return streamed.to_completed_process()
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    with pytest.raises(RelayError, match=r"release check failed \(local\.pytest\)"):
+        run_local_release_validation(
+            LocalReleaseValidationOptions(project_root=tmp_path, report_path=report_path),
+            runner=runner,
+        )
+
+    report = load_validation_report(report_path)
+    assert report.status is ValidationStatus.FAILED
+    failed = next(check for check in report.checks if check.check_id == "local.pytest")
+    assert failed.status is ValidationStatus.FAILED
+    assert failed.error is not None
+    assert "check_timeout after 0.5s" in failed.error
+    assert len(failed.evidence) == 1
+    assert failed.evidence[0].metadata["exit_code"] == TIMEOUT_RETURNCODE
+    excerpt = failed.evidence[0].excerpt
+    assert excerpt is not None
+    assert "check_timeout after 0.5s" in excerpt
 
 
 @pytest.mark.parametrize(
