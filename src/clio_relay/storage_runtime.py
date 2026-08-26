@@ -156,7 +156,8 @@ def initialize_queue_with_shared_writer_fencing(lifetime_lock: WorkerLifetimeLoc
                 )
             except WorkerLifetimeLockUnavailable as exc:
                 raise WorkerLifetimeLockUnavailable(
-                    "timed out restoring shared writer ownership after queue seal handoff"
+                    "timed out restoring shared writer ownership after queue seal handoff",
+                    holder_diagnostic=exc.holder_diagnostic,
                 ) from exc
 
     try:

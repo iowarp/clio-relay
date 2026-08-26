@@ -90,13 +90,18 @@ class WorkerLifetimeLockUnavailable(ConfigurationError):
     """The lifetime lock is healthy but incompatible ownership is active.
 
     ``holder_diagnostic`` carries the lock-holder sidecar's rendered line
-    (iowarp/clio-relay#202) when one is available, structurally -- not just
-    baked into the message string -- so a caller that re-wraps this
-    exception (e.g. ``bootstrap_invocation_lock``) can compose its own
-    message without re-parsing prose out of ``str(exc)``. It is ``None``
-    when this exception was not raised from a bounded-timeout path (e.g.
-    the ``storage_runtime`` reacquire wrapper, which authors its own
-    message from a caught instance of this type).
+    (iowarp/clio-relay#202) structurally -- not just baked into the message
+    string -- so a caller that catches and re-raises this exception can
+    thread the SAME diagnostic into its own message instead of dropping it.
+    Both current re-raise sites do exactly that:
+    ``storage_runtime.initialize_queue_with_shared_writer_fencing`` (the
+    seal-handoff reacquire wrapper) and
+    ``bootstrap_reconcile_locks.bootstrap_invocation_lock`` (which wraps
+    this into a ``ConfigurationError`` and must carry the diagnostic across
+    that boundary by hand, since ``ConfigurationError`` itself has no such
+    attribute). ``holder_diagnostic`` defaults to ``None`` only so a
+    construction with no known diagnostic (a future caller, or a test)
+    remains valid -- every raise site in THIS module always supplies one.
     """
 
     def __init__(self, message: str, *, holder_diagnostic: str | None = None) -> None:
@@ -325,6 +330,14 @@ class WorkerLifetimeLock:
                     lock_path=lock_path,
                 )
         except BaseException:
+            # A successful OS-level acquire always writes the holder entry
+            # BEFORE returning (lock_holder_sidecar.write_lock_holder_sidecar),
+            # so an exception reaching here after that point (e.g. an async
+            # KeyboardInterrupt landing between the acquire call and this
+            # frame) must not leave a false "this pid holds it" entry behind
+            # for a lock this object is about to release via os.close
+            # (clio-relay#202 D8).
+            remove_lock_holder_sidecar(lock_path)
             os.close(fd)
             raise
         self._fd = fd
@@ -443,6 +456,7 @@ def _acquire_posix_lock(
     exclusive: bool,
     timeout_seconds: float | None,
     lock_path: Path,
+    record_holder: bool = True,
 ) -> None:
     try:
         fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
@@ -451,13 +465,15 @@ def _acquire_posix_lock(
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     if timeout_seconds is None:
         fcntl.flock(fd, operation)
-        write_lock_holder_sidecar(lock_path)
+        if record_holder:
+            write_lock_holder_sidecar(lock_path)
         return
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             fcntl.flock(fd, operation | fcntl.LOCK_NB)
-            write_lock_holder_sidecar(lock_path)
+            if record_holder:
+                write_lock_holder_sidecar(lock_path)
             return
         except OSError as exc:
             if exc.errno not in {errno.EACCES, errno.EAGAIN}:
@@ -644,15 +660,20 @@ def _validate_and_acquire_inherited_migration_guard(
 ) -> LockedCoreIdentity:
     """Validate and acquire EX on bootstrap's exact inherited lock descriptor.
 
-    A successful acquisition here writes the lock-holder sidecar like every
-    other acquisition path (iowarp/clio-relay#202), but there is no matching
-    Python-level release: the inherited descriptor's unlock is owned by the
-    bootstrap shell (``bootstrap_release_worker_lifetime_guard`` in
-    ``bootstrap_worker_fence_script.py``), never by this process. The
-    sidecar is left to age into a correctly-diagnosed "stale holder" once
-    that shell exits and releases the fd, or to be overwritten by the next
-    acquirer -- both are within the sidecar's documented best-effort
-    contract, not a leak this function needs to compensate for.
+    Deliberately does NOT write a lock-holder entry (clio-relay#202 D6).
+    The OS-level flock is held by the underlying open-file description,
+    which the bootstrap SHELL retains independently after this Python
+    process exits (see the "Do not unlock or close the inherited
+    descriptor" comment on ``exclusive_migration_lifetime`` below) --
+    there is no matching Python-level release here, ever. Recording THIS
+    process's pid would attribute the hold to an entity that, once this
+    process exits, is no longer the one actually holding it: a later
+    reader would see a "dead" pid and render "stale... may be orphaned"
+    for a lock the shell still legitimately holds -- exactly the false
+    orphan verdict clio-relay#202's own review caught elsewhere. Writing
+    nothing is the honest choice: a later reader sees "no holder record"
+    for THIS acquisition, which is a true statement about what this path
+    chooses to record, not a false claim about liveness.
     """
     current_uid = _current_uid()
     if os.name != "posix" or current_uid is None:
@@ -706,6 +727,7 @@ def _validate_and_acquire_inherited_migration_guard(
         exclusive=True,
         timeout_seconds=timeout_seconds,
         lock_path=lock_path,
+        record_holder=False,
     )
     return _locked_core_identity(
         logical_filesystem_path(canonical_core),
