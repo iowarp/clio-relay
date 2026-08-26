@@ -627,9 +627,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # cap so this decomposition cannot silently re-accrete.
     # Campaign merge: values are the MEASURED merged-tree counts.
     "src/clio_relay/door_error_adapters.py": 170,
-    # Pattern-triggered observation adds two typed refusal reasons to the
-    # frozen door registry; the measured post-change owner count is 744.
-    "src/clio_relay/door_errors.py": 744,
+    # door_errors.py: clio-relay#221/#259 (D3/D5) added two typed SSE
+    # refusal reasons taking the file 744 -> 750 -- still 50 under the
+    # DEFAULT_MAX_LINES cap, so per ground rule 5 its baseline entry is
+    # REMOVED rather than raised (the gate's own advisory; an entry at 750
+    # would pin the file to zero self-imposed headroom for no reason).
     # #231 R6 review fixes: +9 net lines -- F4, `_write_recovered_jarvis_
     # run_result`'s `recovered_document` now nulls `stdout_truncation`/
     # `stderr_truncation` alongside the blanked `stdout`/`stderr`, instead
@@ -1801,7 +1803,21 @@ RATCHET_BASELINE: dict[str, int] = {
     # LogStreamName). Adds append_console_stderr for symmetry with
     # append_console, and one more file in initialize()'s created-file list.
     # A justified, minimal ratchet-up: 1000 -> 1023.
-    "src/clio_relay/spool.py": 1023,
+    # clio-relay#221/#259 adversarial review (D9/D5): read_log now delegates
+    # its file I/O to the new read_log_bytes (a caller decoding across a
+    # stateful incremental UTF-8 decoder -- the SSE follow loop -- must read
+    # raw bytes, since read_log's own per-call errors="replace" decode
+    # mangles any multi-byte character straddling two read-boundary offsets
+    # into two replacement characters instead of one correct one), plus the
+    # new log_size helper (lets a caller distinguish a genuinely-at-EOF
+    # resume offset from one already past the stream's current size, which
+    # read_log/read_log_bytes cannot tell apart on their own). Plus (D12)
+    # CONSOLE_OBSERVE_TAIL_LIMIT_BYTES, the smaller per-stream fetch cap
+    # relay_observe's default log view now applies to console/console_stderr
+    # (mcp_job_lifecycle.py/mcp_remote_transport.py), so both owners share
+    # one constant instead of each defining their own. A justified, minimal
+    # ratchet-up: 1023 -> 1070.
+    "src/clio_relay/spool.py": 1070,
     # split/storage-policy-w2: storage_policy.py's own ratchet-baseline entry
     # (1826) is removed here. The wire types/limits/error vocabulary moved to
     # storage_policy_types.py (280 lines), the ledger content codec to

@@ -51,6 +51,7 @@ from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.remote_connection import (
     DEFAULT_OWNED_SESSION_API_PORT,
+    LogStreamChunk,
     RemoteConnection,
     RemoteConnectionRegistry,
     resolve_remote_api_port,
@@ -62,13 +63,36 @@ OWNER_TOKEN = "owner-token"
 
 
 class _Response:
-    def __init__(self, document: object, *, status: int = 200) -> None:
-        self._payload = json.dumps(document).encode("utf-8")
+    def __init__(
+        self,
+        document: object | None = None,
+        *,
+        status: int = 200,
+        sse_lines: list[bytes] | None = None,
+    ) -> None:
+        """One fake ``http.client.HTTPResponse``.
+
+        ``sse_lines`` (clio-relay#221/#259) opts a response into the
+        streaming ``readline()`` shape :func:`clio_relay.
+        remote_connection_stream_io._stream_sse_frames_on_stream` reads
+        instead of the whole-body ``read()`` every other canned response
+        here uses -- each element is one already-terminated line
+        (``http.client.HTTPResponse.readline()``'s own return shape), and
+        ``readline()`` returns ``b""`` once exhausted, matching a real
+        response body reaching EOF.
+        """
+        self._payload = b"" if sse_lines is not None else json.dumps(document).encode("utf-8")
         self.status = status
         self.will_close = False
+        self._sse_lines = list(sse_lines) if sse_lines is not None else None
 
     def read(self, _amount: int) -> bytes:
         return self._payload
+
+    def readline(self, _limit: int = -1) -> bytes:
+        if not self._sse_lines:
+            return b""
+        return self._sse_lines.pop(0)
 
 
 class _Socket:
@@ -115,7 +139,11 @@ class _Stream:
         # Keyed on the path alone (query string stripped): GET /queue is the
         # first caller in this harness to send query parameters, and a fixed
         # canned response per endpoint is simpler than matching them exactly.
-        return _Response(self.harness.responses.get(path.split("?", 1)[0], {"ok": True}))
+        stripped_path = path.split("?", 1)[0]
+        sse_lines = self.harness.sse_responses.get(stripped_path)
+        if sse_lines is not None:
+            return _Response(sse_lines=list(sse_lines))
+        return _Response(self.harness.responses.get(stripped_path, {"ok": True}))
 
     def close(self) -> None:
         self.closed = True
@@ -186,6 +214,12 @@ class _Harness:
         self.streams: list[_Stream] = []
         self.requests: list[dict[str, object]] = []
         self.responses: dict[str, object] = {}
+        # clio-relay#221/#259: a SEPARATE table from `responses` above --
+        # keyed the same way (path, query stripped), but a hit here opts
+        # `_Stream.getresponse()` into the streaming `readline()` shape
+        # instead of the whole-body canned JSON document every other
+        # operation in this harness uses.
+        self.sse_responses: dict[str, list[bytes]] = {}
         self.registry = RemoteConnectionRegistry()
         self.dialing_cluster = "ares"
 
@@ -469,6 +503,136 @@ def test_reestablished_channel_serves_operations_without_further_dials(
         connection.request_json(method="GET", path=f"/jobs/job_{index}/status")
 
     assert harness.dials == 2
+
+
+def test_stream_log_chunks_reads_over_the_held_channel_with_no_extra_dial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 client half: ``RemoteConnection.stream_log_chunks``
+    rides the exact SAME held channel every other owned-session operation
+    does -- proven the same way this whole file proves it for
+    ``request_json`` (``harness.dials`` unchanged), plus the decoded chunk/
+    end shape a caller actually gets."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"id: 5\n",
+        b"event: log_chunk\n",
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
+        b"\n",
+        b"event: end\n",
+        b'data: {"job_id": "job_1", "stream": "console", "state": "succeeded", '
+        b'"offset": 5, "next_offset": 5}\n',
+        b"\n",
+    ]
+
+    chunks = list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
+
+    assert harness.dials == 1
+    assert len(chunks) == 2
+    assert chunks[0] == LogStreamChunk(
+        job_id="job_1", stream="console", text="hello", offset=5, end=False
+    )
+    assert chunks[1] == LogStreamChunk(
+        job_id="job_1", stream="console", text="", offset=5, end=True, state="succeeded"
+    )
+    request = harness.requests[-1]
+    assert request["method"] == "GET"
+    assert cast(str, request["path"]).startswith("/jobs/job_1/logs/console/sse?")
+    assert cast(dict[str, str], request["headers"])["Accept"] == "text/event-stream"
+
+
+def test_stream_log_chunks_surfaces_channel_dropped_mid_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259: the peer closing the body before an ``end`` frame
+    is a drop, not a clean finish -- surfaced as the SAME typed
+    ``ChannelDropped`` a dead channel raises everywhere else on this
+    connection, and never silently retried under a second stream."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"id: 5\n",
+        b"event: log_chunk\n",
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
+        b"\n",
+        # No `end` frame -- the canned body simply runs out here, simulating
+        # the peer closing the connection mid-stream.
+    ]
+
+    chunks: list[LogStreamChunk] = []
+    with pytest.raises(ChannelDropped, match="closed unexpectedly"):
+        for chunk in connection.stream_log_chunks(job_id="job_1", stream_name="console"):
+            chunks.append(chunk)
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "hello"
+    assert harness.dials == 1
+
+
+def test_stream_log_chunks_skips_unrecognized_event_type_and_keeps_going(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D10): an SSE event type this
+    client does not recognize is logged and SKIPPED -- never a hard
+    failure that would retroactively break every already-deployed client
+    the moment the server adds a new event kind to this route's
+    vocabulary. Subsequent, recognized frames still arrive normally."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"event: future_kind\n",
+        b'data: {"something": "this client has never heard of"}\n',
+        b"\n",
+        b"id: 5\n",
+        b"event: log_chunk\n",
+        b'data: {"job_id": "job_1", "stream": "console", "chunk": "hello", '
+        b'"offset": 0, "next_offset": 5}\n',
+        b"\n",
+        b"event: end\n",
+        b'data: {"job_id": "job_1", "stream": "console", "state": "succeeded", '
+        b'"offset": 5, "next_offset": 5}\n',
+        b"\n",
+    ]
+
+    chunks = list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
+
+    assert len(chunks) == 2
+    assert chunks[0].text == "hello"
+    assert chunks[1].end is True
+
+
+def test_stream_log_chunks_rejects_unterminated_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clio-relay#221/#259 adversarial review (D8): a line that reaches its
+    byte cap without a ``\\n`` terminator is a typed refusal, never
+    silently truncated or read forever."""
+    harness = _install(monkeypatch, _Harness())
+    connection = _connect(tmp_path, harness)
+    from clio_relay.remote_connection_stream_io import MAX_SESSION_API_RESPONSE_BYTES
+
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"x" * MAX_SESSION_API_RESPONSE_BYTES,
+    ]
+
+    with pytest.raises(RelayError, match="terminator"):
+        list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
+
+    # Residual 4: a SHORT unterminated line is the body ending mid-line --
+    # a drop, never a misleading size message.
+    harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
+        b"this short line never ends with a newline",
+    ]
+
+    with pytest.raises(ChannelDropped, match="mid-line"):
+        list(connection.stream_log_chunks(job_id="job_1", stream_name="console", offset=0))
 
 
 def test_broken_http_stream_is_reproven_over_the_same_channel_without_a_new_dial(

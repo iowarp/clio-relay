@@ -162,7 +162,7 @@ class _FrpChannelTransport:
         # Carried for interface parity with SshForwardTransport and a later
         # multiplexed stream-channel slice; the authoritative cross-check against
         # the remote relay's own report happens in
-        # RemoteConnection._verify_bootstrap, not here.
+        # remote_connection_registry.verify_bootstrap, not here.
         self._remote_api_port = remote_api_port
         self._api_token = api_token
         self._identity_anchor: IdentityAnchor = identity_anchor

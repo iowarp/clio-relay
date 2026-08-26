@@ -78,7 +78,24 @@ JARVIS_ROOT_ENV = "JARVIS_ROOT"
 DEFAULT_JARVIS_ROOT_DIRNAME = ".ppi-jarvis"
 
 CONSOLE_TAIL_CHUNK_BYTES = MAX_LOG_READ_BYTES
-CONSOLE_TAIL_MIN_POLL_INTERVAL_SECONDS = 2.0
+#: clio-relay#221/#259 adversarial review (capture-side floor): the live
+#: acceptance target is end-to-end console latency <= 2s. Before this fix
+#: the capture-side tailer's own 2.0s floor, stacked with the SSE push
+#: loop's 0.15s follow interval, put the lane at ~2.15s -- already over
+#: budget before counting the door/queue hop. Tightened to a fixed 0.25s
+#: (0.25 + 0.15 = 0.4s, comfortably under 2s), NOT an adaptive
+#: tight-while-busy/back-off-when-idle design: :class:`ConsoleLiveTailer`
+#: is only ever driven during a job's RUNNING phase in the first place
+#: (its own docstring -- once terminal, :func:`flush_terminal_console`
+#: takes over and this class's poll loop is no longer ticked at all), and
+#: :meth:`ConsoleLiveTailer.poll`/:meth:`poll_stderr` are already
+#: self-throttled BELOW whatever cadence the job's own subprocess-poll
+#: loop calls them at (that class's own docstring: "every tick is fine").
+#: A fixed floor is therefore already bounded by the caller's tick rate --
+#: an adaptive backoff would add real state-machine complexity (tracking
+#: "was the last poll a no-op", avoiding oscillation) for savings the
+#: caller-side throttle already provides, so it is not worth it here.
+CONSOLE_TAIL_MIN_POLL_INTERVAL_SECONDS = 0.25
 
 
 class ConsoleTailUnavailable(RuntimeError):

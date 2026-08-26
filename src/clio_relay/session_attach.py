@@ -9,7 +9,7 @@ proves ownership on every bring-up, by running ``session recovery-status`` +
 ``session challenge-owned`` over the same held forward
 (:func:`clio_relay.control_channel.owned_session_channel_bootstrap_script`)
 and cross-checking the result against the exact session/generation this
-connection is pinned to (``RemoteConnection._verify_bootstrap``). Attaching
+connection is pinned to (``remote_connection_registry.verify_bootstrap``). Attaching
 is therefore exactly the ordinary connection bring-up path, reached with the
 identity resolved from the durable record instead of a session the caller
 already had open in this process.

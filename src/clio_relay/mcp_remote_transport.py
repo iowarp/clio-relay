@@ -34,6 +34,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.session_api import OwnedSessionApiClient
+from clio_relay.spool import CONSOLE_OBSERVE_TAIL_LIMIT_BYTES, LOG_STREAM_NAMES
 
 JSON = dict[str, Any]
 
@@ -315,13 +316,47 @@ def _owned_job_logs(
     *,
     limit: int,
 ) -> JSON:
+    """Return the current log page for every stream an owned-session job can carry.
+
+    clio-relay#221/#259: includes ``console``/``console_stderr`` alongside
+    ``stdout``/``stderr`` -- the owned-session HTTP door already serves all
+    four identically (``GET /jobs/{id}/logs/{stream}``), so a
+    ``jarvis_run`` mcp_call job dispatched to a remote cluster via an owned
+    session is just as visible mid-run as a local one (`_job_logs`,
+    mcp_job_lifecycle.py). Deliberately NOT mirrored onto `_remote_job_logs`
+    below: that path shells out to the remote ``clio-relay job read-log``
+    CLI, whose ``--stream`` option still rejects anything but
+    stdout/stderr (cli_job_records.py) -- extending its stream set here
+    without first fixing that command would either error loudly for a
+    legacy direct-SSH deployment or, worse, silently mislabel data. So the
+    default ``relay_observe`` log view is asymmetric by design: 4 keys for
+    a local job, 4 keys for an owned-session remote job (this function),
+    but only the original 2 (stdout/stderr) for a legacy direct-SSH remote
+    job -- and pattern-scoped observation (``until_pattern``) still only
+    ever scans stdout/stderr everywhere, deferred generalization per #259's
+    own scope note.
+
+    Adversarial review (D12): console/console_stderr are capped at
+    :data:`~clio_relay.spool.CONSOLE_OBSERVE_TAIL_LIMIT_BYTES` regardless of
+    the caller's own ``limit`` (mirrors `_job_logs`'s identical cap) -- 4
+    owned-session HTTP requests per poll is already the cost of this view;
+    two of them should not also carry a full 32-128 KiB payload nobody
+    asked to read in depth.
+    """
     return {
         stream: _owned_json(
             client,
             method="GET",
             path=f"/jobs/{job_id}/logs/{stream}",
-            query={"offset": 0, "limit": limit},
+            query={
+                "offset": 0,
+                "limit": (
+                    limit
+                    if stream in ("stdout", "stderr")
+                    else min(limit, CONSOLE_OBSERVE_TAIL_LIMIT_BYTES)
+                ),
+            },
             label=f"owned remote {stream} log",
         )
-        for stream in ("stdout", "stderr")
+        for stream in LOG_STREAM_NAMES
     }

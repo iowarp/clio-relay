@@ -62,7 +62,17 @@ def register_session_routes(
 
     @app.get("/healthz")
     def healthz() -> dict[str, object]:
-        return {"ok": True, "auth": ctx.resolved.api_token is not None}
+        # clio-relay#221/#259: negotiation, never timing (house rule) -- a
+        # client decides whether to open the SSE log-tail route or fall back
+        # to polling the byte-range route by reading this flag, not by
+        # probing/timing the SSE route itself. Always True: it names a
+        # code-level capability this build ships, not an environment-
+        # dependent condition, so it never varies by request.
+        return {
+            "ok": True,
+            "auth": ctx.resolved.api_token is not None,
+            "console_sse": True,
+        }
 
     @app.get("/session-identity")
     def session_identity(nonce: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")]) -> dict[str, str]:

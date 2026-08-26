@@ -19,10 +19,11 @@ identical for FastAPI/Starlette route matching.
 
 from __future__ import annotations
 
+import math
 from typing import Annotated
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Query
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from clio_relay import door_error_adapters, door_errors
 from clio_relay.bounded_payload import describe_delivery_refusal, is_delivery_refusal
@@ -30,12 +31,17 @@ from clio_relay.errors import NotFoundError, RelayError
 from clio_relay.http_api_context import RelayApiContext
 from clio_relay.http_api_models import ProgressUpdateRequest
 from clio_relay.http_api_redaction import _public_model_page, _public_payload, _public_record
+from clio_relay.http_api_streaming import (
+    LOG_SSE_FOLLOW_POLL_SECONDS,
+    LOG_SSE_MAX_POLL_SECONDS,
+    _log_tail_sse_events,
+)
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.models import ProgressRecord
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.progress_provenance import external_progress_metadata
 from clio_relay.relay_ops import read_artifact_bytes, read_job_log
-from clio_relay.spool import LOG_STREAM_NAMES
+from clio_relay.spool import LOG_STREAM_NAMES, JobSpool
 
 
 def register_artifact_routes(
@@ -73,6 +79,95 @@ def register_artifact_routes(
             )
         except NotFoundError as exc:
             raise door_errors.http_problem("job_not_found", exc=exc) from exc
+
+    @app.get("/jobs/{job_id}/logs/{stream_name}/sse", dependencies=[auth_dependency])
+    def get_log_sse(
+        job_id: DurableRecordId,
+        stream_name: str,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        poll_seconds: float = LOG_SSE_FOLLOW_POLL_SECONDS,
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    ) -> StreamingResponse:
+        """Stream a job log as Server-Sent Events from a byte offset.
+
+        clio-relay#221/#259 live-console lane: the push-side sibling of
+        ``GET /jobs/{job_id}/logs/{stream_name}`` immediately above -- same
+        auth (``dependencies=[auth_dependency]``), same owned-job admission
+        (``ctx.require_owned_job``), and the exact same typed refusal
+        vocabulary (``log_stream_invalid`` for an unknown stream,
+        ``job_not_found`` for a job this session cannot see or that does not
+        exist) -- so a client that already handles the byte-range route's
+        errors needs nothing new to handle this one's. Rides the caller's
+        already-open connection to the door; it opens no ssh dial or
+        transport of its own.
+
+        clio-relay#221/#259 adversarial review: ``Last-Event-ID`` (D3), when
+        present and a parseable non-negative integer, is preferred over
+        ``?offset=`` -- a spec-compliant client's own automatic-reconnect
+        resume value, which was previously accepted but silently ignored
+        (restarting at 0 and re-delivering already-seen bytes). A caller-
+        supplied offset already past the stream's CURRENT size at request
+        time is refused rather than silently affirmed with a clean ``end``
+        as if the offset had been valid (D5). ``poll_seconds`` is guarded
+        against non-finite/non-positive/pathologically-large values (D6),
+        reusing the same shape ``RemoteConnection.request_json``
+        (remote_connection.py) already uses for its own timeout guard.
+        """
+        if (
+            not math.isfinite(poll_seconds)
+            or poll_seconds <= 0
+            or poll_seconds > LOG_SSE_MAX_POLL_SECONDS
+        ):
+            raise door_errors.http_problem(
+                "poll_interval_invalid",
+                message=(
+                    f"poll_seconds must be positive, finite, and at most {LOG_SSE_MAX_POLL_SECONDS}"
+                ),
+            )
+        if stream_name not in LOG_STREAM_NAMES:
+            raise door_errors.http_problem(
+                "log_stream_invalid",
+                message=f"stream must be one of: {', '.join(LOG_STREAM_NAMES)}",
+            )
+        effective_offset = offset
+        if last_event_id is not None:
+            try:
+                parsed_last_event_id = int(last_event_id)
+            except ValueError:
+                parsed_last_event_id = -1
+            if parsed_last_event_id < 0:
+                raise door_errors.http_problem(
+                    "log_offset_invalid",
+                    message="Last-Event-ID must be a non-negative integer byte offset",
+                )
+            effective_offset = parsed_last_event_id
+        try:
+            job = ctx.require_owned_job(job_id)
+        except NotFoundError as exc:
+            raise door_errors.http_problem("job_not_found", exc=exc) from exc
+        # pyright narrows str -> LogStreamName from the `not in
+        # LOG_STREAM_NAMES` guard above, matching `get_log`'s own narrowing
+        # comment -- no cast needed.
+        current_size = JobSpool(ctx.resolved.spool_dir, job).log_size(stream_name)
+        if effective_offset > current_size:
+            raise door_errors.http_problem(
+                "log_offset_beyond_eof",
+                message=(
+                    f"offset {effective_offset} is past the current {stream_name} "
+                    f"size ({current_size} bytes)"
+                ),
+            )
+        return StreamingResponse(
+            _log_tail_sse_events(
+                ctx.resolved,
+                ctx.queue,
+                job_id,
+                stream_name=stream_name,
+                offset=effective_offset,
+                poll_seconds=poll_seconds,
+            ),
+            media_type="text/event-stream",
+        )
 
     @app.get(
         "/jobs/{job_id}/artifacts",

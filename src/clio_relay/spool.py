@@ -44,6 +44,18 @@ ARTIFACT_OWNERSHIP_SCHEMA = "clio-relay.owned-artifact.v1"
 LogStreamName = Literal["stdout", "stderr", "console", "console_stderr"]
 LOG_STREAM_NAMES: tuple[LogStreamName, ...] = ("stdout", "stderr", "console", "console_stderr")
 
+#: clio-relay#221/#259 adversarial review (D12): ``relay_observe``'s
+#: default (non-``until_pattern``) log view fetches all four streams --
+#: console/console_stderr exist only for "output exists mid-run"
+#: visibility there, never full-content review (the SSE log-tail route is
+#: the live-console lane's actual content surface), so they are capped at
+#: this smaller tail regardless of the caller's own requested ``limit`` --
+#: mirroring the agent-side observation cap
+#: (``mcp_tool_catalog_job_lifecycle.MAX_AGENT_LOG_READ_BYTES``'s own
+#: order of magnitude) instead of paying for a full 32-128 KiB fetch on
+#: two streams nobody asked to read in depth. stdout/stderr are unaffected.
+CONSOLE_OBSERVE_TAIL_LIMIT_BYTES = 8_192
+
 
 class _StreamCaptureState(TypedDict):
     observed_bytes: int
@@ -388,7 +400,30 @@ class JobSpool:
         offset: int = 0,
         limit: int = 65536,
     ) -> tuple[str, int, bool]:
-        """Read a byte range from a named log and return text, next offset, and EOF."""
+        """Read a byte range from a named log and return text, next offset, and EOF.
+
+        Per-call ``errors="replace"`` decode -- fine for one-shot callers,
+        but a caller reading the SAME stream repeatedly at advancing offsets
+        (clio-relay#221's SSE follow loop) must use :meth:`read_log_bytes`
+        plus a held ``codecs`` incremental decoder instead, or a multi-byte
+        character straddling two reads gets mangled into two replacements.
+        """
+        chunk, next_offset, eof = self.read_log_bytes(stream_name, offset=offset, limit=limit)
+        return chunk.decode("utf-8", errors="replace"), next_offset, eof
+
+    def read_log_bytes(
+        self,
+        stream_name: LogStreamName,
+        *,
+        offset: int = 0,
+        limit: int = 65536,
+    ) -> tuple[bytes, int, bool]:
+        """Read a byte range and return raw bytes, next offset, and EOF.
+
+        clio-relay#221/#259: :meth:`read_log`'s byte-returning sibling (it
+        delegates its own I/O here) for a caller decoding across a stateful
+        incremental decoder instead of a per-call lossy one.
+        """
         if offset < 0:
             raise ValueError("offset must be non-negative")
         if limit <= 0:
@@ -397,13 +432,25 @@ class JobSpool:
             raise ValueError(f"limit cannot exceed {MAX_LOG_READ_BYTES} bytes")
         path = self._storage_path / f"{stream_name}.log"
         if not path.exists():
-            return "", offset, True
+            return b"", offset, True
         with _open_owned_log(path, mode="rb") as stream:
             size = os.fstat(stream.fileno()).st_size
             stream.seek(offset)
             chunk = stream.read(limit)
         next_offset = offset + len(chunk)
-        return chunk.decode("utf-8", errors="replace"), next_offset, next_offset >= size
+        return chunk, next_offset, next_offset >= size
+
+    def log_size(self, stream_name: LogStreamName) -> int:
+        """Return one log stream's CURRENT byte size, 0 if never written.
+
+        clio-relay#221/#259 (D5): distinguishes a genuinely-at-EOF resume
+        offset from one PAST the stream's current size -- :meth:`read_log`
+        cannot tell the two apart (both read back empty with ``eof=True``).
+        """
+        path = self._storage_path / f"{stream_name}.log"
+        if not path.exists():
+            return 0
+        return _owned_log_size(path)
 
     def artifact_for(self, path: Path, *, kind: str) -> ArtifactRef:
         """Build an artifact reference for a spool-backed path."""

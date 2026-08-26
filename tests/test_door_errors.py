@@ -87,6 +87,8 @@ _EXPECTED_REASONS = frozenset(
         "observation_pattern_invalid",
         "observation_pattern_unsafe",
         "log_stream_invalid",
+        "log_offset_invalid",
+        "log_offset_beyond_eof",
         "authentication_required",
         "resource_ownership_refused",
         "session_scope_refused",
@@ -146,7 +148,16 @@ _EXPECTED_REASONS = frozenset(
 )
 
 _EXPECTED_R9_HTTP_STATUSES = {
-    **dict.fromkeys({"http_request_malformed", "poll_interval_invalid", "log_stream_invalid"}, 400),
+    **dict.fromkeys(
+        {
+            "http_request_malformed",
+            "poll_interval_invalid",
+            "log_stream_invalid",
+            "log_offset_invalid",
+            "log_offset_beyond_eof",
+        },
+        400,
+    ),
     "authentication_required": 401,
     **dict.fromkeys({"resource_ownership_refused", "session_scope_refused"}, 403),
     **dict.fromkeys(
@@ -220,7 +231,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 73
+    assert len(door_errors.REASONS) == 75
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -229,7 +240,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 58
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 60
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -981,13 +992,19 @@ def _http_api_split_sources() -> list[tuple[str, str]]:
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 107 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_127_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 112 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
     unsplit unit (clio-relay#231), so its three refusal-counting functions
     still all live in the one file the pre-split test already walked.
+
+    112 (was 107): clio-relay#221/#259's SSE log-tail route
+    (http_api_routes_artifacts.py) adds 5 sites across its two commits --
+    poll_interval_invalid, log_stream_invalid, job_not_found (the route
+    itself), plus log_offset_invalid and log_offset_beyond_eof (the
+    adversarial-review D3/D5 fixes).
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1011,7 +1028,7 @@ def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 107
+    assert len(calls) == 112
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1051,7 +1068,7 @@ def test_http_api_rewrites_exactly_122_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 122
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 127
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1084,7 +1101,7 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_57_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
@@ -1094,8 +1111,9 @@ def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None
     conflict/mismatch detail PLUS an authored what-to-do-next tail (the
     conflicting idempotency_key and the retry-with-a-new-key move; the
     refresh-discovery move), so they now pass an explicit, reviewed
-    ``message=`` instead of relying on the generic reason title. The
-    remaining 56 keep the closed-set discipline this test proves.
+    ``message=`` instead of relying on the generic reason title. 56 (now 57
+    with clio-relay#221/#259's ``get_log_sse`` -> ``job_not_found`` site)
+    keep the closed-set discipline this test proves.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1110,7 +1128,7 @@ def test_all_56_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 56
+    assert len(calls) == 57
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])
