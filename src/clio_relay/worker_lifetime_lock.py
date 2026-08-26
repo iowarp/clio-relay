@@ -21,6 +21,11 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
+from clio_relay.lock_holder_sidecar import (
+    describe_lock_holder,
+    remove_lock_holder_sidecar,
+    write_lock_holder_sidecar,
+)
 
 WORKER_LIFETIME_LOCK_NAME = ".clio-relay-worker-lifetime.lock"
 WORKER_LIFETIME_GUARD_FD_ENV = "CLIO_RELAY_WORKER_LIFETIME_GUARD_FD"
@@ -82,7 +87,22 @@ class _WindowsOverlapped(ctypes.Structure):
 
 
 class WorkerLifetimeLockUnavailable(ConfigurationError):
-    """The lifetime lock is healthy but incompatible ownership is active."""
+    """The lifetime lock is healthy but incompatible ownership is active.
+
+    ``holder_diagnostic`` carries the lock-holder sidecar's rendered line
+    (iowarp/clio-relay#202) when one is available, structurally -- not just
+    baked into the message string -- so a caller that re-wraps this
+    exception (e.g. ``bootstrap_invocation_lock``) can compose its own
+    message without re-parsing prose out of ``str(exc)``. It is ``None``
+    when this exception was not raised from a bounded-timeout path (e.g.
+    the ``storage_runtime`` reacquire wrapper, which authors its own
+    message from a caught instance of this type).
+    """
+
+    def __init__(self, message: str, *, holder_diagnostic: str | None = None) -> None:
+        self.holder_diagnostic = holder_diagnostic
+        full_message = message if holder_diagnostic is None else f"{message}; {holder_diagnostic}"
+        super().__init__(full_message)
 
 
 @dataclass
@@ -287,12 +307,14 @@ class WorkerLifetimeLock:
             self.core_dir,
             lock_name=self.lock_name,
         )
+        lock_path = canonical_core / self.lock_name
         try:
             if os.name == "nt":
                 overlapped = _acquire_windows_lock(
                     fd,
                     exclusive=self.mode == "exclusive",
                     timeout_seconds=effective_timeout,
+                    lock_path=lock_path,
                 )
                 self._windows_overlapped = overlapped
             else:
@@ -300,6 +322,7 @@ class WorkerLifetimeLock:
                     fd,
                     exclusive=self.mode == "exclusive",
                     timeout_seconds=effective_timeout,
+                    lock_path=lock_path,
                 )
         except BaseException:
             os.close(fd)
@@ -323,6 +346,7 @@ class WorkerLifetimeLock:
         finally:
             self._windows_overlapped = None
             os.close(fd)
+            remove_lock_holder_sidecar(self.path)
 
     def __enter__(self) -> WorkerLifetimeLock:
         """Acquire this lock for a context-managed lifetime."""
@@ -418,6 +442,7 @@ def _acquire_posix_lock(
     *,
     exclusive: bool,
     timeout_seconds: float | None,
+    lock_path: Path,
 ) -> None:
     try:
         fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
@@ -426,18 +451,21 @@ def _acquire_posix_lock(
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     if timeout_seconds is None:
         fcntl.flock(fd, operation)
+        write_lock_holder_sidecar(lock_path)
         return
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             fcntl.flock(fd, operation | fcntl.LOCK_NB)
+            write_lock_holder_sidecar(lock_path)
             return
         except OSError as exc:
             if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                 raise ConfigurationError(f"cannot acquire worker lifetime lock: {exc}") from exc
             if time.monotonic() >= deadline:
                 raise WorkerLifetimeLockUnavailable(
-                    "timed out acquiring worker lifetime lock"
+                    "timed out acquiring worker lifetime lock",
+                    holder_diagnostic=describe_lock_holder(lock_path),
                 ) from exc
             time.sleep(min(_LOCK_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
 
@@ -453,6 +481,7 @@ def _acquire_windows_lock(
     *,
     exclusive: bool,
     timeout_seconds: float | None,
+    lock_path: Path,
 ) -> _WindowsOverlapped:
     import msvcrt
     from ctypes import wintypes
@@ -487,18 +516,23 @@ def _acquire_windows_lock(
         if not lock_file_ex(handle, exclusive_flag, 0, 1, 0, ctypes.byref(overlapped)):
             error = get_last_error()
             raise ConfigurationError(f"cannot acquire worker lifetime lock: WinError {error}")
+        write_lock_holder_sidecar(lock_path)
         return overlapped
 
     deadline = time.monotonic() + timeout_seconds
     while True:
         flags = exclusive_flag | 0x00000001
         if lock_file_ex(handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
+            write_lock_holder_sidecar(lock_path)
             return overlapped
         error = get_last_error()
         if error != 33:
             raise ConfigurationError(f"cannot acquire worker lifetime lock: WinError {error}")
         if time.monotonic() >= deadline:
-            raise WorkerLifetimeLockUnavailable("timed out acquiring worker lifetime lock")
+            raise WorkerLifetimeLockUnavailable(
+                "timed out acquiring worker lifetime lock",
+                holder_diagnostic=describe_lock_holder(lock_path),
+            )
         time.sleep(min(_LOCK_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
@@ -608,7 +642,18 @@ def _validate_and_acquire_inherited_migration_guard(
     guard_fd: str,
     timeout_seconds: float,
 ) -> LockedCoreIdentity:
-    """Validate and acquire EX on bootstrap's exact inherited lock descriptor."""
+    """Validate and acquire EX on bootstrap's exact inherited lock descriptor.
+
+    A successful acquisition here writes the lock-holder sidecar like every
+    other acquisition path (iowarp/clio-relay#202), but there is no matching
+    Python-level release: the inherited descriptor's unlock is owned by the
+    bootstrap shell (``bootstrap_release_worker_lifetime_guard`` in
+    ``bootstrap_worker_fence_script.py``), never by this process. The
+    sidecar is left to age into a correctly-diagnosed "stale holder" once
+    that shell exits and releases the fd, or to be overwritten by the next
+    acquirer -- both are within the sidecar's documented best-effort
+    contract, not a leak this function needs to compensate for.
+    """
     current_uid = _current_uid()
     if os.name != "posix" or current_uid is None:
         raise ConfigurationError("inherited worker lifetime guards require POSIX flock")
@@ -660,6 +705,7 @@ def _validate_and_acquire_inherited_migration_guard(
         descriptor,
         exclusive=True,
         timeout_seconds=timeout_seconds,
+        lock_path=lock_path,
     )
     return _locked_core_identity(
         logical_filesystem_path(canonical_core),

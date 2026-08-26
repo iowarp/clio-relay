@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import stat
 import subprocess
@@ -18,7 +20,7 @@ import pytest
 
 import clio_relay.endpoint as endpoint_module
 import clio_relay.storage_runtime as storage_runtime_module
-from clio_relay import queue_legacy_audit, queue_startup, worker_lifetime_lock
+from clio_relay import lock_holder_sidecar, queue_legacy_audit, queue_startup, worker_lifetime_lock
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
@@ -56,6 +58,43 @@ lock.release()
     assert process.stdout is not None
     assert process.stdout.readline().strip() == "ready"
     return process
+
+
+def _start_shared_lock_holder_with_reported_pid(
+    core_dir: Path,
+) -> tuple[subprocess.Popen[str], int]:
+    """Start a real shared-lock-holding child, returning its own self-reported pid.
+
+    Some sandboxed process-launch environments remap the parent-observed
+    ``Popen.pid`` away from the child's real OS pid (verified locally: under
+    this harness's PowerShell sandbox, ``Popen.pid`` and the child's own
+    ``os.getpid()`` are different numbers for the same process). The
+    lock-holder sidecar always records ``os.getpid()`` from the holder's own
+    perspective, so a test asserting the diagnostic names "the real holder"
+    must compare against that same self-reported identity, not ``Popen.pid``.
+    """
+    source = """
+from pathlib import Path
+import os
+import sys
+from clio_relay.worker_lifetime_lock import WorkerLifetimeLock
+
+lock = WorkerLifetimeLock(Path(sys.argv[1]), mode="shared").acquire()
+print(f"ready {os.getpid()}", flush=True)
+sys.stdin.readline()
+lock.release()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", source, str(core_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    ready_line = process.stdout.readline().strip()
+    assert ready_line.startswith("ready ")
+    return process, int(ready_line.split(" ", 1)[1])
 
 
 def _release_lock_holder(process: subprocess.Popen[str]) -> None:
@@ -931,3 +970,146 @@ def test_locked_core_descriptor_failure_is_fail_closed(
                 os.close(replacement)
             with suppress(OSError):
                 os.close(descriptor)
+
+
+# --- Lock-holder sidecar diagnostics (iowarp/clio-relay#202) ---------------
+
+
+def test_lock_holder_sidecar_written_on_acquire_and_removed_on_release(
+    tmp_path: Path,
+) -> None:
+    """A successful acquisition records this process; release erases the record."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared").acquire()
+    sidecar_path = lock_holder_sidecar._sidecar_path(lock.path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert sidecar_path.is_file()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA
+    assert payload["pid"] == os.getpid()
+    assert isinstance(payload["argv_summary"], str)
+    assert isinstance(payload["acquired_at"], str)
+    assert isinstance(payload["hostname"], str)
+
+    lock.release()
+    assert not sidecar_path.exists()
+
+
+def test_timeout_message_names_the_live_cross_process_holder(tmp_path: Path) -> None:
+    """A bounded exclusive timeout names the real child process holding the shared lock."""
+    core_dir = tmp_path / "core"
+    process, holder_pid = _start_shared_lock_holder_with_reported_pid(core_dir)
+    try:
+        with pytest.raises(WorkerLifetimeLockUnavailable) as excinfo:
+            WorkerLifetimeLock(core_dir, mode="exclusive", timeout_seconds=0).acquire()
+        message = str(excinfo.value)
+        assert "timed out acquiring worker lifetime lock" in message
+        assert f"held by pid {holder_pid}" in message
+        assert "since" in message
+        assert "on host" in message
+        assert excinfo.value.holder_diagnostic is not None
+        assert f"held by pid {holder_pid}" in excinfo.value.holder_diagnostic
+    finally:
+        _release_lock_holder(process)
+
+
+def test_stale_holder_pid_is_rendered_as_dead(tmp_path: Path) -> None:
+    """A sidecar naming a pid that has since exited renders as a stale holder."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        # subprocess.run() blocks until the child exits, and the child reports
+        # its OWN os.getpid() -- the pid asserted dead must be a genuine OS pid
+        # a liveness probe can meaningfully evaluate, not Popen.pid: this
+        # sandbox's process launcher remaps Popen.pid away from the child's
+        # real pid (see _start_shared_lock_holder_with_reported_pid above).
+        completed = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.getpid())"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        dead_pid = int(completed.stdout.strip())
+
+        sidecar_path = lock_holder_sidecar._sidecar_path(lock.path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": lock_holder_sidecar.LOCK_HOLDER_SIDECAR_SCHEMA,
+                    "pid": dead_pid,
+                    "argv_summary": "clio-relay api start --port 8796",
+                    "acquired_at": "2026-01-01T00:00:00+00:00",
+                    "hostname": "test-host",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+        assert f"stale holder pid {dead_pid} (dead)" in diagnostic
+        assert "sidecar was not cleaned up" in diagnostic
+        assert "orphaned" in diagnostic
+    finally:
+        lock.release()
+
+
+def test_no_sidecar_is_rendered_as_no_holder_record(tmp_path: Path) -> None:
+    """A lock with no sidecar file explains why no holder is known."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        sidecar_path = lock_holder_sidecar._sidecar_path(lock.path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        assert sidecar_path.is_file()
+        sidecar_path.unlink()
+
+        diagnostic = lock_holder_sidecar.describe_lock_holder(lock.path)
+        assert diagnostic == (
+            "no holder record (lock predates the sidecar or the holder crashed before recording)"
+        )
+    finally:
+        lock.release()
+
+
+def test_corrupt_sidecar_is_rendered_as_unreadable(tmp_path: Path) -> None:
+    """A corrupt or foreign-shaped sidecar cannot crash the diagnostic path."""
+    core_dir = tmp_path / "core"
+    lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        sidecar_path = lock_holder_sidecar._sidecar_path(lock.path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+        sidecar_path.write_text("{not valid json", encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+
+        sidecar_path.write_text(json.dumps({"pid": "not-a-pid"}), encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+
+        sidecar_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        assert lock_holder_sidecar.describe_lock_holder(lock.path) == "holder record unreadable"
+    finally:
+        lock.release()
+
+
+def test_acquisition_survives_an_unwritable_sidecar_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sidecar write failure is a typed log note, never an acquisition failure."""
+    core_dir = tmp_path / "core"
+    unwritable_target = tmp_path / "missing-parent-directory" / "lock.holder.json"
+
+    def _fixed_sidecar_path(_lock_path: Path) -> Path:
+        return unwritable_target
+
+    monkeypatch.setattr(lock_holder_sidecar, "_sidecar_path", _fixed_sidecar_path)
+
+    with caplog.at_level(logging.WARNING, logger="clio_relay.lock_holder_sidecar"):
+        lock = WorkerLifetimeLock(core_dir, mode="shared", timeout_seconds=0).acquire()
+    try:
+        assert lock.acquired is True
+        assert not unwritable_target.parent.exists()
+        assert any(
+            "lock_holder_sidecar_write_failed" in record.message for record in caplog.records
+        )
+    finally:
+        lock.release()

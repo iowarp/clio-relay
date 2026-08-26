@@ -2348,6 +2348,21 @@ def test_bootstrap_invocation_lock_is_private_and_bounded(tmp_path: Path) -> Non
             raise AssertionError("a concurrent bootstrap lock was acquired")
 
 
+def test_bootstrap_invocation_lock_timeout_names_the_holder(tmp_path: Path) -> None:
+    """A bounded bootstrap-lock timeout appends the lock-holder diagnostic (#202)."""
+    with bootstrap_invocation_lock(home=tmp_path, timeout_seconds=1):
+        with (
+            pytest.raises(ConfigurationError) as excinfo,
+            bootstrap_invocation_lock(home=tmp_path, timeout_seconds=0.05),
+        ):
+            raise AssertionError("a concurrent bootstrap lock was acquired")
+        message = str(excinfo.value)
+        assert "timed out acquiring the bootstrap lock" in message
+        assert f"held by pid {os.getpid()}" in message
+        assert "since" in message
+        assert "on host" in message
+
+
 def test_bootstrap_invocation_lock_refuses_redirected_lock_path(tmp_path: Path) -> None:
     with bootstrap_invocation_lock(home=tmp_path, timeout_seconds=1) as lock_path:
         pass
