@@ -74,6 +74,10 @@ from clio_relay.filesystem_paths import (
     internal_filesystem_path,
 )
 from clio_relay.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
+from clio_relay.mcp_call_result_error import (
+    mcp_call_dispatch_failure_detail,
+    mcp_call_dispatch_failure_text,
+)
 from clio_relay.models import (
     JobKind,
     JobState,
@@ -151,6 +155,10 @@ class JobExecutionMixin:
         spool.initialize()
         runtime_spools.append(spool)
         self._check_runtime_storage(job, spool, force_job_scan=True)
+        # clio-relay#162: refuse an empty jarvis_run pipeline before it ever
+        # reaches scheduler submission below.
+        if self._refuse_empty_jarvis_pipeline(job, task=task, spool=spool):
+            return
         endpoint_mcp_call = job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec)
         pipeline_name = None if endpoint_mcp_call else _jarvis_pipeline_name(job)
         configured_scheduler_provider = _configured_scheduler_provider_name(self.scheduler_provider)
@@ -746,6 +754,22 @@ class JobExecutionMixin:
             return
         watch_failure = outcome.watch_failure
         outputs_missing_detail = outcome.outputs_missing
+        # clio-relay#183 residual + #248: none of the three typed reasons
+        # above applied -- e.g. a non-jarvis_run mcp_call (spack_install, a
+        # registered remote-mcp refresh, ...) whose own typed error the
+        # JARVIS-route-scoped refusal detector never reaches, or a dispatch
+        # that left no terminal result document at all (a spawn failure).
+        # Owner logic lives in mcp_call_result_error.py (no headroom here).
+        mcp_dispatch_failure: dict[str, object] | None = None
+        if (
+            endpoint_mcp_call
+            and dispatch_refusal is None
+            and watch_failure is None
+            and outputs_missing_detail is None
+        ):
+            mcp_dispatch_failure = mcp_call_dispatch_failure_detail(
+                self.queue, job, spool=spool, returncode=effective_returncode
+            )
         failure_metadata: dict[str, object] = {"returncode": effective_returncode}
         if dispatch_refusal is not None:
             failure_metadata["jarvis_dispatch_refusal"] = dispatch_refusal.as_payload()
@@ -753,6 +777,8 @@ class JobExecutionMixin:
             failure_metadata["execution_watch_failure"] = watch_failure
         if outputs_missing_detail is not None:
             failure_metadata["execution_outputs_missing"] = outputs_missing_detail
+        if mcp_dispatch_failure is not None:
+            failure_metadata["mcp_dispatch_failure"] = mcp_dispatch_failure
         self.queue.update_task_state(
             task.task_id,
             JobState.FAILED,
@@ -786,6 +812,8 @@ class JobExecutionMixin:
                     execution_watch.execution_outputs_missing_error_text(outputs_missing_detail)
                 )
                 if outputs_missing_detail is not None
+                else bounded_error_detail(mcp_call_dispatch_failure_text(mcp_dispatch_failure))
+                if mcp_dispatch_failure is not None
                 else f"exit code {effective_returncode}"
             ),
         )

@@ -3205,6 +3205,12 @@ def test_virtual_jarvis_progress_is_visible_while_endpoint_job_is_running(
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never answers
+                # it, so the precheck is always INCONCLUSIVE and the
+                # progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -3320,6 +3326,12 @@ def test_virtual_jarvis_progress_rejects_provider_identity_mismatch(
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -3429,6 +3441,12 @@ def test_virtual_jarvis_native_progress_accepts_indeterminate_event_without_adap
         ) -> subprocess.CompletedProcess[str]:
             del command, credential_payload, on_stdout, on_stderr, should_cancel
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the progress behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             assert env is not None
@@ -6038,6 +6056,12 @@ def test_worker_prefers_structured_jarvis_mcp_runtime_metadata(
             del command, env, credential_payload, on_stderr, should_cancel
             del on_poll, timeout_seconds, on_timeout
             assert cwd is not None
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the runtime-metadata behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             if on_start is not None:
                 on_start(700)
             if process_label == "endpoint MCP operation":
@@ -6253,6 +6277,12 @@ def test_worker_native_direct_execution_discards_stdout_scheduler_fallback(
         ) -> subprocess.CompletedProcess[str]:
             del command, env, credential_payload, on_stderr, should_cancel, on_poll
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the runtime behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:
@@ -6409,6 +6439,12 @@ def test_generic_jarvis_named_mcp_result_is_ignored_before_native_validation(
             del command, env, credential_payload, on_stdout, on_stderr
             del should_cancel, on_poll
             del timeout_seconds, on_timeout
+            if process_label == "jarvis pipeline precheck query":
+                # clio-relay#162: every jarvis_run dispatch is preceded by a
+                # pipeline-emptiness precheck query. This fake never
+                # answers it, so the precheck is always INCONCLUSIVE and
+                # the result-handling behavior below is unaffected.
+                return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
             assert process_label == "endpoint MCP operation"
             assert cwd is not None
             if on_start is not None:

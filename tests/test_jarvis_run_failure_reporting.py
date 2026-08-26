@@ -23,6 +23,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from clio_relay import endpoint as endpoint_module
+from clio_relay import endpoint_jarvis_recovery
 from clio_relay import jarvis_run_environment as jarvis_run_environment_module
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.config import RelaySettings
@@ -261,6 +262,14 @@ class _DispatchProvider(JarvisCdProvider):
     ) -> subprocess.CompletedProcess[str]:
         del command, credential_payload, on_stderr, should_cancel, on_poll
         del timeout_seconds, on_timeout
+        if process_label == "jarvis pipeline precheck query":
+            # clio-relay#162: every jarvis_run dispatch is preceded by a
+            # pipeline-emptiness precheck query. This fake never answers it
+            # (no mcp-result.json written, nonzero returncode), so the
+            # precheck is always INCONCLUSIVE and the specimen-reproduction
+            # behavior below -- what this fixture exists to test -- is
+            # unaffected.
+            return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
         assert process_label == "endpoint MCP operation"
         assert cwd is not None
         if env is not None:
@@ -343,7 +352,12 @@ def test_errored_jarvis_run_terminalizes_with_its_typed_reason(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -410,7 +424,12 @@ def test_refusal_outranks_a_clean_transport_exit(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -456,7 +475,12 @@ def test_restart_cleanup_settles_a_run_left_stuck_by_an_earlier_build(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -485,7 +509,9 @@ def test_restart_cleanup_settles_a_run_left_stuck_by_an_earlier_build(
             "artifact-pinned JARVIS execution recovery result was not trusted"
         )
 
-    monkeypatch.setattr(endpoint_module, "jarvis_dispatch_refusal", _blind_to_refusals)
+    # Same pre-existing drift as above: jarvis_dispatch_refusal is called
+    # from endpoint_jarvis_recovery.py's own globals now, not endpoint.py's.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_dispatch_refusal", _blind_to_refusals)
     monkeypatch.setattr(
         endpoint_module.EndpointWorker,
         "_recover_jarvis_execution",
@@ -501,7 +527,12 @@ def test_restart_cleanup_settles_a_run_left_stuck_by_an_earlier_build(
     assert stuck_intent["state"] == "pending"
 
     monkeypatch.undo()
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
 
     assert worker.run_once() is None
 
@@ -530,7 +561,12 @@ def test_successful_jarvis_run_still_terminalizes_as_succeeded(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -573,7 +609,12 @@ def test_run_without_any_result_stays_nonterminal_for_recovery(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -729,7 +770,12 @@ def test_worker_publishes_the_registered_spack_command_to_the_mcp_runner(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,
@@ -776,7 +822,12 @@ def test_worker_without_a_declaration_leaves_the_run_environment_unchanged(
         "install_spec": "/releases/clio-kit.whl",
     }
     digest = remote_mcp_server_artifact_digest(server_artifact)
-    monkeypatch.setattr(endpoint_module, "jarvis_mcp_command", lambda: command)
+    # Pre-existing test-infra drift (unrelated to this slice): the
+    # monkeypatch target followed jarvis_mcp_command's own #231 slice-6 move
+    # into endpoint_jarvis_recovery.py's globals (endpoint.py no longer
+    # re-exports it at all) -- test_execution_watch.py's _watch_env fixture
+    # already patches the correct module; this file had not been updated.
+    monkeypatch.setattr(endpoint_jarvis_recovery, "jarvis_mcp_command", lambda: command)
     job = _submit_registered_run(
         queue,
         command=command,

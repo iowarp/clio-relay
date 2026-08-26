@@ -14,6 +14,7 @@ Two layers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -134,6 +135,49 @@ def test_execution_phase_job_metadata_shape() -> None:
     assert payload["scheduler_job_id"] == "9001"
     assert payload["poll_count"] == 3
     assert payload["observed_at"] == "2026-08-20T00:00:00+00:00"
+    # clio-relay#265 + #183 residual: a DISTINCT application_verdict key,
+    # never conflated with the scheduler-only "phase"/"jarvis_state" above.
+    verdict = cast(dict[str, Any], payload["application_verdict"])
+    assert verdict["schema_version"] == execution_watch.APPLICATION_VERDICT_SCHEMA
+    assert verdict["status"] == "unknown"
+    assert verdict["reason"] == "execution_not_terminal"
+
+
+@pytest.mark.parametrize(
+    ("state", "terminal", "returncode", "reason", "expected_status", "expected_reason"),
+    [
+        ("completed", True, 0, None, "success", None),
+        ("failed", True, 1, "application exited nonzero", "failed", "application exited nonzero"),
+        ("canceled", True, None, None, "failed", "jarvis_state:canceled"),
+        ("running", False, None, None, "unknown", "execution_not_terminal"),
+        (None, None, None, None, "unknown", "execution_not_terminal"),
+        ("a_future_jarvis_state", True, 0, None, "unknown", "jarvis_state:a_future_jarvis_state"),
+    ],
+)
+def test_application_verdict_for_metadata_is_distinct_from_scheduler_state(
+    state: str | None,
+    terminal: bool | None,
+    returncode: int | None,
+    reason: str | None,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    """#265's own issue text: scheduler rc=0 must never read as application success.
+
+    ``application_verdict_for_metadata`` answers a DIFFERENT question than
+    ``execution_watch_succeeded`` (below) -- it never fabricates a signal
+    JARVIS did not report, so a terminal-but-unrecognized state (a future
+    JARVIS state) or a non-terminal execution both report "unknown", not a
+    guessed success/failure.
+    """
+    metadata = _metadata(state=state, terminal=terminal, returncode=returncode, reason=reason)
+    verdict = execution_watch.application_verdict_for_metadata(metadata)
+    assert verdict == {
+        "schema_version": execution_watch.APPLICATION_VERDICT_SCHEMA,
+        "status": expected_status,
+        "application_returncode": returncode,
+        "reason": expected_reason,
+    }
 
 
 def test_execution_watch_query_spec_omits_artifacts_by_default() -> None:
@@ -368,6 +412,13 @@ class _WatchTransportProvider(JarvisCdProvider):
     ) -> subprocess.CompletedProcess[str]:
         del command, credential_payload, should_cancel, timeout_seconds, on_timeout
         assert cwd is not None
+        if process_label == "jarvis pipeline precheck query":
+            # clio-relay#162: every jarvis_run dispatch is preceded by a
+            # pipeline-emptiness precheck query. This fake never answers it
+            # (no mcp-result.json written, nonzero returncode), so the
+            # precheck is always INCONCLUSIVE and #266's watch behavior
+            # below -- what this fixture exists to test -- is unaffected.
+            return subprocess.CompletedProcess(["jarvis-describe"], 1, "", "")
         if on_start is not None:
             probe = subprocess.Popen([sys.executable, "-c", "pass"])
             on_start(probe.pid)
@@ -447,6 +498,28 @@ def _submit_watch_job(
     return job, execution_id
 
 
+def _present_output_artifacts(path: Path, *, relative: str) -> list[dict[str, object]]:
+    """Declare ``path`` (already written) as one present, non-empty output.
+
+    clio-relay#265 D1: a "completed" terminal poll with NO declared
+    execution-file entries is itself now a typed outputs_missing verdict
+    (``no_outputs_declared``) -- every watch test in this file whose fake
+    execution genuinely succeeds must declare at least one real, present
+    output, or it now (correctly) fails typed instead of succeeding.
+    """
+    payload = path.read_bytes()
+    return [
+        {
+            "package_id": "jarvis.execution",
+            "kind": "execution-file",
+            "role": "log",
+            "location": {"kind": "execution_path", "value": relative},
+            "size_bytes": len(payload),
+            "checksum": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        }
+    ]
+
+
 @pytest.fixture
 def _watch_env(
     tmp_path: Path,
@@ -512,6 +585,12 @@ def test_deferred_execution_watched_to_success(
         server_artifact=server_artifact,
         execution_root=execution_root,
         created_at=created_at,
+        # clio-relay#265 D1: a genuinely successful run declares its real
+        # output, or a zero-declared-outputs "completed" now (correctly)
+        # fails typed instead of reading green.
+        terminal_artifacts=_present_output_artifacts(
+            execution_root / "stdout.log", relative="stdout.log"
+        ),
     )
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
@@ -788,6 +867,11 @@ def test_cancellation_during_watch_is_refused_typed_and_watch_continues(
         cancel_on_poll_index=1,
         queue=queue,
         job_id=job.job_id,
+        # clio-relay#265 D1: declare the real output so this genuinely
+        # successful run does not (correctly) fail on zero declared outputs.
+        terminal_artifacts=_present_output_artifacts(
+            execution_root / "stdout.log", relative="stdout.log"
+        ),
     )
     worker = EndpointWorker(
         role=EndpointRole.WORKER,

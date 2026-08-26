@@ -3,13 +3,15 @@ deferred-execution watch/finalize.
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition. Composes the
 registered-site Spack environment for a ``jarvis_run`` child
-(``_jarvis_run_environment_values``); reads a durable dispatch refusal an earlier
-attempt already recorded (``_recorded_jarvis_dispatch_refusal``) and settles recovery
-from an explicit JARVIS tool-error refusal (``_refuse_jarvis_execution_recovery``);
-projects a recovered execution-query answer back into the lost run response
-(``_write_recovered_jarvis_run_result``); and the #266 scheduler-deferred-execution
-watch/validate/finalize trio (``_watch_deferred_jarvis_execution``/
-``_validated_recovered_jarvis_dispatch``/ ``_finalize_recovered_jarvis_dispatch``).
+(``_jarvis_run_environment_values``); refuses an empty pipeline before scheduler
+submission (``_refuse_empty_jarvis_pipeline``, clio-relay#162); reads a durable dispatch
+refusal an earlier attempt already recorded (``_recorded_jarvis_dispatch_refusal``) and
+settles recovery from an explicit JARVIS tool-error refusal
+(``_refuse_jarvis_execution_recovery``); projects a recovered execution-query answer
+back into the lost run response (``_write_recovered_jarvis_run_result``); and the #266
+scheduler-deferred-execution watch/validate/finalize trio
+(``_watch_deferred_jarvis_execution``/ ``_validated_recovered_jarvis_dispatch``/
+``_finalize_recovered_jarvis_dispatch``).
 """
 
 from __future__ import annotations
@@ -18,7 +20,8 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, cast
 
-from clio_relay import execution_watch
+from clio_relay import execution_watch, jarvis_pipeline_precheck
+from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.console_stream import (
     ConsoleLiveTailer,
 )
@@ -116,6 +119,87 @@ class JarvisDispatchMixin:
                 },
             )
         return values
+
+    def _refuse_empty_jarvis_pipeline(
+        self,
+        job: RelayJob,
+        *,
+        task: RelayTask,
+        spool: JobSpool,
+    ) -> bool:
+        """clio-relay#162: refuse a ``jarvis_run`` whose pipeline has zero declared steps.
+
+        Queries JARVIS's own ``jarvis_describe(target="pipeline")`` before
+        ``_run_job_impl`` ever calls ``_run_execution_streaming`` for this
+        job, so an empty pipeline never reaches scheduler submission. An
+        INCONCLUSIVE precheck (see ``jarvis_pipeline_precheck``'s own
+        docstring) changes nothing -- it is not itself a refusal, and
+        today's pre-#162 behavior (submit, let JARVIS/the scheduler answer)
+        applies unchanged; this only closes the specific hole where a real
+        scheduler allocation started and stopped nothing. Returns ``True``
+        when the job was refused and terminalized here.
+        """
+        if not isinstance(job.spec, McpCallSpec) or job.spec.tool != "jarvis_run":
+            return False
+        pipeline_id = job.spec.arguments.get("pipeline_id")
+        if not isinstance(pipeline_id, str) or not pipeline_id:
+            return False
+        route_valid, _reason = _trusted_jarvis_mcp_route(job)
+        if not route_valid:
+            return False
+        result = jarvis_pipeline_precheck.dispatch_pipeline_describe_query(
+            job,
+            base_spec=job.spec,
+            provider=self.provider,
+            query_dir=spool.path / ".pipeline-precheck",
+            pipeline_id=pipeline_id,
+        )
+        if result.inconclusive_reason is not None:
+            self.queue.append_event(
+                job.job_id,
+                "jarvis.pipeline_precheck_inconclusive",
+                "Pre-dispatch pipeline emptiness check was inconclusive; dispatch proceeds "
+                "unchanged",
+                payload={
+                    "schema_version": (
+                        jarvis_pipeline_precheck.PIPELINE_PRECHECK_INCONCLUSIVE_SCHEMA
+                    ),
+                    "pipeline_id": pipeline_id,
+                    "reason": result.inconclusive_reason,
+                },
+            )
+            return False
+        if result.step_count is None or result.step_count > 0:
+            return False
+        execution_id = job.spec.arguments.get("execution_id")
+        payload = jarvis_pipeline_precheck.empty_pipeline_refusal_payload(
+            pipeline_id=pipeline_id,
+            execution_id=execution_id if isinstance(execution_id, str) else None,
+        )
+        self.queue.update_task_state(
+            task.task_id,
+            JobState.FAILED,
+            message=f"Task failed: {task.name}",
+            metadata={"jarvis_pipeline_empty_refusal": payload, "returncode": 1},
+        )
+        self.queue.update_job_state(
+            job.job_id,
+            JobState.FAILED,
+            message=(
+                "JARVIS run refused before scheduler submission: pipeline has zero declared steps"
+            ),
+            error=bounded_error_detail(
+                jarvis_pipeline_precheck.empty_pipeline_refusal_text(payload)
+            ),
+        )
+        self.queue.append_event(
+            job.job_id,
+            "jarvis.pipeline_empty_refused",
+            f"jarvis_run refused before scheduler submission: pipeline {pipeline_id} has zero "
+            "declared steps",
+            payload=payload,
+        )
+        return True
 
     def _recorded_jarvis_dispatch_refusal(
         self,

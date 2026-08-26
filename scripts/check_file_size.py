@@ -172,6 +172,21 @@ RATCHET_BASELINE: dict[str, int] = {
     # files with no guard against them drifting apart. A justified,
     # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
     "src/clio_relay/bootstrap.py": 926,
+    # clio-relay#265/#183/#248/#162 "honest verdict" slice: +28 net lines --
+    # (1) the terminal-failure branch now folds mcp_call_result_error.py's
+    # typed dispatch-failure detail (a non-jarvis_run mcp_call whose own
+    # typed error the JARVIS-route-scoped refusal never reached, or a
+    # dispatch that left no result document at all) into failure_metadata/
+    # error= instead of falling straight to a bare "exit code N"; (2) one
+    # `_refuse_empty_jarvis_pipeline` call before scheduler submission
+    # (#162 -- the real pre-dispatch check lives in
+    # jarvis_pipeline_precheck.py / endpoint_jarvis_dispatch.py). All the
+    # real logic in both lives in owner modules; this is the irreducible
+    # wiring (one computed local + branches, one early-return call)
+    # `_run_job_impl`'s existing ~10-local-closure shape requires. A
+    # justified, minimal ratchet-up, mirroring #266's own precedent
+    # elsewhere in this table.
+    "src/clio_relay/endpoint_job_execution.py": 819,
     # #158 journal hardening (site-prefix walk + cross-call swap refusal): 1534
     # measured; restored after a merge-resolution slip dropped the entry.
     #

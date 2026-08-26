@@ -87,6 +87,20 @@ EXECUTION_WATCH_QUERY_PROCESS_TIMEOUT_SECONDS = 75
 EXECUTION_PHASE_SCHEMA = "clio-relay.execution-phase.v1"
 EXECUTION_CANCEL_REFUSAL_SCHEMA = "clio-relay.execution-cancel-refusal.v1"
 EXECUTION_WATCH_FAILURE_SCHEMA = "clio-relay.execution-watch-failure.v1"
+#: clio-relay#265 + #183 residual: the typed, DISTINCT application-level
+#: verdict schema -- see :func:`application_verdict_for_metadata`.
+APPLICATION_VERDICT_SCHEMA = "clio-relay.application-verdict.v1"
+
+#: JARVIS's own terminal execution states mapped to #265's application
+#: verdict status vocabulary. Anything not taught here (a future JARVIS
+#: state) reports "unknown" with a typed ``jarvis_state:<raw>`` reason
+#: rather than being silently guessed at -- the same closed-vocabulary
+#: discipline :data:`_NON_TERMINAL_STATE_PHASE` already uses.
+_TERMINAL_STATE_APPLICATION_STATUS: dict[str, str] = {
+    "completed": "success",
+    "failed": "failed",
+    "canceled": "failed",
+}
 
 #: Page size for the ONE terminal, artifact-bearing poll -- matches the
 #: existing lost-response recovery query's page size
@@ -180,6 +194,50 @@ def execution_phase_for_state(state: str | None) -> str:
     return _NON_TERMINAL_STATE_PHASE.get(state, f"jarvis_state:{state}")
 
 
+def application_verdict_for_metadata(metadata: JarvisRuntimeMetadata) -> dict[str, object]:
+    """Build #265's typed, DISTINCT application-level verdict.
+
+    ``execution_watch_succeeded`` (below) answers one narrow question --
+    did JARVIS's own execution record reach ``state == "completed"`` -- the
+    scheduler/launcher's own outcome (did mpirun/SLURM exit cleanly). #265's
+    own issue text names why that is not the same question as "did the
+    application do its work": "a crashed-after-startup run, a 0-step run,
+    or an empty-output run can all exit 0". This verdict is additive and
+    carried alongside ``execution_watch_succeeded``'s existing terminal-
+    outcome fold (``resolve_execution_outcome``, unchanged by this function)
+    rather than replacing it -- it names the limitation explicitly for a run
+    card to render honestly (D1's ``outputs_missing`` check is the other,
+    complementary half: it inspects the declared OUTPUTS this function
+    cannot see). ``status`` is ``"unknown"`` whenever JARVIS has not (yet,
+    or ever) reported a resolvable terminal outcome -- never fabricated from
+    a state JARVIS did not report.
+    """
+    state = metadata.terminal.state
+    returncode = metadata.terminal.returncode
+    if metadata.terminal.terminal is not True or state is None:
+        return {
+            "schema_version": APPLICATION_VERDICT_SCHEMA,
+            "status": "unknown",
+            "application_returncode": returncode,
+            "reason": "execution_not_terminal",
+        }
+    status = _TERMINAL_STATE_APPLICATION_STATUS.get(state)
+    if status is None:
+        return {
+            "schema_version": APPLICATION_VERDICT_SCHEMA,
+            "status": "unknown",
+            "application_returncode": returncode,
+            "reason": f"jarvis_state:{state}",
+        }
+    failure_reason = metadata.terminal.reason or f"jarvis_state:{state}"
+    return {
+        "schema_version": APPLICATION_VERDICT_SCHEMA,
+        "status": status,
+        "application_returncode": returncode,
+        "reason": None if status == "success" else failure_reason,
+    }
+
+
 def execution_phase_job_metadata(
     metadata: JarvisRuntimeMetadata,
     *,
@@ -204,6 +262,10 @@ def execution_phase_job_metadata(
         "scheduler_job_id": metadata.scheduler_job_id,
         "poll_count": poll_count,
         "observed_at": observed_at.isoformat(),
+        # clio-relay#265 + #183 residual: a DISTINCT application-level
+        # verdict, never conflated with execution_watch_succeeded's own
+        # scheduler-rc-only answer -- see application_verdict_for_metadata.
+        "application_verdict": application_verdict_for_metadata(metadata),
     }
 
 
@@ -315,10 +377,13 @@ def execution_outputs_missing_error_text(outputs_missing: dict[str, object]) -> 
     :func:`~clio_relay.jarvis_execution_artifacts.ingest_jarvis_execution_outputs`'s
     typed ``clio-relay.execution-outputs-missing.v1`` payload -- the owner
     ruling made concrete: an execution JARVIS itself reported terminal, but
-    whose declared outputs are missing or empty, is a FAILED job with this
-    reason, never a decorated "completed".
+    whose declared outputs are missing or empty (or whose page declared NONE
+    at all, ``reason="no_outputs_declared"`` -- the #265 D1 revision), is a
+    FAILED job with this reason, never a decorated "completed".
     """
     execution_id = outputs_missing.get("execution_id")
+    if outputs_missing.get("reason") == "no_outputs_declared":
+        return f"JARVIS execution {execution_id} completed but declared zero outputs"
     raw_missing = outputs_missing.get("missing")
     entries: list[dict[str, object]] = []
     if isinstance(raw_missing, list):
