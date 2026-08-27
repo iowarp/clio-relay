@@ -178,8 +178,22 @@ def test_only_worker_slot_zero_owns_cleanup_reconciliation(
     )
     observed_ownership: list[bool] = []
 
-    class StopSlot(Exception):
-        """End one otherwise-infinite worker-slot loop after construction."""
+    class StopSlot(BaseException):
+        """End one otherwise-infinite worker-slot loop after construction.
+
+        Deliberately a ``BaseException``, not an ``Exception``: since clio-relay#238
+        (``run_worker_lane_iteration``, ``endpoint_worker_lanes.py``), the per-slot
+        ``while True`` loop in ``_serve_worker_slot`` catches every ``Exception``
+        from one iteration and keeps polling rather than dying -- intentionally, so
+        a real application fault can never again kill a daemon-mode worker slot
+        silently. A same-hierarchy ``StopSlot`` would be swallowed by that same
+        barrier and the ``while True: ... time.sleep(0)`` loop below it would spin
+        forever (matches the identical fix in
+        ``test_control_query_admission.py::test_supervised_slots_publish_total_and_disjoint_lane_metadata``).
+        ``BaseException`` is the same idiom Python's own control-flow signals
+        (``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit``) use to stay
+        outside blanket ``except Exception`` handlers.
+        """
 
     class FakeSlotWorker:
         """Capture constructor ownership without starting a real slot loop."""

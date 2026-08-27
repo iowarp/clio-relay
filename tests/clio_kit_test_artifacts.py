@@ -37,15 +37,29 @@ def _wheel_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verified_wheel(path: Path, *, source: str) -> Path:
-    """Validate one candidate against the immutable runtime wheel pin."""
+def _verified_wheel(path: Path, *, source: str, check_name: bool = True) -> Path:
+    """Validate one candidate against the immutable runtime wheel pin.
+
+    ``check_name=False`` skips the filename-identity check for a
+    not-yet-renamed download candidate. ``provision_clio_kit_wheel`` downloads
+    to a deliberately randomized ``*.partial`` temp name (so concurrent
+    provisioning attempts against the same shared cache never collide) and
+    only renames it to the canonical ``CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME``
+    after this check passes -- a candidate at that stage can never carry the
+    canonical name yet, so requiring it there made every cold-cache download
+    fail unconditionally regardless of content. Only the hash (the candidate's
+    actual identity) is meaningful to check before the atomic rename; the name
+    check still applies to every other caller (the cached/sibling/env-var
+    artifacts, whose name is not under this function's control).
+    """
     try:
         resolved = path.expanduser().resolve(strict=True)
     except OSError as exc:
         raise ConfigurationError(
             f"{source} does not name a readable clio-kit wheel: {path}"
         ) from exc
-    if not resolved.is_file() or resolved.name != CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME:
+    name_mismatch = check_name and resolved.name != CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME
+    if not resolved.is_file() or name_mismatch:
         raise ConfigurationError(
             f"{source} must name {CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}, got {resolved.name}"
         )
@@ -144,7 +158,7 @@ def provision_clio_kit_wheel() -> Path:
             partial = cache_directory / f".{cached_wheel.name}.{uuid4().hex}.partial"
             try:
                 _download_pinned_wheel(partial)
-                _verified_wheel(partial, source="downloaded clio-kit artifact")
+                _verified_wheel(partial, source="downloaded clio-kit artifact", check_name=False)
                 os.replace(partial, cached_wheel)
             finally:
                 partial.unlink(missing_ok=True)
