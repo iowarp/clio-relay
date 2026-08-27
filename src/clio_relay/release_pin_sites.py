@@ -2,7 +2,7 @@
 
 Split from :mod:`clio_relay.release_pins` (iowarp/clio-relay#231 R7, ground
 rule 6): the registry genuinely has ~70 real sites (doc
-``docs/design/relay-architecture-2026-08.md`` §7's own audit plus this
+``docs/design/relay-architecture-2026-08.md`` Â§7's own audit plus this
 module's completeness sweep), and a data table that size does not fit under
 the 800-line cap in the same file as the logic that reads it -- the same
 reasoning that split ``frp_link.py`` from ``frp_transport.py`` in R4/R5. This
@@ -31,7 +31,7 @@ class PinFamily(StrEnum):
 
 
 class SelectorKind(StrEnum):
-    """How a :class:`PinSite`'s current value is recognized (doc §7)."""
+    """How a :class:`PinSite`'s current value is recognized (doc Â§7)."""
 
     LINE = "line"
     KEY = "key"
@@ -68,7 +68,7 @@ class PinSite:
         id: Stable, unique identifier (used in reports and sabotage tests).
         path: POSIX path relative to the repository root.
         family: Which release-identity axis this site belongs to.
-        kind: How the value is recognized (doc §7's selector taxonomy).
+        kind: How the value is recognized (doc Â§7's selector taxonomy).
         summary: One-line human description for reports.
         line: 1-indexed line number. Used by ``LINE``/``REGEX``/
             ``PLACEHOLDER`` sites and by YAML ``KEY``/``DERIVED_DIGEST``
@@ -86,7 +86,7 @@ class PinSite:
             renames the file instead of editing its content.
         mutable: ``False`` for a site tracked for completeness but
             deliberately never asserted-to-agree or rewritten (a frozen,
-            stable historical label -- doc §7's
+            stable historical label -- doc Â§7's
             ``ares-secure-jarvis-runtime`` check-id/description pair, which
             permanently says "v3.6" by design, not by drift).
         value_group: Sites that must currently hold the identical value.
@@ -98,7 +98,7 @@ class PinSite:
             a literal -- the vendored contract file's own path (and its
             internal content, once renamed) can only be found by first
             reading a reliable, never-renamed sibling site ("the version IS
-            the path", doc §7): a static path baked in at import time goes
+            the path", doc Â§7): a static path baked in at import time goes
             permanently stale the moment a real bump renames the file.
         path_group: Which ``value_group`` to resolve a ``dynamic_path``
             site's anchor from. Defaults to this site's own ``value_group``
@@ -147,7 +147,7 @@ def _row(
 #: every existing vX.Y revision (v3.1-v3.7) still matches unchanged.
 _CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)")
 #: A bare `vX.Y[.Z]` token with no surrounding contract-name context (doc
-#: §7's two frozen "v3.6" sites: a description sentence and a stable
+#: Â§7's two frozen "v3.6" sites: a description sentence and a stable
 #: check-id). The optional patch segment mirrors ``_CONTRACT`` above --
 #: without it, a bare `v3.7.1` token is truncated to `v3.7` on read (the
 #: trailing `\b` is satisfied at the `7`/`.` boundary regardless of what
@@ -215,7 +215,7 @@ PINSITES: tuple[PinSite, ...] = (
         value_group="relay_version",
     ),
     # -- matrix_digest: derived, recomputed strictly after every other -----
-    # -- relay_version/matrix site is bumped (doc §7's ordering rule) ------
+    # -- relay_version/matrix site is bumped (doc Â§7's ordering rule) ------
     _row(
         "matrix.canonical_digest",
         "examples/release-gate/report-matrix-1.0.json",
@@ -235,7 +235,7 @@ PINSITES: tuple[PinSite, ...] = (
         pattern=re.compile(r"^acceptance_matrix_sha256: ([0-9a-f]{64})$"),
         value_group="matrix_digest",
     ),
-    # -- jarvis_contract: the user contract id/path literal (§1's ---------
+    # -- jarvis_contract: the user contract id/path literal (Â§1's ---------
     # -- "13-copy v3.7" story) -- mutable literal sites --------------------
     _row(
         # iowarp/clio-relay#231 split/cluster-config: RemoteMcpContract moved
@@ -466,7 +466,7 @@ PINSITES: tuple[PinSite, ...] = (
         # #172 survivors: the new spack-provider-guidance tests inserted
         # above it pushed this unchanged docstring reference from line
         # 2100 to line 2125.
-        line=2125,
+        line=2138,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
@@ -525,7 +525,7 @@ PINSITES: tuple[PinSite, ...] = (
         _JC,
         _LN,
         "release-gate policy fixture assertion: native_execution.contract_id",
-        line=368,
+        line=392,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
