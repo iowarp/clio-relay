@@ -493,7 +493,13 @@ def read_remote_session_cleanup_report(
     session_id: str,
     status: OwnedSessionRecoveryStatus,
 ) -> SessionLifecycleReport:
-    """Retrieve one finalized report through its exact bounded sidecar reference."""
+    """Retrieve one finalized report through its exact bounded sidecar reference.
+
+    Every refusal below names the exact precondition that failed and, where
+    there is one, the remedy -- a caller must never have to re-derive that
+    from a bare "not exact" (iowarp/clio-relay#(twice-expired session
+    brick): this opacity cost two live diagnosis round-trips).
+    """
     reference = status.coordinator_report_ref
     generation_id = status.session_generation_id
     if not (
@@ -503,12 +509,35 @@ def read_remote_session_cleanup_report(
         and status.cleanup_receipt
         and status.cleanup_paths_pending is False
         and generation_id is not None
-        and status.coordinator_report_bound
-        and status.coordinator_report is None
-        and reference is not None
-        and status.coordinator_report_sha256 == reference.sha256
     ):
-        raise RelayError("remote coordinator cleanup report reference is not exact")
+        raise RelayError(
+            "remote coordinator cleanup report reference is not exact: recovery "
+            f"status is not a verified, complete cleanup receipt for {cluster!r}/"
+            f"{session_id!r}"
+        )
+    if not status.coordinator_report_bound:
+        raise RelayError(
+            "remote coordinator cleanup report reference is not exact: no "
+            f"coordinator report is bound yet for generation {generation_id!r} of "
+            f"{session_id!r} -- this receipt was most likely written by the "
+            "lease-expiry sweep without a desktop present to finalize it; the "
+            "caller must tolerate an unbound receipt (gate on "
+            "coordinator_report_bound) instead of forcing this read"
+        )
+    if status.coordinator_report is not None or reference is None:
+        raise RelayError(
+            "remote coordinator cleanup report reference is not exact: status "
+            f"carried an inline report or no reference for generation "
+            f"{generation_id!r} of {session_id!r}, instead of the expected sidecar "
+            "reference"
+        )
+    if status.coordinator_report_sha256 != reference.sha256:
+        raise RelayError(
+            "remote coordinator cleanup report reference is not exact: status "
+            f"digest {status.coordinator_report_sha256!r} does not match its own "
+            f"reference digest {reference.sha256!r} for generation {generation_id!r} "
+            f"of {session_id!r}"
+        )
     request = OwnedSessionCleanupReportReadRequest(
         cluster=cluster,
         session_id=session_id,
