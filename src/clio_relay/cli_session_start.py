@@ -173,7 +173,32 @@ def _finalize_completed_cleanup_receipt_before_start(
     cluster: str,
     session_id: str,
 ) -> None:
-    """Finish the exact teardown commit if reconnect observes its completed receipt."""
+    """Finish the exact teardown commit if reconnect observes its completed receipt.
+
+    ``coordinator_report_bound`` is gated separately from ``cleanup_receipt``
+    the same way ``cli_session_teardown_recovery._resolve_teardown_recovery``
+    already, correctly, gates its own analogous call: a receipt written by
+    the lease-expiry sweep (``endpoint_owner_session_sweep.py``, #277) is
+    genuine but deliberately skips the two-sided coordinator-report finalize
+    ceremony -- the desktop that ceremony hands a receipt to is exactly the
+    thing that is gone when the sweep runs. Without this gate,
+    ``read_remote_session_cleanup_report`` always refuses an unbound
+    reference, so reconnecting after a sweep-driven (rather than a
+    desktop-driven) expiry would brick every ``session start --replace``
+    before it ever reached its own start logic
+    (iowarp/clio-relay#(twice-expired session brick)). This function is
+    purely an opportunistic reconciliation of the DESKTOP's own bookkeeping
+    for an already-finalized receipt; when there is nothing bound to
+    reconcile, degrading to a no-op here is correct, not a swallowed error
+    -- it does not itself prove the remote generation is closed (cleanup
+    may still be ``cleanup_paths_pending``). That exact-state verification
+    is the actual ``session start`` logic's own job, immediately after this
+    returns: it defers to the remote start barrier
+    (``prepare_owner_session_start`` on the cluster) instead of asserting
+    anything about remote closure here. The local desktop admission mirror
+    self-heals lazily the next time it is opened for a new generation
+    (``mirror_owner_session_generation_open``).
+    """
     import clio_relay.cli as cli
 
     raw_status = session_lifecycle.status_remote_session(
@@ -185,7 +210,7 @@ def _finalize_completed_cleanup_receipt_before_start(
         status = OwnedSessionRecoveryStatus.model_validate(raw_status)
     except ValidationError:
         return
-    if not status.cleanup_receipt:
+    if not status.cleanup_receipt or not status.coordinator_report_bound:
         return
     report = session_lifecycle.read_remote_session_cleanup_report(
         definition=definition,

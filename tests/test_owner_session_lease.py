@@ -1506,3 +1506,103 @@ def test_running_job_ids_helper_reports_no_truncation_when_pages_are_exhausted(
 
     assert truncated is False
     assert job_ids == [job.job_id]
+
+
+def test_get_owner_session_cleanup_intent_tolerates_a_safely_closed_prior_generation(
+    tmp_path: Path,
+) -> None:
+    """iowarp/clio-relay#(twice-expired session brick): a closing record left
+    over from an EARLIER, already safely-closed generation is stale
+    bookkeeping, not a live conflict.
+
+    ``session teardown``'s own recovery-resolution phase
+    (``cli_session_teardown_recovery._resolve_teardown_recovery``) reads this
+    exact call BEFORE anything has a chance to re-mirror the CURRENT
+    generation (that only happens later, in
+    ``cli_owned_relay_jobs._quiesce_owner_session_intake``, via
+    ``mirror_owner_session_generation_open``). A desktop-scoped admission
+    mirror that closed generation-1 cleanly (via a desktop-driven recovery,
+    exactly as the sweep-honors-a-recorded-intent tests above leave it) but
+    never happened to route a gateway write for generation-2 before
+    generation-2's OWN lease expired leaves this exact stale closing record
+    on disk. Before this fix, any generation mismatch here was a hard
+    refusal -- bricking every subsequent ``session teardown`` attempt for a
+    session that has already safely recovered once.
+    """
+    queue = _queue(tmp_path)
+    admission_id = "desktop-admission-session-1"
+    _start_generation(queue, owner_session_id=admission_id, generation_id="generation-1")
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id="generation-1",
+        operation_id="cleanup_first",
+    )
+    queue.set_owner_session_closed(
+        admission_id,
+        session_generation_id="generation-1",
+        residual_resource_ids=[],
+    )
+
+    assert (
+        queue.get_owner_session_cleanup_intent(
+            admission_id,
+            session_generation_id="generation-2",
+        )
+        is None
+    )
+
+
+def test_get_owner_session_cleanup_intent_still_refuses_an_unresolved_foreign_generation(
+    tmp_path: Path,
+) -> None:
+    """The self-heal above must not swallow a REAL conflict: a closing record
+    for a generation that has not (yet) been proven safely closed is still a
+    hard refusal -- now naming both the recorded and the requested
+    generation plus the remedy, instead of the opaque admission-id-only
+    message this replaces."""
+    queue = _queue(tmp_path)
+    admission_id = "desktop-admission-session-1"
+    _start_generation(queue, owner_session_id=admission_id, generation_id="generation-1")
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id="generation-1",
+        operation_id="cleanup_first",
+    )
+
+    with pytest.raises(QueueConflictError, match="generation-1") as excinfo:
+        queue.get_owner_session_cleanup_intent(
+            admission_id,
+            session_generation_id="generation-2",
+        )
+    assert "generation-2" in str(excinfo.value)
+    assert admission_id in str(excinfo.value)
+
+
+def test_get_owner_session_cleanup_intent_refuses_a_prior_generation_with_residuals(
+    tmp_path: Path,
+) -> None:
+    """The self-heal must gate on a PROVEN-safe closure, not merely a closure
+    record's existence: a foreign generation that closed WITH residual
+    resources still recorded must keep refusing -- tolerating it here would
+    let orphaned resources from an incompletely torn-down generation go
+    silent the moment the next generation's teardown reads past them."""
+    queue = _queue(tmp_path)
+    admission_id = "desktop-admission-session-1"
+    _start_generation(queue, owner_session_id=admission_id, generation_id="generation-1")
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id="generation-1",
+        operation_id="cleanup_first",
+    )
+    closure = queue.set_owner_session_closed(
+        admission_id,
+        session_generation_id="generation-1",
+        residual_resource_ids=["orphan-job-1"],
+    )
+    assert closure.residual_resource_ids == ["orphan-job-1"]
+
+    with pytest.raises(QueueConflictError, match="generation-1"):
+        queue.get_owner_session_cleanup_intent(
+            admission_id,
+            session_generation_id="generation-2",
+        )

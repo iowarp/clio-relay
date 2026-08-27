@@ -951,6 +951,64 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
     assert closure.residual_resource_ids == []
 
 
+def test_session_start_reconnect_tolerates_a_sweep_reaped_unbound_receipt(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """iowarp/clio-relay#(twice-expired session brick): the lease-expiry
+    sweep (endpoint_owner_session_sweep.py, #277) deliberately reaps an
+    expired generation WITHOUT the two-sided coordinator-report finalize
+    ceremony -- the desktop that ceremony hands a receipt to is exactly the
+    thing that is gone when the sweep runs. That leaves a genuine
+    ``cleanup_receipt=True`` status with ``coordinator_report_bound=False``.
+
+    Before this fix, ``_finalize_completed_cleanup_receipt_before_start``
+    checked only ``cleanup_receipt`` before unconditionally calling
+    ``read_remote_session_cleanup_report`` -- which hard-requires a bound
+    reference and always raises here, bricking ``session start --replace``
+    on any reconnect after a sweep-driven (rather than desktop-driven)
+    expiry. The gate refuses before the function ever touches the local
+    desktop admission mirror or issues a remote call, so this test proves
+    exactly that: a clean, no-op return with zero remote mutation attempted.
+    """
+
+    def fake_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
+        return OwnedSessionRecoveryStatus(
+            cluster="ares",
+            session_id="session-1",
+            session_generation_id="generation-2",
+            owner="clio-relay",
+            process_state="already_closed",
+            cluster_registry_verified=True,
+            durable_generation_verified=True,
+            cleanup_receipt=True,
+            cleanup_paths_pending=False,
+            coordinator_report_ref=None,
+            coordinator_report_sha256=None,
+            coordinator_report_bound=False,
+            ownership_verified=True,
+            recovery_verified=True,
+        )
+
+    monkeypatch.setattr(session_lifecycle, "status_remote_session", fake_status)
+
+    remote_calls: list[list[str]] = []
+
+    def track_remote_call(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        remote_calls.append(arguments)
+        return "{}"
+
+    monkeypatch.setattr(remote_cli, "run_remote_clio", track_remote_call)
+
+    result = cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        cluster="ares",
+        session_id="session-1",
+    )
+
+    assert result is None
+    assert remote_calls == []
+
+
 def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -2131,12 +2189,19 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
 
     monkeypatch.setattr(remote_cli, "run_remote_clio", forbidden_remote)
 
-    with pytest.raises(RelayError, match="reference is not exact"):
-        cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            definition=ClusterDefinition(name="ares", ssh_host="ares"),
-            cluster="ares",
-            session_id="session-1",
-        )
+    # coordinator_report_bound=False here is the SAME shape a lease-expiry
+    # sweep leaves (endpoint_owner_session_sweep.py, #277): a genuine receipt
+    # with no coordinator report ever bound, because the desktop that
+    # ceremony hands a receipt to was gone when it ran. This must degrade to
+    # a no-op -- proceed without raising, but never close admission from it
+    # -- not refuse the whole reconnect (iowarp/clio-relay#(twice-expired
+    # session brick): the prior hard refusal here bricked every
+    # ``session start --replace`` after a sweep-driven expiry).
+    cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        definition=ClusterDefinition(name="ares", ssh_host="ares"),
+        cluster="ares",
+        session_id="session-1",
+    )
 
     local_status = queue.owner_session_generation_status(
         local_session_id,

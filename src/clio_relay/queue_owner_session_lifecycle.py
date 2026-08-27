@@ -143,7 +143,23 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
         *,
         session_generation_id: str,
     ) -> dict[str, object] | None:
-        """Return the immutable cleanup intent for one exact closing generation."""
+        """Return the immutable cleanup intent for one exact closing generation.
+
+        A closing record left over from an EARLIER generation that is
+        already safely closed (a verified closure with no residual
+        resources) is stale bookkeeping, not a live conflict -- the exact
+        same tolerance :meth:`mirror_owner_session_generation_open` already
+        applies when it lazily clears that same record on the next
+        generation's admission. This read must apply it too: ``session
+        teardown``'s own recovery-resolution phase calls this BEFORE
+        anything has a chance to re-mirror the current generation, so
+        without this tolerance a desktop-scoped mirror that closed one
+        generation cleanly but never routed a gateway write for the next one
+        would refuse every later teardown attempt for that session, forever
+        (iowarp/clio-relay#(twice-expired session brick)). A closing record
+        for a generation that is NOT provably safely closed remains a
+        genuine, unresolved conflict and still refuses.
+        """
         if not owner_session_id:
             raise ValueError("owner_session_id must not be empty")
         session_generation_id = queue_layout.QueueLayout.require_durable_record_id(
@@ -162,8 +178,18 @@ class QueueOwnerSessionLifecycleMixin(queue_owner_session_records.QueueOwnerSess
             if closing_generation is None:
                 return None
             if closing_generation != session_generation_id:
+                stale_closure = self.get_owner_session_closed(
+                    owner_session_id,
+                    session_generation_id=closing_generation,
+                )
+                if stale_closure is not None and not stale_closure.residual_resource_ids:
+                    return None
                 raise QueueConflictError(
-                    f"owner session closing generation does not match request: {owner_session_id}"
+                    "owner session closing record is for a different, unresolved "
+                    f"generation ({closing_generation!r}) than requested "
+                    f"({session_generation_id!r}) for {owner_session_id!r}; a prior "
+                    "teardown must finish (or its closure must be proven safe with no "
+                    "residual resources) before this generation can be read"
                 )
             return self._validate_owner_session_cleanup_intent(
                 owner_session_id,
