@@ -186,12 +186,18 @@ def _finalize_completed_cleanup_receipt_before_start(
     reference, so reconnecting after a sweep-driven (rather than a
     desktop-driven) expiry would brick every ``session start --replace``
     before it ever reached its own start logic
-    (iowarp/clio-relay#(twice-expired session brick)). There is nothing
-    local to finalize in that case -- the remote generation is already
-    closed -- so degrading to a no-op here is correct, not a swallowed
-    error: the caller's own start logic proceeds unaffected, and the local
-    desktop admission mirror self-heals lazily the next time it is opened
-    for a new generation (``mirror_owner_session_generation_open``).
+    (iowarp/clio-relay#(twice-expired session brick)). This function is
+    purely an opportunistic reconciliation of the DESKTOP's own bookkeeping
+    for an already-finalized receipt; when there is nothing bound to
+    reconcile, degrading to a no-op here is correct, not a swallowed error
+    -- it does not itself prove the remote generation is closed (cleanup
+    may still be ``cleanup_paths_pending``). That exact-state verification
+    is the actual ``session start`` logic's own job, immediately after this
+    returns: it defers to the remote start barrier
+    (``prepare_owner_session_start`` on the cluster) instead of asserting
+    anything about remote closure here. The local desktop admission mirror
+    self-heals lazily the next time it is opened for a new generation
+    (``mirror_owner_session_generation_open``).
     """
     import clio_relay.cli as cli
 

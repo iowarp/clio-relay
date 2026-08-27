@@ -524,19 +524,19 @@ def read_remote_session_cleanup_report(
             "caller must tolerate an unbound receipt (gate on "
             "coordinator_report_bound) instead of forcing this read"
         )
-    if status.coordinator_report is not None or reference is None:
+    # Two conditions the original combined check also named are structurally
+    # unreachable here and are deliberately not re-described: `coordinator_
+    # report` is typed `None` on OwnedSessionRecoveryStatus (session_wire_
+    # models.py) -- no validated instance can ever carry a non-None value --
+    # and `_validate_coordinator_report_reference` (same module) refuses to
+    # construct any instance whose `coordinator_report_sha256` disagrees with
+    # a non-None `coordinator_report_ref`, so once `coordinator_report_bound`
+    # is true the only reachable refusal left is a missing reference.
+    if reference is None:
         raise RelayError(
-            "remote coordinator cleanup report reference is not exact: status "
-            f"carried an inline report or no reference for generation "
-            f"{generation_id!r} of {session_id!r}, instead of the expected sidecar "
-            "reference"
-        )
-    if status.coordinator_report_sha256 != reference.sha256:
-        raise RelayError(
-            "remote coordinator cleanup report reference is not exact: status "
-            f"digest {status.coordinator_report_sha256!r} does not match its own "
-            f"reference digest {reference.sha256!r} for generation {generation_id!r} "
-            f"of {session_id!r}"
+            "remote coordinator cleanup report reference is not exact: no "
+            f"reference is present for generation {generation_id!r} of "
+            f"{session_id!r}, even though a coordinator report is bound"
         )
     request = OwnedSessionCleanupReportReadRequest(
         cluster=cluster,

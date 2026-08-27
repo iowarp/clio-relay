@@ -1576,3 +1576,33 @@ def test_get_owner_session_cleanup_intent_still_refuses_an_unresolved_foreign_ge
         )
     assert "generation-2" in str(excinfo.value)
     assert admission_id in str(excinfo.value)
+
+
+def test_get_owner_session_cleanup_intent_refuses_a_prior_generation_with_residuals(
+    tmp_path: Path,
+) -> None:
+    """The self-heal must gate on a PROVEN-safe closure, not merely a closure
+    record's existence: a foreign generation that closed WITH residual
+    resources still recorded must keep refusing -- tolerating it here would
+    let orphaned resources from an incompletely torn-down generation go
+    silent the moment the next generation's teardown reads past them."""
+    queue = _queue(tmp_path)
+    admission_id = "desktop-admission-session-1"
+    _start_generation(queue, owner_session_id=admission_id, generation_id="generation-1")
+    queue.set_owner_session_closing(
+        admission_id,
+        session_generation_id="generation-1",
+        operation_id="cleanup_first",
+    )
+    closure = queue.set_owner_session_closed(
+        admission_id,
+        session_generation_id="generation-1",
+        residual_resource_ids=["orphan-job-1"],
+    )
+    assert closure.residual_resource_ids == ["orphan-job-1"]
+
+    with pytest.raises(QueueConflictError, match="generation-1"):
+        queue.get_owner_session_cleanup_intent(
+            admission_id,
+            session_generation_id="generation-2",
+        )

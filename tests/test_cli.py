@@ -952,7 +952,6 @@ def test_session_start_finalizes_completed_teardown_receipt_before_reconnect(
 
 
 def test_session_start_reconnect_tolerates_a_sweep_reaped_unbound_receipt(
-    tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     """iowarp/clio-relay#(twice-expired session brick): the lease-expiry
@@ -967,32 +966,10 @@ def test_session_start_reconnect_tolerates_a_sweep_reaped_unbound_receipt(
     ``read_remote_session_cleanup_report`` -- which hard-requires a bound
     reference and always raises here, bricking ``session start --replace``
     on any reconnect after a sweep-driven (rather than desktop-driven)
-    expiry. This reproduces that exact sequence: a first generation that
-    WAS recovered by a desktop-driven teardown (closed cleanly, exactly as
-    test_session_start_finalizes_completed_teardown_receipt_before_reconnect
-    leaves it), and a second generation that was only ever reaped by the
-    sweep."""
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    queue = ClioCoreQueue(tmp_path / "core")
-    local_session_id = cli._desktop_owner_session_admission_id(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        session_id="session-1",
-    )
-    queue.prepare_owner_session_start(
-        local_session_id,
-        recorded_generation_id=None,
-        candidate_generation_id="generation-1",
-    )
-    queue.set_owner_session_closing(
-        local_session_id,
-        session_generation_id="generation-1",
-        operation_id="cleanup_first",
-    )
-    queue.set_owner_session_closed(
-        local_session_id,
-        session_generation_id="generation-1",
-        residual_resource_ids=[],
-    )
+    expiry. The gate refuses before the function ever touches the local
+    desktop admission mirror or issues a remote call, so this test proves
+    exactly that: a clean, no-op return with zero remote mutation attempted.
+    """
 
     def fake_status(**_kwargs: object) -> OwnedSessionRecoveryStatus:
         return OwnedSessionRecoveryStatus(
@@ -1014,20 +991,22 @@ def test_session_start_reconnect_tolerates_a_sweep_reaped_unbound_receipt(
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", fake_status)
 
-    def refuse_remote_call(_definition: ClusterDefinition, arguments: list[str]) -> str:
-        raise AssertionError(
-            f"no remote mutation is possible without a bound coordinator report: {arguments}"
-        )
+    remote_calls: list[list[str]] = []
 
-    monkeypatch.setattr(remote_cli, "run_remote_clio", refuse_remote_call)
+    def track_remote_call(_definition: ClusterDefinition, arguments: list[str]) -> str:
+        remote_calls.append(arguments)
+        return "{}"
 
-    # Must return cleanly -- there is nothing bound to finalize, so this is a
-    # no-op that lets `session start`'s own start logic proceed.
-    cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    monkeypatch.setattr(remote_cli, "run_remote_clio", track_remote_call)
+
+    result = cli_session_start._finalize_completed_cleanup_receipt_before_start(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         definition=ClusterDefinition(name="ares", ssh_host="ares"),
         cluster="ares",
         session_id="session-1",
     )
+
+    assert result is None
+    assert remote_calls == []
 
 
 def test_cleanup_report_is_persisted_and_reread_before_authoritative_closure(
@@ -2229,7 +2208,6 @@ def test_session_start_never_closes_from_remote_only_cleanup_receipt(
         session_generation_id="generation-1",
     )
     assert local_status["closing"] is True
-    assert local_status["closed"] is False
     assert local_status["closed"] is False
 
 
