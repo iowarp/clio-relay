@@ -10,7 +10,20 @@ from typing import Any, cast
 
 import pytest
 
+# clio-relay#231 continuation (3b759cc split): relay_cli (clio_relay.cli)
+# still owns `_JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA` and the other
+# constants used below, but `_JarvisExecutionQueryAcceptance`,
+# `_mark_jarvis_validation_pending`, `_load_jarvis_validation_resume_
+# checkpoint`, and the bounded-observation helpers moved to their own owner
+# modules and are no longer reachable through `relay_cli.<name>` -- this
+# file reaches them at their true origin instead of resurrecting a cli.py
+# compatibility shim nothing in src still needs (only this test reached
+# them through cli.py).
 import clio_relay.cli as relay_cli
+import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
+import clio_relay.cli_jarvis_pending_report as cli_jarvis_pending_report
+import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
+import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
 import clio_relay.jarvis_mcp_validation as jarvis_validation
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
@@ -258,7 +271,7 @@ def test_progress_only_execution_query_is_strictly_resumable_but_not_passed(
         sequence=2,
         terminal=terminal,
     )
-    query = relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="acceptance",
         execution_id="jarvis-execution-acceptance",
@@ -275,7 +288,7 @@ def test_progress_only_execution_query_is_strictly_resumable_but_not_passed(
         lifecycle_observations=[observation],
     )
 
-    pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    pending = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -340,8 +353,8 @@ def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Pa
         inputs: dict[str, Any],
         observation: dict[str, Any],
         lifecycle: list[dict[str, Any]],
-    ) -> relay_cli._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        return relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) -> cli_jarvis_execution_types._JarvisExecutionQueryAcceptance:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        return cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             cluster="ares",
             pipeline_id="acceptance",
             execution_id="jarvis-execution-acceptance",
@@ -395,7 +408,7 @@ def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Pa
         "builder_inputs": builder_inputs,
         "lifecycle_observations": first_query.lifecycle_observations,
     }
-    first_pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first_pending = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         first_report,
         execution_query=first_query,
         resume_checkpoint=first_checkpoint,
@@ -403,7 +416,7 @@ def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Pa
     first_path = tmp_path / "first-pending.json"
     write_validation_report(first_pending, first_path)
 
-    first_loaded = relay_cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first_loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         first_path,
         cluster="ares",
     )
@@ -441,7 +454,7 @@ def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Pa
         },
         "lifecycle_observations": second_query.lifecycle_observations,
     }
-    second_pending = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    second_pending = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         second_report,
         execution_query=second_query,
         resume_checkpoint=second_checkpoint,
@@ -449,7 +462,7 @@ def test_real_builder_pending_checkpoints_round_trip_across_resumes(tmp_path: Pa
     second_path = tmp_path / "second-pending.json"
     write_validation_report(second_pending, second_path)
 
-    second_loaded = relay_cli._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    second_loaded = cli_jarvis_resume_checkpoint._load_jarvis_validation_resume_checkpoint(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         second_path,
         cluster="ares",
     )
@@ -495,7 +508,7 @@ def test_terminal_artifacts_pending_never_masks_terminal_workload_failure(
     terminal_record["error"] = error
     inputs["query_lifecycle_observations"] = observations
     report = build_jarvis_mcp_validation_report(**inputs)
-    query = relay_cli._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    query = cli_jarvis_execution_types._JarvisExecutionQueryAcceptance(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster="ares",
         pipeline_id="acceptance",
         execution_id="jarvis-execution-acceptance",
@@ -512,7 +525,7 @@ def test_terminal_artifacts_pending_never_masks_terminal_workload_failure(
         lifecycle_observations=observations,
     )
 
-    unchanged = relay_cli._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    unchanged = cli_jarvis_pending_report._mark_jarvis_validation_pending(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         report,
         execution_query=query,
     )
@@ -1052,7 +1065,7 @@ def test_compaction_persists_lifecycle_regression_beyond_observation_bound() -> 
             state, terminal = "completed", True
         else:
             state, terminal = "running", False
-        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             observations,
             _query_lifecycle_observation(state, sequence=sequence, terminal=terminal),
         )
@@ -1133,7 +1146,7 @@ def test_compaction_persists_every_query_integrity_violation(
             observation["relay_query_integrity"] = {}
         elif sequence == 3 and mutation == "gap_marker":
             observation["relay_query_verified_gap"] = {}
-        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             observations,
             observation,
         )
@@ -1176,12 +1189,12 @@ def test_compaction_preserves_healthy_multi_phase_progress_semantics() -> None:
         else:
             latest["label"] = "phase-a"
             latest["current"] = float(sequence - 10)
-        relay_cli._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        cli_jarvis_query_observation._append_bounded_jarvis_execution_query_observation(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             observations,
             observation,
         )
 
-    observations = relay_cli._merge_jarvis_execution_query_observations(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    observations = cli_jarvis_query_observation._merge_jarvis_execution_query_observations(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         observations,
         [],
     )

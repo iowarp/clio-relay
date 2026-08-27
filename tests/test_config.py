@@ -87,15 +87,20 @@ def test_relay_settings_load_owner_session_generation_from_environment(
     assert settings.remote_cluster is None
 
 
-def test_relay_settings_owner_session_lease_ttl_defaults_to_thirty_minutes(
+def test_relay_settings_owner_session_lease_ttl_defaults_to_never_expire(
     monkeypatch: MonkeyPatch,
 ) -> None:
     """iowarp/clio-relay#277: TTL is configuration with a sane default, never
-    a hardcoded constant scattered across the renewal/sweep call sites."""
+    a hardcoded constant scattered across the renewal/sweep call sites.
+
+    Default re-anchored to 0 (never expires) by 80c138d: owner ruling
+    2026-08-27 -- a timeout must never destroy a live session by default
+    (ssh transport reap costs a VPN + 2FA re-auth). Bounded self-clean is
+    now an opt-in deployment choice (>= 30s), not a default."""
     settings = RelaySettings.from_env()
 
     assert settings.owner_session_lease_ttl_seconds == DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS
-    assert settings.owner_session_lease_ttl_seconds == 1800
+    assert settings.owner_session_lease_ttl_seconds == 0
 
 
 def test_relay_settings_load_owner_session_lease_ttl_from_environment(
