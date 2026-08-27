@@ -30,11 +30,16 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 # The bootstrap default install pin (clio-relay#190): the exact clio-kit
 # release a *fresh* deployment installs for its built-in JARVIS MCP server.
 # This is the runtime dependency pin, not a certification snapshot: it moves
-# independently of CONTRACT_CERTIFICATION_WHEEL_* below.
-JARVIS_MCP_WHEEL_FILENAME = "clio_kit-2.7.2-py3-none-any.whl"
-JARVIS_MCP_WHEEL_SHA256 = "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
+# independently of CONTRACT_CERTIFICATION_WHEEL_* below. Kept in sync with
+# clio_relay.jarvis_mcp.CLIO_KIT_JARVIS_MCP_VERSION by hand (release 1.6.8,
+# chore(release) c0ec01f) -- this file intentionally re-derives its own
+# copies rather than importing the wheel filename/URL/SHA-256 so a source
+# bump can never silently drag the CI-workflow-consistency check along
+# unnoticed; this test is the tripwire that forces the two to be reconciled.
+JARVIS_MCP_WHEEL_FILENAME = "clio_kit-2.10.3-py3-none-any.whl"
+JARVIS_MCP_WHEEL_SHA256 = "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
 JARVIS_MCP_WHEEL_URL = (
-    f"https://github.com/iowarp/clio-kit/releases/download/v2.7.2/{JARVIS_MCP_WHEEL_FILENAME}"
+    f"https://github.com/iowarp/clio-kit/releases/download/v2.10.3/{JARVIS_MCP_WHEEL_FILENAME}"
 )
 
 # The exact upstream wheel CI stages before the local release gate, which
@@ -48,13 +53,19 @@ JARVIS_MCP_WHEEL_URL = (
 # above to 2.7.2 and deliberately left this certification pin on 2.6.6 as
 # tracked follow-up; clio-relay#199 completed that follow-up by
 # re-certifying every locked surface against 2.7.2, so this pin now matches
-# the bootstrap install pin again.
-CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.7.2-py3-none-any.whl"
+# the bootstrap install pin again. CI stages exactly one wheel per job
+# (single "stage exact clio-kit release wheel" step, ci.yml) and
+# provision_clio_kit_wheel() consumes that same staged artifact for the
+# contract-certification suite, so this pin tracks the bootstrap pin above
+# going forward -- re-certified to 2.10.3 by the clio-kit-jarvis-user-v3.7.x
+# contract-recognition work (test_clio_kit_mcp_contracts.py passes against
+# this exact wheel).
+CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.10.3-py3-none-any.whl"
 CONTRACT_CERTIFICATION_WHEEL_SHA256 = (
-    "8ebe41bf366e475a7da703a52c968231780d5d9013fc5fc913fe0f0539c6b6b5"
+    "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
 )
 CONTRACT_CERTIFICATION_WHEEL_URL = (
-    "https://github.com/iowarp/clio-kit/releases/download/v2.7.2/"
+    "https://github.com/iowarp/clio-kit/releases/download/v2.10.3/"
     f"{CONTRACT_CERTIFICATION_WHEEL_FILENAME}"
 )
 
@@ -124,7 +135,7 @@ def test_contract_wheel_provisioning_reports_an_actionable_offline_error(
 
 def test_bootstrap_jarvis_mcp_install_pin_is_self_consistent() -> None:
     """The bootstrap default JARVIS MCP install pin resolves to one exact wheel (#190)."""
-    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.7.2"
+    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.10.3"
     assert CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME == JARVIS_MCP_WHEEL_FILENAME
     assert CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 == JARVIS_MCP_WHEEL_SHA256
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == JARVIS_MCP_WHEEL_URL

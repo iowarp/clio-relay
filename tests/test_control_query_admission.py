@@ -377,8 +377,25 @@ def test_supervised_slots_publish_total_and_disjoint_lane_metadata(
     parent_endpoint = parent.register()
     observed: list[tuple[dict[str, object], dict[str, object]]] = []
 
-    class StopSlot(Exception):
-        """Stop one synthetic supervised slot after its first dispatch attempt."""
+    class StopSlot(BaseException):
+        """Stop one synthetic supervised slot after its first dispatch attempt.
+
+        Deliberately a ``BaseException``, not an ``Exception``: since clio-relay#238
+        (``run_worker_lane_iteration``, ``endpoint_worker_lanes.py``), the per-slot
+        ``while True`` loop in ``_serve_worker_slot`` catches every ``Exception`` from
+        one iteration, logs it, records it as typed ``lane_last_error`` metadata, and
+        keeps polling -- intentionally, so a real application fault can never again
+        kill a daemon-mode worker slot silently. A same-hierarchy ``StopSlot`` would
+        be swallowed by that same barrier and the ``while True: ... time.sleep(0)``
+        loop below it would spin forever (reproduced: this test hung indefinitely
+        under the old ``Exception`` base, even on 1.6.7's #238 commit itself -- this
+        is not a regression from any recent merge, just never exercised by a full
+        suite run because CI does not run on develop pushes). ``BaseException`` is
+        the same idiom Python's own control-flow signals (``SystemExit``,
+        ``KeyboardInterrupt``, ``GeneratorExit``) use to stay outside blanket
+        ``except Exception`` handlers -- exactly the distinction this test's escape
+        hatch needs now that the production loop is intentionally exception-proof.
+        """
 
     def stop_slot(self: EndpointWorker, **kwargs: object) -> None:
         assert self.endpoint is not None
