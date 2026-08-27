@@ -139,9 +139,13 @@ class RelaySettings(BaseModel):
     owner_session_generation_id: DurableRecordId | None = None
     owner_session_cluster: str | None = None
     owner_session_api_port: int | None = Field(default=None, gt=0, le=65_535)
+    #: 0 (the default) disables lease expiry entirely -- no timeout ever
+    #: destroys a live session; teardown is the only terminator. Positive
+    #: values (>= 30) opt a deployment into bounded self-clean. Values 1-29
+    #: are refused by the validator below as reap-storm footguns.
     owner_session_lease_ttl_seconds: int = Field(
         default=DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
-        ge=30,
+        ge=0,
         le=86_400,
     )
     remote_transport_mode: TransportMode = DEFAULT_REMOTE_TRANSPORT_MODE
@@ -173,6 +177,17 @@ class RelaySettings(BaseModel):
         default=DEFAULT_EXECUTION_WATCH_CEILING_SECONDS,
         ge=1,
     )
+
+    @model_validator(mode="after")
+    def validate_owner_session_lease_ttl(self) -> Self:
+        """Refuse the 1-29s lease-TTL footgun band; 0 means expiry disabled."""
+        if 0 < self.owner_session_lease_ttl_seconds < 30:
+            raise ValueError(
+                "owner_session_lease_ttl_seconds must be 0 (expiry disabled, the default) "
+                "or at least 30; values under 30 seconds would reap sessions faster than "
+                "a client can renew them"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_owner_session_identity(self) -> Self:
@@ -335,7 +350,7 @@ class RelaySettings(BaseModel):
             owner_session_api_port=_optional_positive_int_env(
                 "CLIO_RELAY_OWNER_SESSION_API_PORT",
             ),
-            owner_session_lease_ttl_seconds=_positive_int_env(
+            owner_session_lease_ttl_seconds=_nonnegative_int_env(
                 "CLIO_RELAY_OWNER_SESSION_LEASE_TTL_SECONDS",
                 DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
             ),

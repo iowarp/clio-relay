@@ -2015,7 +2015,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 77.36
 #: test_queue_progress_bounded_window.py, raising it to 129/206 = 62.62%;
 #: iowarp/clio-relay#285 added two under-500 reconciliation test files).
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.15
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.33
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

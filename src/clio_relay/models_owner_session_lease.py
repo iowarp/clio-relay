@@ -75,10 +75,16 @@ OWNER_SESSION_LEASE_SCHEMA = "clio-relay.owner-session-lease.v1"
 #: purely for one constant.
 MAX_OWNER_SESSION_LEASE_RUNNING_JOB_IDS = 1_000
 
-#: A sane, non-hardcoded-in-scattered-constants default TTL (30 minutes).
+#: Default TTL: 0 -- the lease NEVER expires unless a deployment opts in.
+#: Owner ruling (2026-08-27, direct): a timeout must never destroy a live
+#: session by default -- on the ssh transport a reaped session costs the user
+#: a VPN + 2FA re-authentication, and a 30-minute reaper made the product
+#: unusable ("i will stop using it if i have to reconnect every 30 min").
+#: Bounded self-clean is an OPT-IN deployment choice
+#: (``CLIO_RELAY_OWNER_SESSION_LEASE_TTL_SECONDS`` >= 30), not a default.
 #: The authoritative value is ``RelaySettings.owner_session_lease_ttl_seconds``
 #: (config.py); this is only the fallback that field itself defaults to.
-DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS = 1_800
+DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS = 0
 
 #: Bounds the sweep's own retry loop (BLOCKER 2): a session whose recorded
 #: cleanup intent the sweep cannot safely honor stops retrying after this
@@ -113,7 +119,9 @@ class OwnerSessionLease(BaseModel):
     owner_session_id: str = Field(min_length=1, max_length=256)
     session_generation_id: DurableRecordId
     cluster: str = Field(min_length=1, max_length=256)
-    ttl_seconds: int = Field(gt=0, le=86_400)
+    #: 0 = the lease never expires (the default posture); positive values
+    #: opt this generation into bounded self-clean.
+    ttl_seconds: int = Field(ge=0, le=86_400)
     status: OwnerSessionLeaseStatus = "open"
     opened_at: datetime
     last_seen_at: datetime
@@ -156,6 +164,10 @@ class OwnerSessionLease(BaseModel):
         still-open lease.
         """
         if self.status != "open":
+            return False
+        if self.ttl_seconds == 0:
+            # Disabled lease (the default): never due, no matter how quiet.
+            # Only an explicit close (clean teardown) ever terminates it.
             return False
         current = now or datetime.now(UTC)
         return current >= self.last_seen_at + timedelta(seconds=self.ttl_seconds)

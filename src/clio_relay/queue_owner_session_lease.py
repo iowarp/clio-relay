@@ -114,8 +114,8 @@ class QueueOwnerSessionLeaseMixin:
         )
         if not cluster:
             raise ValueError("cluster must not be empty")
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        if ttl_seconds < 0:
+            raise ValueError("ttl_seconds must be 0 (expiry disabled) or positive")
         self._store_adapter.initialize()
         current_time = now or datetime.now(UTC)
         path = self._owner_session_lease_path(owner_session_id)
@@ -123,6 +123,11 @@ class QueueOwnerSessionLeaseMixin:
             existing = self._read_owner_session_lease_unlocked(path)
             if existing is not None and existing.session_generation_id == session_generation_id:
                 if existing.status != "open":
+                    return existing
+                if existing.ttl_seconds == 0:
+                    # Disabled lease (the default): never due, so last_seen_at
+                    # freshness is meaningless -- skip the fsync'd rewrite
+                    # every authenticated request would otherwise pay.
                     return existing
                 debounce_window = timedelta(
                     seconds=existing.ttl_seconds / OWNER_SESSION_LEASE_RENEWAL_DEBOUNCE_FRACTION
