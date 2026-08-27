@@ -432,19 +432,11 @@ PINSITES: tuple[PinSite, ...] = (
         ),
         value_group="jarvis_contract_id",
     ),
-    _row(
-        "jc.execution_watch_docstring",
-        "src/clio_relay/execution_watch.py",
-        _JC,
-        _LN,
-        "module-level comment cross-reference (cancel-refusal rationale)",
-        # #231 decomposition: execution_watch.py is a new module born from
-        # the mcp_call/runner.py split; its own comment naming the current
-        # contract was never registered.
-        line=102,
-        pattern=_CONTRACT,
-        value_group="jarvis_contract_id",
-    ),
+    # jc.execution_watch_docstring was REMOVED here (v1.7.0 campaign):
+    # clio-relay#214's review round trimmed execution_watch.py's prose to fit
+    # the 800-line cap, and the contract-naming comment this site pinned was
+    # among the casualties. A pin site follows its referent -- the contract id
+    # stays pinned at its many remaining sites.
     _row(
         "jc.relay_schema_equality_contract_const",
         "tests/fixtures/relay_schema_equality_v1.json",
@@ -556,8 +548,9 @@ PINSITES: tuple[PinSite, ...] = (
         _LN,
         "registered-contract parametrized job spec (#231 A6; -1 from 5963, N15)",
         # #231 decomposition wave (post-A6): further test additions above it
-        # pushed this unchanged entry from line 5962 to line 6006.
-        line=6006,
+        # pushed this unchanged entry from line 5962 to line 6006; the v1.7.0
+        # campaign's test additions pushed it again to line 6056.
+        line=6056,
         pattern=_CONTRACT,
         value_group="jarvis_contract_id",
     ),
