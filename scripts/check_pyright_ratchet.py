@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Ratchet guard against the repo's strict-pyright error backlog (clio-relay#270).
 
 ``local.pyright`` (:func:`clio_relay.release_validation.run_local_release_validation`)
