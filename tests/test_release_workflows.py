@@ -38,7 +38,21 @@ def test_tag_workflow_validates_identity_without_blocking_publication() -> None:
         "pull-requests": "read",
     }
     assert jobs["bind"]["if"] == "github.event_name == 'push'"
-    assert cast(dict[str, Any], workflow["on"]) == {"push": {"tags": ["v*"]}}
+    # c2d1e33: workflow_dispatch(tag) re-anchored the trigger set -- a failed
+    # tag-push run can be re-published against the already-released assets
+    # without re-tagging (tags are deletion-protected).
+    assert cast(dict[str, Any], workflow["on"]) == {
+        "push": {"tags": ["v*"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "tag": {
+                    "description": "Existing release tag to validate and publish (e.g. v1.6.8)",
+                    "required": "true",
+                    "type": "string",
+                }
+            }
+        },
+    }
     steps = cast(list[dict[str, Any]], jobs["bind"]["steps"])
     checkout = next(step for step in steps if "actions/checkout@" in str(step.get("uses")))
     assert cast(dict[str, str], checkout["with"])["persist-credentials"] == "false"
@@ -61,8 +75,14 @@ def test_tag_push_uploads_exact_release_distributions_asynchronously() -> None:
     text = str(publish)
 
     assert publish["needs"] == "bind"
+    # c2d1e33: publication now also runs on workflow_dispatch (re-publication
+    # of an already-released tag); needs.bind is skipped (not failed) on
+    # dispatch, so `!failure()` -- not a hard `needs.bind == 'success'` --
+    # is what lets the dispatch path publish while a push still requires
+    # bind to succeed.
     assert publish["if"] == (
-        "github.event_name == 'push' && github.repository == 'iowarp/clio-relay'"
+        "!failure() && !cancelled() && github.repository == 'iowarp/clio-relay' "
+        "&& (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
     )
     assert cast(dict[str, str], publish["environment"])["name"] == "pypi"
     assert publish["permissions"] == {
@@ -111,7 +131,11 @@ def test_release_build_requires_local_exact_tag_before_distribution_construction
 
 def test_same_tag_release_stages_share_one_non_canceling_concurrency_group() -> None:
     workflows = (
-        ("release.yml", "${{ github.ref_name }}"),
+        # c2d1e33: release.yml's concurrency key now falls back to the
+        # dispatch tag input so a re-publication dispatch for tag v1.6.8
+        # shares the SAME group as the original tag-push run for v1.6.8
+        # (github.ref_name is unset/irrelevant on workflow_dispatch).
+        ("release.yml", "${{ inputs.tag || github.ref_name }}"),
         ("stage-candidate.yml", "${{ inputs.tag }}"),
         ("live-validation-attest.yml", "${{ inputs.tag }}"),
         ("release-gate.yml", "${{ inputs.tag }}"),
@@ -366,8 +390,13 @@ def test_jarvis_release_requirement_enforces_unified_gray_scott_contract() -> No
     )
     native_execution = clio_kit_component["native_execution"]
     assert native_execution["contract_id"] == "clio-kit-jarvis-user-v3.7.2"
+    # c0ec01f (1.6.8): jarvis contract v3.7.2 re-anchored this digest; every
+    # registered release-identity site agrees on it (docs/release-gate-1.0.yaml,
+    # docs/remote-mcp-federation.md, remote_mcp.py,
+    # src/clio_relay/_contracts/jarvis-user-v3.7.2.json) -- this test was the
+    # one unregistered, stale straggler.
     assert native_execution["contract_sha256"] == (
-        "ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849"
+        "52238d942a15e48e4d92984b5c1ca939ac224dcc067452c6828c63247e1dd2e5"
     )
     jarvis_component = worker["metadata_equals"]["component_artifacts"]["jarvis-cd"]
     assert jarvis_component["distribution_version"] == "1.8.0"
@@ -1348,10 +1377,22 @@ def test_release_network_metadata_is_bounded_before_json_parsing() -> None:
         assert text.count("response.read(4 * 1024 * 1024 + 1)") == expected_reads
         assert "json.load(response)" not in text
 
-    bootstrap = (ROOT / "src" / "clio_relay" / "bootstrap.py").read_text(encoding="utf-8")
+    # 3b759cc (#231 decomposition): bootstrap.py's embedded PyPI-metadata
+    # heredocs moved out to these three owner modules -- bootstrap.py itself
+    # no longer contains any network-fetch code (`git log -S` on the old
+    # literal bottoms out at 3b759cc, which only removed it from
+    # bootstrap.py while re-adding it, unchanged, in the split files below).
+    bootstrap_script_files = (
+        "bootstrap_script_provider_install.py",
+        "bootstrap_script_jarvis_state.py",
+        "bootstrap_reconcile_script_generation_prepare.py",
+    )
+    for filename in bootstrap_script_files:
+        content = (ROOT / "src" / "clio_relay" / filename).read_text(encoding="utf-8")
+        assert content.count("response.read(4 * 1024 * 1024 + 1)") == 1, filename
+        assert "json.load(response)" not in content, filename
+
     promotion = (ROOT / "src" / "clio_relay" / "promotion_record.py").read_text(encoding="utf-8")
-    assert "response.read(4 * 1024 * 1024 + 1)" in bootstrap
-    assert "json.load(response)" not in bootstrap
     assert "response.read(MAX_PYPI_JSON_BYTES + 1)" in promotion
     assert "json.load(response)" not in promotion
 

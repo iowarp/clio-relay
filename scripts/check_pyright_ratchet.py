@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Ratchet guard against the repo's strict-pyright error backlog (clio-relay#270).
 
 ``local.pyright`` (:func:`clio_relay.release_validation.run_local_release_validation`)
@@ -169,7 +169,7 @@ from typing import Any, NamedTuple
 # (a static attribute access on a name that no longer exists on
 # ``clio_relay.cli``) plus one adjacent count movement. Net -2, measured
 # 7569 -> 7567.
-BASELINE_TOTAL = 7567
+BASELINE_TOTAL = 7498
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
@@ -206,7 +206,7 @@ def run_pyright_json(repo_root: Path) -> dict[str, Any]:
     ``uv run``: this script already executes inside the project environment
     (release_validation launches it via ``uv run --no-sync``), and adding a
     third uv layer wedged CI's validate-local for its full 60-minute job
-    timeout (job 96602335205, 2026-08-20 — an orphaned uv child at teardown,
+    timeout (job 96602335205, 2026-08-20 â€” an orphaned uv child at teardown,
     zero output for an hour). The timeout is a generous typed runaway
     backstop for the ONE pyright exchange, never a tuning knob: expiry is a
     loud failure naming the bound, not a silent cancel.

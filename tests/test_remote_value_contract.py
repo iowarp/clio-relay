@@ -7,12 +7,12 @@ from typing import Protocol, cast
 import pytest
 
 import clio_relay.live_acceptance as live_acceptance
-import clio_relay.service_runtime as service_runtime
 import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.deployment import render_endpoint_user_service
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError
+from clio_relay.frp_remote_scripts import remote_frpc_start_script
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import (
     render_remote_shell_path,
@@ -158,11 +158,13 @@ def test_doctor_and_connector_runtime_share_safe_bin_rendering(
     assert f"JARVIS_BIN={expected_jarvis}" in doctor_scripts[0]
     assert f"AGENT_BIN={expected_agent}" in doctor_scripts[0]
 
-    connector_script_renderer = cast(
-        Callable[..., str],
-        vars(service_runtime)["_remote_frpc_start_script"],
-    )
-    connector_script = connector_script_renderer(
+    # 3b759cc (#231 split): service_runtime.py's connector-start script
+    # rendering moved to its true origin, frp_remote_scripts.py (imported
+    # there under the private alias `_remote_frpc_start_script` for its own
+    # internal use only -- same pattern as the `_remote_stop_script` move in
+    # slice 14) -- so this reaches the public name directly instead of the
+    # no-longer-bound `service_runtime._remote_frpc_start_script`.
+    connector_script = remote_frpc_start_script(
         definition=definition,
         session_id="session-contract",
         config_text="serverAddr = 'relay.example.test'\n",

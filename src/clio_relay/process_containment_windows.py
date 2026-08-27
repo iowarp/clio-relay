@@ -79,13 +79,30 @@ def _windows_process_start_identity(process_id: int) -> str | None:
     import ctypes
     from ctypes import wintypes
 
+    error_invalid_parameter = 87
+    error_access_denied = 5
+
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     handle = kernel32.OpenProcess(0x1000, False, process_id)
     if not handle:
         error = ctypes.get_last_error()
-        if error == 87:
+        if error == error_invalid_parameter:
             return None
+        if error == error_access_denied:
+            # ERROR_ACCESS_DENIED does not mean "gone": it can name a real,
+            # inspection-restricted process (clio-relay#202 D1 -- the same
+            # ambiguity `lock_holder_sidecar._windows_pid_alive` already
+            # resolves this way). Returning None here would misreport a
+            # possibly-live pid as exited to callers like
+            # `terminate_recorded_process_tree` (skip cleanup) and
+            # `_append_execution_start` (record identity for a job that
+            # just started); raising unconditionally instead crashed the
+            # unrelated caller with a raw OpenProcess error. Surface a
+            # stable, distinguishable placeholder so recorded-identity
+            # comparisons still fail closed (refuse cleanup on mismatch)
+            # without an unhandled exception.
+            return f"windows-access-denied:{process_id}"
         raise RuntimeError(f"OpenProcess failed for {process_id}: {error}")
     creation = wintypes.FILETIME()
     exit_time = wintypes.FILETIME()

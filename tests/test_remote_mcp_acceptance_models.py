@@ -3,12 +3,20 @@
 Two concerns:
 
 1. **Extraction seam** -- ``clio_relay.remote_mcp_acceptance_models`` is the
-   owner module; ``clio_relay.remote_mcp`` must re-export every model class
-   it still references directly under an identical binding (proven by
+   owner module; ``clio_relay.remote_mcp`` re-exports the model classes it
+   still references directly under an identical binding (proven by
    identity, not structural equality) so existing callers -- ``cli.py``,
    remote_mcp.py's own validator functions, and tests/test_remote_mcp.py's
    ``remote_mcp.RemoteMcpAcceptanceCheck(...)`` construction sites -- keep
-   resolving to the *same* class after the move.
+   resolving to the *same* class after the move. Per remote_mcp.py's own
+   re-export comment (c719d3c split), ``RemoteMcpCatalogIssue`` and the
+   three Spack transition-evidence sub-models (``RemoteMcpSpackTransition
+   ArtifactEvidence``/``StdioEvidence``/``CallEvidence``) are deliberately
+   NOT re-exported -- nothing outside remote_mcp_acceptance_models.py's own
+   former body reaches them through the ``remote_mcp`` namespace any more
+   (``remote_mcp_catalog_build.py`` imports ``RemoteMcpCatalogIssue`` from
+   the owner module directly), so this test only proves identity for the
+   names actually still bound.
 2. **Path-canonicalization primitive behavior** -- ``_is_canonical_absolute_posix_path``
    and ``_is_canonical_relative_posix_path`` were previously exercised only
    indirectly, as internals of the Spack evidence models' own field/model
@@ -22,12 +30,8 @@ from __future__ import annotations
 import clio_relay.remote_mcp as remote_mcp
 from clio_relay.remote_mcp_acceptance_models import (
     RemoteMcpAcceptanceReport,
-    RemoteMcpCatalogIssue,
     RemoteMcpSpackConfigurationObservation,
     RemoteMcpSpackInstallTransitionEvidence,
-    RemoteMcpSpackTransitionArtifactEvidence,
-    RemoteMcpSpackTransitionCallEvidence,
-    RemoteMcpSpackTransitionStdioEvidence,
     RemoteMcpStructuredResultExpectation,
     _is_canonical_absolute_posix_path,
     _is_canonical_relative_posix_path,
@@ -35,17 +39,10 @@ from clio_relay.remote_mcp_acceptance_models import (
 
 
 def test_remote_mcp_reexports_referenced_model_classes() -> None:
-    assert remote_mcp.RemoteMcpCatalogIssue is RemoteMcpCatalogIssue
     assert remote_mcp.RemoteMcpStructuredResultExpectation is RemoteMcpStructuredResultExpectation
-    assert (
-        remote_mcp.RemoteMcpSpackTransitionArtifactEvidence
-        is RemoteMcpSpackTransitionArtifactEvidence
-    )
-    assert remote_mcp.RemoteMcpSpackTransitionStdioEvidence is RemoteMcpSpackTransitionStdioEvidence
     assert (
         remote_mcp.RemoteMcpSpackConfigurationObservation is RemoteMcpSpackConfigurationObservation
     )
-    assert remote_mcp.RemoteMcpSpackTransitionCallEvidence is RemoteMcpSpackTransitionCallEvidence
     assert (
         remote_mcp.RemoteMcpSpackInstallTransitionEvidence
         is RemoteMcpSpackInstallTransitionEvidence
