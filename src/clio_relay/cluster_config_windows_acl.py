@@ -91,10 +91,32 @@ def _verify_private_windows_acl(
     *,
     directory: bool,
     expected_owner_sid: str,
+    default_owner_sid: str | None = None,
     advapi32: Any,
     kernel32: Any,
     path: Path,
 ) -> None:
+    """Verify the exact owner-private ACL, optionally accepting a second owner.
+
+    `default_owner_sid` defaults `None`, preserving the exact prior behavior
+    for the existing (write-side, post-hardening) caller in
+    `cluster_config_windows_paths._set_private_windows_acl`, which by that
+    point in its own owner-normalization dance has already driven the real
+    owner to `expected_owner_sid` -- accepting a second SID there would only
+    weaken a check that should already be exact.
+
+    The read-only verifier (`cluster_config_windows_read_verify`) passes the
+    real `default_owner_sid` (clio-relay#289, D5): a pre-existing config
+    created under an elevated token can legitimately still be owned by that
+    token's default owner (commonly BUILTIN\\Administrators, iowarp/clio-
+    relay#30's migration case) without having ever been touched by a write.
+    The write side already treats that as an acceptable starting owner
+    before normalizing it (`_set_private_windows_acl`'s own
+    `_require_current_windows_owner(..., default_owner_sid=default_owner_sid, ...)`
+    call); the read verifier must accept the identical starting state as
+    non-drift instead of flagging every read of a #30-migrated config as an
+    owner mismatch.
+    """
     get_security = advapi32.GetSecurityInfo
     get_security.argtypes = [
         ctypes.c_void_p,
@@ -135,6 +157,7 @@ def _verify_private_windows_acl(
         _windows_primitives._require_current_windows_owner(
             owner_sid=owner_sid,
             user_sid=expected_owner_sid,
+            default_owner_sid=default_owner_sid,
             path=path,
         )
         if dacl.value is None:

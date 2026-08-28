@@ -24,6 +24,7 @@ from clio_relay.cluster_config_io import (
     MAX_CLUSTER_REGISTRY_BYTES,
     _fsync_directory,
     read_bounded_configuration_bytes,
+    verify_private_configuration_path,
 )
 from clio_relay.cluster_config_models import ClusterDefinition, _validated_cluster_label
 from clio_relay.cluster_config_windows_paths import (
@@ -98,8 +99,22 @@ class ClusterRegistry(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> ClusterRegistry:
-        """Load a registry from disk, creating defaults if the file is absent."""
-        ensure_private_configuration_directory(path.parent)
+        """Load a registry from disk, creating defaults if the file is absent.
+
+        clio-relay#289 D2/D3: this is a read, so the parent directory gets
+        the verify-with-heal-on-drift treatment
+        (`verify_private_configuration_path`, zero `SetSecurityInfo` when
+        already clean) rather than the unconditional-apply
+        `ensure_private_configuration_directory` every write/create path
+        still uses. When the directory does not exist yet (first use), it
+        is a genuine bootstrap -- there is nothing to verify -- so this
+        still calls `ensure_private_configuration_directory` to create and
+        harden it, identically to before.
+        """
+        if path.parent.exists():
+            verify_private_configuration_path(path.parent, directory=True)
+        else:
+            ensure_private_configuration_directory(path.parent)
         if not path.exists():
             with FileLock(f"{path}.lock"):
                 if not path.exists():

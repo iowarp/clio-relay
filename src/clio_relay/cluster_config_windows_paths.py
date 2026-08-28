@@ -194,7 +194,21 @@ def _open_windows_configuration_handle(
     directory: bool,
     kernel32: Any,
     write_owner: bool = False,
+    request_write_dac: bool = True,
 ) -> ctypes.c_void_p:
+    """Open an existing configuration path and validate its handle.
+
+    `request_write_dac` defaults True -- every existing caller (the write
+    side hardening/verifying a path it may need to re-ACL) needs it and gets
+    identical behavior to before this parameter existed. clio-relay#289
+    read-path fix: a pure read-only verifier passes `request_write_dac=False`
+    since it never calls `SetSecurityInfo`. This is not just narrower
+    privilege -- it changes what a wrong-mask ACL (e.g. an OWNER RIGHTS ACE
+    that denies WRITE_DAC even to the owner) produces: requesting a right the
+    caller doesn't need and won't use turns a diagnosable "ACL is wrong"
+    outcome into an opaque `CreateFileW` `ERROR_ACCESS_DENIED (5)` before
+    `_validate_windows_configuration_handle` or the ACL verifier ever run.
+    """
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
         ctypes.c_wchar_p,
@@ -209,7 +223,9 @@ def _open_windows_configuration_handle(
     flags = _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
         flags |= _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
-    desired_access = _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL | _WINDOWS_WRITE_DAC
+    desired_access = _WINDOWS_GENERIC_READ | _WINDOWS_READ_CONTROL
+    if request_write_dac:
+        desired_access |= _WINDOWS_WRITE_DAC
     if write_owner:
         desired_access |= _WINDOWS_WRITE_OWNER
     raw_handle = create_file(

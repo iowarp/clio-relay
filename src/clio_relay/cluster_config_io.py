@@ -9,12 +9,16 @@ Platform-agnostic -- the Windows-specific ACL enforcement itself lives in the
 patches it).
 
 `verify_private_configuration_path` (clio-relay#289) is the platform-agnostic
-read-path entry point: it VERIFIES existing private protections rather than
-RE-APPLYING them, dispatching on Windows to the read-only
-`cluster_config_windows_read_verify` owner module instead of the write-side
-`ensure_private_configuration_path`. Every genuine read path in this module
-calls it; write/create paths elsewhere keep calling
-`ensure_private_configuration_path` directly and are unaffected.
+read-path entry point: on Windows it VERIFIES existing private protections
+first and only re-applies them on detected drift -- loudly, via a structured
+warning, never silently -- dispatching to the read-only
+`cluster_config_windows_read_verify` owner module (VERIFY-then-HEAL-LOUDLY;
+see that module's docstring for the controller design ruling and why an
+outright refusal was rejected). POSIX is unchanged: its `ensure_private_
+configuration_path` branch is already a pure stat check with no mutation, so
+it is called directly. Every genuine read path in this module calls
+`verify_private_configuration_path`; write/create paths elsewhere keep
+calling `ensure_private_configuration_path` directly and are unaffected.
 """
 
 from __future__ import annotations
@@ -92,32 +96,31 @@ def read_bounded_configuration_bytes(path: Path, *, max_bytes: int) -> bytes:
 
 
 def verify_private_configuration_path(path: Path, *, directory: bool) -> None:
-    """Verify -- never re-apply -- private configuration protections on a read.
+    """Verify private configuration protections on a read; heal drift loudly.
 
     The read-path counterpart to `cluster_config_windows_paths.
     ensure_private_configuration_path`. On POSIX, delegates to it directly:
     that function's non-Windows branch is already a pure stat/ownership/mode
     check with no mutation, so a read path can call it unchanged (mirrors
-    the same shape rather than duplicating it). On Windows, calls the new
-    read-only verifier (`cluster_config_windows_read_verify.
-    verify_private_configuration_windows_path`) instead of
-    `ensure_private_configuration_path`'s Windows branch, which re-applies
-    (`SetSecurityInfo`) the ACL on every call.
+    the same shape rather than duplicating it) -- no POSIX regression
+    motivated a change there. On Windows, calls the read-only verifier
+    (`cluster_config_windows_read_verify.
+    verify_private_configuration_windows_path`): a clean path costs zero
+    `SetSecurityInfo` calls (the write side's `SetSecurityInfo` write is
+    what stalled for seconds under LSA network-resolution flakiness); a
+    DRIFTED path is healed by calling the existing, trusted write path and
+    reporting the heal via a structured, typed warning -- never silently,
+    and never a bare refusal. See `cluster_config_windows_read_verify`'s
+    module docstring for the controller design ruling (clio-relay#289,
+    2026-08-28) this implements and why an unconditional refusal on drift
+    was rejected: it broke ten in-tree tests and the documented
+    hand-edit-the-registry workflow, both of which produce a legitimately
+    unhardened file/directory that is not tampering.
 
-    That re-apply is correct and required on write/create paths
-    (`open_private_atomic_file`, `create_private_configuration_directory`,
-    `ensure_private_configuration_directory`, all unchanged). On a read path
-    it is wasted work and, under LSA network-resolution flakiness, a
-    multi-second-per-call stall for no security benefit: the OS already
-    enforces the installed ACL on every access, so a read only needs to
-    confirm that ACL still holds. Per the clio-relay#289 owner ruling
-    (2026-08-28), "you apply them and then let the OS check on reads;
-    re-applying them has no value."
-
-    Raises `ConfigurationError` naming the path -- never silently heals --
-    when protections have drifted from the private set the write side
-    installs. Re-applying on a read would silently overwrite (and thereby
-    mask) evidence of tampering, which is strictly weaker than refusing.
+    Write/create paths (`open_private_atomic_file`,
+    `create_private_configuration_directory`,
+    `ensure_private_configuration_directory`) are unaffected and keep
+    unconditionally applying+verifying the ACL exactly as before.
     """
     if os.name != "nt":
         # Function-scope import: cluster_config_windows_paths imports
