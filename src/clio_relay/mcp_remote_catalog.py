@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -64,8 +65,17 @@ MCP_PROFILE_ENV = "CLIO_RELAY_MCP_PROFILE"
 def _tool_definitions_and_remote_catalog(
     *,
     profile: str | None = None,
+    registry_path: Path | None = None,
 ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
     """Render tools and return the exact remote catalog used for this list.
+
+    ``registry_path`` (clio-relay#289) is the explicit local cluster-registry
+    override threaded down from ``RelaySettings.cluster_registry_path`` via
+    ``create_fastmcp_server`` -> ``RelayToolProvider`` -> ``mcp_tool_
+    definitions_and_remote_catalog``. ``None`` (unchanged default) leaves
+    every reader below to fall back to ``default_registry_path()`` lazily,
+    exactly as before this parameter existed -- production behavior with no
+    explicit path is identical.
 
     ``_remote_mcp_catalog``/``_configured_cluster_names`` are reached through
     the `_mcp_server` back-reference, not a same-module bare call, even
@@ -84,8 +94,9 @@ def _tool_definitions_and_remote_catalog(
     catalog = _mcp_server._remote_mcp_catalog(
         profile=normalized,
         reserved_names=reserved_names,
+        registry_path=registry_path,
     )
-    configured_clusters = _mcp_server._configured_cluster_names()
+    configured_clusters = _mcp_server._configured_cluster_names(registry_path=registry_path)
     jarvis_clusters = _bound_virtual_jarvis_clusters(catalog)
     tools = _all_tool_definitions(
         clusters=configured_clusters,
@@ -154,13 +165,17 @@ def _remote_mcp_catalog(
     *,
     profile: str,
     reserved_names: set[str],
+    registry_path: Path | None = None,
 ) -> VirtualRemoteMcpCatalog:
     try:
         catalog = load_virtual_remote_mcp_catalog(
             profile=profile,
             reserved_names=reserved_names,
+            registry_path=registry_path,
         )
-        cache = RemoteMcpSchemaCache.load(default_remote_mcp_cache_path())
+        cache = RemoteMcpSchemaCache.load(
+            default_remote_mcp_cache_path(registry_path=registry_path)
+        )
     except (ConfigurationError, OSError, ValidationError) as exc:
         return unavailable_virtual_remote_mcp_catalog(str(exc))
     now = datetime.now(UTC)
@@ -189,13 +204,13 @@ def _remote_mcp_catalog(
     )
 
 
-def _configured_cluster_names() -> list[str]:
+def _configured_cluster_names(*, registry_path: Path | None = None) -> list[str]:
     """Return the stable cluster labels available to local agent tools."""
-    registry_path = default_registry_path()
-    if not registry_path.exists():
+    resolved_registry_path = registry_path or default_registry_path()
+    if not resolved_registry_path.exists():
         return []
     try:
-        return sorted(ClusterRegistry.load(registry_path).clusters)
+        return sorted(ClusterRegistry.load(resolved_registry_path).clusters)
     except (ConfigurationError, OSError, ValidationError):
         return []
 

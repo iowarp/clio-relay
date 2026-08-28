@@ -64,6 +64,15 @@ class RelaySettings(BaseModel):
 
     core_dir: Path = Field(default_factory=lambda: Path(".clio-relay/core"))
     spool_dir: Path = Field(default_factory=lambda: Path(".clio-relay/spool"))
+    #: Explicit override for the local cluster-registry path threaded through
+    #: to ``load_virtual_remote_mcp_catalog``/``_configured_cluster_names``
+    #: (clio-relay#289). ``None`` (the default, unchanged production
+    #: behavior) means every reader falls back to ``default_registry_path()``
+    #: lazily, exactly as before this field existed -- this is deliberately
+    #: NOT a ``default_factory=default_registry_path`` field, since that
+    #: would bake the checkout-local fallback into every settings object at
+    #: construction time instead of leaving it a per-call decision.
+    cluster_registry_path: Path | None = None
     spool_max_log_bytes_per_stream: int = Field(
         default=DEFAULT_MAX_LOG_BYTES_PER_STREAM,
         ge=1,

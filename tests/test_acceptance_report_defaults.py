@@ -85,8 +85,33 @@ from clio_relay.validation_report import (
 @pytest.fixture(autouse=True)
 def _local_cli(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    """Pin the CLI mode and the cleanup-evidence lock directory (clio-relay#289).
+
+    ``session teardown``/``session detach`` acquire a crash-released flock on
+    ``<install-receipt-parent>/.clio-cleanup-evidence-v1.lock`` (see
+    ``cli_cleanup_evidence._acquire_cleanup_evidence_lock``). That parent is
+    ``default_install_receipt_path().parent`` -- ``Path.home() / ".local" /
+    "share" / "clio-relay"`` by default -- which is keyed on the user's home
+    directory, NOT the process cwd, so ``monkeypatch.chdir(tmp_path)`` alone
+    never isolates it: every test process on this machine, and any real
+    concurrently-running ``clio-relay session teardown``, contend on the
+    exact same lock file regardless of cwd (live-proven evidence: a real
+    ares recovery teardown collided with this suite's own session-teardown
+    tests, both racing for that one shared home-scoped lock, producing
+    ``RelayError('another cleanup is writing evidence in this directory')``).
+    Pinning ``CLIO_RELAY_INSTALL_RECEIPT`` into ``tmp_path`` -- the existing
+    seam ``default_install_receipt_path`` already reads -- gives every test
+    its own private lock directory, matching the established convention in
+    ``tests/test_cli.py``/``tests/test_cli_session.py`` (and every other
+    ``test_cli_*.py`` sibling) that this file was missing.
+    """
     monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
+    monkeypatch.setenv(
+        "CLIO_RELAY_INSTALL_RECEIPT",
+        str(tmp_path / "relay-state" / "install-receipt.json"),
+    )
 
 
 def _write_cluster(root: Path, name: str = "test-cluster") -> None:
