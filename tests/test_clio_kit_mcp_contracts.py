@@ -36,6 +36,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_user_contract,
 )
 from clio_relay.remote_mcp import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_ARTIFACT_SHA256_BY_ID,
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ARTIFACT_BY_ID,
     CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID,
@@ -63,10 +64,49 @@ CONTRACT_PROJECTION = "mcp-agent-tool-schema-v1"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 16 * 1024 * 1024
 EXPECTED_CONTRACTS = {
+    "clio-kit-jarvis-user-v3.7.2": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.7.2.json",
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
+    "clio-kit-jarvis-user-v3.7.1": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.7.1.json",
+        "contract_sha256": "ede2e48f7201d3e072bd24713ea15f5e4a714a8d52974d884d956fc400174849",
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
+    "clio-kit-jarvis-user-v3.7": {
+        "server_name": "jarvis",
+        "artifact": "jarvis-user-v3.7.json",
+        "contract_sha256": "d34761523f39e75b144a0567eb368c3cb51c199ea40da0010aaf572afdd2cec4",
+        "tool_names": {
+            "jarvis_add_step",
+            "jarvis_create_pipeline",
+            "jarvis_describe",
+            "jarvis_edit_step",
+            "jarvis_get_execution",
+            "jarvis_run",
+        },
+    },
     "clio-kit-jarvis-user-v3.6": {
         "server_name": "jarvis",
         "artifact": "jarvis-user-v3.6.json",
-        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
+        "contract_sha256": CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID["clio-kit-jarvis-user-v3.6"],
         "tool_names": {
             "jarvis_add_step",
             "jarvis_create_pipeline",
@@ -241,6 +281,9 @@ ACTIVE_CONTRACT_IDS = frozenset(EXPECTED_CONTRACTS) - {
     "clio-kit-jarvis-user-v3.3",
     "clio-kit-jarvis-user-v3.4",
     "clio-kit-jarvis-user-v3.5",
+    "clio-kit-jarvis-user-v3.6",
+    "clio-kit-jarvis-user-v3.7",
+    "clio-kit-jarvis-user-v3.7.1",
     "clio-kit-scientific-catalog-user-v1",
     "clio-kit-spack-user-v2",
 }
@@ -313,7 +356,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         assert artifact["contract_sha256"] == expected["contract_sha256"]
         assert set(cast(list[str], artifact["tool_names"])) == expected["tool_names"]
 
-    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.6"])
+    jarvis_tools = _tools_by_name(shipped_contracts["clio-kit-jarvis-user-v3.7.2"])
     artifact_projection = {
         name: {
             "description": tool.get("description"),
@@ -407,6 +450,10 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "artifact_id",
         "page_size",
         "cursor",
+        # v3.7.x addition (clio-relay#288 recert to kit 2.10.5): a bounded
+        # tail-read filter for role="log" artifacts -- verified against the
+        # live shipped v3.7.2 artifact, not a relaxation of this assertion.
+        "content_max_bytes",
     }
     assert artifact_query_properties["page_size"] == {
         "default": 50,
@@ -469,7 +516,7 @@ def test_relay_contract_pins_match_clio_kit_wheel_artifacts(
         "type": "object",
     }
     assert "token" not in cast(JSON, authorization["properties"])
-    assert shipped_contracts["clio-kit-jarvis-user-v3.6"]["wire_sha256"] == (
+    assert shipped_contracts["clio-kit-jarvis-user-v3.7.2"]["wire_sha256"] == (
         CLIO_KIT_JARVIS_USER_WIRE_SHA256
     )
 

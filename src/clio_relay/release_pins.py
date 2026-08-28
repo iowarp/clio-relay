@@ -413,7 +413,7 @@ def sweep_incompleteness(root: Path) -> tuple[UnregisteredHit, ...]:
 #: this literal (never widen it to a general vX.Y[.Z] wildcard) each time
 #: "current" advances -- exactly the same discipline every other pin site
 #: in this registry already follows.
-_CURRENT_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-v3\.7\.1\b")
+_CURRENT_CONTRACT = re.compile(r"(?:clio-kit-)?jarvis-user-v3\.7\.2\b")
 #: Files naming a v3.7 path or literal as registry metadata or test-fixture
 #: sample data, not an unowned duplicate pin: this module and its
 #: companion data table (their own docstrings/row data), and this sweep's

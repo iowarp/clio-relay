@@ -420,7 +420,7 @@ def test_an_unregistered_v37_literal_is_named_by_the_sweep(tmp_path: Path) -> No
     package_dir = tmp_path / "src" / "clio_relay"
     package_dir.mkdir(parents=True)
     (package_dir / "new_module.py").write_text(
-        'STALE_COPY = "clio-kit-jarvis-user-v3.7.1"\n', encoding="utf-8"
+        'STALE_COPY = "clio-kit-jarvis-user-v3.7.2"\n', encoding="utf-8"
     )
 
     hits = sweep_jarvis_contract_v37_completeness(tmp_path)
@@ -450,10 +450,10 @@ def test_an_unregistered_v37_literal_in_docs_markdown_is_named_by_the_sweep(
     ai_dir = docs_dir / "ai"
     ai_dir.mkdir(parents=True)
     (docs_dir / "some-guide.md").write_text(
-        "Exact `clio-kit-jarvis-user-v3.7.1` routes support staging.\n", encoding="utf-8"
+        "Exact `clio-kit-jarvis-user-v3.7.2` routes support staging.\n", encoding="utf-8"
     )
     (ai_dir / "some-context.md").write_text(
-        "Registered `clio-kit-jarvis-user-v3.7.1` gates the staging plane.\n", encoding="utf-8"
+        "Registered `clio-kit-jarvis-user-v3.7.2` gates the staging plane.\n", encoding="utf-8"
     )
 
     hits = sweep_jarvis_contract_v37_completeness(tmp_path)
@@ -463,7 +463,7 @@ def test_an_unregistered_v37_literal_in_docs_markdown_is_named_by_the_sweep(
 
 
 def test_docs_design_prose_about_the_registry_is_not_swept(tmp_path: Path) -> None:
-    """docs/design/ is deliberately shallow-excluded: it discusses v3.7.1 as prose
+    """docs/design/ is deliberately shallow-excluded: it discusses v3.7.2 as prose
 
     about the pin registry itself (this section's own audit language), not a
     duplicate pin -- sweeping it recursively would flag the document that
@@ -472,7 +472,7 @@ def test_docs_design_prose_about_the_registry_is_not_swept(tmp_path: Path) -> No
     design_dir = tmp_path / "docs" / "design"
     design_dir.mkdir(parents=True)
     (design_dir / "relay-architecture-2026-08.md").write_text(
-        "The registry tracks `clio-kit-jarvis-user-v3.7.1` sites.\n", encoding="utf-8"
+        "The registry tracks `clio-kit-jarvis-user-v3.7.2` sites.\n", encoding="utf-8"
     )
 
     assert sweep_jarvis_contract_v37_completeness(tmp_path) == ()

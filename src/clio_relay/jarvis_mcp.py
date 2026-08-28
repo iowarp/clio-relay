@@ -29,14 +29,14 @@ from clio_relay.remote_mcp import (
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
 
-CLIO_KIT_JARVIS_MCP_VERSION = "2.10.3"
+CLIO_KIT_JARVIS_MCP_VERSION = "2.10.5"
 CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME = f"clio_kit-{CLIO_KIT_JARVIS_MCP_VERSION}-py3-none-any.whl"
 CLIO_KIT_JARVIS_MCP_WHEEL_URL = (
     "https://github.com/iowarp/clio-kit/releases/download/"
     f"v{CLIO_KIT_JARVIS_MCP_VERSION}/{CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME}"
 )
 CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 = (
-    "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
+    "954c2f76aef96ad1a69717f693b15f76d6fa0a3cd1d2ae417baf2830c73c3a67"
 )
 CLIO_KIT_JARVIS_USER_CONTRACT_ID = "clio-kit-jarvis-user-v3.7.2"
 DEFAULT_JARVIS_MCP_COMMAND = [

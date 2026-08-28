@@ -2005,8 +2005,11 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: in the review-fix round, execution_watch_prediction.py (122 lines),
 #: raising it to 480/621 = 77.29%; iowarp/clio-relay#285 added
 #: frp_visitor_reconciliation.py + frp_visitor_process_inspection.py, both
-#: sweet-spot-sized owner modules). May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 77.36
+#: sweet-spot-sized owner modules; clio-relay#288 recert (kit 2.10.5) split
+#: release_pin_sites_jarvis_tests.py out of release_pin_sites.py (same
+#: no-accretion move as release_pin_sites_kit.py before it), raising it to
+#: 483/624 = 77.40%). May only RISE.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 77.40
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
