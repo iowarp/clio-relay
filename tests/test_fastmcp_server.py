@@ -27,7 +27,11 @@ from fastmcp_tasks.client_models import (
 from fastmcp_tasks.models import MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp.shared.exceptions import MCPError
 
+import clio_relay.cluster_config as cluster_config_module
 import clio_relay.fastmcp_server as fastmcp_server_module
+import clio_relay.mcp_remote_catalog as mcp_remote_catalog_module
+import clio_relay.remote_mcp_cache as remote_mcp_cache_module
+import clio_relay.remote_mcp_catalog_build as remote_mcp_catalog_build_module
 from clio_relay import door_errors
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
@@ -60,6 +64,46 @@ from clio_relay.spool import JobSpool
 JSON = dict[str, Any]
 
 
+@pytest.fixture(autouse=True)
+def _default_registry_path_is_unreachable(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermeticity proof (clio-relay#289): every fastmcp-server construction
+    in this file must pin its own ``RelaySettings.cluster_registry_path``
+    into ``tmp_path`` rather than falling back to ``default_registry_path()``
+    -- the checkout-local ``.clio-relay/clusters.json`` that a live-proven
+    ~5s-per-load ACL stall (SetSecurityInfo under LSA slowness) made this
+    whole file's ``relay_observe ... until_pattern`` tests fail deterministically
+    (issue evidence: 15/15 loads, 4.4-5.1s each).
+
+    ``default_registry_path`` is patched to raise in every module that holds
+    its own bare-imported binding of it -- ``mcp_remote_catalog``
+    (``_configured_cluster_names``), ``remote_mcp_catalog_build``
+    (``load_virtual_remote_mcp_catalog``), and ``remote_mcp_cache``
+    (``default_remote_mcp_cache_path``) -- plus the origin ``cluster_config``
+    module itself for defense in depth. Python name bindings are copied at
+    import time, so patching only ``cluster_config.default_registry_path``
+    would leave each bare-imported copy dead and this guard toothless.
+
+    Pre-fix (no explicit ``registry_path``/``cluster_registry_path`` thread),
+    every one of this file's ``create_fastmcp_server``-backed tests reaches
+    one of these functions and this fixture's raise fires; post-fix, none
+    of them do.
+    """
+
+    def _unreachable() -> Path:
+        raise AssertionError(
+            "default_registry_path() was reached from a test-constructed fastmcp "
+            "server -- pin RelaySettings.cluster_registry_path (or the registry_path "
+            "parameter it threads through) into tmp_path instead (clio-relay#289)"
+        )
+
+    monkeypatch.setattr(cluster_config_module, "default_registry_path", _unreachable)
+    monkeypatch.setattr(mcp_remote_catalog_module, "default_registry_path", _unreachable)
+    monkeypatch.setattr(remote_mcp_catalog_build_module, "default_registry_path", _unreachable)
+    monkeypatch.setattr(remote_mcp_cache_module, "default_registry_path", _unreachable)
+
+
 def _observe_job(
     job: RelayJob,
     *,
@@ -85,7 +129,9 @@ def _task_server(
     queue: ClioCoreQueue,
 ) -> FastMCP[dict[str, Any]]:
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     tool = RelayTool(
         definition,
@@ -204,7 +250,9 @@ def _guarded_task_server(
     queue: ClioCoreQueue,
 ) -> FastMCP[dict[str, Any]]:
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     server: FastMCP[dict[str, Any]] = FastMCP(
         "relay-guarded-task-test",
@@ -230,6 +278,7 @@ def test_fastmcp_factory_advertises_tasks_and_preserves_user_catalog(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -255,9 +304,12 @@ def test_fastmcp_provider_exposes_dynamic_catalog_revision(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
-    definitions, catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     revision = "a" * 64
     dynamic_definition: JSON = {
         "name": "remote_demo_echo",
@@ -274,7 +326,10 @@ def test_fastmcp_provider_exposes_dynamic_catalog_revision(
         },
     }
 
-    def dynamic_catalog(*, profile: str) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+    def dynamic_catalog(
+        *, profile: str, registry_path: Path | None = None
+    ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+        del registry_path
         assert profile == "user"
         return (
             [*definitions, dynamic_definition],
@@ -339,9 +394,12 @@ def test_fastmcp_tools_list_forwards_remote_tool_titles(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
-    definitions, catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     raw_wire_tools: JSON = {
         "remote_demo_explicit_title": {
             "name": "remote_demo_explicit_title",
@@ -381,7 +439,10 @@ def test_fastmcp_tools_list_forwards_remote_tool_titles(
     assert projected_definitions["remote_demo_annotations_title"]["title"] == "Annotated Title"
     assert "title" not in projected_definitions["remote_demo_no_title"]
 
-    def dynamic_catalog(*, profile: str) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+    def dynamic_catalog(
+        *, profile: str, registry_path: Path | None = None
+    ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+        del registry_path
         assert profile == "user"
         return (
             [*definitions, *projected_definitions.values()],
@@ -413,14 +474,20 @@ def test_fastmcp_factory_tasks_virtual_jarvis_tool(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
-    definitions, catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     submit_definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     virtual_definition = {**submit_definition, "name": "jarvis_describe"}
     original_call = fastmcp_server_module.call_mcp_tool
 
-    def virtual_catalog(*, profile: str) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+    def virtual_catalog(
+        *, profile: str, registry_path: Path | None = None
+    ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
+        del registry_path
         assert profile == "user"
         return (
             [virtual_definition],
@@ -473,6 +540,7 @@ def test_official_fastmcp_tool_task_projects_job_and_survives_reopen(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -545,6 +613,7 @@ def test_agent_task_parks_post_admission_input_and_resumes_with_answer(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -752,6 +821,7 @@ def test_agent_task_admission_engages_without_the_followup_opt_in(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -794,6 +864,7 @@ def test_agent_task_admission_is_terminal_at_birth_for_instant_settling_calls(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -841,6 +912,7 @@ def test_official_fastmcp_tool_task_cancel_uses_relay_cancellation(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -867,6 +939,7 @@ def test_transparent_fastmcp_call_tool_polls_relay_task_to_completion(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -898,7 +971,11 @@ def test_relay_observe_until_pattern_returns_before_terminal(
     tmp_path: Path,
 ) -> None:
     """A matching streamed log returns while the durable job is still running."""
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
         RelayJob(
@@ -939,7 +1016,11 @@ def test_relay_observe_until_pattern_returns_terminal_without_match(
     tmp_path: Path,
 ) -> None:
     """A pattern observation returns the terminal snapshot with matched=false."""
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
         RelayJob(
@@ -974,7 +1055,11 @@ def test_relay_observe_until_pattern_rejects_invalid_regex_as_typed_refusal(
     tmp_path: Path,
 ) -> None:
     """Regex syntax failures use the relay's queryable refusal reason."""
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
         RelayJob(
@@ -1008,7 +1093,11 @@ def test_relay_observe_until_pattern_bounds_huge_matching_line(
     tmp_path: Path,
 ) -> None:
     """A match excerpt remains within the byte budget even for a huge line."""
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     job = queue.submit_job(
         RelayJob(
@@ -1046,6 +1135,7 @@ def test_task_capability_is_visible_without_starting_docket(tmp_path: Path) -> N
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -1072,6 +1162,7 @@ def test_task_methods_require_the_client_extension_capability(tmp_path: Path) ->
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -1109,6 +1200,7 @@ def test_task_methods_are_not_available_on_legacy_protocol(tmp_path: Path) -> No
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -1132,6 +1224,7 @@ def test_streamable_http_requires_bearer_authentication(tmp_path: Path) -> None:
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
         api_token="relay-http-secret",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = create_fastmcp_server(
@@ -1166,6 +1259,7 @@ def test_http_task_management_rejects_mcp_name_header_mismatch(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -1193,6 +1287,7 @@ def test_official_tool_task_reattaches_over_new_http_client(tmp_path: Path) -> N
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -1233,6 +1328,7 @@ def test_failed_relay_job_is_completed_task_with_tool_error(tmp_path: Path) -> N
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
 
@@ -1265,6 +1361,7 @@ def test_official_client_answers_durable_input_required_task(tmp_path: Path) -> 
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     elicitation_messages: list[str] = []
@@ -1318,6 +1415,7 @@ def test_task_input_updates_are_partial_replay_safe_and_cas_retrying(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
@@ -1370,10 +1468,13 @@ def test_task_projection_is_idempotent_bounded_and_conflict_checked(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     tool = RelayTool(
         definition,
@@ -1571,10 +1672,13 @@ def test_task_projection_conflict_check_ignores_relay_control_only_arguments(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     tool = RelayTool(
         definition,
@@ -1634,6 +1738,7 @@ def test_task_projection_conflict_surfaces_as_typed_mcp_error(tmp_path: Path) ->
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -1682,6 +1787,7 @@ def test_legacy_queue_state_during_task_creation_keeps_foreign_text_private(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -1738,6 +1844,7 @@ def test_task_persistence_untyped_failure_surfaces_as_typed_error_v1(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -1821,6 +1928,7 @@ def test_park_agent_input_cas_exhaustion_is_never_mistyped_as_invalid_params(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     server = _task_server(settings, queue)
@@ -2103,7 +2211,9 @@ def _live_relay_job(job_id: str, *, state: JobState, tool: str) -> JSON:
 
 
 def _make_tool(runtime: RelayMcpRuntime) -> RelayTool:
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=runtime.settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     return RelayTool(definition, runtime=runtime, catalog_revision=None, task_capable=True)
 
@@ -2133,7 +2243,11 @@ def test_create_task_eager_promotion_matches_the_lazy_first_poll_document(
     both now run through the SAME shared function
     (``RelayMcpRuntime._terminal_completed_result``)."""
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
     tool = _make_tool(runtime)
@@ -2250,7 +2364,11 @@ def test_create_task_eager_promotion_preserves_a_failed_dispatchs_evidence(
     (job_3544b072....json), which genuinely reached ``completed_result`` in
     production."""
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
     tool = _make_tool(runtime)
@@ -2356,7 +2474,11 @@ def test_create_task_does_not_promote_a_cancelled_at_birth_job(
     its honest ``cancelled`` branch instead of the shadowed
     ``completed_result is not None`` branch."""
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
     tool = _make_tool(runtime)
@@ -2430,7 +2552,11 @@ def test_create_task_degrades_to_lazy_resolution_when_eager_transport_fails(
     eager path would have produced. Degradation is safe, not silent, and
     never a lost dispatch."""
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
     tool = _make_tool(runtime)
@@ -2525,10 +2651,13 @@ def test_task_get_wraps_a_status_reconciliation_failure_as_a_typed_error(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     tool = RelayTool(
         definition,
@@ -2656,6 +2785,7 @@ def test_guarded_input_round_completes_before_relay_task_creation(
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
     )
     queue = ClioCoreQueue(settings.core_dir)
     elicitation_count = 0

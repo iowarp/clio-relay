@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import mcp_types
@@ -102,7 +103,12 @@ class RelayToolProvider(Provider):
         self._runtime = runtime
 
     async def _definitions(self) -> tuple[list[JSON], str]:
-        return await asyncio.to_thread(lambda: _definitions_with_revision(self._runtime.profile))
+        return await asyncio.to_thread(
+            lambda: _definitions_with_revision(
+                self._runtime.profile,
+                self._runtime.settings.cluster_registry_path,
+            )
+        )
 
     async def _list_tools(self) -> Sequence[Tool]:
         definitions, revision = await self._definitions()
@@ -159,8 +165,14 @@ def _task_capable_tool_name(name: str, static_names: set[str]) -> bool:
     )
 
 
-def _definitions_with_revision(profile: str) -> tuple[list[JSON], str]:
+def _definitions_with_revision(
+    profile: str,
+    registry_path: Path | None = None,
+) -> tuple[list[JSON], str]:
     import clio_relay.fastmcp_server as fastmcp_server
 
-    definitions, catalog = fastmcp_server.mcp_tool_definitions_and_remote_catalog(profile=profile)
+    definitions, catalog = fastmcp_server.mcp_tool_definitions_and_remote_catalog(
+        profile=profile,
+        registry_path=registry_path,
+    )
     return definitions, catalog.revision

@@ -145,8 +145,12 @@ def _bind_virtual_jarvis_catalog(
     """Give a focused dispatch test one already-discovered JARVIS artifact binding."""
     original_catalog = mcp_server_module._remote_mcp_catalog  # pyright: ignore[reportPrivateUsage]
 
-    def bound_catalog(*, profile: str, reserved_names: set[str]) -> object:
-        catalog = original_catalog(profile=profile, reserved_names=reserved_names)
+    def bound_catalog(
+        *, profile: str, reserved_names: set[str], registry_path: Path | None = None
+    ) -> object:
+        catalog = original_catalog(
+            profile=profile, reserved_names=reserved_names, registry_path=registry_path
+        )
         return replace(
             catalog,
             jarvis_artifact_bindings={
@@ -538,11 +542,15 @@ def test_mcp_omits_unbound_built_in_jarvis_but_keeps_registered_alias(
         *,
         profile: str,
         reserved_names: set[str],
+        registry_path: Path | None = None,
     ) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+        del profile, reserved_names, registry_path
         return catalog
 
-    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", lambda: ["ares"])
+    def configured_ares_only(**_kwargs: object) -> list[str]:
+        return ["ares"]
+
+    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", configured_ares_only)
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
     queue = ClioCoreQueue(tmp_path / "core")
     session = McpSessionState()
@@ -606,14 +614,18 @@ def test_mcp_limits_built_in_jarvis_schema_to_bound_clusters(
         *,
         profile: str,
         reserved_names: set[str],
+        registry_path: Path | None = None,
     ) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+        del profile, reserved_names, registry_path
         return catalog
+
+    def configured_ares_and_homelab(**_kwargs: object) -> list[str]:
+        return ["ares", "homelab"]
 
     monkeypatch.setattr(
         mcp_server_module,
         "_configured_cluster_names",
-        lambda: ["ares", "homelab"],
+        configured_ares_and_homelab,
     )
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
 
@@ -648,7 +660,10 @@ def test_user_mcp_schemas_avoid_root_unions_and_preserve_exclusive_forms(
 ) -> None:
     """Keep agent-facing schemas visible to SDK clients without weakening validation."""
 
-    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", lambda: ["ares"])
+    def configured_ares_only(**_kwargs: object) -> list[str]:
+        return ["ares"]
+
+    monkeypatch.setattr(mcp_server_module, "_configured_cluster_names", configured_ares_only)
 
     response = handle_request(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
@@ -4125,8 +4140,10 @@ def test_owned_registered_remote_mcp_call_uses_authenticated_session_api(
         cluster_route_revisions={"ares": cluster_route_revision(definition)},
     )
 
-    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+    def selected_catalog(
+        *, profile: str, reserved_names: set[str], registry_path: Path | None = None
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names, registry_path
         return catalog
 
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
@@ -4670,8 +4687,10 @@ def test_virtual_remote_mcp_idempotency_replays_exactly_and_conflicts_on_drift(
         cluster_route_revisions={"alpha": cluster_route_revision(definition)},
     )
 
-    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+    def selected_catalog(
+        *, profile: str, reserved_names: set[str], registry_path: Path | None = None
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names, registry_path
         return catalog
 
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)
@@ -4767,8 +4786,10 @@ def test_generated_remote_mcp_alias_propagates_exact_fastmcp_tool_error(
         cluster_route_revisions={"ares": "d" * 64},
     )
 
-    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+    def selected_catalog(
+        *, profile: str, reserved_names: set[str], registry_path: Path | None = None
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names, registry_path
         return catalog
 
     exact_error = (
@@ -4900,8 +4921,10 @@ def test_virtual_remote_mcp_wait_envelope_returns_same_call_result_without_leaki
         cluster_route_revisions={"ares": cluster_route_revision(definition)},
     )
 
-    def selected_catalog(*, profile: str, reserved_names: set[str]) -> VirtualRemoteMcpCatalog:
-        del profile, reserved_names
+    def selected_catalog(
+        *, profile: str, reserved_names: set[str], registry_path: Path | None = None
+    ) -> VirtualRemoteMcpCatalog:
+        del profile, reserved_names, registry_path
         return catalog
 
     monkeypatch.setattr(mcp_server_module, "_remote_mcp_catalog", selected_catalog)

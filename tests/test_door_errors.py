@@ -781,7 +781,9 @@ def _fastmcp_task_server(
     queue: ClioCoreQueue,
 ) -> tuple[FastMCP[dict[str, Any]], RelayMcpRuntime, RelayTool]:
     runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(profile="user")
+    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
+        profile="user", registry_path=settings.cluster_registry_path
+    )
     definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
     tool = RelayTool(definition, runtime=runtime, catalog_revision=None, task_capable=True)
     server: FastMCP[dict[str, Any]] = FastMCP(
@@ -805,7 +807,11 @@ def test_task_input_park_conflict_is_typed_not_bare(
     internal error. Patching the runtime's own raise site proves it is now
     typed via door_errors instead.
     """
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     server, runtime, _tool = _fastmcp_task_server(settings, queue)
 
@@ -905,7 +911,11 @@ def test_mcp_error_pass_through_is_never_reclassified_by_the_owner(
     assert reclassified.reason == "internal_error"
     assert reclassified.mcp_code != original.code
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
+    )
     queue = ClioCoreQueue(settings.core_dir)
     server, runtime, tool = _fastmcp_task_server(settings, queue)
 

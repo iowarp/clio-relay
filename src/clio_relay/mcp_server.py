@@ -372,9 +372,16 @@ def normalize_mcp_profile(profile: str) -> str:
 def mcp_tool_definitions_and_remote_catalog(
     *,
     profile: str,
+    registry_path: Path | None = None,
 ) -> tuple[list[JSON], VirtualRemoteMcpCatalog]:
-    """Return the complete static and dynamic MCP tool catalog."""
-    return _tool_definitions_and_remote_catalog(profile=profile)
+    """Return the complete static and dynamic MCP tool catalog.
+
+    ``registry_path`` (clio-relay#289) threads an explicit local
+    cluster-registry override down to ``load_virtual_remote_mcp_catalog``;
+    ``None`` (unchanged default) preserves the original
+    ``default_registry_path()`` fallback exactly.
+    """
+    return _tool_definitions_and_remote_catalog(profile=profile, registry_path=registry_path)
 
 
 def call_mcp_tool(
