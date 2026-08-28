@@ -171,10 +171,19 @@ def _heal_and_warn_on_read_drift(
     opaque failure (D6's diagnosability goal applies here too: a bare
     `could not open ... (5)` from the heal attempt alone would silently
     swallow the specific, already-diagnosed drift reason).
+
+    Round-2 review N1: the write path is not guaranteed to raise only
+    `ConfigurationError` -- a raw `OSError` (e.g. `PermissionError` from an
+    underlying filesystem/CRT call the Win32 ctypes layer doesn't wrap) can
+    also escape it. Catching only `ConfigurationError` let such a failure
+    through WITHOUT the drift diagnosis attached, silently dropping exactly
+    the context this function exists to preserve. `OSError` covers
+    `ConfigurationError`'s own non-`RelayError` siblings too (`PermissionError`,
+    `FileNotFoundError`, etc. are all `OSError` subclasses).
     """
     try:
         _windows_paths.ensure_private_configuration_path(path, directory=directory)
-    except ConfigurationError as heal_failure:
+    except (ConfigurationError, OSError) as heal_failure:
         raise ConfigurationError(
             f"configuration ACL drifted and could not be healed on read: {path} "
             f"(drift: {drift}; heal failed: {heal_failure})"

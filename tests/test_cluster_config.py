@@ -885,6 +885,29 @@ def test_windows_read_verify_threads_default_owner_sid_to_acl_verification(
     allowance), by passing the real `default_owner_sid` through to
     `_verify_private_windows_acl` -- not silently dropping it as the
     original clio-relay#289 slice did.
+
+    Also proves the CALLER passes the value `_current_windows_user_sid`
+    (the caller's own, independently-fetched identity) returns as
+    `expected_owner_sid` -- never a value derived from the object's own
+    owner, which would make the comparison inside `_verify_private_
+    windows_acl` tautological (always pass, regardless of who actually
+    owns the object, since it would be comparing the object's owner to
+    itself). `test_windows_verify_private_acl_detects_real_owner_mismatch`
+    proves the CALLEE's comparison is real; this proves the CALLER supplies
+    the real value that comparison depends on.
+
+    Round-2 review finding: an earlier version of this test computed its
+    own "expected" value from the SAME real, unmocked
+    `_current_windows_user_sid` the correct call site also uses -- against
+    a file this test process itself just hardened, that value is IDENTICAL
+    to the file's actual owner, so a mutation that rebinds the call site's
+    `expected_owner_sid=` to the object's own owner (the reviewer's M3)
+    produces the exact same captured value and survives undetected. Mocking
+    `_current_windows_user_sid` to a synthetic, unmistakable SID breaks that
+    coincidence: correct code must thread whatever this mock returns
+    through unchanged (it has no other source for `expected_owner_sid`),
+    while M3's mutated call site reads the object's real (unmocked, still
+    genuine) owner instead and never sees the synthetic value.
     """
     if os.name != "nt":
         return
@@ -903,12 +926,33 @@ def test_windows_read_verify_threads_default_owner_sid_to_acl_verification(
             advapi32=advapi32, kernel32=kernel32, path=path
         )
     )
+
+    # A synthetic SID no real object on this box owns: the file's genuine
+    # owner (read via the unmocked `_windows_object_owner_sid` an M3-style
+    # mutation would substitute) can never equal this value by coincidence.
+    synthetic_user_sid = "S-1-5-21-1111111111-2222222222-3333333333-424242"
+
+    def fake_current_windows_user_sid(*, advapi32: object, kernel32: object, path: Path) -> str:
+        del advapi32, kernel32, path
+        return synthetic_user_sid
+
+    monkeypatch.setattr(
+        cluster_config_windows_primitives,
+        "_current_windows_user_sid",
+        fake_current_windows_user_sid,
+    )
+
     captured: dict[str, object] = {}
-    original_verify = cluster_config_windows_acl._verify_private_windows_acl  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def capturing_verify(*args: object, **kwargs: object) -> None:
+        # Captures the call site's arguments only -- does not invoke the
+        # real ACL verifier. With expected_owner_sid mocked away from the
+        # file's true owner, letting the real comparison run would raise
+        # (a genuine, correctly-detected mismatch) and cascade into this
+        # test's own heal path with the same synthetic SID, which is not
+        # what this test is proving and would only add noise.
+        del args
         captured.update(kwargs)
-        original_verify(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(cluster_config_windows_acl, "_verify_private_windows_acl", capturing_verify)
 
@@ -916,6 +960,12 @@ def test_windows_read_verify_threads_default_owner_sid_to_acl_verification(
         path, directory=False
     )
 
+    assert captured.get(
+        "expected_owner_sid"
+    ) == cluster_config_windows_primitives._current_windows_user_sid(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        advapi32=advapi32, kernel32=kernel32, path=path
+    )
+    assert captured.get("expected_owner_sid") == synthetic_user_sid
     assert captured.get("default_owner_sid") == expected_default_owner_sid
     assert captured.get("default_owner_sid") is not None
 
@@ -995,6 +1045,42 @@ def test_windows_read_verify_diagnoses_write_dac_denial_that_opaquely_blocked_th
     with pytest.raises(ConfigurationError, match="unexpected ACE") as excinfo:
         verify_private_configuration_path(path, directory=False)
     assert "could not be healed on read" in str(excinfo.value)
+
+
+def test_windows_read_verify_folds_drift_into_a_raw_oserror_heal_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """N1 (round-2 review advisory): the write path is not guaranteed to
+    raise only `ConfigurationError` -- a raw `OSError` (`PermissionError`
+    here, matching the reviewer's own sabotaged-heal probe) can also escape
+    it. Before this fix, `_heal_and_warn_on_read_drift` caught only
+    `ConfigurationError`, so a `PermissionError` from the heal would
+    propagate BARE, silently dropping the drift diagnosis that had already
+    been made. It must come out typed (`ConfigurationError`) and carry both
+    the original drift reason and the heal failure, exactly like the
+    already-covered `ConfigurationError`-heal-failure case above.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+    _tamper_windows_acl_widen_to_everyone(path)  # guarantees a real drift to diagnose
+
+    def sabotaged_heal(_path: Path, *, directory: bool) -> None:
+        del directory
+        raise PermissionError("simulated CRT/filesystem failure the ctypes layer didn't wrap")
+
+    monkeypatch.setattr(
+        cluster_config_windows_paths, "ensure_private_configuration_path", sabotaged_heal
+    )
+
+    with pytest.raises(ConfigurationError, match="not owner-private") as excinfo:
+        verify_private_configuration_path(path, directory=False)
+    assert "could not be healed on read" in str(excinfo.value)
+    assert "simulated CRT/filesystem failure" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, PermissionError)
 
 
 def test_windows_read_verify_never_heals_a_structural_open_failure(
