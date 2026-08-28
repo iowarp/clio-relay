@@ -1,7 +1,12 @@
 """Register terminal JARVIS execution outputs as bounded relay references.
 
-Also the single owner of clio-relay#265's "declared outputs" verdict. Owner
-ruling (#265, superseding an earlier ``completed_outputs_missing`` side-channel
+Also the single owner of clio-relay#265's "declared outputs" DETECTION (its
+*consumption* -- whether the typed verdict below may ever flip a job to
+FAILED -- moved to ``execution_watch.py`` and was itself corrected; see the
+"Correction (owner ruling, CURRENT)" paragraph near the end of this
+docstring for the ground truth, which supersedes the ORIGINAL #265 ruling
+this paragraph narrates for the historical record). Original owner ruling
+(#265, superseding an earlier ``completed_outputs_missing`` side-channel
 proposal): producing the declared outputs is PART of what "completed" means --
 a jarvis_run whose execution finished but whose declared outputs are missing
 or empty reaches terminal state FAILED with typed reason ``outputs_missing``,
@@ -32,21 +37,45 @@ disk -- the pre-existing behavior, unchanged in shape). A run whose terminal
 record carries no ``artifact_page`` at all keeps its original semantics
 (the early return above, unaffected by this revision).
 
-Refinement (adversarial-review Ruling B on the D1 slice above, flagged for
-owner review -- see the "honest verdict" campaign plan, clio-relay#265):
-the D1 revision's *detection* stands exactly as written here (this module
-still computes and returns ``no_outputs_declared`` unchanged), but its
-*consumption* was corrected -- ``no_outputs_declared`` does NOT flow into
+Refinement (adversarial-review Ruling B on the D1 slice above -- see the
+"honest verdict" campaign plan, clio-relay#265): the D1 revision's
+*detection* stands exactly as written here (this module still computes and
+returns ``no_outputs_declared`` unchanged), but its *consumption* was
+corrected -- ``no_outputs_declared`` does NOT flow into
 ``execution_watch.resolve_execution_outcome`` and does NOT flip a job to
-FAILED (unlike ``declared_outputs_missing``, which still does, unchanged).
-The campaign plan mandates the typed SIGNAL, not an automatic failure: this
-module's own line 17's instruction ("never invent a heuristic about which
-files should exist") applies here too -- a page declaring real artifacts of
-another kind (a ``pipeline-snapshot``, the relay-flushed ``console.log``,
-...) or a pure-stdout application would otherwise be false-failed purely
-for not declaring an ``execution-file`` entry. The signal still reaches the
-durable task record on both outcomes (see ``endpoint_job_execution.py``'s
-success and failure branches) so a run card can render it either way.
+FAILED (unlike ``declared_outputs_missing``, which at the time still did).
+This module's own line 17's instruction ("never invent a heuristic about
+which files should exist") applies here too -- a page declaring real
+artifacts of another kind (a ``pipeline-snapshot``, the relay-flushed
+``console.log``, ...) or a pure-stdout application would otherwise be
+false-failed purely for not declaring an ``execution-file`` entry.
+
+Correction (owner ruling, CURRENT -- supersedes Ruling B above in full):
+live evidence proved Ruling B's own remaining half wrong too. A real LAMMPS
+run on ares (jarvis execution ``jarvis_70633ea9d168bb28191178a4a1ced5ce``:
+state=completed, return_code=0, 1000/1000 steps, real slurm job 23723)
+completed cleanly, but its wrapping relay job
+(``job_d5466728059642baa293e72c2379e50d``) was marked FAILED because its
+one declared output (``stderr.log``) was PRESENT and legitimately empty --
+a clean LAMMPS run writes nothing to stderr. "Producing the declared
+outputs is PART of what completed means" (this module's original #265
+framing above) does not survive that evidence: existence/size heuristics
+deciding job success/failure are explicitly banned in this codebase, full
+stop -- ``application_verdict`` (:mod:`clio_relay.application_verdict`),
+which reads the RETURNCODE, is the only thing allowed to decide
+success/failure. So as of this correction, BOTH ``outputs_missing``
+reasons -- ``declared_outputs_missing`` (one or more declared outputs
+absent or empty on disk) and ``no_outputs_declared`` (zero declared at
+all) -- are SURFACED TYPED SIGNALS ONLY; neither ever flows into
+``execution_watch.resolve_execution_outcome``'s ``effective_returncode``.
+A return_code=0 application with a missing or empty declared output is a
+SUCCEEDED job carrying the ``outputs_missing`` signal, on both outcomes
+(the success and failure branches in ``endpoint_job_execution.py`` both
+fold the raw signal into the durable task record unconditionally, so a run
+card can render it either way) -- this module's own DETECTION below
+(including the missing-vs-empty ``"absent"``/``"empty"`` per-item
+distinction) is entirely UNCHANGED by this correction; only
+``execution_watch``'s *consumption* of it was.
 """
 
 from __future__ import annotations
@@ -77,9 +106,11 @@ from clio_relay.spool import (
 
 EXECUTION_OUTPUT_OWNERSHIP_SCHEMA = "clio-relay.execution-output.v1"
 EXECUTION_OUTPUT_TRUNCATION_SCHEMA = "jarvis.execution-output-truncation.v1"
-#: clio-relay#265: the typed terminal-failure reason/payload schema for one
-#: or more declared execution outputs that turned out missing (absent on
-#: disk) or empty (declared ``size_bytes == 0``) at terminal.
+#: clio-relay#265: the typed SIGNAL schema (never itself a terminal-failure
+#: driver -- see this module's own "Correction (owner ruling, CURRENT)"
+#: docstring paragraph) for one or more declared execution outputs that
+#: turned out missing (absent on disk) or empty (declared
+#: ``size_bytes == 0``) at terminal.
 EXECUTION_OUTPUTS_MISSING_SCHEMA = "clio-relay.execution-outputs-missing.v1"
 MAX_RELAY_EXECUTION_OUTPUTS = 128
 MAX_EXECUTION_RESULT_BYTES = 16 * 1_048_576
@@ -98,8 +129,10 @@ def ingest_jarvis_execution_outputs(
     the execution directory and is read later through relay's bounded route.
 
     Returns ``(indexed, truncation, outputs_missing)``. ``outputs_missing`` is
-    clio-relay#265's typed terminal-failure payload
-    (:data:`EXECUTION_OUTPUTS_MISSING_SCHEMA`) whenever the terminal
+    clio-relay#265's typed SIGNAL payload (:data:`EXECUTION_OUTPUTS_MISSING_
+    SCHEMA`) -- never itself a terminal-failure driver, see this module's own
+    "Correction (owner ruling, CURRENT)" docstring paragraph -- whenever the
+    terminal
     ``artifact_page`` was present but did NOT prove clean declared outputs --
     either at least one declared ``execution-file`` output is absent on disk
     or declared empty (``size_bytes == 0``, ``reason="declared_outputs_missing"``),
