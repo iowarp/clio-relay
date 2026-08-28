@@ -7,6 +7,14 @@ Platform-agnostic -- the Windows-specific ACL enforcement itself lives in the
 `cluster_config_windows_*` owner modules, which this module's
 `_is_reparse_stat` is shared with (imported there directly since no test
 patches it).
+
+`verify_private_configuration_path` (clio-relay#289) is the platform-agnostic
+read-path entry point: it VERIFIES existing private protections rather than
+RE-APPLYING them, dispatching on Windows to the read-only
+`cluster_config_windows_read_verify` owner module instead of the write-side
+`ensure_private_configuration_path`. Every genuine read path in this module
+calls it; write/create paths elsewhere keep calling
+`ensure_private_configuration_path` directly and are unaffected.
 """
 
 from __future__ import annotations
@@ -31,18 +39,10 @@ def read_bounded_configuration_bytes(path: Path, *, max_bytes: int) -> bytes:
     """Read one stable regular configuration file without following links."""
     if max_bytes < 1:
         raise ValueError("configuration byte limit must be positive")
-    # Function-scope import: cluster_config_windows_paths imports _is_reparse_stat
-    # from this module at module scope, so a module-scope import back here would
-    # be a load-order circular import between the two halves of the original
-    # single-file module. Deferring to call time (this module is fully loaded by
-    # then) is the same proven idiom this codebase's own decomposition history
-    # already uses for this exact shape of cross-owner dependency.
-    from clio_relay.cluster_config_windows_paths import ensure_private_configuration_path
-
-    ensure_private_configuration_path(path.parent, directory=True)
+    verify_private_configuration_path(path.parent, directory=True)
     initial = os.lstat(path)
     _require_safe_configuration_stat(path, initial, max_bytes=max_bytes)
-    ensure_private_configuration_path(path, directory=False)
+    verify_private_configuration_path(path, directory=False)
     last_error: OSError | _ConfigurationChangedError | None = None
     for attempt in range(MAX_CONFIG_READ_ATTEMPTS):
         try:
@@ -89,6 +89,59 @@ def read_bounded_configuration_bytes(path: Path, *, max_bytes: int) -> bytes:
             f"cannot read configuration file {path}: {last_error}"
         ) from last_error
     raise ConfigurationError(f"cannot read configuration file: {path}")
+
+
+def verify_private_configuration_path(path: Path, *, directory: bool) -> None:
+    """Verify -- never re-apply -- private configuration protections on a read.
+
+    The read-path counterpart to `cluster_config_windows_paths.
+    ensure_private_configuration_path`. On POSIX, delegates to it directly:
+    that function's non-Windows branch is already a pure stat/ownership/mode
+    check with no mutation, so a read path can call it unchanged (mirrors
+    the same shape rather than duplicating it). On Windows, calls the new
+    read-only verifier (`cluster_config_windows_read_verify.
+    verify_private_configuration_windows_path`) instead of
+    `ensure_private_configuration_path`'s Windows branch, which re-applies
+    (`SetSecurityInfo`) the ACL on every call.
+
+    That re-apply is correct and required on write/create paths
+    (`open_private_atomic_file`, `create_private_configuration_directory`,
+    `ensure_private_configuration_directory`, all unchanged). On a read path
+    it is wasted work and, under LSA network-resolution flakiness, a
+    multi-second-per-call stall for no security benefit: the OS already
+    enforces the installed ACL on every access, so a read only needs to
+    confirm that ACL still holds. Per the clio-relay#289 owner ruling
+    (2026-08-28), "you apply them and then let the OS check on reads;
+    re-applying them has no value."
+
+    Raises `ConfigurationError` naming the path -- never silently heals --
+    when protections have drifted from the private set the write side
+    installs. Re-applying on a read would silently overwrite (and thereby
+    mask) evidence of tampering, which is strictly weaker than refusing.
+    """
+    if os.name != "nt":
+        # Function-scope import: cluster_config_windows_paths imports
+        # _is_reparse_stat from this module at module scope, so a
+        # module-scope import back here would be a load-order circular
+        # import between the two halves of the original single-file module.
+        # Deferring to call time (this module is fully loaded by then) is
+        # the same proven idiom this codebase's own decomposition history
+        # already uses for this exact shape of cross-owner dependency.
+        from clio_relay.cluster_config_windows_paths import (
+            ensure_private_configuration_path,
+        )
+
+        ensure_private_configuration_path(path, directory=directory)
+        return
+    # Same deferral reasoning: cluster_config_windows_read_verify imports
+    # cluster_config_windows_paths (module scope), which imports this module
+    # (module scope) for _is_reparse_stat -- a module-scope import here would
+    # complete the cycle.
+    from clio_relay.cluster_config_windows_read_verify import (
+        verify_private_configuration_windows_path,
+    )
+
+    verify_private_configuration_windows_path(path, directory=directory)
 
 
 def _require_safe_configuration_stat(path: Path, value: os.stat_result, *, max_bytes: int) -> None:

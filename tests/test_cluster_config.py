@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from clio_relay import (
     cluster_config_registry,
     cluster_config_windows_paths,
     cluster_config_windows_primitives,
+    cluster_config_windows_read_verify,
 )
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -34,6 +36,7 @@ from clio_relay.cluster_config import (
     ensure_private_configuration_path,
     open_private_atomic_file,
     read_bounded_configuration_bytes,
+    verify_private_configuration_path,
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.remote_mcp import default_remote_mcp_cache_path
@@ -558,6 +561,163 @@ def test_windows_configuration_hardening_allows_an_existing_writer(tmp_path: Pat
         assert writer.read() == b"original"
 
     ensure_private_configuration_path(path, directory=False)
+
+
+def _tamper_windows_acl_to_permissive(path: Path) -> None:
+    """Widen a path's DACL to a protected, non-owner-private set via icacls.
+
+    Simulates real tampering/misconfiguration rather than an uninitialized
+    default ACL: `/inheritance:r` makes the DACL protected (matching the
+    state a legitimately hardened file is already in), and
+    `/grant:r Everyone:F` replaces its contents with a SID the private set
+    never contains -- so the failure this produces is specifically "not
+    owner-private" (a real SID/mask mismatch), not "remains inherited" (an
+    unrelated, weaker signal).
+    """
+    subprocess.run(
+        ["icacls", str(path), "/inheritance:r", "/grant:r", "Everyone:F"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_windows_read_verify_accepts_a_clean_hardened_file(tmp_path: Path) -> None:
+    """(b) clio-relay#289: a properly hardened file and directory read fine."""
+    if os.name != "nt":
+        return
+    directory = tmp_path / "state"
+    directory.mkdir()
+    ensure_private_configuration_path(directory, directory=True)
+    verify_private_configuration_path(directory, directory=True)
+
+    path = directory / "configuration.json"
+    with open_private_atomic_file(path) as stream:
+        stream.write(b"{}")
+    verify_private_configuration_path(path, directory=False)
+
+
+def test_windows_read_verify_refuses_tampered_acl(tmp_path: Path) -> None:
+    """(a) clio-relay#289: the new verify-only read path refuses drifted ACLs.
+
+    A read must surface tampering as a typed refusal, not paper over it.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+    verify_private_configuration_path(path, directory=False)  # sanity: clean file is fine
+
+    _tamper_windows_acl_to_permissive(path)
+
+    with pytest.raises(ConfigurationError, match="not owner-private"):
+        verify_private_configuration_path(path, directory=False)
+    # The lower-level Windows-only entry point refuses identically.
+    with pytest.raises(ConfigurationError, match="not owner-private"):
+        cluster_config_windows_read_verify.verify_private_configuration_windows_path(
+            path, directory=False
+        )
+
+
+def test_windows_ensure_private_configuration_path_silently_heals_tampering(
+    tmp_path: Path,
+) -> None:
+    """clio-relay#289 security-defect pin: the OLD read-path primitive heals
+    tampering instead of refusing it -- exactly why reads no longer call it.
+
+    `ensure_private_configuration_path` is unchanged and stays correct for
+    write/create paths: applying (and thereby re-securing) the ACL is the
+    right behavior there. But it is precisely the wrong behavior for a READ
+    -- called on a tampered file, it silently re-applies the private ACL and
+    returns success, erasing the evidence a mismatch ever existed. Contrast
+    with `test_windows_read_verify_refuses_tampered_acl` immediately above,
+    which proves the NEW verify-only path refuses the identical starting
+    state instead. This is the concrete security improvement clio-relay#289
+    ships: a read now refuses drift; it never silently re-locks over it.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    _tamper_windows_acl_to_permissive(path)
+
+    # The new verify-only read path detects and refuses the tampering.
+    with pytest.raises(ConfigurationError, match="not owner-private"):
+        verify_private_configuration_path(path, directory=False)
+
+    # The OLD primitive -- what every read called before this fix -- must
+    # not raise: it silently re-applies (heals) the private ACL instead.
+    ensure_private_configuration_path(path, directory=False)
+
+    # Proof the heal actually happened: verification now passes again, with
+    # no trace that the file was ever tampered with.
+    verify_private_configuration_path(path, directory=False)
+
+
+def test_windows_read_bounded_configuration_bytes_refuses_tampered_registry(
+    tmp_path: Path,
+) -> None:
+    """End-to-end clio-relay#289 proof on the originally-affected function."""
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)
+
+    assert ClusterRegistry.load(path) == registry  # sanity: clean file reads fine
+
+    _tamper_windows_acl_to_permissive(path)
+
+    with pytest.raises(ConfigurationError, match="not owner-private"):
+        ClusterRegistry.load(path)
+
+
+def test_windows_read_bounded_configuration_bytes_never_calls_set_security_info(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Regression pin for clio-relay#289: reads verify; they never re-apply.
+
+    `SetSecurityInfo` is the write primitive `_set_private_windows_acl`
+    calls and the one whose SID-normalization work measured the 4.4-5.1s
+    per-call stall this fix exists to avoid. A real, functioning advapi32 is
+    wrapped (not replaced) so the read still exercises genuine Win32 ACL
+    verification; only the call count to this one entry point is observed.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)
+
+    real_advapi32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "advapi32"
+    )
+    calls = {"SetSecurityInfo": 0}
+    original_load_library = cluster_config_windows_primitives._load_windows_library  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    class _CountingAdvapi32:
+        def __getattr__(self, name: str) -> object:
+            if name == "SetSecurityInfo":
+                calls["SetSecurityInfo"] += 1
+            return getattr(real_advapi32, name)
+
+    counting_advapi32 = _CountingAdvapi32()
+
+    def load_library(name: str) -> object:
+        if name == "advapi32":
+            return counting_advapi32
+        return original_load_library(name)
+
+    monkeypatch.setattr(cluster_config_windows_primitives, "_load_windows_library", load_library)
+
+    payload = read_bounded_configuration_bytes(path, max_bytes=MAX_CLUSTER_REGISTRY_BYTES)
+
+    assert json.loads(payload)
+    assert calls["SetSecurityInfo"] == 0
 
 
 def test_windows_configuration_owner_must_match_current_user(tmp_path: Path) -> None:

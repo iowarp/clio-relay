@@ -26,6 +26,9 @@ Owner modules:
                                        Windows files and directories
     cluster_config_windows_guard   -- the parent-rename guard and opening an
                                        existing file under an enforced ACL
+    cluster_config_windows_read_verify -- read-path-only ACL verification
+                                       (clio-relay#289): confirms, never
+                                       re-applies, the private ACL
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from clio_relay.cluster_config_io import (
     MAX_CLUSTER_REGISTRY_BYTES,
     MAX_CONFIG_READ_ATTEMPTS,
     read_bounded_configuration_bytes,
+    verify_private_configuration_path,
 )
 from clio_relay.cluster_config_models import (
     MAX_REMOTE_MCP_ALLOW_TOOLS,
@@ -114,6 +118,7 @@ __all__ = [
     "open_private_configuration_windows_descriptor",
     "read_bounded_configuration_bytes",
     "release_private_configuration_windows_parent_guard",
+    "verify_private_configuration_path",
 ]
 
 CLUSTER_REGISTRY_ENV = "CLIO_RELAY_CLUSTER_REGISTRY"

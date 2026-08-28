@@ -2005,8 +2005,11 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: in the review-fix round, execution_watch_prediction.py (122 lines),
 #: raising it to 480/621 = 77.29%; iowarp/clio-relay#285 added
 #: frp_visitor_reconciliation.py + frp_visitor_process_inspection.py, both
-#: sweet-spot-sized owner modules). May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 77.36
+#: sweet-spot-sized owner modules, raising it to 482/623 = 77.36%;
+#: clio-relay#289 (read-path ACL verify-only fix) added the new, sweet-spot-
+#: sized owner module cluster_config_windows_read_verify.py, raising it to
+#: 483/624 = 77.40%. May only RISE.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 77.40
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
