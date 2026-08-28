@@ -279,7 +279,10 @@ CLIO_KIT_JARVIS_USER_TOOL_NAMES = frozenset(
 #: moved) -- NOT the per-revision CLIO_KIT_SPACK_USER_WHEEL_VERSION_BY_ID
 #: table below, which records when each contract *revision's* digest was
 #: first locked and stays put unless that revision's bytes actually shift.
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.10.5"
+#: v1.7.0 upstream wave: 2.10.5 -> 2.10.6, again a pin-carrier move only --
+#: clio-kit's own generator --check reported the 2.10.6 contract artifacts
+#: byte-identical to 2.10.5.
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.10.6"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 # v2.3 adds spack_search/spack_info to the audited surface (clio-kit 2.8.0) and
@@ -359,7 +362,9 @@ CLIO_KIT_SPACK_USER_TOOL_NAMES_BY_ID: dict[str, frozenset[str]] = {
 #: Same single-wheel-download/fallback-evidence semantics as
 #: CLIO_KIT_SPACK_USER_WHEEL_VERSION above (clio-relay#288 recert: 2.7.2 ->
 #: 2.10.5; the v1.1 contract bytes/digest below are unchanged in 2.10.5).
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.10.5"
+#: v1.7.0 upstream wave: 2.10.5 -> 2.10.6, same pin-carrier move (contract
+#: artifacts byte-identical per clio-kit's generator --check).
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.10.6"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(

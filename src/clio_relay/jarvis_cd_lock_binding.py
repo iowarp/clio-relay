@@ -19,12 +19,12 @@ from typing import Any, cast
 
 _JARVIS_CD_LOCK_BINDING_SCHEMA = "clio-relay.jarvis-cd-lock-binding.v1"
 
-JARVIS_CD_VERSION = "1.8.0"
+JARVIS_CD_VERSION = "1.8.1"
 JARVIS_CD_WHEEL_URL = (
     "https://github.com/grc-iit/jarvis-cd/releases/download/"
     f"v{JARVIS_CD_VERSION}/jarvis_cd-{JARVIS_CD_VERSION}-py3-none-any.whl"
 )
-JARVIS_CD_WHEEL_SHA256 = "2c2e2042d0256bd3d9c117d75aaf00d26d9e814fcbcca9a904abf06399fc1067"
+JARVIS_CD_WHEEL_SHA256 = "ed891233e4b3767e949c6b5217bb03d4175b7d39334969c17ec83beb3c0c02d0"
 
 
 def _jarvis_cd_lock_binding(lock_content: bytes) -> dict[str, Any]:
