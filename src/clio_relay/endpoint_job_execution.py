@@ -677,8 +677,10 @@ class JobExecutionMixin:
         # see execution_watch.resolve_execution_outcome's own docstring for
         # why a resolved watch always wins over a pending cancellation.
         # #265: outputs_missing (from the ONE mcp_result ingest just above)
-        # folds the same way -- producing the declared outputs is part of
-        # what "completed" means.
+        # folds unconditionally into the durable record but NEVER into
+        # effective_returncode -- owner ruling, current: existence/size
+        # heuristics deciding success/failure are banned; the RETURNCODE is
+        # the only thing that decides it.
         outcome = execution_watch.resolve_execution_outcome(
             dispatch_recovered=dispatch_recovered,
             watch_resolution=execution_watch_resolution,
@@ -727,7 +729,8 @@ class JobExecutionMixin:
             self.queue.acknowledge_job_cancellation(job.job_id)
             return
         if effective_returncode == 0:
-            # Ruling B: the signal never fails a success, but still reaches the record.
+            # Owner ruling (current): outputs_missing is a signal only and
+            # never fails a success, but still reaches the record.
             success_metadata: dict[str, object] = {
                 "returncode": effective_returncode,
                 "mcp_dispatch_recovered": dispatch_recovered,
@@ -750,7 +753,6 @@ class JobExecutionMixin:
             return
         watch_failure = outcome.watch_failure
         application_verdict_failure = outcome.application_verdict_failure
-        outputs_missing_failure = outcome.outputs_missing_failure  # Ruling B: GATED, not raw.
         mcp_dispatch_failure = mcp_call_dispatch_failure_detail(
             self.queue,
             job,
@@ -760,7 +762,6 @@ class JobExecutionMixin:
             dispatch_refusal_present=dispatch_refusal is not None,
             watch_failure_present=watch_failure is not None,
             application_verdict_failure_present=application_verdict_failure is not None,
-            outputs_missing_failure_present=outputs_missing_failure is not None,
         )
         failure_metadata = job_terminal_verdict.terminal_failure_metadata(
             effective_returncode=effective_returncode,
@@ -783,14 +784,12 @@ class JobExecutionMixin:
                 dispatch_refusal=dispatch_refusal,
                 watch_failure=watch_failure,
                 application_verdict_failure=application_verdict_failure,
-                outputs_missing_failure=outputs_missing_failure,
                 endpoint_mcp_call=endpoint_mcp_call,
             ),
             error=job_terminal_verdict.terminal_failure_error_text(
                 dispatch_refusal=dispatch_refusal,
                 watch_failure=watch_failure,
                 application_verdict_failure=application_verdict_failure,
-                outputs_missing_failure=outputs_missing_failure,
                 mcp_dispatch_failure=mcp_dispatch_failure,
                 effective_returncode=effective_returncode,
             ),

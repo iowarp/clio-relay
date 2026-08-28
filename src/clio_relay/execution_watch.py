@@ -328,36 +328,6 @@ def execution_watch_error_text(failure_detail: dict[str, object]) -> str:
     return f"JARVIS execution {execution_id} ended in {state}"
 
 
-def execution_outputs_missing_error_text(outputs_missing: dict[str, object]) -> str:
-    """Render one bounded, human-readable error from #265's outputs-missing detail.
-
-    ``outputs_missing`` is
-    :func:`~clio_relay.jarvis_execution_artifacts.ingest_jarvis_execution_outputs`'s
-    typed ``clio-relay.execution-outputs-missing.v1`` payload -- the owner
-    ruling made concrete: an execution JARVIS itself reported terminal, but
-    whose declared outputs are missing or empty (or whose page declared NONE
-    at all, ``reason="no_outputs_declared"`` -- the #265 D1 revision), is a
-    FAILED job with this reason, never a decorated "completed".
-    """
-    execution_id = outputs_missing.get("execution_id")
-    if outputs_missing.get("reason") == "no_outputs_declared":
-        return f"JARVIS execution {execution_id} completed but declared zero outputs"
-    raw_missing = outputs_missing.get("missing")
-    entries: list[dict[str, object]] = []
-    if isinstance(raw_missing, list):
-        for raw_entry in cast(list[object], raw_missing):
-            if isinstance(raw_entry, dict):
-                entries.append(cast(dict[str, object], raw_entry))
-    count = len(entries)
-    noun = "output" if count == 1 else "outputs"
-    names = ", ".join(str(entry.get("relative_path")) for entry in entries)
-    detail = f": {names}" if names else ""
-    return (
-        f"JARVIS execution {execution_id} completed but {count} declared {noun} were "
-        f"missing or empty{detail}"
-    )
-
-
 def execution_phase_status_message(
     job_state: str,
     execution_phase: object,
@@ -434,54 +404,32 @@ class ExecutionOutcome:
     cancellation_honored: bool
     watch_failure: dict[str, object] | None
     #: clio-relay#265: the PURE, unconditional ``outputs_missing`` signal
-    #: (or ``None``), regardless of whether it drove this outcome's FAILED
-    #: state. Callers folding the signal into a durable record
-    #: unconditionally (e.g. the success branch) read this. Callers
-    #: deciding WHY a job failed must use :attr:`outputs_missing_failure`
-    #: instead -- see that field's own docstring.
+    #: (or ``None``). Owner ruling, current (supersedes this module's own
+    #: earlier Ruling B, which still forced FAILED for the
+    #: ``declared_outputs_missing`` reason -- see jarvis_execution_
+    #: artifacts.py's module docstring for the full history, and the live
+    #: LAMMPS defect -- jarvis_70633ea9d168bb28191178a4a1ced5ce, relay
+    #: job_d5466728059642baa293e72c2379e50d -- that forced the correction):
+    #: existence/size heuristics deciding success/failure are banned, so
+    #: this signal NEVER drives :attr:`effective_returncode` for ANY
+    #: reason -- it is carried here purely so callers fold it into the
+    #: durable record unconditionally (both the success and failure
+    #: branches already do). ``application_verdict``
+    #: (:mod:`clio_relay.application_verdict`), which reads the
+    #: RETURNCODE, is the only thing that may decide success/failure.
     outputs_missing: dict[str, object] | None = None
     #: Ruling A: the resolved watch's own ``application_verdict`` ONLY
     #: when it is the reason this outcome is FAILED
     #: (``RETURNCODE_CONFLICT_REASON``) and ``watch_failure`` is not --
     #: otherwise a returncode_conflict failure renders as a bare exit
     #: code, the exact defect class this campaign kills. Mutually
-    #: exclusive with ``watch_failure`` by construction.
+    #: exclusive with ``watch_failure`` by construction. Unlike the now-
+    #: removed ``outputs_missing_failure`` gated field this dataclass used
+    #: to carry, Ruling A's own conflict detection reads the RETURNCODE
+    #: (``application_verdict_for_metadata``'s own ``returncode_conflict``
+    #: branch) -- an allowed, returncode-driven decision, not an existence
+    #: heuristic, so it stays.
     application_verdict_failure: dict[str, object] | None = None
-    #: Ruling B (adversarial-review fix, mirrors ``application_verdict_
-    #: failure``): :attr:`outputs_missing` ONLY when :func:`_outputs_
-    #: missing_forces_failure` says so (``declared_outputs_missing``,
-    #: never the signal-only ``no_outputs_declared``). Proven live:
-    #: threading the RAW signal into the renderers/guard instead of this
-    #: gated field let a present-but-non-forcing signal hijack an
-    #: unrelated real failure (rendered "completed but declared zero
-    #: outputs" and suppressed the #183/#248 tier entirely). Callers
-    #: rendering "why did this job fail" must use THIS field, never the
-    #: raw :attr:`outputs_missing`.
-    outputs_missing_failure: dict[str, object] | None = None
-
-
-#: clio-relay#265 D1 revision (adversarial-review Ruling B -- flag for
-#: owner review): this ONE outputs_missing reason is a typed, SURFACED
-#: SIGNAL only -- it reaches the phase payload/task record/door metadata
-#: (see :mod:`jarvis_execution_artifacts`'s own module docstring) but never
-#: forces a job to FAILED on its own; the approved campaign plan mandates
-#: the signal, not an automatic failure (a page declaring one
-#: pipeline-snapshot artifact and zero execution-file entries, or a pure-
-#: stdout application, must still SUCCEED). Every other reason (today just
-#: "declared_outputs_missing": one or more DECLARED outputs were found
-#: missing/empty on disk) still fails the job, unchanged from develop --
-#: and an older/legacy outputs_missing dict shape carrying no "reason" key
-#: at all fails closed the same way it always has (``.get`` returns
-#: ``None``, which is not the signal-only sentinel either).
-_OUTPUTS_MISSING_SIGNAL_ONLY_REASON = "no_outputs_declared"
-
-
-def _outputs_missing_forces_failure(outputs_missing: dict[str, object] | None) -> bool:
-    """Ruling B: only a genuinely missing/empty DECLARED output fails the job."""
-    return (
-        outputs_missing is not None
-        and outputs_missing.get("reason") != _OUTPUTS_MISSING_SIGNAL_ONLY_REASON
-    )
 
 
 def resolve_execution_outcome(
@@ -510,18 +458,22 @@ def resolve_execution_outcome(
     path): JARVIS's own returncode field disagreeing with its state must
     never read as success.
 
-    ``outputs_missing`` folds per :func:`_outputs_missing_forces_failure`
-    (Ruling B) -- only a genuinely missing/empty DECLARED output is FAILED
-    regardless of what the scheduler/JARVIS/dispatch path otherwise
-    reported (including an already-recovered dispatch); the signal-only
-    ``no_outputs_declared`` reason never does, and never populates
-    :attr:`ExecutionOutcome.outputs_missing_failure` either -- only that
-    gated field, never the raw :attr:`ExecutionOutcome.outputs_missing`
-    signal, may drive a "why did this job fail" decision (mirrors
-    :attr:`ExecutionOutcome.application_verdict_failure`'s own split).
-    A forced failure (either source) wins over a pending cancellation for
-    the same reason a resolved watch already does: the real outcome was
-    observed.
+    ``outputs_missing`` (regardless of its ``reason`` -- ``declared_outputs_
+    missing`` or ``no_outputs_declared``) NEVER folds into
+    :attr:`ExecutionOutcome.effective_returncode` or
+    :attr:`ExecutionOutcome.cancellation_honored`. Owner ruling, current
+    (supersedes this function's own earlier Ruling B, which still forced
+    FAILED for ``declared_outputs_missing`` -- see jarvis_execution_
+    artifacts.py's module docstring for the full history, and the live
+    LAMMPS defect that forced the correction: a real ares run,
+    jarvis_70633ea9d168bb28191178a4a1ced5ce, completed 1000/1000 steps with
+    return_code=0, but its wrapping job (job_d5466728059642baa293e72c2379e50d)
+    was wrongly marked FAILED purely because its declared ``stderr.log`` was
+    present and legitimately empty): existence/size heuristics deciding
+    success/failure are banned in this codebase. The signal is only ever
+    carried on :attr:`ExecutionOutcome.outputs_missing`, unconditionally,
+    for callers that fold it into the durable record regardless of outcome
+    -- it is never itself a "why did this job fail" driver.
     """
     if dispatch_recovered:
         effective_returncode = 0
@@ -540,18 +492,12 @@ def resolve_execution_outcome(
         effective_returncode = 1
         cancellation_honored = False
         application_verdict_failure = watch_resolution.application_verdict
-    outputs_missing_failure: dict[str, object] | None = None
-    if _outputs_missing_forces_failure(outputs_missing):
-        effective_returncode = 1
-        cancellation_honored = False
-        outputs_missing_failure = outputs_missing
     return ExecutionOutcome(
         effective_returncode=effective_returncode,
         cancellation_honored=cancellation_honored,
         watch_failure=(watch_resolution.failure_detail if watch_resolution is not None else None),
         outputs_missing=outputs_missing,
         application_verdict_failure=application_verdict_failure,
-        outputs_missing_failure=outputs_missing_failure,
     )
 
 

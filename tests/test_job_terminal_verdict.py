@@ -3,15 +3,20 @@
 Extracted from endpoint_job_execution.py (adversarial-review item 2: that
 module sits at its own line-count ratchet ceiling, #774/#775) -- this file
 proves the fixed priority order (dispatch refusal > execution-watch failure
-> Ruling A application-verdict failure > Ruling B outputs_missing_failure
-> #183/#248 generic mcp_call failure > bare exit code) survived the move,
-that a returncode_conflict verdict (Ruling A's new consumer) never falls
-through to the bare exit code this whole campaign exists to kill, and that
-only the GATED outputs_missing_failure (never the raw, unconditional
-outputs_missing signal) can drive that priority slot -- the adversarial-
-review fix for Ruling B's own hijacking bug (a present-but-non-forcing
-signal was suppressing the #183/#248 tier and mis-rendering an unrelated
-real failure).
+> Ruling A application-verdict failure > #183/#248 generic mcp_call failure
+> bare exit code) survived the move, and that a returncode_conflict verdict
+(Ruling A's own consumer) never falls through to the bare exit code this
+whole campaign exists to kill.
+
+A #265 ``outputs_missing`` signal used to occupy a priority slot here too
+(a GATED ``outputs_missing_failure`` parameter). Owner ruling, current
+(the LAMMPS live-defect correction this file's own history narrates):
+existence/size heuristics deciding job success/failure are banned outright,
+so ``outputs_missing`` can never be the reason a job is FAILED -- neither
+rendering function takes that parameter any more. The RAW signal still
+folds into ``terminal_failure_metadata`` unconditionally regardless of
+outcome (its own ``outputs_missing_signal`` parameter, unrelated to the
+removed priority slot) -- covered below.
 """
 
 from __future__ import annotations
@@ -46,7 +51,11 @@ _APPLICATION_VERDICT_FAILURE: dict[str, object] = {
     "application_returncode": 3,
     "reason": "returncode_conflict",
 }
-_OUTPUTS_MISSING_FAILURE: dict[str, object] = {
+#: A #265 outputs_missing signal (declared_outputs_missing shape). Never a
+#: FAILED-driving parameter any more -- only used below via
+#: ``terminal_failure_metadata``'s own unconditional ``outputs_missing_
+#: signal`` fold, which is unrelated to what actually failed the job.
+_OUTPUTS_MISSING_SIGNAL: dict[str, object] = {
     "schema_version": "clio-relay.execution-outputs-missing.v1",
     "reason": "declared_outputs_missing",
     "execution_id": "exec",
@@ -85,7 +94,6 @@ def test_priority_order_dispatch_refusal_wins_over_everything() -> None:
         dispatch_refusal=_REFUSAL,
         watch_failure=_WATCH_FAILURE,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
         endpoint_mcp_call=True,
     )
     assert message == "JARVIS run failed"
@@ -93,7 +101,6 @@ def test_priority_order_dispatch_refusal_wins_over_everything() -> None:
         dispatch_refusal=_REFUSAL,
         watch_failure=_WATCH_FAILURE,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
         mcp_dispatch_failure=_MCP_DISPATCH_FAILURE,
         effective_returncode=1,
     )
@@ -106,7 +113,6 @@ def test_priority_order_watch_failure_wins_over_application_verdict_and_below() 
         dispatch_refusal=None,
         watch_failure=_WATCH_FAILURE,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
         endpoint_mcp_call=True,
     )
     assert message == "JARVIS execution ended in failure"
@@ -114,7 +120,6 @@ def test_priority_order_watch_failure_wins_over_application_verdict_and_below() 
         dispatch_refusal=None,
         watch_failure=_WATCH_FAILURE,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
         mcp_dispatch_failure=None,
         effective_returncode=1,
     )
@@ -130,7 +135,6 @@ def test_returncode_conflict_never_falls_through_to_a_bare_exit_code() -> None:
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=None,
         endpoint_mcp_call=True,
     )
     assert "returncode_conflict" in message
@@ -138,7 +142,6 @@ def test_returncode_conflict_never_falls_through_to_a_bare_exit_code() -> None:
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_failure=None,
         mcp_dispatch_failure=None,
         effective_returncode=1,
     )
@@ -148,47 +151,27 @@ def test_returncode_conflict_never_falls_through_to_a_bare_exit_code() -> None:
     assert error != "exit code 1"
 
 
-def test_priority_order_outputs_missing_failure_wins_over_mcp_dispatch_failure() -> None:
-    message = terminal_failure_message(
-        dispatch_refusal=None,
-        watch_failure=None,
-        application_verdict_failure=None,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
-        endpoint_mcp_call=True,
-    )
-    assert "declared outputs are missing or empty" in message
-    error = terminal_failure_error_text(
-        dispatch_refusal=None,
-        watch_failure=None,
-        application_verdict_failure=None,
-        outputs_missing_failure=_OUTPUTS_MISSING_FAILURE,
-        mcp_dispatch_failure=_MCP_DISPATCH_FAILURE,
-        effective_returncode=1,
-    )
-    assert error is not None
-    assert "dump.h5" in error
-
-
-def test_signal_only_outputs_missing_never_hijacks_a_real_failure() -> None:
-    """Ruling B adversarial-review fix, the exact proven e2e bug: a present
-    but non-forcing no_outputs_declared signal must NEVER win priority --
-    the real reason (here, the #183/#248 mcp_call tier) must still render,
-    not "completed but declared zero outputs".
+def test_outputs_missing_signal_never_hijacks_the_mcp_dispatch_failure_tier() -> None:
+    """Owner ruling, current (the exact proven e2e bug this correction
+    closes): an outputs_missing signal -- of EITHER reason -- must NEVER
+    influence which typed reason renders as the FAILED job's own message/
+    error. Neither rendering function even accepts an outputs_missing
+    parameter any more (unlike the removed, GATED ``outputs_missing_
+    failure`` this file's own docstring narrates) -- the #183/#248 mcp_call
+    tier renders exactly as if outputs_missing did not exist.
     """
     message = terminal_failure_message(
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,  # the signal-only reason gates to None here
         endpoint_mcp_call=True,
     )
     assert message == "Endpoint MCP operation failed"
-    assert "declared zero outputs" not in message
+    assert "declared" not in message
     error = terminal_failure_error_text(
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,
         mcp_dispatch_failure=_MCP_DISPATCH_FAILURE,
         effective_returncode=1,
     )
@@ -214,7 +197,6 @@ def test_mcp_dispatch_failure_is_the_last_typed_reason_before_bare_exit_code() -
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,
         endpoint_mcp_call=True,
     )
     assert message == "Endpoint MCP operation failed"
@@ -222,7 +204,6 @@ def test_mcp_dispatch_failure_is_the_last_typed_reason_before_bare_exit_code() -
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,
         mcp_dispatch_failure=_MCP_DISPATCH_FAILURE,
         effective_returncode=1,
     )
@@ -235,7 +216,6 @@ def test_bare_exit_code_is_the_true_last_resort_only() -> None:
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,
         mcp_dispatch_failure=None,
         effective_returncode=7,
     )
@@ -247,7 +227,6 @@ def test_non_mcp_call_message_names_jarvis_cd() -> None:
         dispatch_refusal=None,
         watch_failure=None,
         application_verdict_failure=None,
-        outputs_missing_failure=None,
         endpoint_mcp_call=False,
     )
     assert message == "JARVIS-CD run failed"
@@ -259,13 +238,13 @@ def test_terminal_failure_metadata_folds_every_typed_reason_present() -> None:
         dispatch_refusal=None,
         watch_failure=_WATCH_FAILURE,
         application_verdict_failure=_APPLICATION_VERDICT_FAILURE,
-        outputs_missing_signal=_OUTPUTS_MISSING_FAILURE,
+        outputs_missing_signal=_OUTPUTS_MISSING_SIGNAL,
         mcp_dispatch_failure=_MCP_DISPATCH_FAILURE,
     )
     assert metadata["returncode"] == 1
     assert metadata["execution_watch_failure"] == _WATCH_FAILURE
     assert metadata["application_verdict_failure"] == _APPLICATION_VERDICT_FAILURE
-    assert metadata["execution_outputs_missing"] == _OUTPUTS_MISSING_FAILURE
+    assert metadata["execution_outputs_missing"] == _OUTPUTS_MISSING_SIGNAL
     assert metadata["mcp_dispatch_failure"] == _MCP_DISPATCH_FAILURE
     assert "jarvis_dispatch_refusal" not in metadata
 

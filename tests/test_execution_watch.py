@@ -30,6 +30,7 @@ from clio_relay import application_runtime_prediction, endpoint_jarvis_recovery,
 from clio_relay.config import RelaySettings
 from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.endpoint import EndpointWorker
+from clio_relay.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     Cursor,
@@ -324,37 +325,6 @@ def test_execution_cancel_unsupported_payload() -> None:
     assert payload["schema_version"] == execution_watch.EXECUTION_CANCEL_REFUSAL_SCHEMA
 
 
-def test_execution_outputs_missing_error_text() -> None:
-    # Explicit dict[str, object] annotation: dict's value-type parameter is
-    # invariant, so the inferred narrower literal type (dict[str, str | int
-    # | list[dict[str, str | int]]]) is not otherwise assignable to the
-    # function's dict[str, object] parameter under strict pyright.
-    detail: dict[str, object] = {
-        "schema_version": "clio-relay.execution-outputs-missing.v1",
-        "execution_id": "jarvis_exec",
-        "declared_count": 2,
-        "missing": [
-            {
-                "relative_path": "dump.h5",
-                "role": "output",
-                "reason": "absent",
-                "declared_size_bytes": 2048,
-            },
-            {
-                "relative_path": "stdout.log",
-                "role": "log",
-                "reason": "empty",
-                "declared_size_bytes": 0,
-            },
-        ],
-    }
-    text = execution_watch.execution_outputs_missing_error_text(detail)
-    assert "jarvis_exec" in text
-    assert "2 declared outputs" in text
-    assert "dump.h5" in text
-    assert "stdout.log" in text
-
-
 def _clean_verdict(status: str = "success") -> dict[str, object]:
     """A non-conflicting application_verdict for outputs_missing-focused cases."""
     return {
@@ -371,28 +341,30 @@ def _clean_verdict(status: str = "success") -> dict[str, object]:
         "outputs_missing",
         "expected_returncode",
         "expected_cancellation",
-        "expected_forces",
     ),
     [
-        # Legacy/pre-Ruling-B shape (no "reason" key at all) fails closed,
-        # unchanged from develop.
-        (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 1, False, True),
-        # declared_outputs_missing: one or more DECLARED outputs were found
-        # missing/empty -- still forces failure ("producing the declared
-        # outputs is PART of what completed means").
-        (True, {"reason": "declared_outputs_missing"}, 1, False, True),
-        # Ruling B (adversarial review, flagged for owner sign-off):
-        # no_outputs_declared is a SURFACED SIGNAL only -- it must NOT flip
-        # a genuinely successful run (a pipeline-snapshot-only page, a
-        # pure-stdout application, ...) to FAILED, and must NOT populate
-        # the GATED outputs_missing_failure field either (adversarial-
-        # review fix: that field, not the raw signal, is what a renderer
-        # may use to explain a failure).
-        (True, {"reason": "no_outputs_declared"}, 0, False, False),
+        # Legacy/pre-Ruling-B shape (no "reason" key at all): a SURFACED
+        # SIGNAL only, same as every other reason below -- never forces
+        # failure. existence/size heuristics deciding success/failure are
+        # banned; only the returncode/application_verdict may decide that.
+        (True, {"schema_version": "clio-relay.execution-outputs-missing.v1"}, 0, False),
+        # declared_outputs_missing (one or more DECLARED outputs found
+        # missing/empty on disk -- the exact LAMMPS live-defect shape: a
+        # clean rc=0 run whose declared stderr.log is legitimately empty)
+        # is ALSO signal-only now -- the owner ruling that superseded this
+        # module's own earlier "producing declared outputs is part of what
+        # completed means" stance (jarvis_execution_artifacts.py's module
+        # docstring narrates the full history).
+        (True, {"reason": "declared_outputs_missing"}, 0, False),
+        # no_outputs_declared: unchanged -- was already signal-only.
+        (True, {"reason": "no_outputs_declared"}, 0, False),
         # No outputs_missing verdict: the watch's own success stands.
-        (True, None, 0, False, False),
-        # A genuinely failed watch stays failed regardless of outputs_missing.
-        (False, None, 1, False, False),
+        (True, None, 0, False),
+        # A genuinely failed watch stays failed regardless of outputs_missing
+        # -- the guard: a real application failure is never masked BY, nor
+        # dependent on, the outputs-missing signal.
+        (False, None, 1, False),
+        (False, {"reason": "declared_outputs_missing"}, 1, False),
     ],
 )
 def test_resolve_execution_outcome_folds_outputs_missing(
@@ -400,7 +372,6 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     outputs_missing: dict[str, object] | None,
     expected_returncode: int,
     expected_cancellation: bool,
-    expected_forces: bool,
 ) -> None:
     resolution = execution_watch.ExecutionWatchResolution(
         succeeded=watch_succeeded,
@@ -417,10 +388,9 @@ def test_resolve_execution_outcome_folds_outputs_missing(
     )
     assert outcome.effective_returncode == expected_returncode
     assert outcome.cancellation_honored is expected_cancellation
-    # The RAW signal is always carried, regardless of whether it forces failure.
+    # The RAW signal is always carried unconditionally -- it never drives
+    # effective_returncode, but it must never be silently dropped either.
     assert outcome.outputs_missing == outputs_missing
-    # The GATED field only carries it when it actually drove the failure.
-    assert outcome.outputs_missing_failure == (outputs_missing if expected_forces else None)
 
 
 def test_resolve_execution_outcome_folds_returncode_conflict() -> None:
@@ -876,15 +846,18 @@ def test_deferred_execution_watched_to_failure(
     assert watch_failure["reason"] == "application exited with code 137"
 
 
-def test_deferred_execution_completed_with_missing_declared_output_fails_typed(
+def test_deferred_execution_completed_with_missing_declared_output_succeeds_with_signal(
     tmp_path: Path,
     _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
 ) -> None:
-    """clio-relay#265 owner ruling made concrete: JARVIS itself reports the
-    execution ``completed``, but a declared output never landed on disk --
-    "producing the declared outputs is PART of what completed means", so the
-    job must reach FAILED with a typed ``outputs_missing`` reason, never a
-    decorated "completed".
+    """Owner ruling, current (supersedes this module's own earlier #265/
+    Ruling-B stance -- see jarvis_execution_artifacts.py's module docstring
+    for the full history): a missing/empty DECLARED output is a SURFACED
+    TYPED SIGNAL, never itself a reason to fail a job whose application
+    genuinely returned success. JARVIS itself reports the execution
+    ``completed`` (rc=0) here; a declared output never landed on disk --
+    the job must still reach SUCCEEDED, carrying the typed ``outputs_missing``
+    signal naming exactly which declared output is missing.
     """
     settings, queue, command, server_artifact, digest = _watch_env
     job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
@@ -924,14 +897,13 @@ def test_deferred_execution_completed_with_missing_declared_output_fails_typed(
     result = worker.run_once()
 
     assert result is not None
-    assert result.state is JobState.FAILED
-    assert result.last_error is not None
-    assert "declared" in result.last_error
-    assert "dump.h5" in result.last_error
+    assert result.state is JobState.SUCCEEDED
+    assert result.last_error is None
     task = queue.list_tasks(job.job_id)[0]
-    assert task.state is JobState.FAILED
+    assert task.state is JobState.SUCCEEDED
     outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
     assert outputs_missing["schema_version"] == "clio-relay.execution-outputs-missing.v1"
+    assert outputs_missing["reason"] == "declared_outputs_missing"
     assert outputs_missing["declared_count"] == 1
     assert outputs_missing["missing"] == [
         {
@@ -942,12 +914,244 @@ def test_deferred_execution_completed_with_missing_declared_output_fails_typed(
         }
     ]
     # JARVIS's own execution record genuinely reached "completed" -- the
-    # watch resolved normally; #265's outputs_missing fold is what turns
-    # that into a failed job, never a fabricated execution-level failure.
+    # watch resolved normally; the signal is surfaced but never forces a
+    # fabricated execution-level failure.
     events = _event_types(queue, job.job_id)
     assert "execution.watch_resolved" in events
     assert "jarvis.execution_output_missing" in events
     assert "jarvis.execution_outputs_missing" in events
+
+
+def test_deferred_execution_completed_with_empty_declared_output_succeeds_with_signal(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """The exact live defect this fix slice closes (2026-08-27 ares LAMMPS
+    run, jarvis_70633ea9d168bb28191178a4a1ced5ce / real slurm job 23723 /
+    relay job_d5466728059642baa293e72c2379e50d): the application completed
+    1000/1000 steps with return_code=0, but its declared ``stderr.log``
+    output was PRESENT and legitimately empty (a clean run writes nothing to
+    stderr) -- the wrapping job was wrongly marked FAILED. This is the EMPTY
+    counterpart of the sibling ABSENT test above -- the file genuinely
+    exists on disk (unlike ``dump.h5`` there), proving the fix does not
+    merely special-case "file not found" but the declared-size_bytes==0
+    case too, which flows through the SAME ``declared_outputs_missing``
+    reason with per-item ``reason: "empty"`` (not ``"absent"``).
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"1000/1000 steps\n")
+    # The declared output genuinely EXISTS on disk -- 0 bytes, not absent.
+    (execution_root / "stderr.log").write_bytes(b"")
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        states=[
+            ("submitted", False, "23723"),
+            ("running", False, "23723"),
+            ("completed", True, "23723"),
+        ],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        return_code=0,
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.execution",
+                "kind": "execution-file",
+                "role": "log",
+                "location": {"kind": "execution_path", "value": "stderr.log"},
+                "size_bytes": 0,
+                "checksum": f"sha256:{empty_sha256}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    assert result.last_error is None
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.state is JobState.SUCCEEDED
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["schema_version"] == "clio-relay.execution-outputs-missing.v1"
+    assert outputs_missing["reason"] == "declared_outputs_missing"
+    assert outputs_missing["declared_count"] == 1
+    assert outputs_missing["missing"] == [
+        {
+            "relative_path": "stderr.log",
+            "role": "log",
+            "reason": "empty",
+            "declared_size_bytes": 0,
+        }
+    ]
+    events = _event_types(queue, job.job_id)
+    assert "execution.watch_resolved" in events
+    assert "jarvis.execution_output_empty" in events
+    assert "jarvis.execution_outputs_missing" in events
+
+
+def test_deferred_execution_with_empty_declared_output_stays_resolvable_by_execution_id(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """Second consumer of the SAME defect (live evidence, same LAMMPS run):
+    ``relay_list_artifacts {"execution_id": ...}`` on the wrongly-FAILED
+    job returned a typed ``execution_not_found`` -- the wrongly-failed job
+    made its own execution's artifacts unreachable by execution_id. This
+    pins the cascade end to end through the REAL admission path
+    ``relay_list_artifacts``/the door's execution_id route both use
+    (``jarvis_execution_artifacts.resolve_jarvis_run_owner_by_execution_id``,
+    the exact function ``artifact_routing.list_artifacts`` calls): the SAME
+    rc=0-with-empty-declared-output execution must (a) SUCCEED, (b) carry
+    the ``outputs_missing`` signal, AND (c) still resolve by execution_id
+    with its artifacts listable.
+
+    Note (investigated, not fixed): the admission lookup itself
+    (``resolve_jarvis_run_owner_by_execution_id`` ->
+    ``_jarvis_run_matches`` -> ``_is_jarvis_run``) applies NO job-state
+    filter at all -- confirmed by direct probe, a FAILED job's execution_id
+    resolves through it exactly like a SUCCEEDED one's. The live
+    not-found symptom was entirely downstream of THIS fix's own defect (the
+    wrongly-FAILED job state), not a second, independent heuristic in the
+    lookup -- so no separate admission-path change is warranted.
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"1000/1000 steps\n")
+    (execution_root / "stderr.log").write_bytes(b"")
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        states=[
+            ("submitted", False, "23723"),
+            ("running", False, "23723"),
+            ("completed", True, "23723"),
+        ],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        return_code=0,
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.execution",
+                "kind": "execution-file",
+                "role": "log",
+                "location": {"kind": "execution_path", "value": "stderr.log"},
+                "size_bytes": 0,
+                "checksum": f"sha256:{empty_sha256}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.SUCCEEDED
+    task = queue.list_tasks(job.job_id)[0]
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["reason"] == "declared_outputs_missing"
+
+    # The exact admission path relay_list_artifacts / the door's
+    # GET /executions/{execution_id}/artifacts route both call.
+    owner = resolve_jarvis_run_owner_by_execution_id(
+        queue,
+        execution_id,
+        cluster=job.cluster,
+        owns_job=None,
+    )
+    assert owner.job_id == job.job_id
+    assert owner.state is JobState.SUCCEEDED
+    artifacts, _next_cursor, total = queue.list_artifacts_page(owner.job_id, cursor=1, limit=100)
+    assert total > 0
+    assert artifacts
+
+
+def test_deferred_execution_genuinely_failed_with_missing_declared_output_stays_failed(
+    tmp_path: Path,
+    _watch_env: tuple[RelaySettings, ClioCoreQueue, list[str], dict[str, Any], str],
+) -> None:
+    """Guard: a NONZERO returncode (a real application failure) must still
+    fail the job even when a declared output also happens to be missing --
+    the outputs_missing signal never masks, dilutes, or substitutes for the
+    real failure reason. The watch's own ``execution_watch_failure`` must
+    remain the terminal-failure driver, and the outputs_missing signal must
+    still reach the durable record unconditionally alongside it.
+    """
+    settings, queue, command, server_artifact, digest = _watch_env
+    job, execution_id = _submit_watch_job(queue, command=command, digest=digest)
+    execution_root = tmp_path / "execution-root"
+    execution_root.mkdir()
+    (execution_root / "stdout.log").write_bytes(b"application crashed\n")
+    transport = _WatchTransportProvider(
+        pipeline_id="watch-pipeline",
+        execution_id=execution_id,
+        states=[
+            ("submitted", False, "9007"),
+            ("running", False, "9007"),
+            ("failed", True, "9007"),
+        ],
+        server_artifact=server_artifact,
+        execution_root=execution_root,
+        created_at=job.created_at.isoformat(),
+        return_code=1,
+        error="application exited with code 137",
+        terminal_artifacts=[
+            {
+                "package_id": "jarvis.execution",
+                "kind": "execution-file",
+                "role": "output",
+                "location": {"kind": "execution_path", "value": "dump.h5"},
+                "size_bytes": 2048,
+                "checksum": f"sha256:{'e' * 64}",
+            }
+        ],
+    )
+    worker = EndpointWorker(
+        role=EndpointRole.WORKER,
+        settings=settings,
+        cluster=job.cluster,
+        queue=queue,
+        provider=transport,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert result.last_error is not None
+    # The REAL failure reason names the crash, not the outputs signal.
+    assert "application exited with code 137" in result.last_error
+    task = queue.list_tasks(job.job_id)[0]
+    assert task.state is JobState.FAILED
+    watch_failure = cast(dict[str, Any], task.metadata["execution_watch_failure"])
+    assert watch_failure["reason"] == "application exited with code 137"
+    # The outputs_missing signal is still folded into the durable record
+    # unconditionally, even though it did not drive the failure.
+    outputs_missing = cast(dict[str, Any], task.metadata["execution_outputs_missing"])
+    assert outputs_missing["reason"] == "declared_outputs_missing"
+    assert outputs_missing["missing"][0]["relative_path"] == "dump.h5"
 
 
 def test_deferred_execution_with_only_a_pipeline_snapshot_artifact_succeeds(
