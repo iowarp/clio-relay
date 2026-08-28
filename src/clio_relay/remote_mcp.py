@@ -268,7 +268,18 @@ CLIO_KIT_JARVIS_USER_TOOL_NAMES = frozenset(
         "jarvis_run",
     }
 )
-CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.7.2"
+#: The single clio-kit wheel version this whole cross-repository certification
+#: module downloads and verifies against (test_clio_kit_mcp_contracts.py's
+#: ``clio_kit_wheel`` fixture asserts the provisioned wheel's filename embeds
+#: this exact version) and the fallback "expected_clio_kit_version" evidence
+#: value when a live registration's declared_contract isn't a recognized id.
+#: Tracks the bootstrap/certification kit-version pin going forward
+#: (clio-relay#288 recert: 2.7.2 -> 2.10.5; the v2.1 contract bytes/digest
+#: below are unchanged in 2.10.5 -- only this single-wheel-download version
+#: moved) -- NOT the per-revision CLIO_KIT_SPACK_USER_WHEEL_VERSION_BY_ID
+#: table below, which records when each contract *revision's* digest was
+#: first locked and stays put unless that revision's bytes actually shift.
+CLIO_KIT_SPACK_USER_WHEEL_VERSION = "2.10.5"
 CLIO_KIT_SPACK_USER_CONTRACT_ID = "clio-kit-spack-user-v2.1"
 CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID = "clio-kit-spack-user-v2"
 # v2.3 adds spack_search/spack_info to the audited surface (clio-kit 2.8.0) and
@@ -345,7 +356,10 @@ CLIO_KIT_SPACK_USER_TOOL_NAMES_BY_ID: dict[str, frozenset[str]] = {
     CLIO_KIT_SPACK_USER_LEGACY_CONTRACT_ID: CLIO_KIT_SPACK_USER_LEGACY_TOOL_NAMES,
     CLIO_KIT_SPACK_USER_CONTRACT_ID_V2_3: CLIO_KIT_SPACK_USER_V2_3_TOOL_NAMES,
 }
-CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.7.2"
+#: Same single-wheel-download/fallback-evidence semantics as
+#: CLIO_KIT_SPACK_USER_WHEEL_VERSION above (clio-relay#288 recert: 2.7.2 ->
+#: 2.10.5; the v1.1 contract bytes/digest below are unchanged in 2.10.5).
+CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION = "2.10.5"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1.1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_LEGACY_CONTRACT_ID = "clio-kit-scientific-catalog-user-v1"
 CLIO_KIT_SCIENTIFIC_CATALOG_USER_CONTRACT_IDS = frozenset(

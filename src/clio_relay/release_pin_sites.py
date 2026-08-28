@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from clio_relay.errors import RelayError
+from clio_relay.release_pin_sites_jarvis_tests import jarvis_contract_test_pin_sites
 from clio_relay.release_pin_sites_kit import kit_pin_sites
 
 
@@ -777,5 +778,11 @@ PINSITES: tuple[PinSite, ...] = (
         filename=_FN,
         placeholder=_PH,
         regex=_RX,
+    ),
+    *jarvis_contract_test_pin_sites(
+        _row,
+        family=_JC,
+        line=_LN,
+        filename=_FN,
     ),
 )

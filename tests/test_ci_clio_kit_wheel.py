@@ -36,10 +36,10 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 # copies rather than importing the wheel filename/URL/SHA-256 so a source
 # bump can never silently drag the CI-workflow-consistency check along
 # unnoticed; this test is the tripwire that forces the two to be reconciled.
-JARVIS_MCP_WHEEL_FILENAME = "clio_kit-2.10.3-py3-none-any.whl"
-JARVIS_MCP_WHEEL_SHA256 = "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
+JARVIS_MCP_WHEEL_FILENAME = "clio_kit-2.10.5-py3-none-any.whl"
+JARVIS_MCP_WHEEL_SHA256 = "954c2f76aef96ad1a69717f693b15f76d6fa0a3cd1d2ae417baf2830c73c3a67"
 JARVIS_MCP_WHEEL_URL = (
-    f"https://github.com/iowarp/clio-kit/releases/download/v2.10.3/{JARVIS_MCP_WHEEL_FILENAME}"
+    f"https://github.com/iowarp/clio-kit/releases/download/v2.10.5/{JARVIS_MCP_WHEEL_FILENAME}"
 )
 
 # The exact upstream wheel CI stages before the local release gate, which
@@ -57,15 +57,15 @@ JARVIS_MCP_WHEEL_URL = (
 # (single "stage exact clio-kit release wheel" step, ci.yml) and
 # provision_clio_kit_wheel() consumes that same staged artifact for the
 # contract-certification suite, so this pin tracks the bootstrap pin above
-# going forward -- re-certified to 2.10.3 by the clio-kit-jarvis-user-v3.7.x
-# contract-recognition work (test_clio_kit_mcp_contracts.py passes against
-# this exact wheel).
-CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.10.3-py3-none-any.whl"
+# going forward -- re-certified to 2.10.5 by the clio-relay#288 recert
+# (the v3.7.2-revision JARVIS contract-recognition work;
+# test_clio_kit_mcp_contracts.py passes against this exact wheel).
+CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.10.5-py3-none-any.whl"
 CONTRACT_CERTIFICATION_WHEEL_SHA256 = (
-    "3ee195e914d6ed98af59d3422f4167658ee3ee867bc725d7a1716cbc239f5846"
+    "954c2f76aef96ad1a69717f693b15f76d6fa0a3cd1d2ae417baf2830c73c3a67"
 )
 CONTRACT_CERTIFICATION_WHEEL_URL = (
-    "https://github.com/iowarp/clio-kit/releases/download/v2.10.3/"
+    "https://github.com/iowarp/clio-kit/releases/download/v2.10.5/"
     f"{CONTRACT_CERTIFICATION_WHEEL_FILENAME}"
 )
 
@@ -135,7 +135,7 @@ def test_contract_wheel_provisioning_reports_an_actionable_offline_error(
 
 def test_bootstrap_jarvis_mcp_install_pin_is_self_consistent() -> None:
     """The bootstrap default JARVIS MCP install pin resolves to one exact wheel (#190)."""
-    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.10.3"
+    assert CLIO_KIT_JARVIS_MCP_VERSION == "2.10.5"
     assert CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME == JARVIS_MCP_WHEEL_FILENAME
     assert CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 == JARVIS_MCP_WHEEL_SHA256
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == JARVIS_MCP_WHEEL_URL
@@ -150,10 +150,14 @@ def test_contract_certification_pins_match_the_certified_release() -> None:
     to 2.7.2 and deliberately left this certification pin on 2.6.6 as
     tracked follow-up (clio-relay#199); that follow-up re-certified every
     locked surface against 2.7.2, so the certification pin below now equals
-    the bootstrap install pin above instead of trailing it.
+    the bootstrap install pin above instead of trailing it. clio-relay#288
+    (kit 2.10.5 recert) moved this pin again -- the spack v2.1 / scientific-
+    catalog v1.1 contract bytes/digests are byte-identical in 2.10.5 (live-
+    probe verified), so this is the single-wheel-download version tracking
+    the bootstrap pin forward, not a contract re-certification.
     """
-    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.7.2"
-    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.7.2"
+    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.10.5"
+    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.10.5"
 
 
 def _ci_workflow() -> dict[str, Any]:
