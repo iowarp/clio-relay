@@ -385,15 +385,26 @@ class QueueJobsMixin:
         """Read bounded active jobs without touching terminal history."""
         self._store_adapter.initialize()
         with self._lock:
-            self._recover_pending_transitions_unlocked()
-            self._repair_active_job_index_unlocked()
-            indexed_jobs, truncated = queue_store_read.scan_many(
-                self._storage_root / "jobs_active",
-                RelayJob,
-                limit=limit,
-            )
-            jobs = [self.get_job(indexed.job_id) for indexed in indexed_jobs]
-            return sorted(jobs, key=self._job_submission_order_key_unlocked), truncated
+            return self._scan_active_jobs_unlocked(limit=limit)
+
+    def job_active_scan(self, job_id: str, *, limit: int) -> tuple[RelayJob, list[RelayJob], bool]:
+        """Read a job's live record and the bounded active-job scan under one lock (#290)."""
+        self._store_adapter.initialize()
+        with self._lock:
+            jobs, truncated = self._scan_active_jobs_unlocked(limit=limit)
+            return self.get_job(job_id), jobs, truncated
+
+    def _scan_active_jobs_unlocked(self, *, limit: int) -> tuple[list[RelayJob], bool]:
+        """Read the bounded active-job index. Caller must hold ``self._lock``."""
+        self._recover_pending_transitions_unlocked()
+        self._repair_active_job_index_unlocked()
+        indexed_jobs, truncated = queue_store_read.scan_many(
+            self._storage_root / "jobs_active",
+            RelayJob,
+            limit=limit,
+        )
+        jobs = [self.get_job(indexed.job_id) for indexed in indexed_jobs]
+        return sorted(jobs, key=self._job_submission_order_key_unlocked), truncated
 
     def active_job_capacity(self) -> dict[str, int | bool]:
         """Return explicit active-job admission capacity and current occupancy."""
