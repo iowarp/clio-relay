@@ -3,7 +3,9 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import logging
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +18,11 @@ from clio_relay import (
     cluster_config,
     cluster_config_io,
     cluster_config_registry,
+    cluster_config_windows_acl,
     cluster_config_windows_paths,
     cluster_config_windows_primitives,
+    cluster_config_windows_read_verify,
+    mcp_remote_catalog,
 )
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -34,6 +39,7 @@ from clio_relay.cluster_config import (
     ensure_private_configuration_path,
     open_private_atomic_file,
     read_bounded_configuration_bytes,
+    verify_private_configuration_path,
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.remote_mcp import default_remote_mcp_cache_path
@@ -558,6 +564,591 @@ def test_windows_configuration_hardening_allows_an_existing_writer(tmp_path: Pat
         assert writer.read() == b"original"
 
     ensure_private_configuration_path(path, directory=False)
+
+
+_ACL_HEALED_ON_READ_LOGGER = "clio_relay.cluster_config_windows_read_verify"
+
+
+def _tamper_windows_acl_widen_to_everyone(path: Path) -> None:
+    """Widen a path's DACL to a protected, non-owner-private set via icacls.
+
+    Simulates real tampering/misconfiguration rather than an uninitialized
+    default ACL: `/inheritance:r` makes the DACL protected (matching the
+    state a legitimately hardened file is already in), and
+    `/grant:r Everyone:F` replaces its contents with a SID the private set
+    never contains -- so the failure this produces is specifically "not
+    owner-private" (a real SID/mask mismatch), not "remains inherited" (an
+    unrelated, weaker signal).
+    """
+    subprocess.run(
+        ["icacls", str(path), "/inheritance:r", "/grant:r", "Everyone:F"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _tamper_windows_acl_deny_write_dac_to_current_user(path: Path) -> None:
+    """Add a DENY(WRITE_DAC) ACE for the current user on top of the private ACL.
+
+    clio-relay#289 D6: this is the reliably-constructible real-world analog
+    of an OWNER RIGHTS ACE narrowed below WRITE_DAC -- both leave GENERIC_READ/
+    READ_CONTROL available while specifically denying WRITE_DAC, even to the
+    owner. Also makes the DACL non-owner-private (an extra DENY ACE the
+    private 3-ACE ALLOW-only set never contains), so it is simultaneously a
+    genuine drift case once a handle can be opened to inspect it at all.
+    """
+    whoami = subprocess.run(["whoami"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(
+        ["icacls", str(path), "/deny", f"{whoami}:(WDAC)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _install_set_security_info_counter(monkeypatch: MonkeyPatch) -> dict[str, int]:
+    """Wrap the real advapi32 so `SetSecurityInfo` calls are counted, not faked.
+
+    A real, functioning advapi32 is wrapped (not replaced) so a read under
+    test still exercises genuine Win32 ACL verification/healing; only the
+    call count to the one write primitive (`SetSecurityInfo`, what
+    `_set_private_windows_acl` calls and the entry point whose SID work
+    measured the multi-second clio-relay#289 stall) is observed.
+    """
+    real_advapi32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "advapi32"
+    )
+    calls = {"SetSecurityInfo": 0}
+    original_load_library = cluster_config_windows_primitives._load_windows_library  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    class _CountingAdvapi32:
+        def __getattr__(self, name: str) -> object:
+            if name == "SetSecurityInfo":
+                calls["SetSecurityInfo"] += 1
+            return getattr(real_advapi32, name)
+
+    counting_advapi32 = _CountingAdvapi32()
+
+    def load_library(name: str) -> object:
+        if name == "advapi32":
+            return counting_advapi32
+        return original_load_library(name)
+
+    monkeypatch.setattr(cluster_config_windows_primitives, "_load_windows_library", load_library)
+    return calls
+
+
+def test_windows_read_verify_accepts_a_clean_hardened_file(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """clio-relay#289: a properly hardened file and directory read fine, and
+    a clean read costs zero `SetSecurityInfo` calls (the latency fix)."""
+    if os.name != "nt":
+        return
+    directory = tmp_path / "state"
+    directory.mkdir()
+    ensure_private_configuration_path(directory, directory=True)
+    path = directory / "configuration.json"
+    with open_private_atomic_file(path) as stream:
+        stream.write(b"{}")
+
+    calls = _install_set_security_info_counter(monkeypatch)
+    verify_private_configuration_path(directory, directory=True)
+    verify_private_configuration_path(path, directory=False)
+
+    assert calls["SetSecurityInfo"] == 0
+
+
+def test_windows_read_verify_heals_widened_dacl_and_warns_loudly(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Controller design ruling (clio-relay#289, 2026-08-28): VERIFY-on-read,
+    HEAL-ONLY-ON-DRIFT, LOUDLY -- not refuse-on-drift. A read must fix a
+    drifted ACL (the same way the write side always has) and say so; it must
+    never simply refuse and leave the caller stuck with no recovery route.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+    verify_private_configuration_path(path, directory=False)  # sanity: clean file is fine
+
+    _tamper_windows_acl_widen_to_everyone(path)
+
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        verify_private_configuration_path(path, directory=False)  # must NOT raise
+
+    [record] = [record for record in caplog.records if record.name == _ACL_HEALED_ON_READ_LOGGER]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "configuration_acl_healed_on_read"
+    assert record.path == str(path)  # type: ignore[attr-defined]
+    assert "not owner-private" in record.drift  # type: ignore[attr-defined]
+
+    # Proof the heal actually happened: a fresh verify is now clean and costs
+    # zero further SetSecurityInfo calls.
+    calls = _install_set_security_info_counter(monkeypatch)
+    verify_private_configuration_path(path, directory=False)
+    assert calls["SetSecurityInfo"] == 0
+
+    # The lower-level Windows-only entry point heals+warns identically.
+    _tamper_windows_acl_widen_to_everyone(path)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        cluster_config_windows_read_verify.verify_private_configuration_windows_path(
+            path, directory=False
+        )
+    assert any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
+
+
+def test_windows_ensure_private_configuration_path_heals_silently_unlike_the_read_path(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Contrasts the write primitive's correct silence with the read path's
+    required loudness.
+
+    `ensure_private_configuration_path` is unchanged and stays correct for
+    write/create paths: applying (and thereby re-securing) the ACL is
+    exactly its job every time it is called, so it does not need to
+    announce doing its job. The READ path calling the SAME underlying heal
+    mechanism on drift is different: the caller did not ask for a write, so
+    the heal must be reported. This is the concrete distinction clio-
+    relay#289's design ruling draws between the two.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    _tamper_windows_acl_widen_to_everyone(path)
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        ensure_private_configuration_path(path, directory=False)  # heals; must NOT raise
+    assert not any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
+
+    _tamper_windows_acl_widen_to_everyone(path)
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        verify_private_configuration_path(path, directory=False)  # heals; must NOT raise
+    assert any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
+
+
+def test_windows_read_bounded_configuration_bytes_heals_tampered_registry_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end clio-relay#289 proof on the originally-affected function."""
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)
+
+    assert ClusterRegistry.load(path) == registry  # sanity: clean file reads fine
+
+    _tamper_windows_acl_widen_to_everyone(path)
+
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        assert ClusterRegistry.load(path) == registry  # must NOT raise; heals instead
+    assert any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
+
+
+def test_windows_read_bounded_configuration_bytes_never_calls_set_security_info(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Regression pin for clio-relay#289: a clean read verifies; it never
+    re-applies (zero `SetSecurityInfo` calls)."""
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)
+
+    calls = _install_set_security_info_counter(monkeypatch)
+    payload = read_bounded_configuration_bytes(path, max_bytes=MAX_CLUSTER_REGISTRY_BYTES)
+
+    assert json.loads(payload)
+    assert calls["SetSecurityInfo"] == 0
+
+
+def test_windows_cluster_registry_load_and_mcp_catalog_never_call_set_security_info(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """D2 regression pin: the reviewer's blind spot was that the primitive-
+    level test above drove `read_bounded_configuration_bytes` directly, never
+    `ClusterRegistry.load` itself -- which called `ensure_private_
+    configuration_directory(path.parent)` (the unconditional-apply write
+    primitive) BEFORE the read, so the door (`_configured_cluster_names`,
+    the actual `tools/list` path) still paid one `SetSecurityInfo` per call
+    even after the primitive-level fix landed. Drives both real entry points
+    end to end against a clean, already-hardened registry.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)  # hardens both the parent directory and the file
+
+    calls = _install_set_security_info_counter(monkeypatch)
+    assert ClusterRegistry.load(path) == registry
+    assert calls["SetSecurityInfo"] == 0
+
+    calls["SetSecurityInfo"] = 0
+    configured_cluster_names = mcp_remote_catalog._configured_cluster_names  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert configured_cluster_names(registry_path=path) == ["alpha"]
+    assert calls["SetSecurityInfo"] == 0
+
+
+def test_windows_cluster_registry_load_heals_tampered_parent_directory_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """D3: the parent-directory ensure that used to be the silent heal is now
+    a LOUD heal -- a tampered parent directory is fixed, reported, and a
+    subsequent read of the same directory is clean.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "clusters.json"
+    registry = _registry("alpha")
+    registry.save(path)
+
+    _tamper_windows_acl_widen_to_everyone(path.parent)
+
+    with caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER):
+        assert ClusterRegistry.load(path) == registry  # must NOT raise; heals instead
+
+    [record] = [record for record in caplog.records if record.name == _ACL_HEALED_ON_READ_LOGGER]
+    assert record.path == str(path.parent)  # type: ignore[attr-defined]
+    assert record.directory is True  # type: ignore[attr-defined]
+
+    verify_private_configuration_path(path.parent, directory=True)  # now clean
+
+
+def test_windows_verify_private_acl_detects_real_owner_mismatch(tmp_path: Path) -> None:
+    """D5 mutation-kill: the reviewer's M3 ("tautological owner check")
+    survived the prior suite because no test drove a REAL owner comparison
+    through the read path against a REAL handle -- every prior assertion
+    either exercised `_require_current_windows_owner` in isolation or used a
+    starting ACL state that failed for an unrelated reason first (a DACL
+    mismatch masked whether the owner check itself does anything). This
+    opens a real, freshly-hardened file's real handle via the real Win32
+    verify path and passes a deliberately WRONG `expected_owner_sid` --
+    nothing else about the ACL is wrong, so the owner comparison is the ONLY
+    thing that can make this raise. A mutation that weakens or removes it
+    (e.g. comparing a value against itself) makes this test pass when it
+    must fail.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    kernel32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "kernel32"
+    )
+    advapi32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "advapi32"
+    )
+    handle = cluster_config_windows_paths._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path, directory=False, kernel32=kernel32, request_write_dac=False
+    )
+    try:
+        with pytest.raises(ConfigurationError, match="not owned by this user"):
+            cluster_config_windows_acl._verify_private_windows_acl(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                handle,
+                directory=False,
+                expected_owner_sid="S-1-5-21-1111111111-2222222222-3333333333-9999",
+                advapi32=advapi32,
+                kernel32=kernel32,
+                path=path,
+            )
+    finally:
+        cluster_config_windows_primitives._close_windows_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            handle, kernel32=kernel32
+        )
+
+
+def test_windows_read_verify_threads_default_owner_sid_to_acl_verification(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """D5: the read path must accept the SAME second owner the write side
+    already does (`_set_private_windows_acl`'s elevated-token/#30-migration
+    allowance), by passing the real `default_owner_sid` through to
+    `_verify_private_windows_acl` -- not silently dropping it as the
+    original clio-relay#289 slice did.
+
+    Also proves the CALLER passes the value `_current_windows_user_sid`
+    (the caller's own, independently-fetched identity) returns as
+    `expected_owner_sid` -- never a value derived from the object's own
+    owner, which would make the comparison inside `_verify_private_
+    windows_acl` tautological (always pass, regardless of who actually
+    owns the object, since it would be comparing the object's owner to
+    itself). `test_windows_verify_private_acl_detects_real_owner_mismatch`
+    proves the CALLEE's comparison is real; this proves the CALLER supplies
+    the real value that comparison depends on.
+
+    Round-2 review finding: an earlier version of this test computed its
+    own "expected" value from the SAME real, unmocked
+    `_current_windows_user_sid` the correct call site also uses -- against
+    a file this test process itself just hardened, that value is IDENTICAL
+    to the file's actual owner, so a mutation that rebinds the call site's
+    `expected_owner_sid=` to the object's own owner (the reviewer's M3)
+    produces the exact same captured value and survives undetected. Mocking
+    `_current_windows_user_sid` to a synthetic, unmistakable SID breaks that
+    coincidence: correct code must thread whatever this mock returns
+    through unchanged (it has no other source for `expected_owner_sid`),
+    while M3's mutated call site reads the object's real (unmocked, still
+    genuine) owner instead and never sees the synthetic value.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    kernel32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "kernel32"
+    )
+    advapi32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "advapi32"
+    )
+    expected_default_owner_sid = (
+        cluster_config_windows_primitives._current_windows_default_owner_sid(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            advapi32=advapi32, kernel32=kernel32, path=path
+        )
+    )
+
+    # A synthetic SID no real object on this box owns: the file's genuine
+    # owner (read via the unmocked `_windows_object_owner_sid` an M3-style
+    # mutation would substitute) can never equal this value by coincidence.
+    synthetic_user_sid = "S-1-5-21-1111111111-2222222222-3333333333-424242"
+
+    def fake_current_windows_user_sid(*, advapi32: object, kernel32: object, path: Path) -> str:
+        del advapi32, kernel32, path
+        return synthetic_user_sid
+
+    monkeypatch.setattr(
+        cluster_config_windows_primitives,
+        "_current_windows_user_sid",
+        fake_current_windows_user_sid,
+    )
+
+    captured: dict[str, object] = {}
+
+    def capturing_verify(*args: object, **kwargs: object) -> None:
+        # Captures the call site's arguments only -- does not invoke the
+        # real ACL verifier. With expected_owner_sid mocked away from the
+        # file's true owner, letting the real comparison run would raise
+        # (a genuine, correctly-detected mismatch) and cascade into this
+        # test's own heal path with the same synthetic SID, which is not
+        # what this test is proving and would only add noise.
+        del args
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cluster_config_windows_acl, "_verify_private_windows_acl", capturing_verify)
+
+    cluster_config_windows_read_verify.verify_private_configuration_windows_path(
+        path, directory=False
+    )
+
+    assert captured.get(
+        "expected_owner_sid"
+    ) == cluster_config_windows_primitives._current_windows_user_sid(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        advapi32=advapi32, kernel32=kernel32, path=path
+    )
+    assert captured.get("expected_owner_sid") == synthetic_user_sid
+    assert captured.get("default_owner_sid") == expected_default_owner_sid
+    assert captured.get("default_owner_sid") is not None
+
+
+def test_windows_read_verify_open_never_requests_write_dac(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """D6: the read-only verifier must never request WRITE_DAC -- it never
+    exercises it, and requesting it turns a wrong-mask ACL that specifically
+    restricts WRITE_DAC into an opaque open failure instead of a diagnosable
+    (and healable) drift.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    captured: dict[str, object] = {}
+    original_open = cluster_config_windows_paths._open_windows_configuration_handle  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+    def capturing_open(*args: object, **kwargs: object) -> ctypes.c_void_p:
+        captured.update(kwargs)
+        return original_open(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        cluster_config_windows_paths, "_open_windows_configuration_handle", capturing_open
+    )
+
+    cluster_config_windows_read_verify.verify_private_configuration_windows_path(
+        path, directory=False
+    )
+
+    assert captured.get("request_write_dac") is False
+
+
+def test_windows_read_verify_diagnoses_write_dac_denial_that_opaquely_blocked_the_old_open(
+    tmp_path: Path,
+) -> None:
+    """D6 drift-matrix centerpiece: an ACL that denies WRITE_DAC to the
+    owner (the reliable real-world analog of a narrowed OWNER RIGHTS ACE)
+    made the OLD shared handle-open (which always requested WRITE_DAC) fail
+    with an opaque `ERROR_ACCESS_DENIED (5)` -- indistinguishable from "file
+    doesn't exist" or any other open-time failure, and gives no hint that
+    the object even needed inspecting. Denying WRITE_DAC to the owner also
+    means the owner cannot re-grant it via `SetSecurityInfo` either (that
+    call needs WRITE_DAC too) -- so this specific drift is genuinely
+    unrecoverable without an elevated repair, and the read path correctly
+    still fails in the end. What D6 changes is what that final failure
+    SAYS: the new read-only open (GENERIC_READ | READ_CONTROL only)
+    succeeds where the old one didn't, so the real diagnosis (the DENY ACE
+    makes the DACL no longer match the private set) runs and is folded into
+    the propagated error instead of being lost behind a bare "(5)".
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    _tamper_windows_acl_deny_write_dac_to_current_user(path)
+
+    kernel32 = cluster_config_windows_primitives._load_windows_library(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        "kernel32"
+    )
+    open_failure = r"could not open Windows configuration path \(5\)"
+    with pytest.raises(ConfigurationError, match=open_failure):
+        cluster_config_windows_paths._open_windows_configuration_handle(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            path, directory=False, kernel32=kernel32
+        )
+
+    # The new read-only open succeeds and reaches real ACL diagnosis instead
+    # of the old open's bare "(5)" -- even though the heal that follows
+    # cannot succeed here (WRITE_DAC really is gone), the final error names
+    # the actual drift, not just the heal's own opaque failure.
+    with pytest.raises(ConfigurationError, match="unexpected ACE") as excinfo:
+        verify_private_configuration_path(path, directory=False)
+    assert "could not be healed on read" in str(excinfo.value)
+
+
+def test_windows_read_verify_folds_drift_into_a_raw_oserror_heal_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """N1 (round-2 review advisory): the write path is not guaranteed to
+    raise only `ConfigurationError` -- a raw `OSError` (`PermissionError`
+    here, matching the reviewer's own sabotaged-heal probe) can also escape
+    it. Before this fix, `_heal_and_warn_on_read_drift` caught only
+    `ConfigurationError`, so a `PermissionError` from the heal would
+    propagate BARE, silently dropping the drift diagnosis that had already
+    been made. It must come out typed (`ConfigurationError`) and carry both
+    the original drift reason and the heal failure, exactly like the
+    already-covered `ConfigurationError`-heal-failure case above.
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+    _tamper_windows_acl_widen_to_everyone(path)  # guarantees a real drift to diagnose
+
+    def sabotaged_heal(_path: Path, *, directory: bool) -> None:
+        del directory
+        raise PermissionError("simulated CRT/filesystem failure the ctypes layer didn't wrap")
+
+    monkeypatch.setattr(
+        cluster_config_windows_paths, "ensure_private_configuration_path", sabotaged_heal
+    )
+
+    with pytest.raises(ConfigurationError, match="not owner-private") as excinfo:
+        verify_private_configuration_path(path, directory=False)
+    assert "could not be healed on read" in str(excinfo.value)
+    assert "simulated CRT/filesystem failure" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, PermissionError)
+
+
+def test_windows_read_verify_never_heals_a_structural_open_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A structural failure at open time (a reparse point, or the wrong
+    file/directory kind -- both raised inside `_open_windows_configuration_
+    handle`, before the ACL verifier ever runs) is never healed: an ACL
+    re-apply cannot and must not paper over "this is not the kind of object
+    a configuration path may be". The heal-on-drift catch is scoped
+    strictly to the ACL VERIFY step; this proves the boundary by forcing
+    the open step itself to fail and confirming no heal is attempted (no
+    call to the write path, no warning emitted).
+    """
+    if os.name != "nt":
+        return
+    path = tmp_path / "configuration.json"
+    path.write_text("{}", encoding="utf-8")
+    ensure_private_configuration_path(path, directory=False)
+
+    healed: list[tuple[Path, bool]] = []
+
+    def recording_heal(path: Path, *, directory: bool) -> None:
+        healed.append((path, directory))
+
+    monkeypatch.setattr(
+        cluster_config_windows_paths,
+        "ensure_private_configuration_path",
+        recording_heal,
+    )
+
+    def failing_open(*_args: object, **_kwargs: object) -> ctypes.c_void_p:
+        raise ConfigurationError(f"configuration path is not a regular file: {path}")
+
+    monkeypatch.setattr(
+        cluster_config_windows_paths, "_open_windows_configuration_handle", failing_open
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER),
+        pytest.raises(ConfigurationError, match="not a regular file"),
+    ):
+        verify_private_configuration_path(path, directory=False)
+
+    assert healed == []
+    assert not any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
+
+
+def test_windows_read_verify_never_heals_a_real_directory_as_file_mismatch(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real, unmocked open genuinely refuses a directory-as-file
+    mismatch (a structural violation) without ever emitting a heal warning.
+    """
+    if os.name != "nt":
+        return
+    directory = tmp_path / "state"
+    directory.mkdir()
+    ensure_private_configuration_path(directory, directory=True)
+    with (
+        caplog.at_level(logging.WARNING, logger=_ACL_HEALED_ON_READ_LOGGER),
+        pytest.raises(ConfigurationError),
+    ):
+        verify_private_configuration_path(directory, directory=False)
+    assert not any(record.name == _ACL_HEALED_ON_READ_LOGGER for record in caplog.records)
 
 
 def test_windows_configuration_owner_must_match_current_user(tmp_path: Path) -> None:
