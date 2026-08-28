@@ -469,8 +469,8 @@ selected by the release policy. Other servers use the operator registry and
 generated `remote_...` aliases.
 
 The exact release wheel bootstrap installs by default is
-`clio_kit-2.10.5-py3-none-any.whl` with SHA-256
-`954c2f76aef96ad1a69717f693b15f76d6fa0a3cd1d2ae417baf2830c73c3a67`.
+`clio_kit-2.10.6-py3-none-any.whl` with SHA-256
+`bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d`.
 Its canonical contract is `clio-kit-jarvis-user-v3.7.2`. The relay's own
 vendored certification snapshot of that contract (used to cross-check the
 bundled `_contracts/jarvis-user-v3.7.2.json` copy against a known-good
@@ -484,9 +484,9 @@ bundled contract artifact SHA-256
 (clio-kit 2.7.2 added a `title` key to every user-profile tool, which shifts
 all three digests from the pre-2.7.2 values; clio-relay#199.)
 The nested runtime lock is bound to the public
-[`jarvis_cd-1.8.0-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.8.0/jarvis_cd-1.8.0-py3-none-any.whl)
+[`jarvis_cd-1.8.1-py3-none-any.whl`](https://github.com/grc-iit/jarvis-cd/releases/download/v1.8.1/jarvis_cd-1.8.1-py3-none-any.whl)
 release artifact with SHA-256
-`2c2e2042d0256bd3d9c117d75aaf00d26d9e814fcbcca9a904abf06399fc1067`;
+`ed891233e4b3767e949c6b5217bb03d4175b7d39334969c17ec83beb3c0c02d0`;
 bootstrap and call-time validation reject any other URL, version, or bytes.
 
 ## Register the Spack MCP
