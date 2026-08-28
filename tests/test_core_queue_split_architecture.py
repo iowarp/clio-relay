@@ -2633,6 +2633,7 @@ _FACADE_PUBLIC_METHOD_NAMES: tuple[str, ...] = (
     "get_transform_ref",
     "index_migration_status",
     "initialize",
+    "job_active_scan",
     "job_artifact_count",
     "job_has_pending_execution_cleanup",
     "latest_job_event",
@@ -2729,10 +2730,15 @@ def test_facade_public_method_set_stays_at_the_128_method_base() -> None:
     # 128-method base + 6 (#277: touch/status/close/sweep-failure/due-scan/
     # prune on the owned-session client-liveness lease -- see
     # queue_owner_session_lease.py) + 1 (#214: latest_progress_window, the
-    # bounded prediction window read -- see queue_progress.py) = 135. This is
-    # the count assertion doing its job: the additions are DELIBERATE, named
-    # individually above, not a silent regrowth.
-    assert len(_FACADE_PUBLIC_METHOD_NAMES) == 135
+    # bounded prediction window read -- see queue_progress.py) + 1 (#290:
+    # job_active_scan -- reads a job's live record together with the bounded
+    # active-job scan under one lock acquisition, closing the submit/observe
+    # TOCTOU where relay_queue_status trusted a caller-supplied job.state
+    # snapshot that could go stale between being read and the scan actually
+    # running -- see queue_jobs.py) = 136. This is the count assertion doing
+    # its job: the additions are DELIBERATE, named individually above, not a
+    # silent regrowth.
+    assert len(_FACADE_PUBLIC_METHOD_NAMES) == 136
 
 
 # The two facade-legitimate exceptions to "every public method resolves to a

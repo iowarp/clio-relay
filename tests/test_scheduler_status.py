@@ -6,6 +6,7 @@ import hmac
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -36,6 +37,7 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     SchedulerPhase,
+    TransformRef,
 )
 from clio_relay.relay_ops import job_status
 from clio_relay.runtime_metadata import runtime_metadata_from_sidecar_record
@@ -442,6 +444,110 @@ def test_relay_queue_status_counts_older_cluster_jobs(tmp_path: Path) -> None:
         "jobs_ahead": None,
         "position": None,
     }
+
+
+def test_relay_queue_status_reflects_live_state_despite_a_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    """#290: a job that left QUEUED after the caller's snapshot was taken must
+    not be reported as absent from the bounded active-job index.
+
+    ``relay_queue_status`` is handed a job snapshot the caller may have read
+    before this call; a legitimate concurrent transition can make that
+    snapshot's state disagree with the live record by the time the active-job
+    scan actually runs. Deterministic without any thread or timing: passing a
+    snapshot that says QUEUED for a job the durable record now reports
+    terminal reproduces the exact stale-state window without a race.
+    """
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: stale\npkgs: []\n"),
+            idempotency_key="stale-snapshot",
+        )
+    )
+    stale = queue.get_job(job.job_id)
+    assert stale.state == JobState.QUEUED
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+
+    assert relay_queue_status(queue, stale) == {
+        "state": "succeeded",
+        "jobs_ahead": None,
+        "position": None,
+    }
+
+
+def test_job_status_survives_a_state_transition_racing_the_queue_position_read(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """#290: force the submit-vs-observe interleaving deterministically.
+
+    ``job_status`` reads a job snapshot (``queue.get_job``), then a second
+    collaborator (``queue.get_transform_ref``), then calls
+    ``relay_queue_status`` with that snapshot. A barrier seam on
+    ``get_transform_ref`` -- a real collaborator that already sits between the
+    two reads, not a fake hook -- lets a second thread complete
+    ``update_job_state`` (transitioning the job out of QUEUED and out of the
+    active-job index) before the observer's ``relay_queue_status`` call runs,
+    reproducing the observed intermittent flake
+    (``test_relay_observe_until_pattern_returns_terminal_without_match``)
+    without depending on timing.
+    """
+    queue = ClioCoreQueue(tmp_path)
+    job = queue.submit_job(
+        RelayJob(
+            cluster="ares",
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(pipeline_yaml="name: observe-race\npkgs: []\n"),
+            idempotency_key="observe-race",
+        )
+    )
+    barrier = threading.Barrier(2)
+    original_get_transform_ref = queue.get_transform_ref
+
+    def blocking_get_transform_ref(job_id: str) -> TransformRef | None:
+        result = original_get_transform_ref(job_id)
+        barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(queue, "get_transform_ref", blocking_get_transform_ref)
+
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            results.append(job_status(queue, job.job_id))
+        except BaseException as exc:  # pragma: no cover - asserted in the parent thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=observe)
+    thread.start()
+    # This transition and de-index complete on the main thread strictly before
+    # its own barrier.wait() call below; the observer thread cannot resume
+    # past blocking_get_transform_ref (and therefore cannot call
+    # relay_queue_status) until that same barrier releases.
+    queue.update_job_state(job.job_id, JobState.SUCCEEDED)
+    barrier.wait(timeout=5)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    status = results[0]
+    # ``status["job"]``/``status["terminal"]`` legitimately reflect the point-in-
+    # time snapshot job_status read before the barrier (still QUEUED) -- that is
+    # ordinary read-time semantics, not the defect. The defect under test is
+    # specifically relay_queue_status raising QueueConflictError instead of
+    # reasoning from the job's actual live state, which by now (after
+    # update_job_state, before the barrier released) is terminal and no longer
+    # in the active-job index.
+    assert isinstance(status["job"], dict)
+    assert status["job"]["state"] == "queued"
+    assert status["relay_queue"] == {"state": "succeeded", "jobs_ahead": None, "position": None}
 
 
 def test_poll_slurm_status_reports_pending_queue_position(monkeypatch: MonkeyPatch) -> None:
