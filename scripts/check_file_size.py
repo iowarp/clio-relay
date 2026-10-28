@@ -2020,9 +2020,11 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 77.44
 #: test_application_runtime_prediction.py, then in the review-fix round
 #: test_execution_watch_prediction.py and
 #: test_queue_progress_bounded_window.py, raising it to 129/206 = 62.62%;
-#: iowarp/clio-relay#285 added two under-500 reconciliation test files).
+#: iowarp/clio-relay#285 added two under-500 reconciliation test files;
+#: iowarp/clio-relay#246 added test_session_remote_stdin_transport.py,
+#: 134/211 = 63.51%).
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.33
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.50
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

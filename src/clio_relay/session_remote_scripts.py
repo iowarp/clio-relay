@@ -208,7 +208,7 @@ def _owned_cleanup_finalize_script(
     *,
     definition: ClusterDefinition,
 ) -> str:
-    """Run the bounded coordinator-report finalizer with SSH stdin left intact."""
+    """Run the bounded coordinator-report finalizer reading its request on stdin."""
     relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
@@ -219,7 +219,7 @@ def _owned_cleanup_finalize_script(
 
 
 def _owned_cleanup_report_read_script(*, definition: ClusterDefinition) -> str:
-    """Run the pinned coordinator-report reader with SSH stdin left intact."""
+    """Run the pinned coordinator-report reader reading its request on stdin."""
     relay_executable = _owned_session_relay_executable(definition)
     return (
         "set -euo pipefail\n"
@@ -335,7 +335,14 @@ def _ssh_stdin_command(
     input_limit: int,
     stdout_limit: int,
 ) -> str:
-    """Run a small remote command while carrying a separately bounded stdin payload."""
+    """Run a remote script whose commands read a separately bounded stdin payload.
+
+    Both the script and its payload travel on ssh's stdin (``bash -l -s``), never in
+    argv: some ssh clients silently truncate a long argument, and the remote shell
+    then reports a cut-off script as a syntax error (clio-relay#246). The rendered
+    script feeds the payload to the caller's script with the ``printf`` builtin, so
+    the payload is never an exec argument on the remote side either.
+    """
     encoded_script = script.encode("utf-8")
     if len(encoded_script) > _MAX_REMOTE_SESSION_SCRIPT_BYTES:
         raise RelayError("remote session command exceeds its byte limit")
@@ -343,11 +350,17 @@ def _ssh_stdin_command(
         raise ValueError("remote session input and output limits must be positive")
     if len(input_bytes) > input_limit:
         raise RelayError("remote session stdin exceeds its byte limit")
-    remote_command = f"bash -lc {shlex.quote(script)}"
+    try:
+        payload = input_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RelayError("remote session stdin is not UTF-8 text") from exc
+    if "\0" in payload:
+        raise RelayError("remote session stdin contains a NUL byte")
+    remote_script = f"printf '%s' {_shell_single_quote(payload)} | {{\n{script}\n}}\n"
     try:
         result = session_remote_command._run_bounded_command(
-            ["ssh", definition.ssh_host, remote_command],
-            input_bytes=input_bytes,
+            ["ssh", definition.ssh_host, "bash", "-l", "-s"],
+            input_bytes=remote_script.encode("utf-8"),
             timeout_seconds=_REMOTE_SESSION_COMMAND_TIMEOUT_SECONDS,
             stdout_limit=stdout_limit,
             stderr_limit=_MAX_REMOTE_SESSION_STDERR_BYTES,
