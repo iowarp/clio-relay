@@ -1019,7 +1019,7 @@ def test_runner_launches_exact_wheel_only_through_verified_snapshot(
     result_payload = (tmp_path / "mcp-result.json").read_text(encoding="utf-8")
     result = _json_object(result_payload.encode("utf-8"), label="runner result")
 
-    assert return_code == 0, result.get("protocol_error")
+    assert return_code == 0, result
     assert result["server_args"] == server_args
     assert cast(JSON, result["server_artifact"])["install_spec"] == str(clio_kit_wheel)
     assert result["observed_server_artifact_digest"] == expected_digest

@@ -13,6 +13,8 @@ permissions:
 jobs:
   quality:
     runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -27,7 +29,9 @@ jobs:
         with:
           version: '0.11.28'
       - name: Install locked development dependencies
-        run: uv sync --frozen --python '${{ matrix.python }}'
+        run: |
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --frozen python -c "import os, sys; print(sys.version); assert '.'.join(map(str, sys.version_info[:2])) == os.environ['UV_PYTHON']"
       - name: Check lint and formatting
         run: |
           uv run --frozen ruff check .

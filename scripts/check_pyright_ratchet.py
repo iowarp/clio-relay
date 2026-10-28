@@ -169,7 +169,9 @@ from typing import Any, NamedTuple
 # (a static attribute access on a name that no longer exists on
 # ``clio_relay.cli``) plus one adjacent count movement. Net -2, measured
 # 7569 -> 7567.
-BASELINE_TOTAL = 7498
+# Native Windows 3.12 and 3.14 qualification now measure 7,497 errors after
+# typing the native ctypes exports; keep the maximum native-platform count.
+BASELINE_TOTAL = 7497
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
