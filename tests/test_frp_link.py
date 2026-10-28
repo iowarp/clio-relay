@@ -522,10 +522,7 @@ def test_close_reports_residual_config_file_when_cleanup_fails(monkeypatch: Monk
     assert visitor.config_path == config_path
 
 
-@pytest.mark.skipif(
-    os.name != "nt",
-    reason="reproduces the review's exact Windows open-file-handle scenario",
-)
+@pytest.mark.release_platform("windows")
 def test_close_reports_residual_config_file_when_windows_holds_it_open() -> None:
     """The same F3 fix, reproduced without a monkeypatch: an actual open file
     handle on Windows makes ``shutil.rmtree`` (inside ``TemporaryDirectory.

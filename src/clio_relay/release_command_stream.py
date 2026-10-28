@@ -330,7 +330,9 @@ def _kill_process_tree(process: subprocess.Popen[str]) -> tuple[str, ...]:
         return (f"tree_kill_uncertain: taskkill exit={result.returncode}: {detail}",)
     reasons: list[str] = []
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        # start_new_session made the tracked PID the owned process-group ID.
+        # It remains valid for descendants after their direct parent is reaped.
+        os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass  # already gone -- not a failure
     except (PermissionError, OSError) as exc:
