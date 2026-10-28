@@ -1,0 +1,44 @@
+name: Develop quality
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Install locked development dependencies
+        run: uv sync --frozen --python '${{ matrix.python }}'
+      - name: Check lint and formatting
+        run: |
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
+      - name: Check types
+        run: uv run --frozen pyright
+      - name: Run the full test suite
+        run: uv run --frozen pytest --junitxml=develop-results.xml -ra
+      - name: Require every collected test to run
+        run: |
+          python -c "import xml.etree.ElementTree as E; root = E.parse('develop-results.xml').getroot(); skipped = list(root.iter('skipped')); assert not skipped, f'{len(skipped)} tests were skipped'"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: develop-results-${{ matrix.python }}
+          path: develop-results.xml
+          if-no-files-found: warn
