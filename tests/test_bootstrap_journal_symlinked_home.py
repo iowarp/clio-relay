@@ -21,14 +21,13 @@ symlink AT the target itself is still refused.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
 from clio_relay import bootstrap_journal
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned traversal is POSIX")
+pytestmark = pytest.mark.release_platform("posix")
 
 
 def test_a_symlinked_site_prefix_is_traversed(tmp_path: Path) -> None:

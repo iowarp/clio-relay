@@ -333,6 +333,7 @@ def _real_systemd_user_reachable(bash: str) -> bool:
     return probe.returncode == 0
 
 
+@pytest.mark.release_platform("posix")
 @pytest.mark.parametrize(
     "raw",
     [
