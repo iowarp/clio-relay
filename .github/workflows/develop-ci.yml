@@ -23,14 +23,34 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.11.28'
       - name: Install locked development dependencies
         run: uv sync --frozen --python '${{ matrix.python }}'
       - name: Check lint and formatting
         run: |
           uv run --frozen ruff check .
           uv run --frozen ruff format --check .
-      - name: Check types
-        run: uv run --frozen pyright
+      - name: Check the existing strict type ratchet
+        run: uv run --frozen python scripts/check_pyright_ratchet.py
+      - name: Stage the existing pinned clio-kit wheel fixture
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.10.6-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          wheel_dir="$RUNNER_TEMP/clio-kit-fixture"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --connect-timeout 20 --max-time 180 \
+            --output "$wheel" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$wheel" | sha256sum --check --strict
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
       - name: Run the full test suite
         run: uv run --frozen pytest --junitxml=develop-results.xml -ra
       - name: Require every collected test to run
