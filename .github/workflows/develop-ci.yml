@@ -1,0 +1,69 @@
+name: Develop quality
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.11.28'
+      - name: Install locked development dependencies
+        run: |
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --frozen python -c "import os, sys; print(sys.version); assert '.'.join(map(str, sys.version_info[:2])) == os.environ['UV_PYTHON']"
+      - name: Check lint and formatting
+        run: |
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
+      - name: Check the existing strict type ratchet
+        run: uv run --frozen python scripts/check_pyright_ratchet.py
+      - name: Stage the existing pinned clio-kit wheel fixture
+        shell: bash
+        env:
+          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.10.6-py3-none-any.whl
+          CLIO_KIT_WHEEL_SHA256: bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d
+          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
+        run: |
+          set -euo pipefail
+          wheel_dir="$RUNNER_TEMP/clio-kit-fixture"
+          mkdir "$wheel_dir"
+          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --connect-timeout 20 --max-time 180 \
+            --output "$wheel" "$CLIO_KIT_WHEEL_URL"
+          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$wheel" | sha256sum --check --strict
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
+          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
+      - name: Run the full test suite
+        run: uv run --frozen pytest --junitxml=develop-results.xml -ra
+      - name: Require every collected test to run
+        run: |
+          python -c "import xml.etree.ElementTree as E; root = E.parse('develop-results.xml').getroot(); skipped = list(root.iter('skipped')); assert not skipped, f'{len(skipped)} tests were skipped'"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: develop-results-${{ matrix.os }}-${{ matrix.python }}
+          path: develop-results.xml
+          if-no-files-found: warn

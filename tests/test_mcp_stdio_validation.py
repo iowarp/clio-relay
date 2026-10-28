@@ -884,40 +884,72 @@ def test_packaged_stdio_byte_framing_preserves_unicode_and_rejects_ambiguity() -
     assert not isinstance(depth_error.value, RecursionError)
 
 
+def _orphan_barrier_program(tmp_path: Path) -> tuple[str, Path, Path, Path]:
+    """Hold a real child until the test releases it after containment cleanup."""
+    ready = tmp_path / "orphan-ready.txt"
+    release = tmp_path / "orphan-release.txt"
+    marker = tmp_path / "orphan-survived.txt"
+    child = f"""
+import pathlib
+import time
+
+pathlib.Path({str(ready)!r}).write_text('ready', encoding='utf-8')
+deadline = time.monotonic() + 30
+while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+pathlib.Path({str(marker)!r}).write_text('survived', encoding='utf-8')
+""".lstrip()
+    return child, ready, release, marker
+
+
+def _spawn_orphan_prefix(child: str, ready: Path, *, inherit_pipes: bool) -> str:
+    """Finish child startup before the parent answers the staged MCP exchange."""
+    handles = (
+        ""
+        if inherit_pipes
+        else ", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL"
+    )
+    return f"""
+import pathlib
+import subprocess
+import time
+
+subprocess.Popen([sys.executable, '-c', {child!r}]{handles})
+deadline = time.monotonic() + 5
+while not pathlib.Path({str(ready)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not pathlib.Path({str(ready)!r}).exists():
+    raise RuntimeError('orphan did not reach its startup barrier')
+""".lstrip()
+
+
 def test_packaged_stdio_rejects_and_kills_orphan_after_valid_root_exit(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     """A valid transcript cannot hide a detached descendant in the owned scope."""
-    marker = tmp_path / "orphan-survived.txt"
-    child = (
-        "import pathlib,time;time.sleep(0.5);"
-        f"pathlib.Path({str(marker)!r}).write_text('survived',encoding='utf-8')"
-    )
+    child, ready, release, marker = _orphan_barrier_program(tmp_path)
     transcript = _fake_transcript()
     executable = _write_fake_executable(
         tmp_path,
         _staged_fake_program(
             transcript,
-            prefix=(
-                "import subprocess\n"
-                "subprocess.Popen(\n"
-                f"    [sys.executable, '-c', {child!r}],\n"
-                "    stdin=subprocess.DEVNULL,\n"
-                "    stdout=subprocess.DEVNULL,\n"
-                "    stderr=subprocess.DEVNULL,\n"
-                ")\n"
-            ),
+            prefix=_spawn_orphan_prefix(child, ready, inherit_pipes=False),
         ),
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
-    with pytest.raises(RelayError, match="containment could not be verified"):
-        run_packaged_mcp_stdio_session(
-            profile="user",
-            tool="jarvis_run",
-            arguments={},
-            timeout_seconds=2,
-        )
+    try:
+        # Two real Windows Python processes must start before this assertion.
+        with pytest.raises(RelayError, match="containment could not be verified"):
+            run_packaged_mcp_stdio_session(
+                profile="user",
+                tool="jarvis_run",
+                arguments={},
+                timeout_seconds=10,
+            )
+        assert ready.is_file()
+    finally:
+        release.touch()
     time.sleep(0.7)
     assert not marker.exists()
 
@@ -927,29 +959,30 @@ def test_packaged_stdio_kills_orphan_holding_pipe_after_root_exit(
     monkeypatch: MonkeyPatch,
 ) -> None:
     """A descendant-held pipe is bounded and terminated after its root exits."""
-    marker = tmp_path / "pipe-orphan-survived.txt"
-    child = (
-        "import pathlib,time;time.sleep(0.5);"
-        f"pathlib.Path({str(marker)!r}).write_text('survived',encoding='utf-8')"
-    )
+    child, ready, release, marker = _orphan_barrier_program(tmp_path)
     executable = _write_fake_executable(
         tmp_path,
-        f"""
-import subprocess
-import sys
-
-sys.stdin.buffer.read()
-subprocess.Popen([sys.executable, "-c", {child!r}])
-""".lstrip(),
+        _staged_fake_program(
+            _fake_transcript(),
+            prefix=_spawn_orphan_prefix(child, ready, inherit_pipes=True),
+        ),
     )
     monkeypatch.setenv("CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE", str(executable))
-    with pytest.raises(RelayError, match="total wall-clock deadline"):
-        run_packaged_mcp_stdio_session(
-            profile="user",
-            tool="jarvis_run",
-            arguments={},
-            timeout_seconds=0.1,
-        )
+    try:
+        # Allow real Windows process startup, then require the orphan to have
+        # reached its pipe-holding barrier before the actual deadline expires.
+        with pytest.raises(ObservationTimeoutError, match="stdio validation"):
+            run_packaged_mcp_stdio_session(
+                profile="user",
+                tool="jarvis_run",
+                arguments={},
+                timeout_seconds=10,
+            )
+        assert ready.is_file(), "deadline expired before the orphan held the pipe"
+    finally:
+        # A surviving child can write immediately now; also retire it if a
+        # regression causes the test's assertions to fail.
+        release.touch()
     time.sleep(0.7)
     assert not marker.exists()
 

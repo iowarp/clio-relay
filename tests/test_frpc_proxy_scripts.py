@@ -460,6 +460,7 @@ def _run_install_harness(
 
 
 @_REQUIRES_BASH_TOOLS
+@pytest.mark.release_platform("posix")
 def test_install_script_runs_under_a_real_shell_and_reports_a_clean_failure() -> None:
     """A real bash proves file-writing + activation-helper wiring + D5's trap.
 
@@ -517,6 +518,7 @@ def test_install_script_runs_under_a_real_shell_and_reports_a_clean_failure() ->
 
 
 @_REQUIRES_BASH_TOOLS
+@pytest.mark.release_platform("posix")
 def test_install_script_active_recheck_catches_a_flip_the_activation_helper_missed() -> None:
     """D6 end-to-end: reproduces the live-proven false-success scenario.
 
@@ -563,6 +565,7 @@ exit 1
 
 
 @_REQUIRES_BASH_TOOLS
+@pytest.mark.release_platform("posix")
 def test_install_script_lingering_gate_refuses_before_writing_anything() -> None:
     """D7 end-to-end: a real bash + stub loginctl reproduces the live-proven exit 78.
 

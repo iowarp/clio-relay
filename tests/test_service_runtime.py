@@ -15,13 +15,12 @@ import sys
 import threading
 import time
 import types
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from typing import BinaryIO, Literal, cast
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -1475,43 +1474,6 @@ def _start_lifecycle_frp_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[ServiceRuntimeSupervisor, LifecycleFrpRunner, ServiceRuntimeStartResult]:
-    def allow_private_path(_path: Path, *, directory: bool = True) -> None:
-        del directory
-
-    for module_name in (
-        "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
-        # #231 class-mixin split: _gateway_transition_lock_path (the caller)
-        # lives in service_runtime_core.py now, not service_runtime.py.
-        "clio_relay.service_runtime_core",
-    ):
-        monkeypatch.setattr(
-            f"{module_name}.ensure_private_configuration_directory",
-            allow_private_path,
-            raising=False,
-        )
-    for module_name in (
-        # service_runtime_core never imports ensure_private_configuration_path
-        # -- it only uses ensure_private_configuration_directory
-        # (src/clio_relay/service_runtime_core.py).
-        "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
-    ):
-        monkeypatch.setattr(
-            f"{module_name}.ensure_private_configuration_path",
-            allow_private_path,
-            raising=False,
-        )
-
-    @contextmanager
-    def open_test_atomic_file(path: Path) -> Iterator[BinaryIO]:
-        with path.open("xb") as handle:
-            yield handle
-
-    monkeypatch.setattr(
-        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
-        open_test_atomic_file,
-    )
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",

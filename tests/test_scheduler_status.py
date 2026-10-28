@@ -1879,7 +1879,8 @@ def test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks(
     containment_filename = process_containment.__file__
     assert containment_filename is not None
     containment_source = Path(containment_filename)
-    (relay_package / "process_containment.py").write_bytes(containment_source.read_bytes())
+    for source in containment_source.parent.glob("process_containment*.py"):
+        (relay_package / source.name).write_bytes(source.read_bytes())
     jarvis_execution_filename = sys.modules[run_native_jarvis_broker.__module__].__file__
     assert isinstance(jarvis_execution_filename, str)
     (relay_package / "jarvis_execution.py").write_bytes(

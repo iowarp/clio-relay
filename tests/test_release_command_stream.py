@@ -217,6 +217,7 @@ def test_run_streaming_command_base_exception_kills_tree_and_propagates(
     def wait_side_effect(self: subprocess.Popen[str], timeout: float | None = None) -> int:
         calls["count"] += 1
         if calls["count"] == 1:
+            _wait_for_pid_file(pid_file)
             raise KeyboardInterrupt("simulated Ctrl-C mid-gate")
         return original_wait(self, timeout=timeout)
 

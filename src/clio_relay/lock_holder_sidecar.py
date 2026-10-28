@@ -408,19 +408,19 @@ def _win32_open_process(pid: int) -> tuple[int, int]:
     from ctypes import wintypes
 
     process_query_limited_information = 0x1000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = cast(Any, ctypes).WinDLL("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     open_process.restype = wintypes.HANDLE
     handle = open_process(process_query_limited_information, False, pid)
-    return handle, ctypes.get_last_error()
+    return handle, cast(Any, ctypes).get_last_error()
 
 
 def _win32_get_exit_code(handle: int) -> int | None:
     """``GetExitCodeProcess`` syscall seam; ``None`` when the call itself fails."""
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = cast(Any, ctypes).WinDLL("kernel32", use_last_error=True)
     get_exit_code = kernel32.GetExitCodeProcess
     get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     get_exit_code.restype = wintypes.BOOL
@@ -432,7 +432,7 @@ def _win32_get_exit_code(handle: int) -> int | None:
 
 def _win32_close_handle(handle: int) -> None:
     """``CloseHandle`` syscall seam."""
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = cast(Any, ctypes).WinDLL("kernel32", use_last_error=True)
     kernel32.CloseHandle(handle)
 
 

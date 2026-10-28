@@ -1465,7 +1465,7 @@ def test_windows_sidecar_cleanup_anchors_parent_and_rejects_reparse_points(
         def fake_windows_handle_information(handle: int, path: Path) -> tuple[int, int]:
             del handle, path
             return (
-                cast(Any, endpoint_module)._WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
+                cast(Any, endpoint_sidecar_types)._WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
                 os.stat(spool).st_ino,
             )
 
