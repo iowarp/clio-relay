@@ -223,22 +223,32 @@ def mcp_call_result_error(document: dict[str, object]) -> dict[str, object] | No
     }
 
 
+def _stderr_suffix(detail: dict[str, object]) -> str:
+    """``": <stderr tail>"`` when the detail carries one, else ""."""
+    tail = detail.get("stderr_tail")
+    return f": {tail}" if isinstance(tail, str) and tail else ""
+
+
 def mcp_call_dispatch_failure_text(detail: dict[str, object]) -> str:
-    """Render any of this module's typed detail shapes as one bounded line."""
+    """Render any of this module's typed detail shapes as one bounded line.
+
+    The stderr tail is appended whenever no typed tool error explains the
+    failure: a server that dies before answering (#248's ``--jarvis-root``
+    specimen) says why only on stderr.
+    """
     if detail.get("reason") == DISPATCH_NO_RESULT_DOCUMENT_REASON:
         returncode = detail.get("returncode")
-        tail = detail.get("stderr_tail")
-        suffix = f": {tail}" if isinstance(tail, str) and tail else ""
-        return f"MCP dispatch produced no terminal result document (exit code {returncode}){suffix}"
+        return (
+            f"MCP dispatch produced no terminal result document (exit code {returncode})"
+            f"{_stderr_suffix(detail)}"
+        )
     if detail.get("reason") == MCP_CALL_TIMED_OUT_REASON:
         tool = detail.get("tool")
         returncode = detail.get("returncode")
-        tail = detail.get("stderr_tail")
-        suffix = f": {tail}" if isinstance(tail, str) and tail else ""
         named = (
             f"MCP call {tool} timed out" if isinstance(tool, str) and tool else "MCP call timed out"
         )
-        return f"{named} (exit code {returncode}){suffix}"
+        return f"{named} (exit code {returncode}){_stderr_suffix(detail)}"
     tool = detail.get("tool")
     code = detail.get("code")
     error_detail = detail.get("detail")
@@ -248,9 +258,9 @@ def mcp_call_dispatch_failure_text(detail: dict[str, object]) -> str:
             f"{code}: {error_detail}" if isinstance(error_detail, str) and error_detail else code
         )
     elif isinstance(protocol_error, str) and protocol_error:
-        message = protocol_error
+        message = f"{protocol_error}{_stderr_suffix(detail)}"
     else:
-        message = "MCP call returned an error without a typed payload"
+        message = f"MCP call returned an error without a typed payload{_stderr_suffix(detail)}"
     return (
         f"MCP call {tool} failed: {message}"
         if isinstance(tool, str) and tool
