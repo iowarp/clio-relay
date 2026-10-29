@@ -193,6 +193,40 @@ def test_protocol_error_only_is_still_typed() -> None:
     assert "jarvis-root" in cast(str, detail["stderr_tail"])
     text = mcp_call_dispatch_failure_text(detail)
     assert "process exited before answering" in text
+    assert "JARVIS root does not exist" in text  # the cause, not only the symptom
+
+
+def test_typed_tool_error_text_leaves_stderr_out() -> None:
+    """A typed tool error already says why; its stderr noise stays in metadata."""
+    detail = mcp_call_result_error(
+        {
+            "tool": "spack_install",
+            "structured_result": {"error": {"code": "command_failed", "detail": "no variant"}},
+            "protocol_error": "tools/call returned isError=true",
+            "stderr": "progress chatter",
+            "returncode": 1,
+        }
+    )
+
+    assert detail is not None
+    assert mcp_call_dispatch_failure_text(detail) == (
+        "MCP call spack_install failed: command_failed: no variant"
+    )
+
+
+def test_untyped_is_error_text_carries_stderr_tail() -> None:
+    detail = mcp_call_result_error(
+        {
+            "tool": "probe",
+            "protocol_result": {"isError": True, "content": []},
+            "protocol_error": None,
+            "stderr": "probe: config missing",
+            "returncode": 1,
+        }
+    )
+
+    assert detail is not None
+    assert mcp_call_dispatch_failure_text(detail).endswith("typed payload: probe: config missing")
 
 
 def test_clean_result_reports_no_error() -> None:
