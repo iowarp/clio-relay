@@ -1351,6 +1351,14 @@ relay and scheduler work requires both explicit flags:
 clio-relay session teardown --cluster my-cluster --session-id desktop-session --cancel-jobs --cancel-scheduler-jobs --preserve-scheduler-job-id unrelated-validation-job
 ```
 
+When the cluster's relay runs on the same host as the command (`ssh_host` is
+`localhost`, or `CLIO_RELAY_CLI_MODE=local`), teardown acts on the core and spool
+named by `CLIO_RELAY_CORE_DIR` and `CLIO_RELAY_SPOOL_DIR`, or their defaults when
+unset. Teardown refuses unless those resolve to the cluster's registered
+`core_dir` and `spool_dir`. The refusal names both paths. On a shared host,
+export the registered paths before tearing down a deployment that does not use
+the default core.
+
 Jobs submitted through the owned session API are stamped with the server-side
 `owner_session_id` and `owner_session_generation_id`; clients cannot supply those
 metadata fields. Every owned job submission must authenticate with the relay API

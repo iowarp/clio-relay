@@ -53,6 +53,7 @@ import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.session_lifecycle as session_lifecycle
 import clio_relay.session_lifecycle_report as session_lifecycle_report
 import clio_relay.session_start_query as session_start_query
+import clio_relay.teardown_core_scope as teardown_core_scope
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__, cli
 from clio_relay.cli import app
@@ -160,6 +161,10 @@ def _owner_session_closure_payload(
     )
 
 
+def _accept_core_scope(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for the #203 core-scope guard in tests about other teardown behavior."""
+
+
 @pytest.fixture(autouse=True)
 def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: MonkeyPatch,
@@ -170,6 +175,12 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         "CLIO_RELAY_INSTALL_RECEIPT",
         str(tmp_path / "relay-state" / "install-receipt.json"),
     )
+    # iowarp/clio-relay#203's core-scope guard compares the core this process
+    # resolves against the registry entry. These tests force local mode and
+    # point the core at temp paths their registry entries never name, so the
+    # guard would refuse every teardown before the behavior under test runs.
+    # Its own CLI coverage lives in tests/test_teardown_core_scope.py.
+    monkeypatch.setattr(teardown_core_scope, "require_registered_local_core", _accept_core_scope)
     finalized_statuses: dict[str, OwnedSessionRecoveryStatus] = {}
 
     def preserve_verified_report(

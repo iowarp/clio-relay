@@ -39,6 +39,7 @@ import clio_relay.remote_mcp as remote_mcp
 import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.scheduler_validation as scheduler_validation
 import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.teardown_core_scope as teardown_core_scope
 import clio_relay.transport_probe as transport_probe
 from clio_relay.cli import app
 from clio_relay.cluster_config import (
@@ -82,6 +83,10 @@ from clio_relay.validation_report import (
 )
 
 
+def _accept_core_scope(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for the #203 core-scope guard in tests about other teardown behavior."""
+
+
 @pytest.fixture(autouse=True)
 def _local_cli(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: pytest.MonkeyPatch,
@@ -112,6 +117,12 @@ def _local_cli(  # pyright: ignore[reportUnusedFunction]
         "CLIO_RELAY_INSTALL_RECEIPT",
         str(tmp_path / "relay-state" / "install-receipt.json"),
     )
+    # iowarp/clio-relay#203's core-scope guard compares the core this process
+    # resolves against the registry entry. These tests force local mode and
+    # point the core at temp paths their registry entries never name, so the
+    # guard would refuse every teardown before the behavior under test runs.
+    # Its own CLI coverage lives in tests/test_teardown_core_scope.py.
+    monkeypatch.setattr(teardown_core_scope, "require_registered_local_core", _accept_core_scope)
 
 
 def _write_cluster(root: Path, name: str = "test-cluster") -> None:
