@@ -57,7 +57,9 @@ import clio_relay.cli_session_teardown_action as cli_session_teardown_action
 import clio_relay.cli_session_teardown_state as cli_session_teardown_state
 import clio_relay.cli_support as cli_support
 import clio_relay.remote_cli as remote_cli
+import clio_relay.teardown_core_scope as teardown_core_scope
 import clio_relay.validation_report as validation_report_module
+from clio_relay.config import RelaySettings
 from clio_relay.validation_report import (
     LiveValidationReport,
     default_report_path,
@@ -193,6 +195,9 @@ def session_teardown(
                 "--preserve-scheduler-job-id requires both --cancel-jobs and "
                 "--cancel-scheduler-jobs"
             )
+        if not remote_cli.should_execute_on_cluster(definition):
+            # iowarp/clio-relay#203: refuse before any local core is opened.
+            teardown_core_scope.require_registered_local_core(definition, RelaySettings.from_env())
     except BaseException as exc:
         try:
             cli._write_failed_acceptance_report(

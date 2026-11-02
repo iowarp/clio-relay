@@ -52,6 +52,32 @@ class ObservationPatternError(ConfigurationError):
         super().__init__(message)
 
 
+class TeardownCoreScopeError(ConfigurationError):
+    """A local teardown would act on a core other than its cluster's registered one.
+
+    iowarp/clio-relay#203: when a cluster runs on this host, teardown opens the
+    core named by ``CLIO_RELAY_CORE_DIR``/``CLIO_RELAY_SPOOL_DIR`` (or their
+    defaults), never the registry entry's paths. On a shared host that default
+    can be a different deployment's live core.
+    """
+
+    reason = "teardown_core_scope_mismatch"
+
+    def __init__(self, *, cluster: str, field: str, registered: str, resolved: str) -> None:
+        self.cluster = cluster
+        self.field = field
+        self.registered = registered
+        self.resolved = resolved
+        environment_name = "CLIO_RELAY_CORE_DIR" if field == "core_dir" else "CLIO_RELAY_SPOOL_DIR"
+        super().__init__(
+            f"refusing to tear down cluster {cluster!r}: its registered {field} is "
+            f"{registered}, but this process resolves {resolved}. Teardown for this "
+            "cluster runs on this host, so it would act on a different deployment's "
+            f"state. Set {environment_name}={registered} (or correct the registry "
+            "entry) and re-run (iowarp/clio-relay#203)."
+        )
+
+
 class QueueConflictError(RelayError):
     """Raised when a queue operation violates an invariant."""
 
