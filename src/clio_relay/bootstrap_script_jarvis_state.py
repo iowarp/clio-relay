@@ -414,6 +414,7 @@ __CLIO_RELAY_CANDIDATE_PYPI_WHEEL__
     sha256sum --check --strict -
 
   BOOTSTRAP_PINNED_UV_SOURCE="$HOME/.local/bin/uv"
+  bootstrap_require_pinned_uv_source "$BOOTSTRAP_PINNED_UV_SOURCE"
   BOOTSTRAP_PINNED_UV="$(
     env -u PYTHONPATH -u PYTHONHOME -u LD_PRELOAD -u LD_LIBRARY_PATH \
       python3 -I -c {pinned_uv_copy_program} \

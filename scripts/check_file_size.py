@@ -2013,7 +2013,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 77.44
+SRC_DISTRIBUTION_BASELINE_PERCENT = 77.47
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -2022,7 +2022,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 77.44
 #: test_queue_progress_bounded_window.py, raising it to 129/206 = 62.62%;
 #: iowarp/clio-relay#285 added two under-500 reconciliation test files).
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.33
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 63.50
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
