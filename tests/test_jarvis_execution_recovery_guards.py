@@ -321,6 +321,17 @@ def test_minimal_recovery_environment_exposes_only_base_and_referenced_sources(
     assert "REMOTE_TOKEN" not in environment
 
 
+def test_minimal_runner_environment_forwards_jarvis_root(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An operator's per-instance JARVIS root reaches the MCP runner (iowarp/clio-relay#173)."""
+    monkeypatch.setenv("JARVIS_ROOT", "/srv/instance-a/jarvis-state")
+
+    environment = minimal_mcp_runner_environment({})
+
+    assert environment["JARVIS_ROOT"] == "/srv/instance-a/jarvis-state"
+
+
 def test_recovery_directory_rejects_an_existing_unowned_path(tmp_path: Path) -> None:
     """A recovery attempt cannot adopt a directory it did not create and pin."""
     recovery_directory = tmp_path / "recovery"
