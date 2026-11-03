@@ -31,6 +31,15 @@ share a version string. A fresh bootstrap may finish with the endpoint service
 reported as `pending_install`; the explicit `install-endpoint-service` command
 above owns unit creation and activation.
 
+The cluster host needs `bash`, `flock`, and a `python3` of version 3.10 or
+newer on `PATH`. Bootstrap runs its verification stages under that `python3`
+and refuses up front, naming the version it found, when it is older. The relay
+runtime itself installs its own pinned interpreter. On a host that already has
+JARVIS state, bootstrap also expects `~/.local/bin/uv` to be the pinned uv
+release and does not install it there; if uv is missing or a different build,
+bootstrap refuses and names the release to extract (uv and uvx) into
+`~/.local/bin`.
+
 Bootstrap is an install/reconcile operation, not a desktop-session startup
 requirement. An ordinary reconnect reuses the persistent endpoint directly.
 When an operator explicitly repeats bootstrap with the same release artifact,

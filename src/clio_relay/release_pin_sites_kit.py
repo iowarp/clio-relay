@@ -128,8 +128,9 @@ def kit_pin_sites(
             family,
             filename,
             "Use Remote JARVIS MCP: uv tool install wheel URL",
-            # v1.7.0 campaign: doc additions above pushed this from 719 to 741.
-            line=741,
+            # v1.7.0 campaign: doc additions above pushed this from 719 to 741;
+            # the #283 host-requirements paragraph pushed it to 750.
+            line=750,
             pattern=_KIT_VERSION,
             value_group="bootstrap_kit_version_text",
         ),

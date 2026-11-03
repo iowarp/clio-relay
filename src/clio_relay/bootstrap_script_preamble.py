@@ -11,6 +11,7 @@ from __future__ import annotations
 import shlex
 
 from clio_relay.bootstrap_receipt_classifier_source import _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE
+from clio_relay.bootstrap_script_host_requirements import host_requirements_script
 
 
 def script_preamble(
@@ -121,7 +122,7 @@ command -v flock >/dev/null 2>&1 || {{
   echo "flock is required to serialize clio-relay bootstrap" >&2
   exit 1
 }}
-if [ "${{CLIO_RELAY_BOOTSTRAP_LOCK_FD:-}}" != 9 ]; then
+{host_requirements_script()}if [ "${{CLIO_RELAY_BOOTSTRAP_LOCK_FD:-}}" != 9 ]; then
   python3 - "$0" <<'__CLIO_RELAY_BOOTSTRAP_LOCK_AND_REEXEC__'
 import fcntl
 import os
