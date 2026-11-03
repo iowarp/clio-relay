@@ -127,6 +127,9 @@ tool allowlists, local profile permissions, and optional child-to-worker
 environment references. References contain names only; the packaged runner
 constructs a minimal child environment and resolves explicitly allowed values
 at execution time. Relay-owned credentials are never eligible references.
+The minimal environment always carries the worker's `JARVIS_ROOT` when it is
+set, so a JARVIS-backed server uses that deployment's JARVIS root rather than
+falling back to the shared `~/.ppi-jarvis`.
 Schema discovery is a durable
 `mcp_call` job using the `tools/list` operation. Its validated result and
 provenance are cached on the operator desktop; local MCP `tools/list` never

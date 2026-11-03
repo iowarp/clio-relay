@@ -2545,6 +2545,20 @@ def test_mcp_call_runner_scrubs_progress_env_from_server(
     assert "REGISTERED_APPLICATION_SECRET" not in explicit
 
 
+def test_mcp_call_runner_forwards_jarvis_root_to_server(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The MCP server sees the runner's JARVIS root, not jarvis-cd's ~/.ppi-jarvis default.
+
+    iowarp/clio-relay#173: without this, a per-instance root set on the worker
+    was dropped and every deployment on the host shared one JARVIS inventory.
+    """
+    runner = _load_runner()
+    monkeypatch.setenv("JARVIS_ROOT", "/srv/instance-a/jarvis-state")
+
+    assert cast(Any, runner)._child_env({})["JARVIS_ROOT"] == "/srv/instance-a/jarvis-state"
+
+
 def test_mcp_call_runner_rejects_relay_credential_references() -> None:
     runner = _load_runner()
 

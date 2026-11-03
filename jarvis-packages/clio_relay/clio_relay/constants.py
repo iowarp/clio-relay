@@ -201,6 +201,9 @@ _BASE_CHILD_ENV_NAMES = frozenset(
         "APPDATA",
         "COMSPEC",
         "HOME",
+        # jarvis-cd's config root; without it a per-instance root falls back
+        # to the shared ~/.ppi-jarvis (iowarp/clio-relay#173).
+        "JARVIS_ROOT",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
