@@ -435,8 +435,8 @@ def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
     monkeypatch: MonkeyPatch,
 ) -> None:
     """#216: an edit that changes cluster_route_revision must warn loudly at edit
-    time -- cached MCP discovery evidence for the cluster silently strands
-    otherwise, and every call through it fails typed only later, per call.
+    time -- a running owned session keeps its old route, and every registered
+    MCP call through it fails typed (409) until the session restarts.
     """
     monkeypatch.chdir(tmp_path)
     registry_path = tmp_path / ".clio-relay" / "clusters.json"
@@ -456,8 +456,8 @@ def test_cli_cluster_pin_runtime_warns_when_route_revision_changes(
     )
     assert changed.exit_code == 0, changed.output
     assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
+    assert "session start --cluster ares-p5run2 --session-id <id> --replace" in changed.output
+    assert "remote-mcp refresh does not clear it" in changed.output
 
     # Re-pinning the identical value changes nothing: no repeated warning noise.
     unchanged = CliRunner().invoke(
@@ -483,8 +483,8 @@ def test_cli_cluster_add_warns_when_route_revision_changes(
     the fix names (add / pin-target / pin-runtime) but only pin-runtime's
     warning path was pinned by a test above -- this fills that gap for
     `add`. Re-adding an EXISTING cluster with a changed routing-relevant
-    field (ssh_host) must warn loudly that cached MCP discovery evidence is
-    now stale, exactly like pin-runtime.
+    field (ssh_host) must warn loudly that a running owned session needs a
+    restart, exactly like pin-runtime.
     """
     monkeypatch.chdir(tmp_path)
 
@@ -503,8 +503,8 @@ def test_cli_cluster_add_warns_when_route_revision_changes(
     )
     assert changed.exit_code == 0, changed.output
     assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
+    assert "keeps its old route" in changed.output
+    assert "session start --cluster" in changed.output
 
     # Re-adding with the identical routing-relevant fields changes nothing:
     # no repeated warning noise.
@@ -526,7 +526,7 @@ def test_cli_cluster_pin_target_warns_when_route_revision_changes(
     that gap for `pin-target`. target_identity is included in
     cluster_route_revision()'s digest (it excludes only
     remote_mcp_servers/worker_capacity), so pinning a physical target
-    identity strands cached MCP discovery evidence exactly like pin-runtime
+    identity strands a running owned session's route exactly like pin-runtime
     and must warn the same way.
     """
     monkeypatch.chdir(tmp_path)
@@ -549,8 +549,8 @@ def test_cli_cluster_pin_target_warns_when_route_revision_changes(
     )
     assert changed.exit_code == 0, changed.output
     assert "route revision changed" in changed.output
-    assert "stale" in changed.output
-    assert "remote-mcp refresh" in changed.output
+    assert "keeps its old route" in changed.output
+    assert "session start --cluster" in changed.output
 
     # Re-pinning the identical target identity changes nothing: no repeated
     # warning noise.

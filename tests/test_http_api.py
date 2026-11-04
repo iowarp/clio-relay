@@ -2550,7 +2550,13 @@ def test_owned_registered_mcp_call_uses_immutable_session_authority(
         },
     )
     assert route_drift.status_code == 409
-    assert "cluster route changed" in route_drift.json()["detail"]
+    route_drift_detail = route_drift.json()["detail"]
+    assert "route changed after relay session desktop-session-1 started" in route_drift_detail
+    assert "refreshing MCP discovery will not clear this" in route_drift_detail
+    assert (
+        "clio-relay session start --cluster alpha --session-id desktop-session-1 --replace"
+        in route_drift_detail
+    )
 
     registration_drift = client.post(
         "/jobs/mcp-call",

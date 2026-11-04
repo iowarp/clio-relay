@@ -26,6 +26,7 @@ declares dependencies through this module.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import secrets
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from clio_relay.models import (
     RelayTask,
     new_id,
 )
+from clio_relay.models_mcp_admission import McpControlQueryEvidence
 from clio_relay.storage_runtime import StorageAdmissionError
 
 _SESSION_REGISTRY_SHA256_ENV = "CLIO_RELAY_SESSION_REGISTRY_SHA256"
@@ -176,6 +178,31 @@ class RelayApiContext:
             raise door_errors.http_problem(
                 "session_intake_closed", "relay session generation is not open for new work"
             )
+
+    def require_session_route(self, evidence: McpControlQueryEvidence | None) -> None:
+        """Refuse route evidence minted after this owned session's route froze.
+
+        clio-relay#216: the caller mints control-query evidence from its current
+        ``clusters.json`` on every catalog build, but an owned session API keeps
+        the cluster definition it started with. A route edit on the caller after
+        the session started fails every call, and ``remote-mcp refresh`` cannot
+        clear it because the session's copy never changes. Name the restart.
+        """
+        pinned = self.owner_session_cluster_definition
+        if pinned is None or evidence is None or evidence.cluster != pinned.name:
+            return
+        session_revision = cluster_route_revision(pinned)
+        if hmac.compare_digest(evidence.cluster_route_revision, session_revision):
+            return
+        session_id = self.resolved.owner_session_id
+        raise door_errors.http_problem(
+            "mcp_submission_conflict",
+            f"cluster {pinned.name!r} route changed after relay session {session_id} started "
+            f"(session route {session_revision[:12]}, caller route "
+            f"{evidence.cluster_route_revision[:12]}); refreshing MCP discovery will not "
+            f"clear this -- restart the session with 'clio-relay session start --cluster "
+            f"{pinned.name} --session-id {session_id} --replace', then retry",
+        )
 
     def owns_job(self, job: RelayJob) -> bool:
         return job_owned_by_session(
