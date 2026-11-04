@@ -1228,6 +1228,14 @@ session reconnect --cluster my-cluster`) is the one explicit, user-present
 action that performs that single new dial. An already-live channel is reused
 untouched -- zero new dials.
 
+An owned session keeps the cluster definition it started with. Editing that
+cluster's routing fields afterwards (`cluster add`, `cluster pin-target`,
+`cluster pin-runtime`) makes every registered MCP call through the session fail
+with a 409 `mcp_submission_conflict` naming both route revisions. `remote-mcp
+refresh` does not clear it; restart the session with `clio-relay session start
+--cluster my-cluster --session-id <id> --replace`. The edit commands print the
+same warning when they change the route.
+
 For a recorder or other client that must survive loss of the initiating process,
 run `session plan-start` first and persist its JSON. Pass the plan's operation id,
 route revision, and release digest to `session start`. The returned

@@ -27,7 +27,7 @@ so they are imported directly, matching ``cli.py``'s own prior style.
 
 **What moves here as private helpers, and why.**
 ``_route_revision_before_edit``/``_warn_if_route_revision_changed`` (the
-clio-relay#216 stale-MCP-cache warning) and ``_split_csv`` had every one of
+clio-relay#216 route-drift warning) and ``_split_csv`` had every one of
 their call sites inside this exact four-command group -- unlike the
 cross-cutting helpers left in ``cli.py`` (``_require_cluster``,
 ``_none_if_blank``, ``_kind_concurrency_options``, each with call sites in
@@ -83,21 +83,19 @@ def _route_revision_before_edit(cluster: str) -> str | None:
 
 
 def _warn_if_route_revision_changed(cluster: str, *, before: str | None, after: str) -> None:
-    """Warn loudly when an edit strands cached MCP discovery evidence (clio-relay#216).
+    """Warn loudly when an edit strands a running owned session's route (clio-relay#216).
 
-    ``cluster_route_revision()`` covers every routing-relevant field except
-    ``remote_mcp_servers``/``worker_capacity``. Every call routed through
-    cached MCP discovery evidence (minted by ``remote-mcp refresh``) fails
-    typed only once dispatched -- and only per call, well after this edit --
-    unless the operator is warned here, at edit time, that a refresh is due.
+    ``cluster_route_revision()`` skips only ``remote_mcp_servers``/``worker_capacity``.
+    Catalogs re-mint MCP evidence from the current file, but a running owned session
+    keeps the route it started with, so its calls fail (409) until it restarts.
     """
     if before is not None and before != after:
         typer.echo(
             f"warning: cluster {cluster!r} route revision changed "
-            f"({before[:12]} -> {after[:12]}); cached MCP discovery evidence for this "
-            f"cluster is now stale. Run 'clio-relay remote-mcp refresh --cluster {cluster}' "
-            "before the next MCP call through it, or every call will fail typed (409) only "
-            "after its full dispatch budget.",
+            f"({before[:12]} -> {after[:12]}). A running owned relay session for this "
+            "cluster keeps its old route, so every registered MCP call through it fails (409) "
+            f"until restarted with 'clio-relay session start --cluster {cluster} --session-id "
+            "<id> --replace'; remote-mcp refresh does not clear it.",
             err=True,
         )
 

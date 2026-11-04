@@ -175,6 +175,7 @@ def register_job_routes(
         request: McpCallSubmitRequest,
         owner_session_identity: JobOwnerSessionIdentity | None = job_identity_parameter,
     ) -> RelayJob:
+        ctx.require_session_route(request.control_query_evidence)
         registry_path = default_registry_path()
         try:
             definition = (

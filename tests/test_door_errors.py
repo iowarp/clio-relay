@@ -1019,8 +1019,8 @@ def _http_api_split_sources() -> list[tuple[str, str]]:
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 123 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_139_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 124 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -1049,6 +1049,11 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
     123 (was 113): clio-relay#179 dial burn-down (review M5): three new
     owned-session-channel route modules add 10 more raise sites -- see
     ``_HTTP_API_SPLIT_MODULES``'s own comment for the per-module breakdown.
+
+    124 (was 123): clio-relay#216 adds ONE ``mcp_submission_conflict`` site,
+    ``RelayApiContext.require_session_route`` (http_api_context.py), which
+    names a session restart when the caller's cluster route left the one the
+    owned session started with.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1072,7 +1077,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 123
+    assert len(calls) == 124
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1112,7 +1117,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 138
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 139
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
