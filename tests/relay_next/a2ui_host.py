@@ -203,7 +203,9 @@ class Host:
     async def choose(self, row_id: str, column: str, value: str, sid: str = "relay-sites") -> Any:
         return await self.call(*self.choice(row_id, column, value, sid))
 
-    def menu_item(self, row_id: str, item: str, sid: str = "relay-sites") -> tuple[str, dict[str, Any]]:
+    def menu_item(
+        self, row_id: str, item: str, sid: str = "relay-sites"
+    ) -> tuple[str, dict[str, Any]]:
         items = {entry["id"]: entry for entry in self.row(row_id, sid).get("menu", [])}
         assert item in items, f"{item} is not in {row_id}'s menu"
         event = items[item]["action"]["event"]

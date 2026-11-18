@@ -227,11 +227,11 @@ class TabActions:
             logger.warning("setting up site %s", site.id, exc_info=True)
             self.state.notice = f"{done} Setting it up failed ({type(exc).__name__})."
             return
-        failed = [
-            f"{name} could not set it up ({as_dict(as_dict(result).get('refusal')).get('message', '')})"
-            for name, result in results.items()
-            if "refusal" in as_dict(result)
-        ]
+        failed: list[str] = []
+        for name, result in results.items():
+            if "refusal" in as_dict(result):
+                message = as_dict(as_dict(result)["refusal"]).get("message", "")
+                failed.append(f"{name} could not set it up ({message})")
         self.state.notice = " ".join([done, *(item + "." for item in failed)])
 
     async def add_site(self, adapter: str, values: dict[str, Any]) -> Outcome:
@@ -240,7 +240,10 @@ class TabActions:
         if not common.get("id") and "site.id" not in errors:
             errors["site.id"] = "Enter an endpoint ID"
         config = _config(
-            adapter, as_dict(as_dict(values.get("config")).get(adapter)), errors, f"config.{adapter}."
+            adapter,
+            as_dict(as_dict(values.get("config")).get(adapter)),
+            errors,
+            f"config.{adapter}.",
         )
         if errors or config is None:
             return self._fail(ADD_SURFACE, errors)
@@ -273,7 +276,9 @@ class TabActions:
         catalog_id = _first(values.get("id"))
         site_id = str(values.get("site_id") or "").strip() or None
         if not catalog_id:
-            return self._fail(ADD_SURFACE, {CATALOG_SITE_ERROR: "Choose an endpoint from the catalog"})
+            return self._fail(
+                ADD_SURFACE, {CATALOG_SITE_ERROR: "Choose an endpoint from the catalog"}
+            )
         try:
             added = self.service.sites.add_from_catalog(catalog.site(catalog_id), site_id)
         except ValidationError:
@@ -282,7 +287,9 @@ class TabActions:
         except Refusal as refusal:
             if refusal.reason is RefusalReason.SITE_EXISTS:
                 taken = refusal.data.get("site") or site_id or catalog_id
-                return self._fail(ADD_SURFACE, {CATALOG_ID_ERROR: f"An endpoint named {taken} exists"})
+                return self._fail(
+                    ADD_SURFACE, {CATALOG_ID_ERROR: f"An endpoint named {taken} exists"}
+                )
             return self._fail(ADD_SURFACE, {CATALOG_ERROR: _sentence(refusal.message)})
         self._close_add()
         await self._saved(added, f"Added {added.title}.")
@@ -496,7 +503,9 @@ class TabActions:
             return Outcome(ok=True, resend={SITES_SURFACE: (f"/drafts/{site.id}",)})
         settings = config.model_dump(mode="json", exclude_defaults=True)
         try:
-            self.service.sites.edit(site.id, {"alternatives": site.alternatives | {value: settings}})
+            self.service.sites.edit(
+                site.id, {"alternatives": site.alternatives | {value: settings}}
+            )
         except Refusal as refusal:
             return self._fail(site.id, {FORM_ERROR: _sentence(refusal.message)})
         return await self.switch_adapter(site.id, {"adapter": [value]})

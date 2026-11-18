@@ -213,7 +213,7 @@ def endpoints_surface(
     children = [tree.text("sites-title", "Endpoints", "h2")]
     if state.notice:
         children.append(tree.text("sites-notice", state.notice))
-    rows =  [_row(tree, view, state, forms, tokens) for view in views]
+    rows = [_row(tree, view, state, forms, tokens) for view in views]
     children.append(
         tree.add(
             "endpoints",

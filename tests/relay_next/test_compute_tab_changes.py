@@ -14,8 +14,8 @@ from clio_relay.surface.a2ui.tab import WATCH_INTERVAL_S
 from clio_relay.surface.server import create_server
 from clio_relay.surface.settings import RelayPaths
 
-from .conftest import add_site
 from .a2ui_host import AD, Host
+from .conftest import add_site
 
 
 def test_changes_from_the_command_line_refresh_the_page(relay_paths: RelayPaths) -> None:
