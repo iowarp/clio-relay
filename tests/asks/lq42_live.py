@@ -18,7 +18,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -52,7 +52,7 @@ class Live:
         self.verify: Any = args.cacert or True
 
     @asynccontextmanager
-    async def client(self) -> AsyncIterator[Client]:
+    async def client(self) -> AsyncGenerator[Client]:
         """Connect the way any MCP host would, advertising nothing extra."""
         if self.args.url is None:
             params = StdioServerParameters(
@@ -92,6 +92,12 @@ def structured(result: Any) -> dict[str, Any]:
     return cast(dict[str, Any], content)
 
 
+def job_name(shown: dict[str, Any]) -> Any:
+    """Return the scheduler job name relay recorded, if any."""
+    result: dict[str, Any] = shown.get("result") or {}
+    return result.get("job_name")
+
+
 def operation(result: Any) -> dict[str, Any]:
     """Return the operation a result names, refusal or not."""
     shown = structured(result)
@@ -106,7 +112,7 @@ def operation(result: Any) -> dict[str, Any]:
         "state": shown.get("state"),
         "operation_id": shown.get("operation_id"),
         "native_id": shown.get("native_id"),
-        "job_name": (shown.get("result") or {}).get("job_name"),
+        "job_name": job_name(shown),
         "spec_digest": shown.get("spec_digest"),
         "outputs": shown.get("outputs"),
     }
@@ -131,7 +137,7 @@ async def describe(client: Client, operation_id: str) -> dict[str, Any]:
         "state": shown.get("state"),
         "native_id": shown.get("native_id"),
         "asks": [(ask["ask_id"], ask["state"]) for ask in shown.get("asks", [])],
-        "job_name": (shown.get("result") or {}).get("job_name"),
+        "job_name": job_name(shown),
     }
 
 
