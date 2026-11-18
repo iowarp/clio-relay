@@ -265,7 +265,7 @@ async def test_the_site_hook_on_a_tacc_host_registers_once(
 async def test_the_site_hook_before_sign_in_asks_for_it(
     stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Signed out, the hook refuses ``needs_sign_in`` and calls nothing that changes Tapis."""
+    """Signed out, the hook refuses ``needs_sign_in`` before any call to Tapis Systems."""
     use_memory_keyring(monkeypatch)
     entry = SiteEntry.model_validate(
         {"id": "vista", "adapter": "tapis", "config": tapis_config(stub, authn="tms")}
@@ -274,11 +274,12 @@ async def test_the_site_hook_before_sign_in_asks_for_it(
         site_id="vista", state_dir=tmp_path / "relay", content=ContentStore(tmp_path / "c")
     )
     adapter = TapisAdapter(TapisConfig.model_validate(entry.config), context)
+    before = len(stub.state.requests_to("/v3/systems"))
     with pytest.raises(Refusal) as refused:
         await adapter.on_site_added(entry)
     print(f"site hook signed out {refused.value.to_dict()}")
     assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
-    assert not stub.state.credentials
+    assert len(stub.state.requests_to("/v3/systems")) == before
 
 
 async def test_max_minutes_never_falls_to_the_tapis_default() -> None:

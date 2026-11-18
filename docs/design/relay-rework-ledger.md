@@ -629,7 +629,7 @@ Also on Ares:
 All three are **pending**, never passed. They wait on the owner blockers below. The person signs in and supplies credentials; W10 runs the rows. Before each run: `ssh ares`, `cd ~/clio-relay-rework/clio-relay-w10`, `git pull`, `~/.local/bin/uv sync --extra tapis`. The person sets the OAuth client in the shell themselves (`export CLIO_RELAY_TACC_CLIENT_ID=...` and `CLIO_RELAY_TACC_CLIENT_KEY=...`); neither is pasted into a chat. `T=python -m clio_relay.adapters.tapis`; `R=clio-relay-next` (the new CLI, until W1 renames it `clio-relay`).
 
 **Sign-in (shared by all three).** `S` is the row's site: `chameleon-tapis` or `ares-tapis`.
-1. `uv run $R site add-from-catalog $S`. For `chameleon-tapis`, then set the person's SSH profile for the node: `uv run $R site edit $S '{alternatives: {ssh: {ssh_profile: <profile>}}}'` (`ares-tapis` already names `ares`). Check `ssh <profile> hostname` first. Signed out, each prints `set_up` with a `needs_sign_in` refusal, and the site is saved.
+1. `uv run $R site add-from-catalog $S`. For `chameleon-tapis`, then set the person's SSH profile for the node: `uv run $R site edit $S '{alternatives: {ssh: {ssh_profile: <profile>}}}'` (`ares-tapis` already names `ares`). Check `ssh <profile> hostname` first. Signed out, each prints `set_up` with a `needs_sign_in` refusal, and the site is saved; with no OAuth client in the shell, the refusal is `invalid_config` naming the two variables instead.
 2. `uv run $T sign-in --site $S`. It prints TACC's page and a code.
 3. The person opens the page, enters the code, and signs in with their TACC account and second factor. The driver prints "Signed in."
 4. `uv run $T status --site $S`. Record `account` and `expires_at`, never a token.
