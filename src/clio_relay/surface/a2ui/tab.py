@@ -458,7 +458,7 @@ class ComputeTab:
             return self._fail(ADD_SURFACE, {FORM_ERROR: refusal.message})
         self.state.errors.pop(ADD_SURFACE, None)
         await self._saved(added, f"Added {added.title}.")
-        return Outcome(ok=True, resend={ADD_SURFACE: ("/drafts/add",)})
+        return Outcome(ok=True, resend={ADD_SURFACE: ("/drafts/add",), SITES_SURFACE: ("/switch",)})
 
     async def add_from_catalog(self, _subject: str, values: dict[str, Any]) -> Outcome:
         catalog_id = _first(values.get("id"))
@@ -475,7 +475,7 @@ class ComputeTab:
             return self._fail(ADD_SURFACE, {"catalog": refusal.message.capitalize()})
         self.state.errors.pop(ADD_SURFACE, None)
         await self._saved(added, f"Added {added.title}.")
-        return Outcome(ok=True, resend={ADD_SURFACE: ("/catalog",)})
+        return Outcome(ok=True, resend={ADD_SURFACE: ("/catalog",), SITES_SURFACE: ("/switch",)})
 
     async def edit_site(self, site_id: str, _values: dict[str, Any]) -> Outcome:
         if self._site(site_id) is None:
@@ -536,7 +536,7 @@ class ComputeTab:
         self.state.editing.discard(site_id)
         self.state.errors.pop(site_id, None)
         await self._saved(saved, f"Saved {saved.title}.")
-        return Outcome(ok=True)
+        return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
 
     async def cancel(self, site_id: str, _values: dict[str, Any]) -> Outcome:
         self.state.editing.discard(site_id)
