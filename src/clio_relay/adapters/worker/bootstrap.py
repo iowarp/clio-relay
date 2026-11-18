@@ -340,7 +340,7 @@ def _remaining_public_deadline(deadline: float, *, action: str) -> float:
 
 def package_source_root() -> Path:
     """Return the project root for editable installs, or the package root for wheels."""
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[4]
 
 
 def _pinned_artifact_fetch_shell_function() -> str:
@@ -774,7 +774,7 @@ def _write_packaged_bootstrap_archive(archive: Path, *, relay_wheel: Path | None
     if relay_wheel is not None and not relay_wheel.is_file():
         raise ConfigurationError(f"relay wheel does not exist: {relay_wheel}")
     assets = resources.files("clio_relay").joinpath("assets", "jarvis-packages")
-    source_assets = Path(__file__).resolve().parents[2] / "jarvis-packages"
+    source_assets = Path(__file__).resolve().parents[4] / "jarvis-packages"
     with tarfile.open(archive, "w") as tar:
         if relay_wheel is not None:
             _add_canonical_archive_member(
