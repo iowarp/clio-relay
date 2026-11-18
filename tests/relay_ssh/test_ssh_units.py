@@ -333,8 +333,7 @@ async def test_a_signal_to_the_batch_shell_reaches_the_command(tmp_path: Path) -
     # Some Slurm sites signal only the batch shell on a cancel, as this test does.
     started = tmp_path / "started"
     command = (
-        f"trap 'echo stopping > {tmp_path}/log; exit 143' TERM; "
-        f"touch {started}; sleep 3600 & wait"
+        f"trap 'echo stopping > {tmp_path}/log; exit 143' TERM; touch {started}; sleep 3600 & wait"
     )
     shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, command)))
     while not started.exists():
@@ -372,9 +371,7 @@ def test_forward_signals_needs_a_launch_line() -> None:
 
 
 def test_checks_of_remote_files_list_their_directory_first() -> None:
-    status = scripts.status_script(
-        "/j", mode="scheduler", status_command="squeue", native_id="53"
-    )
+    status = scripts.status_script("/j", mode="scheduler", status_command="squeue", native_id="53")
     assert status.index("fresh .") < status.index("[ -f final ]")
     assert status.index("fresh .") < status.index("53.ec")
     check = scripts.check_script("~/.r", "op_1", "auto", ["ab" * 32])
