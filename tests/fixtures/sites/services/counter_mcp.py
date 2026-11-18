@@ -2,8 +2,10 @@
 
 It runs over stdio or streamable HTTP. ``count_slowly`` is task capable, so a client
 that negotiates the tasks extension gets an MCP task with progress. Every result
-reports the session that made the call and how many distinct sessions the server has
-seen, so a test can show that one session served a series of calls.
+reports the server instance (one per process), the session id the server saw and how
+many distinct session ids it has seen. On protocol 2026-07-28 streamable HTTP carries
+no MCP session, so there the session id is new on every request and the server
+instance is what shows that one server served a series of calls.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import argparse
 import asyncio
 import os
 import sys
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +30,7 @@ class CounterState:
 
     count: int = 0
     calls: int = 0
+    instance: str = field(default_factory=lambda: uuid.uuid4().hex)
     sessions: set[str] = field(default_factory=lambda: set[str]())
 
     def observe(self, ctx: Context) -> str:
@@ -43,6 +47,7 @@ class CounterState:
             "calls": self.calls,
             "session_id": session_id,
             "sessions_seen": len(self.sessions),
+            "server_instance": self.instance,
             "pid": os.getpid(),
         }
 

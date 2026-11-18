@@ -449,7 +449,9 @@ def test_counter_mcp_keeps_one_session_and_runs_a_task() -> None:
             start = _structured(await client.call_tool("read"))["count"]
             results = [_structured(await client.call_tool("increment")) for _ in range(3)]
             assert [r["count"] for r in results] == [start + 1, start + 2, start + 3]
-            assert len({r["session_id"] for r in results}) == 1
+            # Streamable HTTP on 2026-07-28 has no MCP session; one server instance
+            # served all three.
+            assert len({r["server_instance"] for r in results}) == 1
 
             task = await start_task(client, "count_slowly", {"steps": 3, "delay_seconds": 0.2})
             assert task.task_id
@@ -481,5 +483,7 @@ def test_counter_mcp_runs_over_ssh_stdio() -> None:
         async with Client(transport) as client:
             results = [_structured(await client.call_tool("increment")) for _ in range(3)]
             assert [r["count"] for r in results] == [1, 2, 3]
+            assert len({r["server_instance"] for r in results}) == 1
+            print("stdio session ids:", sorted({r["session_id"] for r in results}))
 
     asyncio.run(scenario())
