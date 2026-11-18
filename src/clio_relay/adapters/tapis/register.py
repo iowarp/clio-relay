@@ -274,6 +274,8 @@ def system_definition(
         "defaultAuthnMethod": "TMS_KEYS" if authn == "tms" else "PKI_KEYS",
         "rootDir": "/",
         "canExec": True,
+        # Lets a batch job exec the launcher, so a cancel's TERM reaches it.
+        "enableCmdPrefix": True,
         "jobRuntimes": [{"runtimeType": "ZIP"}],
         "jobWorkingDir": f"{home.rstrip('/')}/{WORK_DIR_NAME}",
         "tags": ["clio-relay"],
