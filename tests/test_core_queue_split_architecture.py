@@ -88,7 +88,6 @@ _TESTS_ROOT = Path(__file__).parent
 _NON_OWNER_QUEUE_MODULES = frozenset(
     {
         "queue_management",
-        "queue_validation",
         # The "queue diagnosis" surface (queue_diagnosis.py's own module
         # docstring: "listing, diagnosis, stale recovery, worker status"):
         # read-only introspection/simulation built ON TOP of the fully
@@ -285,7 +284,8 @@ _OWNER_BUDGETS = {
     "queue_job_gc_protections": 320,
     "queue_job_gc": 720,
     "queue_index_discovery": 380,
-    "queue_startup": 550,
+    # +2: the move into adapters/worker/ wraps one longer import path.
+    "queue_startup": 552,
     "queue_index_migration": 720,
     "queue_transitions": 280,
     # #277: measured 486 lines at landing; 500 keeps it at the file-size
@@ -1219,7 +1219,6 @@ def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None
         frozenset(
             {
                 "queue_management",
-                "queue_validation",
                 "queue_admission_simulation",
                 "queue_admission_snapshot",
                 "queue_diagnosis",

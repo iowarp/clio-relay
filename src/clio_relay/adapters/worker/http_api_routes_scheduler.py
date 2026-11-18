@@ -37,7 +37,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.params import Depends
 
-from clio_relay import scheduler_providers
+import clio_relay.adapters.worker.scheduler as scheduler_providers
 from clio_relay.adapters.worker import door_errors
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import (
