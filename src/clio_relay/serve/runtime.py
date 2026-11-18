@@ -18,7 +18,7 @@ import logging
 import shlex
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.jobs.handles import (
     Endpoint,
@@ -333,13 +333,11 @@ class ServeRuntime:
         self, adapter: Any, plan: ServePlan, argv: list[str], *, check: bool = True
     ) -> ExecResult:
         hop_exec: Any = getattr(adapter, "hop_exec", None)
-        result: ExecResult
         if callable(hop_exec):
-            result = await hop_exec(plan.site, argv)
+            raw: Any = await hop_exec(plan.site, argv)
         else:
-            result = await adapter.exec(
-                argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT
-            )
+            raw = await adapter.exec(argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT)
+        result = cast(ExecResult, raw)
         if check and result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise Refusal(
