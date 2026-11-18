@@ -183,7 +183,16 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
         adapter=Runs(FixtureConfig(), _context(guard)),
     )
     assert kept.package is not None
-
+    assert kept.package.service is False
+    served_copy = await guard.prepare(
+        hpc,
+        package_spec(digest),
+        adapter=Runs(FixtureConfig(), _context(guard)),
+        service=True,
+    )
+    assert served_copy.package is not None
+    assert served_copy.package.service is True
+    assert served_copy.package.sha256 == digest
 
 @pytest.mark.asyncio
 async def test_prepare_refuses_a_free_form_job_on_a_guarded_site(guard: Guard) -> None:

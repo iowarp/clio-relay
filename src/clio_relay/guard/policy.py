@@ -304,5 +304,8 @@ class Guard:
                     next_step="package_review",
                 )
         if adapter.runs_packages:
+            if service and not package.service:
+                package = package.model_copy(update={"service": True})
+                return spec.model_copy(update={"package": package})
             return spec
         return package_job(spec, jarvis=settings.jarvis, service=service)
