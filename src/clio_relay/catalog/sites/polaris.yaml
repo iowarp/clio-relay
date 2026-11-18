@@ -1,0 +1,32 @@
+# ALCF facility pages this entry was written from:
+#   https://docs.alcf.anl.gov/polaris/running-jobs/ (queues, PBS options)
+#   https://docs.alcf.anl.gov/services/globus-compute/ (the multi-user endpoint and its keys)
+#   https://docs.alcf.anl.gov/data-management/data-transfer/using-globus/ (collections)
+#   https://docs.alcf.anl.gov/services/iri-api/ (the IRI API)
+id: polaris
+name: ALCF Polaris
+address: polaris.alcf.anl.gov
+adapter: globus
+identity: globus
+config:
+  endpoint: 9a947ba5-f537-4681-acf3-cc66485aadec
+  scheduler: pbs
+  queues: [debug, debug-scaling, prod, preemptable, demand, capacity]
+  collection: 9032dd3a-e841-4687-a163-2720da731b5b
+alternatives:
+  iri:
+    base_url: https://api.alcf.anl.gov
+  worker:
+    ssh_profile: polaris
+policy: guarded
+spend:
+  ask: always
+defaults:
+  queue: debug
+  duration: PT1H
+skill: alcf-polaris
+source: https://docs.alcf.anl.gov/polaris/running-jobs/
+description: >-
+  ALCF's GPU system, 560 nodes with four NVIDIA A100 GPUs each, under PBS. Relay
+  reaches it through ALCF's Globus Compute multi-user endpoint, so nothing is
+  installed on Polaris. Set your project in defaults.account.

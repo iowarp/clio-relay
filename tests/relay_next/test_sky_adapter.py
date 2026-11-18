@@ -108,7 +108,7 @@ async def test_price_follows_spot_and_job_overrides(tmp_path: Path) -> None:
     bigger = await _build(tmp_path).price(_hour(custom_attributes={"sky.cpus": "8"}))
     assert bigger.amount == pytest.approx(0.768)
     gpus = await _build(tmp_path, accelerators="A100:8").price(_hour())
-    assert gpus.amount == pytest.approx(2 * 32.7726)
+    assert gpus.amount == pytest.approx(2 * 21.95764)
     with pytest.raises(Refusal) as refused:
         await _build(tmp_path, accelerators="A100:1").price(_hour())
     assert "A100:8" in refused.value.message

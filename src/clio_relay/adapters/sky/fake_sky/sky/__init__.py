@@ -16,7 +16,7 @@ from .jobs import Request
 
 __version__ = "0.14.3-fake"
 
-PRICES = {"m6i.large": 0.096, "m6i.2xlarge": 0.384, "p4d.24xlarge": 32.7726}
+PRICES = {"m6i.large": 0.096, "m6i.2xlarge": 0.384, "p4d.24xlarge": 21.95764}
 SPOT_FACTOR = 0.125
 
 
