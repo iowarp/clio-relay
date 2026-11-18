@@ -177,7 +177,33 @@ def test_a_forgotten_job_with_an_exit_code_completes(tmp_path: Path) -> None:
     assert status.exit_code == 0
 
 
-def test_the_status_script_asks_accounting_only_for_a_forgotten_job() -> None:
+@pytest.mark.parametrize(
+    ("acct", "state", "native"),
+    [
+        (["CANCELLED by 1000|0:15"], "cancelled", "CANCELLED"),
+        (["TIMEOUT|0:15"], "failed", "TIMEOUT"),
+        ([""], "failed", "gone"),
+    ],
+)
+def test_a_forgotten_job_the_scheduler_stopped_asks_accounting(
+    tmp_path: Path, acct: list[str], state: str, native: str
+) -> None:
+    adapter = _adapter(tmp_path)
+    handle = JobHandle(adapter="ssh", native_id="53", data={"job_dir": "/j", "scheduler": "slurm"})
+    sections = {
+        "schedrc": ["0"],
+        "sched": ["JOBID ST REASON"],
+        "ec": ["143"],
+        "signalled": ["TERM"],
+        "acct": acct,
+    }
+    executor = ssh_adapter._executor("slurm", tmp_path)  # pyright: ignore[reportPrivateUsage]
+    status = adapter._scheduler_status(executor, handle, sections, "running")  # pyright: ignore[reportPrivateUsage]
+    assert status.state.value == state
+    assert status.native_state == native
+    if native == "gone":
+        assert status.exit_code == 143
+        assert status.message is not None and "SIGTERM" in status.message
     script = scripts.status_script(
         "/j",
         mode="scheduler",
@@ -324,7 +350,7 @@ def _batch(tmp_path: Path, command: str) -> Path:
     launcher.write_text(f"sh -c {shlex.quote(command)}\n")
     rendered = f'#!/bin/bash\n\n/bin/bash {launcher} a b \n\necho "$?" > {tmp_path}/ec\n'
     batch = tmp_path / "submit.sh"
-    batch.write_text(scripts.forward_signals(rendered, str(launcher)))
+    batch.write_text(scripts.forward_signals(rendered, str(launcher), str(tmp_path)))
     return batch
 
 
@@ -343,6 +369,7 @@ async def test_a_signal_to_the_batch_shell_reaches_the_command(tmp_path: Path) -
     await shell.wait()
     assert (tmp_path / "log").read_text() == "stopping\n"
     assert (tmp_path / "ec").read_text() == "143\n"
+    assert (tmp_path / "signalled").read_text() == "TERM\n"
 
 
 @pytest.mark.asyncio
@@ -350,6 +377,7 @@ async def test_the_batch_shell_keeps_the_commands_exit_code(tmp_path: Path) -> N
     shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, "exit 7")))
     assert await shell.wait() == 0
     assert (tmp_path / "ec").read_text() == "7\n"
+    assert not (tmp_path / "signalled").exists()
 
 
 @pytest.mark.parametrize(("scheduler", "wrapped"), [("slurm", True), ("pbs", False)])

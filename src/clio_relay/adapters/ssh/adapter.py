@@ -114,14 +114,10 @@ def job_name(operation_id: str) -> str:
 def walltime(spec: JobSpec) -> timedelta | None:
     """Return the walltime the spec asks for, or None when it gives none.
 
-    ``JobAttributes`` fills ``duration`` with a default, so a duration counts only
-    when it was given: by the caller, or by the site's ``defaults.duration``.
+    The duration comes from the caller or from the site's ``defaults.duration``.
+    With none, no walltime is rendered and the scheduler's default applies.
     """
-    attributes = spec.attributes
-    duration: timedelta | None = getattr(attributes, "duration", None)
-    if duration is None or "duration" not in attributes.model_fields_set:
-        return None
-    return duration
+    return spec.attributes.duration
 
 
 class _Rendered:
@@ -387,7 +383,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
             script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
         elif scheduler == "slurm":
-            script = scripts.forward_signals(script, command[1])
+            script = scripts.forward_signals(script, command[1], str(job_dir))
         rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))
@@ -496,6 +492,22 @@ class SshAdapter(BaseAdapter[SshConfig]):
                     f"cannot read the scheduler's status: {output.strip()[:500] or exc}",
                 ) from exc
         if observed is None:
+            signalled = _one(sections, "signalled")
+            if exit_code is not None and signalled and not cancelled:
+                # The scheduler stopped the job; accounting says why.
+                accounted = accounted_status(sections.get("acct", []))
+                if accounted is not None:
+                    return accounted
+                if exit_code != 0:
+                    return JobStatus(
+                        state=JobState.FAILED,
+                        exit_code=exit_code,
+                        native_state="gone",
+                        message=(
+                            f"the scheduler stopped job {native_id} with SIG{signalled}: "
+                            "a cancel, its time limit or preemption"
+                        ),
+                    )
             if exit_code is not None:
                 if cancelled and exit_code != 0:
                     return JobStatus(

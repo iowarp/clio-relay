@@ -51,6 +51,7 @@ INTERNAL_FILES = frozenset(
         "exit_code",
         "pid",
         "child_pid",
+        "signalled",
     }
 )
 
@@ -229,6 +230,7 @@ _relay_live() {{
   case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
 }}
 _relay_pass() {{
+  case $1 in TERM|INT) echo "$1" > {marker};; esac
   if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
   sleep 1
   _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null
@@ -248,12 +250,19 @@ _relay_return "$_relay_rc"
 """
 
 
-def forward_signals(script: str, launcher: str) -> str:
-    """Wrap the launch line of a rendered batch script so a cancel reaches the command."""
+def forward_signals(script: str, launcher: str, job_dir: str) -> str:
+    """Wrap the launch line of a rendered batch script so a cancel reaches the command.
+
+    A TERM or INT is also recorded in the job's ``signalled`` file. The command's
+    exit code then says only that it was stopped, not whether by a cancel, the
+    time limit or preemption.
+    """
+    marker = q(f"{job_dir.rstrip('/')}/signalled")
     lines = script.split("\n")
     for index, line in enumerate(lines):
         if launcher in line and not line.lstrip().startswith("#"):
-            lines[index] = _FORWARD_SIGNALS.format(launch=line.rstrip()).rstrip("\n")
+            wrapped = _FORWARD_SIGNALS.format(launch=line.rstrip(), marker=marker)
+            lines[index] = wrapped.rstrip("\n")
             return "\n".join(lines)
     raise ValueError("the rendered script has no launch line")
 
@@ -343,10 +352,11 @@ def status_script(
             f"out=$({status_command} 2>&1 </dev/null); rc=$?\n"
             'echo "@@schedrc $rc"; echo "@@sched"; printf "%s\\n" "$out"\n'
             f'echo "@@ec"; cat {ec} 2>/dev/null; echo\n'
+            '[ -s signalled ] && echo "@@signalled $(cat signalled)"\n'
         )
         if accounting_command is not None:
             body += (
-                f"if [ ! -s {ec} ] && ! printf '%s\\n' \"$out\" | "
+                f"if {{ [ ! -s {ec} ] || [ -s signalled ]; }} && ! printf '%s\\n' \"$out\" | "
                 f"awk '{{print $1}}' | grep -qxF {q(native_id)}; then\n"
                 f'  echo "@@acct"; {accounting_command} 2>/dev/null </dev/null; echo\n'
                 "fi\n"
