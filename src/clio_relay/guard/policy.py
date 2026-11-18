@@ -298,6 +298,6 @@ class Guard:
                     site=site.id,
                     next_step="package_review",
                 )
-        if getattr(adapter, "runs_packages", False):
+        if adapter.runs_packages:
             return spec
         return package_job(spec, jarvis=settings.jarvis)
