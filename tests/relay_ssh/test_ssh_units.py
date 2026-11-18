@@ -416,6 +416,7 @@ async def test_the_batch_shell_waits_for_a_trap_the_launcher_does_not(tmp_path: 
     assert (tmp_path / "log").read_text() == "stopped\n"
     assert (tmp_path / "batch").read_text() == "done\n"
 
+
 @pytest.mark.asyncio
 async def test_the_batch_shell_keeps_the_commands_exit_code(tmp_path: Path) -> None:
     shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, "exit 7")))
