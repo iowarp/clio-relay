@@ -335,7 +335,6 @@ def _default_noop_components(
             "version": desired.jarvis_cd_version,
             "artifact_sha256": desired.jarvis_cd_wheel_sha256,
         },
-        "jarvis-util": {"commit": desired.jarvis_util_commit},
         "frp": {
             "version": desired.frp_version,
             "frpc_sha256": desired.frpc_sha256,

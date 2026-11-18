@@ -26,7 +26,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_models import (
 from clio_relay.adapters.worker.bootstrap_reconcile_planning_support import (
     _full_plan,
     _managed_generation_jarvis_environment,
-    _verify_jarvis_util_reuse,
 )
 from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
     _path_is_directory_alias,
@@ -197,16 +196,6 @@ def plan_bootstrap_reconcile(
             reasons.append(f"{component} artifact did not reverify")
             continue
         reusable_paths[f"{component}_artifact"] = str(path)
-    if components.get("jarvis-util") != desired.jarvis_util_commit:
-        reasons.append("jarvis-util commit is not reusable")
-    else:
-        _verify_jarvis_util_reuse(
-            resolved_home,
-            desired=desired,
-            reusable_paths=reusable_paths,
-            reasons=reasons,
-        )
-
     if "clio-kit" not in upgrade_components:
         clio_kit_runtime = runtime.get("clio-kit")
         if not isinstance(clio_kit_runtime, dict) or any(
@@ -339,7 +328,6 @@ def plan_bootstrap_reconcile(
                 component_actions={
                     "clio-relay": "replace",
                     "jarvis-cd": "replace",
-                    "jarvis-util": "reuse",
                     "clio-kit": "replace",
                     "frp": "reuse",
                     "uv": "reuse",
@@ -354,7 +342,6 @@ def plan_bootstrap_reconcile(
             component_actions={
                 "clio-relay": "replace",
                 "jarvis-cd": "replace",
-                "jarvis-util": "replace",
                 "clio-kit": "replace",
                 "frp": "replace",
                 "uv": "replace",
@@ -370,7 +357,6 @@ def plan_bootstrap_reconcile(
             component_actions={
                 "clio-relay": "reuse",
                 "jarvis-cd": "reuse",
-                "jarvis-util": "reuse",
                 "clio-kit": "reuse",
                 "frp": "reuse",
                 "uv": "reuse",
@@ -389,7 +375,6 @@ def plan_bootstrap_reconcile(
             component_actions={
                 "clio-relay": "replace",
                 "jarvis-cd": "replace",
-                "jarvis-util": "reuse",
                 "clio-kit": "replace",
                 "frp": "reuse",
                 "uv": "reuse",
@@ -404,7 +389,6 @@ def plan_bootstrap_reconcile(
         component_actions={
             "clio-relay": "replace",
             "jarvis-cd": "reuse",
-            "jarvis-util": "reuse",
             "clio-kit": "reuse",
             "frp": "reuse",
             "uv": "reuse",

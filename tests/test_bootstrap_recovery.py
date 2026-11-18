@@ -46,7 +46,6 @@ def _desired() -> BootstrapDesiredState:
         frps_sha256="c" * 64,
         uv_version="0.11.28",
         uv_sha256="d" * 64,
-        jarvis_util_commit="commit",
         jarvis_cd_version="1.4.4",
         jarvis_cd_wheel_url="https://example.test/jarvis.whl",
         jarvis_cd_wheel_sha256="e" * 64,

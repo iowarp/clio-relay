@@ -48,7 +48,6 @@ from clio_relay.adapters.worker.bootstrap_constants import (
     JARVIS_CD_WHEEL_FILENAME,  # noqa: F401 -- re-exported facade surface (test_bootstrap.py)
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
-    JARVIS_UTIL_COMMIT,
     MAX_RELAY_WHEEL_METADATA_BYTES,
     UV_LINUX_AMD64_ARCHIVE_SHA256,  # noqa: F401 -- re-exported facade surface (test_bootstrap.py)
     UV_LINUX_AMD64_EXECUTABLE_SHA256,
@@ -244,7 +243,6 @@ def _bootstrap_desired_state(
         frps_sha256=FRPS_LINUX_AMD64_SHA256,
         uv_version=UV_VERSION,
         uv_sha256=UV_LINUX_AMD64_EXECUTABLE_SHA256,
-        jarvis_util_commit=JARVIS_UTIL_COMMIT,
         jarvis_cd_version=JARVIS_CD_VERSION,
         jarvis_cd_wheel_url=JARVIS_CD_WHEEL_URL,
         jarvis_cd_wheel_sha256=JARVIS_CD_WHEEL_SHA256,

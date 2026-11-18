@@ -82,7 +82,7 @@ def validate_bootstrap_receipt(
         raise RelayError(f"bootstrap receipt contract failed: {failed}")
     assert isinstance(components, dict)
     typed_components = cast(dict[str, object], components)
-    required_components = {"clio-relay", "clio-kit", "jarvis-cd", "jarvis-util", "frp", "uv"}
+    required_components = {"clio-relay", "clio-kit", "jarvis-cd", "frp", "uv"}
     if not required_components.issubset(typed_components):
         raise RelayError("bootstrap receipt omitted required component evidence")
     component_actions: dict[str, str] = {}
@@ -441,7 +441,6 @@ def validate_bootstrap_receipt(
                 "clio-relay": "replaced",
                 "clio-kit": "replaced",
                 "jarvis-cd": "replaced",
-                "jarvis-util": "reused",
                 "frp": "reused",
                 "uv": "reused",
             }
@@ -450,7 +449,6 @@ def validate_bootstrap_receipt(
                 "clio-relay": "prepared",
                 "clio-kit": "reused",
                 "jarvis-cd": "reused",
-                "jarvis-util": "reused",
                 "frp": "reused",
                 "uv": "reused",
             }

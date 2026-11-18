@@ -234,7 +234,6 @@ def _inspect_installation_identity(
     expected_components = {
         "clio-kit": desired.clio_kit_version,
         "jarvis-cd": desired.jarvis_cd_version,
-        "jarvis-util": desired.jarvis_util_commit,
     }
     if not isinstance(raw_components, dict):
         reasons.append("install receipt omitted component identities")

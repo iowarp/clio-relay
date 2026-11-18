@@ -103,7 +103,6 @@ def _desired_state() -> Any:
                 "jarvis_cd_version": "1.8.0",
                 "jarvis_cd_wheel_url": "https://example.test/jarvis_cd-1.8.0-py3-none-any.whl",
                 "jarvis_cd_wheel_sha256": "e" * 64,
-                "jarvis_util_commit": "f" * 40,
                 "clio_kit_version": "2.7.2",
                 "clio_kit_install_spec": "https://example.test/clio_kit-2.7.2-py3-none-any.whl",
                 "clio_kit_artifact_sha256": "0" * 64,

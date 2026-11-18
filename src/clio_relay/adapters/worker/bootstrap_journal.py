@@ -691,6 +691,7 @@ def _validate_recovery_target(target: Path, *, kind: str, home: Path, name: str)
     private_root = resolved_home / ".local/share/clio-relay"
     exact_roots = {
         resolved_home / ".local/src/clio-relay",
+        # Journals from before jarvis-util was dropped may still own this path.
         resolved_home / ".local/src/jarvis-util",
         resolved_home / ".ppi-jarvis",
     }

@@ -202,7 +202,7 @@ for name, action in plan["component_actions"].items():
         "observed_identity": observed,
         "duration_seconds": prepare_duration if action == "replace" else plan_duration,
     }}
-for name in ("frp", "uv", "jarvis-util"):
+for name in ("frp", "uv"):
     components.setdefault(
         name,
         {{

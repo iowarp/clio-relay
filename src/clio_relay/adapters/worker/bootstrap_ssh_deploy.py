@@ -159,6 +159,13 @@ def _bootstrap_preflight_over_ssh(
             "    echo bootstrap_preflight_unsupported=missing_command",
             "    exit 0",
             "  fi",
+            # An installed relay whose desired-state schema predates this
+            # controller cannot be an exact match; reinstall it in full.
+            "  if printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" | "
+            "grep -Fqx 'error: bootstrap desired state is invalid'; then",
+            "    echo bootstrap_preflight_unsupported=desired_state_schema",
+            "    exit 0",
+            "  fi",
             '  if BOOTSTRAP_PREFLIGHT_OUTPUT="$BOOTSTRAP_PREFLIGHT_OUTPUT" '
             "python3 -I - <<'__CLIO_RELAY_REPAIRABLE_QUEUE_ROOT__'",
             "import json",
@@ -245,6 +252,7 @@ def _bootstrap_preflight_over_ssh(
             in {
                 "bootstrap_preflight_unsupported=not_installed",
                 "bootstrap_preflight_unsupported=missing_command",
+                "bootstrap_preflight_unsupported=desired_state_schema",
                 "bootstrap_preflight_unsupported=legacy_relay_provider",
                 "bootstrap_preflight_unsupported=repairable_queue_permissions",
             }

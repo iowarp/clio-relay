@@ -110,7 +110,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_planning_support import (
     _bounded_subprocess,  # noqa: F401
     _full_plan,  # noqa: F401
     _managed_generation_jarvis_environment,  # noqa: F401
-    _verify_jarvis_util_reuse,  # noqa: F401
 )
 from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
     _atomic_exchange_paths,  # noqa: F401

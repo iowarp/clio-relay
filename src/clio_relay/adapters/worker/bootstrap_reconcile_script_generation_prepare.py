@@ -403,12 +403,6 @@ bootstrap_relay_only_reconcile() {{
     if [ "$BOOTSTRAP_PLAN_MODE" = "component-upgrade" ]; then
       STAGED_JARVIS_VENV="$BOOTSTRAP_GENERATION/jarvis-venv"
       "$HOME/.local/bin/uv" venv --python 3.12 --seed "$STAGED_JARVIS_VENV"
-      "$STAGED_JARVIS_VENV/bin/python" -m pip install --isolated \
-        --index-url https://pypi.org/simple \
-        -r "$HOME/.local/src/jarvis-util/requirements.txt"
-      "$STAGED_JARVIS_VENV/bin/python" -m pip install --isolated --no-deps \
-        "$HOME/.local/src/jarvis-util"
-
       mkdir -m 0700 "$BOOTSTRAP_GENERATION/artifacts"
       JARVIS_CD_STAGING="$(mktemp "${{JARVIS_CD_WHEEL}}.XXXXXX")"
       bootstrap_fetch_exact_artifact \\

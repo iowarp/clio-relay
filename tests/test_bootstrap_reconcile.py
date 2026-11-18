@@ -124,7 +124,6 @@ def _desired(*, uv_sha256: str, frpc_sha256: str, frps_sha256: str) -> Bootstrap
         frps_sha256=frps_sha256,
         uv_version="0.11.28",
         uv_sha256=uv_sha256,
-        jarvis_util_commit="commit",
         jarvis_cd_version="1.4.4",
         jarvis_cd_wheel_url="https://example.test/jarvis.whl",
         jarvis_cd_wheel_sha256="c" * 64,
@@ -208,7 +207,6 @@ def _installation_info(desired: BootstrapDesiredState) -> dict[str, object]:
                 "clio-relay": "1.5.0",
                 "clio-kit": desired.clio_kit_version,
                 "jarvis-cd": desired.jarvis_cd_version,
-                "jarvis-util": desired.jarvis_util_commit,
             },
         },
         "component_runtime": {
@@ -572,6 +570,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     stable_jarvis = bin_dir / "jarvis"
     stable_jarvis.write_bytes(b"stable-jarvis")
     stable_jarvis.chmod(0o755)
+    # A leftover checkout from an older bootstrap is ignored and never probed.
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -672,7 +671,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     # plan_bootstrap_reconcile (the caller) now lives in
     # bootstrap_reconcile_planning.py, _verify_uv (which calls
     # run_bounded_process) in bootstrap_reconcile_readiness.py, and
-    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # _bounded_subprocess (which must not probe that checkout) in
     # bootstrap_reconcile_planning_support.py -- patch each collaborator on
     # its own caller's module (iowarp/clio-relay#255).
     monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
@@ -684,16 +683,6 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
 
     def bounded_identity(command: list[str], *, maximum: int) -> str:
         assert maximum > 0
-        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
-            return "commit" if "rev-parse" in command else ""
-        if command[0] == str(legacy_python):
-            return json.dumps(
-                {
-                    "name": "jarvis-util",
-                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
-                    "record": True,
-                }
-            )
         raise AssertionError(command)  # pragma: no cover
 
     monkeypatch.setattr(
@@ -733,7 +722,6 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     assert plan.component_actions == {
         "clio-relay": "replace",
         "jarvis-cd": "reuse" if expected_mode == "relay-only" else "replace",
-        "jarvis-util": "reuse",
         "clio-kit": "reuse" if expected_mode == "relay-only" else "replace",
         "frp": "reuse",
         "uv": "reuse",
@@ -1079,6 +1067,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         return resolve_path(path, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", resolve_stable_wrapper)
+    # A leftover checkout from an older bootstrap is ignored and never probed.
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -1119,7 +1108,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     # plan_bootstrap_reconcile (the caller) now lives in
     # bootstrap_reconcile_planning.py, _verify_uv (which calls
     # run_bounded_process) in bootstrap_reconcile_readiness.py, and
-    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # _bounded_subprocess (which must not probe that checkout) in
     # bootstrap_reconcile_planning_support.py (iowarp/clio-relay#255).
     monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
 
@@ -1129,16 +1118,6 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
 
     def bounded_identity(command: list[str], *, maximum: int) -> str:
         assert maximum > 0
-        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
-            return "commit" if "rev-parse" in command else ""
-        if command[0] == str(legacy_python):
-            return json.dumps(
-                {
-                    "name": "jarvis-util",
-                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
-                    "record": True,
-                }
-            )
         raise AssertionError(command)  # pragma: no cover
 
     monkeypatch.setattr(bootstrap_reconcile_readiness, "run_bounded_process", identity_command)
@@ -1155,7 +1134,6 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     assert plan.component_actions == {
         "clio-relay": "replace",
         "jarvis-cd": "replace",
-        "jarvis-util": "reuse",
         "clio-kit": "replace",
         "frp": "reuse",
         "uv": "reuse",
