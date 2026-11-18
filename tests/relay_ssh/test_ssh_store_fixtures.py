@@ -43,7 +43,9 @@ async def test_an_input_the_job_deletes_leaves_no_copy_in_the_store(
 
     def on_site(path: str) -> bool:
         parent = path.rsplit("/", 1)[0]
-        answer = site_shell(fx, profile, f"ls -f {parent} >/dev/null 2>&1; test -e {path} && echo y")
+        answer = site_shell(
+            fx, profile, f"ls -f {parent} >/dev/null 2>&1; test -e {path} && echo y"
+        )
         return answer.strip() == "y"
 
     def store(digest: str) -> str:
