@@ -200,7 +200,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 68
+    assert len(door_errors.REASONS) == 66
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -810,8 +810,8 @@ def _http_api_split_sources() -> list[tuple[str, str]]:
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 113 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_125_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 110 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -845,6 +845,9 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
     http_api_routes_jobs.py and 3 MCP admission sites in
     http_api_context.py, and removing the execution-scoped artifact-listing
     route drops its single ``execution_not_found`` site.
+
+    110 (was 113): removing the JARVIS runtime-authority route drops its 3
+    sites in http_api_routes_session.py.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -868,7 +871,7 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 113
+    assert len(calls) == 110
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -913,7 +916,7 @@ def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 128
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 125
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -946,7 +949,7 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_59_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_57_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
@@ -971,7 +974,8 @@ def test_all_59_exception_backed_http_sites_use_stable_public_messages() -> None
 
     Removing the MCP job routes drops 3 sites and removing the
     execution-scoped listing route drops its ``execution_not_found`` site:
-    63 -> 59.
+    63 -> 59. Removing the JARVIS runtime-authority route drops 2 more:
+    59 -> 57.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -986,7 +990,7 @@ def test_all_59_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 59
+    assert len(calls) == 57
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])
