@@ -150,6 +150,16 @@ class DefaultGuard:
             node_hours=None if node_hours is None else round(node_hours, 4),
         )
 
+    async def prepare(
+        self,
+        site: SiteEntry,
+        spec: JobSpec,
+        *,
+        adapter: BaseAdapter[Any],
+        service: bool = False,
+    ) -> JobSpec:
+        return spec
+
 
 class StubServe:
     """No service runtime is installed."""

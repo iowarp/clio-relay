@@ -10,6 +10,11 @@
 #   for mode exec:    executable, arguments...
 #   for mode package: name, version, sha256, key=value parameters...
 #
+# A package is `<repo>.<package>`, and its archive holds
+# `<repo>/<repo>/<package>/...`. The launcher runs it with JARVIS_ROOT in the
+# job's directory: jarvis init, repo add <unpacked>/<repo>, ppl create,
+# ppl append <name> pkg key=value..., ppl run.
+#
 # The launcher writes the job's exit code to relay.exitcode in the job's
 # directory and exits with it.
 
@@ -66,6 +71,9 @@ package)
     version="${f[i + 1]}"
     digest="${f[i + 2]}"
     params=("${f[@]:i+3}")
+    [[ "$name" =~ ^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$ ]] \
+        || fail 64 "package name $name is not <repo>.<package>"
+    repo="${name%%.*}"
     archive="$content_dir/$digest"
     [ -f "$archive" ] || fail 66 "package $name $version is not in the content store"
     actual="$(sha256sum "$archive" | cut -d' ' -f1)"
@@ -76,12 +84,16 @@ package)
         mkdir -p "$unpacked.part" && tar -xzf "$archive" -C "$unpacked.part" \
             && mv "$unpacked.part" "$unpacked" || fail 66 "cannot unpack package $name"
     fi
+    [ -d "$unpacked/$repo/$repo" ] || fail 66 "package archive has no $repo/$repo directory"
     pipeline="relay_${_tapisJobUUID:-job}"
     pipeline="${pipeline//-/_}"
+    # A JARVIS of the job's own, so the site's ~/.ppi-jarvis is never read or changed.
+    export JARVIS_ROOT="$job_dir/.relay-jarvis"
     {
-        jarvis repo add "$unpacked" \
+        jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared" \
+            && jarvis repo add "$unpacked/$repo" \
             && jarvis ppl create "$pipeline" \
-            && jarvis ppl append "$name" "${params[@]}" \
+            && jarvis ppl append "$name" pkg ${params[@]+"${params[@]}"} \
             && jarvis ppl run
     } < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
     finish "$?"

@@ -253,6 +253,7 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
 - [connection model](docs/connection-model.md) — normative
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
+- [guarded sites](docs/guarded-sites.md): what a guarded site runs, and how packages are reviewed
 - [release](docs/release.md)
 - [brand prompt](docs/brand.md)
 - [ai context](docs/ai/README.md)

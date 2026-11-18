@@ -231,6 +231,10 @@ def binding_table(ask: Ask) -> str:
     digest = ask.binding.get("spec_digest")
     if digest:
         rows.append(("Job hash", str(digest)))
+    for key, label in (("package", "Package"), ("version", "Version"), ("source", "Source")):
+        value = ask.binding.get(key)
+        if value not in (None, ""):
+            rows.append((label, str(value)))
     package = ask.binding.get("package_hash")
     if package:
         rows.append(("Package hash", str(package)))
