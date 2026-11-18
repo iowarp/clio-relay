@@ -151,7 +151,12 @@ class DefaultGuard:
         )
 
     async def prepare(
-        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+        self,
+        site: SiteEntry,
+        spec: JobSpec,
+        *,
+        adapter: BaseAdapter[Any],
+        service: bool = False,
     ) -> JobSpec:
         return spec
 

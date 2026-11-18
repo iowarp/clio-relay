@@ -515,7 +515,7 @@ class RelayService:
     ) -> OperationRecord:
         try:
             service = ServiceSpec.model_validate(record.spec)
-            job = await self.guard.prepare(site, service.job, adapter=adapter)
+            job = await self.guard.prepare(site, service.job, adapter=adapter, service=True)
             endpoint = await self.serve_hook.start(
                 site, adapter, service.model_copy(update={"job": job}), record
             )
