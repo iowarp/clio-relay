@@ -333,7 +333,7 @@ class ServeRuntime:
         self, adapter: Any, plan: ServePlan, argv: list[str], *, check: bool = True
     ) -> ExecResult:
         hop_exec: Any = getattr(adapter, "hop_exec", None)
-        if callable(hop_exec):
+        if hop_exec is not None:
             raw: Any = await hop_exec(plan.site, argv)
         else:
             raw = await adapter.exec(argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT)
