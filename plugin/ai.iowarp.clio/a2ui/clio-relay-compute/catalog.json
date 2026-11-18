@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://iowarp.ai/a2ui/catalogs/clio-relay-compute/v1",
   "title": "Relay Compute Catalog",
-  "description": "The Basic components relay's Compute tab uses, unmodified: text, layout, buttons and form fields.",
+  "description": "The components relay's Compute page uses: the Basic text, layout, button and form components, unmodified, and CLIO's choice table.",
   "catalogId": "https://iowarp.ai/a2ui/catalogs/clio-relay-compute/v1",
   "components": {
     "Text": {
@@ -470,6 +470,221 @@
             "component",
             "options",
             "value"
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "clio.choice-table.v1": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+        },
+        {
+          "$ref": "#/$defs/CatalogComponentCommon"
+        },
+        {
+          "type": "object",
+          "description": "CLIO's choice table: a defaults row and one row per item, each with inline pickers, read-only status cells and a row menu. Provisional until CLIO publishes its schema.",
+          "properties": {
+            "component": {
+              "const": "clio.choice-table.v1"
+            },
+            "label": {
+              "type": "string"
+            },
+            "columns": {
+              "type": "array",
+              "maxItems": 6,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "help": {
+                    "type": "string"
+                  },
+                  "editable": {
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "options": {
+                    "type": "array",
+                    "maxItems": 24,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "value": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "icon": {
+                          "type": "string"
+                        },
+                        "tone": {
+                          "type": "string",
+                          "enum": [
+                            "neutral",
+                            "positive",
+                            "warning",
+                            "negative"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value",
+                        "label"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "title",
+                  "options"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "defaults": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "values": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "context": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "title",
+                "values"
+              ],
+              "additionalProperties": false
+            },
+            "rows": {
+              "type": "array",
+              "maxItems": 500,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "subtitle": {
+                    "type": "string"
+                  },
+                  "caption": {
+                    "type": "string"
+                  },
+                  "icon": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "inherited": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "context": {
+                    "type": "object"
+                  },
+                  "menu": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "destructive": {
+                          "type": "boolean"
+                        },
+                        "action": {
+                          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "label",
+                        "action"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "error": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentId"
+                  }
+                },
+                "required": [
+                  "id",
+                  "title",
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "onChoose": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+            },
+            "add": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "action": {
+                  "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+                }
+              },
+              "required": [
+                "label",
+                "action"
+              ],
+              "additionalProperties": false
+            },
+            "empty": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "component",
+            "columns",
+            "rows",
+            "onChoose"
           ]
         }
       ],
@@ -1060,6 +1275,9 @@
         },
         {
           "$ref": "#/components/ChoicePicker"
+        },
+        {
+          "$ref": "#/components/clio.choice-table.v1"
         }
       ],
       "discriminator": {

@@ -1,7 +1,9 @@
-"""The Compute tab's add-site surface (RL32, RL50).
+"""The Compute page's add-endpoint surface (RL32, RL50).
 
 Like :mod:`clio_relay.surface.a2ui.surfaces`, this builder is pure: it mints one
-action token per button and returns components and a data model.
+action token per button and returns components and a data model. The form shows
+only after the person presses "Add endpoint"; until then the surface is empty.
+Its draft is in the data model either way, so opening the form sends a fresh one.
 """
 
 from __future__ import annotations
@@ -25,20 +27,24 @@ from clio_relay.surface.a2ui.surfaces import (
     ADD_FROM_CATALOG,
     ADD_PATH,
     ADD_SITE,
+    ADD_SUBJECT,
     ADD_SURFACE,
+    CANCEL,
     CATALOG_ERROR,
     CATALOG_ID_ERROR,
     CATALOG_PATH,
     CATALOG_SITE_ERROR,
     TabState,
+    protocol_name,
+    protocol_order,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
 
 
-def add_draft(forms: dict[str, Form]) -> dict[str, Any]:
-    """Return the add form's empty draft."""
+def add_draft(forms: dict[str, Form], security: str = "guarded") -> dict[str, Any]:
+    """Return the add form's empty draft, with ``security`` picked."""
     return {
-        "site": draft(ADD_FIELDS, {"policy": "guarded", "spend": "always"}),
+        "site": draft(ADD_FIELDS, {"policy": security, "spend": "always"}),
         "config": {name: draft(item.fields, {}) for name, item in forms.items() if item.listed},
     }
 
@@ -49,17 +55,33 @@ def add_surface(
     state: TabState,
     tokens: ActionTokens,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return the add-site surface's components and data model."""
+    """Return the add-endpoint surface's components and data model."""
     tree = Tree()
     errors = state.errors.get(ADD_SURFACE, {})
-    children = [tree.text("add-title", "Add a site", "h2")]
+    data: dict[str, Any] = {
+        "catalog": {
+            "id": [catalog[0].id] if catalog else [],
+            "site_id": "",
+            "valid": valid_map(errors, (CATALOG_ID_ERROR, CATALOG_SITE_ERROR)),
+        },
+        "drafts": {
+            "add": {
+                **add_draft(forms, state.default("security")),
+                "valid": valid_map(errors, ADD_ERROR_PREFIXES),
+            }
+        },
+    }
+    if not state.adding:
+        tree.column("root", [])
+        return tree.components, data
+    children = [tree.text("add-title", "Add an endpoint", "h2")]
     if catalog:
         children.append(tree.text("add-catalog-title", "From the catalog", "h4"))
         children.append(
             tree.add(
                 "add-catalog-site",
                 "ChoicePicker",
-                label="Site",
+                label="Endpoint",
                 options=[{"label": entry.title, "value": entry.id} for entry in catalog],
                 value=bound("/catalog/id"),
                 variant="mutuallyExclusive",
@@ -73,7 +95,7 @@ def add_surface(
             tree.add(
                 "add-catalog-id",
                 "TextField",
-                label="Site ID (optional)",
+                label="Endpoint ID (optional)",
                 value=bound("/catalog/site_id"),
                 variant="shortText",
                 **error_checks(
@@ -99,11 +121,11 @@ def add_surface(
     children.append(tree.text("add-own-title", "Your own", "h4"))
     children += form_error(tree, "add", errors)
     children += field_rows(tree, "add-s", ADD_FIELDS, "/drafts/add/site", errors, "site.", ADD_PATH)
-    children.append(tree.text("add-ways", "How relay reaches it", "h5"))
+    children.append(tree.text("add-ways", "Protocol", "h5"))
     tabs: list[dict[str, str]] = []
-    for name, adapter_form in forms.items():
-        if not adapter_form.listed:
-            continue
+    listed = [name for name, item in forms.items() if item.listed]
+    for name in protocol_order(listed, state.default("protocol")):
+        adapter_form = forms[name]
         base = f"add-a-{name}"
         rows = field_rows(
             tree,
@@ -119,23 +141,20 @@ def add_surface(
         rows.append(
             tree.button(
                 f"{base}-add",
-                "Add site",
+                "Add endpoint",
                 event(
                     ADD_SITE, {"token": tokens.mint(ADD_SITE, name), "values": bound("/drafts/add")}
                 ),
                 "primary",
             )
         )
-        tabs.append({"title": name, "child": tree.column(f"{base}-col", rows)})
+        tabs.append({"title": protocol_name(name), "child": tree.column(f"{base}-col", rows)})
     if tabs:
         children.append(tree.add("add-tabs", "Tabs", tabs=tabs))
+    children.append(
+        tree.button(
+            "add-cancel", "Cancel", event(CANCEL, {"token": tokens.mint(CANCEL, ADD_SUBJECT)})
+        )
+    )
     tree.column("root", children)
-    data: dict[str, Any] = {
-        "catalog": {
-            "id": [catalog[0].id] if catalog else [],
-            "site_id": "",
-            "valid": valid_map(errors, (CATALOG_ID_ERROR, CATALOG_SITE_ERROR)),
-        },
-        "drafts": {"add": {**add_draft(forms), "valid": valid_map(errors, ADD_ERROR_PREFIXES)}},
-    }
     return tree.components, data

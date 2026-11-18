@@ -1,180 +1,31 @@
-"""The Compute tab: listing rules, action tokens, and each action through the site store."""
+"""The Compute page: listing rules, action tokens, and each card action through the site store.
+
+These run as a client that renders only the Basic catalog, which gets a card per
+endpoint. The endpoint table a client with relay's catalog gets is in
+``test_compute_table.py``.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import copy
-import json
-from typing import Any, cast
+from typing import Any
 
-import mcp_types
 import pytest
 from fastmcp import Client
-from mcp.client.extension import advertise
 
 from clio_relay.adapters import registry
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface.a2ui import (
-    ACTIONS,
-    BASIC_CATALOG_ID,
-    EXTENSION_ID,
-    RELAY_CATALOG_ID,
-    TAB_URI,
-)
+from clio_relay.surface.a2ui import ACTIONS, BASIC_CATALOG_ID, RELAY_CATALOG_ID, TAB_URI
+from clio_relay.surface.a2ui.actions import _sentence  # pyright: ignore[reportPrivateUsage]
 from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
-from clio_relay.surface.a2ui.protocol import MIME_TYPE
-from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
 
+from .a2ui_host import VERBS, Host, a2ui_client, basic_client, said
 from .conftest import add_site
-
-VERBS = {"describe", "run", "exec", "files", "serve"}
-AD = {
-    "versions": ["v0.9.1"],
-    "clientCapabilities": {"v0.9.1": {"supportedCatalogIds": [BASIC_CATALOG_ID, RELAY_CATALOG_ID]}},
-}
-
-
-def a2ui_client(paths: RelayPaths) -> Client[Any]:
-    return Client(create_server(paths), extensions=[advertise(EXTENSION_ID, AD)])
-
-
-def _body(contents: object) -> str:
-    assert isinstance(contents, mcp_types.TextResourceContents), contents
-    return contents.text
-
-
-def _said(result: Any) -> str:
-    first = result.content[0]
-    assert isinstance(first, mcp_types.TextContent), first
-    return first.text
-
-
-def _unescape(part: str) -> str:
-    return part.replace("~1", "/").replace("~0", "~")
-
-
-def _get(data: Any, path: str) -> Any:
-    for part in [p for p in path.strip("/").split("/") if p]:
-        if not isinstance(data, dict):
-            return None
-        data = cast(dict[str, Any], data).get(_unescape(part))
-    return data
-
-
-def _set(data: dict[str, Any], path: str, value: Any) -> None:
-    parts = [_unescape(p) for p in path.strip("/").split("/") if p]
-    if not parts:
-        data.clear()
-        data.update(copy.deepcopy(value))
-        return
-    for part in parts[:-1]:
-        data = data.setdefault(part, {})
-    data[parts[-1]] = copy.deepcopy(value)
-
-
-class Host:
-    """Folds A2UI messages the way CLIO does and presses buttons for a test."""
-
-    def __init__(self, client: Client[Any]) -> None:
-        self.client = client
-        self.surfaces: dict[str, dict[str, Any]] = {}
-
-    def apply(self, messages: list[dict[str, Any]]) -> None:
-        for message in messages:
-            if "createSurface" in message:
-                sid = message["createSurface"]["surfaceId"]
-                self.surfaces[sid] = {"components": {}, "data": {}}
-            elif "updateComponents" in message:
-                body = message["updateComponents"]
-                for component in body["components"]:
-                    self.surfaces[body["surfaceId"]]["components"][component["id"]] = component
-            elif "updateDataModel" in message:
-                body = message["updateDataModel"]
-                data = self.surfaces[body["surfaceId"]]["data"]
-                _set(data, body.get("path", "/"), body.get("value"))
-
-    async def open(self) -> list[dict[str, Any]]:
-        contents = await self.client.read_resource(TAB_URI)
-        assert len(contents) == 1 and contents[0].mime_type == MIME_TYPE
-        messages = json.loads(_body(contents[0]))
-        assert "createSurface" in messages[0]
-        self.surfaces = {}
-        self.apply(messages)
-        return messages
-
-    def visible(self, sid: str) -> set[str]:
-        """Return the ids reachable from the surface's root."""
-        components = self.surfaces[sid]["components"]
-        seen: set[str] = set()
-        stack = ["root"]
-        while stack:
-            cid = stack.pop()
-            if cid in seen or cid not in components:
-                continue
-            seen.add(cid)
-            component = components[cid]
-            stack += component.get("children", [])
-            if "child" in component:
-                stack.append(component["child"])
-            stack += [tab["child"] for tab in component.get("tabs", [])]
-        return seen
-
-    def text(self, sid: str) -> str:
-        components = self.surfaces[sid]["components"]
-        return "\n".join(
-            str(components[cid].get("text"))
-            for cid in sorted(self.visible(sid))
-            if components[cid]["component"] == "Text"
-        )
-
-    def failing(self, sid: str) -> dict[str, str]:
-        """Return each visible field's failing check message, judged as web_core does."""
-        components = self.surfaces[sid]["components"]
-        found: dict[str, str] = {}
-        for cid in sorted(self.visible(sid)):
-            for check in components[cid].get("checks", []):
-                condition = check["condition"]
-                assert set(condition) == {"path"}, "a literal condition reads as valid"
-                if not _get(self.surfaces[sid]["data"], condition["path"]):
-                    found[cid] = check["message"]
-        return found
-
-    def set(self, sid: str, path: str, value: Any) -> None:
-        _set(self.surfaces[sid]["data"], path, value)
-
-    def get(self, sid: str, path: str) -> Any:
-        return _get(self.surfaces[sid]["data"], path)
-
-    def action(self, sid: str, button: str) -> tuple[str, dict[str, Any]]:
-        assert button in self.visible(sid), f"{button} is not on {sid}"
-        event = self.surfaces[sid]["components"][button]["action"]["event"]
-        context: dict[str, Any] = {}
-        for key, value in cast(dict[str, Any], event["context"]).items():
-            bound = cast(dict[str, Any], value) if isinstance(value, dict) else None
-            if bound is not None and set(bound) == {"path"}:
-                context[key] = _get(self.surfaces[sid]["data"], str(bound["path"]))
-            else:
-                context[key] = value
-        return str(event["name"]), context
-
-    async def press(self, sid: str, button: str) -> Any:
-        name, context = self.action(sid, button)
-        result = await self.client.call_tool(name, context, raise_on_error=False)
-        assert result.content[0].type == "text"
-        if not result.is_error:
-            embedded = [
-                item for item in result.content if isinstance(item, mcp_types.EmbeddedResource)
-            ]
-            assert len(embedded) == 1
-            messages = json.loads(_body(embedded[0].resource))
-            assert not any("createSurface" in message for message in messages)
-            self.apply(messages)
-        return result
 
 
 def test_plain_clients_see_the_five_verbs_and_no_tab(relay_paths: RelayPaths) -> None:
@@ -198,7 +49,7 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
     add_site(relay_paths)
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
             assert set(tools) == VERBS | set(ACTIONS)
             for name in ACTIONS:
@@ -210,7 +61,7 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
             for args in ({}, {"token": "made-up"}):
                 result = await client.call_tool("compute_probe_site", args, raise_on_error=False)
                 assert result.is_error
-                assert "out of date" in _said(result)
+                assert "out of date" in said(result)
 
             host = Host(client)
             await host.open()
@@ -240,7 +91,7 @@ def test_a_reread_with_nothing_changed_is_identical(relay_paths: RelayPaths) -> 
     add_site(relay_paths)
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             first = await host.open()
             assert await host.open() == first
@@ -261,15 +112,15 @@ def test_a_token_rendered_by_one_relay_is_spent_by_another_once(
 
     async def scenario() -> None:
         async with (
-            a2ui_client(relay_paths) as reader,
-            a2ui_client(relay_paths) as first,
-            a2ui_client(relay_paths) as second,
+            basic_client(relay_paths) as reader,
+            basic_client(relay_paths) as first,
+            basic_client(relay_paths) as second,
         ):
             host = Host(reader)
             await host.open()
             name, context = host.action("relay-sites", "s-fx-edit")
             result = await first.call_tool(name, context, raise_on_error=False)
-            assert not result.is_error, _said(result)
+            assert not result.is_error, said(result)
             again = await second.call_tool(name, context, raise_on_error=False)
             assert again.is_error, "a token is single use across relays"
             # What one relay's action changed, the reader's next read shows.
@@ -280,20 +131,28 @@ def test_a_token_rendered_by_one_relay_is_spent_by_another_once(
     asyncio.run(scenario())
 
 
-def test_tab_uses_only_the_catalog_components(relay_paths: RelayPaths) -> None:
+def test_page_uses_only_the_catalog_components(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, adapter="fixture", config={"sign_in": True})
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with a2ui_client(relay_paths) as rich:
+            messages = await Host(rich).open()
+            created = [m["createSurface"] for m in messages if "createSurface" in m]
+            assert {item["catalogId"] for item in created} == {RELAY_CATALOG_ID}
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             messages = await host.open()
             created = [m["createSurface"] for m in messages if "createSurface" in m]
             assert {item["surfaceId"] for item in created} == {"relay-sites", "relay-add"}
-            assert {item["catalogId"] for item in created} == {RELAY_CATALOG_ID}
+            assert {item["catalogId"] for item in created} == {BASIC_CATALOG_ID}
+            # The add form shows only once the person asks for it.
+            assert host.visible("relay-add") == {"root"}
+            await host.press("relay-sites", "sites-add")
             await host.press("relay-sites", "s-fx-edit")
             for surface in host.surfaces.values():
                 for component in surface["components"].values():
                     assert component["component"] in COMPONENTS
+                    assert component["component"] != "clio.choice-table.v1"
             # The add form has a tab per installed adapter, each with its config fields.
             # A test-only adapter is not offered, but a site already on one can edit it.
             visible = host.visible("relay-add")
@@ -327,10 +186,12 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
     store = SiteStore(relay_paths.sites_file)
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            assert "No sites yet" in host.text("relay-sites")
+            assert "No endpoints yet" in host.text("relay-sites")
+            await host.press("relay-sites", "sites-add")
+            assert "add-cancel" in host.visible("relay-add")
 
             # A bad value is shown on its field, not as a tool error or a caption.
             host.set("relay-add", "/drafts/add/site/id", "Bad Id")
@@ -347,7 +208,7 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
 
             host.set("relay-add", "/drafts/add/site/id", "")
             await host.press("relay-add", "add-a-fixture-add")
-            assert host.failing("relay-add") == {"add-s-f-id": "Enter a site ID"}
+            assert host.failing("relay-add") == {"add-s-f-id": "Enter an endpoint ID"}
 
             host.set("relay-add", "/drafts/add/site/id", "lab")
             host.set("relay-add", "/drafts/add/site/name", "Lab cluster")
@@ -364,13 +225,15 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             assert added == ["lab"]
             assert host.get("relay-add", "/drafts/add/site/id") == ""
             assert host.get("relay-sites", "/switch/lab/adapter") == ["fixture"]
-            assert "Added Lab cluster." in _said(result)
+            assert "Added Lab cluster." in said(result)
+            assert host.visible("relay-add") == {"root"}, "a successful add closes the form"
 
             # Adding the same id again is refused on the id field.
+            await host.press("relay-sites", "sites-add")
             host.set("relay-add", "/drafts/add/site/id", "lab")
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is False
-            assert host.failing("relay-add") == {"add-s-f-id": "A site named lab exists"}
+            assert host.failing("relay-add") == {"add-s-f-id": "An endpoint named lab exists"}
             # A policy outside the picker's options is refused on the picker.
             host.set("relay-add", "/drafts/add/site/id", "lab2")
             host.set("relay-add", "/drafts/add/site/policy", ["nowhere"])
@@ -379,6 +242,8 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             assert set(host.failing("relay-add")) == {"add-s-f-policy"}
             assert host.get("relay-add", "/drafts/add/valid/site.policy") is False
             host.set("relay-add", "/drafts/add/site/policy", ["guarded"])
+            await host.press("relay-add", "add-cancel")
+            assert host.visible("relay-add") == {"root"}
 
             await host.press("relay-sites", "s-lab-probe-button")
             assert "Probed Lab cluster." in host.text("relay-sites")
@@ -421,7 +286,7 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
 
             # A fresh read shows the store as the command line left it.
             await host.open()
-            assert "No sites yet" in host.text("relay-sites")
+            assert "No endpoints yet" in host.text("relay-sites")
 
     asyncio.run(scenario())
 
@@ -447,11 +312,11 @@ def test_a_site_that_cannot_be_read_leaves_the_others(
     monkeypatch.setattr(tab_module.ComputeTab, "probe_site", probe)
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             await host.open()
             assert {"s-fx", "s-broken"} <= host.visible("relay-sites")
-            assert "Relay could not read this site's state (RuntimeError)" in host.text(
+            assert "Relay could not read this endpoint's state (RuntimeError)" in host.text(
                 "relay-sites"
             )
             result = await host.press("relay-sites", "s-fx-probe-button")
@@ -464,9 +329,9 @@ def test_a_site_that_cannot_be_read_leaves_the_others(
     asyncio.run(scenario())
 
 
-def test_a_removed_site_leaves_the_tab(relay_paths: RelayPaths) -> None:
+def test_a_removed_site_leaves_the_page(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             await host.open()
             add_site(relay_paths, "cli")
@@ -485,7 +350,7 @@ def test_connect_offers_relay_sign_in_page(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, "signs", config={"sign_in": True})
 
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             await host.open()
             assert "s-signs-connect" in host.visible("relay-sites"), host.text("relay-sites")
