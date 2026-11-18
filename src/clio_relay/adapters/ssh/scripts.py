@@ -339,7 +339,8 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
         f"J={q(job_dir)}\n"
         + _ENTER_JOB
         + '[ -f final ] && { echo "@@final"; exit 0; }\n'
-        ": > cancel\nprintf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
+        + ": > cancel\n"
+        + "printf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
     )
     if cancel_command is not None:
         body += f'out=$({cancel_command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'

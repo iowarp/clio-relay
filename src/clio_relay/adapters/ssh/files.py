@@ -45,11 +45,7 @@ def _start(path: str) -> str:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a path")
     # A job on another node may have just written the path; see scripts.FRESH.
     return (
-        'cd "$HOME" 2>/dev/null\n'
-        + f"p={q(path)}\n"
-        + FRESH
-        + 'fresh "$(dirname "$p")"\n'
-        + _STAT
+        'cd "$HOME" 2>/dev/null\n' + f"p={q(path)}\n" + FRESH + 'fresh "$(dirname "$p")"\n' + _STAT
     )
 
 
