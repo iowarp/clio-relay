@@ -11,6 +11,7 @@ legacy one, and otherwise as a typed refusal that names the ask and its page.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from collections.abc import AsyncGenerator, Sequence
@@ -50,8 +51,9 @@ from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
+from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
-from clio_relay.surface.service import RelayService, endpoint_summary, service_ready
+from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
 PROTOCOL_VERSION = "2026-07-28"
@@ -258,6 +260,9 @@ class RelayTasksExtension(ServerExtension):
             return "waiting for a sign-in to finish"
         if service_ready(record):
             return f"the service is running: {endpoint_summary(record)}"
+        latest = service_message(record)
+        if latest is not None:
+            return f"the service is {record.state.value}: {latest}"
         return f"relay operation is {record.state.value}"
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
@@ -458,6 +463,7 @@ class RelayServer:
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
+                self.service.same_request(self.service.operation(resume), site, spec)
                 record = await self.service.advance(resume)
                 return await self._deliver(ctx, record, wait_s)
             if site is None or spec is None:
@@ -524,19 +530,7 @@ class RelayServer:
     ) -> ToolResult | InputRequiredToolResult:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
-        if site is not None and spec is not None:
-            entry = self.service.site(site)
-            current = (
-                self.service.prepare_service(entry, spec)
-                if isinstance(spec, ServiceSpec)
-                else self.service.apply_defaults(entry, spec)
-            )
-            if site != record.site or current.digest() != record.spec_digest:
-                raise Refusal(
-                    RefusalReason.APPROVAL_MISMATCH,
-                    "the retry's arguments differ from what was asked about; call run again",
-                    operation_id=operation_id,
-                )
+        self.service.same_request(record, site, spec)
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
                 action, content = _response_parts(response)
@@ -545,12 +539,30 @@ class RelayServer:
         return await self._deliver(ctx, record, wait_s)
 
     async def exec(
-        self, site: str, command: list[str], timeout_s: float, max_output_bytes: int
+        self,
+        ctx: Context,
+        site: str,
+        command: list[str],
+        timeout_s: float | None,
+        max_output_bytes: int,
     ) -> ToolResult:
-        """The ``exec`` verb."""
+        """The ``exec`` verb. With no ``timeout_s`` it runs until the command ends,
+        and tells the person when it goes quiet; cancelling the call stops it."""
+
+        async def quiet(idle_s: float, next_s: float) -> None:
+            note = (
+                f"no output for {idle_s:.0f} s; the command is still running; relay checks "
+                f"again in {next_s:.0f} s; cancel the call to stop it"
+            )
+            await ctx.report_progress(idle_s, message=note)
+
         try:
             result = await self.service.exec(
-                site, command, timeout_s=timeout_s, max_output_bytes=max_output_bytes
+                site,
+                command,
+                timeout_s=timeout_s,
+                max_output_bytes=max_output_bytes,
+                on_stall=quiet,
             )
         except Refusal as refusal:
             return refusal_result(refusal)
@@ -659,11 +671,17 @@ class RelayServer:
         async def exec_(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
             command: Annotated[list[str], Field(min_length=1, description="argv, no shell")],
-            timeout_s: Annotated[float, Field(gt=0, le=600)] = 60,
+            ctx: Context,
+            timeout_s: Annotated[
+                float | None,
+                Field(
+                    gt=0, description="Optional limit; by default the command runs until it ends"
+                ),
+            ] = None,
             max_output_bytes: Annotated[int, Field(ge=1, le=MAX_INLINE_BYTES)] = 65536,
         ) -> ToolResult:
             """Run one command on the site's login side and return bounded output."""
-            return await relay.exec(site, command, timeout_s, max_output_bytes)
+            return await relay.exec(ctx, site, command, timeout_s, max_output_bytes)
 
         @server.tool(
             name="files",
@@ -718,9 +736,13 @@ class RelayServer:
 
     @asynccontextmanager
     async def _lifespan(self, _server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
+        # A service that ended while relay was down is finished without anyone asking.
+        observing = asyncio.create_task(self.service.observe_open_services())
         try:
             yield {}
         finally:
+            observing.cancel()
+            await asyncio.gather(observing, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 

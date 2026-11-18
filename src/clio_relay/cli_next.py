@@ -16,6 +16,7 @@ import yaml
 
 from clio_relay import catalog
 from clio_relay.adapters import registry
+from clio_relay.cli_asks import app as asks_app
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import routes
@@ -29,22 +30,6 @@ app.add_typer(site_app, name="site")
 app.add_typer(rendezvous_app, name="rendezvous")
 
 
-def _installed_asks_app() -> typer.Typer | None:
-    try:
-        from clio_relay.cli_asks import (  # pyright: ignore[reportMissingImports]
-            app as installed,  # pyright: ignore[reportUnknownVariableType]
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "clio_relay.cli_asks":
-            raise
-        return None
-    return cast(typer.Typer, installed)
-
-
-_asks_app = _installed_asks_app()
-asks_app = _asks_app or typer.Typer(
-    no_args_is_help=True, help="See and answer what relay is asking."
-)
 app.add_typer(asks_app, name="asks")
 
 
@@ -136,7 +121,9 @@ def serve(
 
 
 @app.command()
-def connect(handle: Annotated[str, typer.Argument(help="A service's operation id")]) -> None:
+def connect(
+    handle: Annotated[str, typer.Argument(help="The handle in the serve result's connect_command")],
+) -> None:
     """Forward a running service's ports to this machine and hold them open."""
     try:
         from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
@@ -212,6 +199,25 @@ def site_list() -> None:
     _print([entry.model_dump(mode="json") for entry in SiteStore(_paths().sites_file).list()])
 
 
+def _saved(entry: SiteEntry) -> None:
+    """Print a saved site and what its adapters set up for it."""
+
+    async def set_up() -> dict[str, Any]:
+        from clio_relay.surface.service import RelayService
+
+        service = RelayService(_paths())
+        try:
+            return await service.site_added(entry.id)
+        finally:
+            await service.close()
+
+    shown = entry.model_dump(mode="json")
+    set_up_by = asyncio.run(set_up())
+    if set_up_by:
+        shown["set_up"] = set_up_by
+    _print(shown)
+
+
 @site_app.command("show")
 def site_show(site_id: str) -> None:
     """Show one site and which adapter serves each verb."""
@@ -256,9 +262,11 @@ def site_add(
                 "spend": {"ask": ask},
             }
         )
-        _print(SiteStore(_paths().sites_file).add(entry).model_dump(mode="json"))
+        added = SiteStore(_paths().sites_file).add(entry)
     except Refusal as refusal:
         _fail(refusal)
+        return
+    _saved(added)
 
 
 @site_app.command("catalog")
@@ -275,7 +283,7 @@ def site_add_from_catalog(catalog_id: str, site_id: str | None = None) -> None:
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(added.model_dump(mode="json"))
+    _saved(added)
 
 
 @site_app.command("edit")
@@ -293,7 +301,7 @@ def site_edit(
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(edited.model_dump(mode="json"))
+    _saved(edited)
 
 
 @site_app.command("remove")
@@ -315,65 +323,7 @@ def site_switch(site_id: str, adapter: str) -> None:
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(switched.model_dump(mode="json"))
-
-
-def asks_list(
-    all_asks: Annotated[bool, typer.Option("--all", help="Include answered asks")] = False,
-) -> None:
-    """List asks waiting on you."""
-    from clio_relay.surface.service import RelayService
-
-    service = RelayService(_paths())
-    shown = [
-        ask.model_dump(mode="json")
-        for ask in service.asks.all()
-        if all_asks or ask.state == "pending" or (ask.kind == "url" and ask.completed_at is None)
-    ]
-    _print(shown)
-
-
-def asks_answer(
-    ask_id: str,
-    decline: Annotated[bool, typer.Option(help="Say no")] = False,
-    value: Annotated[str | None, typer.Option(help="The choice, for a choose ask")] = None,
-) -> None:
-    """Answer an ask. Approves unless --decline."""
-    from clio_relay.jobs.handles import utc_now
-    from clio_relay.surface.service import RelayService
-
-    service = RelayService(_paths())
-    try:
-        current = service.asks.get(ask_id)
-        if current is None:
-            typer.echo(f"there is no ask {ask_id!r}", err=True)
-            raise typer.Exit(2)
-        content: dict[str, Any] | None = None
-        if current.kind == "approve":
-            content = {"approve": not decline}
-        elif current.kind == "choose":
-            properties: dict[str, Any] = (current.requested_schema or {}).get("properties") or {}
-            field = next(iter(properties), "value")
-            content = {field: value}
-        ask = service.answer(ask_id, "decline" if decline else "accept", content, by="cli")
-        if ask.kind == "url" and not decline and ask.completed_at is None:
-            with service.asks.locked(ask_id):
-                stored = service.asks.get(ask_id)
-                if stored is not None:
-                    stored.completed_at = utc_now()
-                    service.asks.put(ask_id, stored)
-        if ask.operation_id:
-            record = asyncio.run(service.advance(ask.operation_id))
-            _print({"ask": ask_id, "operation": record.operation_id, "state": record.state.value})
-        else:
-            _print({"ask": ask_id, "state": ask.state})
-    except Refusal as refusal:
-        _fail(refusal)
-
-
-if _asks_app is None:
-    asks_app.command("list")(asks_list)
-    asks_app.command("answer")(asks_answer)
+    _saved(switched)
 
 
 def main() -> None:

@@ -154,8 +154,8 @@ class Charge(BaseModel):
     queue: str | None = None
     account: str | None = None
     nodes: int
-    walltime_s: float
-    node_hours: float
+    walltime_s: float | None = Field(default=None, description="None when no walltime is set")
+    node_hours: float | None = Field(default=None, description="None when unknown")
     amount: float | None = None
     unit: str = "node-hours"
 

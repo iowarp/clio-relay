@@ -1,0 +1,21 @@
+id: ares-tapis
+name: Ares (through Tapis)
+description: >-
+  IIT's Ares cluster, reached through TACC's Tapis. Relay registers Ares as the
+  person's own Tapis system with one logical queue per Slurm partition and runs jobs as
+  Tapis BATCH jobs, the path Vista uses.
+source: https://tapis.readthedocs.io/en/latest/technical/systems.html
+address: ares.cs.iit.edu
+adapter: tapis
+identity: tacc
+config:
+  base_url: https://tacc.tapis.io
+  tenant_id: tacc
+  authn: pki
+alternatives:
+  ssh:
+    ssh_profile: ares
+policy: open
+spend:
+  ask: never
+skill: ares-tapis

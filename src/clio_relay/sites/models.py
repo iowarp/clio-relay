@@ -20,13 +20,16 @@ class SpendPolicy(BaseModel):
 
     ask: SpendAsk = "always"
 
-    def needs_approval(self, node_hours: float) -> bool:
-        """Return whether a job of ``node_hours`` needs a yes."""
+    def needs_approval(self, node_hours: float | None) -> bool:
+        """Return whether a job of ``node_hours`` needs a yes.
+
+        An unknown cost (None) always asks, unless the site never asks.
+        """
         if self.ask == "always":
             return True
         if self.ask == "never":
             return False
-        return node_hours > self.ask
+        return node_hours is None or node_hours > self.ask
 
 
 class SiteDefaults(BaseModel):

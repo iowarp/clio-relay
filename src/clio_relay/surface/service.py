@@ -14,10 +14,11 @@ from datetime import timedelta
 from typing import Any, cast
 
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import VERBS, AdapterContext, BaseAdapter, Verb
+from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
     Ask,
     AskProvider,
+    Charge,
     GuardHook,
     HookContext,
     ServeHook,
@@ -25,7 +26,7 @@ from clio_relay.adapters.hooks import (
     hook_factory,
 )
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, utc_now
+from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
 from clio_relay.jobs.records import (
     OperationKind,
     OperationRecord,
@@ -37,8 +38,10 @@ from clio_relay.jobs.records import (
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
-from clio_relay.sites.routing import route, routes
+from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
+from clio_relay.surface.describing import relay_report, site_report
+from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 
@@ -64,31 +67,17 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _public_endpoint(endpoint: Endpoint) -> dict[str, Any]:
-    """Return what the record keeps of an endpoint: no port URLs.
-
-    A port URL may carry a secret, so only the serve hook's ``ui_data`` hands it
-    out, in the serve result's ``_meta`` (RL22).
-    """
-    return endpoint.model_dump(mode="json", exclude={"ports": {"__all__": {"url"}}})
-
-
-def service_ready(record: OperationRecord) -> bool:
-    """Return whether a service operation is running and has an endpoint."""
+def _approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
+    if charge.walltime_s is None or charge.node_hours is None:
+        return (
+            f"{action} on {site.title}? It asks for {charge.nodes} node(s) and sets no "
+            "walltime, so its duration and cost are unknown: the scheduler's default "
+            "limit applies."
+        )
     return (
-        record.kind == "serve"
-        and record.state == OperationState.RUNNING
-        and bool((record.result or {}).get("endpoint"))
+        f"{action} on {site.title}? It may use up to {charge.node_hours:g} {charge.unit} "
+        f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
     )
-
-
-def endpoint_summary(record: OperationRecord) -> str | None:
-    """Name a service's ports as ``name host:port``. No URLs, which may carry secrets."""
-    endpoint: dict[str, Any] = (record.result or {}).get("endpoint") or {}
-    ports: list[dict[str, Any]] = endpoint.get("ports") or []
-    if not ports:
-        return None
-    return ", ".join(f"{port['name']} {port['host']}:{port['port']}" for port in ports)
 
 
 class RelayService:
@@ -109,7 +98,8 @@ class RelayService:
         )
         self.asks: RecordStore[Ask] = RecordStore(paths.asks_dir, Ask)
         settings: dict[str, Any] = {
-            "grant_files": {key: str(value) for key, value in paths.grant_files.items()}
+            "grant_files": {key: str(value) for key, value in paths.grant_files.items()},
+            "config_dir": str(paths.config_dir),
         }
         if public_base_url is not None:
             settings["public_base_url"] = public_base_url
@@ -145,9 +135,17 @@ class RelayService:
             self._adapters[key] = adapter
         return adapter
 
+    def route(self, site: SiteEntry, verb: Verb) -> Routed:
+        """Route ``verb`` on ``site``, skipping adapters whose settings do not build (RL5)."""
+        return route(site, verb, lambda name, config: self._build(site, name, config))
+
+    def site_routes(self, site: SiteEntry) -> list[Route]:
+        """Return every verb's route on ``site``, with what was skipped and why."""
+        return routes(site, lambda name, config: self._build(site, name, config))
+
     def adapter_for(self, site: SiteEntry, verb: Verb) -> BaseAdapter[Any]:
         """Return the adapter that serves ``verb`` on ``site`` (RL5)."""
-        name, config = route(site, verb)
+        name, config, _skipped = self.route(site, verb)
         return self._build(site, name, config)
 
     def adapter_named(self, site: SiteEntry, name: str) -> BaseAdapter[Any]:
@@ -163,6 +161,26 @@ class RelayService:
             adapter=name,
         )
 
+    async def site_added(self, site_id: str) -> dict[str, Any]:
+        """Let each adapter that implements ``SiteAdded`` set up a saved site.
+
+        An adapter whose settings do not build is left out here; ``describe`` names it.
+        """
+        site = self.site(site_id)
+        results: dict[str, Any] = {}
+        for name, config in [(site.adapter, site.config), *site.alternatives.items()]:
+            try:
+                adapter = self._build(site, name, config)
+            except Refusal:
+                continue
+            if not isinstance(adapter, SiteAdded):
+                continue
+            try:
+                results[name] = await adapter.on_site_added(site)
+            except Refusal as refusal:
+                results[name] = {"refusal": refusal.to_dict()}
+        return results
+
     # describe
 
     async def describe(self, site_id: str | None = None, job: str | None = None) -> dict[str, Any]:
@@ -170,34 +188,8 @@ class RelayService:
         if job is not None:
             return self.view(await self.refresh(job))
         if site_id is None:
-            return {
-                "sites": [
-                    {
-                        "id": entry.id,
-                        "name": entry.title,
-                        "adapter": entry.adapter,
-                        "alternatives": sorted(entry.alternatives),
-                        "policy": entry.policy,
-                    }
-                    for entry in self.sites.list()
-                ],
-                "adapters": registry.names(),
-                "verbs": list(VERBS),
-            }
-        site = self.site(site_id)
-        described: dict[str, Any] = {
-            "site": site.model_dump(mode="json"),
-            "routes": [item.model_dump(mode="json") for item in routes(site)],
-        }
-        try:
-            adapter = self.adapter_for(site, "describe")
-            described["info"] = (await adapter.describe()).model_dump(mode="json")
-            need = await adapter.sign_in_needed()
-            described["sign_in"] = None if need is None else need.model_dump(mode="json")
-        except Refusal as refusal:
-            described["info"] = None
-            described["refusal"] = refusal.to_dict()
-        return described
+            return await relay_report(self)
+        return await site_report(self, self.site(site_id))
 
     # run
 
@@ -209,7 +201,7 @@ class RelayService:
             changes["queue_name"] = site.defaults.queue
         if attributes.account is None and site.defaults.account is not None:
             changes["account"] = site.defaults.account
-        if "duration" not in attributes.model_fields_set and site.defaults.duration is not None:
+        if attributes.duration is None and site.defaults.duration is not None:
             changes["duration"] = site.defaults.duration
         if not changes:
             return spec
@@ -241,7 +233,7 @@ class RelayService:
     ) -> OperationRecord:
         """Check and price a service's job, record it, ask, and start it if nothing must."""
         site = self.site(site_id)
-        route(site, "serve")
+        self.route(site, "serve")
         if isinstance(self.serve_hook, StubServe):
             raise Refusal(
                 RefusalReason.VERB_NOT_IMPLEMENTED,
@@ -274,11 +266,14 @@ class RelayService:
         task: bool,
     ) -> OperationRecord:
         verb: Verb = "serve" if kind == "serve" else "run"
-        adapter_name, _config = route(site, verb)
-        adapter = self.adapter_for(site, verb)
+        adapter_name, config, skipped = self.route(site, verb)
+        adapter = self._build(site, adapter_name, config)
         (await self.guard.check_run(site, job)).raise_if_refused()
         charge = await self.guard.price(site, job)
         operation_id = new_id("op")
+        result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
+        if skipped:
+            result["skipped"] = [item.model_dump() for item in skipped]
         record = OperationRecord(
             operation_id=operation_id,
             kind=kind,
@@ -290,7 +285,7 @@ class RelayService:
             state=OperationState.AWAITING_INPUT,
             history=[StateChange(state=OperationState.AWAITING_INPUT)],
             task=task,
-            result={"charge": charge.model_dump(mode="json")},
+            result=result,
         )
         asks: list[Ask] = []
         need = await adapter.sign_in_needed()
@@ -308,11 +303,7 @@ class RelayService:
                 await self.ask_provider.approve(
                     site=site,
                     operation_id=operation_id,
-                    message=(
-                        f"{action} on {site.title}? It may use up to "
-                        f"{charge.node_hours:g} {charge.unit} "
-                        f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
-                    ),
+                    message=_approval_message(action, site, charge),
                     binding=binding,
                 )
             )
@@ -375,6 +366,28 @@ class RelayService:
             self.asks.put(ask_id, ask)
         return ask
 
+    def same_request(
+        self, record: OperationRecord, site: str | None, spec: JobSpec | ServiceSpec | None
+    ) -> None:
+        """Refuse a retry or resume whose site or spec differs from what was approved."""
+        if site is None and spec is None:
+            return
+        changed = site is not None and site != record.site
+        if spec is not None and not changed:
+            entry = self.site(record.site)
+            current = (
+                self.prepare_service(entry, spec)
+                if isinstance(spec, ServiceSpec)
+                else self.apply_defaults(entry, spec)
+            )
+            changed = current.digest() != record.spec_digest
+        if changed:
+            raise Refusal(
+                RefusalReason.APPROVAL_MISMATCH,
+                "the arguments differ from what was asked about; call run again",
+                operation_id=record.operation_id,
+            )
+
     async def _signed_in(self, ask: Ask, record: OperationRecord) -> bool:
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
@@ -384,6 +397,25 @@ class RelayService:
             return False
         await adapter.sign_in_done(ask.answer or {})
         return await adapter.sign_in_needed() is None
+
+    async def _signed_in_elsewhere(self, ask: Ask, record: OperationRecord) -> bool:
+        """Close a pending sign-in ask the person finished outside relay's page.
+
+        A device-flow sign-in completes at the provider, so nobody answers the
+        ask; the adapter saying it no longer needs a sign-in is the answer.
+        """
+        site = self.site(record.site)
+        adapter = self.adapter_named(site, record.adapter)
+        if await adapter.sign_in_needed() is not None:
+            return False
+        with self.asks.locked(ask.ask_id):
+            stored = self.asks.get(ask.ask_id)
+            if stored is not None and stored.state == "pending":
+                stored.resolve("accepted", {"action": "accept", "content": None}, "adapter")
+                if stored.completed_at is None:
+                    stored.completed_at = utc_now()
+                self.asks.put(ask.ask_id, stored)
+        return True
 
     async def advance(self, operation_id: str) -> OperationRecord:
         """Move an operation past its asks once they are all answered."""
@@ -399,6 +431,8 @@ class RelayService:
                     Refusal(RefusalReason.DECLINED, f"the person declined: {ask.message}"),
                 )
             if ask.state == "pending":
+                if ask.kind == "url" and await self._signed_in_elsewhere(ask, record):
+                    continue
                 waiting = True
                 continue
             if ask.kind == "approve" and (
@@ -507,7 +541,7 @@ class RelayService:
             if endpoint is not None:
                 record.result = {
                     **(record.result or {}),
-                    "endpoint": _public_endpoint(endpoint),
+                    "endpoint": public_endpoint(endpoint),
                 }
                 record.move(OperationState.RUNNING, "the service is ready")
             else:
@@ -570,8 +604,40 @@ class RelayService:
             ):
                 return self._finish(operation_id, OperationState.FAILED, refusal)
             logger.warning("observing service %s: %s", operation_id, refusal.message)
-            return record
+            return self._observation_failed(operation_id, refusal.message)
+        except Exception as exc:
+            # One failed look is not the service's end; it stays open and says why.
+            logger.warning("observing service %s", operation_id, exc_info=True)
+            return self._observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
         return await self._apply(operation_id, adapter, status, endpoint)
+
+    def _observation_failed(self, operation_id: str, error: str) -> OperationRecord:
+        with self.operations.locked(operation_id):
+            record = self.operation(operation_id)
+            if not record.state.final:
+                result = dict(record.result or {})
+                result["message"] = f"relay could not observe the service: {error}"
+                record.result = result
+                self.operations.put(operation_id, record)
+            return record
+
+    async def observe_open_services(self) -> None:
+        """Observe each open service once, so one that ended while relay was down ends."""
+        open_services = [
+            record.operation_id
+            for record in self.operations.all()
+            if record.kind == "serve"
+            and not record.state.final
+            and record.state != OperationState.AWAITING_INPUT
+        ]
+
+        async def observe(operation_id: str) -> None:
+            try:
+                await self.refresh(operation_id)
+            except Exception:
+                logger.warning("observing service %s at startup", operation_id, exc_info=True)
+
+        await asyncio.gather(*(observe(item) for item in open_services))
 
     async def _apply(
         self,
@@ -593,7 +659,7 @@ class RelayService:
             result = dict(record.result or {})
             if record.kind == "serve":
                 if endpoint is not None:
-                    result["endpoint"] = _public_endpoint(endpoint)
+                    result["endpoint"] = public_endpoint(endpoint)
                 if status.message is not None:
                     result["message"] = status.message
             if status.state.final:
@@ -674,17 +740,24 @@ class RelayService:
         site_id: str,
         command: list[str],
         *,
-        timeout_s: float,
+        timeout_s: float | None = None,
         max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> dict[str, Any]:
-        """Run one short command (RL9)."""
+        """Run one command (RL9). With no ``timeout_s`` it runs until it ends."""
         site = self.site(site_id)
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
         (await self.guard.check_exec(site, command)).raise_if_refused()
-        adapter = self.adapter_for(site, "exec")
-        result = await adapter.exec(command, timeout_s=timeout_s, max_output_bytes=max_output_bytes)
-        return result.model_dump(mode="json")
+        name, config, skipped = self.route(site, "exec")
+        adapter = self._build(site, name, config)
+        result = await adapter.exec(
+            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+        )
+        shown = result.model_dump(mode="json")
+        if skipped:
+            shown["skipped"] = [item.model_dump() for item in skipped]
+        return shown
 
     # views
 
