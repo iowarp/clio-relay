@@ -26,9 +26,9 @@ from clio_relay.validation_report import SoftwareIdentity
 #: to stay hard regardless of dev mode. Zero coupling to clio_relay.dev_mode is
 #: proof by construction: these modules cannot consult a flag they never import.
 _HARD_CHECK_MODULES = (
-    "worker_lifetime_lock.py",  # exclusive worker lock per cluster
+    "adapters/worker/worker_lifetime_lock.py",  # exclusive worker lock per cluster
     "storage_policy.py",  # storage admission/reservation limits
-    "session_lifecycle.py",  # teardown scoping and cleanup policy
+    "adapters/worker/session_lifecycle.py",  # teardown scoping and cleanup policy
 )
 
 

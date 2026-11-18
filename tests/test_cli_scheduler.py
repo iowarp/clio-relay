@@ -33,9 +33,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.scheduler_providers as scheduler_providers
+import clio_relay.adapters.worker.scheduler as scheduler_providers
 from clio_relay.adapters.worker.cli import worker_app as app
-from clio_relay.cluster_config import ClusterRegistry
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -52,32 +51,6 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         "CLIO_RELAY_INSTALL_RECEIPT",
         str(tmp_path / "relay-state" / "install-receipt.json"),
     )
-
-
-def test_cli_scheduler_preflight_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
-    report_path = tmp_path / "scheduler-preflight-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "validate-lifecycle",
-            "--cluster",
-            "missing",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code != 0
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "scheduler.preflight"
 
 
 def test_scheduler_status_batch_command_returns_each_exact_identity(

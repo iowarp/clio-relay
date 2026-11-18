@@ -33,13 +33,13 @@ import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.adapters.worker.cli_session_start as cli_session_start
 import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
+import clio_relay.adapters.worker.scheduler as scheduler_providers
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
 import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.cluster_config as cluster_config
 import clio_relay.installation as installation_module
 import clio_relay.remote_cli as remote_cli
-import clio_relay.scheduler_providers as scheduler_providers
 import clio_relay.validation_report as validation_report
 from clio_relay import __version__
 from clio_relay.adapters.worker import (
@@ -49,6 +49,7 @@ from clio_relay.adapters.worker import (
 )
 from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.scheduler import SchedulerProvider
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
@@ -89,7 +90,6 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
-from clio_relay.scheduler_providers import SchedulerProvider
 from clio_relay.service_runtime import (
     ServiceRuntimeSupervisor,
 )
@@ -3858,11 +3858,6 @@ def test_cli_session_start_requires_token_by_default(
             "transport.preflight",
         ),
         (
-            ["live-test", "--cluster", "missing"],
-            "--report",
-            "live.preflight",
-        ),
-        (
             [
                 "session",
                 "detach",
@@ -3935,33 +3930,6 @@ def test_cli_acceptance_preflight_failure_always_writes_canonical_report(
                 "missing",
                 "--session-id",
                 "owned-session",
-            ],
-            "detach",
-            False,
-            False,
-            False,
-        ),
-        (
-            [
-                "gateway",
-                "stop-runtime",
-                "gateway-owned",
-                "--cluster",
-                "missing",
-                "--cancel-scheduler-job",
-            ],
-            "teardown",
-            False,
-            True,
-            False,
-        ),
-        (
-            [
-                "gateway",
-                "detach-runtime",
-                "gateway-owned",
-                "--cluster",
-                "missing",
             ],
             "detach",
             False,
@@ -4907,7 +4875,7 @@ def test_cli_session_scheduler_cancellation_is_owned_and_canonical(
         return ConfirmingScheduler()
 
     monkeypatch.setattr(
-        "clio_relay.scheduler_providers.provider_for_scheduler",
+        "clio_relay.adapters.worker.scheduler.provider_for_scheduler",
         confirming_provider,
     )
 
@@ -5221,7 +5189,7 @@ def test_cli_session_cancels_owned_scheduler_after_relay_job_is_terminal(
         fake_teardown,
     )
     monkeypatch.setattr(
-        "clio_relay.scheduler_providers.provider_for_scheduler",
+        "clio_relay.adapters.worker.scheduler.provider_for_scheduler",
         fake_provider_for_scheduler,
     )
 

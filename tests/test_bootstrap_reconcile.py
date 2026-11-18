@@ -1352,7 +1352,7 @@ def test_managed_repo_migration_preserves_operator_repo_and_resolves_jarvis_pack
     registered_repo = next(
         Path(value) for value in document["repos"] if Path(value).name == "clio_relay"
     )
-    package_source = registered_repo / registered_repo.name / "mcp_call/pkg.py"
+    package_source = registered_repo / registered_repo.name / "bounded_command/pkg.py"
     assert registered_repo == managed_repo.absolute()
     assert package_source.is_file()
     before = repos_file.read_bytes()

@@ -52,10 +52,9 @@ def test_relay_distribution_contains_no_built_in_application_plugins() -> None:
     assert not (source_root / "app_profiles").exists()
     assert not (source_root / "package_adapters").exists()
     for relative_path in (
-        "bootstrap.py",
-        "endpoint.py",
-        "progress_adapters.py",
-        "live_acceptance.py",
+        "adapters/worker/bootstrap.py",
+        "adapters/worker/endpoint.py",
+        "adapters/worker/progress_adapters.py",
     ):
         source = (source_root / relative_path).read_text(encoding="utf-8")
         assert "spack install" not in source.lower()

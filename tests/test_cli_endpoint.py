@@ -45,10 +45,10 @@ import clio_relay.adapters.worker.endpoint as endpoint
 import clio_relay.installation as installation_module
 from clio_relay.adapters.worker import cli
 from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.scheduler import SchedulerProvider
 from clio_relay.cluster_config import ClusterDefinition, WorkerCapacityPolicy
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import JobKind
-from clio_relay.scheduler_providers import SchedulerProvider
 
 
 @pytest.fixture(autouse=True)

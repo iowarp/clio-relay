@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.config import RelaySettings
@@ -96,25 +93,6 @@ def _assert_exact_page(page: dict[str, Any], record_key: str) -> None:
     assert page["limit"] == 2
     assert page["next_cursor"] is None
     assert page["total"] == RECORD_COUNT
-
-
-def test_cli_pages_more_than_501_job_records(
-    pagination_fixture: _PaginationFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(pagination_fixture.settings.core_dir))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(pagination_fixture.settings.spool_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    runner = CliRunner()
-    commands = {
-        "tasks": ["job", "tasks", pagination_fixture.job_id],
-        "artifacts": ["job", "list-artifacts", pagination_fixture.job_id],
-        "progress": ["job", "progress", pagination_fixture.job_id],
-    }
-    for record_key, command in commands.items():
-        result = runner.invoke(app, [*command, "--cursor", "501", "--limit", "2"])
-        assert result.exit_code == 0, result.output
-        _assert_exact_page(json.loads(result.output), record_key)
 
 
 def test_http_pages_more_than_501_job_records(

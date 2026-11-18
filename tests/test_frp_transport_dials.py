@@ -66,7 +66,8 @@ import os
 import sys
 from pathlib import Path
 
-from clio_relay import control_channel, frp_link, frp_transport, remote_connection
+from clio_relay import control_channel, frp_link, frp_transport
+from clio_relay.adapters.worker import remote_connection
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.frp_visitor_reconciliation import ReconciliationResult

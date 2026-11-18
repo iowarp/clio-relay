@@ -6,25 +6,10 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from uuid import uuid4
 
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
-from clio_relay.remote_mcp import (
-    CLIO_KIT_JARVIS_USER_CONTRACT_SHA256,
-    CLIO_KIT_JARVIS_USER_WIRE_SHA256,
-    MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS,
-    RemoteMcpSchemaCache,
-    RemoteMcpSchemaCacheEntry,
-    default_remote_mcp_cache_path,
-    remote_mcp_server_artifact_digest,
-    virtual_jarvis_job_output_schema,
-)
-from clio_relay.remote_mcp import (
-    jarvis_service_runtime_handoff_json_schema as jarvis_service_runtime_handoff_json_schema,
-)
 
 if TYPE_CHECKING:
     from clio_relay.installation import ComponentArtifactIdentity, InstallReceipt
@@ -46,8 +31,6 @@ DEFAULT_JARVIS_MCP_COMMAND = [
 ]
 JARVIS_MCP_COMMAND_ENV = "CLIO_RELAY_JARVIS_MCP_COMMAND"
 JARVIS_MCP_SPACK_COMMAND_ENV = "JARVIS_MCP_SPACK_COMMAND"
-VIRTUAL_JARVIS_PREFIX = "jarvis_"
-JARVIS_MCP_CACHE_SERVER_NAME = "__builtin_jarvis__"
 
 #: RelayJob.metadata key a dev-mode-downgraded PINNED launcher resolution is
 #: recorded under (clio-relay#228 rework). dev mode relaxes VERIFICATION of a
@@ -72,11 +55,13 @@ JARVIS_MCP_AMBIENT_LAUNCHER_UNVERIFIED_REASON = "jarvis_mcp_ambient_launcher_ide
 
 JSON = dict[str, Any]
 
-# CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 / CLIO_KIT_JARVIS_USER_WIRE_SHA256 are
-# imported from clio_relay.remote_mcp above, not redefined here: the two
-# modules carried independent duplicate literals for the same clio-kit
-# contract digest until clio-relay#199 consolidated them to remote_mcp's
-# CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID as the sole source of truth.
+# Digests of the pinned clio-kit JARVIS user contract (jarvis-user-v3.7.2).
+CLIO_KIT_JARVIS_USER_CONTRACT_SHA256 = (
+    "52238d942a15e48e4d92984b5c1ca939ac224dcc067452c6828c63247e1dd2e5"
+)
+CLIO_KIT_JARVIS_USER_WIRE_SHA256 = (
+    "ee3f0d5edd92f635646e9f8463ed79bfea0fda963fafed85845d0303cb59ac24"
+)
 _JARVIS_USER_CONTRACT_PATH = Path(__file__).with_name("_contracts") / "jarvis-user-v3.7.2.json"
 _EXPECTED_JARVIS_USER_TOOLS = {
     "jarvis_add_step",
@@ -346,16 +331,6 @@ def jarvis_mcp_command(
     return cast(list[str], command_items)
 
 
-def jarvis_mcp_env_from() -> dict[str, str]:
-    """Return the sole operator-configured site variable allowed into JARVIS MCP."""
-    value = os.environ.get(JARVIS_MCP_SPACK_COMMAND_ENV)
-    if value is None:
-        return {}
-    if not value or value != value.strip() or any(item in value for item in "\x00\r\n"):
-        raise ValueError(f"{JARVIS_MCP_SPACK_COMMAND_ENV} must name one executable path")
-    return {JARVIS_MCP_SPACK_COMMAND_ENV: JARVIS_MCP_SPACK_COMMAND_ENV}
-
-
 def jarvis_cd_lock_binding_expectation() -> dict[str, str]:
     """Return the exact relay release pin required by its built-in JARVIS MCP."""
     from clio_relay.adapters.worker.bootstrap import (
@@ -529,7 +504,19 @@ def jarvis_mcp_server_artifact_binding_verified(
     if expected_digest is None or not jarvis_mcp_server_artifact_verified(value):
         return False
     server_artifact = cast(JSON, value)
-    return remote_mcp_server_artifact_digest(server_artifact) == expected_digest
+    return server_artifact_digest(server_artifact) == expected_digest
+
+
+def server_artifact_digest(server_artifact: JSON) -> str:
+    """Return the canonical digest that binds discovery to later execution."""
+    return hashlib.sha256(
+        json.dumps(
+            {"server_artifact": server_artifact},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _persistent_clio_kit_tool_identity(
@@ -650,135 +637,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def jarvis_mcp_server(
-    *,
-    receipt_path: Path | None = None,
-    cluster: str | None = None,
-    dev_mode: bool | None = None,
-    findings: VerificationFindings | None = None,
-    registered_command: list[str] | None = None,
-) -> str:
-    """Return the executable component of the JARVIS MCP command."""
-    return jarvis_mcp_command(
-        receipt_path=receipt_path,
-        cluster=cluster,
-        dev_mode=dev_mode,
-        findings=findings,
-        registered_command=registered_command,
-    )[0]
-
-
-def jarvis_mcp_server_args(
-    *,
-    receipt_path: Path | None = None,
-    cluster: str | None = None,
-    dev_mode: bool | None = None,
-    findings: VerificationFindings | None = None,
-    registered_command: list[str] | None = None,
-) -> list[str]:
-    """Return the argument component of the JARVIS MCP command."""
-    return jarvis_mcp_command(
-        receipt_path=receipt_path,
-        cluster=cluster,
-        dev_mode=dev_mode,
-        findings=findings,
-        registered_command=registered_command,
-    )[1:]
-
-
-def is_virtual_jarvis_control_query(remote_tool: str) -> bool:
-    """Return whether the pinned virtual JARVIS contract marks a tool read-only."""
-    definition = _VIRTUAL_JARVIS_TOOLS.get(remote_tool)
-    if definition is None:
-        return False
-    annotations = definition.get("annotations")
-    if not isinstance(annotations, dict):
-        return False
-    typed_annotations = cast(JSON, annotations)
-    return bool(
-        typed_annotations.get("readOnlyHint") is True
-        and typed_annotations.get("destructiveHint") is False
-    )
-
-
-def virtual_jarvis_tool_definitions(*, clusters: list[str] | None = None) -> list[JSON]:
-    """Return agent-facing virtual tools for the cluster-local JARVIS MCP server."""
-    tools: list[JSON] = []
-    for remote_tool, definition in _VIRTUAL_JARVIS_TOOLS.items():
-        input_schema = deepcopy(cast(JSON, definition["inputSchema"]))
-        properties = cast(JSON, input_schema["properties"])
-        input_schema["properties"] = {
-            "cluster": {
-                "type": "string",
-                "description": "Configured clio-relay cluster target.",
-                **({"enum": sorted(clusters)} if clusters is not None else {}),
-            },
-            **properties,
-            "timeout_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                **(
-                    {"maximum": MAX_PINNED_CONTROL_QUERY_TIMEOUT_SECONDS}
-                    if is_virtual_jarvis_control_query(remote_tool)
-                    else {}
-                ),
-            },
-            "idempotency_key": {"type": "string"},
-            "wait_for_terminal": {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "Set true when the current turn needs this JARVIS operation's result. "
-                    "This waits only for the bounded remote MCP dispatch, never for the "
-                    "scheduler workload. Leave false only when intentionally preserving an "
-                    "asynchronous relay receipt for a later relay_wait call."
-                ),
-            },
-            "wait_timeout_seconds": {"type": "number", "default": 600},
-            "poll_seconds": {"type": "number", "default": 2},
-        }
-        required = cast(list[str], input_schema.get("required", []))
-        input_schema["required"] = ["cluster", *required]
-        output_schema = virtual_jarvis_job_output_schema(remote_tool, clusters=clusters)
-        tool_guidance = ""
-        if remote_tool == "jarvis_get_execution":
-            tool_guidance = (
-                " If this call returns queued, call relay_wait with its exact cluster, job_id, "
-                "and route_revision. The terminal wait returns service_runtime_bindings when "
-                "include_service_runtimes=true; bind one with relay_bind_jarvis_runtime before "
-                "opening a viewer. Never use execution_id as gateway_session_id."
-            )
-        elif remote_tool == "jarvis_run":
-            tool_guidance = (
-                " Before running, inspect every selected package with jarvis_describe. If its "
-                "deployment contract reports an unavailable runtime and advertises a provider "
-                "resolution, call that provider's locate tool and pass the returned immutable "
-                "load_spec in spack_specs. Do not submit until every required runtime is usable "
-                "or explicitly activated."
-                " wait_for_terminal is a clio-relay transport control: it waits only for the "
-                "brief remote MCP dispatch to return the durable execution handle. It never "
-                "waits for workload completion. Use jarvis_get_execution with the returned "
-                "pipeline_id and execution_id for lifecycle, progress, artifacts, and services."
-            )
-        tools.append(
-            {
-                "name": virtual_jarvis_tool_name(remote_tool),
-                "description": (
-                    f"{definition['description']} Routed through the verified cluster-local "
-                    "clio-kit JARVIS MCP and returned as a durable relay job. Preserve the "
-                    "returned cluster, job_id, and route_revision unchanged for every remote "
-                    "follow-up. For ordinary interactive use, set wait_for_terminal=true so "
-                    "the bounded MCP result returns in this call; leave it false only when "
-                    f"intentionally queuing the transport operation.{tool_guidance}"
-                ),
-                "inputSchema": input_schema,
-                "outputSchema": output_schema,
-                "annotations": deepcopy(cast(JSON, definition["annotations"])),
-            }
-        )
-    return tools
-
-
 def jarvis_user_contract() -> dict[str, JSON]:
     """Return a defensive copy of the pinned clio-kit user contract."""
     return deepcopy(_VIRTUAL_JARVIS_TOOLS)
@@ -794,163 +652,3 @@ def jarvis_user_contract_titles() -> dict[str, str | None]:
     live clio-kit ``tools/list`` response) use this instead.
     """
     return dict(_VIRTUAL_JARVIS_TOOL_TITLES)
-
-
-def jarvis_user_contract_digest() -> str:
-    """Return the bundled clio-kit JARVIS user-contract digest."""
-    return _jarvis_contract_digest(_VIRTUAL_JARVIS_TOOLS, _VIRTUAL_JARVIS_TOOL_TITLES)
-
-
-def jarvis_mcp_artifact_binding(
-    cluster: str,
-    *,
-    cache_path: Path | None = None,
-    now: datetime | None = None,
-) -> str:
-    """Return the verified discovery-time artifact binding for built-in JARVIS calls."""
-    resolved_cache = cache_path or default_remote_mcp_cache_path()
-    entry = RemoteMcpSchemaCache.load(resolved_cache).entry_for(
-        cluster,
-        JARVIS_MCP_CACHE_SERVER_NAME,
-    )
-    if entry is None:
-        raise ValueError(
-            f"JARVIS MCP identity is not discovered for {cluster}; run jarvis-mcp-refresh"
-        )
-    return jarvis_mcp_artifact_binding_from_entry(entry, now=now)
-
-
-def jarvis_mcp_artifact_binding_from_entry(
-    entry: RemoteMcpSchemaCacheEntry,
-    *,
-    now: datetime | None = None,
-) -> str:
-    """Validate one durable JARVIS discovery entry and return its artifact digest."""
-    current = now or datetime.now(UTC)
-    if entry.server_name != JARVIS_MCP_CACHE_SERVER_NAME:
-        raise ValueError("JARVIS MCP discovery cache entry has the wrong server identity")
-    if not entry.is_fresh(now=current):
-        raise ValueError(
-            f"JARVIS MCP identity for {entry.cluster} expired at "
-            f"{entry.expires_at.astimezone(UTC).isoformat()}; run jarvis-mcp-refresh"
-        )
-    if entry.schema_digest != CLIO_KIT_JARVIS_USER_CONTRACT_SHA256:
-        raise ValueError(
-            f"JARVIS MCP discovered contract does not match clio-kit {CLIO_KIT_JARVIS_MCP_VERSION}"
-        )
-    if {tool.name for tool in entry.tools} != set(_VIRTUAL_JARVIS_TOOLS):
-        raise ValueError("JARVIS MCP discovery does not contain the exact user tool set")
-    server_artifact = entry.provenance.server_artifact
-    if not jarvis_mcp_server_artifact_verified(server_artifact):
-        from clio_relay.dev_mode import dev_mode_enabled
-
-        if not dev_mode_enabled():
-            raise ValueError(
-                "JARVIS MCP discovered persistent server or JARVIS-CD lock identity is "
-                "unverified; run jarvis-mcp-refresh"
-            )
-    return remote_mcp_server_artifact_digest(server_artifact)
-
-
-def virtual_jarvis_tool_name(remote_tool: str) -> str:
-    """Return the local virtual tool name for a remote JARVIS MCP tool."""
-    if remote_tool.startswith(VIRTUAL_JARVIS_PREFIX):
-        return remote_tool
-    return f"{VIRTUAL_JARVIS_PREFIX}{remote_tool}"
-
-
-def is_virtual_jarvis_tool(tool_name: str) -> bool:
-    """Return true when a local MCP tool name represents a virtual JARVIS tool."""
-    return tool_name in _VIRTUAL_JARVIS_TOOLS
-
-
-def virtual_jarvis_remote_tool(tool_name: str) -> str:
-    """Return the remote JARVIS MCP tool name for a local virtual tool."""
-    if tool_name not in _VIRTUAL_JARVIS_TOOLS:
-        raise ValueError(f"unknown virtual JARVIS tool: {tool_name}")
-    return tool_name
-
-
-def virtual_jarvis_call_arguments(tool_name: str, arguments: JSON) -> JSON:
-    """Map virtual tool arguments to the generic relay JARVIS MCP call contract."""
-    remote_tool = virtual_jarvis_remote_tool(tool_name)
-    forwarded = dict(arguments)
-    cluster = _pop_required_str(forwarded, "cluster")
-    call: JSON = {
-        "cluster": cluster,
-        "registered_route": True,
-        "tool": remote_tool,
-        "arguments": _remote_tool_arguments(forwarded),
-        "env_from": jarvis_mcp_env_from(),
-        # JARVIS mutations and runs are not implicitly idempotent. A caller
-        # that wants retry de-duplication must opt in with an explicit key.
-        "idempotency_key": str(
-            arguments.get("idempotency_key")
-            or f"mcp:virtual:{cluster}:jarvis:{remote_tool}:{uuid4().hex}"
-        ),
-    }
-    for key in (
-        "timeout_seconds",
-        "idempotency_key",
-        "wait_for_terminal",
-        "wait_timeout_seconds",
-        "poll_seconds",
-    ):
-        if key in arguments:
-            call[key] = arguments[key]
-    return call
-
-
-def render_virtual_jarvis_agent_context() -> str:
-    """Render prompt text that explains the virtual JARVIS tools to an agent."""
-    tool_names = ", ".join(sorted(virtual_jarvis_tool_name(name) for name in _VIRTUAL_JARVIS_TOOLS))
-    return (
-        "clio-relay virtualizes the cluster-local JARVIS MCP as concrete tools. "
-        "Call jarvis_create_pipeline, jarvis_describe, jarvis_add_step, "
-        "jarvis_edit_step, jarvis_run, and jarvis_get_execution with a cluster "
-        "argument. clio-relay routes each call to the JARVIS MCP server running "
-        "on that cluster and returns a durable relay job_id. jarvis_get_execution "
-        "includes progress by default and can optionally return a bounded artifact "
-        "page without adding another agent tool. Use jarvis_describe with "
-        "target='package_search' for bounded package discovery, then describe the "
-        "selected canonical package name. "
-        "Before jarvis_run, satisfy each selected package's deployment runtime requirements. "
-        "When an unavailable requirement advertises a Spack provider resolution, call the "
-        "Spack locate tool and pass its exact immutable load_spec in jarvis_run spack_specs; "
-        "do not assume software found in a site store is already on the execution PATH. "
-        "For ordinary interactive operations, set wait_for_terminal=true so the bounded MCP "
-        "result returns in the current call; leave it false only when intentionally queuing "
-        "transport for a later relay_wait. "
-        "When wait_for_terminal=true, the same JARVIS tool waits only for its bounded remote "
-        "MCP dispatch and returns the artifact-bound mcp_result. For jarvis_run this means the "
-        "durable execution handle, not workload completion; query that lifecycle with "
-        "jarvis_get_execution. "
-        "If a JARVIS call returns queued, call relay_wait with its exact cluster, job_id, and "
-        "route_revision. A completed jarvis_get_execution call with "
-        "include_service_runtimes=true returns service_runtime_bindings either directly or "
-        "from that terminal relay_wait. Pass one item unchanged as the binding argument to "
-        "relay_bind_jarvis_runtime before opening a viewer; jarvis_run does not produce these "
-        "handoffs, and a JARVIS execution_id is never a gateway_session_id. "
-        "For later job queries, preserve cluster, job_id, and the opaque 64-character "
-        "route_revision from one receipt as a single handle; never substitute a catalog "
-        "or dataset revision. "
-        f"Available virtual JARVIS tools: {tool_names}."
-    )
-
-
-def _remote_tool_arguments(arguments: JSON) -> JSON:
-    control_keys = {
-        "timeout_seconds",
-        "idempotency_key",
-        "wait_for_terminal",
-        "wait_timeout_seconds",
-        "poll_seconds",
-    }
-    return {key: value for key, value in arguments.items() if key not in control_keys}
-
-
-def _pop_required_str(arguments: JSON, key: str) -> str:
-    value = arguments.pop(key, None)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{key} is required")
-    return value

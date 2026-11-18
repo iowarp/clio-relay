@@ -83,6 +83,7 @@ from clio_relay.models import (
 )
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
+_QUEUE_ROOT = _SOURCE_ROOT / "adapters" / "worker"
 _TESTS_ROOT = Path(__file__).parent
 _NON_OWNER_QUEUE_MODULES = frozenset(
     {
@@ -481,12 +482,12 @@ def _discover_owner_manifest(source_root: Path) -> tuple[str, ...]:
     )
 
 
-_OWNER_MANIFEST = _discover_owner_manifest(_SOURCE_ROOT)
+_OWNER_MANIFEST = _discover_owner_manifest(_QUEUE_ROOT)
 
 
 def _owner_tree(owner: str) -> ast.Module:
     return ast.parse(
-        (_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8"),
+        (_QUEUE_ROOT / f"{owner}.py").read_text(encoding="utf-8"),
         filename=f"{owner}.py",
     )
 
@@ -498,7 +499,7 @@ def _imported_owner(
 ) -> str | None:
     if module is None:
         return None
-    normalized = module.removeprefix("clio_relay.")
+    normalized = module.removeprefix("clio_relay.adapters.worker.").removeprefix("clio_relay.")
     return normalized if normalized in owners else None
 
 
@@ -514,7 +515,7 @@ def _core_import_lines(tree: ast.Module) -> list[int]:
         elif isinstance(node, ast.ImportFrom) and (
             node.module in {"core_queue", "clio_relay.adapters.worker.core_queue"}
             or (
-                node.module in {None, "clio_relay"}
+                node.module in {None, "clio_relay", "clio_relay.adapters.worker"}
                 and any(alias.name == "core_queue" for alias in node.names)
             )
         ):
@@ -664,7 +665,7 @@ def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
                 collaborator = _imported_owner(node.module)
                 if collaborator is not None and collaborator != caller:
                     dependencies.add(_OwnerDependency(caller, collaborator))
-                if node.module in {None, "clio_relay"}:
+                if node.module in {None, "clio_relay", "clio_relay.adapters.worker"}:
                     for alias in node.names:
                         if alias.name in _OWNER_MANIFEST and alias.name != caller:
                             dependencies.add(_OwnerDependency(caller, alias.name))
@@ -1063,7 +1064,7 @@ def test_split_owners_never_bare_import_cross_owner_functions() -> None:
 
 def _core_queue_module_tree() -> ast.Module:
     return ast.parse(
-        (_SOURCE_ROOT / "core_queue.py").read_text(encoding="utf-8"),
+        (_QUEUE_ROOT / "core_queue.py").read_text(encoding="utf-8"),
         filename="core_queue.py",
     )
 
@@ -1123,7 +1124,7 @@ def test_core_queue_module_aliases_each_have_a_named_production_consumer() -> No
     }
 
     production_consumers: set[str] = set()
-    for py_file in sorted(_SOURCE_ROOT.glob("*.py")) + sorted(_SOURCE_ROOT.rglob("*/*.py")):
+    for py_file in sorted(_SOURCE_ROOT.rglob("*.py")):
         if py_file.name == "core_queue.py":
             continue
         file_tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
@@ -1162,7 +1163,10 @@ def _local_names_bound_to_core_queue(tree: ast.Module) -> set[str]:
             for alias in node.names:
                 if alias.name in {"clio_relay.adapters.worker.core_queue", "core_queue"}:
                     bound.add(alias.asname or alias.name.split(".")[-1])
-        elif isinstance(node, ast.ImportFrom) and node.module == "clio_relay":
+        elif isinstance(node, ast.ImportFrom) and node.module in {
+            "clio_relay",
+            "clio_relay.adapters.worker",
+        }:
             for alias in node.names:
                 if alias.name == "core_queue":
                     bound.add(alias.asname or "core_queue")
@@ -1196,7 +1200,7 @@ def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
     assert set(_OWNER_MANIFEST) == set(_OWNER_BUDGETS)
     for owner in _OWNER_MANIFEST:
         budget = _OWNER_BUDGETS[owner]
-        line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
+        line_count = len((_QUEUE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
 
 
@@ -1239,7 +1243,7 @@ def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None
 
     # 3. Every module actually on disk is exactly either a ranked owner or an
     #    exempted non-owner -- no third, silently-ignored category.
-    all_queue_modules = frozenset(path.stem for path in _SOURCE_ROOT.glob("queue_*.py"))
+    all_queue_modules = frozenset(path.stem for path in _QUEUE_ROOT.glob("queue_*.py"))
     assert all_queue_modules == set(_OWNER_MANIFEST) | _NON_OWNER_QUEUE_MODULES
     assert set(_OWNER_MANIFEST) & _NON_OWNER_QUEUE_MODULES == set()
 

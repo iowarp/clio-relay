@@ -8,10 +8,8 @@ from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
 from clio_relay.adapters.worker import queue_artifact_lineage, queue_idempotency, queue_jobs
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import (
     OWNER_SESSION_ID_HEADER,
@@ -575,55 +573,3 @@ def test_http_submission_and_lineage_queries_share_the_content_pin(tmp_path: Pat
     assert used_by.status_code == 200
     assert used.json()["used_artifacts"][0]["consumer_job_id"] == consumer_id
     assert used_by.json()["used_by"] == used.json()["used_artifacts"]
-
-
-def test_cli_submits_and_queries_content_pinned_lineage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    _producer, artifact = _producer_artifact(queue)
-    assert artifact.sha256 is not None
-    pipeline = tmp_path / "pipeline.yaml"
-    pipeline.write_text("name: lineage-cli\npkgs: []\n", encoding="utf-8")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-
-    def require_local_cluster(_cluster: str) -> object:
-        return object()
-
-    def execute_locally(_definition: object) -> bool:
-        return False
-
-    monkeypatch.setattr("clio_relay.adapters.worker.cli._require_cluster", require_local_cluster)
-    monkeypatch.setattr(
-        "clio_relay.remote_cli.should_execute_on_cluster",
-        execute_locally,
-    )
-
-    submitted = CliRunner().invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "test-cluster",
-            "--jarvis-yaml",
-            str(pipeline),
-            "--used-artifact",
-            f"{artifact.artifact_id}={artifact.sha256}",
-        ],
-    )
-    assert submitted.exit_code == 0
-    consumer_id = submitted.output.strip()
-    assert queue.get_job(consumer_id).used_artifact_refs == [
-        ArtifactUse(artifact_id=artifact.artifact_id, sha256=artifact.sha256)
-    ]
-
-    forward = CliRunner().invoke(app, ["job", "used-artifacts", consumer_id])
-    reverse = CliRunner().invoke(app, ["job", "used-by", artifact.artifact_id])
-    assert forward.exit_code == reverse.exit_code == 0
-    forward_payload = cast(dict[str, Any], json.loads(forward.output))
-    reverse_payload = cast(dict[str, Any], json.loads(reverse.output))
-    assert forward_payload["used_artifacts"] == reverse_payload["used_by"]
-    assert forward_payload["used_artifacts"][0]["consumer_job_id"] == consumer_id
