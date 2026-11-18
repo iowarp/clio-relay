@@ -943,6 +943,85 @@ W12, gact-tui host semantics and removals: done (draft PR iowarp/gact-tui#1320).
 
 ## W13. Guardrails
 
+Branch `jaimecernuda-relay-rework-w13`. Rows: RL24 to RL26, RL42 (relay side), the guard half of RL45, LQ16 to LQ21, and the run sheets for LQ-L10 and LQ-L13. Page: [docs/guarded-sites.md](../guarded-sites.md).
+
+Files: `src/clio_relay/guard/` (`policy.py`, `reviews.py`, `execlist.py`, `warm.py`, `config.py`), `src/clio_relay/jarvis_site.py` and `tests/guard/`. The guard is installed through the `clio_relay.hooks` entry point `guard`, so W1's `guard_unavailable` stand-in no longer answers once it is installed.
+
+### Decisions
+
+- **A guarded site runs only reviewed JARVIS packages (RL24).** `check_run` refuses an `executable` with `policy_refused`, `next_step: package_review` and the way forward: build an archive with `python -m clio_relay.jarvis_site archive <repo dir> <repo.package> --stage`, then call `run` with `package: {name, version, sha256, parameters}`. A package job carrying `environment` or `launcher` is also refused, because its settings travel as package parameters. An open site is never checked.
+- **A review is pinned by the archive's SHA-256, per site.** An unreviewed hash asks once (`kind: approve`). The binding is `{kind: package_review, package, version, package_hash, source, files}`. The question shows the package and version, the hash, the git source (tag, commit, path), the archive's path on the relay host, and each file with its own hash and size. A yes is harvested from the answered asks into `<state>/guard/reviews/<site>/`. A changed byte is a new hash and a new review. There is no withdrawal command yet; deleting the review file withdraws it.
+- **The archive is byte-stable and carries what the repo reads beside it.** It is a gzip tar with mtime 0 and fixed modes, holding `<repo>/<repo>/<package>/…`, the repo's `__init__.py` files, `_contract/` and the repository's `schemas/` (clio-jarvis's `_contract/spec.py:42` reads `<repo dir>/../schemas`; W10's job 27773 failed without it). f54f171.
+- **`prepare` lowers a reviewed package to a `/bin/bash` runner job.** The archive is an input named `.relay-package/<sha256>.tar.gz`. The runner checks the name is `<repo>.<package>` (exit 64), the archive's hash against the reviewed one (65), the `<repo>/<repo>` layout (66) and that `jarvis` is on PATH (69), the same codes as W10's tapis launcher. Then, with `JARVIS_ROOT=<job dir>/.relay-jarvis`, it runs `jarvis init`, `repo add`, `hostfile set` (from Slurm or PBS), `ppl create relay_<digest12>` and `ppl append <name> pkg k=v…`. The site's own `~/.ppi-jarvis` is never read or changed. An adapter with `runs_packages` (Tapis) gets the package spec unchanged and runs it itself.
+- **A service package holds until stopped (RL45, W9's finding).** `prepare(…, service=True)` (W1's `_start_service`) picks the service tail: `jarvis ppl start`, then a `sleep 60 & wait` loop; a `TERM`, `INT` or `HUP` trap, or a failed wait (a `pkill -9 -P` of the sleep), runs `jarvis ppl stop`. A failed `ppl start` runs `ppl stop` and exits with start's code. The sleep pid is kept in a variable, so `set -u` never meets a bare `$!` (W10 5681806). An application package keeps `exec jarvis ppl run`. For `runs_packages` adapters, `prepare` returns a copy with `package.service = True` (W1's `PackageRef.service`), so W10's launcher picks its `package-service` mode with the same tail. beefba3, 790824e, 02e1481.
+- **`exec` on a guarded site runs only a read-only argument list.** `argv[0]`, named bare, must be on the list: `cat df du file find grep head hostname id jarvis lfs ls md5sum module nproc pbsnodes pwd qstat quota readlink realpath sacct sacctmgr scontrol sha256sum sinfo sprio squeue srun sshare stat tail uname wc whoami`, plus the site's `read_only` in `guard.yaml`. Some are checked by argument: `find` without `-exec`, `-delete` or `-fprint*`; `file` without `--compile`; `scontrol show`; `sacctmgr show|list`; `lfs quota|df|getstripe`; `pbsnodes` without the options that change a node; module queries; JARVIS reads (`ppl list|status|print|path`, `repo list`, `pkg readme|help|path`, `execution get|list|progress|artifacts`). `srun` runs only as `srun --jobid=<a warm allocation relay holds on this site> --overlap <a read-only command>`. A path such as `/tmp/x/ls` is refused, and since the list is matched against argv with no shell, a shell, a redirect or a pipe never runs.
+- **The spend gate prices every job and asks unless the site's `spend.ask` lets it go (RL25).** `price` builds a `Charge` from the spec (queue, account, nodes, walltime, node-hours), then asks the routed adapter's own `price(spec)` when it has one, which is `SkyAdapter` (USD) and `SshAdapter`. An unknown walltime gives `walltime_s`, `node_hours` and `amount` null, and an unknown cost always asks unless `spend.ask` is `never`. Relay never sets a walltime. `hooks.Charge` stays without a currency field: `unit` already says `USD` or `node-hours`.
+- **A warm allocation is a holder job (RL26).** `run` with `executable: clio-relay-warm` and no arguments goes through the spend gate like any job and is submitted as a `/bin/sh` holder. Every 30 s it takes the latest use from a running step (`squeue -s`), the end of the latest finished step (`sacct`, so a short `srun` between two looks counts) and the job directory's `.relay-warm-active` marker. Once nothing has used it for `warm_idle_s` (600 by default, at least 60) and no step runs, it exits and the scheduler frees the nodes. It never stops a running step, and a scheduler that does not answer counts as busy. Without Slurm only the marker counts. The finished-step end time was found missing live (Slurm 284) and added in f1ccc62.
+- **RL42 is `add_clio_jarvis(adapter, url=, tag=, commit=, base=, jarvis=)`.** Through the adapter's `exec`, it clones the tag shallowly into `<base>/<tag>` (default `~/.clio-relay/clio-jarvis`), checks the tag's commit when one is given (exit 65 otherwise), and runs `jarvis repo add <dir>/clio_jarvis` unless `jarvis repo list` already shows it. It returns `{tag, commit, repo, added}`. W1 calls it from the bootstrap after W8's move; W13 edits no bootstrap file.
+- **Settings per site** live in `<config>/guard.yaml` under `sites.<id>`: `jarvis` (the command on the site), `read_only` and `warm_idle_s`. The file is read on every check.
+
+### Facts
+
+- **Slurm cancel on Ares** (Slurm 21.08.5, `proctrack/cgroup`, KillWait 30 s; job 27814): a plain `scancel` sends `TERM` to the batch shell only. A child in another process group got nothing, then `SIGKILL` at KillWait. So on the `ssh` path the runner's trap is reached only through W7's process-group forwarding; it cannot `exec` into place, because psij's `single_launch.sh` runs the command as `"$@"`.
+- **W7's forwarding had two gaps, found with RL45 (R10, routed to W7).** (1) It wrapped only the first line of the launch, so a multi-line argument (the runner, or any multi-line `bash -c`) got the wrapper inside its quotes: no forwarding, and the script's first line ran as a background no-op (job 27812: no `signalled` marker, no `.ec`, no `ppl stop`). (2) After passing `TERM` on, the batch shell exited as soon as `single_launch.sh` died, and Slurm killed the runner mid-stop (job 27820, fix 1 only: `signalled` TERM, no stop record, the supervisor pid file left). The group drain is in W7's f8ff1a4; the multi-line fix is routed to W7.
+- **NFS on Ares** (`/mnt/common`, NFSv3): a file written on a compute node can stay invisible to `[ -f ]` on the login node for up to 120 s; the drivers list the directory first.
+- **clio-jarvis v0.1.2** (W5, 8f69e37, local on Ares, not pushed): pvserver has no `max_lifetime` (absent means until stopped), `hold` defaults to false, `ppl start` returns once pvserver is ready, and its records land in `{shared_dir}/pvserver`.
+
+### Evidence
+
+All on Ares: relay in `~/clio-relay-rework/clio-relay-w13` with its own venv, W2's `fx-slurm` (Slurm, ports 47100 to 47107) for LQ16 to LQ21 and RL42, and the real Ares Slurm for RL45. The client is `tests/guard/guard_live.py`, a plain MCP client over stdio that drives `clio-relay-next mcp` and answers asks only through W6's page (GET then the CSRF-bound POST). Sites: `fxg` (guarded, no spend setting, so unknown cost asks), `fxk` (guarded, `spend.ask: always`, `defaults.duration` 5 min, account `fixture`) and `ares13` (guarded, `spend.ask: never`, queue `debug`). The proof ran on integration code (1a8c20b and later) with no scratch patch; the scratch patch the coordinator allowed was never applied. The test package is `w13demo.hello` in a local git repo with tags v0.1.0 (`5b2beb81…`) and v0.1.1 (`da0a07af…`).
+
+| Row | State | Handles | What was read |
+| --- | --- | --- | --- |
+| LQ16 | Passed | `run` `/bin/sh` on `fxg` | `policy_refused`, no operation, no ask, `next_step: package_review`, and the way forward (build the archive, call `run` with `package`). `squeue` empty |
+| LQ17 | Passed | op_e66e66821a1acb03db338269, Slurm 283; op_5e2b56723498563f5e6087ed | The review question showed `w13demo.hello 0.1.0`, the hash `5b2beb81…`, the source (tag v0.1.0, commit c004b4e, path w13demo), the archive path and three files with their hashes. After the yes and the spend yes, 283 completed with jarvis's `[START]`/`[STOP]` lines and `wrote hello.txt`. A second run of the same hash (op_bb33198445283954505eb516) asked only the spend question. The edited package (v0.1.1, `da0a07af…`) asked for a new review |
+| LQ18 | Passed | `exec` on `fxg` | `rm …` and `sh -c …` refused with `policy_refused`, naming the program and listing the read-only programs; `squeue` returned its listing |
+| LQ19 | Passed (page half by W6; R8 open) | op_a394bab1ae615b712863f109 on `fxk` | After the review, the spend question: "It may use up to 0.0833 node-hours (1 node(s) for 5 min)", with queue `debug`, account `fixture`, 1 node and 300 s in the charge. A no gave `cancelled`, reason `declined`, `native_id` null and an empty `squeue`. The unknown-cost question (op_bb33…, `fxg`): "sets no walltime, so its duration and cost are unknown"; a no submitted nothing |
+| LQ20 | Passed | op_5e2b56723498563f5e6087ed | With nobody answering, `run(resume=)` returned `needs_approval` with the same ask, the operation stayed `awaiting_input`, and `squeue` showed no job |
+| LQ21 | Passed | op_bcc2a45ccc21c02f34a2aeba, Slurm 305 | The warm request asked the spend question; after the yes, 305 ran. `exec srun --jobid=305 --overlap hostname` returned `fx-slurm`, and `squeue` run the same way listed step 305.1 inside it. `srun … rm …` and `srun --jobid=1 …` were refused. The last step, 305.2, ended at 15:05:45. The holder logged "idle for 617 s; released at 2026-11-18T15:16:02Z", and `sacct` showed 305 COMPLETED 0:0, elapsed 00:14:34. The first try (Slurm 284) found the gap fixed in f1ccc62 |
+| RL42 | Passed (local tag; O1 open) | `add_clio_jarvis` on `fxg`, url a bare clone of W5's local repo, tag v0.1.0 | First call `{commit: 2d12dbb…, repo: /home/relay/.clio-relay/clio-jarvis/v0.1.0/clio_jarvis, added: true}`; the second `added: false`; a wrong commit `submit_failed` exit 65 "tag v0.1.0 is 2d12dbb…, not 0000…". `jarvis repo list` showed `clio_jarvis` once. Against `iowarp/clio-jarvis` it waits on O1 |
+| RL45 (guard half) | Passed, with W7's R10 | op_a0a368ea466173130a7d917a, Slurm 27819 on ares-comp-03 | clio-jarvis v0.1.2 `clio_jarvis.pvserver`, archive `7095bef8…` (16 files with `schemas/`). Unreviewed `prepare` refused `policy_refused`; reviewed, it lowered to `/bin/bash`, mode `service`. Ready with `max_lifetime: null`; the port was open from the node through each poll. (The earlier 27812 held for more than 10 minutes.) An adapter cancel gave `signalled` TERM, stdout `Stopping pipeline … [STOP] BEGIN/END`, `pvserver-stop.json` reason `signal`, the supervisor pid file gone, `.ec` 143, final `cancelled`. This run had W7's two fixes as a scratch patch; it is to be repeated on integration once R10 lands |
+
+Suite on Ares at 02e1481: ruff, format and pyright are clean on the W13 paths. `tests/guard` passes 80 of 80. Against base 1a8c20b, the only new failures in the full suite are W1's two guard-absent tests (R9) and two `test_wheel_record_closure.py` tests that pass alone and together with `tests/guard`.
+
+### Run sheets for the person rows
+
+Record for each: the date, relay's commit, the site entry as used, the review and spend screenshots, the handle (`native_id`), the states seen, and the exit code. Write the result in W16's summary.
+
+**LQ-L10. Xcompact3d into the tab, on Polaris (guarded).**
+
+Needs: an ALCF account with a Polaris allocation, LQ-L2's Globus sign-in, the clio-jarvis release on Polaris (RL42; the real remote waits on O1), a `jarvis` on Polaris with Xcompact3d built, and the ParaView tab (W14, W15).
+
+1. Add the catalog site `polaris` (guarded, `spend.ask: always`). Set `defaults.account` to the project. In `guard.yaml`, set `sites.polaris.jarvis` to the jarvis on Polaris.
+2. From a clio-jarvis checkout at the release tag, run `python -m clio_relay.jarvis_site archive <checkout>/clio_jarvis clio_jarvis.xcompact3d --stage`. Record the `sha256` and the file count.
+3. Ask the agent to run Xcompact3d on Polaris and show the field. Check that it calls `run` with `package: {name: clio_jarvis.xcompact3d, version, sha256, parameters}`, not an executable.
+4. Review question: check the hash, the tag, the commit and the file list against step 2, then approve it.
+5. Spend question: check queue `debug`, the account, the nodes, walltime 1 h (the catalog's `defaults.duration`) and the node-hours, then approve it.
+6. Watch queued, running. Open the tab as the run writes. Record the time from a step's file being written (its mtime, through `files`) to the tab showing it.
+7. When it completes, read `stdout` for jarvis's `[START]`/`[STOP]` lines. Run it again with one parameter changed: no review question, only the spend question. Edit one file in the package, rebuild: a new hash and a new review question.
+
+**LQ-L13. Offline pvserver on Polaris (guarded).**
+
+Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (clio-jarvis v0.1.2 or later) with ParaView on Polaris, W9's `serve` (its module is not yet in integration) and the tab.
+
+1. Build and stage `clio_jarvis.pvserver` as in LQ-L10 step 2. Record the hash, and check that `schemas/` is listed.
+2. Ask the agent to open `<dataset path on Polaris>` in ParaView. Check that it uses `serve` with the package; on a guarded site a free-form `pvserver` is refused.
+3. Approve the review question, then the spend question (debug, 1 node, 1 h).
+4. The service holds: no `max_lifetime`, until it is stopped. The tab connects through the port relay returns and shows the dataset.
+5. Check that the dataset is not copied off the site: relay's content store and any `files` transfers in relay's log hold no part of it.
+6. Stop the service. Record that the port closes, `pvserver-stop.json` exists with reason `signal`, and PBS shows the job gone. On PBS, check that `qdel` reaches the runner: the stop record is the proof.
+
+### Requests and open items
+
+- R6, R7 (W1): `prepare(…, service=)` and `PackageRef.service`. Done at dae2774.
+- R8 (W6): the approval page's rows when the walltime and the cost are unknown (the ask's message carries them). Open.
+- R9 (W1): `tests/relay_next/test_server.py::test_refusals_are_typed` and `test_service.py::test_guarded_site_refuses_without_a_guard` expect `guard_unavailable`, but with the guard installed it answers `policy_refused`. Force the stand-in in those tests. Open.
+- R10 (W7): the multi-line launch in `forward_signals`. The group drain is in f8ff1a4. Open.
+- O1: `iowarp/clio-jarvis` on GitHub, for RL42 against the real remote.
+- W9's `clio_relay.serve` module, for RL45 through `serve` and LQ-L13.
+- A review withdrawal command (today: delete the review file).
+- The full suite on Ares hung at exit in pytest's temp cleanup after writing its report (job 27790).
+
 ## W14. Relay's CLIO plugin and the Compute tab
 
 ## W15. ParaView follows a growing source (RL44, LQ-L12)
