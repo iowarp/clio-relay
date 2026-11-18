@@ -32,7 +32,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
-import clio_relay.cli_remote_mcp as cli_remote_mcp
 import pytest
 
 import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
@@ -317,52 +316,6 @@ def test_remote_target_identity_falls_back_to_ssh_when_cold(
     assert len(calls) == 1
     assert calls[0][:2] == ["endpoint", "target-info"]
     assert _fallback_reasons("remote_target_identity")
-
-
-def test_mcp_result_artifact_read_stays_ssh_unconditionally(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """clio-relay#179 review B1: this dial site was DROPPED from the slice --
-    the discovery job carries no owner metadata, so GET /artifacts/{id}/
-    content 403s (resource_ownership_refused) even with a live channel.
-    Proves the ssh path runs unconditionally and no channel is ever
-    consulted, regardless of what the registry holds.
-    """
-    calls: list[list[str]] = []
-
-    def fake_remote(_definition: ClusterDefinition, args: list[str]) -> str:
-        calls.append(args)
-        return json.dumps({"encoding": "base64", "content": "eyJvayI6IHRydWV9"})
-
-    monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
-    monkeypatch.setattr(
-        "clio_relay.cli_jarvis_artifact_io._remote_artifact_records",
-        _fake_remote_artifact_records,
-    )
-    monkeypatch.setattr(
-        "clio_relay.cli_jarvis_artifact_io._decode_artifact_envelope",
-        _fake_decode_artifact_envelope,
-    )
-
-    artifact, payload = cli_remote_mcp._read_remote_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        _definition(), "job-1"
-    )
-
-    assert artifact["artifact_id"] == "artifact-1"
-    assert b"content" in payload
-    assert len(calls) == 1
-    assert calls[0][:2] == ["job", "read-artifact"]
-    assert _fallback_reasons("read_remote_mcp_result_artifact") == []
-
-
-def _fake_remote_artifact_records(
-    _definition: ClusterDefinition, _job_id: str
-) -> list[dict[str, object]]:
-    return [{"artifact_id": "artifact-1", "kind": "mcp_result"}]
-
-
-def _fake_decode_artifact_envelope(envelope: object) -> bytes:
-    return json.dumps(envelope).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ from pathlib import Path
 
 path, action, *arguments = sys.argv[1:]
 if os.environ.get("BOOTSTRAP_STAGED_GENERATION") and action != "repair-legacy-cursors":
-    from clio_relay import bootstrap_reconcile as module
+    from clio_relay.adapters.worker import bootstrap_reconcile as module
 else:
     candidate_root = os.environ["BOOTSTRAP_CANDIDATE_PYTHON_ROOT"]
     if not sys.path or sys.path[0] != candidate_root:
@@ -100,8 +100,8 @@ else:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-from clio_relay import bootstrap_jarvis_staging, bootstrap_recovery
-from clio_relay import bootstrap_full_activation_staging
+from clio_relay.adapters.worker import bootstrap_jarvis_staging, bootstrap_recovery
+from clio_relay.adapters.worker import bootstrap_full_activation_staging
 journal_path = Path(os.environ["BOOTSTRAP_TRANSACTION_JOURNAL"])
 if action == "journal-create":
     service_value = os.environ["BOOTSTRAP_SERVICE_ACTIVE_BEFORE"]

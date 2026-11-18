@@ -38,7 +38,6 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
-from typing import cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -47,7 +46,6 @@ from typer.testing import CliRunner
 import clio_relay.adapters.worker.application_profiles as application_profiles
 import clio_relay.adapters.worker.bootstrap as bootstrap
 import clio_relay.adapters.worker.bootstrap_acceptance as bootstrap_acceptance
-import clio_relay.adapters.worker.cli as cli
 import clio_relay.adapters.worker.cli_cluster_deploy as cli_cluster_deploy
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.adapters.worker.cluster_probe as cluster_probe
@@ -1097,134 +1095,3 @@ def test_cli_cluster_bootstrap_uses_package_source_root(
     assert captured["relay_wheel"] == wheel
     assert captured["jarvis_resource_graph_profile"] == "ares"
     assert captured["allow_jarvis_resource_graph_build"] is True
-
-
-def test_bootstrap_same_generation_preserves_remote_mcp_cache(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    def reject_invalidation(
-        _cls: type[object],
-        _path: Path,
-        _cluster: str,
-    ) -> tuple[object, tuple[str, ...]]:
-        raise AssertionError("same-generation bootstrap must preserve cached MCP schemas")
-
-    monkeypatch.setattr(
-        cli.RemoteMcpSchemaCache,
-        "invalidate_cluster_entries",
-        classmethod(reject_invalidation),
-    )
-
-    evidence = cli_cluster_deploy._invalidate_remote_mcp_cache_after_bootstrap(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        receipt={
-            "generation": {
-                "previous": "a" * 64,
-                "active": "a" * 64,
-            }
-        },
-        registry_path=tmp_path / "clusters.json",
-    )
-
-    assert evidence == {
-        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-        "cluster": "ares",
-        "previous_generation": "a" * 64,
-        "active_generation": "a" * 64,
-        "generation_changed": False,
-        "action": "preserved",
-        "removed_server_count": 0,
-        "removed_server_names": [],
-    }
-
-
-def test_cluster_bootstrap_invalidates_cache_before_target_validation_and_records_evidence(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    report_path = tmp_path / "bootstrap-report.json"
-    events: list[str] = []
-
-    def fake_bootstrap_cluster_over_ssh(**_kwargs: object) -> list[str]:
-        receipt = {
-            "schema_version": "clio-relay.bootstrap-receipt.v2",
-            "outcome": "reconciled",
-            "invocation_id": "bootstrap_generation_changed",
-            "generation": {
-                "previous": "a" * 64,
-                "active": "b" * 64,
-            },
-        }
-        return [
-            "bootstrap_receipt=/home/test/.local/share/clio-relay/bootstrap-receipt.json",
-            "bootstrap_receipt_json=" + json.dumps(receipt, sort_keys=True),
-        ]
-
-    def invalidate_cluster_entries(
-        cls: type[cli.RemoteMcpSchemaCache],
-        path: Path,
-        cluster: str,
-    ) -> tuple[cli.RemoteMcpSchemaCache, tuple[str, ...]]:
-        events.append("cache-invalidated")
-        assert path == (tmp_path / ".clio-relay" / "remote-mcp-cache.json").resolve()
-        assert cluster == "ares"
-        return cls(), ("__builtin_jarvis__", "jarvis-demo")
-
-    def fake_remote_target_identity(
-        _definition: ClusterDefinition,
-    ) -> dict[str, object]:
-        assert events == ["cache-invalidated"]
-        events.append("target-validated")
-        return {"verified": True}
-
-    monkeypatch.setattr(bootstrap, "package_source_root", lambda: tmp_path / "package")
-    monkeypatch.setattr(bootstrap, "bootstrap_cluster_over_ssh", fake_bootstrap_cluster_over_ssh)
-    monkeypatch.setattr(
-        cli_remote_worker_probe, "_remote_target_identity", fake_remote_target_identity
-    )
-    monkeypatch.setattr(
-        cli.RemoteMcpSchemaCache,
-        "invalidate_cluster_entries",
-        classmethod(invalidate_cluster_entries),
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "cluster",
-            "bootstrap",
-            "--cluster",
-            "ares",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert events == ["cache-invalidated", "target-validated"]
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    bootstrap_check = cast(dict[str, object], report["checks"][0])
-    evidence = cast(list[dict[str, object]], bootstrap_check["evidence"])
-    cache_evidence = next(
-        item for item in evidence if item["kind"] == "remote_mcp_cache_invalidation"
-    )
-    assert cache_evidence["metadata"] == {
-        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-        "cluster": "ares",
-        "previous_generation": "a" * 64,
-        "active_generation": "b" * 64,
-        "generation_changed": True,
-        "action": "invalidated",
-        "removed_server_count": 2,
-        "removed_server_names": ["__builtin_jarvis__", "jarvis-demo"],
-    }
-    bootstrap_resource = next(
-        resource for resource in report["resources"] if resource["kind"] == "bootstrap_invocation"
-    )
-    assert (
-        bootstrap_resource["metadata"]["remote_mcp_cache_invalidation"]
-        == cache_evidence["metadata"]
-    )

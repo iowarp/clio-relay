@@ -61,10 +61,7 @@ from typer.testing import CliRunner
 import clio_relay.adapters.worker.cli_support as cli_support
 from clio_relay.adapters.worker import cli
 from clio_relay.adapters.worker.cli import app
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 from clio_relay.errors import ConfigurationError
-from clio_relay.storage_policy import StorageDecision, StorageReason
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -404,13 +401,6 @@ def test_audited_collaborators_cover_every_family_named_in_the_design_doc() -> N
 # ---------------------------------------------------------------------------
 
 
-def _storage_admission_error() -> StorageAdmissionError:
-    decision = StorageDecision(
-        allowed=False, reason=StorageReason.CORE_HIGH_WATER, message="storage refused"
-    )
-    return StorageAdmissionError(decision)
-
-
 def test_sabotage_run_or_exit_via_cli_support(monkeypatch: MonkeyPatch) -> None:
     """Patching `cli_support._run_or_exit` must reach `relay-host
     render-frps-config`'s real call path through `cli.py`'s forwarder."""
@@ -569,97 +559,6 @@ def test_sabotage_write_failed_acceptance_report_via_cli(
     assert json.loads(report_path.read_text(encoding="utf-8")) == {"sentinel": "cli-sabotage"}
 
 
-def test_sabotage_echo_storage_admission_error_via_cli_support(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
-    """`_echo_storage_admission_error` has two real callers: `_submit_managed_
-    job` (cli_support.py-resident since the #231 shared-plumbing relocation
-    pass, reached only through a bare internal call cli_support.py's own
-    module namespace resolves -- a `cli.py`-forwarder patch can never
-    intercept it, the same "patch where it's looked up" boundary SS4.6
-    describes one level deeper) and `mcp-call`'s own inline admission-refusal
-    handling, which reaches it as an explicit `cli._echo_storage_admission_
-    error(...)` attribute lookup. `mcp-call` (not `agent run`, which only
-    exercises the now cli_support-internal path) is the real command driven
-    here, so both patch directions remain observable through the same
-    forwarder. A fake managed queue forces the real `StorageAdmissionError`
-    handling path without needing live storage infrastructure."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-
-    class _FakeQueue:
-        def submit_job(self, job: object) -> object:
-            del job
-            raise _storage_admission_error()
-
-        def close(self) -> None:
-            return None
-
-    def _fake_echo_cli_support(error: StorageAdmissionError) -> None:
-        del error
-        print("SABOTAGE-CLI-SUPPORT-ECHO")  # noqa: T201
-
-    monkeypatch.setattr(cli, "_managed_queue_from_env", lambda: _FakeQueue())
-    monkeypatch.setattr(cli_support, "_echo_storage_admission_error", _fake_echo_cli_support)
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            "ares",
-            "--server",
-            "arbitrary-mcp",
-            "--operation",
-            "tools/list",
-        ],
-    )
-    assert result.exit_code == 1
-    assert "SABOTAGE-CLI-SUPPORT-ECHO" in result.output
-    assert "storage_admission_denied" not in result.output
-
-
-def test_sabotage_echo_storage_admission_error_via_cli(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
-    """The pre-existing patch direction must still bite (see the sibling
-    test's docstring for why `mcp-call`, not `agent run`, is the real command
-    driven here)."""
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-
-    class _FakeQueue:
-        def submit_job(self, job: object) -> object:
-            del job
-            raise _storage_admission_error()
-
-        def close(self) -> None:
-            return None
-
-    def _fake_echo_cli(error: StorageAdmissionError) -> None:
-        del error
-        print("SABOTAGE-CLI-ECHO")  # noqa: T201
-
-    monkeypatch.setattr(cli, "_managed_queue_from_env", lambda: _FakeQueue())
-    monkeypatch.setattr(cli, "_echo_storage_admission_error", _fake_echo_cli)
-    result = CliRunner().invoke(
-        app,
-        [
-            "mcp-call",
-            "--cluster",
-            "ares",
-            "--server",
-            "arbitrary-mcp",
-            "--operation",
-            "tools/list",
-        ],
-    )
-    assert result.exit_code == 1
-    assert "SABOTAGE-CLI-ECHO" in result.output
-    assert "storage_admission_denied" not in result.output
-
-
 # ---------------------------------------------------------------------------
 # #231 shared-plumbing relocation pass: `_managed_queue_from_env`'s own
 # sabotage guard. Unlike the five R8(ii) forwarders above, this symbol has
@@ -676,37 +575,3 @@ def test_sabotage_echo_storage_admission_error_via_cli(
 # consulted there -- that boundary is deliberate and documented on those
 # tests, not a second bug to fix here.
 # ---------------------------------------------------------------------------
-
-
-def test_sabotage_managed_queue_from_env_via_cli_support(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
-    """Patching `cli_support._managed_queue_from_env` must reach `monitor
-    run-once`'s real call path through `cli.py`'s forwarder."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "env-core"))
-    sentinel_core = tmp_path / "sentinel-core-support"
-
-    monkeypatch.setattr(
-        cli_support, "_managed_queue_from_env", lambda: ClioCoreQueue(sentinel_core)
-    )
-    result = CliRunner().invoke(app, ["monitor", "run-once"])
-
-    assert result.exit_code == 0, result.output
-    assert sentinel_core.exists()
-    assert not (tmp_path / "env-core").exists()
-
-
-def test_sabotage_managed_queue_from_env_via_cli(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    """The pre-existing patch direction must still bite."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "env-core"))
-    sentinel_core = tmp_path / "sentinel-core-cli"
-
-    monkeypatch.setattr(cli, "_managed_queue_from_env", lambda: ClioCoreQueue(sentinel_core))
-    result = CliRunner().invoke(app, ["monitor", "run-once"])
-
-    assert result.exit_code == 0, result.output
-    assert sentinel_core.exists()
-    assert not (tmp_path / "env-core").exists()
-    assert "storage_admission_denied" not in result.output

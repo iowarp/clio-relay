@@ -54,10 +54,10 @@ from clio_relay.adapters.worker import (
     queue_tasks,
     queue_transitions,
 )
+from clio_relay.adapters.worker.browser_attachment_record import BrowserAttachmentRecord
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.queue_jarvis_inputs import QueueJarvisInputsMixin
 from clio_relay.adapters.worker.queue_layout import QueueLayout
-from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,

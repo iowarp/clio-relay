@@ -29,11 +29,16 @@ _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY = (
     b"except _clio_relay_metadata.PackageNotFoundError:\n"
     b"    pass\n"
 )
+_BOOTSTRAP_CANDIDATE_SUBPACKAGE_INIT = (
+    b'"""Candidate overlay of a relay subpackage."""\n\n'
+    b"from pkgutil import extend_path\n\n"
+    b"__path__ = extend_path(__path__, __name__)\n"
+)
 _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
-    "bootstrap_full_activation_staging.py",
-    "bootstrap_jarvis_staging.py",
-    "bootstrap_provider_build_info.py",
-    "bootstrap_reconcile.py",
+    "adapters/worker/bootstrap_full_activation_staging.py",
+    "adapters/worker/bootstrap_jarvis_staging.py",
+    "adapters/worker/bootstrap_provider_build_info.py",
+    "adapters/worker/bootstrap_reconcile.py",
     # integrate-w2 merge-train fix (post-#231 split/bootstrap-reconcile-w2 +
     # split/process-containment-w2): bootstrap_reconcile.py and
     # process_containment.py stopped being self-contained single files and
@@ -51,24 +56,24 @@ _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
     # find it and exits SystemExit(125) before the child-readiness handshake.
     # Both owner-module families must travel with the candidate so the
     # facade's own directory is always the one that wins import resolution.
-    "bootstrap_reconcile_activation_paths.py",
-    "bootstrap_reconcile_builtin_repos.py",
-    "bootstrap_reconcile_constants.py",
-    "bootstrap_reconcile_execution_identity.py",
-    "bootstrap_reconcile_generation_staging.py",
-    "bootstrap_reconcile_inspection.py",
-    "bootstrap_reconcile_jarvis_wrapper_binding.py",
-    "bootstrap_reconcile_locks.py",
-    "bootstrap_reconcile_models.py",
-    "bootstrap_reconcile_planning.py",
-    "bootstrap_reconcile_planning_support.py",
-    "bootstrap_reconcile_primitives.py",
-    "bootstrap_reconcile_readiness.py",
-    "bootstrap_reconcile_receipt.py",
-    "bootstrap_reconcile_replacement_provider.py",
-    "bootstrap_reconcile_repository.py",
-    "bootstrap_reconcile_transaction.py",
-    "bootstrap_recovery.py",
+    "adapters/worker/bootstrap_reconcile_activation_paths.py",
+    "adapters/worker/bootstrap_reconcile_builtin_repos.py",
+    "adapters/worker/bootstrap_reconcile_constants.py",
+    "adapters/worker/bootstrap_reconcile_execution_identity.py",
+    "adapters/worker/bootstrap_reconcile_generation_staging.py",
+    "adapters/worker/bootstrap_reconcile_inspection.py",
+    "adapters/worker/bootstrap_reconcile_jarvis_wrapper_binding.py",
+    "adapters/worker/bootstrap_reconcile_locks.py",
+    "adapters/worker/bootstrap_reconcile_models.py",
+    "adapters/worker/bootstrap_reconcile_planning.py",
+    "adapters/worker/bootstrap_reconcile_planning_support.py",
+    "adapters/worker/bootstrap_reconcile_primitives.py",
+    "adapters/worker/bootstrap_reconcile_readiness.py",
+    "adapters/worker/bootstrap_reconcile_receipt.py",
+    "adapters/worker/bootstrap_reconcile_replacement_provider.py",
+    "adapters/worker/bootstrap_reconcile_repository.py",
+    "adapters/worker/bootstrap_reconcile_transaction.py",
+    "adapters/worker/bootstrap_recovery.py",
     "bounded_process.py",
     "errors.py",
     "process_containment.py",
@@ -86,16 +91,25 @@ _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
     "process_containment_termination.py",
     "process_containment_types.py",
     "process_containment_windows.py",
-    "safe_archive.py",
+    "adapters/worker/safe_archive.py",
 )
 
 
 def _bootstrap_candidate_package_sources() -> dict[str, bytes]:
-    """Return the exact sources overlaid during candidate reconciliation."""
-    package_root = Path(__file__).parent
+    """Return the exact sources overlaid during candidate reconciliation.
+
+    Keys are paths relative to the candidate ``clio_relay`` package. The
+    worker's own modules live under ``adapters/worker/``, so the two package
+    ``__init__`` files on that path travel too, each extended the same way as
+    the top-level one so anything not overlaid still resolves from the
+    installed ``clio_relay``.
+    """
+    package_root = Path(__file__).parent.parent.parent
     sources = {
         "__init__.py": (package_root / "__init__.py").read_bytes()
-        + _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY
+        + _BOOTSTRAP_CANDIDATE_PACKAGE_OVERLAY,
+        "adapters/__init__.py": _BOOTSTRAP_CANDIDATE_SUBPACKAGE_INIT,
+        "adapters/worker/__init__.py": _BOOTSTRAP_CANDIDATE_SUBPACKAGE_INIT,
     }
     for name in _BOOTSTRAP_CANDIDATE_SOURCE_NAMES:
         sources[name] = (package_root / name).read_bytes()

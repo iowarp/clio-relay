@@ -6,18 +6,17 @@ distribution once, and publishes them to PyPI through trusted publishing and
 the `pypi` environment. Nothing else gates publication.
 
 `ci.yml` runs on pull requests, on `main` and on tags. It runs ruff, pyright
-and pytest, and builds the wheel to check its entry point. Do not wait on it
-to cut a release; check it after, and fix any failure in the next patch.
+(held to the error count in `scripts/check_pyright_ratchet.py`), the file
+size and nested class checks, and pytest, and builds the wheel to check its
+entry point. Do not wait on it to cut a release; check it after, and fix any
+failure in the next patch.
 
 ## Version
 
-Update the version in:
+Set the same version in both places:
 
-- `pyproject.toml`
-- `src/clio_relay/__init__.py`
-
-`scripts/bump_release_version.py` changes every pinned site in one pass, and
-`scripts/check_release_identity.py` checks that they agree.
+- `version` in `pyproject.toml`
+- `__version__` in `src/clio_relay/__init__.py`
 
 ## Tag and publish
 

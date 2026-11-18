@@ -162,7 +162,7 @@ import hashlib
 import json
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 destination = Path(sys.argv[1])
 encoded_sources = json.loads(r'''{rendered_candidate_package_sources}''')
@@ -173,7 +173,16 @@ sources = {{
     for name, encoded in encoded_sources.items()
 }}
 for name, payload in sources.items():
-    path = destination / name
+    relative = PurePosixPath(name)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise SystemExit(f"bootstrap candidate source path is invalid: {{name}}")
+    parent = destination
+    for part in relative.parts[:-1]:
+        parent = parent / part
+        if parent.is_symlink():
+            raise SystemExit(f"bootstrap candidate package must not hold a symbolic link: {{name}}")
+        parent.mkdir(mode=0o700, exist_ok=True)
+    path = parent / relative.name
     if path.is_symlink():
         raise SystemExit(f"bootstrap candidate source must not be a symbolic link: {{name}}")
     try:
@@ -189,8 +198,9 @@ for name, payload in sources.items():
         raise SystemExit(f"bootstrap candidate source identity changed: {{name}}")
     print(f"bootstrap_candidate_source={{name}}:{{hashlib.sha256(observed).hexdigest()}}")
 __CLIO_RELAY_CANDIDATE_PACKAGE__
-BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_PACKAGE/bootstrap_reconcile.py"
-BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO="$BOOTSTRAP_CANDIDATE_PACKAGE/bootstrap_provider_build_info.py"
+BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/bootstrap_reconcile.py"
+BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO=\
+  "$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/bootstrap_provider_build_info.py"
 BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT="$BOOTSTRAP_CANDIDATE_PACKAGE/process_containment.py"
 echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
   sha256sum --check --strict -
@@ -202,7 +212,8 @@ echo "{candidate_errors_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/errors.py" | \
   sha256sum --check --strict -
 echo "{candidate_process_containment_sha256} *$BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT" | \
   sha256sum --check --strict -
-echo "{candidate_safe_archive_sha256} *$BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" | \
+BOOTSTRAP_CANDIDATE_SAFE_ARCHIVE="$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/safe_archive.py"
+echo "{candidate_safe_archive_sha256} *$BOOTSTRAP_CANDIDATE_SAFE_ARCHIVE" | \
   sha256sum --check --strict -
 export BOOTSTRAP_CANDIDATE_PYTHON_ROOT BOOTSTRAP_CANDIDATE_RECONCILE
 bootstrap_safe_extract() {{
@@ -226,7 +237,7 @@ from pathlib import Path
 
 candidate_root, archive_value, destination_value = sys.argv[1:]
 sys.path.insert(0, candidate_root)
-from clio_relay.safe_archive import safe_extract_tar
+from clio_relay.adapters.worker.safe_archive import safe_extract_tar
 
 receipt = safe_extract_tar(Path(archive_value), Path(destination_value))
 print(

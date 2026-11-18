@@ -573,14 +573,14 @@ def render_linux_user_bootstrap_script(
         name: hashlib.sha256(payload).hexdigest()
         for name, payload in candidate_package_sources.items()
     }
-    candidate_reconcile_sha256 = candidate_package_sha256["bootstrap_reconcile.py"]
+    candidate_reconcile_sha256 = candidate_package_sha256["adapters/worker/bootstrap_reconcile.py"]
     candidate_provider_build_info_sha256 = candidate_package_sha256[
-        "bootstrap_provider_build_info.py"
+        "adapters/worker/bootstrap_provider_build_info.py"
     ]
     candidate_bounded_process_sha256 = candidate_package_sha256["bounded_process.py"]
     candidate_errors_sha256 = candidate_package_sha256["errors.py"]
     candidate_process_containment_sha256 = candidate_package_sha256["process_containment.py"]
-    candidate_safe_archive_sha256 = candidate_package_sha256["safe_archive.py"]
+    candidate_safe_archive_sha256 = candidate_package_sha256["adapters/worker/safe_archive.py"]
     bootstrap_journal_source = Path(__file__).with_name("bootstrap_journal.py").read_bytes()
     rendered_bootstrap_journal_source = base64.b64encode(bootstrap_journal_source).decode("ascii")
     relay_only_reconcile = _relay_only_reconcile_script(

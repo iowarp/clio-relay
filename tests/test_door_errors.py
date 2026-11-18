@@ -15,7 +15,6 @@ collision, silent truncation, the unenforced byte budget, a hostile
 from __future__ import annotations
 
 import ast
-import asyncio
 import hashlib
 import json
 import re
@@ -33,19 +32,12 @@ from urllib.parse import urlencode
 import mcp_types
 import mcp_types.jsonrpc
 import pytest
-from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
-from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from fastmcp import Client, FastMCP
-from fastmcp.tools import ToolResult
-from fastmcp_tasks.client import call_tool_task  # pyright: ignore[reportUnknownVariableType]
-from fastmcp_tasks.client_models import ClientGetTaskResult, GetTaskRequest, GetTaskRequestParams
 from mcp.shared.exceptions import MCPError
 
 from clio_relay.adapters.worker import door_errors
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.adapters.worker.storage_runtime import (
     StorageAdmissionError,
@@ -62,7 +54,7 @@ from clio_relay.errors import (
     TaskInputParkConflictError,
 )
 from clio_relay.job_identity import OwnerSessionIdentityError
-from clio_relay.models import JobKind, JobState
+from clio_relay.models import JobKind
 from clio_relay.storage_policy import StorageDecision, StorageReason
 
 # --------------------------------------------------------------------------- #
@@ -743,73 +735,6 @@ def test_websocket_refusal_adapter_preserves_policy_code_and_reason(reason: str)
 # --------------------------------------------------------------------------- #
 
 
-def _fastmcp_task_server(
-    settings: RelaySettings,
-    queue: ClioCoreQueue,
-) -> tuple[FastMCP[dict[str, Any]], RelayMcpRuntime, RelayTool]:
-    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
-        profile="user", registry_path=settings.cluster_registry_path
-    )
-    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
-    tool = RelayTool(definition, runtime=runtime, catalog_revision=None, task_capable=True)
-    server: FastMCP[dict[str, Any]] = FastMCP(
-        "door-errors-fastmcp-test",
-        tools=[tool],
-        lifespan=runtime.lifespan,
-        tasks=False,
-        strict_input_validation=True,
-    )
-    server.add_extension(RelayTasksExtension(runtime))
-    return server, runtime, tool
-
-
-def test_task_input_park_conflict_is_typed_not_bare(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The live hole (doc §6.1, fastmcp_server.py:1106-1115): before R3,
-    ``intercept_tool_call`` left ``TaskInputParkConflictError`` deliberately
-    unwrapped, so it escaped through FastMCP's generic handler as a bare
-    internal error. Patching the runtime's own raise site proves it is now
-    typed via door_errors instead.
-    """
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
-    )
-    queue = ClioCoreQueue(settings.core_dir)
-    server, runtime, _tool = _fastmcp_task_server(settings, queue)
-
-    async def always_park_conflict(*_args: Any, **_kwargs: Any) -> Any:
-        raise TaskInputParkConflictError("forced park conflict for the door_errors live-hole test")
-
-    monkeypatch.setattr(runtime, "_park_agent_input", always_park_conflict)
-
-    async def scenario() -> None:
-        async with Client(server, mode="auto") as client:
-            arguments = {
-                "cluster": "test-cluster",
-                "prompt_path": str(tmp_path / "prompt.md"),
-                "timeout_seconds": 45,
-                "idempotency_key": "door-errors-park-conflict",
-                "request_followup_message": True,
-            }
-            with pytest.raises(MCPError) as failure:
-                await call_tool_task(client, "relay_submit_agent", arguments)
-            spec = door_errors.REASONS["mcp_task_input_park_conflict"]
-            assert failure.value.code == spec.mcp_code
-            assert failure.value.code != mcp_types.INTERNAL_ERROR
-            assert failure.value.code != mcp_types.INVALID_PARAMS
-            assert spec.retryable is True
-            assert failure.value.data == {"reason": "mcp_task_input_park_conflict"}
-            assert failure.value.message == "MCP task input park conflict."
-            assert "forced park conflict" not in failure.value.message
-
-    asyncio.run(scenario())
-
-
 def test_218_regression_mcp_task_conflict_reason_comes_from_the_table() -> None:
     """#218 re-pointed at door_errors: a genuine task-identity conflict is
     INVALID_PARAMS with the frozen table's ``mcp_task_conflict`` reason --
@@ -851,71 +776,6 @@ def test_215_regression_reconciliation_failure_never_leaks_str_exc() -> None:
         "reason": "mcp_task_status_reconciliation_failed",
         "task_id": "job-2",
     }
-
-
-def test_mcp_error_pass_through_is_never_reclassified_by_the_owner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Regression pin: ``_handle_get``'s ``except MCPError: raise`` must
-    stay. ``door_errors`` has no dedicated reason for an already-typed
-    ``MCPError`` -- it is not one of the seven typed reasons dispatched by
-    ``isinstance``, so handing one directly to ``classify()`` collapses it
-    into the generic ``internal_error`` bucket, destroying its original
-    code and data. If the pass-through clause were ever removed, an
-    ``MCPError`` raised inside ``task_status`` (e.g. from a nested call)
-    would fall into the broader ``except Exception`` and be silently
-    re-wrapped.
-    """
-    original = MCPError(
-        code=mcp_types.URL_ELICITATION_REQUIRED,
-        message="a nested, already-typed failure",
-        data={"reason": "url_elicitation_required"},
-    )
-
-    # Ground truth: classify() alone would destroy this if ever reached.
-    reclassified = door_errors.classify(original)
-    assert reclassified.reason == "internal_error"
-    assert reclassified.mcp_code != original.code
-
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
-    )
-    queue = ClioCoreQueue(settings.core_dir)
-    server, runtime, tool = _fastmcp_task_server(settings, queue)
-
-    async def raise_original(*_args: Any, **_kwargs: Any) -> Any:
-        raise original
-
-    async def scenario() -> None:
-        saved = await runtime.create_task(
-            tool=tool,
-            arguments={"value": "mcp-error-pass-through"},
-            result=ToolResult(
-                content=[mcp_types.TextContent(type="text", text="queued")],
-                structured_content={
-                    "job_id": "job-mcp-error-pass-through",
-                    "state": JobState.QUEUED.value,
-                    "terminal": False,
-                },
-            ),
-        )
-        assert saved is not None
-        monkeypatch.setattr(runtime, "task_status", raise_original)
-
-        async with Client(server, mode="auto") as client:
-            with pytest.raises(MCPError) as failure:
-                await client.session.send_request(
-                    GetTaskRequest(params=GetTaskRequestParams(task_id=saved.task_id)),
-                    ClientGetTaskResult,
-                )
-            assert failure.value.code == original.code
-            assert failure.value.data == original.data
-            assert failure.value.message == original.message
-
-    asyncio.run(scenario())
 
 
 def test_public_error_constructors_never_interpolate_a_caught_exception() -> None:

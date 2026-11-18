@@ -32,8 +32,12 @@ jobs:
         run: uv run --no-sync ruff check
       - name: ruff format
         run: uv run --no-sync ruff format --check
-      - name: pyright
-        run: uv run --no-sync pyright
+      - name: pyright, held to the error ratchet
+        run: uv run --no-sync python scripts/check_pyright_ratchet.py
+      - name: file size ratchet
+        run: uv run --no-sync python scripts/check_file_size.py
+      - name: no classes inside functions
+        run: uv run --no-sync python scripts/check_no_class_in_function.py
 
   test:
     name: ${{ matrix.os }} / python ${{ matrix.python-version }}

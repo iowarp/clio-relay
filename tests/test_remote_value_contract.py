@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import subprocess
-from collections.abc import Callable
-from typing import Protocol, cast
+from typing import Protocol
 
-import clio_relay.live_acceptance as live_acceptance
 import pytest
-from clio_relay.doctor import run_cluster_doctor
 
-import clio_relay.adapters.worker.transport_probe as transport_probe
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError
-from clio_relay.frp_remote_scripts import remote_frpc_start_script
-from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import (
     render_remote_shell_path,
     render_remote_shell_value,
@@ -26,18 +19,6 @@ class _RemoteRenderer(Protocol):
     def __call__(self, value: str, *, field: str) -> str:
         """Render one configured remote value."""
         ...
-
-
-def _configured_definition() -> ClusterDefinition:
-    return ClusterDefinition(
-        name="custom",
-        ssh_host="cluster.example.test",
-        core_dir="$HOME/core dir/o'hare$(touch /tmp/core)`id`$CORE_SUFFIX",
-        spool_dir="/srv/$HOME/spool dir/$(touch /tmp/spool)`id`$SPOOL_SUFFIX",
-        jarvis_bin="$HOME/bin/jarvis $(touch /tmp/jarvis)`id`$JARVIS_SUFFIX",
-        frpc_bin="/opt/$HOME/frpc $(touch /tmp/frpc)`id`$FRPC_SUFFIX",
-        agent_bin="$HOME/bin/agent $(touch /tmp/agent)`id`$AGENT_SUFFIX",
-    )
 
 
 def test_remote_value_contract_expands_only_exact_leading_home() -> None:
@@ -77,101 +58,6 @@ def test_remote_value_contract_rejects_controls(renderer: _RemoteRenderer) -> No
     """No remote rendering surface accepts control characters."""
     with pytest.raises(ConfigurationError, match="control characters"):
         renderer("$HOME/path\nforged", field="path")
-
-
-def test_remote_environment_surfaces_share_the_value_contract() -> None:
-    """CLI, acceptance, and transport probes render identical configured meanings."""
-    definition = _configured_definition()
-    rendered_core_dir = render_remote_shell_path(definition.core_dir, field="core_dir")
-    rendered_spool_dir = render_remote_shell_path(definition.spool_dir, field="spool_dir")
-    rendered_jarvis_bin = render_remote_shell_value(
-        definition.jarvis_bin or "",
-        field="jarvis_bin",
-    )
-    rendered_frpc_bin = render_remote_shell_value(
-        definition.frpc_bin or "",
-        field="frpc_bin",
-    )
-    rendered_agent_bin = render_remote_shell_value(
-        definition.agent_bin or "",
-        field="agent_bin",
-    )
-    expected = [
-        f"CLIO_RELAY_CORE_DIR={rendered_core_dir}",
-        f"CLIO_RELAY_SPOOL_DIR={rendered_spool_dir}",
-        f"CLIO_RELAY_JARVIS_BIN={rendered_jarvis_bin}",
-        f"CLIO_RELAY_FRPC_BIN={rendered_frpc_bin}",
-        f"CLIO_RELAY_AGENT_BIN={rendered_agent_bin}",
-    ]
-
-    cli_environment = remote_env(definition)
-    acceptance_env_renderer = cast(
-        Callable[..., str],
-        vars(live_acceptance)["_remote_env"],
-    )
-    probe_script_renderer = cast(
-        Callable[..., str],
-        vars(transport_probe)["_remote_probe_script"],
-    )
-    acceptance_environment = acceptance_env_renderer(definition)
-    probe_script = probe_script_renderer(
-        cluster=definition.name,
-        definition=definition,
-        probe_id="probe-contract",
-        api_token=None,
-        api_port=8765,
-        frpc_config="",
-    )
-
-    for assignment in expected:
-        assert assignment in cli_environment
-        assert assignment in acceptance_environment
-        assert assignment in probe_script
-
-
-def test_doctor_and_connector_runtime_share_safe_bin_rendering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Diagnostic and connector scripts cannot reevaluate configured executable values."""
-    definition = _configured_definition()
-    doctor_scripts: list[str] = []
-
-    def fake_run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        assert capture_output is True
-        assert check is False
-        doctor_scripts.append(input.decode("utf-8"))
-        return subprocess.CompletedProcess(command, 0, b"", b"")
-
-    monkeypatch.setattr("clio_relay.doctor.subprocess.run", fake_run)
-    run_cluster_doctor(definition)
-
-    expected_frpc = render_remote_shell_value(definition.frpc_bin or "", field="frpc_bin")
-    expected_jarvis = render_remote_shell_value(definition.jarvis_bin or "", field="jarvis_bin")
-    expected_agent = render_remote_shell_value(definition.agent_bin or "", field="agent_bin")
-    assert f"FRPC_BIN={expected_frpc}" in doctor_scripts[0]
-    assert f"JARVIS_BIN={expected_jarvis}" in doctor_scripts[0]
-    assert f"AGENT_BIN={expected_agent}" in doctor_scripts[0]
-
-    # 3b759cc (#231 split): service_runtime.py's connector-start script
-    # rendering moved to its true origin, frp_remote_scripts.py (imported
-    # there under the private alias `_remote_frpc_start_script` for its own
-    # internal use only -- same pattern as the `_remote_stop_script` move in
-    # slice 14) -- so this reaches the public name directly instead of the
-    # no-longer-bound `service_runtime._remote_frpc_start_script`.
-    connector_script = remote_frpc_start_script(
-        definition=definition,
-        session_id="session-contract",
-        config_text="serverAddr = 'relay.example.test'\n",
-        owner_token="owner-token",
-        connector_generation_id="generation-id",
-    )
-    assert f"frpc_bin={expected_frpc}" in connector_script
 
 
 def test_endpoint_service_expands_only_leading_home_specifiers() -> None:

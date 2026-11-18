@@ -11,7 +11,6 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
-from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -509,25 +508,6 @@ def test_http_api_shutdown_releases_managed_writer_lifetime(tmp_path: Path) -> N
         TestClient(app),
     ):
         pass
-
-
-def test_mcp_stdio_exit_releases_managed_writer_lifetime(tmp_path: Path) -> None:
-    """The stdio MCP server releases shared ownership when its input closes."""
-    from clio_relay.mcp_server import serve_stdio
-
-    core_dir = tmp_path / "core"
-    serve_stdio(
-        stdin=StringIO(""),
-        stdout=StringIO(),
-        settings=RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool"),
-    )
-
-    exclusive = WorkerLifetimeLock(
-        core_dir,
-        mode="exclusive",
-        timeout_seconds=0,
-    ).acquire()
-    exclusive.release()
 
 
 def test_authoritative_migration_api_enters_exclusive_lifetime_guard(

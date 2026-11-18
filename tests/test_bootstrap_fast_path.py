@@ -3275,9 +3275,9 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
 
     assert 'tar -xf "$SOURCE_ARCHIVE"' not in script
     assert "stream.extractall(destination" not in script
-    assert "from clio_relay.safe_archive import safe_extract_tar" in script
+    assert "from clio_relay.adapters.worker.safe_archive import safe_extract_tar" in script
     assert "candidate_safe_archive" not in script
-    assert "BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" in script
+    assert "BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/safe_archive.py" in script
 
 
 def test_legacy_planning_attests_private_candidate_before_transaction_or_fence() -> None:
@@ -3373,7 +3373,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
 
     assert "bootstrap_use_staged_provider()" in script
     assert 'if os.environ.get("BOOTSTRAP_STAGED_GENERATION"):' in script
-    assert "from clio_relay import bootstrap_reconcile as module" in script
+    assert "from clio_relay.adapters.worker import bootstrap_reconcile as module" in script
     assert 'receipt_document.get("deployment_manifest")' in script
     assert "staged install receipt omitted its desired state" in script
     assert "journal-phase prepared_manifest" in script
