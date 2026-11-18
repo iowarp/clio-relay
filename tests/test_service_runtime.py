@@ -27,7 +27,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
@@ -37,18 +37,18 @@ import clio_relay.service_runtime_local_start as service_runtime_local_start
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
-import clio_relay.session_lifecycle as session_lifecycle
-from clio_relay import cli as relay_cli
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+from clio_relay.adapters.worker import cli as relay_cli
 from clio_relay.browser_gateway import (
     CAPABILITY_ENV,
     UPSTREAM_AUTHORIZATION_ENV,
     BrowserGatewayBootstrap,
     BrowserGatewayConfig,
 )
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     BrowserAttachmentIdentityConflictError,
     ConfigurationError,
@@ -74,7 +74,7 @@ from clio_relay.service_runtime_types import (
     CommandRunner,
     LocalConnectorIdentity,
 )
-from clio_relay.session_lifecycle import CleanupResource
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 from clio_relay.validation_report import (
     EvidenceReference,
     LiveValidationReport,
@@ -1480,7 +1480,7 @@ def _start_lifecycle_frp_runtime(
 
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
+        "clio_relay.adapters.worker.worker_lifetime_lock",
         # #231 class-mixin split: _gateway_transition_lock_path (the caller)
         # lives in service_runtime_core.py now, not service_runtime.py.
         "clio_relay.service_runtime_core",
@@ -1495,7 +1495,7 @@ def _start_lifecycle_frp_runtime(
         # -- it only uses ensure_private_configuration_directory
         # (src/clio_relay/service_runtime_core.py).
         "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
+        "clio_relay.adapters.worker.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
             f"{module_name}.ensure_private_configuration_path",
@@ -1509,7 +1509,7 @@ def _start_lifecycle_frp_runtime(
             yield handle
 
     monkeypatch.setattr(
-        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        "clio_relay.adapters.worker.queue_store_write.cluster_config.open_private_atomic_file",
         open_test_atomic_file,
     )
     settings = RelaySettings(
@@ -5742,7 +5742,7 @@ def test_gateway_start_runtime_cli_uses_service_runtime_spec(
 
     monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
     monkeypatch.setattr(
-        "clio_relay.cli_remote_worker_attach._attach_verified_remote_worker",
+        "clio_relay.adapters.worker.cli_remote_worker_attach._attach_verified_remote_worker",
         fake_worker_identity,
     )
     validation_report = tmp_path / "gateway-validation.json"

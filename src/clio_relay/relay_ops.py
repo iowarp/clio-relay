@@ -15,9 +15,9 @@ from urllib.parse import unquote, urlparse
 
 from clio_relay.bounded_payload import JSON, build_delivery_refusal
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_execution_artifacts import EXECUTION_OUTPUT_OWNERSHIP_SCHEMA
+from clio_relay.adapters.worker.jarvis_execution_artifacts import EXECUTION_OUTPUT_OWNERSHIP_SCHEMA
 from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
@@ -35,7 +35,7 @@ from clio_relay.models import (
 )
 from clio_relay.pagination import validate_response_page_limit
 from clio_relay.progress_provenance import external_progress_metadata
-from clio_relay.scheduler_status import relay_queue_status
+from clio_relay.adapters.worker.scheduler_status import relay_queue_status
 from clio_relay.spool import (
     ARTIFACT_OWNERSHIP_SCHEMA,
     JobSpool,

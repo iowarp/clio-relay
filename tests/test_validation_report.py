@@ -40,7 +40,7 @@ from clio_relay.remote_mcp import (
     build_remote_mcp_structured_result_check,
 )
 from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
-from clio_relay.session_lifecycle import (
+from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     RemoteSessionStateEvidence,
     SessionLifecycleReport,

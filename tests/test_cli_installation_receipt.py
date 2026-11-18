@@ -35,7 +35,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.installation as installation_module
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.installation import InstallReceipt
 from clio_relay.validation_report import SoftwareIdentity
 

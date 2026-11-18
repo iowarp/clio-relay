@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.application_profiles import (
+from clio_relay.adapters.worker.application_profiles import (
     install_cluster_app_over_ssh,
     load_application_profile,
 )
 from clio_relay.errors import ConfigurationError
-from clio_relay.progress_adapters import package_progress_adapter_from_pipeline
+from clio_relay.adapters.worker.progress_adapters import package_progress_adapter_from_pipeline
 from tests.plugin_fakes import (
     FakeEntryPoint,
     FakeEntryPoints,
@@ -37,12 +37,12 @@ def _install_site_profile(monkeypatch: MonkeyPatch) -> None:
         [
             FakeEntryPoint(
                 name="site-stack",
-                group="clio_relay.application_profiles",
+                group="clio_relay.adapters.worker.application_profiles",
                 loaded=SiteStackProfile(),
             )
         ]
     )
-    monkeypatch.setattr("clio_relay.application_profiles.entry_points", lambda: entries)
+    monkeypatch.setattr("clio_relay.adapters.worker.application_profiles.entry_points", lambda: entries)
 
 
 def test_relay_distribution_contains_no_built_in_application_plugins() -> None:

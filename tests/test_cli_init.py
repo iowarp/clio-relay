@@ -2,7 +2,7 @@
 (iowarp/clio-relay#231).
 
 These moved out of ``tests/test_cli.py`` alongside the two commands'
-extraction into ``src/clio_relay/cli_init.py``, per ground rule 3 (SS2 of
+extraction into ``src/clio_relay/adapters/worker/cli_init.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 
@@ -30,8 +30,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.storage_runtime as storage_runtime
-from clio_relay.cli import app
+import clio_relay.adapters.worker.storage_runtime as storage_runtime
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterRegistry
 
 

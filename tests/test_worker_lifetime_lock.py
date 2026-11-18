@@ -18,16 +18,17 @@ from typing import Any, Literal
 
 import pytest
 
-import clio_relay.endpoint as endpoint_module
-import clio_relay.storage_runtime as storage_runtime_module
-from clio_relay import lock_holder_sidecar, queue_legacy_audit, queue_startup, worker_lifetime_lock
+import clio_relay.adapters.worker.endpoint as endpoint_module
+import clio_relay.adapters.worker.storage_runtime as storage_runtime_module
+from clio_relay import lock_holder_sidecar
+from clio_relay.adapters.worker import queue_legacy_audit, queue_startup, worker_lifetime_lock
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import EndpointRole, JarvisRunSpec, JobKind, RelayEvent, RelayJob
-from clio_relay.queue_store_lock import LegacyQueueStateError
-from clio_relay.storage_runtime import storage_managed_queue
-from clio_relay.worker_lifetime_lock import (
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
+from clio_relay.adapters.worker.worker_lifetime_lock import (
     WORKER_LIFETIME_GUARD_FD_ENV,
     LockedCoreIdentity,
     WorkerLifetimeLock,
@@ -41,7 +42,7 @@ def _start_shared_lock_holder(core_dir: Path) -> subprocess.Popen[str]:
     source = """
 from pathlib import Path
 import sys
-from clio_relay.worker_lifetime_lock import WorkerLifetimeLock
+from clio_relay.adapters.worker.worker_lifetime_lock import WorkerLifetimeLock
 
 lock = WorkerLifetimeLock(Path(sys.argv[1]), mode="shared").acquire()
 print("ready", flush=True)
@@ -77,7 +78,7 @@ def _start_shared_lock_holder_with_reported_pid(
 from pathlib import Path
 import os
 import sys
-from clio_relay.worker_lifetime_lock import WorkerLifetimeLock
+from clio_relay.adapters.worker.worker_lifetime_lock import WorkerLifetimeLock
 
 lock = WorkerLifetimeLock(Path(sys.argv[1]), mode="shared").acquire()
 print(f"ready {os.getpid()}", flush=True)
@@ -152,7 +153,7 @@ def test_old_shared_writer_prevents_missing_seal_mutation_until_exclusive(
     source = """
 from pathlib import Path
 import sys
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 
 core, started = map(Path, sys.argv[1:])
 started.write_text("started", encoding="utf-8")
@@ -485,7 +486,7 @@ def test_http_api_shutdown_releases_managed_writer_lifetime(tmp_path: Path) -> N
     """The HTTP server retains shared ownership only through its app lifespan."""
     from fastapi.testclient import TestClient
 
-    from clio_relay.http_api import create_app
+    from clio_relay.adapters.worker.http_api import create_app
 
     core_dir = tmp_path / "core"
     settings = RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool")
@@ -632,7 +633,7 @@ def test_storage_migration_waits_for_exclusive_before_runtime_mutation(
 from pathlib import Path
 import sys
 from clio_relay.config import RelaySettings
-from clio_relay.storage_runtime import storage_managed_queue
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 
 core, spool, started = map(Path, sys.argv[1:])
 started.write_text("started", encoding="utf-8")

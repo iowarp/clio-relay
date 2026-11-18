@@ -13,7 +13,7 @@ from typing import cast
 
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import ServiceRuntimeSpec
 from clio_relay.service_runtime import ServiceRuntimeSupervisor
 from clio_relay.service_runtime_connector_identity import (

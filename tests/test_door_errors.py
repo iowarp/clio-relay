@@ -42,10 +42,10 @@ from fastmcp_tasks.client import call_tool_task  # pyright: ignore[reportUnknown
 from fastmcp_tasks.client_models import ClientGetTaskResult, GetTaskRequest, GetTaskRequestParams
 from mcp.shared.exceptions import MCPError
 
-from clio_relay import door_errors
+from clio_relay.adapters.worker import door_errors
 from clio_relay.browser_gateway import BrowserGatewayConfig, CapabilityProxyServer
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -55,13 +55,13 @@ from clio_relay.errors import (
     TaskInputParkConflictError,
 )
 from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
-from clio_relay.http_api import create_app
-from clio_relay.jarvis_dispatch_failure import JarvisDispatchRefusal
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
 from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from clio_relay.models import JobKind, JobState
 from clio_relay.storage_policy import StorageDecision, StorageReason
-from clio_relay.storage_runtime import StorageAdmissionError, StorageRuntimeViolation
+from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError, StorageRuntimeViolation
 
 # --------------------------------------------------------------------------- #
 # The frozen REASONS registry
@@ -494,7 +494,7 @@ def test_classify_internal_error_fallback_never_leaks_str_exc(
     class _NovelSurpriseError(RuntimeError):
         pass
 
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         try:
             raise _NovelSurpriseError("a distinctly identifiable internal detail 8f2c1a")
         except _NovelSurpriseError as exc:
@@ -510,7 +510,7 @@ def test_classify_internal_error_fallback_never_leaks_str_exc(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -531,7 +531,7 @@ def test_classify_guards_a_hostile_str_and_never_raises(
         def __str__(self) -> str:
             raise RuntimeError("hostile __str__ payload -- must never propagate")
 
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         fault = door_errors.classify(_HostileConfigurationError("irrelevant"))
 
     assert fault.reason == "configuration_error"
@@ -541,7 +541,7 @@ def test_classify_guards_a_hostile_str_and_never_raises(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -1295,7 +1295,7 @@ def test_sabotage_twin_novel_exception_via_testclient_returns_typed_internal_err
     # TestClient's default raise_server_exceptions=True would otherwise
     # surface that re-raise as a test failure instead of a response to assert on.
     client = cast(Any, TestClient(app, raise_server_exceptions=False))
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         response = client.get("/__sabotage_twin_9f4b1c")
 
     assert response.status_code == 500
@@ -1308,7 +1308,7 @@ def test_sabotage_twin_novel_exception_via_testclient_returns_typed_internal_err
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -1327,7 +1327,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     handles), the handler must fall back to the hardcoded internal_error
     document rather than let a second exception replace the first.
     """
-    import clio_relay.http_api as http_api_module
+    import clio_relay.adapters.worker.http_api as http_api_module
 
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     app = create_app(settings)
@@ -1342,7 +1342,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     monkeypatch.setattr(http_api_module.door_errors, "classify", broken_classify)
 
     client = cast(Any, TestClient(app, raise_server_exceptions=False))
-    with caplog.at_level("ERROR", logger="clio_relay.http_api"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.http_api"):
         response = client.get("/__handler_guard_probe")
 
     assert response.status_code == 500
@@ -1353,7 +1353,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.http_api" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.http_api" and record.exc_info is not None
     ]
     assert len(logged) == 1
 
@@ -1598,7 +1598,7 @@ def test_browser_gateway_does_not_create_an_import_cycle_with_door_errors() -> N
         [
             sys.executable,
             "-c",
-            "import clio_relay.core_queue; import clio_relay.browser_gateway",
+            "import clio_relay.adapters.worker.core_queue; import clio_relay.browser_gateway",
         ],
         capture_output=True,
         text=True,

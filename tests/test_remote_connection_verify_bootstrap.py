@@ -18,7 +18,7 @@ import pytest
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.control_channel import OwnedSessionChannelBootstrap
 from clio_relay.errors import RelayError
-from clio_relay.remote_connection_registry import verify_bootstrap
+from clio_relay.adapters.worker.remote_connection_registry import verify_bootstrap
 
 CLUSTER = "homelab"
 SESSION_ID = "session-1"

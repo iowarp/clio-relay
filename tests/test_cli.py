@@ -22,8 +22,8 @@ from click import unstyle
 from filelock import FileLock
 from typer.testing import CliRunner
 
-import clio_relay.cli_cleanup_evidence as cli_cleanup_evidence
-import clio_relay.cli_cleanup_report as cli_cleanup_report
+import clio_relay.adapters.worker.cli_cleanup_evidence as cli_cleanup_evidence
+import clio_relay.adapters.worker.cli_cleanup_report as cli_cleanup_report
 import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
 import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
 import clio_relay.cli_jarvis_execution_types as cli_jarvis_execution_types
@@ -33,29 +33,30 @@ import clio_relay.cli_jarvis_pending_report as cli_jarvis_pending_report
 import clio_relay.cli_jarvis_query_observation as cli_jarvis_query_observation
 import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
 import clio_relay.cli_jarvis_resume_checkpoint as cli_jarvis_resume_checkpoint
-import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
-import clio_relay.cli_owned_report_artifact as cli_owned_report_artifact
-import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
-import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
-import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
-import clio_relay.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
-import clio_relay.cli_remote_collection_pagination as cli_remote_collection_pagination
-import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.cli_session_start as cli_session_start
-import clio_relay.cli_session_teardown as cli_session_teardown
+import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.adapters.worker.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
+import clio_relay.adapters.worker.cli_owned_report_artifact as cli_owned_report_artifact
+import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
+import clio_relay.adapters.worker.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
+import clio_relay.adapters.worker.cli_remote_collection_pagination as cli_remote_collection_pagination
+import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.cli_session_start as cli_session_start
+import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
 import clio_relay.cluster_config as cluster_config
 import clio_relay.installation as installation_module
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
 import clio_relay.remote_cli as remote_cli
 import clio_relay.scheduler_providers as scheduler_providers
-import clio_relay.session_lifecycle as session_lifecycle
-import clio_relay.session_lifecycle_report as session_lifecycle_report
-import clio_relay.session_start_query as session_start_query
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
+import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.validation_report as validation_report
-from clio_relay import __version__, cli
-from clio_relay.cli import app
+from clio_relay import __version__
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
@@ -64,7 +65,7 @@ from clio_relay.cluster_config import (
     RemoteMcpServerConfig,
     cluster_route_revision,
 )
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     ConfigurationError,
     ObservationTimeoutError,
@@ -104,7 +105,7 @@ from clio_relay.scheduler_providers import SchedulerProvider
 from clio_relay.service_runtime import (
     ServiceRuntimeSupervisor,
 )
-from clio_relay.session_lifecycle import (
+from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
     SessionApiReleaseIdentity,
@@ -706,9 +707,9 @@ def test_cli_session_lifecycle_commands(tmp_path: Path, monkeypatch: MonkeyPatch
     ) -> SessionApiReleaseIdentity:
         return _session_api_release_identity()
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.start_remote_session", fake_start)
-    monkeypatch.setattr("clio_relay.session_lifecycle.status_remote_session", fake_status)
-    monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.start_remote_session", fake_start)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.status_remote_session", fake_status)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.teardown_remote_session", fake_teardown)
     monkeypatch.setattr("clio_relay.remote_cli.run_remote_clio", fake_run_remote_clio)
     monkeypatch.setattr(
         cli_session_start,
@@ -4244,10 +4245,10 @@ def test_cli_session_teardown_defaults_to_keep_jobs(
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
     _activate_owner_session(queue)
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         _fake_owned_session_status,
     )
-    monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.teardown_remote_session", fake_teardown)
 
     result = CliRunner().invoke(
         app,
@@ -4532,10 +4533,10 @@ def test_cli_session_teardown_can_cancel_active_jobs(
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
     _activate_owner_session(queue)
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         _fake_owned_session_status,
     )
-    monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.teardown_remote_session", fake_teardown)
 
     result = CliRunner().invoke(
         app,
@@ -4805,10 +4806,10 @@ def test_cli_session_scheduler_cancellation_requires_explicit_flag(
         return _verified_teardown_report()
 
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         _fake_owned_session_status,
     )
-    monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.teardown_remote_session", fake_teardown)
     result = CliRunner().invoke(
         app,
         [
@@ -4978,10 +4979,10 @@ def test_cli_session_scheduler_cancellation_is_owned_and_canonical(
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     _activate_owner_session(queue)
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         _fake_owned_session_status,
     )
-    monkeypatch.setattr("clio_relay.session_lifecycle.teardown_remote_session", fake_teardown)
+    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.teardown_remote_session", fake_teardown)
 
     def confirming_provider(_provider: str) -> ConfirmingScheduler:
         return ConfirmingScheduler()
@@ -5293,11 +5294,11 @@ def test_cli_session_cancels_owned_scheduler_after_relay_job_is_terminal(
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
     _activate_owner_session(queue)
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         _fake_owned_session_status,
     )
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.teardown_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.teardown_remote_session",
         fake_teardown,
     )
     monkeypatch.setattr(

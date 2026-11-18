@@ -55,14 +55,14 @@ from typing import TYPE_CHECKING, cast
 
 from clio_relay import application_runtime_prediction, application_verdict
 from clio_relay.command_evidence import bounded_error_detail
-from clio_relay.endpoint_jarvis_recovery import (
+from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
     _trusted_jarvis_execution_query_validation,
     endpoint_mcp_runner_command,
     minimal_mcp_runner_environment,
     trusted_jarvis_mcp_result,
 )
-from clio_relay.endpoint_recovery_directory import write_private_json_file
-from clio_relay.endpoint_scheduler_metadata import _runtime_metadata_is_native
+from clio_relay.adapters.worker.endpoint_recovery_directory import write_private_json_file
+from clio_relay.adapters.worker.endpoint_scheduler_metadata import _runtime_metadata_is_native
 from clio_relay.errors import RelayError
 from clio_relay.execution_watch_prediction import ExecutionWatchPredictionTracker
 from clio_relay.filesystem_paths import internal_filesystem_path
@@ -71,7 +71,7 @@ from clio_relay.runtime_metadata import runtime_metadata_from_mcp_result_documen
 
 if TYPE_CHECKING:
     from clio_relay.console_stream import ConsoleLiveTailer
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
     from clio_relay.jarvis_provider import JarvisCdProvider
     from clio_relay.models import RelayJob
     from clio_relay.runtime_metadata import JarvisRuntimeMetadata

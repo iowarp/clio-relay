@@ -2,7 +2,7 @@
 
 This moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``queue validate`` command's extraction into
-``src/clio_relay/cli_queue_maintenance.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_queue_maintenance.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises. No dedicated
 test existed for retention-plan/retention-status/retention-collect in
@@ -32,7 +32,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.scheduler_providers as scheduler_providers
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from tests.queue_validation_fixtures import (
     DeterministicQueueValidationProvider,
     LiveWorkerFleet,

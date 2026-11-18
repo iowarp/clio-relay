@@ -14,8 +14,8 @@ from typing import Any, cast
 
 import pytest
 
-from clio_relay import bootstrap
-from clio_relay import bootstrap_provider_build_info as provider_build_info
+from clio_relay.adapters.worker import bootstrap
+from clio_relay.adapters.worker import bootstrap_provider_build_info as provider_build_info
 
 
 def _extract_candidate_sources(script: str) -> dict[str, bytes]:
@@ -115,7 +115,7 @@ candidate_root = Path(sys.argv[1]).resolve()
 legacy_root = Path(sys.argv[2]).resolve()
 sys.path.insert(0, str(legacy_root))
 sys.path.insert(0, str(candidate_root))
-reconciler_path = candidate_root / "clio_relay/bootstrap_reconcile.py"
+reconciler_path = candidate_root / "clio_relay/adapters/worker/bootstrap_reconcile.py"
 name = "clio_relay.bootstrap_reconcile_candidate"
 spec = importlib.util.spec_from_file_location(name, reconciler_path)
 if spec is None or spec.loader is None:

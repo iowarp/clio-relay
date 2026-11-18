@@ -6,9 +6,9 @@
 *owning* module (e.g. `monkeypatch.setattr(transport_probe,
 "run_frp_http_probe", ...)`), not on the caller's own namespace. That only
 works because the caller resolves them through a module-attribute lookup
-(`import clio_relay.transport_probe as transport_probe`, then
+(`import clio_relay.adapters.worker.transport_probe as transport_probe`, then
 `transport_probe.run_frp_http_probe(...)`) rather than binding the bare name
-into its own namespace (`from clio_relay.transport_probe import
+into its own namespace (`from clio_relay.adapters.worker.transport_probe import
 run_frp_http_probe`, then `run_frp_http_probe(...)`). The bare-name form is
 what `docs/design/relay-architecture-2026-08.md` SS4.6 calls "the coupling
 that makes extracting logic out of cli.py expensive" -- a future edit that
@@ -58,13 +58,13 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_support as cli_support
-from clio_relay import cli
-from clio_relay.cli import app
-from clio_relay.core_queue import ClioCoreQueue
+import clio_relay.adapters.worker.cli_support as cli_support
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.storage_policy import StorageDecision, StorageReason
-from clio_relay.storage_runtime import StorageAdmissionError
+from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )

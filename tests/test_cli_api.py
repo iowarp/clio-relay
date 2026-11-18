@@ -1,7 +1,7 @@
 """Tests for the ``api`` command group (iowarp/clio-relay#231).
 
 This moved out of ``tests/test_cli.py`` alongside the ``api_app`` commands'
-extraction into ``src/clio_relay/cli_api.py``, per ground rule 3 (SS2 of
+extraction into ``src/clio_relay/adapters/worker/cli_api.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 
@@ -34,11 +34,11 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_api as cli_api
+import clio_relay.adapters.worker.cli_api as cli_api
 import clio_relay.installation as installation_module
-import clio_relay.session_lifecycle as session_lifecycle
-from clio_relay import cli
-from clio_relay.cli import app
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import app
 from tests.test_cli import (
     _installation_identity,
     _session_api_release_identity,
@@ -66,7 +66,7 @@ def test_cli_api_start_verifies_process_bound_release_identity(
     events: list[str] = []
     bound_app = object()
     late_app = object()
-    http_api_module = importlib.import_module("clio_relay.http_api")
+    http_api_module = importlib.import_module("clio_relay.adapters.worker.http_api")
     monkeypatch.setattr(http_api_module, "app", bound_app)
     monkeypatch.setenv("CLIO_RELAY_SESSION_OWNER_TOKEN", "a" * 64)
 

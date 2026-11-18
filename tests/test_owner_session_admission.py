@@ -7,7 +7,7 @@ from typing import cast
 import pytest
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError, RelayError
 from clio_relay.models import GatewaySession
 from clio_relay.owner_session_admission import (

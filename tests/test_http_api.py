@@ -15,9 +15,9 @@ from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
-from clio_relay import door_errors as door_errors_module
-from clio_relay import http_api as http_api_module
-from clio_relay import http_api_streaming as http_api_streaming_module
+from clio_relay.adapters.worker import door_errors as door_errors_module
+from clio_relay.adapters.worker import http_api as http_api_module
+from clio_relay.adapters.worker import http_api_streaming as http_api_streaming_module
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -26,10 +26,10 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.dev_mode import DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError, NotFoundError
-from clio_relay.http_api import create_app
+from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
     ComponentArtifactIdentity,
@@ -78,7 +78,7 @@ from clio_relay.remote_mcp import (
 )
 from clio_relay.session_api import session_identity_document
 from clio_relay.spool import JobSpool
-from clio_relay.storage_runtime import StorageManagedQueue
+from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue
 
 
 def _bind_owned_session_cluster_authority(
@@ -111,7 +111,7 @@ def _parse_sse_frames(body: str) -> list[dict[str, str]]:
     """Parse a raw ``text/event-stream`` body into ``{event, data, id}`` frames.
 
     A minimal test-only parser matching the wire shape
-    :func:`clio_relay.http_api_streaming._log_tail_sse_events` writes:
+    :func:`clio_relay.adapters.worker.http_api_streaming._log_tail_sse_events` writes:
     each frame is one ``id:``/``event:``/``data:`` line group terminated by
     a blank line.
     """
@@ -981,7 +981,7 @@ def test_http_wait_returns_nonterminal_durable_state_when_observation_expires(
     # split/http-api-w3 (iowarp/clio-relay#231): `wait` moved to
     # http_api_routes_events.py, the only remaining caller of
     # observe_until_terminal -- the patch target follows the move.
-    import clio_relay.http_api_routes_events as http_api_routes_events_module
+    import clio_relay.adapters.worker.http_api_routes_events as http_api_routes_events_module
 
     monkeypatch.setattr(http_api_routes_events_module, "observe_until_terminal", observe)
     response = cast(Any, TestClient(create_app(settings))).post(
@@ -1603,7 +1603,7 @@ def test_http_job_lanes_record_owner_session_identity_when_supplied(
     # split/http-api-w3 (iowarp/clio-relay#231): submit_mcp_call (and its
     # resolve_registered_remote_mcp_admission/default_registry_path calls)
     # moved to http_api_routes_jobs.py -- the patch targets follow the move.
-    import clio_relay.http_api_routes_jobs as http_api_routes_jobs_module
+    import clio_relay.adapters.worker.http_api_routes_jobs as http_api_routes_jobs_module
 
     monkeypatch.setattr(
         http_api_routes_jobs_module,
@@ -2856,7 +2856,7 @@ def test_owned_jarvis_mcp_submission_forwards_desktop_binding_without_remote_cac
         pytest.fail("owned API must not consult its cluster-local cache")
 
     monkeypatch.setattr(
-        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
+        "clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         fail_on_cluster_cache,
     )
     client = cast(
@@ -2952,7 +2952,7 @@ def test_unowned_jarvis_mcp_submission_still_validates_operator_cache(
         return expected_digest
 
     monkeypatch.setattr(
-        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
+        "clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -3052,8 +3052,8 @@ def test_owned_jarvis_mcp_submission_resolves_launcher_from_cluster_pinned_recei
         )
         return ["mcp-server", "jarvis"]
 
-    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", fake_server)
-    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server_args", fake_server_args)
+    monkeypatch.setattr("clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_server", fake_server)
+    monkeypatch.setattr("clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_server_args", fake_server_args)
     client = cast(
         Any,
         TestClient(
@@ -3119,7 +3119,7 @@ def test_owned_jarvis_mcp_submission_surfaces_launcher_failure_as_typed_conflict
     ) -> str:
         raise ValueError("receipt-bound clio-kit runtime identity did not verify")
 
-    monkeypatch.setattr("clio_relay.http_api_routes_jobs.jarvis_mcp_server", failing_server)
+    monkeypatch.setattr("clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_server", failing_server)
     client = cast(
         Any,
         TestClient(

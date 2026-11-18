@@ -13,7 +13,7 @@ import base64
 import pytest
 
 from clio_relay.errors import RelayError
-from clio_relay.frpc_proxy_receipt import (
+from clio_relay.adapters.worker.frpc_proxy_receipt import (
     BRINGUP_RECEIPT_SCHEMA,
     TEARDOWN_RECEIPT_SCHEMA,
     build_frpc_proxy_status_document,

@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.cli_jarvis_mcp as cli_jarvis_mcp
-import clio_relay.http_api_routes_session as http_api_routes_session_module
+import clio_relay.adapters.worker.http_api_routes_session as http_api_routes_session_module
 import clio_relay.jarvis_service_runtime as runtime_binding
 import clio_relay.mcp_server as mcp_server_module
 import clio_relay.owner_session_admission as owner_session_admission_module
@@ -30,7 +30,7 @@ import clio_relay.service_runtime_observation as service_runtime_observation_mod
 import clio_relay.service_runtime_readiness as service_runtime_readiness_module
 import clio_relay.service_runtime_types as service_runtime_types_module
 from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -39,9 +39,9 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
-from clio_relay.http_api import create_app
+from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
@@ -65,14 +65,14 @@ from clio_relay.models import (
     SchedulerStatus,
     ServiceRuntimeSpec,
 )
-from clio_relay.remote_connection import validate_channel_request
+from clio_relay.adapters.worker.remote_connection import validate_channel_request
 from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.service_runtime import (
     ServiceRuntimePendingResult,
     ServiceRuntimeStopResult,
     ServiceRuntimeSupervisor,
 )
-from clio_relay.session_lifecycle import CleanupResource
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 from tests.jarvis_mcp_fakes import verified_jarvis_server_artifact
 
 

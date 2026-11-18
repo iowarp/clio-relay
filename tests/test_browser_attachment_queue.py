@@ -9,7 +9,7 @@ import pytest
 
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 from clio_relay.browser_gateway import BrowserAttachmentRecord
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import GatewaySession, GatewaySessionState, utc_now
 

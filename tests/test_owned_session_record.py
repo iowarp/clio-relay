@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from clio_relay.errors import ConfigurationError
-from clio_relay.owned_session_record import (
+from clio_relay.adapters.worker.owned_session_record import (
     OWNED_SESSION_RECORD_SCHEMA,
     OWNED_SESSION_REGISTRY_ENV,
     OwnedSessionRecord,

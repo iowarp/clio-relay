@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 
 import clio_relay.installation as installation_module
-import clio_relay.worker_runtime_verification as worker_runtime_verification_module
+import clio_relay.adapters.worker.worker_runtime_verification as worker_runtime_verification_module
 from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
 from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
@@ -1404,7 +1404,7 @@ def test_worker_runtime_info_resolves_cluster_pinned_receipt(
     ambient ``current`` installation happens to be (env-dependent, and on a
     shared host may reflect a different tenant's protected generation).
     """
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
     from clio_relay.models import EndpointRegistration, EndpointRole
 
     root = tmp_path / "core"
@@ -1502,7 +1502,7 @@ def test_worker_runtime_info_expands_home_anchored_pinned_receipt(
     undergo remote shell expansion, so the failure mode is not confined to
     this local read path either.
     """
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
     from clio_relay.models import EndpointRegistration, EndpointRole
 
     root = tmp_path / "core"
@@ -1618,7 +1618,7 @@ def test_worker_runtime_info_reads_only_the_sealed_fresh_endpoint_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
     from clio_relay.models import EndpointRegistration, EndpointRole
 
     root = tmp_path / "core"

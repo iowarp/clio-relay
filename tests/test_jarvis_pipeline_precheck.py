@@ -2,7 +2,7 @@
 
 Two layers:
 
-* Pure-function unit coverage for ``clio_relay.jarvis_pipeline_precheck``
+* Pure-function unit coverage for ``clio_relay.adapters.worker.jarvis_pipeline_precheck``
   (declared step-count extraction from a ``jarvis_describe(target="pipeline")``
   result, the typed refusal payload/text).
 * End-to-end ``EndpointWorker`` lifecycle coverage proving: a pipeline with
@@ -24,11 +24,11 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint_jarvis_recovery
+from clio_relay.adapters.worker import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
-from clio_relay.jarvis_pipeline_precheck import (
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.jarvis_pipeline_precheck import (
     JARVIS_PIPELINE_EMPTY_REASON,
     empty_pipeline_refusal_payload,
     empty_pipeline_refusal_text,

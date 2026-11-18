@@ -42,8 +42,8 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.jarvis_execution_artifacts import ingest_jarvis_execution_outputs
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob
 from clio_relay.relay_ops import read_artifact_bytes
@@ -137,7 +137,7 @@ def _fake_remote_cli(remote_queue: ClioCoreQueue) -> Any:
             if "--execution-id" in args:
                 # clio-relay#278: mirrors job_list_artifacts's own
                 # --execution-id resolution on the remote CLI.
-                from clio_relay.jarvis_execution_artifacts import (
+                from clio_relay.adapters.worker.jarvis_execution_artifacts import (
                     resolve_jarvis_run_owner_by_execution_id,
                 )
 

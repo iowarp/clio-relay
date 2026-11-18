@@ -26,11 +26,12 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import application_runtime_prediction, endpoint_jarvis_recovery, execution_watch
+from clio_relay import application_runtime_prediction, execution_watch
+from clio_relay.adapters.worker import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
-from clio_relay.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.jarvis_execution_artifacts import resolve_jarvis_run_owner_by_execution_id
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     Cursor,

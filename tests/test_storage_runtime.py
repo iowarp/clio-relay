@@ -7,7 +7,7 @@ import pytest
 
 import clio_relay.storage_policy as storage_module
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
@@ -15,7 +15,7 @@ from clio_relay.models import (
     StorageReservationEstimate,
 )
 from clio_relay.storage_policy import StorageLimits, StorageReason
-from clio_relay.storage_runtime import (
+from clio_relay.adapters.worker.storage_runtime import (
     STORAGE_RUNTIME_STATUS_SCHEMA,
     StorageAdmissionError,
     StorageManagedQueue,

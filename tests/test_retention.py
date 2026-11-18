@@ -7,12 +7,12 @@ from typing import Any, cast
 
 import pytest
 
-import clio_relay.retention as retention_module
-from clio_relay import door_error_adapters, door_errors
-from clio_relay.core_queue import ClioCoreQueue
+import clio_relay.adapters.worker.retention as retention_module
+from clio_relay.adapters.worker import door_error_adapters, door_errors
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
-from clio_relay.retention import (
+from clio_relay.adapters.worker.retention import (
     SpoolRetentionPhase,
     TerminalRetentionCoordinator,
 )
@@ -172,7 +172,7 @@ def test_invalid_retention_receipt_keeps_validation_detail_off_public_error(
     )
 
     with (
-        caplog.at_level("WARNING", logger="clio_relay.retention"),
+        caplog.at_level("WARNING", logger="clio_relay.adapters.worker.retention"),
         pytest.raises(QueueConflictError) as captured,
     ):
         private._read_receipt_optional(job_id)

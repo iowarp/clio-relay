@@ -13,7 +13,7 @@ from typing import cast
 import pytest
 from filelock import FileLock, Timeout
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_idempotency,
     queue_layout,
     queue_legacy_audit,
@@ -21,7 +21,7 @@ from clio_relay import (
     queue_store_read,
     queue_store_write,
 )
-from clio_relay.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 from clio_relay.models import (

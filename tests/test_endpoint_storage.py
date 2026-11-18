@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     EndpointRole,
@@ -19,7 +19,7 @@ from clio_relay.models import (
     StorageReservationEstimate,
 )
 from clio_relay.storage_policy import StorageLimits
-from clio_relay.storage_runtime import StorageRuntime, StorageRuntimeConfig
+from clio_relay.adapters.worker.storage_runtime import StorageRuntime, StorageRuntimeConfig
 
 
 class _GrowingProvider(JarvisCdProvider):

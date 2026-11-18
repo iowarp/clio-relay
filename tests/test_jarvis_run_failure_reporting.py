@@ -22,17 +22,17 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint as endpoint_module
-from clio_relay import endpoint_jarvis_recovery
-from clio_relay import jarvis_run_environment as jarvis_run_environment_module
+from clio_relay.adapters.worker import endpoint as endpoint_module
+from clio_relay.adapters.worker import endpoint_jarvis_recovery
+from clio_relay.adapters.worker import jarvis_run_environment as jarvis_run_environment_module
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
 from clio_relay.errors import ConfigurationError
-from clio_relay.jarvis_dispatch_failure import jarvis_dispatch_refusal
+from clio_relay.adapters.worker.jarvis_dispatch_failure import jarvis_dispatch_refusal
 from clio_relay.jarvis_provider import JarvisCdProvider
-from clio_relay.jarvis_run_environment import (
+from clio_relay.adapters.worker.jarvis_run_environment import (
     RELAY_JARVIS_SPACK_COMMAND_ENV,
     jarvis_run_environment_values,
     registered_site_spack_command,

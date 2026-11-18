@@ -10,10 +10,10 @@ from typing import cast
 import pytest
 from typer.testing import CliRunner
 
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.deployment import render_endpoint_user_service
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import (
     EndpointRegistration,
@@ -24,8 +24,8 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
 )
-from clio_relay.queue_management import worker_status
-from clio_relay.worker_concurrency import (
+from clio_relay.adapters.worker.queue_management import worker_status
+from clio_relay.adapters.worker.worker_concurrency import (
     kind_concurrency_metadata,
     normalize_kind_concurrency,
     parse_kind_concurrency_options,

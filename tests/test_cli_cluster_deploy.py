@@ -4,7 +4,7 @@ These moved out of ``tests/test_cli.py`` alongside the six deployment
 ``cluster_app`` commands' (``probe``/``bootstrap``/``install-app``/
 ``install-endpoint-service``/``restart-endpoint-service``/
 ``endpoint-service-status``) extraction into
-``src/clio_relay/cli_cluster_deploy.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_cluster_deploy.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 
@@ -44,19 +44,19 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.application_profiles as application_profiles
-import clio_relay.bootstrap as bootstrap
-import clio_relay.bootstrap_acceptance as bootstrap_acceptance
-import clio_relay.cli as cli
-import clio_relay.cli_cluster_deploy as cli_cluster_deploy
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.cluster_probe as cluster_probe
-import clio_relay.deployment as deployment
-from clio_relay.bootstrap_pin import (
+import clio_relay.adapters.worker.application_profiles as application_profiles
+import clio_relay.adapters.worker.bootstrap as bootstrap
+import clio_relay.adapters.worker.bootstrap_acceptance as bootstrap_acceptance
+import clio_relay.adapters.worker.cli as cli
+import clio_relay.adapters.worker.cli_cluster_deploy as cli_cluster_deploy
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.cluster_probe as cluster_probe
+import clio_relay.adapters.worker.deployment as deployment
+from clio_relay.adapters.worker.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
     BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
 )
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -759,7 +759,7 @@ def test_cluster_bootstrap_costs_exactly_two_ssh_dials_end_to_end(
         "_ssh_host_key_fingerprints_with_trust_source",
         fake_ssh_host_key_fingerprints_with_trust_source,
     )
-    import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
+    import clio_relay.adapters.worker.bootstrap_receipt_validation as bootstrap_receipt_validation
 
     monkeypatch.setattr(
         bootstrap_receipt_validation, "validate_bootstrap_receipt", validate_receipt

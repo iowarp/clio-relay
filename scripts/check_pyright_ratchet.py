@@ -167,7 +167,7 @@ from typing import Any, NamedTuple
 # cli_remote_worker_attach.py, were repointed at the module that actually
 # holds them now -- removing the one real ``reportAttributeAccessIssue``
 # (a static attribute access on a name that no longer exists on
-# ``clio_relay.cli``) plus one adjacent count movement. Net -2, measured
+# ``clio_relay.adapters.worker.cli``) plus one adjacent count movement. Net -2, measured
 # 7569 -> 7567.
 BASELINE_TOTAL = 7498
 

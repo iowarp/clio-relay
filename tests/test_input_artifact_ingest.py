@@ -12,7 +12,7 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from clio_relay import door_errors
+from clio_relay.adapters.worker import door_errors
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -20,9 +20,9 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY, ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY, ClioCoreQueue
 from clio_relay.errors import QueueConflictError
-from clio_relay.http_api import InputArtifactBodyLimitMiddleware, create_app
+from clio_relay.adapters.worker.http_api import InputArtifactBodyLimitMiddleware, create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
@@ -38,9 +38,9 @@ from clio_relay.models import (
     new_id,
     utc_now,
 )
-from clio_relay.queue_management import diagnose_job
+from clio_relay.adapters.worker.queue_management import diagnose_job
 from clio_relay.spool import JobSpool
-from clio_relay.storage_runtime import storage_managed_queue
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 
 
 def _owned_settings(

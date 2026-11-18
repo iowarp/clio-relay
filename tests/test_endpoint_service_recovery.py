@@ -9,12 +9,12 @@ from typing import cast
 import pytest
 from typer.testing import CliRunner
 
-import clio_relay.cli as cli
-import clio_relay.endpoint_service_status as service_status
-from clio_relay.cli import app
+import clio_relay.adapters.worker.cli as cli
+import clio_relay.adapters.worker.endpoint_service_status as service_status
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.deployment import render_endpoint_user_service
-from clio_relay.endpoint_service_status import (
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+from clio_relay.adapters.worker.endpoint_service_status import (
     EndpointServiceReadiness,
     endpoint_service_readiness_over_ssh,
     parse_endpoint_service_readiness,

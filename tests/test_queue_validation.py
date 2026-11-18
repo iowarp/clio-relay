@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     Cursor,
@@ -17,8 +17,8 @@ from clio_relay.models import (
     RemoteAgentTaskSpec,
     utc_now,
 )
-from clio_relay.queue_management import cancel_queue_job, cleanup_stale_jobs
-from clio_relay.queue_validation import run_queue_management_validation
+from clio_relay.adapters.worker.queue_management import cancel_queue_job, cleanup_stale_jobs
+from clio_relay.adapters.worker.queue_validation import run_queue_management_validation
 from clio_relay.relay_ops import cancel_job
 from clio_relay.validation_report import ValidationStatus, load_release_gate_policy
 from tests.queue_validation_fixtures import LiveWorkerFleet

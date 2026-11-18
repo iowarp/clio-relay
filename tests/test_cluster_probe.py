@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pytest import MonkeyPatch
 
-import clio_relay.cluster_probe as cluster_probe
+import clio_relay.adapters.worker.cluster_probe as cluster_probe
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.cluster_probe import (
+from clio_relay.adapters.worker.cluster_probe import (
     CLUSTER_PROBE_SCHEMA,
     probe_cluster_runtime,
 )

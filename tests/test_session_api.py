@@ -27,7 +27,7 @@ from clio_relay.models import (
     RelayJob,
     prepare_owned_jarvis_run_submission,
 )
-from clio_relay.remote_connection import RemoteConnectionRegistry
+from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 from clio_relay.session_api import (
     ChannelReconnectRequired,
     OwnedSessionApiClient,
@@ -310,9 +310,9 @@ def _install_transport(
 
     monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
     monkeypatch.setattr("clio_relay.control_channel._wait_for_channel_health", skip_health)
-    monkeypatch.setattr("clio_relay.remote_connection.secrets.token_hex", token_hex)
+    monkeypatch.setattr("clio_relay.adapters.worker.remote_connection.secrets.token_hex", token_hex)
     monkeypatch.setattr(
-        "clio_relay.remote_connection.http.client.HTTPConnection",
+        "clio_relay.adapters.worker.remote_connection.http.client.HTTPConnection",
         connection_factory,
     )
     monkeypatch.setattr("clio_relay.session_api.connection_registry", lambda: registry)

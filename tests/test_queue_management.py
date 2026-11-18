@@ -6,10 +6,10 @@ from typing import cast
 
 from pytest import MonkeyPatch, raises
 
-import clio_relay.core_queue as core_queue_module
-import clio_relay.queue_admission_simulation as queue_admission_simulation_module
-import clio_relay.queue_layout as queue_layout_module
-from clio_relay.core_queue import ClioCoreQueue
+import clio_relay.adapters.worker.core_queue as core_queue_module
+import clio_relay.adapters.worker.queue_admission_simulation as queue_admission_simulation_module
+import clio_relay.adapters.worker.queue_layout as queue_layout_module
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.models import (
     Cursor,
@@ -29,7 +29,7 @@ from clio_relay.models import (
     SchedulerStatus,
     utc_now,
 )
-from clio_relay.queue_management import (
+from clio_relay.adapters.worker.queue_management import (
     cancel_queue_job,
     cleanup_stale_jobs,
     diagnose_job,

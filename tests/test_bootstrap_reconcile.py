@@ -18,16 +18,16 @@ from typing import Any, cast
 import pytest
 import yaml
 
-import clio_relay.bootstrap_reconcile as bootstrap_reconcile_module
-import clio_relay.bootstrap_reconcile_activation_paths as bootstrap_reconcile_activation_paths
-import clio_relay.bootstrap_reconcile_generation_staging as bootstrap_reconcile_generation_staging
-import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
-import clio_relay.bootstrap_reconcile_planning as bootstrap_reconcile_planning
-import clio_relay.bootstrap_reconcile_planning_support as bootstrap_reconcile_planning_support
-import clio_relay.bootstrap_reconcile_readiness as bootstrap_reconcile_readiness
-import clio_relay.bootstrap_reconcile_repository as bootstrap_reconcile_repository
-from clio_relay import bootstrap_reconcile_jarvis_wrapper_binding
-from clio_relay.bootstrap_reconcile import (
+import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile_module
+import clio_relay.adapters.worker.bootstrap_reconcile_activation_paths as bootstrap_reconcile_activation_paths
+import clio_relay.adapters.worker.bootstrap_reconcile_generation_staging as bootstrap_reconcile_generation_staging
+import clio_relay.adapters.worker.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
+import clio_relay.adapters.worker.bootstrap_reconcile_planning as bootstrap_reconcile_planning
+import clio_relay.adapters.worker.bootstrap_reconcile_planning_support as bootstrap_reconcile_planning_support
+import clio_relay.adapters.worker.bootstrap_reconcile_readiness as bootstrap_reconcile_readiness
+import clio_relay.adapters.worker.bootstrap_reconcile_repository as bootstrap_reconcile_repository
+from clio_relay.adapters.worker import bootstrap_reconcile_jarvis_wrapper_binding
+from clio_relay.adapters.worker.bootstrap_reconcile import (
     BootstrapActivationPath,
     BootstrapDesiredState,
     BootstrapReconcilePlan,
@@ -253,7 +253,7 @@ def test_exact_noop_is_read_only_and_preserves_operator_jarvis_bytes(
         return desired.fingerprint, str(generation.resolve())
 
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile_inspection._inspect_active_generation",
+        "clio_relay.adapters.worker.bootstrap_reconcile_inspection._inspect_active_generation",
         inspect_active_generation,
     )
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -970,7 +970,7 @@ def test_replacement_provider_attests_real_private_uv_tool(
                 [
                     "import json,sys",
                     "from pathlib import Path",
-                    "from clio_relay.bootstrap_reconcile import (",
+                    "from clio_relay.adapters.worker.bootstrap_reconcile import (",
                     "    BootstrapDesiredState,prove_bootstrap_replacement_provider,",
                     ")",
                     "desired=BootstrapDesiredState.model_validate_json(Path(sys.argv[1]).read_text())",
@@ -2408,7 +2408,7 @@ def test_noop_receipt_records_no_scheduler_or_generation_gc(tmp_path: Path) -> N
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
     _write_jarvis_state(tmp_path, desired)
     inspection = inspect_jarvis_state(desired, home=tmp_path)
-    from clio_relay.bootstrap_reconcile import (  # noqa: PLC0415
+    from clio_relay.adapters.worker.bootstrap_reconcile import (  # noqa: PLC0415
         BootstrapInspection,
         BootstrapReadinessEvidence,
     )
@@ -2567,7 +2567,7 @@ def test_prepared_generation_refuses_a_tampered_relay_owned_jarvis_wrapper(
     # inspect_prepared_generation (the caller) now lives in
     # bootstrap_reconcile_generation_staging.py (iowarp/clio-relay#255).
     monkeypatch.setattr(
-        "clio_relay.bootstrap_reconcile_generation_staging.installation_info",
+        "clio_relay.adapters.worker.bootstrap_reconcile_generation_staging.installation_info",
         read_installation,
     )
 

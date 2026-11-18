@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``endpoint_app`` commands' extraction into
-``src/clio_relay/cli_endpoint.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_endpoint.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 ``test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix``,
@@ -40,11 +40,11 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_endpoint as cli_endpoint
-import clio_relay.endpoint as endpoint
+import clio_relay.adapters.worker.cli_endpoint as cli_endpoint
+import clio_relay.adapters.worker.endpoint as endpoint
 import clio_relay.installation as installation_module
-from clio_relay import cli
-from clio_relay.cli import app
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition, WorkerCapacityPolicy
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import JobKind

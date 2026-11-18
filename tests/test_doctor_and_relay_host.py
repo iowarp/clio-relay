@@ -7,11 +7,11 @@ from typing import cast
 
 import pytest
 
-import clio_relay.deployment as deployment
+import clio_relay.adapters.worker.deployment as deployment
 import clio_relay.doctor as doctor
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.deployment import (
+from clio_relay.adapters.worker.deployment import (
     install_endpoint_user_service_over_ssh,
     render_endpoint_user_service,
 )

@@ -10,8 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clio_relay import queue_artifact_lineage, queue_idempotency, queue_jobs
-from clio_relay.cli import app
+from clio_relay.adapters.worker import queue_artifact_lineage, queue_idempotency, queue_jobs
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -19,9 +19,9 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
-from clio_relay.http_api import (
+from clio_relay.adapters.worker.http_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
     create_app,
@@ -596,7 +596,7 @@ def test_cli_submits_and_queries_content_pinned_lineage(
     def execute_locally(_definition: object) -> bool:
         return False
 
-    monkeypatch.setattr("clio_relay.cli._require_cluster", require_local_cluster)
+    monkeypatch.setattr("clio_relay.adapters.worker.cli._require_cluster", require_local_cluster)
     monkeypatch.setattr(
         "clio_relay.remote_cli.should_execute_on_cluster",
         execute_locally,

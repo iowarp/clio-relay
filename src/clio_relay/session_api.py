@@ -4,7 +4,7 @@ Every operation here rides the connection-scoped channel the local relay
 established once, at bring-up, for this cluster.  This module owns owned-session
 *semantics* -- submission receipts, transforms, identity documents -- and never
 owns transport: see :mod:`clio_relay.control_channel` for the held link and
-:mod:`clio_relay.remote_connection` for the connection that holds it.
+:mod:`clio_relay.adapters.worker.remote_connection` for the connection that holds it.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from clio_relay.models import (
     deterministic_jarvis_execution_id,
     is_owned_jarvis_run_spec,
 )
-from clio_relay.remote_connection import (
+from clio_relay.adapters.worker.remote_connection import (
     MAX_SESSION_API_RESPONSE_BYTES,
     RemoteConnection,
     RemoteConnectionRegistry,
@@ -72,7 +72,7 @@ class ChannelReconnectRequired(RelayError):
     owned-session operation. Per the 2FA operating assumption
     (docs/connection-model.md:141-157) this is never turned into a redial
     here, or anywhere upstream of an explicit user action: the connection's
-    own :attr:`~clio_relay.remote_connection.RemoteConnection.state` is
+    own :attr:`~clio_relay.adapters.worker.remote_connection.RemoteConnection.state` is
     already ``"authorization_required"`` by the time this is raised (the
     channel-level ``dropped``/``reestablishing`` events already recorded the
     typed transition), and the only way past it is the single authorized

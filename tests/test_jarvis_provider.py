@@ -18,9 +18,9 @@ from _pytest.monkeypatch import MonkeyPatch
 from filelock import Timeout
 
 from clio_relay import jarvis_provider
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_execution import sanitized_jarvis_environment
+from clio_relay.adapters.worker.jarvis_execution import sanitized_jarvis_environment
 from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import JarvisRunSpec, JobKind, McpCallSpec, RelayJob, RemoteAgentTaskSpec
@@ -569,7 +569,7 @@ def test_scheduled_pipeline_uses_structured_submit_and_observe_runner(tmp_path: 
 
     assert command[0] == str(bin_dir / "python")
     assert command[1:4] == ["-I", "-S", "-c"]
-    assert "from clio_relay.jarvis_execution import run_native_jarvis_broker" in command[4]
+    assert "from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker" in command[4]
     assert "run_native_jarvis_broker(" in command[4]
     assert "runtime_intent=runtime_intent" in command[4]
     assert "runtime_direct_proof=runtime_direct_proof" in command[4]

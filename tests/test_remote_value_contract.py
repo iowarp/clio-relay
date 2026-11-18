@@ -7,9 +7,9 @@ from typing import Protocol, cast
 import pytest
 
 import clio_relay.live_acceptance as live_acceptance
-import clio_relay.transport_probe as transport_probe
+import clio_relay.adapters.worker.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.deployment import render_endpoint_user_service
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.doctor import run_cluster_doctor
 from clio_relay.errors import ConfigurationError
 from clio_relay.frp_remote_scripts import remote_frpc_start_script

@@ -11,7 +11,7 @@ import pytest
 import clio_relay.relay_ops as relay_ops_module
 import clio_relay.spool as spool_module
 from clio_relay.bounded_payload import is_delivery_refusal
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.relay_ops import (

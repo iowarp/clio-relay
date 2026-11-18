@@ -73,7 +73,7 @@ from clio_relay.validation_report import (
     detect_software_identity,
     sha256_file,
 )
-from clio_relay.worker_runtime_verification import (
+from clio_relay.adapters.worker.worker_runtime_verification import (
     MAX_WORKER_ENDPOINT_RECORDS,  # noqa: F401
     _installation_identity_label,  # noqa: F401
     _verify_release_worker_install_source,  # noqa: F401

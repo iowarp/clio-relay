@@ -42,7 +42,7 @@ from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_types as _types
 from clio_relay.cluster_config import ClusterDefinition, ensure_private_configuration_directory
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.jarvis_service_runtime import (

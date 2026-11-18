@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -32,9 +32,9 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.http_api import create_app
-from clio_relay.jarvis_execution_artifacts import ingest_jarvis_execution_outputs
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.jarvis_execution_artifacts import ingest_jarvis_execution_outputs
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.mcp_server import handle_request
 from clio_relay.models import ArtifactRef, JobKind, McpCallSpec, RelayJob

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.bootstrap_pin import (
+from clio_relay.adapters.worker.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
     BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
     PIN_RECONCILIATION_SCHEMA,

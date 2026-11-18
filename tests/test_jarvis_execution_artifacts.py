@@ -8,9 +8,9 @@ from typing import Any, cast
 import pytest
 
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ExecutionOwnerNotFoundError
-from clio_relay.jarvis_execution_artifacts import (
+from clio_relay.adapters.worker.jarvis_execution_artifacts import (
     EXECUTION_OUTPUTS_MISSING_SCHEMA,
     ingest_jarvis_execution_outputs,
     resolve_jarvis_run_owner_by_execution_id,

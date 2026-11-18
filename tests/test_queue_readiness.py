@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay import queue_store_read
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker import queue_store_read
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import EndpointRegistration, EndpointRole
-from clio_relay.queue_store_lock import LegacyQueueStateError
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 
 
 def _tree_identity(root: Path) -> dict[str, tuple[bytes, int]]:

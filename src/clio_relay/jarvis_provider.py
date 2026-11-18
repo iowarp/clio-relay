@@ -24,7 +24,7 @@ import yaml
 
 from clio_relay import process_containment
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_execution import (
+from clio_relay.adapters.worker.jarvis_execution import (
     jarvis_private_credential_channel,
     named_jarvis_command,
     scheduled_jarvis_command,

@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import (
     TERMINAL_STATES,
     EndpointRegistration,

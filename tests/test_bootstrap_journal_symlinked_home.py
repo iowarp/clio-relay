@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay import bootstrap_journal
+from clio_relay.adapters.worker import bootstrap_journal
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned traversal is POSIX")
 

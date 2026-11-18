@@ -11,10 +11,10 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import endpoint_jarvis_recovery
+from clio_relay.adapters.worker import endpoint_jarvis_recovery
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import (
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import (
     EndpointWorker,
     _close_recovery_directory_anchor,  # pyright: ignore[reportPrivateUsage]
     _durable_jarvis_execution_recovery,  # pyright: ignore[reportPrivateUsage]
@@ -24,7 +24,7 @@ from clio_relay.endpoint import (
     _read_owned_recovery_result,  # pyright: ignore[reportPrivateUsage]
     minimal_mcp_runner_environment,
 )
-from clio_relay.endpoint_sidecar_types import MCP_RUNNER_BASE_ENV_NAMES
+from clio_relay.adapters.worker.endpoint_sidecar_types import MCP_RUNNER_BASE_ENV_NAMES
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
     EndpointRole,

@@ -31,7 +31,7 @@ import pytest
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.frp_transport import BrokeredTcpTransport, UdpRendezvousTransport
-from clio_relay.frpc_unit import render_frpc_proxy_toml
+from clio_relay.adapters.worker.frpc_unit import render_frpc_proxy_toml
 
 
 def _frp_definition(*, cluster: str = "ares", proxy_name: str | None = None) -> ClusterDefinition:

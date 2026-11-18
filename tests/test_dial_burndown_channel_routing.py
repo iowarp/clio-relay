@@ -18,7 +18,7 @@ py``, ``cli_remote_worker_probe.py``, ``cli_remote_mcp.py``), two cases:
 Reuses ``tests/test_owned_session_channel.py``'s harness (``_Harness``,
 ``_install``, ``_connect``, ``_definition``, ``_settings``) -- the same
 fake ``http.client.HTTPConnection``/channel-process seam that harness
-already proves a real :class:`~clio_relay.remote_connection.RemoteConnection`
+already proves a real :class:`~clio_relay.adapters.worker.remote_connection.RemoteConnection`
 against, so "zero new dials, requests observed over the held channel" is
 asserted the same way the deployment-gate acceptance test is.
 """
@@ -34,16 +34,16 @@ from typing import cast
 
 import pytest
 
-import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
-import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.adapters.worker.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
+import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 import clio_relay.cli_remote_mcp as cli_remote_mcp
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.remote_channel_dispatch as remote_channel_dispatch
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.cluster_config_models import ClusterTargetIdentity
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.models import JobState
 from tests.test_owned_session_channel import (
@@ -79,7 +79,7 @@ def _install_for_channel_dispatch(monkeypatch: pytest.MonkeyPatch, harness: _Har
 
 def _cold_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """No live channel is held for any cluster -- every dispatch cold-falls-back."""
-    from clio_relay.remote_connection import RemoteConnectionRegistry
+    from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 
     monkeypatch.setattr(
         remote_channel_dispatch, "connection_registry", lambda: RemoteConnectionRegistry()

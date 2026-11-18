@@ -7,10 +7,10 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from clio_relay import queue_jobs
+from clio_relay.adapters.worker import queue_jobs
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.http_api import JarvisMcpCallSubmitRequest, create_app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import JarvisMcpCallSubmitRequest, create_app
 from clio_relay.models import (
     JobKind,
     McpCallSpec,
@@ -285,7 +285,7 @@ def test_typed_http_jarvis_run_retry_replays_server_identity(
         return _SERVER_ARTIFACT_DIGEST
 
     monkeypatch.setattr(
-        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
+        "clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))
@@ -328,7 +328,7 @@ def test_typed_http_jarvis_run_rejects_caller_execution_identity(
         return _SERVER_ARTIFACT_DIGEST
 
     monkeypatch.setattr(
-        "clio_relay.http_api_routes_jobs.jarvis_mcp_artifact_binding",
+        "clio_relay.adapters.worker.http_api_routes_jobs.jarvis_mcp_artifact_binding",
         artifact_binding,
     )
     client = cast(Any, TestClient(create_app(settings)))

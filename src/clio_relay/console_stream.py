@@ -7,7 +7,7 @@ output. The application's own stdout (LAMMPS thermo lines, etc.) is instead
 collected by JARVIS-CD into ``<execution_root>/stdout.log`` on the local
 filesystem and never enters relay on its own. This module feeds a THIRD job
 log stream, ``console``, so ``GET /jobs/{id}/logs/console`` (the same door
-that already serves ``stdout``/``stderr``, see :mod:`clio_relay.http_api`)
+that already serves ``stdout``/``stderr``, see :mod:`clio_relay.adapters.worker.http_api`)
 can serve that application output.
 
 Two halves, deliberately asymmetric in how much they can guarantee:
@@ -16,7 +16,7 @@ Two halves, deliberately asymmetric in how much they can guarantee:
   -- THE GUARANTEE. Once a terminal ``jarvis_run`` result is available, the
   execution root is authoritative (declared in the result's own
   ``execution_record.metadata``, the exact derivation
-  :func:`clio_relay.jarvis_execution_artifacts.execution_root_from_record`
+  :func:`clio_relay.adapters.worker.jarvis_execution_artifacts.execution_root_from_record`
   already trusts for execution-output artifacts). This always succeeds at
   making ``console`` complete, or reports a typed reason -- it never fails
   the job.
@@ -33,7 +33,7 @@ Two halves, deliberately asymmetric in how much they can guarantee:
   its guess turns out wrong.
 
 Every failure mode in both halves is a typed, deduplicated reason the caller
-logs through the job's own event stream (:mod:`clio_relay.endpoint`) --
+logs through the job's own event stream (:mod:`clio_relay.adapters.worker.endpoint`) --
 never a silent skip, and never a reason the job's own execution can fail on.
 """
 
@@ -49,7 +49,7 @@ from typing import Any, Literal, cast
 
 import yaml
 
-from clio_relay.jarvis_execution_artifacts import (
+from clio_relay.adapters.worker.jarvis_execution_artifacts import (
     MAX_EXECUTION_RESULT_BYTES,
     execution_root_from_record,
 )
@@ -525,7 +525,7 @@ def flush_terminal_console(
     """Guarantee the ``console`` stream carries the full application log.
 
     Reuses the exact execution-root derivation
-    :func:`clio_relay.jarvis_execution_artifacts.execution_root_from_record`
+    :func:`clio_relay.adapters.worker.jarvis_execution_artifacts.execution_root_from_record`
     already trusts for execution-output artifacts: the terminal
     ``execution_record.metadata`` declares ``pipeline_snapshot_path`` or
     ``script_path``, whose parent directory is the execution root. This is

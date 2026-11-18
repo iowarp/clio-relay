@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond import and
 patch-target updates) alongside ``session_app``'s six user-facing commands'
-extraction into ``src/clio_relay/cli_session.py``, per ground rule 3 (§2 of
+extraction into ``src/clio_relay/adapters/worker/cli_session.py``, per ground rule 3 (§2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through one of the moved commands moves with the logic it exercises.
 ``session start``/``session teardown`` stay in ``cli.py`` (see
@@ -34,17 +34,17 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
-import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.session_api as session_api
-import clio_relay.session_lifecycle as session_lifecycle
-from clio_relay import cli
-from clio_relay.cli import app
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import app
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.session_lifecycle import CleanupResource, SessionLifecycleReport
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource, SessionLifecycleReport
 from tests.test_cli import (
     _activate_owner_session,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _fake_empty_runtime_cleanup,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

@@ -15,7 +15,7 @@ import pytest
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.control_channel import TransportIdentityAnchorRequired
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.frpc_unit import (
+from clio_relay.adapters.worker.frpc_unit import (
     _env_file_line,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     escape_env_file_value,
     frpc_proxy_config_digest,

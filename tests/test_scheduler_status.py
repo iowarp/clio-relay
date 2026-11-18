@@ -21,9 +21,9 @@ from pytest import MonkeyPatch
 
 from clio_relay import process_containment
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_execution import (
+from clio_relay.adapters.worker.jarvis_execution import (
     named_jarvis_command,
     register_scheduled_jarvis_command,
     run_native_jarvis_broker,
@@ -47,7 +47,7 @@ from clio_relay.scheduler_providers import (
     provider_for_scheduler,
     register_scheduler_provider,
 )
-from clio_relay.scheduler_status import relay_queue_status
+from clio_relay.adapters.worker.scheduler_status import relay_queue_status
 
 
 def _install_runtime_credential_fd(
@@ -1484,7 +1484,7 @@ def test_slurm_execution_adapter_is_separate_from_observation_provider(
     assert "CLIO_RELAY_RUNTIME_METADATA_TOKEN" not in source
     assert "CLIO_RELAY_BROKER_CREDENTIAL_FD" in source
     assert "CLIO_RELAY_BROKER_READY_FD" in source
-    assert "from clio_relay.jarvis_execution import run_native_jarvis_broker" in source
+    assert "from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker" in source
     assert "run_native_jarvis_broker(" in source
     assert "provider_for_scheduler" not in source
     assert "provider.poll(" not in source

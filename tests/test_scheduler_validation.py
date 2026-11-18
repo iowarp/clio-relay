@@ -7,7 +7,7 @@ from pytest import MonkeyPatch
 
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.models import SchedulerPhase, SchedulerStatus
-from clio_relay.scheduler_validation import run_scheduler_lifecycle_validation
+from clio_relay.adapters.worker.scheduler_validation import run_scheduler_lifecycle_validation
 from clio_relay.validation_report import ValidationStatus
 
 
@@ -65,7 +65,7 @@ def test_scheduler_lifecycle_validation_observes_real_ordered_states(
         return provider
 
     monkeypatch.setattr(
-        "clio_relay.scheduler_validation.validation_provider_for_scheduler",
+        "clio_relay.adapters.worker.scheduler_validation.validation_provider_for_scheduler",
         resolve_provider,
     )
 
@@ -124,7 +124,7 @@ def test_scheduler_lifecycle_validation_cancels_exact_job_on_failure(
         return provider
 
     monkeypatch.setattr(
-        "clio_relay.scheduler_validation.validation_provider_for_scheduler",
+        "clio_relay.adapters.worker.scheduler_validation.validation_provider_for_scheduler",
         resolve_provider,
     )
 

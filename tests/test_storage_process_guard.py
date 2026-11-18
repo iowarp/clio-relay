@@ -8,7 +8,7 @@ import pytest
 from clio_relay import process_containment
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.storage_policy import StorageLimits
-from clio_relay.storage_runtime import (
+from clio_relay.adapters.worker.storage_runtime import (
     StorageRuntime,
     StorageRuntimeConfig,
     StorageRuntimeViolation,

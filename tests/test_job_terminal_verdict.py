@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from typing import cast
 
-from clio_relay.jarvis_dispatch_failure import JarvisDispatchRefusal
-from clio_relay.job_terminal_verdict import (
+from clio_relay.adapters.worker.jarvis_dispatch_failure import JarvisDispatchRefusal
+from clio_relay.adapters.worker.job_terminal_verdict import (
     terminal_failure_error_text,
     terminal_failure_message,
     terminal_failure_metadata,

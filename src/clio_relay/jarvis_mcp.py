@@ -358,7 +358,7 @@ def jarvis_mcp_env_from() -> dict[str, str]:
 
 def jarvis_cd_lock_binding_expectation() -> dict[str, str]:
     """Return the exact relay release pin required by its built-in JARVIS MCP."""
-    from clio_relay.bootstrap import (
+    from clio_relay.adapters.worker.bootstrap import (
         JARVIS_CD_VERSION,
         JARVIS_CD_WHEEL_SHA256,
         JARVIS_CD_WHEEL_URL,

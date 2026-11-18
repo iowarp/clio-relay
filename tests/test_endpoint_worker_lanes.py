@@ -3,7 +3,7 @@
 Three layers, matching the module's own two-part fix plus the exact
 crash it replaces:
 
-1. Fast, isolated unit tests of :mod:`clio_relay.endpoint_worker_lanes`
+1. Fast, isolated unit tests of :mod:`clio_relay.adapters.worker.endpoint_worker_lanes`
    itself (``quarantine_relay_error`` / ``run_worker_lane_iteration``)
    against small recording fakes -- no queue, no worker, no subprocess.
 2. An in-process integration test that seeds a poisoned durable
@@ -42,9 +42,9 @@ from typing import Any, cast
 import pytest
 
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
-from clio_relay.endpoint_worker_lanes import (
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.endpoint_worker_lanes import (
     LANE_LAST_ERROR_METADATA_KEY,
     RECOVERY_RECORD_QUARANTINED,
     WORKER_LANE_ITERATION_FAILED,
@@ -193,7 +193,7 @@ def test_run_worker_lane_iteration_contains_failure_and_records_typed_reason(
     def _iterate() -> None:
         raise ConfigurationError("JARVIS-CD executable not found: jarvis")
 
-    with caplog.at_level("ERROR", logger="clio_relay.endpoint_worker_lanes"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.endpoint_worker_lanes"):
         result = run_worker_lane_iteration(_iterate, queue=queue, endpoint=endpoint)
 
     # The iteration's exception never escapes -- this is the whole point:
@@ -353,7 +353,7 @@ def _spawn_daemon_worker(
     cmd = [
         sys.executable,
         "-c",
-        "from clio_relay.cli import app; app()",
+        "from clio_relay.adapters.worker.cli import app; app()",
         "endpoint",
         "start",
         "--role",
