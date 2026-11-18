@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui.components import Tree, bound, event, open_url
@@ -111,13 +111,49 @@ class SiteView:
 
 @dataclass
 class TabState:
-    """What the tab remembers between reads, in memory."""
+    """What the tab remembers between reads."""
 
     notice: str = ""
     editing: set[str] = field(default_factory=set[str])
     confirming: set[str] = field(default_factory=set[str])
     errors: dict[str, dict[str, str]] = field(default_factory=dict[str, dict[str, str]])
     links: dict[str, str] = field(default_factory=dict[str, str])
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the state as JSON-ready data."""
+        return {
+            "notice": self.notice,
+            "editing": sorted(self.editing),
+            "confirming": sorted(self.confirming),
+            "errors": self.errors,
+            "links": self.links,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TabState:
+        """Read a state :meth:`to_dict` wrote; anything unreadable reads as empty."""
+        if not isinstance(data, dict):
+            return cls()
+        raw = cast(dict[str, Any], data)
+
+        def names(key: str) -> set[str]:
+            value = raw.get(key)
+            items = cast(list[Any], value) if isinstance(value, list) else []
+            return {str(item) for item in items}
+
+        def mapping(value: Any) -> dict[str, Any]:
+            return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+        return cls(
+            notice=str(raw.get("notice") or ""),
+            editing=names("editing"),
+            confirming=names("confirming"),
+            errors={
+                str(key): {str(k): str(v) for k, v in mapping(value).items()}
+                for key, value in mapping(raw.get("errors")).items()
+            },
+            links={str(k): str(v) for k, v in mapping(raw.get("links")).items()},
+        )
 
     def forget(self, site_id: str) -> None:
         """Drop everything the tab holds for a site."""

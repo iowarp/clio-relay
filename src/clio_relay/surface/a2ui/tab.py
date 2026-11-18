@@ -187,11 +187,25 @@ class ComputeTab:
     def __init__(self, service: RelayService, changes: ServerChanges) -> None:
         self.service = service
         self.changes = changes
-        self.tokens = ActionTokens()
+        home = service.paths.state_dir / "a2ui"
+        self.tokens = ActionTokens(home / "tokens")
         self.state = TabState()
+        self._state_file = home / "compute-tab.json"
         self._lock = asyncio.Lock()
         self._seen: str | None = None
         self._watching: asyncio.Task[None] | None = None
+
+    # What the tab remembers, shared by every relay process serving it
+
+    def _load_state(self) -> None:
+        try:
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        self.state = TabState.from_dict(data)
+
+    def _save_state(self) -> None:
+        write_json_atomic(self._state_file, self.state.to_dict())
 
     # What the tab shows
 
@@ -304,6 +318,7 @@ class ComputeTab:
     async def read(self, client: A2UIClient | None) -> ResourceResult:
         """Return the whole tab: A2UI for a client that renders it, text otherwise."""
         self._watch()
+        await asyncio.to_thread(self._load_state)
         views = await self.views()
         if client is None:
             return ResourceResult(
@@ -318,7 +333,11 @@ class ComputeTab:
 
     def _snapshot(self) -> str:
         digest = hashlib.sha256()
-        for path in (self.service.paths.sites_file, probes_file(self.service.paths)):
+        for path in (
+            self.service.paths.sites_file,
+            probes_file(self.service.paths),
+            self._state_file,
+        ):
             try:
                 digest.update(path.read_bytes())
             except OSError:
@@ -349,6 +368,12 @@ class ComputeTab:
         """Run one action the tab rendered, if ``token`` allows it."""
         grant = self.tokens.spend(token, action) if token else None
         if grant is None:
+            # The process that rendered the tab may not be this one: changing the
+            # shared state is what makes every reader refresh it.
+            async with self._lock:
+                await asyncio.to_thread(self._load_state)
+                self.state.notice = "That button was out of date, so the tab has been refreshed."
+                await asyncio.to_thread(self._save_state)
             await self.changes.resource_updated(TAB_URI)
             refusal = Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
@@ -366,8 +391,10 @@ class ComputeTab:
             )
         handler = self._handlers()[action]
         async with self._lock:
+            await asyncio.to_thread(self._load_state)
             self.state.notice = ""
             outcome = await handler(grant.subject, _dict(values))
+            await asyncio.to_thread(self._save_state)
             self._seen = await asyncio.to_thread(self._snapshot)
             views = await self.views()
             client = a2ui_client(ctx)

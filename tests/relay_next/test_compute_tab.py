@@ -215,6 +215,33 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
     asyncio.run(scenario())
 
 
+def test_a_token_rendered_by_one_relay_is_spent_by_another_once(
+    relay_paths: RelayPaths,
+) -> None:
+    """A host reads the tab over one connection and calls actions over others."""
+    add_site(relay_paths)
+
+    async def scenario() -> None:
+        async with (
+            a2ui_client(relay_paths) as reader,
+            a2ui_client(relay_paths) as first,
+            a2ui_client(relay_paths) as second,
+        ):
+            host = Host(reader)
+            await host.open()
+            name, context = host.action("relay-sites", "s-fx-edit")
+            result = await first.call_tool(name, context, raise_on_error=False)
+            assert not result.is_error, _said(result)
+            again = await second.call_tool(name, context, raise_on_error=False)
+            assert again.is_error, "a token is single use across relays"
+            # What one relay's action changed, the reader's next read shows.
+            await host.open()
+            assert "s-fx-edit-divider" in host.visible("relay-sites")
+            assert "out of date" in host.text("relay-sites")
+
+    asyncio.run(scenario())
+
+
 def test_tab_uses_only_the_catalog_components(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, adapter="fixture", config={"sign_in": True})
 
