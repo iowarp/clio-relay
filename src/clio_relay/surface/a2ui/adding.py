@@ -20,6 +20,7 @@ from clio_relay.surface.a2ui.surfaces import (
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
 
+
 def add_draft(forms: dict[str, Form]) -> dict[str, Any]:
     """Return the add form's empty draft."""
     return {
@@ -113,4 +114,3 @@ def add_surface(
         "drafts": {"add": add_draft(forms)},
     }
     return tree.components, data
-

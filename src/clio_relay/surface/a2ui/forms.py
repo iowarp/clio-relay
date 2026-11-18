@@ -289,4 +289,3 @@ def field_rows(
 def form_error(tree: Tree, base: str, errors: dict[str, str]) -> list[str]:
     message = errors.get(FORM_ERROR)
     return [tree.text(f"{base}-error", message, "caption")] if message else []
-

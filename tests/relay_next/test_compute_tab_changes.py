@@ -17,6 +17,7 @@ from clio_relay.surface.settings import RelayPaths
 from .conftest import add_site
 from .test_compute_tab import AD, Host
 
+
 def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) -> None:
     heard: asyncio.Queue[str] = asyncio.Queue()
 
