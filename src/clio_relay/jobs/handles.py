@@ -84,6 +84,7 @@ StallReport = Callable[[float, float], Awaitable[None]]
 the seconds until the next check. The command keeps running; the person may
 cancel the call."""
 
+
 class EndpointPort(BaseModel):
     """One reachable port of a service."""
 

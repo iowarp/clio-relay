@@ -561,7 +561,6 @@ class RelayServer:
                 f"again in {next_s:.0f} s; cancel the call to stop it"
             )
             await ctx.report_progress(idle_s, message=note)
-            await ctx.info(note)
 
         try:
             result = await self.service.exec(
@@ -681,7 +680,9 @@ class RelayServer:
             ctx: Context,
             timeout_s: Annotated[
                 float | None,
-                Field(gt=0, description="Optional limit; by default the command runs until it ends"),
+                Field(
+                    gt=0, description="Optional limit; by default the command runs until it ends"
+                ),
             ] = None,
             max_output_bytes: Annotated[int, Field(ge=1, le=MAX_INLINE_BYTES)] = 65536,
         ) -> ToolResult:

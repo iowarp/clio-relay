@@ -20,6 +20,7 @@ def _site(paths: RelayPaths, alternatives: dict[str, dict[str, object]]) -> Site
             "id": "fx",
             "adapter": "fixture",
             "config": {"queue_s": -1},
+            "policy": "open",
             "alternatives": alternatives,
         }
     )
