@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -61,15 +61,27 @@ def _stdio(paths: RelayPaths) -> StdioServerParameters:
     )
 
 
-async def _answer(
-    context: ClientRequestContext, params: mcp_types.ElicitRequestParams
-) -> mcp_types.ElicitResult:
+Answer = Callable[
+    [ClientRequestContext, mcp_types.ElicitRequestParams], Awaitable[mcp_types.ElicitResult]
+]
+
+
+def _answerer(auth: tuple[str, str] | None = None) -> Answer:
     """A person who approves: opens the page for a URL question, says yes to a form."""
-    del context
-    if isinstance(params, mcp_types.ElicitRequestURLParams):
-        assert await asyncio.to_thread(answer_page, params.url) == 200
-        return mcp_types.ElicitResult(action="accept")
-    return mcp_types.ElicitResult(action="accept", content={"approve": True})
+
+    async def answer(
+        context: ClientRequestContext, params: mcp_types.ElicitRequestParams
+    ) -> mcp_types.ElicitResult:
+        del context
+        if isinstance(params, mcp_types.ElicitRequestURLParams):
+            assert await asyncio.to_thread(answer_page, params.url, auth=auth) == 200
+            return mcp_types.ElicitResult(action="accept")
+        return mcp_types.ElicitResult(action="accept", content={"approve": True})
+
+    return answer
+
+
+_answer = _answerer()
 
 
 def _state(result: mcp_types.CallToolResult) -> str:
@@ -206,7 +218,9 @@ def test_plain_mcp_client_over_http(
             headers={"Authorization": f"Bearer {token}"}, timeout=120
         ) as http:
             transport = streamable_http_client(url, http_client=http)
-            async with Client(transport, mode=mode, elicitation_callback=_answer) as client:
+            operator = (relay_paths.state_dir / "operator-token").read_text(encoding="utf-8")
+            answer = _answerer(("operator", operator.strip()))
+            async with Client(transport, mode=mode, elicitation_callback=answer) as client:
                 for site in ("spend", "sso"):
                     ran = await client.call_tool("run", {"site": site, "spec": ECHO, "wait_s": 60})
                     assert _state(ran) == "completed", site
