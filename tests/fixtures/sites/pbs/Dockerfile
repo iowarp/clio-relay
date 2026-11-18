@@ -18,7 +18,8 @@ WORKDIR /src
 RUN ./autogen.sh \
     && ./configure --prefix=/opt/pbs \
     && make -j"$(nproc)" \
-    && make install DESTDIR=/out
+    && make install DESTDIR=/out \
+    && find /out -mindepth 1 -maxdepth 3 -not -path '/out/opt*'
 
 FROM ${BASE_IMAGE}
 LABEL clio-relay-rework="1" clio-relay-rework.owner="w2-fixtures"
@@ -27,7 +28,8 @@ RUN apt-get update \
         expat libedit2 postgresql postgresql-contrib postgresql-server-dev-all \
         sendmail-bin tcl tk libical3 libcjson1 libhwloc15 libxt6 libxft2 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /out/ /
+# Only /opt/pbs: copying all of /out would replace Ubuntu's /lib symlink.
+COPY --from=build /out/opt/pbs /opt/pbs
 RUN /opt/pbs/libexec/pbs_postinstall \
     && chmod 4755 /opt/pbs/sbin/pbs_iff /opt/pbs/sbin/pbs_rcp \
     && for tool in /opt/pbs/bin/*; do ln -sf "$tool" /usr/local/bin/; done

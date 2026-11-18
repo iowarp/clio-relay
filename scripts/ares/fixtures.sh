@@ -35,6 +35,10 @@ LABELS=(
     --label "clio-relay-rework.owner=$OWNER"
 )
 FILTERS=(--filter "label=clio-relay-rework=1" --filter "label=clio-relay-rework.owner=$OWNER")
+# Image labels reach the intermediate containers of a build, so containers the
+# script runs carry one more label, and only those are listed or removed.
+RUN_LABEL=clio-relay-rework.fx-run=1
+RUN_FILTERS=("${FILTERS[@]}" --filter "label=$RUN_LABEL")
 PORT_NAMES="SSH SLURM PBS OTP FRPS FRPS_WSS SECRET COUNTER"
 
 log() { printf '[fixtures] %s\n' "$*" >&2; }
@@ -208,7 +212,7 @@ start_container() {
     docker create --name "$name" --hostname "fx-$site" \
         --network "$NETWORK" --network-alias "fx-$site" \
         --init --stop-timeout 15 \
-        "${LABELS[@]}" --label "com.docker.compose.service=fx-$site" \
+        "${LABELS[@]}" --label "$RUN_LABEL" --label "com.docker.compose.service=fx-$site" \
         "$@" >/dev/null
     # Copied, not bind-mounted: the state directory may sit on NFS with root squash.
     docker cp "$STATE_DIR/bundles/$bundle" "$name:/fixture-secrets" >/dev/null
@@ -239,7 +243,7 @@ tcp_open() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2"; }
 cmd_up() {
     command -v docker >/dev/null || die "docker not found"
     install -d -m 0700 "$STATE_DIR"
-    if [ -n "$(docker ps -aq "${FILTERS[@]}")" ]; then
+    if [ -n "$(docker ps -aq "${RUN_FILTERS[@]}")" ]; then
         die "fixtures already exist; run status, or down first"
     fi
     images_present || cmd_build
@@ -253,7 +257,7 @@ cmd_up() {
         # The tests drive frpc from the host, at the same pinned version as frps.
         install -d "$STATE_DIR/bin"
         local tmp
-        tmp=$(docker create "${LABELS[@]}" "$(image_for frps)")
+        tmp=$(docker create "${LABELS[@]}" --label "$RUN_LABEL" "$(image_for frps)")
         docker cp "$tmp:/usr/local/bin/frpc" "$STATE_DIR/bin/frpc" >/dev/null
         docker rm "$tmp" >/dev/null
     fi
@@ -286,7 +290,7 @@ cmd_up() {
 }
 
 cmd_status() {
-    docker ps -a "${FILTERS[@]}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    docker ps -a "${RUN_FILTERS[@]}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     if [ -f "$STATE_DIR/ports.env" ]; then
         echo
         sed 's/^FX_/  /' "$STATE_DIR/ports.env"
@@ -295,7 +299,7 @@ cmd_status() {
 
 cmd_down() {
     local ids
-    ids=$(docker ps -aq "${FILTERS[@]}")
+    ids=$(docker ps -aq "${RUN_FILTERS[@]}")
     if [ -n "$ids" ]; then
         # shellcheck disable=SC2086
         docker rm -f $ids >/dev/null
