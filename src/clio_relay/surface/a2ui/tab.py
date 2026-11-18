@@ -38,8 +38,16 @@ from clio_relay.identity.probe import probe_site, probes_file
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface.a2ui import surfaces
-from clio_relay.surface.a2ui.forms import Field, Form, FormError, form, parse, parse_value
+from clio_relay.surface.a2ui import adding, protocol, surfaces
+from clio_relay.surface.a2ui.forms import (
+    FORM_ERROR,
+    Field,
+    Form,
+    FormError,
+    form,
+    parse,
+    parse_value,
+)
 from clio_relay.surface.a2ui.protocol import MIME_TYPE, A2UIClient, Message, a2ui_client, embedded
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
@@ -50,7 +58,6 @@ from clio_relay.surface.a2ui.surfaces import (
     CATALOG_PATH,
     CATALOG_SITE_ERROR,
     EDIT_FIELDS,
-    FORM_ERROR,
     SITES_SURFACE,
     SiteView,
     TabState,
@@ -220,11 +227,12 @@ class ComputeTab:
     # What the tab shows
 
     def forms(self) -> dict[str, Form]:
-        """Return a form for each installed adapter, by name."""
+        """Return a form for each installed adapter, by name, marking the test-only ones."""
         found: dict[str, Form] = {}
         for name in registry.names():
             try:
-                found[name] = form(name, registry.config_schema(name))
+                cls = registry.load(name)
+                found[name] = form(name, cls.Config.model_json_schema(), listed=cls.listed)
             except Refusal:
                 continue
         return found
@@ -330,7 +338,7 @@ class ComputeTab:
         forms = self.forms()
         return {
             SITES_SURFACE: surfaces.sites_surface(views, self.state, forms, self.tokens),
-            ADD_SURFACE: surfaces.add_surface(forms, self._catalog(), self.state, self.tokens),
+            ADD_SURFACE: adding.add_surface(forms, self._catalog(), self.state, self.tokens),
         }
 
     async def read(self, client: A2UIClient | None) -> ResourceResult:
@@ -344,7 +352,7 @@ class ComputeTab:
             )
         messages: list[Message] = []
         for surface_id, (components, data) in (await self._surfaces(views)).items():
-            messages += surfaces.create(client, surface_id, components, data)
+            messages += protocol.create(client, surface_id, components, data)
         return ResourceResult([ResourceContent(json.dumps(messages), MIME_TYPE)])
 
     # Watching for changes made elsewhere
@@ -392,6 +400,8 @@ class ComputeTab:
                 await asyncio.to_thread(self._load_state)
                 self.state.notice = "That button was out of date, so the tab has been refreshed."
                 await asyncio.to_thread(self._save_state)
+                # Announced here, so the watcher must not announce the same write again.
+                self._seen = await asyncio.to_thread(self._snapshot)
             await self.changes.resource_updated(TAB_URI)
             refusal = Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
@@ -426,7 +436,7 @@ class ComputeTab:
             if client is not None:
                 messages: list[Message] = []
                 for surface_id, (components, data) in (await self._surfaces(views)).items():
-                    messages += surfaces.update(client, surface_id, components, None)
+                    messages += protocol.update(client, surface_id, components, None)
                     for path in self._resend(surface_id, outcome, data):
                         messages.append(
                             {

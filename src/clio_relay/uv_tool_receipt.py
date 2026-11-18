@@ -213,7 +213,12 @@ def persistent_uv_tool_receipt_identity(
             return {"verified": False, "error": "uv tool receipt entry point is invalid"}
         entrypoint = cast(dict[str, object], raw_entrypoint)
         source = entrypoint.get("from")
-        if isinstance(source, str) and normalized_distribution_name(source) == "clio-relay":
+        # The distribution ships more than one console script (clio-relay-askpass too).
+        if (
+            isinstance(source, str)
+            and normalized_distribution_name(source) == "clio-relay"
+            and entrypoint.get("name") == "clio-relay"
+        ):
             launcher_matches.append(entrypoint)
     launcher_bound = False
     if len(launcher_matches) == 1 and tool_executable is not None:

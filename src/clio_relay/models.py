@@ -102,7 +102,6 @@ from clio_relay.models_job_specs import (
     InputArtifactSpec,  # noqa: F401
     JarvisRunSpec,  # noqa: F401
     JobSpec,  # noqa: F401
-    McpCallSpec,  # noqa: F401
     RemoteAgentTaskSpec,  # noqa: F401
     deterministic_input_artifact_id,  # noqa: F401
 )

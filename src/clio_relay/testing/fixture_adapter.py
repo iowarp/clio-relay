@@ -49,6 +49,7 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
     name: ClassVar[str] = "fixture"
     Config: ClassVar[type[BaseModel]] = FixtureConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
+    listed: ClassVar[bool] = False
 
     def __init__(self, config: FixtureConfig, context: AdapterContext) -> None:
         super().__init__(config, context)

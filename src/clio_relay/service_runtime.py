@@ -6,7 +6,6 @@ from clio_relay import service_runtime_attach as _attach
 from clio_relay import service_runtime_browser as _browser
 from clio_relay import service_runtime_core as _core
 from clio_relay import service_runtime_detach as _detach
-from clio_relay import service_runtime_jarvis_bind as _jarvis_bind
 from clio_relay import service_runtime_local_connector as _local_connector
 from clio_relay import service_runtime_local_start as _local_start
 from clio_relay import service_runtime_observation as _observation
@@ -24,7 +23,6 @@ from clio_relay.service_runtime_results import (
 class ServiceRuntimeSupervisor(
     _core._ServiceRuntimeCoreMixin,
     _start._ServiceRuntimeStartMixin,
-    _jarvis_bind._ServiceRuntimeJarvisBindMixin,
     _browser._ServiceRuntimeBrowserMixin,
     _stop._ServiceRuntimeStopMixin,
     _detach._ServiceRuntimeDetachMixin,
@@ -35,7 +33,7 @@ class ServiceRuntimeSupervisor(
     _remote_connector._ServiceRuntimeRemoteConnectorMixin,
     _local_start._ServiceRuntimeLocalStartMixin,
 ):
-    """Start, bind, probe, and tear down scheduler-backed remote service sessions.
+    """Start, probe, and tear down scheduler-backed remote service sessions.
 
     Composed entirely from owner-module mixins (#231 class-mixin split):
     each mixin owns one coherent slice of the state machine's methods, and
@@ -48,13 +46,11 @@ class ServiceRuntimeSupervisor(
 
     Composition, in base-list order:
       - ``_ServiceRuntimeCoreMixin`` (service_runtime_core.py): construction,
-        the per-gateway transition lock, the shared SSH transport, JARVIS
-        authorization resolution, durable-failure recorders. Must stay
-        first: every other mixin depends on ``__init__`` here.
+        the per-gateway transition lock, the shared SSH transport,
+        durable-failure recorders. Must stay first: every other mixin
+        depends on ``__init__`` here.
       - ``_ServiceRuntimeStartMixin`` (service_runtime_start.py): the
         start/resume-start state machine.
-      - ``_ServiceRuntimeJarvisBindMixin`` (service_runtime_jarvis_bind.py):
-        JARVIS-bound runtime binding.
       - ``_ServiceRuntimeBrowserMixin`` (service_runtime_browser.py):
         browser sandbox attach/detach.
       - ``_ServiceRuntimeStopMixin`` (service_runtime_stop.py): teardown.

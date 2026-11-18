@@ -20,6 +20,11 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from clio_relay.surface.a2ui.components import Tree, bound
+
+FORM_ERROR = ""
+"""The error key for a message about the whole form, not one field."""
+
 Kind = Literal["text", "number", "integer", "bool", "choice", "lines", "yaml"]
 
 _WORDS = {
@@ -81,6 +86,8 @@ class Form:
 
     adapter: str
     fields: tuple[Field, ...] = field(default_factory=tuple[Field, ...])
+    # Offered for a new site or a new way to reach one. A test-only adapter is not.
+    listed: bool = True
 
 
 def _resolve(schema: dict[str, Any], defs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -121,7 +128,7 @@ def _kind(schema: dict[str, Any]) -> Kind:
     return "yaml"
 
 
-def form(adapter: str, schema: dict[str, Any]) -> Form:
+def form(adapter: str, schema: dict[str, Any], *, listed: bool = True) -> Form:
     """Return the form for an adapter's ``Config`` schema."""
     defs = cast(dict[str, Any], schema.get("$defs") or {})
     required = set(cast(list[str], schema.get("required") or []))
@@ -142,7 +149,7 @@ def form(adapter: str, schema: dict[str, Any]) -> Form:
                 default=own.get("default"),
             )
         )
-    return Form(adapter=adapter, fields=tuple(fields))
+    return Form(adapter=adapter, fields=tuple(fields), listed=listed)
 
 
 def draft_value(item: Field, value: Any) -> Any:
@@ -225,3 +232,101 @@ _ID = re.compile(r"[^a-z0-9_-]+")
 def suggest_id(name: str) -> str:
     """Return a site id made from a display name."""
     return _ID.sub("-", name.lower()).strip("-")[:63]
+
+
+# Components for a form's fields
+
+
+def _segment(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def valid_path(form_path: str, key: str) -> str:
+    """Return where a form keeps whether the field under error ``key`` is valid."""
+    return f"{form_path}/valid/{_segment(key)}"
+
+
+def valid_map(errors: dict[str, str], prefixes: tuple[str, ...]) -> dict[str, bool]:
+    """Return a form's ``valid`` data: false for each field with an error under ``prefixes``."""
+    return {key: False for key in errors if key and key.startswith(prefixes)}
+
+
+def error_checks(error: str | None, check_path: str | None) -> dict[str, Any]:
+    """Return a component's `checks`: one bound to `check_path` when there is an error."""
+    if not error or check_path is None:
+        return {}
+    return {"checks": [{"condition": bound(check_path), "message": error}]}
+
+
+def field_components(
+    tree: Tree,
+    base: str,
+    item: Field,
+    path: str,
+    error: str | None,
+    check_path: str | None = None,
+) -> list[str]:
+    """Add one form field, its help and its error, and return their ids.
+
+    Each field shows its own error, through a check bound to ``check_path``
+    that the form's data sets false. Without a ``check_path`` the error is a caption.
+    """
+    label = f"{item.label} (required)" if item.required else item.label
+    value = bound(path)
+    checks = error_checks(error, check_path)
+    if item.kind == "bool":
+        ids = [tree.add(base, "CheckBox", label=label, value=value, **checks)]
+    elif item.kind == "choice":
+        ids = [
+            tree.add(
+                base,
+                "ChoicePicker",
+                label=label,
+                options=item.option_labels(),
+                value=value,
+                variant="mutuallyExclusive",
+                displayStyle="chips",
+                **checks,
+            )
+        ]
+    else:
+        variant = {
+            "number": "number",
+            "integer": "number",
+            "lines": "longText",
+            "yaml": "longText",
+        }.get(item.kind, "shortText")
+        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant, **checks)]
+    if error and not checks:
+        ids.append(tree.text(f"{base}-error", error, "caption"))
+    if item.help:
+        ids.append(tree.text(f"{base}-help", item.help, "caption"))
+    return ids
+
+
+def field_rows(
+    tree: Tree,
+    base: str,
+    fields: tuple[Field, ...],
+    path: str,
+    errors: dict[str, str],
+    prefix: str,
+    form_path: str,
+) -> list[str]:
+    ids: list[str] = []
+    for item in fields:
+        key = prefix + item.key
+        ids += field_components(
+            tree,
+            f"{base}-f-{item.key}",
+            item,
+            f"{path}/{item.key}",
+            errors.get(key),
+            valid_path(form_path, key),
+        )
+    return ids
+
+
+def form_error(tree: Tree, base: str, errors: dict[str, str]) -> list[str]:
+    message = errors.get(FORM_ERROR)
+    return [tree.text(f"{base}-error", message, "caption")] if message else []

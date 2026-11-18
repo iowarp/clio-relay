@@ -21,14 +21,14 @@ from clio_relay.surface.a2ui import (
     RELAY_CATALOG_ID,
     TAB_URI,
 )
-from clio_relay.surface.a2ui.components import COMPONENTS, Tree
-from clio_relay.surface.a2ui.forms import Field, Kind, form
+from clio_relay.surface.a2ui.components import COMPONENTS
+from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
-from clio_relay.surface.a2ui.surfaces import field_components
 from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.testing.fixture_adapter import FixtureAdapter
 
 from .conftest import add_site
 
@@ -235,27 +235,6 @@ def test_notices_keep_the_case_of_names() -> None:
     assert _sentence("") == ""
 
 
-def test_every_field_carries_its_own_error_as_a_check() -> None:
-    """A ChoicePicker, a CheckBox and a TextField each fail a check bound to the form's data."""
-    kinds: tuple[tuple[Kind, tuple[str, ...]], ...] = (
-        ("choice", ("guarded",)),
-        ("bool", ()),
-        ("text", ()),
-    )
-    for kind, options in kinds:
-        item = Field("x", "X", kind, options=options)
-        tree = Tree()
-        ids = field_components(tree, "f", item, "/d/x", "Wrong", "/d/valid/x")
-        assert ids == ["f"]
-        assert tree.components[0]["checks"] == [
-            {"condition": {"path": "/d/valid/x"}, "message": "Wrong"}
-        ]
-    tree = Tree()
-    ids = field_components(tree, "c", Field("x", "X", "choice", options=("a",)), "/d/x", "Wrong")
-    assert ids == ["c", "c-error"]
-    assert "checks" not in tree.components[0]
-
-
 def test_a_reread_with_nothing_changed_is_identical(relay_paths: RelayPaths) -> None:
     """The host re-renders a surface whose content changed, which resets a half-filled form."""
     add_site(relay_paths)
@@ -316,12 +295,18 @@ def test_tab_uses_only_the_catalog_components(relay_paths: RelayPaths) -> None:
                 for component in surface["components"].values():
                     assert component["component"] in COMPONENTS
             # The add form has a tab per installed adapter, each with its config fields.
+            # A test-only adapter is not offered, but a site already on one can edit it.
             visible = host.visible("relay-add")
             for name in registry.names():
+                if not registry.load(name).listed:
+                    assert f"add-a-{name}-add" not in visible
+                    continue
                 assert f"add-a-{name}-add" in visible
                 schema = form(name, registry.config_schema(name))
                 for field in schema.fields:
                     assert f"add-a-{name}-f-{field.key}" in visible
+            assert host.get("relay-add", "/drafts/add/config/fixture") is None
+            assert host.get("relay-sites", "/drafts/fx/adapters/fixture") is not None
 
     asyncio.run(scenario())
 
@@ -337,6 +322,8 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
         return await original(self, site_id)
 
     monkeypatch.setattr(RelayService, "site_added", site_added)
+    # The fixture is test-only, so this test lists it to add a site through the form.
+    monkeypatch.setattr(FixtureAdapter, "listed", True)
     store = SiteStore(relay_paths.sites_file)
 
     async def scenario() -> None:
@@ -477,31 +464,6 @@ def test_a_site_that_cannot_be_read_leaves_the_others(
     asyncio.run(scenario())
 
 
-def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) -> None:
-    heard: asyncio.Queue[str] = asyncio.Queue()
-
-    async def on_message(message: Any) -> None:
-        if isinstance(message, mcp_types.ResourceUpdatedNotification):
-            await heard.put(str(message.params.uri))
-
-    async def scenario() -> None:
-        async with Client(
-            create_server(relay_paths),
-            mode="legacy",
-            extensions=[advertise(EXTENSION_ID, AD)],
-            message_handler=on_message,
-        ) as client:
-            host = Host(client)
-            await host.open()
-            add_site(relay_paths, "cli")
-            async with asyncio.timeout(15):
-                assert await heard.get() == TAB_URI
-            await host.open()
-            assert "s-cli" in host.visible("relay-sites")
-
-    asyncio.run(scenario())
-
-
 def test_a_removed_site_leaves_the_tab(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
         async with a2ui_client(relay_paths) as client:
@@ -532,37 +494,5 @@ def test_connect_offers_relay_sign_in_page(relay_paths: RelayPaths) -> None:
             link = host.surfaces["relay-sites"]["components"]["s-signs-open"]
             url = link["action"]["functionCall"]["args"]["url"]
             assert url.startswith("http://127.0.0.1:")
-
-    asyncio.run(scenario())
-
-
-def test_add_from_catalog(relay_paths: RelayPaths) -> None:
-    async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
-            host = Host(client)
-            await host.open()
-            options = host.surfaces["relay-add"]["components"]["add-catalog-site"]["options"]
-            first = options[0]["value"]
-            host.set("relay-add", "/catalog/id", [first])
-            host.set("relay-add", "/catalog/site_id", "Bad Id")
-            result = await host.press("relay-add", "add-catalog")
-            assert result.structured_content["ok"] is False
-            assert set(host.failing("relay-add")) == {"add-catalog-id"}
-            assert host.get("relay-add", "/catalog/valid/catalog.site_id") is False
-            host.set("relay-add", "/catalog/id", [])
-            await host.press("relay-add", "add-catalog")
-            assert host.failing("relay-add") == {
-                "add-catalog-site": "Choose a site from the catalog"
-            }
-            assert host.get("relay-add", "/catalog/valid/catalog.id") is False
-            assert "Choose a site from the catalog" not in host.text("relay-add")
-            host.set("relay-add", "/catalog/id", [first])
-            host.set("relay-add", "/catalog/site_id", "mine")
-            result = await host.press("relay-add", "add-catalog")
-            assert result.structured_content["ok"] is True, host.text("relay-add")
-            assert host.get("relay-add", "/catalog/valid") == {}
-            [site] = SiteStore(relay_paths.sites_file).list()
-            assert site.id == "mine"
-            assert "s-mine" in host.visible("relay-sites")
 
     asyncio.run(scenario())

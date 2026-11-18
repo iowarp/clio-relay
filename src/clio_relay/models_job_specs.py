@@ -1,7 +1,7 @@
 """Typed job intent specs: the discriminated ``JobSpec`` union and its members.
 
-Covers the four submittable job intents (:class:`InputArtifactSpec`,
-:class:`JarvisRunSpec`, :class:`RemoteAgentTaskSpec`, :class:`McpCallSpec`),
+Covers the three submittable job intents (:class:`InputArtifactSpec`,
+:class:`JarvisRunSpec`, :class:`RemoteAgentTaskSpec`),
 and the :data:`JobSpec` union DSPy/Pydantic dispatches a submission on.
 """
 
@@ -14,12 +14,6 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.models_enums import McpAdmissionClass, McpOperation
-from clio_relay.models_jarvis_pipeline import JarvisRunInputManifest
-from clio_relay.models_shared import (
-    REGISTERED_JARVIS_USER_CONTRACT,
-    validate_mcp_env_from,
-)
 
 
 class InputArtifactSpec(BaseModel):
@@ -129,111 +123,7 @@ class RemoteAgentTaskSpec(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
-class McpCallSpec(BaseModel):
-    """A remote MCP tool call or discovery request."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    server: str
-    server_args: list[str] = Field(default_factory=list)
-    env_from: dict[str, str] = Field(default_factory=dict)
-    expected_server_artifact_digest: str | None = None
-    expected_registered_contract: str | None = Field(default=None, min_length=1, max_length=256)
-    expected_jarvis_cd_lock_binding: dict[str, str] | None = None
-    admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD
-    operation: McpOperation = McpOperation.TOOLS_CALL
-    tool: str | None = None
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    jarvis_input_manifest: JarvisRunInputManifest | None = None
-    timeout_seconds: int | None = Field(default=None, gt=0)
-
-    @field_validator("env_from")
-    @classmethod
-    def validate_environment_references(cls, value: dict[str, str]) -> dict[str, str]:
-        """Reject invalid names and relay-owned credential references."""
-        return validate_mcp_env_from(value)
-
-    @field_validator("expected_server_artifact_digest")
-    @classmethod
-    def validate_expected_server_artifact_digest(cls, value: str | None) -> str | None:
-        """Require a canonical SHA-256 when a call is bound to discovery identity."""
-        if value is None:
-            return None
-        normalized = value.lower()
-        if len(normalized) != 64 or any(
-            character not in "0123456789abcdef" for character in normalized
-        ):
-            raise ValueError("expected_server_artifact_digest must be a SHA-256")
-        return normalized
-
-    @field_validator("expected_jarvis_cd_lock_binding")
-    @classmethod
-    def validate_expected_jarvis_cd_lock_binding(
-        cls,
-        value: dict[str, str] | None,
-    ) -> dict[str, str] | None:
-        """Require a complete expected dependency artifact identity when present."""
-        if value is None:
-            return None
-        expected_keys = {"schema_version", "version", "url", "sha256"}
-        if set(value) != expected_keys or any(not item for item in value.values()):
-            raise ValueError("expected_jarvis_cd_lock_binding must be a complete identity")
-        if value["schema_version"] != "clio-relay.jarvis-cd-lock-expectation.v1":
-            raise ValueError("expected_jarvis_cd_lock_binding schema is unsupported")
-        sha256 = value["sha256"].lower()
-        if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
-            raise ValueError("expected_jarvis_cd_lock_binding SHA-256 is invalid")
-        return {**value, "sha256": sha256}
-
-    @model_validator(mode="after")
-    def validate_operation_contract(self) -> McpCallSpec:
-        """Require call-only fields and keep discovery requests unambiguous."""
-        if self.operation == McpOperation.TOOLS_CALL:
-            if self.tool is None or not self.tool:
-                raise ValueError("tool is required for tools/call")
-            if (
-                self.admission_class is McpAdmissionClass.CONTROL_QUERY
-                and self.expected_server_artifact_digest is None
-            ):
-                raise ValueError(
-                    "control_query MCP calls require an expected server artifact digest"
-                )
-            if (
-                self.expected_registered_contract is not None
-                and self.expected_server_artifact_digest is None
-            ):
-                raise ValueError(
-                    "registered MCP contract binding requires an expected server artifact digest"
-                )
-            if (
-                self.expected_registered_contract is not None
-                and self.expected_jarvis_cd_lock_binding is not None
-            ):
-                raise ValueError(
-                    "registered MCP contract binding and built-in JARVIS lock pin are exclusive"
-                )
-            if self.jarvis_input_manifest is not None and (
-                self.tool != "jarvis_run"
-                or self.expected_registered_contract != REGISTERED_JARVIS_USER_CONTRACT
-                or self.expected_jarvis_cd_lock_binding is not None
-                or self.arguments.get("pipeline_id") != self.jarvis_input_manifest.route.pipeline_id
-            ):
-                raise ValueError(
-                    "JARVIS input manifests require the exact registered jarvis_run pipeline"
-                )
-            return self
-        if self.tool is not None:
-            raise ValueError("tool must be omitted for tools/list")
-        if self.arguments:
-            raise ValueError("arguments must be empty for tools/list")
-        if self.expected_registered_contract is not None:
-            raise ValueError("expected_registered_contract must be omitted for tools/list")
-        if self.jarvis_input_manifest is not None:
-            raise ValueError("jarvis_input_manifest must be omitted for tools/list")
-        return self
-
-
 JobSpec = Annotated[
-    JarvisRunSpec | RemoteAgentTaskSpec | McpCallSpec | InputArtifactSpec,
+    JarvisRunSpec | RemoteAgentTaskSpec | InputArtifactSpec,
     Field(union_mode="left_to_right"),
 ]

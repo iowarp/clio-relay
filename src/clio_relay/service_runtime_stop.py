@@ -259,10 +259,7 @@ class _ServiceRuntimeStopMixin:
             errors.append(unresolved_scheduler.detail or "scheduler submission is unresolved")
         if session.scheduler_job_id is not None:
             try:
-                verified_submission = self._verified_scheduler_submission(
-                    session,
-                    allow_quiesced_owner_source_recovery=not cancel_scheduler_job,
-                )
+                verified_submission = self._verified_scheduler_submission(session)
             except (ConfigurationError, RelayError) as exc:
                 scheduler_resource = CleanupResource(
                     kind="scheduler_job",
