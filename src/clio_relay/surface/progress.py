@@ -25,7 +25,11 @@ def progress_message(record: OperationRecord) -> str | None:
     if step.get("message"):
         parts.append(str(step["message"]))
     outputs = cast(list[dict[str, Any]], step.get("outputs") or [])
-    viewable = [item["name"] for item in outputs if (item.get("metadata") or {}).get(VIEW_METADATA)]
+    viewable = [
+        item["name"]
+        for item in outputs
+        if cast(dict[str, Any], item.get("metadata") or {}).get(VIEW_METADATA)
+    ]
     if viewable:
         parts.append("views: " + ", ".join(viewable))
     return "; ".join(parts) or None
