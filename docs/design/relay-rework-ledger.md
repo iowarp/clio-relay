@@ -294,7 +294,7 @@ W12, gact-tui host semantics and removals: done (draft PR iowarp/gact-tui#1320).
 
 ## W15. ParaView follows a growing source (RL44, LQ-L12)
 
-Branch: iowarp/clio-kit `jaimecernuda-relay-rework`, commit 538703d0 on origin/main 490269fb. Scope: mcp-servers/paraview/ only.
+Branch: iowarp/clio-kit `jaimecernuda-relay-rework`, commit 202ce174 (paraview-mcp 3.1.0 to 3.2.0 bump, docs/mcps/paraview.md regenerated) on top of 538703d0 (RL44), on origin/main 490269fb. Scope: mcp-servers/paraview/ only.
 
 ### Decisions
 - **`open_view` takes a view descriptor.** The new `view` argument is a clio.view-descriptor.v1, vendored from clio-jarvis a6aba08 (`schemas/view-descriptor.v1.json`, sha256 8773b9ed...c1b076, provenance in descriptor.py). The descriptor sets the reader, reader properties, follow and display. Bad display values give a `display_note` and never fail the open. Why: one contract from producer to viewer, and the server stays a generic MCP server, because any host can send the descriptor.
