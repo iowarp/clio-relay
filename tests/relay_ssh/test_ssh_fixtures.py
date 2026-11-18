@@ -160,23 +160,27 @@ async def test_a_job_without_a_duration_gets_the_schedulers_limit(
     """Relay sets no walltime of its own: no directive, and no 10 minute cap."""
     adapter = build(fx, tmp_path, profile)
     files = await adapter.files()
-    expected = {"fx-slurm": ("UNLIMITED", "00:15:00"), "fx-pbs": (None, "00:15:00")}[profile]
-    for spec, limit in (
-        (JobSpec(executable="sleep", arguments=["3600"]), expected[0]),
+    # The fixture's default Slurm partition and PBS queue set no walltime.
+    unset = {"fx-slurm": "UNLIMITED", "fx-pbs": None}[profile]
+    timed = {"fx-slurm": "00:15:00", "fx-pbs": "00:15:00"}[profile]
+    cases: list[tuple[JobSpec, bool, str | None]] = [
+        (JobSpec(executable="sleep", arguments=["3600"]), False, unset),
         (
             JobSpec(
                 executable="sleep",
                 arguments=["3600"],
                 attributes=JobAttributes(duration=timedelta(minutes=15)),
             ),
-            expected[1],
+            True,
+            timed,
         ),
-    ):
+    ]
+    for spec, directive, limit in cases:
         handle = await adapter.run(spec, operation_id=new_id("op"))
         try:
             script = (await files.read(f"{handle.data['job_dir']}/submit.sh")).decode()
             has_directive = "#SBATCH --time=" in script or "#PBS -l walltime=" in script
-            assert has_directive == (limit is not None), script
+            assert has_directive == directive, script
             assert handle.native_id is not None
             assert scheduler_limit(fx, profile, handle.native_id) == limit
         finally:
