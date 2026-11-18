@@ -25,8 +25,9 @@ from clio_relay.adapters.hooks import (
     hook_factory,
 )
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import JobState, JobStatus, utc_now
+from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
 from clio_relay.jobs.records import (
+    OperationKind,
     OperationRecord,
     OperationState,
     RecordStore,
@@ -34,9 +35,9 @@ from clio_relay.jobs.records import (
     new_id,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, canonical_digest
+from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
-from clio_relay.sites.routing import route, routes
+from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
@@ -55,10 +56,51 @@ _JOB_TO_OPERATION = {
 }
 
 
+def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
+    namer = getattr(adapter, "job_name", None)
+    if not callable(namer):
+        return None
+    name = namer(operation_id)
+    return name if isinstance(name, str) else None
+
+
+def _public_endpoint(endpoint: Endpoint) -> dict[str, Any]:
+    """Return what the record keeps of an endpoint: no port URLs.
+
+    A port URL may carry a secret, so only the serve hook's ``ui_data`` hands it
+    out, in the serve result's ``_meta`` (RL22).
+    """
+    return endpoint.model_dump(mode="json", exclude={"ports": {"__all__": {"url"}}})
+
+
+def service_ready(record: OperationRecord) -> bool:
+    """Return whether a service operation is running and has an endpoint."""
+    return (
+        record.kind == "serve"
+        and record.state == OperationState.RUNNING
+        and bool((record.result or {}).get("endpoint"))
+    )
+
+
+def endpoint_summary(record: OperationRecord) -> str | None:
+    """Name a service's ports as ``name host:port``. No URLs, which may carry secrets."""
+    endpoint: dict[str, Any] = (record.result or {}).get("endpoint") or {}
+    ports: list[dict[str, Any]] = endpoint.get("ports") or []
+    if not ports:
+        return None
+    return ", ".join(f"{port['name']} {port['host']}:{port['port']}" for port in ports)
+
+
 class RelayService:
     """One relay host's view of its sites and operations."""
 
-    def __init__(self, paths: RelayPaths, *, transport: Transport = "stdio") -> None:
+    def __init__(
+        self,
+        paths: RelayPaths,
+        *,
+        transport: Transport = "stdio",
+        public_base_url: str | None = None,
+    ) -> None:
         self.paths = paths
         self.sites = SiteStore(paths.sites_file)
         self.content = ContentStore(paths.content_dir)
@@ -66,11 +108,13 @@ class RelayService:
             paths.operations_dir, OperationRecord
         )
         self.asks: RecordStore[Ask] = RecordStore(paths.asks_dir, Ask)
+        settings: dict[str, Any] = {
+            "grant_files": {key: str(value) for key, value in paths.grant_files.items()}
+        }
+        if public_base_url is not None:
+            settings["public_base_url"] = public_base_url
         context = HookContext(
-            state_dir=paths.state_dir,
-            asks=self.asks,
-            transport=transport,
-            settings={"grant_files": {key: str(value) for key, value in paths.grant_files.items()}},
+            state_dir=paths.state_dir, asks=self.asks, transport=transport, settings=settings
         )
         self.ask_provider = cast(AskProvider, hook_factory("asks", StubAskProvider)(context))
         self.guard = cast(GuardHook, hook_factory("guard", DefaultGuard)(context))
@@ -101,9 +145,17 @@ class RelayService:
             self._adapters[key] = adapter
         return adapter
 
+    def route(self, site: SiteEntry, verb: Verb) -> Routed:
+        """Route ``verb`` on ``site``, skipping adapters whose settings do not build (RL5)."""
+        return route(site, verb, lambda name, config: self._build(site, name, config))
+
+    def site_routes(self, site: SiteEntry) -> list[Route]:
+        """Return every verb's route on ``site``, with what was skipped and why."""
+        return routes(site, lambda name, config: self._build(site, name, config))
+
     def adapter_for(self, site: SiteEntry, verb: Verb) -> BaseAdapter[Any]:
         """Return the adapter that serves ``verb`` on ``site`` (RL5)."""
-        name, config = route(site, verb)
+        name, config, _skipped = self.route(site, verb)
         return self._build(site, name, config)
 
     def adapter_named(self, site: SiteEntry, name: str) -> BaseAdapter[Any]:
@@ -143,7 +195,7 @@ class RelayService:
         site = self.site(site_id)
         described: dict[str, Any] = {
             "site": site.model_dump(mode="json"),
-            "routes": [item.model_dump(mode="json") for item in routes(site)],
+            "routes": [item.model_dump(mode="json") for item in self.site_routes(site)],
         }
         try:
             adapter = self.adapter_for(site, "describe")
@@ -177,23 +229,79 @@ class RelayService:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
         spec = self.apply_defaults(site, spec)
-        adapter_name, _config = route(site, "run")
-        adapter = self.adapter_for(site, "run")
-        (await self.guard.check_run(site, spec)).raise_if_refused()
-        charge = await self.guard.price(site, spec)
+        what = spec.executable or (spec.package.name if spec.package else "a job")
+        return await self._open(
+            site,
+            "run",
+            spec,
+            spec.model_dump(mode="json"),
+            spec.digest(),
+            f"Run {what}",
+            task=task,
+        )
+
+    def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
+        """Fill the service job's site defaults."""
+        return spec.model_copy(update={"job": self.apply_defaults(site, spec.job)})
+
+    async def start_serve(
+        self, site_id: str, spec: ServiceSpec, *, task: bool = False
+    ) -> OperationRecord:
+        """Check and price a service's job, record it, ask, and start it if nothing must."""
+        site = self.site(site_id)
+        self.route(site, "serve")
+        if isinstance(self.serve_hook, StubServe):
+            raise Refusal(
+                RefusalReason.VERB_NOT_IMPLEMENTED,
+                "serve needs a service runtime, and none is installed",
+                verb="serve",
+                site=site.id,
+            )
+        spec = self.prepare_service(site, spec)
+        ports = ", ".join(port.name for port in spec.ports)
+        what = spec.job.executable or (spec.job.package.name if spec.job.package else "a service")
+        return await self._open(
+            site,
+            "serve",
+            spec.job,
+            spec.model_dump(mode="json"),
+            spec.digest(),
+            f"Start {what} as a service with port(s) {ports}",
+            task=task,
+        )
+
+    async def _open(
+        self,
+        site: SiteEntry,
+        kind: OperationKind,
+        job: JobSpec,
+        spec: dict[str, Any],
+        spec_digest: str,
+        action: str,
+        *,
+        task: bool,
+    ) -> OperationRecord:
+        verb: Verb = "serve" if kind == "serve" else "run"
+        adapter_name, config, skipped = self.route(site, verb)
+        adapter = self._build(site, adapter_name, config)
+        (await self.guard.check_run(site, job)).raise_if_refused()
+        charge = await self.guard.price(site, job)
         operation_id = new_id("op")
+        result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
+        if skipped:
+            result["skipped"] = [item.model_dump() for item in skipped]
         record = OperationRecord(
             operation_id=operation_id,
-            kind="run",
+            kind=kind,
             site=site.id,
             adapter=adapter_name,
-            spec=spec.model_dump(mode="json"),
-            spec_digest=spec.digest(),
-            input_digests=[item.sha256 for item in spec.inputs],
+            spec=spec,
+            spec_digest=spec_digest,
+            input_digests=[item.sha256 for item in job.inputs],
             state=OperationState.AWAITING_INPUT,
             history=[StateChange(state=OperationState.AWAITING_INPUT)],
             task=task,
-            result={"charge": charge.model_dump(mode="json")},
+            result=result,
         )
         asks: list[Ask] = []
         need = await adapter.sign_in_needed()
@@ -207,13 +315,12 @@ class RelayService:
                 "spec_digest": record.spec_digest,
                 "charge": charge.model_dump(mode="json"),
             }
-            what = spec.executable or (spec.package.name if spec.package else "a job")
             asks.append(
                 await self.ask_provider.approve(
                     site=site,
                     operation_id=operation_id,
                     message=(
-                        f"Run {what} on {site.title}? It may use up to "
+                        f"{action} on {site.title}? It may use up to "
                         f"{charge.node_hours:g} {charge.unit} "
                         f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
                     ),
@@ -336,16 +443,33 @@ class RelayService:
         return record
 
     async def submit(self, operation_id: str) -> OperationRecord:
-        """Submit once. Whoever moves the record to ``submitting`` submits."""
+        """Submit once. Whoever moves the record to ``submitting`` submits.
+
+        The scheduler job name, when the adapter names jobs, is recorded with
+        the move, before anything reaches the scheduler (RL25a).
+        """
+        record = self.operation(operation_id)
+        if record.state != OperationState.AWAITING_INPUT:
+            return record
+        site = self.site(record.site)
+        try:
+            adapter = self.adapter_named(site, record.adapter)
+        except Refusal as refusal:
+            return self._finish(operation_id, OperationState.FAILED, refusal)
+        job_name = _job_name(adapter, operation_id) if record.kind == "run" else None
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if record.state != OperationState.AWAITING_INPUT:
                 return record
-            record.move(OperationState.SUBMITTING)
+            if job_name is not None:
+                record.result = {**(record.result or {}), "job_name": job_name}
+            record.move(
+                OperationState.SUBMITTING, None if job_name is None else f"job name {job_name}"
+            )
             self.operations.put(operation_id, record)
-        site = self.site(record.site)
+        if record.kind == "serve":
+            return await self._start_service(operation_id, site, adapter, record)
         try:
-            adapter = self.adapter_named(site, record.adapter)
             handle = await adapter.run(
                 JobSpec.model_validate(record.spec), operation_id=operation_id
             )
@@ -368,6 +492,43 @@ class RelayService:
             await adapter.cancel(handle)
         return record
 
+    async def _start_service(
+        self,
+        operation_id: str,
+        site: SiteEntry,
+        adapter: BaseAdapter[Any],
+        record: OperationRecord,
+    ) -> OperationRecord:
+        try:
+            endpoint = await self.serve_hook.start(
+                site, adapter, ServiceSpec.model_validate(record.spec), record
+            )
+        except Refusal as refusal:
+            return self._finish(operation_id, OperationState.FAILED, refusal)
+        except Exception as exc:
+            logger.exception("starting service %s failed", operation_id)
+            return self._finish(
+                operation_id,
+                OperationState.FAILED,
+                Refusal(RefusalReason.SUBMIT_FAILED, f"starting the service failed: {exc}"),
+            )
+        with self.operations.locked(operation_id):
+            record = self.operation(operation_id)
+            cancelled = record.state == OperationState.CANCELLED
+            if endpoint is not None:
+                record.result = {
+                    **(record.result or {}),
+                    "endpoint": _public_endpoint(endpoint),
+                }
+                record.move(OperationState.RUNNING, "the service is ready")
+            else:
+                record.move(OperationState.QUEUED, "the service is starting")
+            self.operations.put(operation_id, record)
+        if cancelled:
+            status = await self.serve_hook.stop(site, adapter, record)
+            return await self._apply(operation_id, adapter, status)
+        return record
+
     async def refresh(self, operation_id: str) -> OperationRecord:
         """Observe an operation's job and record what changed."""
         record = self.operation(operation_id)
@@ -377,6 +538,8 @@ class RelayService:
             return await self.advance(operation_id)
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
+        if record.kind == "serve":
+            return await self._refresh_service(operation_id, site, adapter, record)
         handle = record.handle
         if handle is None:
             found = await adapter.find(operation_id)
@@ -402,8 +565,31 @@ class RelayService:
             return record
         return await self._apply(operation_id, adapter, status)
 
+    async def _refresh_service(
+        self,
+        operation_id: str,
+        site: SiteEntry,
+        adapter: BaseAdapter[Any],
+        record: OperationRecord,
+    ) -> OperationRecord:
+        try:
+            status, endpoint = await self.serve_hook.status(site, adapter, record)
+        except Refusal as refusal:
+            if (
+                record.state == OperationState.SUBMITTING
+                and utc_now() - record.updated_at > SUBMIT_GRACE
+            ):
+                return self._finish(operation_id, OperationState.FAILED, refusal)
+            logger.warning("observing service %s: %s", operation_id, refusal.message)
+            return record
+        return await self._apply(operation_id, adapter, status, endpoint)
+
     async def _apply(
-        self, operation_id: str, adapter: BaseAdapter[Any], status: JobStatus
+        self,
+        operation_id: str,
+        adapter: BaseAdapter[Any],
+        status: JobStatus,
+        endpoint: Endpoint | None = None,
     ) -> OperationRecord:
         tail: str | None = None
         if status.state.final:
@@ -415,12 +601,17 @@ class RelayService:
             record.move(_JOB_TO_OPERATION[status.state], status.message)
             record.exit_code = status.exit_code
             record.outputs = status.outputs
+            result = dict(record.result or {})
+            if record.kind == "serve":
+                if endpoint is not None:
+                    result["endpoint"] = _public_endpoint(endpoint)
+                if status.message is not None:
+                    result["message"] = status.message
             if status.state.final:
-                result = dict(record.result or {})
                 result["native_state"] = status.native_state
                 if tail is not None:
                     result["stdout_tail"] = tail
-                record.result = result
+            record.result = result
             self.operations.put(operation_id, record)
         return record
 
@@ -446,20 +637,33 @@ class RelayService:
         record = self.operation(operation_id)
         if record.state.final:
             return record
-        if record.handle is None:
+        started = (
+            record.state not in (OperationState.AWAITING_INPUT, OperationState.SUBMITTING)
+            if record.kind == "serve"
+            else record.handle is not None
+        )
+        if not started:
             for ask in self.outstanding(record):
                 self.answer(ask.ask_id, "cancel", by="cancel")
             record = self._finish(operation_id, OperationState.CANCELLED, None)
             return record
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
-        status = await adapter.cancel(record.handle)
+        if record.kind == "serve":
+            status = await self.serve_hook.stop(site, adapter, record)
+        elif record.handle is not None:
+            status = await adapter.cancel(record.handle)
+        else:
+            return record
         return await self._apply(operation_id, adapter, status)
 
     async def wait(
         self, operation_id: str, timeout_s: float, poll_s: float = 1.0
     ) -> OperationRecord:
-        """Refresh until the operation is final, waits on a person, or time runs out."""
+        """Refresh until the operation is final, waits on a person, or time runs out.
+
+        A service also stops the wait once it is running with an endpoint.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, timeout_s)
         while True:
@@ -467,6 +671,8 @@ class RelayService:
             if record.state.final:
                 return record
             if record.state == OperationState.AWAITING_INPUT and self.outstanding(record):
+                return record
+            if service_ready(record):
                 return record
             if loop.time() >= deadline:
                 return record
@@ -479,17 +685,24 @@ class RelayService:
         site_id: str,
         command: list[str],
         *,
-        timeout_s: float,
+        timeout_s: float | None = None,
         max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> dict[str, Any]:
-        """Run one short command (RL9)."""
+        """Run one command (RL9). With no ``timeout_s`` it runs until it ends."""
         site = self.site(site_id)
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
         (await self.guard.check_exec(site, command)).raise_if_refused()
-        adapter = self.adapter_for(site, "exec")
-        result = await adapter.exec(command, timeout_s=timeout_s, max_output_bytes=max_output_bytes)
-        return result.model_dump(mode="json")
+        name, config, skipped = self.route(site, "exec")
+        adapter = self._build(site, name, config)
+        result = await adapter.exec(
+            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+        )
+        shown = result.model_dump(mode="json")
+        if skipped:
+            shown["skipped"] = [item.model_dump() for item in skipped]
+        return shown
 
     # views
 

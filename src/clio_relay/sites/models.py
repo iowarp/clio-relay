@@ -61,6 +61,10 @@ class SiteEntry(BaseModel):
     spend: SpendPolicy = Field(default_factory=SpendPolicy)
     defaults: SiteDefaults = Field(default_factory=SiteDefaults)
     skill: str | None = None
+    serve: dict[str, Any] = Field(
+        default_factory=dict[str, Any],
+        description="Service settings for this site, validated by the serve hook",
+    )
 
     @property
     def title(self) -> str:

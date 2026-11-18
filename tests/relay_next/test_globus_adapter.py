@@ -1,0 +1,334 @@
+"""The ``globus`` adapter (RL12) against local stand-ins for Compute and Transfer.
+
+Nothing here talks to Globus. The stand-in endpoint runs the real task function
+in a local process, so the job path the adapter drives is the one an endpoint
+runs. These are mock results, never live passes.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+
+from clio_relay.adapters import registry
+from clio_relay.adapters.base import AdapterContext
+from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig, tokens
+from clio_relay.adapters.globus.compute import ComputeService, function_digest
+from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
+from clio_relay.adapters.globus.task import relay_task
+from clio_relay.adapters.globus.transfer import TransferService
+from clio_relay.jobs.content import ContentStore
+from clio_relay.jobs.handles import JobState
+from clio_relay.jobs.records import new_id
+from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.spec import JobAttributes, JobResources, JobSpec
+from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget, wait_final
+
+pytestmark = pytest.mark.release_platform("posix")
+
+ENDPOINT = "9a947ba5-f537-4681-acf3-cc66485aadec"
+SITE_COLLECTION = "05d2c76a-e867-4f67-aa57-76edeb0beda0"
+LOCAL_COLLECTION = "11111111-2222-4333-8444-555555555555"
+
+
+class SignedIn:
+    """An identity provider that always has a token."""
+
+    async def token(self, *, resource_server: str) -> tokens.Token:
+        return tokens.Token(resource_server=resource_server, access_token="test-token")
+
+    def status(self) -> str:
+        return "signed_in"
+
+
+class LocalGlobusAdapter(GlobusAdapter):
+    """The adapter with its Globus services swapped for local stand-ins."""
+
+    name: ClassVar[str] = "globus-local"
+
+    def __init__(self, config: GlobusConfig, context: AdapterContext) -> None:
+        super().__init__(config, context)
+        self.identity = SignedIn()
+
+    async def _compute_service(self) -> ComputeService:
+        await tokens.bearer(self.identity, tokens.COMPUTE_RESOURCE_SERVER, what="compute")
+        return LocalComputeService(self.context.state_dir / "endpoint")
+
+    async def _transfer_service(self) -> TransferService:
+        return LocalTransferService(
+            {
+                SITE_COLLECTION: self.context.state_dir / "site",
+                LOCAL_COLLECTION: self.context.state_dir / "local",
+            }
+        )
+
+
+@pytest.fixture(autouse=True)
+def registered_adapter() -> Any:
+    registry.register(LocalGlobusAdapter, "globus-local")
+    yield
+    registry.unregister("globus-local")
+
+
+def local_config(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "endpoint": ENDPOINT,
+        "scheduler": "pbs",
+        "queues": ["debug", "prod"],
+        "job_root": str(tmp_path / "site-jobs"),
+        "cancel_poll_s": 0.2,
+        "collection": SITE_COLLECTION,
+        "local_collection": LOCAL_COLLECTION,
+        "local_path": "/",
+        "local_dir": str(tmp_path / "adapter" / "local"),
+    }
+
+
+class TestGlobusConformance(AdapterConformance):
+    @pytest.fixture
+    def target(self, tmp_path: Path) -> ConformanceTarget:
+        return ConformanceTarget(
+            adapter="globus-local",
+            config=local_config(tmp_path),
+            state_dir=tmp_path,
+            job_timeout_s=60,
+            poll_s=0.2,
+        )
+
+
+def _context(tmp_path: Path) -> AdapterContext:
+    return AdapterContext(
+        site_id="polaris",
+        state_dir=tmp_path / "adapter",
+        content=ContentStore(tmp_path / "content"),
+    )
+
+
+def _build(tmp_path: Path, **overrides: Any) -> LocalGlobusAdapter:
+    config = GlobusConfig.model_validate({**local_config(tmp_path), **overrides})
+    return LocalGlobusAdapter(config, _context(tmp_path))
+
+
+def test_user_config_maps_the_job_onto_the_template(tmp_path: Path) -> None:
+    adapter = _build(tmp_path, user_config={"worker_init": "module load conda"})
+    spec = JobSpec(
+        executable="hostname",
+        resources=JobResources(node_count=2),
+        attributes=JobAttributes(
+            duration=timedelta(minutes=30),
+            queue_name="debug",
+            account="myproject",
+            custom_attributes={"globus.scheduler_options": "#PBS -l filesystems=home:eagle"},
+        ),
+    )
+    assert adapter.user_config(spec) == {
+        "worker_init": "module load conda",
+        "account": "myproject",
+        "queue": "debug",
+        "walltime": "00:30:00",
+        "nodes_per_block": 2,
+        "scheduler_options": "#PBS -l filesystems=home:eagle",
+    }
+
+
+def test_user_config_keys_follow_the_site(tmp_path: Path) -> None:
+    adapter = _build(
+        tmp_path,
+        scheduler="slurm",
+        user_config_keys={"queue": "partition", "nodes": None},
+        walltime_format="minutes",
+    )
+    spec = JobSpec(
+        executable="hostname",
+        attributes=JobAttributes(
+            duration=timedelta(seconds=90), queue_name="ghx4", account="bbka-dtai-gh"
+        ),
+    )
+    assert adapter.user_config(spec) == {
+        "account": "bbka-dtai-gh",
+        "partition": "ghx4",
+        "walltime": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_job_reaches_the_endpoint_with_its_user_config(tmp_path: Path) -> None:
+    adapter = _build(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "mpiexec"
+    launcher.write_text('#!/bin/sh\nshift 2\nexec "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    spec = JobSpec(
+        executable="echo",
+        arguments=["hello"],
+        environment={"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
+        resources=JobResources(node_count=1, process_count=4),
+        launcher="mpiexec",
+        attributes=JobAttributes(queue_name="debug", account="myproject"),
+    )
+    handle = await adapter.run(spec, operation_id="op-one")
+    status, _ = await wait_final(adapter, handle, 60, 0.2)
+    assert status.state == JobState.COMPLETED, status
+    sent = LocalComputeService(tmp_path / "adapter" / "endpoint").submitted()
+    assert sent[0]["user_config"]["queue"] == "debug"
+    assert sent[0]["user_config"]["account"] == "myproject"
+    assert sent[0]["payload"]["argv"][:3] == ["mpiexec", "-n", "4"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_launchers_refuse(tmp_path: Path) -> None:
+    adapter = _build(tmp_path)
+    with pytest.raises(Refusal) as refused:
+        await adapter.run(JobSpec(executable="x", launcher="jsrun"), operation_id=new_id("op"))
+    assert refused.value.reason == RefusalReason.INVALID_SPEC
+
+
+@pytest.mark.asyncio
+async def test_inputs_over_the_inline_cap_refuse(tmp_path: Path) -> None:
+    from clio_relay.jobs.spec import InputRef
+
+    adapter = _build(tmp_path, inline_input_limit=10)
+    digest = adapter.context.content.put(b"x" * 64)
+    spec = JobSpec(executable="cat", inputs=[InputRef(name="in.txt", sha256=digest)])
+    with pytest.raises(Refusal) as refused:
+        await adapter.run(spec, operation_id=new_id("op"))
+    assert refused.value.reason == RefusalReason.INVALID_SPEC
+
+
+@pytest.mark.asyncio
+async def test_files_without_a_collection_refuse(tmp_path: Path) -> None:
+    adapter = _build(tmp_path, collection=None)
+    with pytest.raises(Refusal) as refused:
+        await adapter.files()
+    assert refused.value.reason == RefusalReason.INVALID_CONFIG
+
+
+@pytest.mark.asyncio
+async def test_reading_without_a_local_collection_refuses(tmp_path: Path) -> None:
+    adapter = _build(tmp_path, local_collection=None, local_path=None, local_dir=None)
+    (tmp_path / "adapter" / "site" / "home").mkdir(parents=True)
+    (tmp_path / "adapter" / "site" / "home" / "a.txt").write_text("a")
+    files = await adapter.files()
+    assert (await files.stat("a.txt")).size == 1
+    with pytest.raises(Refusal) as refused:
+        await files.read("a.txt")
+    assert refused.value.reason == RefusalReason.INVALID_CONFIG
+
+
+@pytest.mark.asyncio
+async def test_signed_out_refuses_needs_sign_in(tmp_path: Path) -> None:
+    config = GlobusConfig.model_validate(local_config(tmp_path))
+    adapter = GlobusAdapter(config, _context(tmp_path))
+    adapter.identity = tokens.GrantFileProvider("globus", tmp_path / "missing.json")
+    need = await adapter.sign_in_needed()
+    assert need is not None
+    assert need.provider == "globus"
+    with pytest.raises(Refusal) as refused:
+        await adapter.run(JobSpec(executable="hostname"), operation_id=new_id("op"))
+    assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+    info = await adapter.describe()
+    assert info.facts["sign_in"] == "signed_out"
+    assert "endpoint_status" not in info.facts
+
+
+def _grant(path: Path, tokens_: list[dict[str, Any]]) -> Path:
+    path.write_text(
+        json.dumps({"version": 1, "provider": "globus", "written_at": 0, "tokens": tokens_}),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.asyncio
+async def test_grant_file_provider_reads_tokens(tmp_path: Path) -> None:
+    later = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    path = _grant(
+        tmp_path / "grant.json",
+        [
+            {"resource_server": "funcx_service", "access_token": "c", "expires_at": later},
+            {"resource_server": "transfer.api.globus.org", "access_token": "t", "expires_at": 1},
+        ],
+    )
+    source = tokens.GrantFileProvider("globus", path)
+    assert source.status() == "signed_in"
+    assert await tokens.bearer(source, "funcx_service", what="x") == "c"
+    with pytest.raises(Refusal) as refused:
+        await tokens.bearer(source, "transfer.api.globus.org", what="Transfer")
+    assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+
+
+def test_grant_file_provider_reports_expired(tmp_path: Path) -> None:
+    path = _grant(
+        tmp_path / "grant.json", [{"resource_server": "x", "access_token": "a", "expires_at": 5}]
+    )
+    assert tokens.GrantFileProvider("globus", path).status() == "expired"
+    assert tokens.GrantFileProvider("globus", tmp_path / "none.json").status() == "signed_out"
+
+
+@pytest.mark.asyncio
+async def test_status_of_accepts_enums_and_coroutines() -> None:
+    from enum import StrEnum
+
+    class Status(StrEnum):
+        SIGNED_IN = "signed_in"
+
+    class Async:
+        async def token(self, *, resource_server: str) -> None:
+            return None
+
+        async def status(self) -> Status:
+            return Status.SIGNED_IN
+
+    assert await tokens.status_of(Async()) == "signed_in"
+
+
+def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:
+    """The endpoint runs the function from its source text, with no relay installed."""
+    import inspect
+
+    source = inspect.getsource(relay_task)
+    script = tmp_path / "standalone.py"
+    job_dir = tmp_path / "job"
+    script.write_text(
+        source
+        + textwrap.dedent(
+            f"""
+            import json
+            print(json.dumps(relay_task({{
+                "mode": "run", "job_dir": {str(job_dir)!r},
+                "argv": ["sh", "-c", "echo out; echo err >&2; exit 3"],
+                "poll_s": 0.1,
+            }})))
+            """
+        ),
+        encoding="utf-8",
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", str(script)], capture_output=True, text=True, check=True
+    )
+    report = json.loads(done.stdout)
+    assert report["state"] == "failed"
+    assert report["exit_code"] == 3
+    assert report["stdout_tail"] == "out\n"
+    assert report["stderr_tail"] == "err\n"
+    again = relay_task({"mode": "run", "job_dir": str(job_dir), "argv": ["false"]})
+    assert again["exit_code"] == 3, "a retried task returns the recorded result"
+
+
+def test_relay_task_serializes_for_globus_compute() -> None:
+    serialize = pytest.importorskip("globus_compute_sdk.serialize")
+    strategy = serialize.PureSourceTextInspect()
+    packed = strategy.serialize(relay_task)
+    assert "def relay_task" in packed
+    restored = strategy.deserialize(packed)
+    assert callable(restored)
+    assert len(function_digest()) == 64

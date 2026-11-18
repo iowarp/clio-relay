@@ -2,6 +2,7 @@
 
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import (
+    STALL_S,
     Endpoint,
     EndpointPort,
     ExecResult,
@@ -11,6 +12,7 @@ from clio_relay.jobs.handles import (
     JobState,
     JobStatus,
     OutputRef,
+    StallReport,
 )
 from clio_relay.jobs.records import (
     OperationKind,
@@ -32,6 +34,7 @@ from clio_relay.jobs.spec import (
 )
 
 __all__ = [
+    "STALL_S",
     "ContentStore",
     "Endpoint",
     "EndpointPort",
@@ -55,6 +58,7 @@ __all__ = [
     "RefusalReason",
     "ServicePort",
     "ServiceSpec",
+    "StallReport",
     "canonical_digest",
     "new_id",
 ]

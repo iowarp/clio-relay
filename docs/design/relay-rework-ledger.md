@@ -86,23 +86,38 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - There is no `sky` extra. skypilot 0.14.3 caps `click<8.2` and `uvicorn<0.36`. W11 runs skypilot from its own environment as a subprocess.
   - keyring is in core (W6), and `keyrings.alt` is in the `testing` extra.
 - **Hook entry points fall back when their module is missing.** `hook_factory` uses the stub when a hook's own module is not installed. Any other import error is raised. Why: an entry point can be registered before its workstream merges, and the guard stub refuses guarded sites, so the fallback is safe.
+- **The serve flow follows run (W9's spec).** `RelayService.start_serve` runs the guard check and price on `spec.job`, creates a `kind="serve"` record with the spend and sign-in asks, and calls `serve_hook.start`. `refresh` calls `serve_hook.status` and `cancel` calls `serve_hook.stop`. `record.result["endpoint"]` holds the endpoint, `record.result["message"]` the latest `JobStatus.message`, and `record.outputs` the stop artifacts. `serve` is task-optional like `run`. A running serve task is `working`, and its status message names each port as `name: host:port`. `wait` also returns once the service is ready.
+- **Secret URLs reach the UI only.** The record, `describe` and the task status keep an endpoint's ports without their `url`. The serve result carries `_meta["ai.iowarp.relay/service"]` from `ServeHook.ui_data(record)`. Why: RL22. A test caught that the endpoint first reached the record with its URLs.
+- **The stub serve hook refuses up front.** With no serve runtime installed, `serve` refuses with `verb_not_implemented` and writes no record. `ServeHook.attach(server, changes)` is called in `RelayServer.build`, and the stub's `attach` and `ui_data` do nothing. `local` lists `serve` and imports `clio_relay.serve` lazily; without it, `local.serve` refuses the same way.
+- **Under tasks, `run(cancel=)` and `run(resume=)` return a plain result.** Only a new run or serve becomes a task. The same holds for `serve(service=)` and `serve(stop=)`.
+- **Ask pages mount on the HTTP server (W6).** `MountsPages` is an optional Protocol (`mount(server)`). `create_server` calls it after `build()` for HTTP when the ask provider implements it. W9's `attach` follows the same pattern. `HookContext.settings["public_base_url"]` holds the server's public origin.
+- **`serve` over HTTP.** The command line takes `--grant-file PROVIDER=PATH` (repeatable). It did not exist at M1, though the published interfaces listed it. It also takes `--tls-cert` and `--tls-key`, given together, which make the origin https for RL25a. Uvicorn's access log is off, because page addresses carry single-use tokens.
+- **The job name is recorded before submit.** A run's SUBMITTING move stores `result["job_name"]` with the note "job name X" (RL25a).
+- **The asks command group comes from W6 when installed.** `clio-relay-next asks` mounts `clio_relay.cli_asks.app`. Without it, the built-in `list` and `answer` remain.
+- **Bounded commands leave nothing behind.** `run_bounded` reads both pipes to their end after a timeout kill. When its caller is cancelled, it kills the process group before it re-raises. This fixed a leaked subprocess transport ("Event loop is closed") from the local conformance tests, which was already present at M1. The relay_next suite now runs with `PytestUnraisableExceptionWarning` as an error.
+- **W11 merged.** `jaimecernuda-relay-rework-w11` at b41c756 is merged as aa9b7b1. Its adapter pages are in the docs index in `README.md`.
+- **Routing skips an adapter whose settings do not build (RL5, coordinator decision).** An alternative that fails at build time with `invalid_config`, such as Aurora with no endpoint or iri with no `resource_id`, is skipped, and routing moves on to the next one. The skip is part of the route, as `skipped: [{site, adapter, reason, message}]`. It shows in `describe`'s routes, in an operation's `result["skipped"]` and in an `exec` result, so the person sees why it was not used. When every candidate fails, the call refuses with `invalid_config`, and the refusal lists each adapter's reason. Any other refusal at build time is still returned as it is. Routing builds each candidate through the service's adapter cache (`RelayService.route` and `site_routes`).
+- **`exec` has no hard time limit (coordinator decision, the person's rule).** `timeout_s` is optional and has no default or ceiling. Without it the command runs until it ends. After 30 s with no output on either stream, relay reports it as quiet, then reports again after waits that double (30, 60, 120 s and so on, capped at 600 s) while it stays quiet. Each report is a progress notification on the call (not a log message, since logging is deprecated at `2026-07-28`): "no output for N s; the command is still running; relay checks again in M s; cancel the call to stop it". Cancelling the call kills the command's process group. A caller may still pass `timeout_s`, and then the command is killed at that limit as before. Every adapter's `exec` must accept `timeout_s=None` and an optional `on_stall`.
+- **The conformance kit no longer skips.** For a verb the adapter does not implement, each kit test asserts the typed `verb_not_implemented` refusal and passes, instead of skipping. A new kit test runs `exec` with no time limit.
 
 ### Published interfaces (M1)
 
 Owned by W1, not frozen. A change goes through W1, which reruns every consumer's contract tests first.
 
-- Adapters (`clio_relay.adapters.base`): the `Adapter` Protocol (`name`, `Config`, `describe`, `run(spec, operation_id)`, `status`, `cancel`, `find(operation_id)`, `exec`, `files`, `serve`), `BaseAdapter[ConfigT]`, `SiteInfo`, `SignInNeed`, `AdapterContext`.
-- Jobs (`clio_relay.jobs`): `JobSpec` (PSI/J names, `JobResources.to_psij()` builds `ResourceSpecV1`), `JobResources`, `JobAttributes`, `InputRef`, `PackageRef`, `ServiceSpec`, `ServicePort`, `ServiceLifetime`, `canonical_digest`, `JobHandle`, `JobStatus`, `JobState`, `ExecResult`, `Endpoint`, `EndpointPort`, `FileEntry`, `FileAccess`, `OutputRef`.
+- Adapters (`clio_relay.adapters.base`): the `Adapter` Protocol (`name`, `Config`, `describe`, `run(spec, operation_id)`, `status`, `cancel`, `find(operation_id)`, `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)`, `files`, `serve`), `BaseAdapter[ConfigT]`, `SiteInfo`, `SignInNeed`, `AdapterContext`.
+- Jobs (`clio_relay.jobs`): `JobSpec` (PSI/J names, `JobResources.to_psij()` builds `ResourceSpecV1`), `JobResources`, `JobAttributes`, `InputRef`, `PackageRef`, `ServiceSpec`, `ServicePort`, `ServiceLifetime`, `canonical_digest`, `JobHandle`, `JobStatus`, `JobState`, `ExecResult`, `StallReport` and `STALL_S`, `Endpoint`, `EndpointPort`, `FileEntry`, `FileAccess`, `OutputRef`.
 - Records: `OperationRecord`, `OperationState`, `RecordStore`. Layout: `<state>/operations/`, `<state>/asks/`, `<state>/sites/<site>/<adapter>/`, and `sites.yaml` in the config directory.
 - Content store: `ContentStore` at `<state>/content/cas/sha256/<first two hex>/<digest>`.
 - `RefusalReason`, 24 typed reasons: `verb_not_implemented`, `site_not_found`, `site_exists`, `unknown_adapter`, `adapter_unavailable`, `invalid_config`, `invalid_spec`, `invalid_arguments`, `guard_unavailable`, `policy_refused`, `needs_approval`, `needs_sign_in`, `declined`, `interactive_auth_required`, `operation_not_found`, `ask_not_found`, `approval_mismatch`, `input_missing`, `path_not_found`, `path_exists`, `not_cancellable`, `submit_failed`, `unreachable`, `timeout`.
-- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` for W9.
+- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` (`start`, `status`, `stop`, `attach`, `ui_data`) for W9; the optional `MountsPages` (`mount`) for an ask provider's pages.
+- Serve runtime, provided by W9 and imported lazily: `clio_relay.serve.factory`, `start_for(adapter, spec, *, operation_id)`, `connect(handle, *, paths)` and `settings(paths, changes)`, where `changes` is None to show. `SiteEntry.serve` holds a site's serve settings.
 - Change events: `ServerChanges` (above).
-- Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token), `adapters`, `site`, `asks`.
+- Routing (`clio_relay.sites.routing`): `route(entry, verb, check) -> Routed(adapter, config, skipped)`, `routes(entry, check) -> list[Route]`, and `Skipped(site, adapter, reason, message)` in `Route.skipped`.
+- Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token, `--grant-file`, `--tls-cert` and `--tls-key`), `adapters`, `site`, `asks`, `connect <handle>`, `rendezvous set|show`.
 
 ### Conformance kit
 
-`clio_relay.testing.conformance.AdapterConformance`, parameterised by a `ConformanceTarget(adapter, config, state_dir, ...)`. It holds 10 executable contract tests per adapter: config schema, describe shape, typed refusal of unimplemented verbs, bounded exec, files round trip, job lifecycle, job failure, job cancel, the same job observed after a restart, and inputs by digest. An adapter package subclasses it in its own tests (see the module docstring). W7 and W8 run it for `ssh` and `worker` (LQ4).
+`clio_relay.testing.conformance.AdapterConformance`, parameterised by a `ConformanceTarget(adapter, config, state_dir, ...)`. It holds 11 executable contract tests per adapter: config schema, describe shape, typed refusal of unimplemented verbs, bounded exec, exec with no time limit, files round trip, job lifecycle, job failure, job cancel, the same job observed after a restart, and inputs by digest. An adapter package subclasses it in its own tests (see the module docstring). W7 and W8 run it for `ssh` and `worker` (LQ4).
 
 ### M1 evidence (Ares)
 
@@ -723,6 +738,208 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 ## W10. Tapis
 
 ## W11. globus, iri and sky
+
+Branch `jaimecernuda-relay-rework-w11`, from `6b32300`. Code: `src/clio_relay/adapters/{globus,iri,sky}/`. Catalog: `catalog/sites/{polaris,aurora,deltaai}.yaml` and the skills `alcf-polaris`, `alcf-aurora` and `ncsa-deltaai`. Pages: `docs/adapters/{globus,iri,sky}.md`. hpc-bridge was read as a reference only; nothing is imported from it.
+
+All W11 evidence below comes from unit and mock tests. None of it is a live pass. The live rows LQ-L2 to LQ-L6 and LQ-L8 belong to the person and have the run sheets at the end of this section.
+
+### Decisions
+
+- **The `sky` adapter never imports SkyPilot (coordinator decision, recorded at `a60bc01`).** SkyPilot 0.14.3 caps `click` below 8.2 and `uvicorn` below 0.36, and the universal lock would force those downgrades on every relay install. So relay has no `sky` extra. The adapter runs `adapters/sky/bridge.py` as a subprocess in SkyPilot's own Python. The bridge uses only the standard library and `sky`. It writes one JSON answer on a line starting `CLIO_RELAY_SKY`, and it moves SkyPilot's own stdout to stderr.
+  - The Python comes from the site's `python` setting. When that is empty, relay tries `~/.clio-relay/sky/bin/python`, then the Python next to a `sky` command on `PATH` or the one its first line names.
+  - With none found, `build()` refuses `adapter_unavailable` with the install steps. A Python that cannot import `sky` gives the same refusal on the first call.
+  - The spend price goes through the same subprocess.
+  - The install step is in `docs/adapters/sky.md`.
+- **globus-compute-sdk is pinned to 4.21.0 (W1, `6b32300`).** 4.22 is an alpha. Stable 4.21.0 is what the adapter and its tests were written against.
+- **Credentials come from W6's identity layer.** `tokens.provider("globus")` calls `clio_relay.identity.get("globus")` when that module exists. Until W6 merges, it uses `GrantFileProvider`, a stub with the same shape (`async token(resource_server=...)`, `status()`). The stub reads the grant file named by `CLIO_RELAY_GRANT_FILE_GLOBUS`. The adapters never start a sign-in. With no token, or an expired one, they refuse `needs_sign_in`, and `sign_in_needed()` names the provider.
+- **globus: one Compute task per job, cancelled with a marker.** The task is `relay_task`, a self-contained function that uses only the standard library, because Compute ships functions by source.
+  - The task writes the inputs and `relay-state.json` into `<job_root>/<operation id>/`. It runs the command in its own process group and polls for a `relay-cancel` marker.
+  - `cancel` sends a second task that writes the marker, because the Compute service cannot cancel a submitted task.
+  - A task the endpoint retries finds the final record and does not run the job again.
+  - Submission uses `create_batch` and `batch_run`, and polling uses `get_task`. The SDK `Executor` is never opened, since it holds a long-lived connection.
+- **globus: `user_config_keys` maps the job onto the endpoint's template.** The defaults, `account`, `queue`, `walltime` and `nodes_per_block`, are ALCF's keys. Each facility names them differently.
+- **globus `files` is Globus Transfer between two collections.** One is the site's; the other is on relay's own machine, for example Globus Connect Personal. A transfer that keeps faulting is cancelled and refused. A transfer that is making progress has no time limit.
+- **globus: the person's own endpoint starts through another adapter.** `start` names `worker` or `ssh` and the start command, for Aurora. It goes through W1's `exec`, which requires `timeout_s` (default 900 s here). The start command daemonizes and returns. See Open.
+- **iri: v2 is the default, and v1 is supported.**
+  - In v2, `run` sends an `Idempotency-Key`, uuid5 of `clio-relay:<site>:<operation id>`, so a retried submit returns the same job.
+  - v1 has no key. Relay's own record under `state_dir/iri-jobs/` covers `find`.
+  - The two versions differ in where file-call parameters go. The adapter handles both, and the fake facility checks both.
+- **iri tokens.** With `identity: globus`, the token comes from the Globus identity, for the facility's resource server and scope. With `token_command`, it is the stdout of a command, for facilities that issue their own tokens.
+- **iri `files`.** File calls are facility tasks, polled with backoff and stall detection, and have no time limit. Reads and writes are capped at 5 MiB, the API's limit. Anything larger is refused with a pointer to the `globus` adapter.
+- **sky runs managed jobs, with `describe` and `run` only.** `serve`, and autostop as the idle release, belong to W9.
+  - The job is named `relay-<operation id>`.
+  - Inputs are materialized into a work directory that SkyPilot syncs. A site `workdir` together with inputs is refused `invalid_spec`.
+  - When the job ends, its log is downloaded as the output.
+  - SkyPilot reports no exit code for a managed job. A failure is recorded with exit code 1, unless the failure reason names a code, and the message says so.
+  - There is no hard limit on a SkyPilot call. Relay stops waiting only when SkyPilot prints nothing for `stall_s` (1800 s).
+- **sky cloud keys come from the keyring.** `credentials.env` maps variables to keyring entries under the service `clio-relay`, such as `AWS_ACCESS_KEY_ID: aws-access-key-id`. A missing entry refuses `needs_sign_in` with the provider. Without `credentials`, SkyPilot uses the cloud profiles already on the machine.
+- **The spend price is `SkyAdapter.price(spec) -> Charge`, in US dollars.**
+  - `amount` is SkyPilot's `Resources.get_cost(walltime)` times the node count.
+  - `unit` is `"USD"`, and `nodes`, `walltime_s` and `node_hours` are filled in. `Charge.unit` is free text, so W13 needs no new field.
+  - The price lookup is offline, from SkyPilot's catalog, and needs no cloud account.
+- **The catalog entries are `guarded` with `spend: {ask: always}`.**
+  - Aurora has no `endpoint`: the person sets their own, and building the site refuses `invalid_config` until they do.
+  - DeltaAI sends the queue as `partition`. NCSA does not publish the template, so LQ-L8 checks that first.
+- **The fakes ship in the package for reuse (W2, W16).**
+  - `adapters.globus.fakes` provides `LocalComputeService` and `LocalTransferService`.
+  - `adapters.iri.fakes.FakeIriFacility` is an `httpx.MockTransport` handler. It validates job specs against the published field sets.
+  - `adapters/sky/fake_sky/sky/` is a stand-in `sky` package with SkyPilot 0.14.3's call shapes. It goes on the bridge's `PYTHONPATH`.
+
+### Facts
+
+| Fact | Value | Source |
+| --- | --- | --- |
+| Polaris address and scheduler | `polaris.alcf.anl.gov`, PBS Pro. MFA with MobilePASS+ or a CRYPTOCard | https://docs.alcf.anl.gov/polaris/ |
+| Polaris hardware | 560 nodes. Each has 1 AMD EPYC 7543P, 512 GB and 4 NVIDIA A100 | https://docs.alcf.anl.gov/polaris/ |
+| Polaris queues | debug (1 to 2 nodes, 1 h), debug-scaling (1 to 10, 1 h), prod (10 to 496, 24 h), preemptable (1 to 10, 72 h), demand (1 to 56), capacity (1 to 4, 168 h). `-A` and `-l filesystems=` are required | https://docs.alcf.anl.gov/polaris/running-jobs/ |
+| Polaris Globus Compute endpoint | multi-user endpoint `9a947ba5-f537-4681-acf3-cc66485aadec`, running Python 3.13 | https://docs.alcf.anl.gov/services/globus-compute/ |
+| ALCF endpoint user-configuration keys | `account` and `queue` are required. Optional: `walltime`, `nodes_per_block`, `worker_init`, `scheduler_options` (default `#PBS -l filesystems=home`) and `max_idletime` (240) | https://docs.alcf.anl.gov/services/globus-compute/ |
+| ALCF Globus collections | `alcf#dtn_home` `9032dd3a-e841-4687-a163-2720da731b5b`, `alcf#dtn_eagle` `05d2c76a-e867-4f67-aa57-76edeb0beda0`, `alcf#dtn_flare` `f39a7a0f-5bfc-46ce-9615-ba9f8592814f` | https://docs.alcf.anl.gov/data-management/data-transfer/using-globus/ |
+| Aurora address and scheduler | `aurora.alcf.anl.gov`, PBS Pro. 10,624 nodes, each with 2 Xeon CPU Max and 6 GPU Max 1550. File system `/flare` | https://docs.alcf.anl.gov/aurora/ |
+| Aurora queues | debug (1 to 2, 1 h), debug-scaling (2 to 256, 1 h), prod (256 to 10,624, 24 h), capacity (1 to 16, 168 h), visualization (1 to 32, 8 h) | https://docs.alcf.anl.gov/aurora/running-jobs-aurora/ |
+| Aurora endpoint | no facility endpoint. Users run their own on a login node, with ALCF's template `configs/aurora` | https://docs.alcf.anl.gov/services/globus-compute/, https://github.com/argonne-lcf/alcf-globus-compute |
+| DeltaAI address and scheduler | `dtai-login.delta.ncsa.illinois.edu`, Duo MFA, Slurm | https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/ |
+| DeltaAI partitions and accounts | ghx4 (48 h), ghx4-interactive (4 nodes, 2 h). 4 NVIDIA GH200 per node. Accounts end in `-dtai-gh`. File systems `/u`, `/projects`, `/work/hdd`, `/work/nvme` | https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/ |
+| DeltaAI Globus Compute endpoint | multi-user endpoint `eb28e239-288a-4974-8341-27c49cacb37a`. Its template keys are not published | https://docs.ncsa.illinois.edu/en/latest/software/portals/diamond.html |
+| IRI API versions | 1.0.0 and 2.0.0, OpenAPI 3.1.0. NERSC and ALCF serve both | https://api.iri.nersc.gov/openapi.json, https://api.iri.nersc.gov/api/v2/openapi.json, https://api.alcf.anl.gov/api/v1/openapi.json, https://api.alcf.anl.gov/api/v2/openapi.json |
+| IRI token type | `HTTPBearer` (`type: http`, `scheme: bearer`). At NERSC the bearer is a Globus Auth access token for scope `https://auth.globus.org/scopes/ed3e577d-f7f3-4639-b96e-ff5a8445d699/iri_api` | the same OpenAPI documents (`components.securitySchemes`). NERSC's scope is from https://api.iri.nersc.gov |
+| IRI base URLs | NERSC `https://api.iri.nersc.gov`, ALCF `https://api.alcf.anl.gov`, ESnet (development) `https://iri-dev.ppg.es.net`. NCSA serves none | https://docs.alcf.anl.gov/services/iri-api/ and the OpenAPI `servers` entries |
+| SkyPilot version | 0.14.3. Calls used: `jobs.launch`, `jobs.queue_v2`, `jobs.cancel`, `jobs.download_logs`, `Resources.get_cost` | probed in `~/clio-relay-rework/w11-sky-venv` on Ares, https://docs.skypilot.co/ |
+| SkyPilot price examples | AWS `m6i.large` at 0.096 USD/h on demand. 2 nodes for 1 h is 0.192 USD on demand and 0.0202 spot. 2 × `p4d.24xlarge` (A100:8) for 1 h is 43.91528 USD | the adapter's `price` through real SkyPilot 0.14.3, Ares, no credentials (Evidence) |
+
+### Evidence
+
+All of this is unit and mock evidence.
+
+- **Gate on Ares** at `3015e81`, in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
+  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: 82 passed, 5 skipped. The skips are the conformance kit's own: `exec` is not implemented on the four targets (globus, iri v2, iri v1, sky), and `files` is not implemented on sky.
+  - `uv run ruff check` and `ruff format --check` on the W11 paths: clean.
+  - `pyright` 1.1.411 on the W11 paths: 0 errors.
+- **What the mocks cover.**
+  - Conformance runs against the globus fakes, the IRI fake facility (v2 and v1), and the sky bridge with the stand-in `sky`. The sky case runs the real `bridge.py` in a separate Python process.
+  - Unit tests cover:
+    - globus: refusals, user-config mapping, walltime formats, marker cancel, retry safety, transfer faults and endpoint start;
+    - iri: idempotency, v1 query parameters, problem documents, token sources, stall, the 5 MiB refusal and download forms;
+    - sky: price, spot and overrides, `adapter_unavailable` for a missing Python and for a missing `sky`, keyring credentials, launch request fields, command rendering and exit code 1;
+    - catalog: each entry validates against `GlobusConfig`.
+- **Real SkyPilot smoke on Ares** (no credentials, `HOME=~/clio-relay-rework/w11-sky-home`):
+  - Setup: `SkyAdapter` in relay's venv, with `python` pointing at the SkyPilot 0.14.3 venv.
+  - `describe` reported `skypilot_version: 0.14.3`.
+  - `price` for 2 nodes and 1 h on `infra: aws, cpus: 2+` gave `{"amount": 0.192, "unit": "USD", "node_hours": 2.0}`. Spot gave 0.0202, and `accelerators: A100:8` gave 43.91528.
+  - This shows the subprocess path and the offline price work with SkyPilot itself. It launched nothing.
+
+### Run sheets for the person rows
+
+These need the integrated relay: W1's verbs, W6's sign-in page, and W13's spend gate. Each sheet first checks the site with `describe` and then runs one job through relay's `run`, from any MCP client. For a check before integration, the adapter can be built directly:
+
+```
+uv run --extra globus python -c "import asyncio; from pathlib import Path; from clio_relay import catalog; from clio_relay.adapters import registry; from clio_relay.adapters.base import AdapterContext; from clio_relay.jobs.content import ContentStore; e = catalog.site('polaris'); d = Path.home() / '.clio-relay' / 'preflight'; a = registry.build(e.adapter, e.config, AdapterContext(site_id=e.id, state_dir=d, content=ContentStore(d / 'content'))); print(asyncio.run(a.describe()))"
+```
+
+Record for each row: the date, relay's commit, the site entry as used, the handle (`native_id`), the states seen, the exit code, the output names, and a screenshot of the spend gate and the tab. Write the result in W16's summary, never in this section.
+
+**LQ-L2. Polaris through `globus`.**
+
+Needs an ALCF account with a Polaris allocation, and a Globus identity linked to it.
+
+1. Add the catalog site `polaris`. Set `defaults.account` to the project.
+2. On relay's page, sign in to Globus. The consent must include Globus Compute (`https://auth.globus.org/scopes/facd7ccc-c5f4-42aa-916b-a0e270e2c2a9/all`) and Transfer (`urn:globus:auth:scope:transfer.api.globus.org:all`).
+3. The row turns ready with no SSH. `describe` shows the endpoint `9a947ba5-…` online and the PBS queues. Record it.
+4. `run` a reviewed package with `queue: debug`, 1 node and 10 minutes. The spend gate asks first, because the site is `spend: always`; approve it.
+5. Watch the states go from queued to running to completed. The first job may wait in the PBS queue while the endpoint's block starts. Record the time to running.
+6. Check that `stdout`, `stderr` and the exit code are listed and readable through `files`.
+7. Run a second job of `sleep 600` and `cancel` it. Record how long the state takes to become cancelled; the cancel task may queue behind the job.
+8. Check `~/.clio-relay/jobs/<operation id>/` on Polaris (through Globus or SSH): `relay-state.json`, `relay-cancel` and the outputs.
+
+**LQ-L3. Polaris through `worker`.**
+
+Needs SSH to Polaris with MobilePASS+, and W8's `worker` adapter.
+
+1. Switch the Polaris row to the `worker` alternative, which uses the `ssh_profile: polaris` SSH profile.
+2. On relay's page, start the sign-in and type the one-time code once.
+3. Run `describe`, then a 1-node debug job, as in LQ-L2 steps 4 to 6.
+4. Leave relay idle and check `describe` at intervals. Record how long the worker stays linked before it needs the code again.
+
+**LQ-L4. Aurora through your own endpoint.**
+
+Needs an ALCF account with an Aurora allocation, and SSH with MobilePASS+.
+
+1. On an Aurora login node, make a Python environment and run `pip install globus-compute-endpoint`.
+2. Run `globus-compute-endpoint configure clio-relay`. Replace its config with ALCF's `configs/aurora` template from https://github.com/argonne-lcf/alcf-globus-compute. Keep the keys `account`, `queue`, `walltime` and `nodes_per_block`, or note the template's names.
+3. Run `globus-compute-endpoint start clio-relay`. Sign in to Globus when it asks; this happens once. Copy the endpoint id it prints.
+4. Add the catalog site `aurora`. Set `config.endpoint` to that id and `defaults.account` to the project. If the template uses other key names, set `config.user_config_keys`.
+5. Run `globus-compute-endpoint stop clio-relay`, then `describe` in relay. The endpoint shows offline.
+6. `run` a reviewed package in `debug`. Relay starts the endpoint through `worker` with one sign-in (the MobilePASS+ code), then submits. Record that the start happened and how long it took.
+7. Check that the job completes and its outputs are listed, as in LQ-L2 steps 5 and 6.
+
+**LQ-L5. An IRI facility (NERSC first, or ALCF).**
+
+Needs a NERSC account with an allocation and IRI access, or the ALCF equivalent.
+
+1. Add a site with `adapter: iri`, `base_url: https://api.iri.nersc.gov`, `api_version: v2`, `identity: globus` and NERSC's scope from the Facts table. For ALCF, use `base_url: https://api.alcf.anl.gov` and a `token_command` that prints a token from ALCF's own tool, since relay has not found ALCF's Globus scope.
+2. Sign in, then run `describe`. It lists `/compute/resources`. Set `resource_id` to the compute resource, such as Perlmutter's, and `filesystem_resource_id` if the files resource differs.
+3. Record the API version, from `GET /api/v2/` or the OpenAPI document, and the token type: what the facility accepted, a Globus access token or the facility's own.
+4. Run `files`: write a 1 KiB file, read it back, list it and stat it. Repeat with a binary file. Record the download form the facility returned.
+5. `run` `hostname` with 1 node in the debug queue and the account set. Check that it completes with exit code 0 and `stdout` and `stderr` listed.
+6. `run` `sleep 600`, then `cancel` it. Check that the state becomes cancelled.
+7. Repeat steps 4 to 6 with `api_version: v1`, if the facility still serves it.
+
+**LQ-L6. AWS through `sky`.**
+
+Needs an AWS account the person agrees to spend on (O11), and an IAM key pair with EC2 rights.
+
+1. On relay's machine, run:
+   ```
+   uv venv ~/.clio-relay/sky
+   uv pip install --python ~/.clio-relay/sky 'skypilot[aws]==0.14.3'
+   ```
+2. Add a site with `adapter: sky`, `infra: aws`, `cpus: 2+` and the keyring entries `AWS_ACCESS_KEY_ID: aws-access-key-id` and `AWS_SECRET_ACCESS_KEY: aws-secret-access-key`.
+3. Without the keys, `describe` reports `skypilot_version` and the site shows as needing sign-in. Type the two keys on relay's page.
+4. Check that they are in the OS keyring under the service `clio-relay`, and not in any file.
+5. `run` `echo hello` with 1 node and 15 minutes. The spend gate must show SkyPilot's price in USD, about 0.024 for `m6i.large` on demand. Screenshot it, then approve.
+6. Check that the job completes with exit code 0, and that `run.log` is listed and contains `hello`.
+7. In the AWS console or `sky status`, check that the job's instance is terminated once the managed job ends. With W9, check that a `serve` cluster autostops when idle.
+8. `run` `sleep 1800`, then `cancel` it. Check that the state becomes cancelled and that no instance is left running.
+
+**LQ-L8. DeltaAI through `globus`.**
+
+Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to the NCSA account.
+
+1. Open https://app.globus.org/compute/endpoints/eb28e239-288a-4974-8341-27c49cacb37a and read the endpoint's user configuration schema. If the queue key is not `partition`, or the account key is not `account`, set `config.user_config_keys` to match.
+2. Add the catalog site `deltaai`. Set `defaults.account` to the allocation ending in `-dtai-gh`.
+3. Sign in to Globus as in LQ-L2 step 2, then run `describe`. Check that the endpoint is online.
+4. `run` `nvidia-smi -L` with 1 node, `queue: ghx4` and 10 minutes. Approve the spend gate. Check that it completes with 4 GH200 listed in `stdout`.
+
+**What the person provides**
+
+- O11: allocations and project names on Polaris, Aurora and DeltaAI. NERSC, or ALCF, IRI access. Consent to spend on a paid AWS account.
+- Accounts: ALCF accounts with MobilePASS+, and an NCSA account with Duo. A Globus identity linked to each.
+- Consent in Globus to the Compute and Transfer scopes and, for LQ-L5, the facility's IRI scope.
+- O10: the Globus native-app client id, for hosts that hand relay no grant (W6's sign-in).
+- AWS: an IAM access key pair, typed on relay's page.
+- On relay's machine: the SkyPilot venv (LQ-L6 step 1).
+- On Aurora: the one-time endpoint setup (LQ-L4 steps 1 to 3).
+- O8: running the rows themselves.
+
+### Open
+
+- **Compute cancel is a marker.** The Compute service cannot cancel a submitted task. On a busy endpoint, the cancel task may wait behind the job it cancels. LQ-L2 step 7 measures this.
+- **A crash between submit and the record write loses the globus task id.** `find` returns nothing, and a retried `run` submits again. Compute has no idempotency key. The window is one local write.
+- **Endpoint start uses `exec`, whose Protocol requires `timeout_s`.** `StartConfig.timeout_s` defaults to 900 s and is settable. `globus-compute-endpoint start` daemonizes and returns, so the bound does not limit jobs. If the coordinator reads it as a hard limit on something the person waits on, W1's `exec` needs a stall-only form.
+- **Globus Compute status strings** beyond those in SDK 4.21.0's documentation are not verified live. Unknown strings map to queued. LQ-L2 records the strings it sees.
+- **ALCF's IRI Globus scope was not found** in ALCF's pages. Until it is, ALCF IRI uses `token_command`.
+- **The IRI download format varies by facility.** Binary round trips are checked in LQ-L5 step 4.
+- **The DeltaAI template keys are unpublished.** LQ-L8 step 1 checks them.
+- **Aurora's endpoint setup is a one-time person step.** Relay starts the endpoint afterwards; it does not create it.
+- **Requests to W1:**
+  - Add `docs/adapters/{globus,iri,sky}.md` to the docs index.
+  - RL5 routing cannot fall back to an alternative on a config-level refusal: Aurora with no `endpoint`, or `iri` with no `resource_id`, refuses `invalid_config` at build. Decide whether routing skips such an alternative or reports it.
+  - O11's text says "paid cloud account for LQ-L8". The cloud row is LQ-L6, and LQ-L8 is DeltaAI.
+- **Requests to W6:**
+  - Confirm the `Token` shape (`access_token`, `expires_at`) and whether `status()` is sync or async. `tokens.py` accepts either.
+  - Confirm the keyring naming for cloud keys: service `clio-relay`, entries such as `aws-access-key-id`. Relay's page should write those entries.
+- **Request to W13:** call `SkyAdapter.price(spec)` from `GuardHook.price` for sky sites. It returns a `Charge` with `unit: "USD"`, and `node_hours` is still filled in for the node-hour threshold.
+- **For W9:** SkyPilot autostop is the idle release for `serve`. The `sky` adapter does not implement `serve`.
 
 ## W12. gact-tui host semantics and removals
 

@@ -1,0 +1,28 @@
+# NCSA facility pages this entry was written from:
+#   https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/ (partitions, accounts, file systems)
+#   https://docs.ncsa.illinois.edu/en/latest/software/portals/diamond.html (the multi-user endpoint)
+# NCSA does not publish the endpoint's user configuration keys; queue: partition
+# is relay's reading, and LQ-L8 checks it against the endpoint's schema.
+id: deltaai
+name: NCSA DeltaAI
+address: dtai-login.delta.ncsa.illinois.edu
+adapter: globus
+identity: globus
+config:
+  endpoint: eb28e239-288a-4974-8341-27c49cacb37a
+  scheduler: slurm
+  queues: [ghx4, ghx4-interactive]
+  user_config_keys:
+    queue: partition
+policy: guarded
+spend:
+  ask: always
+defaults:
+  queue: ghx4
+  duration: PT30M
+skill: ncsa-deltaai
+source: https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/
+description: >-
+  NCSA's AI system with four NVIDIA GH200 superchips per node, under Slurm. Relay
+  reaches it through NCSA's DeltaAI Globus Compute multi-user endpoint. Set your
+  allocation, which ends in -dtai-gh, in defaults.account.

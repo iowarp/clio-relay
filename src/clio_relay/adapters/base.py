@@ -15,7 +15,14 @@ from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import Endpoint, ExecResult, FileAccess, JobHandle, JobStatus
+from clio_relay.jobs.handles import (
+    Endpoint,
+    ExecResult,
+    FileAccess,
+    JobHandle,
+    JobStatus,
+    StallReport,
+)
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 
@@ -88,9 +95,18 @@ class Adapter(Protocol):
         ...
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
-        """Run one short command and return bounded output."""
+        """Run one command and return bounded output.
+
+        With no `timeout_s` the command runs until it ends; the adapter calls
+        `on_stall` while it is quiet, and cancelling the call stops it.
+        """
         ...
 
     async def files(self) -> FileAccess:
@@ -153,7 +169,12 @@ class BaseAdapter[ConfigT: BaseModel]:
         return None
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
         raise not_implemented(self.name, "exec")
 
