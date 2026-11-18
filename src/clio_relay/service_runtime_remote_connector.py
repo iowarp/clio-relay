@@ -37,7 +37,6 @@ from clio_relay.models import (
 )
 from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.service_runtime_scheduler_names import (
-    ALLOCATION_CONNECTOR_RETIRED,
     allocation_connector_residual,
     canonical_scheduler,
     supports_allocation_connector,
@@ -55,11 +54,7 @@ class _ServiceRuntimeRemoteConnectorMixin:
         node: str,
         proxy_name: str,
         ownership_intent: dict[str, object],
-        allocation_provider: str | None = None,
-        allocation_job_id: str | None = None,
     ) -> dict[str, object]:
-        if allocation_provider is not None or allocation_job_id is not None:
-            raise ConfigurationError(ALLOCATION_CONNECTOR_RETIRED)
         transport = self.definition.frp_transport
         server_addr = _primitives._require_server_addr(transport.server_addr, self.cluster)
         config = render_proxy_config(

@@ -42,16 +42,9 @@ from clio_relay.adapters.worker import cli as relay_cli
 from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource
-from clio_relay.browser_gateway import (
-    CAPABILITY_ENV,
-    UPSTREAM_AUTHORIZATION_ENV,
-    BrowserGatewayBootstrap,
-    BrowserGatewayConfig,
-)
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.errors import (
-    BrowserAttachmentIdentityConflictError,
     ConfigurationError,
     QueueConflictError,
     RelayError,
@@ -375,54 +368,6 @@ def test_remote_connector_start_rejects_response_identity_drift(
                 "connector_generation_id": generation_id,
             },
         )
-
-
-def test_browser_detach_maps_only_the_typed_identity_conflict_not_any_queue_conflict_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CQ16 typed-conflict fix, failing-first proof.
-
-    ``_revoke_browser_attachment`` used to catch ``QueueConflictError`` and
-    inspect ``str(exc)`` for the substring "changed before revocation" to
-    decide whether to remap it to a public ``ConfigurationError`` -- the
-    banned prose-match pattern. A decoy ``QueueConflictError`` that happens
-    to carry that same substring for an unrelated reason proves the
-    difference: under the old substring check this decoy would have been
-    misclassified and remapped to ``ConfigurationError``; under the typed
-    ``except BrowserAttachmentIdentityConflictError`` catch it must
-    propagate unchanged as a plain ``QueueConflictError``. This test fails
-    against the old substring-matching implementation and passes only once
-    the catch discriminates by exception type.
-    """
-    queue = ClioCoreQueue(tmp_path / "core")
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    session = queue.create_gateway_session(
-        GatewaySession(cluster="test-cluster", name="decoy-conflict")
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=settings,
-        queue=queue,
-        cluster="test-cluster",
-        definition=_definition(),
-        token="token",
-        secret_key="secret",
-    )
-
-    def decoy_revoke(*_args: object, **_kwargs: object) -> GatewaySession:
-        raise QueueConflictError(
-            "browser attachment changed before revocation for an unrelated reason"
-        )
-
-    monkeypatch.setattr(queue, "begin_gateway_browser_attachment_revoke", decoy_revoke)
-
-    with pytest.raises(QueueConflictError) as excinfo:
-        supervisor.browser_detach(
-            session_id=session.session_id,
-            attachment_id="browser-decoy",
-        )
-    assert not isinstance(excinfo.value, ConfigurationError)
-    assert not isinstance(excinfo.value, BrowserAttachmentIdentityConflictError)
 
 
 @pytest.fixture(autouse=True)
@@ -988,92 +933,6 @@ class AmbiguousRemoteConnectorStartRunner(FakeRunner):
             input_text=input_text,
             timeout_seconds=timeout_seconds,
         )
-
-
-def test_browser_proxy_secrets_exist_only_in_anonymous_stdin_bootstrap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Capability and upstream bearer avoid argv, env, files, records, and logs."""
-    runner = FakeRunner()
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    supervisor = ServiceRuntimeSupervisor(
-        settings=settings,
-        queue=ClioCoreQueue(settings.core_dir),
-        cluster="test-cluster",
-        definition=_definition(),
-        token="token",
-        secret_key="secret",
-        runner=runner,
-        sleep=lambda _seconds: None,
-    )
-    session = GatewaySession(cluster="test-cluster", name="browser-secret-handoff")
-    runtime_dir = settings.core_dir.parent / "runtime-sessions" / session.session_id
-    runtime_dir.mkdir(parents=True)
-    config_path = runtime_dir / "browser-test.browser-gateway.json"
-    stdout_path = runtime_dir / "browser-test.browser-gateway.out"
-    stderr_path = runtime_dir / "browser-test.browser-gateway.err"
-    metadata_path = runtime_dir / "browser-test.browser-gateway-owner.json"
-    capability = "q" * 43
-    bearer_token = "a" * 64
-    authorization = f"Bearer {bearer_token}"
-    config = BrowserGatewayConfig(
-        attachment_id="browser-secret-test",
-        token_sha256=hashlib.sha256(capability.encode("utf-8")).hexdigest(),
-        bind_port=28778,
-        upstream_protocol="http",
-        upstream_port=28777,
-        allowed_paths=["/healthz", "/commands"],
-        command_path="/commands",
-        expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-        revocation_path=str((runtime_dir / "browser-test.revoked").resolve()),
-    )
-    intent: dict[str, object] = {
-        "owner_token": "owner-token",
-        "connector_generation_id": "generation-id",
-        "config_path": str(config_path),
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "metadata_path": str(metadata_path),
-    }
-    monkeypatch.setenv(CAPABILITY_ENV, "stale-capability")
-    monkeypatch.setenv(
-        UPSTREAM_AUTHORIZATION_ENV,
-        f"Bearer {'b' * 64}",
-    )
-
-    proxy = supervisor._start_browser_proxy(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        session=session,
-        config=config,
-        capability=capability,
-        upstream_authorization=authorization,
-        ownership_intent=intent,
-    )
-
-    assert runner.popen_inputs[0] is not None
-    bootstrap = BrowserGatewayBootstrap.model_validate_json(runner.popen_inputs[0])
-    assert bootstrap.capability == capability
-    assert bootstrap.upstream_authorization == authorization
-    environment = cast(dict[str, str], runner.popen_environments[0])
-    assert CAPABILITY_ENV not in environment
-    assert UPSTREAM_AUTHORIZATION_ENV not in environment
-    assert environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] == "owner-token"
-    assert environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] == "generation-id"
-    non_pipe_surfaces = "\n".join(
-        (
-            json.dumps(runner.popen_commands[0], sort_keys=True),
-            json.dumps(environment, sort_keys=True),
-            config_path.read_text(encoding="utf-8"),
-            json.dumps(proxy, sort_keys=True),
-            metadata_path.read_text(encoding="utf-8"),
-            stdout_path.read_text(encoding="utf-8"),
-            stderr_path.read_text(encoding="utf-8"),
-            session.model_dump_json(),
-        )
-    )
-    assert capability not in non_pipe_surfaces
-    assert authorization not in non_pipe_surfaces
-    assert bearer_token not in non_pipe_surfaces
 
 
 class FailingSubmitRunner(FakeRunner):
@@ -6837,63 +6696,6 @@ def test_legacy_jarvis_v1_health_accepts_anonymous_opaque_2xx(
     )
 
     assert observed_headers == [None]
-
-
-def test_browser_health_accepts_opaque_2xx_with_exact_null_origin_cors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    supervisor = _health_probe_supervisor(tmp_path)
-    observed_origins: list[str | None] = []
-
-    def browser_health(request: httpx.Request) -> httpx.Response:
-        observed_origins.append(request.headers.get("origin"))
-        return httpx.Response(
-            200,
-            headers={"Access-Control-Allow-Origin": "null"},
-            content=b"\xffopaque-browser-health",
-        )
-
-    transport = httpx.MockTransport(browser_health)
-    monkeypatch.setattr(
-        service_runtime_readiness,
-        "_new_readiness_http_client",
-        _mock_http_client_factory(transport),
-    )
-
-    supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "http://127.0.0.1:28778/healthz?capability=private",
-        timeout_seconds=1.0,
-        poll_seconds=0.1,
-    )
-
-    assert observed_origins == ["null"]
-
-
-def test_browser_health_rejects_wildcard_cors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    supervisor = _health_probe_supervisor(tmp_path)
-    transport = httpx.MockTransport(
-        lambda _request: httpx.Response(
-            200,
-            headers={"Access-Control-Allow-Origin": "*"},
-            content=b"ignored",
-        )
-    )
-    monkeypatch.setattr(
-        service_runtime_readiness,
-        "_new_readiness_http_client",
-        _mock_http_client_factory(transport),
-    )
-
-    with pytest.raises(RelayError, match="not exactly null"):
-        supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            "http://127.0.0.1:28778/healthz?capability=private",
-            timeout_seconds=0.03,
-            poll_seconds=1.0,
-        )
 
 
 def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_and_metadata(

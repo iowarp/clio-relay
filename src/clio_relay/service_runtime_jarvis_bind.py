@@ -472,8 +472,6 @@ class _ServiceRuntimeJarvisBindMixin:
                     node=runtime.host,
                     proxy_name=proxy_name,
                     ownership_intent=remote_intent,
-                    allocation_provider=verified.binding.scheduler_provider,
-                    allocation_job_id=verified.binding.scheduler_native_id,
                 )
             except _types._AmbiguousRemoteSideEffectError as exc:
                 latest = self.queue.get_gateway_session(session.session_id)
