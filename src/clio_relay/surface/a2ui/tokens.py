@@ -68,9 +68,7 @@ class ActionTokens:
                     self._grants.popitem(last=False)
             return token
         path = self._path(token)
-        write_json_atomic(
-            path, {"action": action, "subject": subject, "expires": grant.expires}
-        )
+        write_json_atomic(path, {"action": action, "subject": subject, "expires": grant.expires})
         with self._lock:
             self._minted += 1
             prune = self._minted % _PRUNE_EVERY == 0
