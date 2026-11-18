@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.owned_session_record import (
     OWNED_SESSION_RECORD_SCHEMA,
     OWNED_SESSION_REGISTRY_ENV,
@@ -19,6 +18,7 @@ from clio_relay.adapters.worker.owned_session_record import (
     load_owned_session_record,
     save_owned_session_record,
 )
+from clio_relay.errors import ConfigurationError
 
 
 def test_load_before_any_save_returns_none(tmp_path: Path) -> None:

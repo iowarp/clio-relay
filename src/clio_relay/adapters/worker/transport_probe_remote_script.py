@@ -13,9 +13,12 @@ anything down. Not itself a monkeypatch seam, so a plain re-export back into
 
 from __future__ import annotations
 
+from clio_relay.adapters.worker.transport_probe_primitives import (
+    _cluster_agent_bin,
+    _shell_single_quote,
+)
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.remote_values import render_remote_shell_path, render_remote_shell_value
-from clio_relay.adapters.worker.transport_probe_primitives import _cluster_agent_bin, _shell_single_quote
 
 
 def _remote_probe_script(

@@ -27,18 +27,18 @@ import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.validation_report as validation_report_module
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.owned_session_record import clear_owned_session_record
+from clio_relay.adapters.worker.session_lifecycle import (
+    OwnedSessionRecoveryStatus,
+    SessionLifecycleReport,
+    session_lifecycle_report_sha256,
+)
+from clio_relay.errors import RelayError
 from clio_relay.owner_session_admission import (
     assert_no_unscoped_desktop_admission_state as _assert_no_unscoped_desktop_admission_state,
 )
 from clio_relay.owner_session_admission import (
     desktop_owner_session_admission_id as _desktop_owner_session_admission_id,
-)
-from clio_relay.adapters.worker.session_lifecycle import (
-    OwnedSessionRecoveryStatus,
-    SessionLifecycleReport,
-    session_lifecycle_report_sha256,
 )
 from clio_relay.validation_report import ValidationResource
 

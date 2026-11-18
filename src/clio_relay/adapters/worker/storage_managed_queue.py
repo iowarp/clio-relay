@@ -15,12 +15,14 @@ from contextlib import suppress
 from pathlib import Path
 
 from clio_relay.adapters.worker.core_queue import DEFAULT_CORE_LOCK_TIMEOUT_SECONDS
-from clio_relay.errors import ConfigurationError
-from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
-from clio_relay.adapters.worker.storage_managed_queue_admission import StorageManagedQueueAdmissionMixin
+from clio_relay.adapters.worker.storage_managed_queue_admission import (
+    StorageManagedQueueAdmissionMixin,
+)
 from clio_relay.adapters.worker.storage_managed_queue_leasing import StorageManagedQueueLeasingMixin
 from clio_relay.adapters.worker.storage_runtime_core import StorageRuntime
 from clio_relay.adapters.worker.worker_lifetime_lock import LockedCoreIdentity, WorkerLifetimeLock
+from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
 
 
 class StorageManagedQueue(StorageManagedQueueAdmissionMixin, StorageManagedQueueLeasingMixin):

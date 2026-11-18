@@ -19,12 +19,12 @@ from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     _GETUID,
     BOOTSTRAP_LOCK_TIMEOUT_SECONDS,
 )
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.worker_lifetime_lock import (
     WorkerLifetimeLock,
     WorkerLifetimeLockUnavailable,
     exclusive_migration_lifetime,
 )
+from clio_relay.errors import ConfigurationError
 
 
 def repair_legacy_cursor_permissions_for_upgrade(core_dir: Path) -> dict[str, object]:

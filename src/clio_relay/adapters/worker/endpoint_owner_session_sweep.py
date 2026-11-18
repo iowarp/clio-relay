@@ -93,10 +93,10 @@ import logging
 import time
 from typing import TYPE_CHECKING, cast
 
-from clio_relay.errors import QueueConflictError, RelayError
-from clio_relay.models_owner_session_lease import OwnerSessionLease
 from clio_relay.adapters.worker.session_cleanup_execution import execute_owned_session_teardown
 from clio_relay.adapters.worker.session_lifecycle import OwnedSessionTeardownRequest
+from clio_relay.errors import QueueConflictError, RelayError
+from clio_relay.models_owner_session_lease import OwnerSessionLease
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.endpoint import EndpointWorker

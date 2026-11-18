@@ -24,7 +24,9 @@ from clio_relay.adapters.worker.bootstrap_reconcile_activation_paths import (
     _reconcile_activation_symlink,
     _verify_stable_symlink,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_builtin_repos import _relay_owned_jarvis_builtin_repositories
+from clio_relay.adapters.worker.bootstrap_reconcile_builtin_repos import (
+    _relay_owned_jarvis_builtin_repositories,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     LEGACY_MANAGED_JARVIS_REPO_PATH,
     MAX_JARVIS_REPOS_BYTES,

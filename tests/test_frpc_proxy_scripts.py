@@ -33,14 +33,17 @@ from uuid import uuid4
 
 import pytest
 
-from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.frpc_proxy_receipt import BRINGUP_RECEIPT_SCHEMA, TEARDOWN_RECEIPT_SCHEMA
+from clio_relay.adapters.worker.frpc_proxy_receipt import (
+    BRINGUP_RECEIPT_SCHEMA,
+    TEARDOWN_RECEIPT_SCHEMA,
+)
 from clio_relay.adapters.worker.frpc_proxy_scripts import (
     render_frpc_proxy_install_script,
     render_frpc_proxy_status_script,
     render_frpc_proxy_teardown_script,
 )
 from clio_relay.adapters.worker.frpc_unit import frpc_proxy_paths
+from clio_relay.errors import RelayError
 
 _PATHS = frpc_proxy_paths("ares")
 _TOML_TEXT = 'serverAddr = "relay.example.org"\nauth.token = "{{ .Envs.CLIO_RELAY_FRP_TOKEN }}"\n'

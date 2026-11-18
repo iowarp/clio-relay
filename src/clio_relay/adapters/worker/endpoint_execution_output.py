@@ -32,6 +32,9 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
     _optional_metadata,
     _optional_str,
 )
+from clio_relay.adapters.worker.progress_adapters import (
+    PackageProgressProvider,
+)
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import (
     internal_filesystem_path,
@@ -44,9 +47,6 @@ from clio_relay.models import (
     RelayEvent,
     RelayJob,
     RemoteAgentTaskSpec,
-)
-from clio_relay.adapters.worker.progress_adapters import (
-    PackageProgressProvider,
 )
 from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority,

@@ -55,6 +55,7 @@ _VALIDATION_PROVENANCE_ENV = (
 # Remote relay commands are the worker adapter's, mounted as `clio-relay worker`.
 WORKER_COMMAND_GROUP = "worker"
 
+
 @contextmanager
 def remote_command_timeout(timeout_seconds: float) -> Generator[None, None, None]:
     """Bound nested remote CLI calls in the current execution context."""

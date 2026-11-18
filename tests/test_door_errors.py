@@ -33,6 +33,8 @@ from urllib.parse import urlencode
 import mcp_types
 import mcp_types.jsonrpc
 import pytest
+from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
+from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -43,9 +45,14 @@ from fastmcp_tasks.client_models import ClientGetTaskResult, GetTaskRequest, Get
 from mcp.shared.exceptions import MCPError
 
 from clio_relay.adapters.worker import door_errors
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageAdmissionError,
+    StorageRuntimeViolation,
+)
 from clio_relay.browser_gateway import BrowserGatewayConfig, CapabilityProxyServer
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -54,13 +61,9 @@ from clio_relay.errors import (
     QueueConflictError,
     TaskInputParkConflictError,
 )
-from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
-from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.job_identity import OwnerSessionIdentityError
-from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from clio_relay.models import JobKind, JobState
 from clio_relay.storage_policy import StorageDecision, StorageReason
-from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError, StorageRuntimeViolation
 
 # --------------------------------------------------------------------------- #
 # The frozen REASONS registry

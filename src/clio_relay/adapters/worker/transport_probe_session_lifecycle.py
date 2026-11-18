@@ -17,15 +17,15 @@ from __future__ import annotations
 import json
 from typing import Literal, cast
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_lifecycle import SessionLifecycleReport
-from clio_relay.session_wire_models import CleanupResource, OwnedSessionStartResult
 from clio_relay.adapters.worker.transport_probe_evidence import (
     _attach_transport_evidence,
     _process_cleanup_resource,
     _transport_resource_line,
 )
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import RelayError
+from clio_relay.session_wire_models import CleanupResource, OwnedSessionStartResult
 from clio_relay.validation_report import TransportCleanupOutcome, TransportCleanupResourceEvidence
 
 

@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING, cast
 import clio_relay.adapters.worker.session_cleanup_targets as session_cleanup_targets
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
-from clio_relay.errors import RelayError
-from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.adapters.worker.session_lifecycle_report import (
     SessionLifecycleReport,
     session_lifecycle_report_sha256,
 )
+from clio_relay.errors import RelayError
+from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.session_wire_models import (
     OwnedSessionCleanupReportReference,
     OwnedSessionCleanupTarget,

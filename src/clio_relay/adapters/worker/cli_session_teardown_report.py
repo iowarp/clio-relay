@@ -31,12 +31,12 @@ import clio_relay.adapters.worker.cli_owned_report_artifact as cli_owned_report_
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.validation_report as validation_report_module
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
     SessionLifecycleReport,
 )
+from clio_relay.errors import RelayError
 from clio_relay.validation_report import (
     CleanupEvidence,
     EvidenceReference,

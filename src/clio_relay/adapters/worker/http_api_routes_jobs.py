@@ -18,7 +18,6 @@ from fastapi import FastAPI
 from fastapi.params import Depends
 
 from clio_relay.adapters.worker import door_errors
-from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import (
     JarvisPipelineSubmitRequest,
@@ -26,6 +25,7 @@ from clio_relay.adapters.worker.http_api_models import (
     RemoteAgentSubmitRequest,
 )
 from clio_relay.adapters.worker.http_api_redaction import _public_payload, _public_record
+from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.job_identity import JobOwnerSessionIdentity
 from clio_relay.models import (

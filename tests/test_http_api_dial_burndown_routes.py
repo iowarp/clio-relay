@@ -15,6 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import clio_relay.adapters.worker.http_api_routes_worker_probe as http_api_routes_worker_probe
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -22,8 +24,6 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob, RelayTask
 

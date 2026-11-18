@@ -18,7 +18,10 @@ from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     BOOTSTRAP_DESIRED_STATE_SCHEMA,
     MANAGED_JARVIS_REPO_PATH,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_primitives import _require_sha256, canonical_json_sha256
+from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
+    _require_sha256,
+    canonical_json_sha256,
+)
 
 
 class BootstrapDesiredState(BaseModel):

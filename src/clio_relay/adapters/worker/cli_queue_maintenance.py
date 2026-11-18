@@ -22,16 +22,15 @@ import typer
 import clio_relay.adapters.worker.cli_queue as cli_queue
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.storage_runtime as storage_runtime
-from clio_relay.config import RelaySettings
-from clio_relay.errors import RelayError
-from clio_relay.models import JobKind
 from clio_relay.adapters.worker.queue_management import (
     DEFAULT_RESULT_LIMIT,
-    DEFAULT_SCAN_LIMIT,
     DEFAULT_STALE_SCAN_LIMIT,
     cleanup_stale_jobs,
 )
 from clio_relay.adapters.worker.retention import TerminalRetentionCoordinator
+from clio_relay.config import RelaySettings
+from clio_relay.errors import RelayError
+from clio_relay.models import JobKind
 
 
 def _optional_datetime(value: str | None) -> datetime | None:

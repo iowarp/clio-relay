@@ -98,7 +98,9 @@ def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> No
             "transport.cleanup=passed",
         ]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     report_path = tmp_path / "ssh-transport.json"
 
@@ -176,7 +178,9 @@ def test_cli_ssh_transport_detach_report_models_retention_without_residual(
             "transport.cleanup=detached",
         ]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     report_path = tmp_path / "ssh-detach.json"
 
@@ -307,7 +311,9 @@ def test_cli_tests_direct_transport_and_writes_canonical_report(
             "transport.cleanup=passed",
         ]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "xtcp-secret")
     report_path = tmp_path / "direct-transport.json"
@@ -350,7 +356,9 @@ def test_cli_transport_failure_writes_partial_canonical_report(
         del kwargs
         raise RelayError("live transport failed")
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_frp_http_probe", failing_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_http_probe", failing_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
     report_path = tmp_path / "failed-transport.json"
@@ -653,7 +661,9 @@ def test_cli_direct_transport_is_strict_xtcp_by_default(
         calls.append(kwargs)
         return ["direct_transport.result=xtcp", "transport.cleanup=passed"]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_direct_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_direct_probe
+    )
 
     result = CliRunner().invoke(
         app,
@@ -705,7 +715,9 @@ def test_cli_install_proxy_delegates_to_frpc_proxy_bringup(
             installed_at="2026-08-26T00:00:00Z",
         )
 
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install
+    )
 
     result = CliRunner().invoke(
         app,
@@ -730,7 +742,9 @@ def test_cli_install_proxy_respects_an_ssh_host_override(
         calls.append(kwargs)
         raise RelayError("stop before any real dial -- this test only checks argument wiring")
 
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install
+    )
 
     result = CliRunner().invoke(
         app,
@@ -762,7 +776,9 @@ def test_cli_teardown_proxy_delegates_to_frpc_proxy_bringup(
             torn_down_at="2026-08-26T00:05:00Z",
         )
 
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", fake_teardown)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", fake_teardown
+    )
 
     result = CliRunner().invoke(
         app,
@@ -801,7 +817,9 @@ def test_cli_proxy_status_delegates_to_frpc_proxy_bringup(
             diagnosis="frpc proxy unit is inactive (state=inactive/dead)",
         )
 
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", fake_status)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", fake_status
+    )
 
     result = CliRunner().invoke(
         app,
@@ -842,9 +860,15 @@ def test_cli_frpc_proxy_verbs_report_an_unconfigured_cluster_cleanly(
     def poison(**_kwargs: object) -> object:
         raise AssertionError("must fail resolving --cluster before any ssh-executing call")
 
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", poison)
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", poison)
-    monkeypatch.setattr("clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", poison)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", poison
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", poison
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", poison
+    )
 
     result = CliRunner().invoke(app, verb_args)
 

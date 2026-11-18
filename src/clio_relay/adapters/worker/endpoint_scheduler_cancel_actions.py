@@ -15,7 +15,6 @@ from __future__ import annotations
 import subprocess
 from typing import Any, cast
 
-from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.adapters.worker.core_queue import DEFAULT_EXACT_RECORD_LIMIT
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _owned_scheduler_job_ids_from_metadata,
@@ -26,6 +25,11 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
     _scheduler_name_from_job,
     _scheduler_status_is_not_found,
 )
+from clio_relay.adapters.worker.scheduler import (
+    SchedulerProvider,
+    provider_for_scheduler,
+)
+from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.models import (
     JobState,
@@ -36,10 +40,6 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
     utc_now,
-)
-from clio_relay.adapters.worker.scheduler import (
-    SchedulerProvider,
-    provider_for_scheduler,
 )
 
 

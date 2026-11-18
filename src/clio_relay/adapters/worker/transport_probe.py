@@ -37,16 +37,6 @@ import subprocess
 import time
 from typing import cast
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.frp_link import (
-    FrpLinkConfig,
-    FrpVisitorType,
-    HeldFrpVisitor,
-    require_frp_server_addr,
-)
-from clio_relay.frp_link import assert_loopback_port_available as _assert_local_bind_port_available
-from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.adapters.worker.session_lifecycle import (
     detach_remote_session,
     start_remote_session_durable,
@@ -81,6 +71,16 @@ from clio_relay.adapters.worker.transport_probe_session_lifecycle import (
     _verified_session_detach_lines,
     _verified_session_teardown_lines,
 )
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.frp_link import (
+    FrpLinkConfig,
+    FrpVisitorType,
+    HeldFrpVisitor,
+    require_frp_server_addr,
+)
+from clio_relay.frp_link import assert_loopback_port_available as _assert_local_bind_port_available
+from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
 from clio_relay.validation_report import TransportCleanupResourceEvidence
 
 

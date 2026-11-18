@@ -73,9 +73,6 @@ import typer
 
 import clio_relay.adapters.worker.cli_session as cli_session
 import clio_relay.adapters.worker.core_queue as core_queue
-from clio_relay.cluster_config import MAX_CLUSTER_REGISTRY_BYTES
-from clio_relay.config import RelaySettings
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_lifecycle import (
     MAX_OWNED_SESSION_CLEANUP_FINALIZE_BYTES,
     OwnedSessionCleanupFinalizeRequest,
@@ -92,6 +89,9 @@ from clio_relay.adapters.worker.session_lifecycle import (
     execute_owned_session_teardown,
     wait_owned_session_start_status,
 )
+from clio_relay.cluster_config import MAX_CLUSTER_REGISTRY_BYTES
+from clio_relay.config import RelaySettings
+from clio_relay.errors import RelayError
 
 # `cli` (`clio_relay.adapters.worker.cli`) is deliberately NOT imported at module level -- see
 # this module's own docstring and `cli_relay_host.py`'s identical discipline.
@@ -229,7 +229,7 @@ def _with_owner_session_lease_projection(
     Never raises, never gates ``recovery_verified``: a missing/unreadable
     lease record leaves the status exactly as the inspection returned it.
     """
-    import clio_relay.adapters.worker.session_recovery_lease_projection as session_recovery_lease_projection
+    from clio_relay.adapters.worker import session_recovery_lease_projection
 
     if status.session_generation_id is None:
         return status

@@ -4,13 +4,13 @@ import subprocess
 from collections.abc import Callable
 from typing import Protocol, cast
 
-import pytest
-
 import clio_relay.live_acceptance as live_acceptance
-import clio_relay.adapters.worker.transport_probe as transport_probe
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+import pytest
 from clio_relay.doctor import run_cluster_doctor
+
+import clio_relay.adapters.worker.transport_probe as transport_probe
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError
 from clio_relay.frp_remote_scripts import remote_frpc_start_script
 from clio_relay.remote_cli import remote_env

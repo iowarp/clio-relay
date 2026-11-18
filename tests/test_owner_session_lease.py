@@ -16,13 +16,13 @@ from typing import cast
 
 import pytest
 
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.session_lifecycle import OwnedSessionTeardownRequest
+from clio_relay.config import RelaySettings
 from clio_relay.errors import QueueConflictError, RelayError
 from clio_relay.models import EndpointRole, JobKind, JobState, RelayJob
 from clio_relay.models_job_specs import JarvisRunSpec
-from clio_relay.adapters.worker.session_lifecycle import OwnedSessionTeardownRequest
 
 
 def _queue(tmp_path: Path) -> ClioCoreQueue:

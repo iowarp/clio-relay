@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 
 from clio_relay import process_containment
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.config import RelaySettings
 from clio_relay.models import (
     EndpointRole,
     JarvisRunSpec,

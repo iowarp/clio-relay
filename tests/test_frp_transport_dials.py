@@ -26,6 +26,11 @@ import pytest
 
 from clio_relay import frp_link
 from clio_relay.adapters.worker import remote_connection_registry
+from clio_relay.adapters.worker.remote_connection import (
+    DEFAULT_OWNED_SESSION_API_PORT,
+    RemoteConnection,
+    RemoteConnectionRegistry,
+)
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
@@ -37,11 +42,6 @@ from clio_relay.control_channel import (
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_transport import BrokeredTcpTransport, TransportPunchFailed
 from clio_relay.frp_visitor_reconciliation import ReconciliationResult
-from clio_relay.adapters.worker.remote_connection import (
-    DEFAULT_OWNED_SESSION_API_PORT,
-    RemoteConnection,
-    RemoteConnectionRegistry,
-)
 from clio_relay.session_api import (
     SESSION_IDENTITY_SCHEMA,
     OwnedSessionApiClient,
@@ -442,8 +442,12 @@ def _install(
     monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
     if skip_health_wait:
         monkeypatch.setattr("clio_relay.frp_link.wait_for_channel_health", skip_health)
-    monkeypatch.setattr("clio_relay.adapters.worker.remote_connection.secrets.token_hex", fixed_nonce)
-    monkeypatch.setattr("clio_relay.adapters.worker.remote_connection.http.client.HTTPConnection", stream_factory)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.remote_connection.secrets.token_hex", fixed_nonce
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.remote_connection.http.client.HTTPConnection", stream_factory
+    )
     monkeypatch.setattr("clio_relay.frp_transport.http.client.HTTPConnection", stream_factory)
     monkeypatch.setattr("clio_relay.frp_transport.reconcile_stale_frp_visitors", reconcile)
     monkeypatch.setattr("clio_relay.session_api.connection_registry", lambda: harness.registry)

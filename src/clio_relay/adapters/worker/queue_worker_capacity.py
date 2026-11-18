@@ -15,9 +15,9 @@ from datetime import datetime
 from typing import cast
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.worker_concurrency import kind_concurrency_metadata
 from clio_relay.errors import ConfigurationError, NotFoundError
 from clio_relay.models import EndpointRegistration
-from clio_relay.adapters.worker.worker_concurrency import kind_concurrency_metadata
 
 
 def _endpoint_concurrency(metadata: dict[str, object]) -> int:

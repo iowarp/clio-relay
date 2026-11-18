@@ -26,8 +26,8 @@ from clio_relay.adapters.worker.bootstrap_one_pass_script import (
     ONE_PASS_PERSISTENT_RECEIPT_MARKER,
     ONE_PASS_TARGET_IDENTITY_MARKER,
 )
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.adapters.worker.deployment import endpoint_user_service_name
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.errors import ConfigurationError
 
 

@@ -61,16 +61,10 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import RelaySettings
-from clio_relay.control_channel import ChannelDropped
-from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.models import RelayJob
 from clio_relay.adapters.worker.owned_session_record import (
     default_owned_session_record_path,
     load_owned_session_record,
 )
-from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.adapters.worker.remote_connection import (
     RemoteConnection,
     RemoteConnectionRegistry,
@@ -78,6 +72,12 @@ from clio_relay.adapters.worker.remote_connection import (
     connection_registry,
     resolve_remote_api_port,
 )
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import RelaySettings
+from clio_relay.control_channel import ChannelDropped
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.models import RelayJob
+from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 
 SESSION_ATTACH_REPORT_SCHEMA = "clio-relay.session-attach-report.v1"
 

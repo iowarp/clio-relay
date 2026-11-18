@@ -19,15 +19,6 @@ import clio_relay.adapters.worker.session_remote_command as session_remote_comma
 import clio_relay.adapters.worker.session_remote_scripts as session_remote_scripts
 import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.adapters.worker.session_startup_receipt as session_startup_receipt
-from clio_relay.cluster_config import (
-    MAX_CLUSTER_REGISTRY_BYTES,
-    ClusterDefinition,
-    cluster_route_revision,  # noqa: F401 -- session_recovery_inspection.py qualifies this back-reference
-)
-from clio_relay.errors import (
-    RelayError,
-)
-from clio_relay.identifiers import validate_durable_record_id
 
 # cli.py compatibility re-exports (#231 split/session-lifecycle rework).
 # cli.py is another agent's active split-in-progress territory (see the
@@ -92,7 +83,19 @@ from clio_relay.adapters.worker.session_start_wait import (
 from clio_relay.adapters.worker.session_transaction import (
     open_owned_session_transaction,  # noqa: F401 -- cli.py bare-imports this; see rationale above
 )
-from clio_relay.adapters.worker.session_validation import _validate_durable_session_identity, _validate_session
+from clio_relay.adapters.worker.session_validation import (
+    _validate_durable_session_identity,
+    _validate_session,
+)
+from clio_relay.cluster_config import (
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    cluster_route_revision,  # noqa: F401 -- session_recovery_inspection.py qualifies this back-reference
+)
+from clio_relay.errors import (
+    RelayError,
+)
+from clio_relay.identifiers import validate_durable_record_id
 
 # Wire models moved to session_wire_models.py (#231 R8(iii), design doc §4.4).
 # Re-exported here under their original names so every existing caller,

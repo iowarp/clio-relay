@@ -32,27 +32,37 @@ import os
 from typing import TYPE_CHECKING
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue, QueueSealRequiresExclusive
-from clio_relay.errors import ConfigurationError
-from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.adapters.worker.storage_managed_queue import StorageManagedQueue as StorageManagedQueue
-from clio_relay.storage_policy import StorageReason
+from clio_relay.adapters.worker.storage_managed_queue import (
+    StorageManagedQueue as StorageManagedQueue,
+)
 from clio_relay.adapters.worker.storage_runtime_core import (
     STORAGE_RUNTIME_STATUS_SCHEMA as STORAGE_RUNTIME_STATUS_SCHEMA,
 )
 from clio_relay.adapters.worker.storage_runtime_core import StorageRuntime as StorageRuntime
-from clio_relay.adapters.worker.storage_runtime_core import StorageRuntimeConfig as StorageRuntimeConfig
+from clio_relay.adapters.worker.storage_runtime_core import (
+    StorageRuntimeConfig as StorageRuntimeConfig,
+)
 from clio_relay.adapters.worker.storage_runtime_core import (
     storage_runtime_from_settings as storage_runtime_from_settings,
 )
-from clio_relay.adapters.worker.storage_runtime_errors import StorageAdmissionError as StorageAdmissionError
-from clio_relay.adapters.worker.storage_runtime_errors import StorageRuntimeError as StorageRuntimeError
-from clio_relay.adapters.worker.storage_runtime_errors import StorageRuntimeViolation as StorageRuntimeViolation
+from clio_relay.adapters.worker.storage_runtime_errors import (
+    StorageAdmissionError as StorageAdmissionError,
+)
+from clio_relay.adapters.worker.storage_runtime_errors import (
+    StorageRuntimeError as StorageRuntimeError,
+)
+from clio_relay.adapters.worker.storage_runtime_errors import (
+    StorageRuntimeViolation as StorageRuntimeViolation,
+)
 from clio_relay.adapters.worker.storage_runtime_errors import _denied_decision
 from clio_relay.adapters.worker.worker_lifetime_lock import (
     WorkerLifetimeLock,
     WorkerLifetimeLockUnavailable,
     exclusive_migration_lifetime,
 )
+from clio_relay.errors import ConfigurationError
+from clio_relay.filesystem_paths import internal_filesystem_path
+from clio_relay.storage_policy import StorageReason
 
 if TYPE_CHECKING:
     from clio_relay.config import RelaySettings

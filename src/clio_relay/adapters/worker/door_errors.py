@@ -93,6 +93,20 @@ from typing import Any, Final
 
 import mcp_types
 
+from clio_relay.adapters.worker.door_error_adapters import MAX_ENVELOPE_BYTES as MAX_ENVELOPE_BYTES
+from clio_relay.adapters.worker.door_error_adapters import SCHEMA_VERSION as SCHEMA_VERSION
+from clio_relay.adapters.worker.door_error_adapters import (
+    as_browser_gateway_error as as_browser_gateway_error,
+)
+from clio_relay.adapters.worker.door_error_adapters import as_http_problem as as_http_problem
+from clio_relay.adapters.worker.door_error_adapters import as_mcp_error as as_mcp_error
+from clio_relay.adapters.worker.door_error_adapters import websocket_refusal as websocket_refusal
+from clio_relay.adapters.worker.door_error_messages import public_message, resolved_public_message
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageAdmissionError,
+    StorageRuntimeError,
+    StorageRuntimeViolation,
+)
 from clio_relay.bounded_payload import (
     # Re-exported (not redefined, F12 #231 R6 review): bounded_payload.py is
     # the single owner of the "clio-relay.truncation.v1" schema tag; R6
@@ -102,13 +116,6 @@ from clio_relay.bounded_payload import (
     TRUNCATION_SCHEMA_VERSION as TRUNCATION_SCHEMA_VERSION,
 )
 from clio_relay.bounded_payload import build_truncation_record
-from clio_relay.adapters.worker.door_error_adapters import MAX_ENVELOPE_BYTES as MAX_ENVELOPE_BYTES
-from clio_relay.adapters.worker.door_error_adapters import SCHEMA_VERSION as SCHEMA_VERSION
-from clio_relay.adapters.worker.door_error_adapters import as_browser_gateway_error as as_browser_gateway_error
-from clio_relay.adapters.worker.door_error_adapters import as_http_problem as as_http_problem
-from clio_relay.adapters.worker.door_error_adapters import as_mcp_error as as_mcp_error
-from clio_relay.adapters.worker.door_error_adapters import websocket_refusal as websocket_refusal
-from clio_relay.adapters.worker.door_error_messages import public_message, resolved_public_message
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -120,11 +127,6 @@ from clio_relay.errors import (
 )
 from clio_relay.errors import public_message_error as public_message_error
 from clio_relay.job_identity import OwnerSessionIdentityError
-from clio_relay.adapters.worker.storage_runtime import (
-    StorageAdmissionError,
-    StorageRuntimeError,
-    StorageRuntimeViolation,
-)
 
 logger = logging.getLogger(__name__)
 

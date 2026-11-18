@@ -31,6 +31,11 @@ from clio_relay import process_ancestry as process_ancestry_module
 from clio_relay import uv_tool_receipt as uv_tool_receipt_module
 from clio_relay import validation_report as validation_report_module
 from clio_relay import validation_writer_lock as validation_writer_lock_module
+from clio_relay.adapters.worker.session_lifecycle import (
+    CleanupResource,
+    RemoteSessionStateEvidence,
+    SessionLifecycleReport,
+)
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import GatewaySession, GatewaySessionState
 from clio_relay.remote_mcp import (
@@ -40,11 +45,6 @@ from clio_relay.remote_mcp import (
     build_remote_mcp_structured_result_check,
 )
 from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
-from clio_relay.adapters.worker.session_lifecycle import (
-    CleanupResource,
-    RemoteSessionStateEvidence,
-    SessionLifecycleReport,
-)
 from clio_relay.validation_report import (
     EvidenceOrigin,
     EvidenceReference,

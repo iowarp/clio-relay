@@ -34,6 +34,14 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from clio_relay.adapters.worker import door_errors
+from clio_relay.adapters.worker.core_queue import (
+    INPUT_INGEST_ATTEMPT_METADATA_KEY,
+    INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
+    ClioCoreQueue,
+)
+from clio_relay.adapters.worker.endpoint_job_execution import SUPPORTED_JOB_KINDS
+from clio_relay.adapters.worker.http_api_redaction import _public_record
+from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -43,14 +51,7 @@ from clio_relay.cluster_config import (
     read_bounded_configuration_bytes,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.core_queue import (
-    INPUT_INGEST_ATTEMPT_METADATA_KEY,
-    INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
-    ClioCoreQueue,
-)
-from clio_relay.adapters.worker.endpoint_job_execution import SUPPORTED_JOB_KINDS
 from clio_relay.errors import ConfigurationError, QueueConflictError
-from clio_relay.adapters.worker.http_api_redaction import _public_record
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.job_identity import (
     JobOwnerSessionIdentity,
@@ -68,7 +69,6 @@ from clio_relay.models import (
     RelayTask,
     new_id,
 )
-from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 
 _SESSION_REGISTRY_SHA256_ENV = "CLIO_RELAY_SESSION_REGISTRY_SHA256"
 _SESSION_ROUTE_REVISION_ENV = "CLIO_RELAY_SESSION_ROUTE_REVISION"

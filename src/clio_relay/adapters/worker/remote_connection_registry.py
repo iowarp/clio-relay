@@ -16,6 +16,7 @@ import atexit
 import threading
 from typing import TYPE_CHECKING, Final, cast
 
+from clio_relay.adapters.worker.remote_connection_lease import raise_if_lease_expired
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings, TransportMode
 from clio_relay.control_channel import (
@@ -26,7 +27,6 @@ from clio_relay.control_channel import (
     channel_event,
 )
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.adapters.worker.remote_connection_lease import raise_if_lease_expired
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.remote_connection import RemoteConnection

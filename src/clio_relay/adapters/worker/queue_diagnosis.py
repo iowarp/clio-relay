@@ -16,16 +16,6 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.models import (
-    TERMINAL_STATES,
-    EndpointRegistration,
-    EndpointRole,
-    JobKind,
-    JobState,
-    Lease,
-    RelayJob,
-    utc_now,
-)
 from clio_relay.adapters.worker.queue_admission_simulation import (
     _queue_evidence,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -45,6 +35,16 @@ from clio_relay.adapters.worker.queue_diagnosis_constants import (
 )
 from clio_relay.adapters.worker.queue_listing import (
     _leases_by_job,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+)
+from clio_relay.models import (
+    TERMINAL_STATES,
+    EndpointRegistration,
+    EndpointRole,
+    JobKind,
+    JobState,
+    Lease,
+    RelayJob,
+    utc_now,
 )
 from clio_relay.relay_ops import scheduler_status_for_job
 

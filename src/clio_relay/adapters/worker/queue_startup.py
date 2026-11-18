@@ -105,9 +105,11 @@ from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesy
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker import queue_legacy_output_codec
-    from clio_relay.models import RelayJob
-    from clio_relay.adapters.worker.queue_lease_records import LeaseCapacityPair as _LeaseCapacityPair
+    from clio_relay.adapters.worker.queue_lease_records import (
+        LeaseCapacityPair as _LeaseCapacityPair,
+    )
     from clio_relay.adapters.worker.worker_lifetime_lock import LockedCoreIdentity
+    from clio_relay.models import RelayJob
 
     LegacyOutputAudit = queue_legacy_output_codec.LegacyOutputAudit
 

@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from clio_relay.mcp_server import handle_request
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from clio_relay.adapters.worker.cli import app
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
-from clio_relay.mcp_server import handle_request
+from clio_relay.config import RelaySettings
 from clio_relay.models import (
     ArtifactRef,
     JarvisRunSpec,

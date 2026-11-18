@@ -26,13 +26,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
 import clio_relay.adapters.worker.session_startup_receipt as session_startup_receipt
+from clio_relay.adapters.worker.session_transaction import _MAX_OWNED_SESSION_DOCUMENT_BYTES
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterRegistry,
     cluster_route_revision,
 )
 from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.session_transaction import _MAX_OWNED_SESSION_DOCUMENT_BYTES
 from clio_relay.session_wire_models import MAX_SESSION_START_ERROR_CHARS, SessionApiReleaseIdentity
 
 if TYPE_CHECKING:
@@ -48,8 +48,8 @@ _MAX_API_HEALTH_RESPONSE_BYTES = 64 * 1024
 
 def _current_session_api_release_identity() -> SessionApiReleaseIdentity:
     """Return the exact locally installed release identity for an API child."""
-    from clio_relay.installation import verified_session_api_install_receipt
     from clio_relay.adapters.worker.session_install_identity import release_identity_from_receipt
+    from clio_relay.installation import verified_session_api_install_receipt
 
     receipt = verified_session_api_install_receipt()
     return release_identity_from_receipt(receipt)

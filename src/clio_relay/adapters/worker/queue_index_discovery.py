@@ -63,7 +63,9 @@ from clio_relay.adapters.worker import (
 from clio_relay.errors import QueueConflictError
 
 if TYPE_CHECKING:
-    from clio_relay.adapters.worker.queue_lease_records import LeaseCapacityPair as _LeaseCapacityPair
+    from clio_relay.adapters.worker.queue_lease_records import (
+        LeaseCapacityPair as _LeaseCapacityPair,
+    )
 
 
 class QueueIndexDiscoveryMixin:

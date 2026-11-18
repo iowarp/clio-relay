@@ -21,10 +21,6 @@ from clio_relay.adapters.worker.bounded_file_io import (
     record_bound_sha256,
     urlsafe_sha256_digest,
 )
-from clio_relay.adapters.worker.clio_kit_wheel_archive import (
-    _zip_member_is_regular,
-    read_bounded_zip_member,
-)
 from clio_relay.adapters.worker.clio_kit_constants import (
     CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
     PYTHON_DISTRIBUTION_MAX_BYTES,
@@ -32,8 +28,12 @@ from clio_relay.adapters.worker.clio_kit_constants import (
     PYTHON_TOOL_IDENTITY_MAX_BYTES,
     PYTHON_TOOL_IDENTITY_TIMEOUT_SECONDS,
 )
+from clio_relay.adapters.worker.clio_kit_wheel_archive import (
+    _file_identity,
+    _zip_member_is_regular,
+    read_bounded_zip_member,
+)
 from clio_relay.adapters.worker.wheel_snapshot_identity import _file_descriptor_identity
-from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity
 
 
 def _persistent_tool_launcher_shebang(payload: bytes, *, executable_name: str) -> str:

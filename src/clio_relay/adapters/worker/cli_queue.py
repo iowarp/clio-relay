@@ -49,9 +49,6 @@ from typing import Annotated
 import typer
 
 import clio_relay.adapters.worker.core_queue as core_queue
-from clio_relay.config import RelaySettings
-from clio_relay.errors import RelayError
-from clio_relay.models import JobKind, JobState
 from clio_relay.adapters.worker.queue_management import (
     DEFAULT_RESULT_LIMIT,
     DEFAULT_SCAN_LIMIT,
@@ -61,6 +58,9 @@ from clio_relay.adapters.worker.queue_management import (
     discover_stale_jobs,
     list_queue_jobs,
 )
+from clio_relay.config import RelaySettings
+from clio_relay.errors import RelayError
+from clio_relay.models import JobKind, JobState
 
 # `cli` (`clio_relay.adapters.worker.cli`) is deliberately NOT imported at module level -- see
 # this module's own docstring and `cli_relay_host.py`'s identical discipline.

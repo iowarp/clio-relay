@@ -80,9 +80,9 @@ from clio_relay.adapters.worker.bootstrap_pin import (
     reconcile_cluster_runtime_pin,
     verify_one_pass_target_identity_against_pin,
 )
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, WorkerCapacityPolicy
 from clio_relay.adapters.worker.cluster_probe import pinned_runtime_present, probe_cluster_runtime
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, WorkerCapacityPolicy
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.validation_report import (
     EvidenceReference,
@@ -190,7 +190,7 @@ def cluster_bootstrap(
 ) -> None:
     """Bootstrap a configured cluster's tools, relay package, and endpoint directories."""
     import clio_relay.adapters.worker.cli as cli
-    import clio_relay.adapters.worker.cli_remote_collection_pagination as cli_remote_collection_pagination
+    from clio_relay.adapters.worker import cli_remote_collection_pagination
     import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 
     report_path = report or default_report_path(cluster)

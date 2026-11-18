@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
-from clio_relay.adapters.worker.bootstrap_reconcile_models import BootstrapDesiredState, BootstrapReconcilePlan
+from clio_relay.adapters.worker.bootstrap_reconcile_models import (
+    BootstrapDesiredState,
+    BootstrapReconcilePlan,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
     _is_sha256,
     _path_is_directory_alias,

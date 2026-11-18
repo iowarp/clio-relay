@@ -82,9 +82,9 @@ from typing import Annotated
 import typer
 
 import clio_relay.adapters.worker.cli_support as cli_support
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.remote_cli as remote_cli
 import clio_relay.session_api as session_api
-import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.validation_report as validation_report_module
 from clio_relay.config import RelaySettings
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
@@ -373,7 +373,7 @@ def session_detach(
     """Close the desktop attachment while retaining remote work and session processes."""
     import clio_relay.adapters.worker.cli as cli
     import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
-    import clio_relay.adapters.worker.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
+    from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
     import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
     import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
     import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery

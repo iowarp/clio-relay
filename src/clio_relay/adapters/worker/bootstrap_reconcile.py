@@ -114,7 +114,9 @@ from clio_relay.adapters.worker.bootstrap_reconcile_models import (
     BootstrapReplacementProviderEvidence,  # noqa: F401
     JarvisStateEvidence,  # noqa: F401
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_planning import plan_bootstrap_reconcile  # noqa: F401
+from clio_relay.adapters.worker.bootstrap_reconcile_planning import (
+    plan_bootstrap_reconcile,  # noqa: F401
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_planning_support import (
     _bounded_subprocess,  # noqa: F401
     _full_plan,  # noqa: F401

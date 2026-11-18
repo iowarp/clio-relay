@@ -20,8 +20,6 @@ import json
 import subprocess
 from typing import cast
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.transport_probe_evidence import (
     _attach_transport_evidence,
     _process_cleanup_resource,
@@ -32,6 +30,8 @@ from clio_relay.adapters.worker.transport_probe_remote_cleanup_models import (
     MAX_REMOTE_CLEANUP_OUTPUT_BYTES,
     _RemoteCleanupPayload,
 )
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import RelayError
 from clio_relay.validation_report import TransportCleanupResourceEvidence
 
 REMOTE_PROBE_CLEANUP_TIMEOUT_SECONDS = 120.0

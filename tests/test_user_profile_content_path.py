@@ -18,8 +18,9 @@ import base64
 import hashlib
 from pathlib import Path
 
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.mcp_server import handle_request
+
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, RelayJob
 
 

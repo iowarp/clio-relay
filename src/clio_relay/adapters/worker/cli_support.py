@@ -81,6 +81,7 @@ import typer
 from pydantic import ValidationError
 
 import clio_relay.adapters.worker.storage_runtime as storage_runtime
+from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
@@ -90,7 +91,6 @@ from clio_relay.models import (
     artifact_use_payload,
     validate_artifact_use_collection,
 )
-from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError, StorageManagedQueue
 from clio_relay.validation_report import (
     LiveValidationReport,
     ValidationRecorder,

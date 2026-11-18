@@ -7,9 +7,9 @@ module keeps relay-level queue status and a compatibility poll helper.
 from __future__ import annotations
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.scheduler import provider_for_scheduler
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JobState, RelayJob, SchedulerStatus
-from clio_relay.adapters.worker.scheduler import provider_for_scheduler
 
 MAX_QUEUE_POSITION_RECORDS = 10_000
 

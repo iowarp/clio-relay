@@ -14,10 +14,15 @@ import os
 from pathlib import Path
 from typing import cast
 
-from clio_relay.adapters.worker.bootstrap_reconcile_activation_paths import _capture_reconcile_activation_paths
+from clio_relay.adapters.worker.bootstrap_reconcile_activation_paths import (
+    _capture_reconcile_activation_paths,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_execution_identity import inspect_jarvis_state
 from clio_relay.adapters.worker.bootstrap_reconcile_inspection import _inspect_installation_identity
-from clio_relay.adapters.worker.bootstrap_reconcile_models import BootstrapDesiredState, BootstrapReconcilePlan
+from clio_relay.adapters.worker.bootstrap_reconcile_models import (
+    BootstrapDesiredState,
+    BootstrapReconcilePlan,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_planning_support import (
     _full_plan,
     _managed_generation_jarvis_environment,

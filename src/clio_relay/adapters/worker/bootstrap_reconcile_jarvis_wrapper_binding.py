@@ -23,8 +23,14 @@ from clio_relay.adapters.worker.bootstrap_reconcile_execution_identity import (
     execution_environment_identity,
     jarvis_wrapper_payload,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_models import BootstrapDesiredState, BootstrapReconcilePlan
-from clio_relay.adapters.worker.bootstrap_reconcile_primitives import _read_regular_bounded, _stat_identity
+from clio_relay.adapters.worker.bootstrap_reconcile_models import (
+    BootstrapDesiredState,
+    BootstrapReconcilePlan,
+)
+from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
+    _read_regular_bounded,
+    _stat_identity,
+)
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import installation_info
 from clio_relay.validation_report import sha256_file

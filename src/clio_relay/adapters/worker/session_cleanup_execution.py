@@ -29,18 +29,18 @@ import clio_relay.adapters.worker.session_cleanup_targets as session_cleanup_tar
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
 import clio_relay.adapters.worker.session_recovery_attempt_status as session_recovery_attempt_status
 import clio_relay.adapters.worker.session_remote_command as session_remote_command
-import clio_relay.adapters.worker.session_start_attempt_validation as session_start_attempt_validation
+from clio_relay.adapters.worker import session_start_attempt_validation
+from clio_relay.adapters.worker.session_lifecycle_report import SessionLifecycleReport
+from clio_relay.adapters.worker.session_transaction import (
+    _MAX_OWNED_SESSION_DOCUMENT_BYTES,
+)
+from clio_relay.adapters.worker.session_validation import _validate_session
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterRegistry,
     cluster_route_revision,
 )
 from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.session_lifecycle_report import SessionLifecycleReport
-from clio_relay.adapters.worker.session_transaction import (
-    _MAX_OWNED_SESSION_DOCUMENT_BYTES,
-)
-from clio_relay.adapters.worker.session_validation import _validate_session
 from clio_relay.session_wire_models import (
     MAX_SESSION_START_ERROR_CHARS,
     CleanupResource,
@@ -488,8 +488,8 @@ def execute_owned_session_teardown(
     # (which imports this module back for its cli.py-compatibility re-export
     # block) -- see the module docstring.
     import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-    from clio_relay.config import RelaySettings
     from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+    from clio_relay.config import RelaySettings
 
     _validate_session(session_id=request.session_id, remote_api_port=1)
     if request.cancel_scheduler_jobs and not request.cancel_jobs:

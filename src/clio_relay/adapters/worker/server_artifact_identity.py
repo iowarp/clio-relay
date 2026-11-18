@@ -15,12 +15,13 @@ from clio_relay.adapters.worker.clio_kit_runtime_identity import (
     _installed_clio_kit_runtime_identity,
     _locked_clio_kit_runtime_identity,
     _nested_clio_kit_server_name,
+    _resolve_executable,
 )
-from clio_relay.adapters.worker.clio_kit_wheel_archive import _install_spec_source
-from clio_relay.adapters.worker.python_console_distribution import _direct_distribution_source_identity
-from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity
-from clio_relay.adapters.worker.python_console_distribution import _python_console_distribution_identity
-from clio_relay.adapters.worker.clio_kit_runtime_identity import _resolve_executable
+from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity, _install_spec_source
+from clio_relay.adapters.worker.python_console_distribution import (
+    _direct_distribution_source_identity,
+    _python_console_distribution_identity,
+)
 
 
 def mcp_server_artifact_identity(

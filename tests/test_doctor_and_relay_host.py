@@ -5,17 +5,17 @@ import subprocess
 from pathlib import Path
 from typing import cast
 
+import clio_relay.doctor as doctor
 import pytest
+from clio_relay.doctor import run_cluster_doctor, run_doctor
 
 import clio_relay.adapters.worker.deployment as deployment
-import clio_relay.doctor as doctor
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.deployment import (
     install_endpoint_user_service_over_ssh,
     render_endpoint_user_service,
 )
-from clio_relay.doctor import run_cluster_doctor, run_doctor
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.relay_host import (
     FrpcConfig,

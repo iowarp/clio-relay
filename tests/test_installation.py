@@ -13,8 +13,8 @@ from typing import cast
 
 import pytest
 
-import clio_relay.installation as installation_module
 import clio_relay.adapters.worker.worker_runtime_verification as worker_runtime_verification_module
+import clio_relay.installation as installation_module
 from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
 from clio_relay.dev_mode import DEV_MODE_BANNER, DEV_MODE_ENV, VerificationFindings
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError

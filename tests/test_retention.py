@@ -10,12 +10,12 @@ import pytest
 import clio_relay.adapters.worker.retention as retention_module
 from clio_relay.adapters.worker import door_error_adapters, door_errors
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import QueueConflictError
-from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.adapters.worker.retention import (
     SpoolRetentionPhase,
     TerminalRetentionCoordinator,
 )
+from clio_relay.errors import QueueConflictError
+from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.spool import JobSpool
 
 

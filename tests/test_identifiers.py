@@ -10,12 +10,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from clio_relay.mcp_server import handle_request
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from clio_relay import mcp_server as mcp_server_module
 from clio_relay.adapters.worker import queue_gateway_indexes, queue_layout, queue_store_read
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
+from clio_relay.adapters.worker.session_lifecycle import (
+    RemoteSessionStateEvidence,
+    SessionLifecycleReport,
+)
+from clio_relay.config import RelaySettings
 from clio_relay.errors import QueueConflictError
 from clio_relay.identifiers import (
     DURABLE_RECORD_ID_MAX_BYTES,
@@ -26,7 +32,6 @@ from clio_relay.identifiers import (
     filesystem_key,
     validate_durable_record_id,
 )
-from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -43,8 +48,6 @@ from clio_relay.models import (
     SchedulerCancelPending,
     TaskTimelineEvent,
 )
-from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
-from clio_relay.adapters.worker.session_lifecycle import RemoteSessionStateEvidence, SessionLifecycleReport
 from clio_relay.validation_report import CleanupEvidence
 
 

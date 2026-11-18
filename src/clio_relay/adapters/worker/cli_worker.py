@@ -16,8 +16,8 @@ from typing import Annotated
 import typer
 
 import clio_relay.adapters.worker.core_queue as core_queue
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.queue_management import worker_status
+from clio_relay.config import RelaySettings
 
 # `cli` is imported inside the command, not at module level, to avoid an
 # import cycle (`cli.py` imports this module).

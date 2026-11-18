@@ -11,9 +11,9 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, cast
 
+from clio_relay.adapters.worker.session_transaction import _MAX_OWNED_SESSION_DOCUMENT_BYTES
 from clio_relay.cluster_config import MAX_CLUSTER_REGISTRY_BYTES
 from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.session_transaction import _MAX_OWNED_SESSION_DOCUMENT_BYTES
 from clio_relay.session_wire_models import OwnedSessionCleanupTarget, OwnedSessionTeardownRequest
 
 if TYPE_CHECKING:

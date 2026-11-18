@@ -7,20 +7,20 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from clio_relay.mcp_server import handle_request
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
 from clio_relay.adapters.worker import cli as relay_cli
 from clio_relay.adapters.worker.cli import app
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
-from clio_relay.mcp_server import handle_request
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.config import RelaySettings
 from clio_relay.models import GatewaySession
 from clio_relay.service_runtime import ServiceRuntimeStopResult
-from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 
 _OWNER_TOKEN = "owner-capability-8c699a93d7cc4af1"
 _API_TOKEN = "api-capability-69dc7b420af54a1b"

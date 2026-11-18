@@ -32,16 +32,16 @@ import clio_relay.adapters.worker.cli_owned_report_artifact as cli_owned_report_
 import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
-import clio_relay.adapters.worker.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
+from clio_relay.adapters.worker import cli_owner_session_teardown_verify
 import clio_relay.adapters.worker.cli_session_teardown_jobs as cli_session_teardown_jobs
 import clio_relay.adapters.worker.cli_session_teardown_report as cli_session_teardown_report
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
-from clio_relay.errors import RelayError
-from clio_relay.models import JobState
 from clio_relay.adapters.worker.owned_session_record import clear_owned_session_record
 from clio_relay.adapters.worker.session_lifecycle import session_lifecycle_report_sha256
+from clio_relay.errors import RelayError
+from clio_relay.models import JobState
 from clio_relay.validation_report import sha256_file
 
 

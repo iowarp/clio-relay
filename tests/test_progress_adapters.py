@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.progress_adapters import (
     package_progress_acceptance_valid,
     package_progress_adapter_from_pipeline,
 )
+from clio_relay.errors import ConfigurationError
 from tests.plugin_fakes import (
     FakeEntryPoints,
     SiteSimulationProgressAdapter,

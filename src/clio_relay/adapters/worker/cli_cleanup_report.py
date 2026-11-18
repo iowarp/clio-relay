@@ -10,13 +10,13 @@ import hashlib
 from typing import cast
 
 import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
-import clio_relay.adapters.worker.cli_owner_session_teardown_verify as cli_owner_session_teardown_verify
-from clio_relay.errors import RelayError
+from clio_relay.adapters.worker import cli_owner_session_teardown_verify
 from clio_relay.adapters.worker.session_lifecycle import (
     OwnedSessionRecoveryStatus,
     SessionLifecycleReport,
     session_lifecycle_report_bytes,
 )
+from clio_relay.errors import RelayError
 
 MAX_FINALIZED_CLEANUP_RETRY_OUTPUT_BYTES = 1024 * 1024
 

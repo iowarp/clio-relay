@@ -143,7 +143,7 @@ def register_adapter_routes(
     prefix = ADAPTER_ROUTE_PREFIX
 
     @app.post(f"{prefix}/describe", dependencies=[auth_dependency])
-    async def adapter_describe(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_describe(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
             info = await _site_adapter(ctx, body).describe()
             return info.model_dump(mode="json")
@@ -151,7 +151,7 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/run", dependencies=[auth_dependency])
-    async def adapter_run(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_run(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
             try:
                 spec = JobSpec.model_validate(body.get("spec"))
@@ -172,7 +172,7 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/status", dependencies=[auth_dependency])
-    async def adapter_status(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_status(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
             status = await _site_adapter(ctx, body).status(_handle(body))
             return status.model_dump(mode="json")
@@ -180,7 +180,7 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/cancel", dependencies=[auth_dependency])
-    async def adapter_cancel(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_cancel(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
             status = await _site_adapter(ctx, body).cancel(_handle(body))
             return status.model_dump(mode="json")
@@ -188,7 +188,7 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/find", dependencies=[auth_dependency])
-    async def adapter_find(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_find(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
             found = await _site_adapter(ctx, body).find(_text(body, "operation_id"))
             return None if found is None else found.model_dump(mode="json")
@@ -199,7 +199,7 @@ def register_adapter_routes(
 
     @app.post(f"{prefix}/exec/start", dependencies=[auth_dependency])
     async def adapter_exec_start(
-        body: dict[str, Any] = Body(default_factory=dict),
+        body: dict[str, Any] = _BODY,
     ) -> dict[str, Any]:
         async def action() -> Any:
             command = body.get("command")
@@ -211,9 +211,7 @@ def register_adapter_routes(
                 or not all(isinstance(part, str) for part in command)
             ):
                 raise Refusal(RefusalReason.INVALID_ARGUMENTS, "command must be a list of strings")
-            if timeout_s is not None and (
-                not isinstance(timeout_s, int | float) or timeout_s <= 0
-            ):
+            if timeout_s is not None and (not isinstance(timeout_s, int | float) or timeout_s <= 0):
                 raise Refusal(RefusalReason.INVALID_ARGUMENTS, "timeout_s must be positive")
             if not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
                 raise Refusal(
@@ -244,13 +242,15 @@ def register_adapter_routes(
 
     @app.post(f"{prefix}/exec/poll", dependencies=[auth_dependency])
     async def adapter_exec_poll(
-        body: dict[str, Any] = Body(default_factory=dict),
+        body: dict[str, Any] = _BODY,
     ) -> dict[str, Any]:
         async def action() -> Any:
             exec_id = _text(body, "exec_id")
             entry = running.get(exec_id)
             if entry is None or entry.task is None:
-                raise Refusal(RefusalReason.OPERATION_NOT_FOUND, f"no command {exec_id} is running here")
+                raise Refusal(
+                    RefusalReason.OPERATION_NOT_FOUND, f"no command {exec_id} is running here"
+                )
             after = body.get("after", 0)
             wait_s = body.get("wait_s", _POLL_WAIT_S)
             if not isinstance(after, int) or after < 0:
@@ -276,7 +276,7 @@ def register_adapter_routes(
 
     @app.post(f"{prefix}/exec/cancel", dependencies=[auth_dependency])
     async def adapter_exec_cancel(
-        body: dict[str, Any] = Body(default_factory=dict),
+        body: dict[str, Any] = _BODY,
     ) -> dict[str, Any]:
         async def action() -> Any:
             entry = running.pop(_text(body, "exec_id"), None)
@@ -290,5 +290,7 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/files/{{op}}", dependencies=[auth_dependency])
-    async def adapter_files(op: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    async def adapter_files(
+        op: str, body: dict[str, Any] = _BODY
+    ) -> dict[str, Any]:
         return await _answer(lambda: _file_op(_site_adapter(ctx, body), op, body))

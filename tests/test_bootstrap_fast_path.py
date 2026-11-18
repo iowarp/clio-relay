@@ -27,11 +27,11 @@ import clio_relay.adapters.worker.bootstrap as bootstrap
 import clio_relay.adapters.worker.bootstrap_receipt_validation as bootstrap_receipt_validation
 import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile
 import clio_relay.adapters.worker.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
-import clio_relay.bounded_process as bounded_process
 import clio_relay.adapters.worker.cli as cli
 import clio_relay.adapters.worker.cli_installation_receipt as cli_installation_receipt
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.adapters.worker.core_queue as core_queue
+import clio_relay.bounded_process as bounded_process
 import clio_relay.installation as installation
 from clio_relay import __version__
 from clio_relay.adapters.worker.bootstrap_reconcile import (
@@ -3334,9 +3334,9 @@ def test_legacy_planning_attests_private_candidate_before_transaction_or_fence()
     assert 'bootstrap_provider_exec "$@"' in script
     assert '"$provider" -I - "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT"' not in script
     assert "expected_provider_interpreter_sha256" in planning_heredoc
-    assert planning_heredoc.index("from clio_relay.adapters.worker.bootstrap_reconcile import (") < (
-        planning_heredoc.index("prove_bootstrap_replacement_provider(")
-    )
+    assert planning_heredoc.index(
+        "from clio_relay.adapters.worker.bootstrap_reconcile import ("
+    ) < (planning_heredoc.index("prove_bootstrap_replacement_provider("))
     assert planning_heredoc.index("prove_bootstrap_replacement_provider(") < (
         planning_heredoc.index("plan_bootstrap_reconcile(desired, replacement_provider=evidence)")
     )

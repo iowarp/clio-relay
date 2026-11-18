@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
-import clio_relay.adapters.worker.session_start_attempt_validation as session_start_attempt_validation
+from clio_relay.adapters.worker import session_start_attempt_validation
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
     ClusterRegistry,
@@ -28,8 +28,8 @@ from clio_relay.session_wire_models import OwnedSessionInputPolicy, OwnedSession
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from clio_relay.models import RelayJob
     from clio_relay.adapters.worker.session_transaction import _OwnedSessionTransaction
+    from clio_relay.models import RelayJob
 
 logger = logging.getLogger(__name__)
 

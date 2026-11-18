@@ -19,9 +19,9 @@ from clio_relay.adapters.worker import (
     queue_legacy_output_migration,
 )
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JobKind, JobState, JobTombstone, RelayEvent, utc_now
-from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 
 
 def _event_path(root: Path, job_id: str, seq: int) -> Path:

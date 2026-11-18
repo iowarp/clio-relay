@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import shlex
 
-from clio_relay.adapters.worker.bootstrap_receipt_classifier_source import _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE
+from clio_relay.adapters.worker.bootstrap_receipt_classifier_source import (
+    _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE,
+)
 
 
 def script_preamble(

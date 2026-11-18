@@ -23,6 +23,10 @@ from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     SchedulerSubmissionUnresolvedError,
 )
+from clio_relay.adapters.worker.scheduler import (
+    SchedulerReconciliationProvider,
+    reconciliation_provider_for_scheduler,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import (
     RelayJob,
@@ -31,10 +35,6 @@ from clio_relay.models import (
 from clio_relay.runtime_metadata import (
     JarvisRuntimeMetadata,
     RuntimeMetadataSource,
-)
-from clio_relay.adapters.worker.scheduler import (
-    SchedulerReconciliationProvider,
-    reconciliation_provider_for_scheduler,
 )
 
 

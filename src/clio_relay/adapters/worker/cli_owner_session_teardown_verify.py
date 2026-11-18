@@ -8,11 +8,11 @@ from __future__ import annotations
 from collections import Counter
 
 import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_lifecycle import (
     SessionLifecycleReport,
     cleanup_connectors_cover_gateways,
 )
+from clio_relay.errors import RelayError
 
 
 def _verify_owner_session_teardown(

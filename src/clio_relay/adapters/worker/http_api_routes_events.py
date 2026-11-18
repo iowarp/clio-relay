@@ -29,17 +29,24 @@ from fastapi.params import Depends
 from fastapi.responses import StreamingResponse
 
 from clio_relay.adapters.worker import door_error_adapters, door_errors
-from clio_relay.errors import NotFoundError
-from clio_relay.adapters.worker.http_api_auth import _require_websocket_page_limit, _require_websocket_token
+from clio_relay.adapters.worker.http_api_auth import (
+    _require_websocket_page_limit,
+    _require_websocket_token,
+)
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import TaskTimelineEventRequest
-from clio_relay.adapters.worker.http_api_redaction import _public_model_page, _public_payload, _public_record
+from clio_relay.adapters.worker.http_api_redaction import (
+    _public_model_page,
+    _public_payload,
+    _public_record,
+)
 from clio_relay.adapters.worker.http_api_streaming import (
     _monitor_sse_events,
     _monitor_stream_payloads,
     _task_sse_events,
     _task_stream_payloads,
 )
+from clio_relay.errors import NotFoundError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.models import Cursor, JobWaitResult, RelayEvent, TaskTimelineEvent
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS

@@ -576,9 +576,7 @@ def lease_expiry_ref_name(identity: LeaseIndexIdentity) -> str:
 
 # Every decodable kind keeps a code so leases written for retired kinds still parse.
 _LEASE_KIND_CODES: dict[JobKind, str] = {kind: kind.value[0] for kind in JobKind}
-_LEASE_KINDS_BY_CODE: dict[str, JobKind] = {
-    code: kind for kind, code in _LEASE_KIND_CODES.items()
-}
+_LEASE_KINDS_BY_CODE: dict[str, JobKind] = {code: kind for kind, code in _LEASE_KIND_CODES.items()}
 if len(_LEASE_KINDS_BY_CODE) != len(_LEASE_KIND_CODES):
     raise RuntimeError("job kind lease codes must be unique")
 

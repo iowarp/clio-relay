@@ -21,6 +21,10 @@ from clio_relay.adapters.worker import (
     queue_store_read,
     queue_store_write,
 )
+from clio_relay.adapters.worker.worker_concurrency import (
+    KindConcurrencyInput,
+    normalize_kind_concurrency,
+)
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     JobKind,
@@ -29,7 +33,6 @@ from clio_relay.models import (
     RelayJob,
     utc_now,
 )
-from clio_relay.adapters.worker.worker_concurrency import KindConcurrencyInput, normalize_kind_concurrency
 
 _LeaseIndexIdentity = queue_lease_records.LeaseIndexIdentity
 _LeaseExpiryReference = queue_layout.LeaseExpiryReference

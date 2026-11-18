@@ -20,14 +20,10 @@ from fastapi import FastAPI, Query
 from fastapi.params import Depends
 
 from clio_relay.adapters.worker import door_errors
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import QueueCancelRequest, RetentionCollectRequest
 from clio_relay.adapters.worker.http_api_queue_paging import _list_owned_session_queue
 from clio_relay.adapters.worker.http_api_redaction import _public_payload, _public_record
-from clio_relay.identifiers import DurableRecordId
-from clio_relay.models import JobKind, JobState, MonitorRule, RelayJob
-from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.adapters.worker.queue_management import (
     DEFAULT_STALE_SCAN_LIMIT,
     cancel_queue_job,
@@ -38,9 +34,13 @@ from clio_relay.adapters.worker.queue_management import (
     list_queue_jobs,
     worker_status,
 )
+from clio_relay.adapters.worker.retention import TerminalRetentionCoordinator
+from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError
+from clio_relay.identifiers import DurableRecordId
+from clio_relay.models import JobKind, JobState, MonitorRule, RelayJob
+from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS
 from clio_relay.relay_ops import cancel_job as request_cancel_job
 from clio_relay.relay_ops import evaluate_monitor_rules
-from clio_relay.adapters.worker.retention import TerminalRetentionCoordinator
 
 
 def register_queue_routes(

@@ -39,13 +39,16 @@ from fastapi.params import Depends
 
 from clio_relay import scheduler_providers
 from clio_relay.adapters.worker import door_errors
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
-from clio_relay.adapters.worker.http_api_models import SchedulerCancelRequest, SchedulerStatusBatchRequest
+from clio_relay.adapters.worker.http_api_models import (
+    SchedulerCancelRequest,
+    SchedulerStatusBatchRequest,
+)
 from clio_relay.adapters.worker.http_api_redaction import (
     _public_payload,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _public_record,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+from clio_relay.errors import ConfigurationError
 from clio_relay.models_scheduling import SchedulerStatus
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.control_channel import CHANNEL_BOOTSTRAP_BEGIN, CHANNEL_BOOTSTRAP_END
@@ -17,7 +18,6 @@ from clio_relay.job_identity import (
     SESSION_GENERATION_ID_HEADER,
 )
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 from clio_relay.session_api import (
     ChannelReconnectRequired,
     OwnedSessionApiClient,

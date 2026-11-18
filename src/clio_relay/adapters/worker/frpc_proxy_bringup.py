@@ -48,10 +48,7 @@ import math
 import subprocess
 from typing import Final
 
-from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.adapters.worker.deployment_activation import ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS
-from clio_relay.errors import RelayError
-from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.adapters.worker.frpc_proxy_receipt import (
     FrpcProxyBringupReceipt,
     FrpcProxyStatusDocument,
@@ -72,6 +69,9 @@ from clio_relay.adapters.worker.frpc_unit import (
     render_frpc_proxy_toml,
     render_frpc_proxy_unit,
 )
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import RelayError
+from clio_relay.frp_proxy_naming import canonical_proxy_name
 
 FRPC_PROXY_SSH_TIMEOUT_SECONDS: Final = 120.0
 """Bound for teardown/status: neither rides the slow activation observer."""

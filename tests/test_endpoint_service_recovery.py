@@ -12,7 +12,6 @@ from typer.testing import CliRunner
 import clio_relay.adapters.worker.cli as cli
 import clio_relay.adapters.worker.endpoint_service_status as service_status
 from clio_relay.adapters.worker.cli import app
-from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.adapters.worker.endpoint_service_status import (
     EndpointServiceReadiness,
@@ -20,6 +19,7 @@ from clio_relay.adapters.worker.endpoint_service_status import (
     parse_endpoint_service_readiness,
     render_endpoint_service_readiness_script,
 )
+from clio_relay.cluster_config import ClusterDefinition
 
 
 def _status_output(**overrides: str) -> str:

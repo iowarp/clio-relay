@@ -97,8 +97,8 @@ def worker_runtime_info(
     still produces a readable status instead of raising; it never affects
     freshness/liveness or the fresh-endpoint scan below, which stay hard.
     """
-    from clio_relay.config import RelaySettings
     from clio_relay.adapters.worker.core_queue import MAX_ENDPOINT_FRESH_SECONDS, ClioCoreQueue
+    from clio_relay.config import RelaySettings
     from clio_relay.installation import installation_info, load_install_receipt
     from clio_relay.models import EndpointRole
 

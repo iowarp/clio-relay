@@ -29,6 +29,10 @@ from clio_relay.adapters.worker.core_queue import (
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
+from clio_relay.adapters.worker.worker_concurrency import (
+    KindConcurrencyInput,
+    normalize_kind_concurrency,
+)
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     TERMINAL_STATES,
@@ -37,7 +41,6 @@ from clio_relay.models import (
     Lease,
     RelayJob,
 )
-from clio_relay.adapters.worker.worker_concurrency import KindConcurrencyInput, normalize_kind_concurrency
 
 _MANAGED_UNSET = object()
 

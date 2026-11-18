@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import Any, cast
 
 from clio_relay.adapters.worker.bounded_file_io import bounded_regular_file_bytes, is_sha256_text
+from clio_relay.adapters.worker.clio_kit_constants import (
+    _CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY,
+    _CLIO_KIT_LOCKED_SERVER_SCHEMA,
+    CLIO_KIT_LOCK_MAX_BYTES,
+    CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
+)
 from clio_relay.adapters.worker.clio_kit_wheel_archive import (
     CLIO_KIT_WHEEL_MAX_PROJECT_BYTES,
+    _file_identity,
     _zip_member_is_regular,
     bounded_zip_member_chunks,
     clio_kit_runtime_project_members,
@@ -22,14 +29,7 @@ from clio_relay.adapters.worker.clio_kit_wheel_archive import (
     validated_wheel_members,
     verified_wheel_archive,
 )
-from clio_relay.adapters.worker.clio_kit_constants import (
-    _CLIO_KIT_LOCKED_SERVER_RUNTIME_POLICY,
-    _CLIO_KIT_LOCKED_SERVER_SCHEMA,
-    CLIO_KIT_LOCK_MAX_BYTES,
-    CLIO_KIT_WHEEL_MAX_LAUNCHER_BYTES,
-)
 from clio_relay.adapters.worker.jarvis_cd_lock_binding import _jarvis_cd_lock_binding
-from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity
 
 
 def _nested_clio_kit_server_name(

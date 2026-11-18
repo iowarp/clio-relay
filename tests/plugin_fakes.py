@@ -180,4 +180,6 @@ def install_site_progress_plugin(monkeypatch: MonkeyPatch) -> None:
             )
         ]
     )
-    monkeypatch.setattr("clio_relay.adapters.worker.progress_adapters.entry_points", lambda: entries)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.progress_adapters.entry_points", lambda: entries
+    )

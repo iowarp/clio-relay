@@ -99,9 +99,7 @@ class WorkerConfig(BaseModel):
         default="auto",
         description="auto picks the scheduler whose submit command is on the site's PATH",
     )
-    work_dir: str | None = Field(
-        default=None, description="Where job directories go on the site"
-    )
+    work_dir: str | None = Field(default=None, description="Where job directories go on the site")
     rendezvous: Rendezvous | None = Field(
         default=None,
         description="Defaults to relay's CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN",
@@ -220,9 +218,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
 
     name: ClassVar[str] = "worker"
     Config: ClassVar[type[BaseModel]] = WorkerConfig
-    implements: ClassVar[frozenset[Verb]] = frozenset(
-        {"describe", "run", "exec", "files", "serve"}
-    )
+    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
 
     # --- link state -----------------------------------------------------
 
@@ -318,9 +314,10 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         encoded = base64.b64encode(data).decode("ascii")
         lines = [encoded[i : i + 76] for i in range(0, len(encoded), 76)]
         return (
-            f'base64 -d > "{target}.new" <<\'CLIO_RELAY_{label}\'\n'
+            f"base64 -d > \"{target}.new\" <<'CLIO_RELAY_{label}'\n"
             + "\n".join(lines)
-            + f'\nCLIO_RELAY_{label}\nchmod {mode} "{target}.new"\nmv -f "{target}.new" "{target}"\n'
+            + f"\nCLIO_RELAY_{label}\n"
+            + f'chmod {mode} "{target}.new"\nmv -f "{target}.new" "{target}"\n'
         )
 
     def _text_file(self, label: str, target: str, text: str) -> str:
@@ -343,10 +340,13 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             # Stop a worker this directory already ran, and its proxy.
             'if [ -f "$D/run/site.pid" ]; then',
             '  p="$(cat "$D/run/site.pid")"',
-            '  if [ -r "/proc/$p/cmdline" ] && tr "\\0" " " < "/proc/$p/cmdline" | grep -q site-serve; then',
+            '  if [ -r "/proc/$p/cmdline" ] \\',
+            '    && tr "\\0" " " < "/proc/$p/cmdline" | grep -q site-serve; then',
             '    kill "$p" 2>/dev/null || true',
             "    n=0",
-            '    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.2; n=$((n+1)); done',
+            '    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 100 ]; do',
+            "      sleep 0.2; n=$((n+1))",
+            "    done",
             '    kill -9 "$p" 2>/dev/null || true',
             "  fi",
             "fi",
@@ -387,9 +387,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 )
             parts.append(self._payload("FRPC", "$D/bin/frpc", Path(local_frpc).read_bytes(), "700"))
             frpc = "$D/bin/frpc"
-        registry = ClusterRegistry(
-            clusters={link.cluster: self._definition(link, site_view=True)}
-        )
+        registry = ClusterRegistry(clusters={link.cluster: self._definition(link, site_view=True)})
         settings = {
             "cluster": link.cluster,
             "session_id": link.session_id,
@@ -457,9 +455,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
         out, err = await process.communicate(script.encode("utf-8"))
         stdout = out.decode("utf-8", "replace")
-        ready = next(
-            (line for line in stdout.splitlines() if line.startswith(READY_MARKER)), None
-        )
+        ready = next((line for line in stdout.splitlines() if line.startswith(READY_MARKER)), None)
         if process.returncode != 0 or ready is None:
             raise Refusal(
                 RefusalReason.UNREACHABLE,

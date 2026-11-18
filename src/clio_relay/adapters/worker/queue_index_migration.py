@@ -69,8 +69,8 @@ if TYPE_CHECKING:
         queue_lease_records,
         queue_legacy_output_codec,
     )
-    from clio_relay.models import SchedulerCancelPending
     from clio_relay.adapters.worker.worker_lifetime_lock import LockedCoreIdentity
+    from clio_relay.models import SchedulerCancelPending
 
     LegacyOutputAudit = queue_legacy_output_codec.LegacyOutputAudit
 

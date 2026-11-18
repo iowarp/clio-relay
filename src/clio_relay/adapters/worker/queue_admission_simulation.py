@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import cast
 
 from clio_relay.adapters.worker.core_queue import MAX_LIVE_LEASE_RECORDS, ClioCoreQueue
-from clio_relay.models import JobKind, JobState, RelayJob
 from clio_relay.adapters.worker.queue_admission_snapshot import (
     _AdmissionSnapshot,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -26,6 +25,7 @@ from clio_relay.adapters.worker.queue_listing import (
     _raw_submission_payload,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
 from clio_relay.adapters.worker.worker_concurrency import kind_concurrency_metadata
+from clio_relay.models import JobKind, JobState, RelayJob
 
 
 def _queue_evidence(  # pyright: ignore[reportUnusedFunction]

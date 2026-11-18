@@ -28,6 +28,7 @@ from clio_relay.adapters.worker.core_queue import (
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
+from clio_relay.adapters.worker.queue_management import diagnose_job, discover_stale_jobs
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import WINDOWS_EXTENDED_PATH_PREFIX
 from clio_relay.models import (
@@ -43,7 +44,6 @@ from clio_relay.models import (
     RelayTask,
     utc_now,
 )
-from clio_relay.adapters.worker.queue_management import diagnose_job, discover_stale_jobs
 
 
 def _job(key: str, *, metadata: dict[str, object] | None = None) -> RelayJob:

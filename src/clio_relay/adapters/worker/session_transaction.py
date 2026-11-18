@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_validation import _validate_session
+from clio_relay.errors import RelayError
 
 _MAX_OWNED_SESSION_DOCUMENT_BYTES = 1024 * 1024
 _MAX_OWNED_SESSION_DIRECTORY_ENTRIES = 256

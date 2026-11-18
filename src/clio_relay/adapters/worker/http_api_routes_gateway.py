@@ -20,7 +20,6 @@ from fastapi import FastAPI, Query
 from fastapi.params import Depends
 
 from clio_relay.adapters.worker import door_errors
-from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import (
     GatewaySessionCreateRequest,
@@ -28,6 +27,7 @@ from clio_relay.adapters.worker.http_api_models import (
     _has_relay_managed_gateway_state,
 )
 from clio_relay.adapters.worker.http_api_redaction import _public_payload, _public_record
+from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.models import GatewaySession
 from clio_relay.pagination import DEFAULT_RESPONSE_PAGE_RECORDS, MAX_RESPONSE_PAGE_RECORDS

@@ -15,10 +15,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-from clio_relay.errors import RelayError
-from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.adapters.worker.session_transaction import open_owned_session_transaction
 from clio_relay.adapters.worker.session_validation import _validate_session
+from clio_relay.errors import RelayError
+from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.session_wire_models import MAX_SESSION_START_ERROR_CHARS, OwnedSessionRecoveryStatus
 
 

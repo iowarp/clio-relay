@@ -10,8 +10,13 @@ import pytest
 
 import clio_relay.storage_policy as storage_module
 from clio_relay.adapters.worker import queue_jobs, queue_order_index
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageAdmissionError,
+    StorageManagedQueue,
+    storage_managed_queue,
+)
+from clio_relay.config import RelaySettings
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     JarvisRunSpec,
@@ -19,11 +24,6 @@ from clio_relay.models import (
     JobState,
     RelayJob,
     StorageReservationEstimate,
-)
-from clio_relay.adapters.worker.storage_runtime import (
-    StorageAdmissionError,
-    StorageManagedQueue,
-    storage_managed_queue,
 )
 
 
@@ -254,7 +254,9 @@ def test_managed_queue_releases_provisional_reservation_after_submit_failure(
     def fail_submit(_self: object, _job: RelayJob) -> RelayJob:
         raise RuntimeError("injected submit failure")
 
-    monkeypatch.setattr("clio_relay.adapters.worker.core_queue.ClioCoreQueue.submit_job", fail_submit)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.core_queue.ClioCoreQueue.submit_job", fail_submit
+    )
 
     with pytest.raises(RuntimeError, match="injected submit failure"):
         queue.submit_job(intent)

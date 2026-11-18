@@ -82,10 +82,13 @@ import typer
 from pydantic import ValidationError
 
 import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile
-import clio_relay.bounded_process as bounded_process
 import clio_relay.adapters.worker.core_queue as core_queue
+import clio_relay.bounded_process as bounded_process
 import clio_relay.installation as installation
-from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapDesiredState, make_bootstrap_receipt
+from clio_relay.adapters.worker.bootstrap_reconcile import (
+    BootstrapDesiredState,
+    make_bootstrap_receipt,
+)
 from clio_relay.bounded_process import BoundedProcessError
 from clio_relay.config import RelaySettings
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled

@@ -36,23 +36,6 @@ from collections.abc import Iterator
 from contextlib import suppress
 from typing import Final, Literal, cast
 
-from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
-from clio_relay.config import RelaySettings, TransportMode
-from clio_relay.control_channel import (
-    ChannelDropped,
-    ChannelEndpoint,
-    ChannelEvent,
-    ChannelEventSink,
-    ChannelLink,
-    ChannelNotEstablished,
-    ChannelProcessFactory,
-    OwnedSessionChannelBootstrap,
-    RelayTransport,
-    build_transport,
-    channel_event,
-)
-from clio_relay.errors import ConfigurationError, RelayError
-
 # Facade: the pooled-stream wire mechanics moved to remote_connection_stream_io.py
 # (identity-bound stream open/request/read + the clio-relay#213 stale-stream
 # classifier); the connections-by-cluster registry moved to
@@ -75,7 +58,10 @@ from clio_relay.adapters.worker.remote_connection_registry import (
 from clio_relay.adapters.worker.remote_connection_registry import (
     connection_registry as connection_registry,
 )
-from clio_relay.adapters.worker.remote_connection_registry import record_reconciliation_events, verify_bootstrap
+from clio_relay.adapters.worker.remote_connection_registry import (
+    record_reconciliation_events,
+    verify_bootstrap,
+)
 from clio_relay.adapters.worker.remote_connection_stream_io import (
     MAX_SESSION_API_RESPONSE_BYTES as MAX_SESSION_API_RESPONSE_BYTES,
 )
@@ -86,6 +72,22 @@ from clio_relay.adapters.worker.remote_connection_stream_io import (
     _request_json_on_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _stream_log_chunks_over_stream,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+from clio_relay.cluster_config import ClusterDefinition, IdentityAnchor
+from clio_relay.config import RelaySettings, TransportMode
+from clio_relay.control_channel import (
+    ChannelDropped,
+    ChannelEndpoint,
+    ChannelEvent,
+    ChannelEventSink,
+    ChannelLink,
+    ChannelNotEstablished,
+    ChannelProcessFactory,
+    OwnedSessionChannelBootstrap,
+    RelayTransport,
+    build_transport,
+    channel_event,
+)
+from clio_relay.errors import ConfigurationError, RelayError
 
 MAX_RECORDED_CHANNEL_EVENTS: Final = 256
 # Idle streams held over the one channel; more concurrent operations simply open

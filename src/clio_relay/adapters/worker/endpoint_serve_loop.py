@@ -35,7 +35,9 @@ from clio_relay.adapters.worker.endpoint_execution_sidecar_cleanup import (
     _execution_cleanup_ack_metadata,
     _remove_execution_sidecars,
 )
-from clio_relay.adapters.worker.endpoint_owner_session_sweep import sweep_expired_owner_session_leases
+from clio_relay.adapters.worker.endpoint_owner_session_sweep import (
+    sweep_expired_owner_session_leases,
+)
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS,
     SchedulerSubmissionUnresolvedError,
@@ -46,6 +48,12 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
 )
 from clio_relay.adapters.worker.endpoint_worker_lanes import (
     run_worker_lane_iteration,
+)
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageRuntimeViolation,
+)
+from clio_relay.adapters.worker.worker_concurrency import (
+    kind_concurrency_metadata,
 )
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import (
@@ -61,12 +69,6 @@ from clio_relay.models import (
     RelayJob,
 )
 from clio_relay.spool import JobSpool
-from clio_relay.adapters.worker.storage_runtime import (
-    StorageRuntimeViolation,
-)
-from clio_relay.adapters.worker.worker_concurrency import (
-    kind_concurrency_metadata,
-)
 
 
 class ServeLoopMixin:

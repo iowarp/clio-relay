@@ -35,7 +35,7 @@ from typing import cast
 
 import pytest
 
-import clio_relay.adapters.worker.bootstrap_full_activation_staging as bootstrap_full_activation_staging_module
+from clio_relay.adapters.worker import bootstrap_full_activation_staging as bootstrap_full_activation_staging_module
 import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile_module
 from clio_relay.adapters.worker.bootstrap_full_activation_staging import (
     FULL_MODE_ACTIVATION_NAMES,

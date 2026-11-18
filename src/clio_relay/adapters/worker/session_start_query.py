@@ -20,9 +20,12 @@ from uuid import uuid4
 
 import clio_relay.adapters.worker.session_remote_command as session_remote_command
 import clio_relay.adapters.worker.session_remote_scripts as session_remote_scripts
+from clio_relay.adapters.worker.session_validation import (
+    _validate_durable_session_identity,
+    _validate_session,
+)
 from clio_relay.errors import RelayError, RemoteExecutableMissingError
 from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.adapters.worker.session_validation import _validate_durable_session_identity, _validate_session
 from clio_relay.session_wire_models import (
     MAX_SESSION_START_ERROR_CHARS,
     OwnedSessionInputPolicy,

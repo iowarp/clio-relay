@@ -37,6 +37,7 @@ from clio_relay.models import (
     RelayTask,
     utc_now,
 )
+
 _RELAY_TRANSPORT_CONTROL_FIELDS = frozenset(
     {
         "idempotency_key",
@@ -65,9 +66,7 @@ def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     incorrectly raise ``QueueConflictError`` (clio-relay#218).
     """
     return {
-        key: value
-        for key, value in arguments.items()
-        if key not in _RELAY_TRANSPORT_CONTROL_FIELDS
+        key: value for key, value in arguments.items() if key not in _RELAY_TRANSPORT_CONTROL_FIELDS
     }
 
 

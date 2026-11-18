@@ -23,11 +23,13 @@ from clio_relay import process_containment as process_containment
 from clio_relay.adapters.worker.bootstrap_reconcile import (
     resolve_receipt_bound_jarvis_python as resolve_receipt_bound_jarvis_python,
 )
-from clio_relay.command_evidence import bounded_error_detail as bounded_error_detail
-from clio_relay.config import RelaySettings as RelaySettings
-from clio_relay.adapters.worker.core_queue import DEFAULT_EXACT_RECORD_LIMIT as DEFAULT_EXACT_RECORD_LIMIT
+from clio_relay.adapters.worker.core_queue import (
+    DEFAULT_EXACT_RECORD_LIMIT as DEFAULT_EXACT_RECORD_LIMIT,
+)
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue as ClioCoreQueue
-from clio_relay.adapters.worker.endpoint_execution_cleanup_actions import ExecutionCleanupActionsMixin
+from clio_relay.adapters.worker.endpoint_execution_cleanup_actions import (
+    ExecutionCleanupActionsMixin,
+)
 
 # EXECUTION_CLEANUP_SCAN_LIMIT re-exported verbatim: tests/test_endpoint.py
 # reads/patches it as `endpoint_module.EXECUTION_CLEANUP_SCAN_LIMIT` even
@@ -60,7 +62,9 @@ from clio_relay.adapters.worker.endpoint_progress_log_io import (
 from clio_relay.adapters.worker.endpoint_progress_log_io import (
     _open_package_progress_log as _open_package_progress_log,
 )
-from clio_relay.adapters.worker.endpoint_progress_log_io import _progress_log_identity as _progress_log_identity
+from clio_relay.adapters.worker.endpoint_progress_log_io import (
+    _progress_log_identity as _progress_log_identity,
+)
 from clio_relay.adapters.worker.endpoint_progress_log_io import (
     _render_progress_log_identity as _render_progress_log_identity,
 )
@@ -70,7 +74,9 @@ from clio_relay.adapters.worker.endpoint_progress_log_io import (
 from clio_relay.adapters.worker.endpoint_progress_trust import (
     _progress_from_sidecar_record as _progress_from_sidecar_record,
 )
-from clio_relay.adapters.worker.endpoint_progress_trust import _progress_log_checkpoint as _progress_log_checkpoint
+from clio_relay.adapters.worker.endpoint_progress_trust import (
+    _progress_log_checkpoint as _progress_log_checkpoint,
+)
 from clio_relay.adapters.worker.endpoint_progress_trust import (
     _progress_log_checkpoint_matches as _progress_log_checkpoint_matches,
 )
@@ -86,7 +92,9 @@ from clio_relay.adapters.worker.endpoint_progress_trust import (
 from clio_relay.adapters.worker.endpoint_result_finalization import ResultFinalizationMixin
 from clio_relay.adapters.worker.endpoint_runtime_metadata_ingest import RuntimeMetadataIngestMixin
 from clio_relay.adapters.worker.endpoint_runtime_metadata_persist import RuntimeMetadataPersistMixin
-from clio_relay.adapters.worker.endpoint_runtime_sidecar_anchor import _open_owned_sidecar as _open_owned_sidecar
+from clio_relay.adapters.worker.endpoint_runtime_sidecar_anchor import (
+    _open_owned_sidecar as _open_owned_sidecar,
+)
 from clio_relay.adapters.worker.endpoint_runtime_sidecar_anchor import (
     _precreate_runtime_sidecar as _precreate_runtime_sidecar,
 )
@@ -99,8 +107,12 @@ from clio_relay.adapters.worker.endpoint_scheduler_cancel_actions import Schedul
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _durable_scheduler_submission_intent as _durable_scheduler_submission_intent,
 )
-from clio_relay.adapters.worker.endpoint_scheduler_metadata import _job_subprocess_env as _job_subprocess_env
-from clio_relay.adapters.worker.endpoint_scheduler_metadata import _job_timeout_seconds as _job_timeout_seconds
+from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
+    _job_subprocess_env as _job_subprocess_env,
+)
+from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
+    _job_timeout_seconds as _job_timeout_seconds,
+)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _native_runtime_created_at as _native_runtime_created_at,
 )
@@ -128,19 +140,29 @@ from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _task_id_for_scheduler_job as _task_id_for_scheduler_job,
 )
-from clio_relay.adapters.worker.endpoint_scheduler_metadata import _task_scheduler_status as _task_scheduler_status
+from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
+    _task_scheduler_status as _task_scheduler_status,
+)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _task_scheduler_submission_refused as _task_scheduler_submission_refused,
 )
 from clio_relay.adapters.worker.endpoint_scheduler_submission import SchedulerSubmissionMixin
-from clio_relay.adapters.worker.endpoint_scheduler_submission_reconcile import SchedulerSubmissionReconcileMixin
+from clio_relay.adapters.worker.endpoint_scheduler_submission_reconcile import (
+    SchedulerSubmissionReconcileMixin,
+)
 from clio_relay.adapters.worker.endpoint_serve_loop import ServeLoopMixin
-from clio_relay.adapters.worker.endpoint_sidecar_types import AGENT_RESULT_MAX_BYTES as AGENT_RESULT_MAX_BYTES
+from clio_relay.adapters.worker.endpoint_sidecar_types import (
+    AGENT_RESULT_MAX_BYTES as AGENT_RESULT_MAX_BYTES,
+)
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS as EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS,
 )
-from clio_relay.adapters.worker.endpoint_sidecar_types import EXECUTION_CLEANUP_SCHEMA as EXECUTION_CLEANUP_SCHEMA
-from clio_relay.adapters.worker.endpoint_sidecar_types import EXECUTION_LAUNCH_PROTOCOL as EXECUTION_LAUNCH_PROTOCOL
+from clio_relay.adapters.worker.endpoint_sidecar_types import (
+    EXECUTION_CLEANUP_SCHEMA as EXECUTION_CLEANUP_SCHEMA,
+)
+from clio_relay.adapters.worker.endpoint_sidecar_types import (
+    EXECUTION_LAUNCH_PROTOCOL as EXECUTION_LAUNCH_PROTOCOL,
+)
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES as PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES,
 )
@@ -177,8 +199,12 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     SchedulerSubmissionUnresolvedError as SchedulerSubmissionUnresolvedError,
 )
-from clio_relay.adapters.worker.endpoint_sidecar_types import _PackageProgressLogState as _PackageProgressLogState
-from clio_relay.adapters.worker.endpoint_sidecar_types import _RuntimeSidecarAnchor as _RuntimeSidecarAnchor
+from clio_relay.adapters.worker.endpoint_sidecar_types import (
+    _PackageProgressLogState as _PackageProgressLogState,
+)
+from clio_relay.adapters.worker.endpoint_sidecar_types import (
+    _RuntimeSidecarAnchor as _RuntimeSidecarAnchor,
+)
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _bounded_output_event_chunks as _bounded_output_event_chunks,
 )
@@ -189,12 +215,18 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
     _extract_scheduler_job_id as _extract_scheduler_job_id,
 )
 from clio_relay.adapters.worker.endpoint_worker_environment import _file_summary as _file_summary
-from clio_relay.adapters.worker.endpoint_worker_environment import _jarvis_pipeline_name as _jarvis_pipeline_name
+from clio_relay.adapters.worker.endpoint_worker_environment import (
+    _jarvis_pipeline_name as _jarvis_pipeline_name,
+)
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _normalized_scheduler_status as _normalized_scheduler_status,
 )
-from clio_relay.adapters.worker.endpoint_worker_environment import _optional_float as _optional_float
-from clio_relay.adapters.worker.endpoint_worker_environment import _optional_metadata as _optional_metadata
+from clio_relay.adapters.worker.endpoint_worker_environment import (
+    _optional_float as _optional_float,
+)
+from clio_relay.adapters.worker.endpoint_worker_environment import (
+    _optional_metadata as _optional_metadata,
+)
 from clio_relay.adapters.worker.endpoint_worker_environment import _optional_str as _optional_str
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _scheduler_name_from_job as _scheduler_name_from_job,
@@ -214,16 +246,55 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _worker_process_identity as _worker_process_identity,
 )
-from clio_relay.adapters.worker.endpoint_worker_lanes import run_worker_lane_iteration as run_worker_lane_iteration
+from clio_relay.adapters.worker.endpoint_worker_lanes import (
+    run_worker_lane_iteration as run_worker_lane_iteration,
+)
+from clio_relay.adapters.worker.jarvis_execution import (
+    RUNTIME_SCHEDULER_PROVIDER_ENV as RUNTIME_SCHEDULER_PROVIDER_ENV,
+)
+from clio_relay.adapters.worker.progress_adapters import (
+    PackageProgressProvider as PackageProgressProvider,
+)
+from clio_relay.adapters.worker.progress_adapters import (
+    package_progress_adapter_from_pipeline as package_progress_adapter_from_pipeline,
+)
+from clio_relay.adapters.worker.scheduler import SchedulerProvider as SchedulerProvider
+from clio_relay.adapters.worker.scheduler import (
+    SchedulerReconciliationProvider as SchedulerReconciliationProvider,
+)
+from clio_relay.adapters.worker.scheduler import provider_for_scheduler as provider_for_scheduler
+from clio_relay.adapters.worker.scheduler import (
+    reconciliation_provider_for_scheduler as reconciliation_provider_for_scheduler,
+)
+from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue as StorageManagedQueue
+from clio_relay.adapters.worker.storage_runtime import StorageRuntime as StorageRuntime
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageRuntimeViolation as StorageRuntimeViolation,
+)
+from clio_relay.adapters.worker.storage_runtime import (
+    initialize_queue_with_shared_writer_fencing as initialize_queue_with_shared_writer_fencing,
+)
+from clio_relay.adapters.worker.storage_runtime import (
+    storage_managed_queue as storage_managed_queue,
+)
+from clio_relay.adapters.worker.worker_concurrency import (
+    KindConcurrencyInput as KindConcurrencyInput,
+)
+from clio_relay.adapters.worker.worker_concurrency import (
+    kind_concurrency_metadata as kind_concurrency_metadata,
+)
+from clio_relay.adapters.worker.worker_concurrency import (
+    normalize_kind_concurrency as normalize_kind_concurrency,
+)
+from clio_relay.adapters.worker.worker_lifetime_lock import WorkerLifetimeLock as WorkerLifetimeLock
+from clio_relay.command_evidence import bounded_error_detail as bounded_error_detail
+from clio_relay.config import RelaySettings as RelaySettings
 from clio_relay.errors import ConfigurationError as ConfigurationError
 from clio_relay.errors import QueueConflictError as QueueConflictError
 from clio_relay.errors import RelayError as RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path as internal_filesystem_path
 from clio_relay.filesystem_paths import logical_filesystem_text as logical_filesystem_text
 from clio_relay.identifiers import filesystem_key as filesystem_key
-from clio_relay.adapters.worker.jarvis_execution import (
-    RUNTIME_SCHEDULER_PROVIDER_ENV as RUNTIME_SCHEDULER_PROVIDER_ENV,
-)
 from clio_relay.jarvis_provider import JarvisCdProvider as JarvisCdProvider
 from clio_relay.models import CLIO_PROVENANCE_METADATA_KEY as CLIO_PROVENANCE_METADATA_KEY
 from clio_relay.models import ArtifactRef as ArtifactRef
@@ -243,10 +314,6 @@ from clio_relay.models import SchedulerCancelPending as SchedulerCancelPending
 from clio_relay.models import SchedulerPhase as SchedulerPhase
 from clio_relay.models import SchedulerStatus as SchedulerStatus
 from clio_relay.models import utc_now as utc_now
-from clio_relay.adapters.worker.progress_adapters import PackageProgressProvider as PackageProgressProvider
-from clio_relay.adapters.worker.progress_adapters import (
-    package_progress_adapter_from_pipeline as package_progress_adapter_from_pipeline,
-)
 from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority as PackageProgressSourceAuthority,
 )
@@ -268,27 +335,8 @@ from clio_relay.runtime_metadata import merge_runtime_metadata as merge_runtime_
 from clio_relay.runtime_metadata import (
     runtime_metadata_from_sidecar_record as runtime_metadata_from_sidecar_record,
 )
-from clio_relay.adapters.worker.scheduler import SchedulerProvider as SchedulerProvider
-from clio_relay.adapters.worker.scheduler import (
-    SchedulerReconciliationProvider as SchedulerReconciliationProvider,
-)
-from clio_relay.adapters.worker.scheduler import provider_for_scheduler as provider_for_scheduler
-from clio_relay.adapters.worker.scheduler import (
-    reconciliation_provider_for_scheduler as reconciliation_provider_for_scheduler,
-)
 from clio_relay.spool import JobSpool as JobSpool
 from clio_relay.spool import read_owned_regular_file_bytes as read_owned_regular_file_bytes
-from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue as StorageManagedQueue
-from clio_relay.adapters.worker.storage_runtime import StorageRuntime as StorageRuntime
-from clio_relay.adapters.worker.storage_runtime import StorageRuntimeViolation as StorageRuntimeViolation
-from clio_relay.adapters.worker.storage_runtime import (
-    initialize_queue_with_shared_writer_fencing as initialize_queue_with_shared_writer_fencing,
-)
-from clio_relay.adapters.worker.storage_runtime import storage_managed_queue as storage_managed_queue
-from clio_relay.adapters.worker.worker_concurrency import KindConcurrencyInput as KindConcurrencyInput
-from clio_relay.adapters.worker.worker_concurrency import kind_concurrency_metadata as kind_concurrency_metadata
-from clio_relay.adapters.worker.worker_concurrency import normalize_kind_concurrency as normalize_kind_concurrency
-from clio_relay.adapters.worker.worker_lifetime_lock import WorkerLifetimeLock as WorkerLifetimeLock
 
 
 class EndpointWorker(

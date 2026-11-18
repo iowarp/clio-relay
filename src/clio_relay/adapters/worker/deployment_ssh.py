@@ -20,14 +20,14 @@ import subprocess
 from math import isfinite
 from typing import Literal
 
-from clio_relay.cluster_config import WorkerCapacityPolicy
 from clio_relay.adapters.worker.deployment_activation import (
     ENDPOINT_SERVICE_SSH_TIMEOUT_SECONDS,
     render_bounded_user_service_activation_helper,
 )
 from clio_relay.adapters.worker.deployment_unit import endpoint_user_service_name
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.worker_concurrency import kind_concurrency_metadata
+from clio_relay.cluster_config import WorkerCapacityPolicy
+from clio_relay.errors import RelayError
 
 _SYSTEMD_SERVICE_NAME = re.compile(r"clio-relay-worker-[a-z0-9_-]+\.service\Z")
 

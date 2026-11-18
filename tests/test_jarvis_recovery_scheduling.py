@@ -9,9 +9,9 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.adapters.worker.endpoint as endpoint_module
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.config import RelaySettings
 from clio_relay.models import (
     EndpointRole,
     JarvisRunSpec,

@@ -16,7 +16,7 @@ import clio_relay.adapters.worker.session_cleanup_targets as session_cleanup_tar
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
 import clio_relay.adapters.worker.session_recovery_attempt_status as session_recovery_attempt_status
-import clio_relay.adapters.worker.session_start_attempt_validation as session_start_attempt_validation
+from clio_relay.adapters.worker import session_start_attempt_validation
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import validate_durable_record_id
 from clio_relay.session_wire_models import (
@@ -43,8 +43,8 @@ def _inspect_owned_session_failed_cleaned_receipt(
 ) -> OwnedSessionRecoveryStatus:
     """Validate a terminal pre-metadata cleanup receipt without inventing API identity."""
     from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-    from clio_relay.process_containment import adopt_linux_systemd_scope_identity
     from clio_relay.adapters.worker.session_lifecycle_report import SessionLifecycleReport
+    from clio_relay.process_containment import adopt_linux_systemd_scope_identity
 
     queue = ClioCoreQueue(core_dir)
     errors: list[str] = []

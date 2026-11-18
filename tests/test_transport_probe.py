@@ -16,24 +16,24 @@ import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.adapters.worker.session_remote_command as session_remote_command
 import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.adapters.worker.transport_probe as transport_probe
-from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
-from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.frp_link import FrpLinkConfig, HeldFrpVisitor
-from clio_relay.relay_host import FrpTransportProtocol
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionRecoveryStatus,
     SessionLifecycleReport,
-)
-from clio_relay.session_wire_models import (
-    OwnedSessionStartStatusSelector,
-    RemoteSessionStateEvidence,
 )
 from clio_relay.adapters.worker.transport_probe import (
     run_frp_direct_http_probe,
     run_frp_http_probe,
     run_ssh_forward_http_probe,
     transport_evidence_lines_from_error,
+)
+from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.frp_link import FrpLinkConfig, HeldFrpVisitor
+from clio_relay.relay_host import FrpTransportProtocol
+from clio_relay.session_wire_models import (
+    OwnedSessionStartStatusSelector,
+    RemoteSessionStateEvidence,
 )
 from clio_relay.validation_report import parse_transport_probe_evidence
 
@@ -86,8 +86,12 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
         cleanup_probe_ids.append(str(kwargs["probe_id"]))
         return ["transport.remote_cleanup=passed"]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup
+    )
 
     lines = run_frp_http_probe(
         cluster="test-cluster",
@@ -162,7 +166,9 @@ def test_frp_http_probe_runs_optional_http_check(monkeypatch: MonkeyPatch) -> No
     def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
         assert timeout_seconds == 30.0
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
     monkeypatch.setattr(
         transport_probe,
         "_cleanup_remote_probe",
@@ -206,8 +212,12 @@ def test_frp_http_probe_surfaces_remote_port_conflict(monkeypatch: MonkeyPatch) 
         cleanup_calls.append(str(kwargs["probe_id"]))
         return ["transport.remote_cleanup=not_started"]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup
+    )
 
     with pytest.raises(RelayError, match="remote API port is already occupied: 8765"):
         run_frp_http_probe(
@@ -375,7 +385,9 @@ def test_frp_http_probe_rejects_dead_visitor_even_if_local_healthz_passes(
     def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
         assert timeout_seconds == 30.0
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
     monkeypatch.setattr(
         transport_probe,
         "_cleanup_remote_probe",
@@ -438,8 +450,12 @@ def test_frp_direct_http_probe_uses_xtcp_proxy_and_visitor(
         cleanup_calls.append(str(kwargs["probe_id"]))
         return ["transport.remote_cleanup=passed"]
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._cleanup_remote_probe", fake_cleanup
+    )
 
     lines = run_frp_direct_http_probe(
         cluster="test-cluster",
@@ -507,7 +523,9 @@ def test_frp_direct_http_probe_reports_stcp_fallback_when_xtcp_fails(
     def fake_healthz(_url: str, *, timeout_seconds: float) -> None:
         assert timeout_seconds == 5
 
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
     monkeypatch.setattr(
         transport_probe,
         "_cleanup_remote_probe",
@@ -607,8 +625,12 @@ def test_ssh_forward_http_probe_starts_owned_remote_api_and_local_forward(
         return ["transport.http_binding=verified"]
 
     monkeypatch.setattr(session_lifecycle, "start_remote_session", fake_start)
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.teardown_remote_session", fake_teardown)
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.teardown_remote_session", fake_teardown
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
 
     lines = run_ssh_forward_http_probe(
         cluster="test-cluster",
@@ -692,7 +714,9 @@ def test_ssh_forward_http_probe_can_detach_remote_session(monkeypatch: MonkeyPat
         "clio_relay.adapters.worker.transport_probe.detach_remote_session",
         fake_detach,
     )
-    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe._wait_for_healthz", fake_healthz
+    )
 
     lines = run_ssh_forward_http_probe(
         cluster="test-cluster",

@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 from typing import Any, cast
 
-from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _owned_scheduler_job_ids_from_metadata,
     _task_id_for_scheduler_job,
@@ -24,6 +23,7 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
     _normalized_scheduler_status,
     _scheduler_name_from_job,
 )
+from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.errors import RelayError
 from clio_relay.models import (
     RelayJob,

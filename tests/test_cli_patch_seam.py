@@ -62,9 +62,9 @@ import clio_relay.adapters.worker.cli_support as cli_support
 from clio_relay.adapters.worker import cli
 from clio_relay.adapters.worker.cli import app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 from clio_relay.errors import ConfigurationError
 from clio_relay.storage_policy import StorageDecision, StorageReason
-from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )

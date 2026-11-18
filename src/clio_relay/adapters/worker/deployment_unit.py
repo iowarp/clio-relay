@@ -16,8 +16,14 @@ import os
 import re
 from pathlib import Path
 
+from clio_relay.adapters.worker.deployment_activation import (
+    ENDPOINT_SERVICE_SYSTEMD_START_TIMEOUT_SECONDS,
+)
+from clio_relay.adapters.worker.worker_concurrency import (
+    KindConcurrencyInput,
+    kind_concurrency_metadata,
+)
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.adapters.worker.deployment_activation import ENDPOINT_SERVICE_SYSTEMD_START_TIMEOUT_SECONDS
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import filesystem_key
 from clio_relay.installation import INSTALL_RECEIPT_PATH_ENV
@@ -27,7 +33,6 @@ from clio_relay.remote_values import (
     render_systemd_remote_path,
     render_systemd_remote_value,
 )
-from clio_relay.adapters.worker.worker_concurrency import KindConcurrencyInput, kind_concurrency_metadata
 
 _SYSTEMD_UNQUOTED_ARGUMENT = re.compile(r"[A-Za-z0-9_./:@%+=,{}-]+\Z")
 

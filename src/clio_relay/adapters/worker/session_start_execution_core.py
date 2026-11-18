@@ -52,12 +52,12 @@ from uuid import uuid4
 
 import clio_relay.adapters.worker.session_api_readiness as session_api_readiness
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
-import clio_relay.adapters.worker.session_start_attempt_validation as session_start_attempt_validation
+from clio_relay.adapters.worker import session_start_attempt_validation
+from clio_relay.adapters.worker.session_start_promotion import _promote_resumable_contained_start
+from clio_relay.adapters.worker.session_validation import _validate_session
 from clio_relay.cluster_config import MAX_CLUSTER_REGISTRY_BYTES
 from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.session_start_promotion import _promote_resumable_contained_start
-from clio_relay.adapters.worker.session_validation import _validate_session
 from clio_relay.session_wire_models import (
     OwnedSessionRecoveryStatus,
     OwnedSessionStartReceipt,
@@ -77,8 +77,8 @@ def execute_owned_session_start(
     # (which imports session_start_execution.py back for its cli.py-
     # compatibility re-export block) -- see the module docstring.
     import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-    from clio_relay.config import RelaySettings
     from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+    from clio_relay.config import RelaySettings
 
     _validate_session(
         session_id=request.session_id,

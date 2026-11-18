@@ -37,7 +37,9 @@ class QueueLeasesMixin:
     _store_adapter: queue_context.QueueStoreProtocol
 
     if TYPE_CHECKING:
-        from clio_relay.adapters.worker.queue_lease_records import LeaseIndexIdentity as _StubIdentity
+        from clio_relay.adapters.worker.queue_lease_records import (
+            LeaseIndexIdentity as _StubIdentity,
+        )
 
         def initialize(self) -> None: ...
         def _require_index_migration_complete(self) -> None: ...

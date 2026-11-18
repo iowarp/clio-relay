@@ -75,11 +75,14 @@ import typer
 
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.endpoint as endpoint
-import clio_relay.installation as installation
 import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.installation as installation
+from clio_relay.adapters.worker.deployment import (
+    render_endpoint_user_service,
+    write_endpoint_user_service,
+)
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.deployment import render_endpoint_user_service, write_endpoint_user_service
 from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import EndpointRole, JobKind

@@ -15,8 +15,10 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import Header, WebSocket
 
 from clio_relay.adapters.worker import door_error_adapters, door_errors
+from clio_relay.adapters.worker.http_api_owner_session_lease_renewal import (
+    renew_owner_session_lease,
+)
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.http_api_owner_session_lease_renewal import renew_owner_session_lease
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,

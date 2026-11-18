@@ -36,8 +36,8 @@ import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_sessio
 import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
 from clio_relay.adapters.worker.cli import app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.models import GatewaySession, JarvisRunSpec, JobKind, RelayJob
 from clio_relay.adapters.worker.session_lifecycle import OwnedSessionRecoveryStatus
+from clio_relay.models import GatewaySession, JarvisRunSpec, JobKind, RelayJob
 from tests.test_cli import (
     _activate_owner_session,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )

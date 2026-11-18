@@ -31,10 +31,10 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
     SIDECAR_DRAIN_CHUNK_BYTES,
     _PackageProgressLogState,
 )
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.progress_adapters import (
     PackageProgressProvider,
 )
+from clio_relay.errors import ConfigurationError
 from clio_relay.progress_provenance import (
     PROTECTED_PROGRESS_METADATA_KEYS,
     PackageProgressSourceAuthority,

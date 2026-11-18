@@ -71,15 +71,20 @@ from __future__ import annotations
 
 import shlex
 
-from clio_relay.adapters.worker.deployment_activation import render_bounded_user_service_activation_helper
-from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.frpc_proxy_receipt import BRINGUP_RECEIPT_SCHEMA, TEARDOWN_RECEIPT_SCHEMA
+from clio_relay.adapters.worker.deployment_activation import (
+    render_bounded_user_service_activation_helper,
+)
+from clio_relay.adapters.worker.frpc_proxy_receipt import (
+    BRINGUP_RECEIPT_SCHEMA,
+    TEARDOWN_RECEIPT_SCHEMA,
+)
 from clio_relay.adapters.worker.frpc_unit import (
     FrpcProxyPaths,
     frpc_proxy_config_digest,
     validate_env_binding_name,
     validate_frpc_proxy_service_name,
 )
+from clio_relay.errors import RelayError
 
 
 def render_frpc_proxy_install_script(

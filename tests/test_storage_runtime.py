@@ -6,15 +6,7 @@ from pathlib import Path
 import pytest
 
 import clio_relay.storage_policy as storage_module
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.models import (
-    JarvisRunSpec,
-    JobKind,
-    RelayJob,
-    StorageReservationEstimate,
-)
-from clio_relay.storage_policy import StorageLimits, StorageReason
 from clio_relay.adapters.worker.storage_runtime import (
     STORAGE_RUNTIME_STATUS_SCHEMA,
     StorageAdmissionError,
@@ -24,6 +16,14 @@ from clio_relay.adapters.worker.storage_runtime import (
     storage_managed_queue,
     storage_runtime_from_settings,
 )
+from clio_relay.config import RelaySettings
+from clio_relay.models import (
+    JarvisRunSpec,
+    JobKind,
+    RelayJob,
+    StorageReservationEstimate,
+)
+from clio_relay.storage_policy import StorageLimits, StorageReason
 
 
 def _config(tmp_path: Path, **changes: object) -> StorageRuntimeConfig:

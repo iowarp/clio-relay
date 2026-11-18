@@ -22,13 +22,13 @@ from pathlib import Path
 from typing import cast
 
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.session_lifecycle_report import (
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
     SessionLifecycleReport,
 )
 from clio_relay.adapters.worker.session_validation import _validate_session
+from clio_relay.errors import RelayError
 from clio_relay.session_wire_models import (
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
     OwnedSessionCleanupReportReference,

@@ -41,13 +41,16 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
     _PackageProgressLogState,
     _RuntimeSidecarAnchor,
 )
+from clio_relay.adapters.worker.progress_adapters import (
+    PackageProgressProvider,
+)
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageRuntimeViolation,
+)
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import (
     Lease,
     RelayJob,
-)
-from clio_relay.adapters.worker.progress_adapters import (
-    PackageProgressProvider,
 )
 from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority,
@@ -56,9 +59,6 @@ from clio_relay.runtime_metadata import (
     JarvisRuntimeMetadata,
 )
 from clio_relay.spool import JobSpool
-from clio_relay.adapters.worker.storage_runtime import (
-    StorageRuntimeViolation,
-)
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.core_queue import ClioCoreQueue

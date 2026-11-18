@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import cast
 
 import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.adapters.worker.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
+from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
 import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 import clio_relay.adapters.worker.core_queue as core_queue

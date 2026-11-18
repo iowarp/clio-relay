@@ -5,19 +5,19 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import clio_relay.mcp_server as mcp_server_module
 import pytest
+from clio_relay.input_staging import merge_artifact_uses
+from clio_relay.mcp_server import handle_request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import clio_relay.adapters.worker.cli as cli_module
-import clio_relay.mcp_server as mcp_server_module
 from clio_relay.adapters.worker import queue_idempotency
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.adapters.worker.http_api import create_app
-from clio_relay.input_staging import merge_artifact_uses
-from clio_relay.mcp_server import handle_request
+from clio_relay.config import RelaySettings
+from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
     ArtifactMechanism,
     ArtifactRef,

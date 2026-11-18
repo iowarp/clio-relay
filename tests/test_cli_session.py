@@ -36,15 +36,15 @@ from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.session_api as session_api
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.session_api as session_api
 from clio_relay.adapters.worker import cli
 from clio_relay.adapters.worker.cli import app
-from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource, SessionLifecycleReport
+from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.adapters.worker.session_lifecycle import CleanupResource, SessionLifecycleReport
 from tests.test_cli import (
     _activate_owner_session,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _fake_empty_runtime_cleanup,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

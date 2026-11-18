@@ -52,11 +52,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, cast
 
+from clio_relay.adapters.worker.remote_connection import RemoteConnection, connection_registry
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.errors import RelayError
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
-from clio_relay.adapters.worker.remote_connection import RemoteConnection, connection_registry
 
 PER_OP_SSH_FALLBACK_REASON: Final = "per_op_ssh_fallback"
 MAX_RECORDED_FALLBACKS: Final = 256

@@ -16,6 +16,9 @@ from importlib import import_module
 from pathlib import Path
 
 import clio_relay.cluster_config as cluster_config
+from clio_relay.adapters.worker.session_lifecycle import (
+    OwnedSessionInputPolicy,
+)
 from clio_relay.cluster_config import (
     ensure_private_configuration_windows_handle,
     release_private_configuration_windows_parent_guard,
@@ -26,9 +29,6 @@ from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
     default_install_receipt_path,
-)
-from clio_relay.adapters.worker.session_lifecycle import (
-    OwnedSessionInputPolicy,
 )
 from clio_relay.validation_report import (
     durably_ensure_validation_directory,

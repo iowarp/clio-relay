@@ -35,8 +35,8 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.cli_api as cli_api
-import clio_relay.installation as installation_module
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.installation as installation_module
 from clio_relay.adapters.worker import cli
 from clio_relay.adapters.worker.cli import app
 from tests.test_cli import (

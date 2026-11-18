@@ -52,11 +52,14 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
     _scheduler_name_from_yaml,
     _validate_scheduler_launch_provider,
 )
+from clio_relay.adapters.worker.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
+from clio_relay.adapters.worker.progress_adapters import (
+    package_progress_adapter_from_pipeline,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import (
     internal_filesystem_path,
 )
-from clio_relay.adapters.worker.jarvis_execution import RUNTIME_SCHEDULER_PROVIDER_ENV
 from clio_relay.models import (
     JobKind,
     JobState,
@@ -64,9 +67,6 @@ from clio_relay.models import (
     RelayJob,
     RelayTask,
     utc_now,
-)
-from clio_relay.adapters.worker.progress_adapters import (
-    package_progress_adapter_from_pipeline,
 )
 from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority,

@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import cast
 
 import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.adapters.worker.cli_remote_collection_pagination as cli_remote_collection_pagination
+from clio_relay.adapters.worker import cli_remote_collection_pagination
 import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
 from clio_relay.cluster_config import ClusterDefinition

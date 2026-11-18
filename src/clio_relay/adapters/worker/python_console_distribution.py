@@ -24,10 +24,10 @@ from clio_relay.adapters.worker.clio_kit_constants import (
     PYTHON_DISTRIBUTION_MAX_ENTRY_POINTS,
     PYTHON_DISTRIBUTION_MAX_FILES,
 )
+from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity
 from clio_relay.adapters.worker.python_external_distribution import (
     _external_python_console_distribution_identity,
 )
-from clio_relay.adapters.worker.clio_kit_wheel_archive import _file_identity
 
 
 def _python_console_distribution_identity(executable: Path) -> dict[str, Any]:

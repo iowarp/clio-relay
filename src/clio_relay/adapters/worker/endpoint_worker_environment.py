@@ -40,16 +40,16 @@ from typing import cast
 
 import yaml
 
+from clio_relay.adapters.worker.endpoint_sidecar_types import OUTPUT_EVENT_MAX_BYTES
+from clio_relay.adapters.worker.scheduler import SchedulerProvider
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 from clio_relay.command_evidence import bounded_error_detail
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.endpoint_sidecar_types import OUTPUT_EVENT_MAX_BYTES
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.installation import installation_info
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob, SchedulerPhase, SchedulerStatus
-from clio_relay.adapters.worker.scheduler import SchedulerProvider
-from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 
 
 def _worker_installation_snapshot() -> dict[str, object]:

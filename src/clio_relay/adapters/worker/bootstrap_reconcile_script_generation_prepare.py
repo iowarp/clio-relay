@@ -16,14 +16,14 @@ from clio_relay.adapters.worker.bootstrap_constants import (
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
 )
+from clio_relay.adapters.worker.worker_lifetime_lock import (
+    WORKER_LIFETIME_GUARD_FD_ENV,
+    WORKER_LIFETIME_LOCK_NAME,
+)
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME,
     CLIO_KIT_JARVIS_MCP_WHEEL_URL,
-)
-from clio_relay.adapters.worker.worker_lifetime_lock import (
-    WORKER_LIFETIME_GUARD_FD_ENV,
-    WORKER_LIFETIME_LOCK_NAME,
 )
 
 

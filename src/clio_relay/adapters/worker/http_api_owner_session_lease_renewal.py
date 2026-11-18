@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import logging
 
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.config import RelaySettings
 
 logger = logging.getLogger(__name__)
 

@@ -12,10 +12,10 @@ from pathlib import Path
 
 import yaml
 
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
 from clio_relay.adapters.worker.jarvis_execution import sanitized_jarvis_environment
+from clio_relay.config import RelaySettings
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     EndpointRegistration,

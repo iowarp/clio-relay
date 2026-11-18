@@ -54,8 +54,10 @@ from clio_relay.adapters.worker import (
     queue_tasks,
     queue_transitions,
 )
-from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_jarvis_inputs import QueueJarvisInputsMixin
+from clio_relay.adapters.worker.queue_layout import QueueLayout
+from clio_relay.browser_gateway import BrowserAttachmentRecord
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
@@ -79,8 +81,6 @@ from clio_relay.models import (
     deterministic_input_artifact_id,
     new_id,
 )
-from clio_relay.adapters.worker.queue_jarvis_inputs import QueueJarvisInputsMixin
-from clio_relay.adapters.worker.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
 _TESTS_ROOT = Path(__file__).parent
@@ -506,7 +506,10 @@ def _core_import_lines(tree: ast.Module) -> list[int]:
     violations: list[int] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(alias.name in {"core_queue", "clio_relay.adapters.worker.core_queue"} for alias in node.names):
+            if any(
+                alias.name in {"core_queue", "clio_relay.adapters.worker.core_queue"}
+                for alias in node.names
+            ):
                 violations.append(node.lineno)
         elif isinstance(node, ast.ImportFrom) and (
             node.module in {"core_queue", "clio_relay.adapters.worker.core_queue"}
@@ -994,11 +997,15 @@ def test_guard_detects_a_dead_plain_object_seam_fixture() -> None:
         "    )\n"
     )
     tree = ast.parse(source)
-    tree_with_import = ast.parse("import clio_relay.adapters.worker.core_queue as core_queue_module\n" + source)
+    tree_with_import = ast.parse(
+        "import clio_relay.adapters.worker.core_queue as core_queue_module\n" + source
+    )
     targets = _plain_object_setattr_targets(tree)
     assert targets == ()  # no import in this file -> the root name is unresolvable, skipped
     targets_with_import = _plain_object_setattr_targets(tree_with_import)
-    assert targets_with_import == (("clio_relay.adapters.worker.core_queue.open_private_atomic_file", True),)
+    assert targets_with_import == (
+        ("clio_relay.adapters.worker.core_queue.open_private_atomic_file", True),
+    )
     assert _resolve_dotted_attribute_chain(targets_with_import[0][0]) is False
 
 

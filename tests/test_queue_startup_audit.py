@@ -17,14 +17,14 @@ from clio_relay.adapters.worker import (
     worker_lifetime_lock,
 )
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import QueueConflictError
-from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
 from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 from clio_relay.adapters.worker.worker_lifetime_lock import (
     LockedCoreIdentity,
     WorkerLifetimeLock,
     WorkerLifetimeLockUnavailable,
 )
+from clio_relay.errors import QueueConflictError
+from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
 
 
 def _job(identity: str) -> RelayJob:

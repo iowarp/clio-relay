@@ -20,8 +20,8 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.adapters.worker import endpoint as endpoint_module
 from clio_relay import process_containment
+from clio_relay.adapters.worker import endpoint as endpoint_module
 from clio_relay.adapters.worker import (
     endpoint_execution_lifecycle,
     endpoint_execution_sidecar_cleanup,
@@ -30,12 +30,14 @@ from clio_relay.adapters.worker import (
     endpoint_windows_sidecar_handles,
     queue_artifacts,
 )
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import DEFAULT_EXACT_RECORD_LIMIT, ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker
+from clio_relay.adapters.worker.progress_adapters import package_progress_adapter_from_pipeline
+from clio_relay.adapters.worker.queue_management import cleanup_stale_jobs, diagnose_job
+from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path, logical_filesystem_path
-from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import (
     ArtifactRef,
@@ -54,8 +56,6 @@ from clio_relay.models import (
     SchedulerStatus,
     utc_now,
 )
-from clio_relay.adapters.worker.progress_adapters import package_progress_adapter_from_pipeline
-from clio_relay.adapters.worker.queue_management import cleanup_stale_jobs, diagnose_job
 from clio_relay.relay_ops import cancel_job
 from clio_relay.runtime_metadata import runtime_sidecar_record
 from clio_relay.spool import JobSpool

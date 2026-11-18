@@ -15,7 +15,6 @@ from typing import Any, Literal, cast
 import pytest
 from pytest import MonkeyPatch
 
-import clio_relay.installation as installation_module
 import clio_relay.adapters.worker.session_api_readiness as session_api_readiness
 import clio_relay.adapters.worker.session_cleanup_execution as session_cleanup_execution
 import clio_relay.adapters.worker.session_cleanup_targets as session_cleanup_targets
@@ -23,28 +22,19 @@ import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
 import clio_relay.adapters.worker.session_recovery_attempt_status as session_recovery_attempt_status
-import clio_relay.adapters.worker.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
+from clio_relay.adapters.worker import session_recovery_cleaned_receipt
 import clio_relay.adapters.worker.session_remote_command as session_remote_command
 import clio_relay.adapters.worker.session_remote_scripts as session_remote_scripts
-import clio_relay.adapters.worker.session_start_attempt_validation as session_start_attempt_validation
+from clio_relay.adapters.worker import session_start_attempt_validation
 import clio_relay.adapters.worker.session_start_execution as session_start_execution
 import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.adapters.worker.session_start_wait as session_start_wait
 import clio_relay.adapters.worker.session_startup_receipt as session_startup_receipt
 import clio_relay.adapters.worker.session_transaction as session_transaction
+import clio_relay.installation as installation_module
 import clio_relay.session_wire_models as session_wire_models
 from clio_relay import __version__
-from clio_relay.cluster_config import (
-    MAX_CLUSTER_REGISTRY_BYTES,
-    ClusterDefinition,
-    ClusterRegistry,
-    RemoteMcpServerConfig,
-    cluster_route_revision,
-)
-from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError, RemoteExecutableMissingError
-from clio_relay.installation import InstallReceipt
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
@@ -73,6 +63,16 @@ from clio_relay.adapters.worker.session_lifecycle_report import (
     SESSION_WORKER_CHECK_ID,
 )
 from clio_relay.adapters.worker.session_start_query import challenge_remote_session_identity
+from clio_relay.cluster_config import (
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    ClusterRegistry,
+    RemoteMcpServerConfig,
+    cluster_route_revision,
+)
+from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
+from clio_relay.errors import RelayError, RemoteExecutableMissingError
+from clio_relay.installation import InstallReceipt
 from clio_relay.session_wire_models import OwnedSessionCleanupTarget, RemoteSessionStateEvidence
 
 
@@ -5064,7 +5064,9 @@ def test_detach_remote_session_rejects_unverified_remote_api_retention(
             "session_generation_id": "generation-123",
         }
 
-    monkeypatch.setattr("clio_relay.adapters.worker.session_lifecycle.status_remote_session", fake_status)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session", fake_status
+    )
 
     report = detach_remote_session(
         definition=ClusterDefinition(name="cluster", ssh_host="cluster"),

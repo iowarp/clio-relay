@@ -18,6 +18,9 @@ from starlette.websockets import WebSocketDisconnect
 from clio_relay.adapters.worker import door_errors as door_errors_module
 from clio_relay.adapters.worker import http_api as http_api_module
 from clio_relay.adapters.worker import http_api_streaming as http_api_streaming_module
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -25,9 +28,7 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, NotFoundError
-from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
@@ -52,7 +53,6 @@ from clio_relay.models import (
 )
 from clio_relay.relay_ops import MAX_ARTIFACT_CONTENT_BYTES, job_wait_result
 from clio_relay.session_api import session_identity_document
-from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue
 
 
 def _bind_owned_session_cluster_authority(

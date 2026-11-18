@@ -42,14 +42,15 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from clio_relay.adapters.worker import door_errors
-from clio_relay.config import RelaySettings
-from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.http_api_auth import (
     _job_owner_session_identity,
     _require_api_token,
     _require_session_submission_binding,
 )
-from clio_relay.adapters.worker.http_api_context import RelayApiContext, _bound_owner_session_cluster_definition
+from clio_relay.adapters.worker.http_api_context import (
+    RelayApiContext,
+    _bound_owner_session_cluster_definition,
+)
 from clio_relay.adapters.worker.http_api_error_handlers import (
     _relay_framework_http_handler,
     _relay_http_problem_handler,
@@ -57,20 +58,24 @@ from clio_relay.adapters.worker.http_api_error_handlers import (
     _relay_unhandled_exception_handler,
 )
 from clio_relay.adapters.worker.http_api_middleware import InputArtifactBodyLimitMiddleware
+from clio_relay.adapters.worker.http_api_routes_adapter import register_adapter_routes
 from clio_relay.adapters.worker.http_api_routes_artifacts import register_artifact_routes
 from clio_relay.adapters.worker.http_api_routes_events import register_event_routes
 from clio_relay.adapters.worker.http_api_routes_gateway import register_gateway_routes
 from clio_relay.adapters.worker.http_api_routes_jobs import register_job_routes
-from clio_relay.adapters.worker.http_api_routes_owner_session_admin import register_owner_session_admin_routes
+from clio_relay.adapters.worker.http_api_routes_owner_session_admin import (
+    register_owner_session_admin_routes,
+)
 from clio_relay.adapters.worker.http_api_routes_queue import register_queue_routes
-from clio_relay.adapters.worker.http_api_routes_adapter import register_adapter_routes
 from clio_relay.adapters.worker.http_api_routes_scheduler import register_scheduler_routes
 from clio_relay.adapters.worker.http_api_routes_session import register_session_routes
 from clio_relay.adapters.worker.http_api_routes_worker_probe import register_worker_probe_routes
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
+from clio_relay.config import RelaySettings
+from clio_relay.errors import ConfigurationError
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER as OWNER_SESSION_ID_HEADER
 from clio_relay.job_identity import SESSION_GENERATION_ID_HEADER as SESSION_GENERATION_ID_HEADER
 from clio_relay.job_identity import JobOwnerSessionIdentity
-from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 
 INPUT_ARTIFACT_REQUEST_JSON_OVERHEAD_BYTES = 16 * 1024
 

@@ -17,8 +17,6 @@ from datetime import datetime
 from typing import cast
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
-from clio_relay.models import JobKind, JobState, Lease, RelayJob, utc_now
 from clio_relay.adapters.worker.queue_admission_snapshot import (
     _admission_snapshot,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -36,6 +34,8 @@ from clio_relay.adapters.worker.queue_diagnosis_constants import (
     _validate_bounds,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _validate_stale_after,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+from clio_relay.errors import ConfigurationError
+from clio_relay.models import JobKind, JobState, Lease, RelayJob, utc_now
 
 
 def discover_stale_jobs(

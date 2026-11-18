@@ -157,7 +157,9 @@ def _install_site_profile(monkeypatch: pytest.MonkeyPatch) -> None:
             )
         ]
     )
-    monkeypatch.setattr("clio_relay.adapters.worker.application_profiles.entry_points", lambda: entries)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.application_profiles.entry_points", lambda: entries
+    )
 
 
 def test_linux_user_bootstrap_script_installs_required_components() -> None:
@@ -875,7 +877,9 @@ def test_local_frp_install_publishes_only_a_verified_staged_pair(
 
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap._assert_frp_pair", accept_pair)
 
     installed = install_local_frp(destination)
@@ -903,7 +907,9 @@ def test_local_frp_install_removes_destination_pair_when_final_verification_fail
 
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
     monkeypatch.setattr(
         "clio_relay.adapters.worker.bootstrap._assert_frp_pair",
         quarantine_destination,
@@ -929,7 +935,9 @@ def test_local_frp_install_never_publishes_a_staged_hash_mismatch(
 
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
     monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
 
     with pytest.raises(ConfigurationError, match="SHA-256 mismatch"):
         install_local_frp(destination)

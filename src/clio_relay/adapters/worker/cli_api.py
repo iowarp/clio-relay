@@ -58,12 +58,12 @@ from typing import Annotated
 import typer
 import uvicorn
 
-import clio_relay.installation as installation
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.installation as installation
+from clio_relay.adapters.worker.session_lifecycle import SessionApiReleaseIdentity
 from clio_relay.config import RelaySettings
 from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import ConfigurationError
-from clio_relay.adapters.worker.session_lifecycle import SessionApiReleaseIdentity
 
 api_app = typer.Typer(no_args_is_help=True)
 

@@ -15,6 +15,13 @@ from typing import Final, cast
 
 from pydantic import ValidationError
 
+from clio_relay.adapters.worker.remote_connection import (
+    MAX_SESSION_API_RESPONSE_BYTES,
+    RemoteConnection,
+    RemoteConnectionRegistry,
+    connection_registry,
+    validate_channel_request,
+)
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.control_channel import ChannelDropped
@@ -26,13 +33,6 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
     TransformRef,
-)
-from clio_relay.adapters.worker.remote_connection import (
-    MAX_SESSION_API_RESPONSE_BYTES,
-    RemoteConnection,
-    RemoteConnectionRegistry,
-    connection_registry,
-    validate_channel_request,
 )
 
 SESSION_IDENTITY_SCHEMA: Final = "clio-relay.session-identity.v1"
@@ -386,4 +386,3 @@ def _validate_submission_receipt(
         }
         if observed_agent != expected_agent:
             raise RelayError("owned session API returned a different remote-agent task")
-

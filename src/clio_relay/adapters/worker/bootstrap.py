@@ -63,14 +63,18 @@ from clio_relay.adapters.worker.bootstrap_pinned_copy_sources import (
     _BOOTSTRAP_PINNED_LOCAL_ARTIFACT_COPY_SOURCE,
     _BOOTSTRAP_PINNED_UV_COPY_SOURCE,
 )
-from clio_relay.adapters.worker.bootstrap_preparing_root_source import _BOOTSTRAP_PREPARING_ROOT_SOURCE
+from clio_relay.adapters.worker.bootstrap_preparing_root_source import (
+    _BOOTSTRAP_PREPARING_ROOT_SOURCE,
+)
 from clio_relay.adapters.worker.bootstrap_receipt_classifier_source import (
     _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE,  # noqa: F401 -- re-exported facade surface
 )
 from clio_relay.adapters.worker.bootstrap_reconcile import (
     BootstrapDesiredState,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_script_activation import reconcile_script_activation
+from clio_relay.adapters.worker.bootstrap_reconcile_script_activation import (
+    reconcile_script_activation,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_script_commit import reconcile_script_commit
 from clio_relay.adapters.worker.bootstrap_reconcile_script_generation_prepare import (
     reconcile_script_generation_prepare,
@@ -94,13 +98,13 @@ from clio_relay.adapters.worker.bootstrap_worker_proof_source import (  # noqa: 
     _WORKER_LIFETIME_EXCLUSIVE_GUARD_PYTHON,
     _WORKER_WRITER_PROOF_PYTHON,
 )
+from clio_relay.adapters.worker.deployment import endpoint_user_service_name
 from clio_relay.bounded_process import (
     BoundedProcessError,
     BoundedProcessOutputLimit,
     BoundedProcessTimeout,
     run_bounded_process,
 )
-from clio_relay.adapters.worker.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_VERSION,

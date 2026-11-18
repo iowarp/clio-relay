@@ -159,5 +159,3 @@ def scheduler_cancel_command(
             raise typer.Exit(code=1)
 
     cli._run_or_exit(action)
-
-

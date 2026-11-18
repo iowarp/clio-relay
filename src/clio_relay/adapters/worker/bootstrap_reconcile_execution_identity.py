@@ -24,7 +24,10 @@ from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     MAX_JARVIS_GRAPH_BYTES,
     MAX_JARVIS_REPOS_BYTES,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_models import BootstrapDesiredState, JarvisStateEvidence
+from clio_relay.adapters.worker.bootstrap_reconcile_models import (
+    BootstrapDesiredState,
+    JarvisStateEvidence,
+)
 from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
     _canonical_path_preserving_final,
     _expand_home,

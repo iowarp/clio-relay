@@ -12,7 +12,6 @@ import base64
 
 import pytest
 
-from clio_relay.errors import RelayError
 from clio_relay.adapters.worker.frpc_proxy_receipt import (
     BRINGUP_RECEIPT_SCHEMA,
     TEARDOWN_RECEIPT_SCHEMA,
@@ -21,6 +20,7 @@ from clio_relay.adapters.worker.frpc_proxy_receipt import (
     parse_frpc_proxy_status_properties,
     parse_frpc_proxy_teardown_receipt,
 )
+from clio_relay.errors import RelayError
 
 _BRINGUP_LINES = [
     f"FrpcProxyReceiptSchema={BRINGUP_RECEIPT_SCHEMA}",

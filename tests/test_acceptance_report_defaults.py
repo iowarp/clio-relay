@@ -10,49 +10,57 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-import pytest
-from typer import Typer
-from typer.testing import CliRunner
-
-import clio_relay.adapters.worker.bootstrap as bootstrap
-import clio_relay.adapters.worker.cli_cleanup_report as cli_cleanup_report
+import clio_relay.adapters.worker.queue_validation as queue_validation
+import clio_relay.adapters.worker.scheduler_validation as scheduler_validation
 import clio_relay.cli_jarvis_artifact_io as cli_jarvis_artifact_io
 import clio_relay.cli_jarvis_dispatch as cli_jarvis_dispatch
 import clio_relay.cli_jarvis_execution_run as cli_jarvis_execution_run
 import clio_relay.cli_jarvis_package_search as cli_jarvis_package_search
 import clio_relay.cli_jarvis_remote_contract as cli_jarvis_remote_contract
-import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
-import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
-import clio_relay.adapters.worker.cli_remote_collection_pagination as cli_remote_collection_pagination
-import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
-import clio_relay.frp_check as frp_check
 import clio_relay.jarvis_mcp_validation as jarvis_mcp_validation
 import clio_relay.live_acceptance as live_acceptance
 import clio_relay.mcp_server as mcp_server
 import clio_relay.mcp_stdio_validation as mcp_stdio_validation
-import clio_relay.adapters.worker.queue_validation as queue_validation
-import clio_relay.relay_ops as relay_ops
 import clio_relay.release_validation as release_validation
+import pytest
+from clio_relay.live_acceptance import LiveAcceptanceOptions
+from clio_relay.release_validation import LocalReleaseValidationOptions
+from typer import Typer
+from typer.testing import CliRunner
+
+import clio_relay.adapters.worker.bootstrap as bootstrap
+import clio_relay.adapters.worker.cli_cleanup_report as cli_cleanup_report
+import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
+import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
+from clio_relay.adapters.worker import cli_remote_collection_pagination
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.adapters.worker.transport_probe as transport_probe
+import clio_relay.frp_check as frp_check
+import clio_relay.relay_ops as relay_ops
 import clio_relay.remote_cli as remote_cli
 import clio_relay.remote_mcp as remote_mcp
 import clio_relay.scheduler_providers as scheduler_providers
-import clio_relay.adapters.worker.scheduler_validation as scheduler_validation
-import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-import clio_relay.adapters.worker.transport_probe as transport_probe
 from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import (
+    CleanupResource,
+    OwnedSessionCleanupReportReference,
+    OwnedSessionRecoveryStatus,
+    RemoteSessionStateEvidence,
+    SessionLifecycleReport,
+    session_lifecycle_report_bytes,
+)
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
     FrpTransportConfig,
     RemoteMcpServerConfig,
 )
-from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.live_acceptance import LiveAcceptanceOptions
 from clio_relay.models import GatewaySession, GatewaySessionState
-from clio_relay.release_validation import LocalReleaseValidationOptions
 from clio_relay.remote_mcp import (
     RemoteMcpRoute,
     RemoteMcpToolSchema,
@@ -63,14 +71,6 @@ from clio_relay.service_runtime import (
     ServiceRuntimeStartResult,
     ServiceRuntimeStopResult,
     ServiceRuntimeSupervisor,
-)
-from clio_relay.adapters.worker.session_lifecycle import (
-    CleanupResource,
-    OwnedSessionCleanupReportReference,
-    OwnedSessionRecoveryStatus,
-    RemoteSessionStateEvidence,
-    SessionLifecycleReport,
-    session_lifecycle_report_bytes,
 )
 from clio_relay.validation_report import (
     EvidenceReference,

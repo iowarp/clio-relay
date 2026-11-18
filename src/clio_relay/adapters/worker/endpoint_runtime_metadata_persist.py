@@ -69,9 +69,8 @@ class RuntimeMetadataPersistMixin:
                 },
             )
             return
-        if (
-            _task_direct_execution_pinned(task)
-            and (metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None)
+        if _task_direct_execution_pinned(task) and (
+            metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None
         ):
             self.queue.append_event(
                 job.job_id,

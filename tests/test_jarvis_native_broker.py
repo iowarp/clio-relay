@@ -337,7 +337,9 @@ def test_broker_uses_one_credential_closed_runtime_and_no_relay_scheduler_pollin
         pipeline_path=Path("pipeline.yaml"),
     )[4]
 
-    assert "from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker" in source
+    assert (
+        "from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker" in source
+    )
     assert "provider_for_scheduler" not in source
     assert "SchedulerPhase" not in source
     assert "run_native_jarvis_broker(" in source

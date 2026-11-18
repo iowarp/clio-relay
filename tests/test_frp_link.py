@@ -20,9 +20,9 @@ from typing import IO, Any
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.adapters.worker.transport_probe as transport_probe
 import clio_relay.control_channel as control_channel
 import clio_relay.frp_link as frp_link
-import clio_relay.adapters.worker.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import (

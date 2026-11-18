@@ -12,6 +12,17 @@ from urllib.parse import unquote, urlsplit
 
 from pydantic import ValidationError
 
+from clio_relay.adapters.worker.worker_runtime_verification import (
+    MAX_WORKER_ENDPOINT_RECORDS,  # noqa: F401
+    _installation_identity_label,  # noqa: F401
+    _verify_release_worker_install_source,  # noqa: F401
+    _verify_report_worker_receipt,  # noqa: F401
+    attach_verified_worker_identity,  # noqa: F401
+    verify_remote_installation_info,  # noqa: F401
+    verify_remote_worker_info,  # noqa: F401
+    worker_runtime_info,  # noqa: F401
+)
+
 # Owner-module re-exports (iowarp/clio-relay#231 split/installation). Each
 # extracted concern is re-imported here under its original name so every
 # existing `from clio_relay.installation import X` caller (bootstrap.py,
@@ -72,16 +83,6 @@ from clio_relay.validation_report import (
     detect_install_source,
     detect_software_identity,
     sha256_file,
-)
-from clio_relay.adapters.worker.worker_runtime_verification import (
-    MAX_WORKER_ENDPOINT_RECORDS,  # noqa: F401
-    _installation_identity_label,  # noqa: F401
-    _verify_release_worker_install_source,  # noqa: F401
-    _verify_report_worker_receipt,  # noqa: F401
-    attach_verified_worker_identity,  # noqa: F401
-    verify_remote_installation_info,  # noqa: F401
-    verify_remote_worker_info,  # noqa: F401
-    worker_runtime_info,  # noqa: F401
 )
 
 INSTALL_RECEIPT_PATH_ENV = "CLIO_RELAY_INSTALL_RECEIPT"

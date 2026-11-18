@@ -27,20 +27,20 @@ from filelock import FileLock
 
 import clio_relay.adapters.worker.cli_api as cli_api
 import clio_relay.adapters.worker.cli_cluster as cli_cluster
-import clio_relay.adapters.worker.cli_cluster_deploy as cli_cluster_deploy  # noqa: F401 -- registers cluster_app's deployment commands
+from clio_relay.adapters.worker import cli_cluster_deploy  # noqa: F401 -- registers cluster_app's deployment commands
 import clio_relay.adapters.worker.cli_endpoint as cli_endpoint
 import clio_relay.adapters.worker.cli_init as cli_init
 import clio_relay.adapters.worker.cli_installation_receipt as cli_installation_receipt
 import clio_relay.adapters.worker.cli_jarvis_runtime_authority as cli_jarvis_runtime_authority
 import clio_relay.adapters.worker.cli_queue as cli_queue
-import clio_relay.adapters.worker.cli_queue_maintenance as cli_queue_maintenance  # noqa: F401 -- registers queue_app's maintenance commands
+from clio_relay.adapters.worker import cli_queue_maintenance  # noqa: F401 -- registers queue_app's maintenance commands
 import clio_relay.adapters.worker.cli_relay_host as cli_relay_host
 import clio_relay.adapters.worker.cli_scheduler as cli_scheduler
 import clio_relay.adapters.worker.cli_session as cli_session
-import clio_relay.adapters.worker.cli_session_attach as cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
-import clio_relay.adapters.worker.cli_session_owned as cli_session_owned  # noqa: F401 -- registers session_app's owned-session commands
-import clio_relay.adapters.worker.cli_session_start as cli_session_start  # noqa: F401 -- registers session_app's start command
-import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown  # noqa: F401 -- registers session_app's teardown command
+from clio_relay.adapters.worker import cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
+from clio_relay.adapters.worker import cli_session_owned  # noqa: F401 -- registers session_app's owned-session commands
+from clio_relay.adapters.worker import cli_session_start  # noqa: F401 -- registers session_app's start command
+from clio_relay.adapters.worker import cli_session_teardown  # noqa: F401 -- registers session_app's teardown command
 import clio_relay.adapters.worker.cli_support as cli_support
 import clio_relay.adapters.worker.cli_worker as cli_worker
 import clio_relay.adapters.worker.site_server as site_server
@@ -92,7 +92,9 @@ worker_app.add_typer(cli_scheduler.scheduler_app, name="scheduler")
 worker_app.command("status")(cli_worker.worker_status_command)
 worker_app.command()(cli_init.init)
 worker_app.command("install-frp")(cli_init.install_frp)
-worker_app.command("installation-write-receipt")(cli_installation_receipt.installation_write_receipt)
+worker_app.command("installation-write-receipt")(
+    cli_installation_receipt.installation_write_receipt
+)
 worker_app.command("installation-info")(cli_installation_receipt.show_installation_info)
 worker_app.command("bootstrap-inspect", hidden=True)(cli_installation_receipt.bootstrap_inspect)
 worker_app.command("jarvis-runtime-authority", hidden=True)(

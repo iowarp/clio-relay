@@ -23,6 +23,11 @@ from typing import cast
 
 import clio_relay.adapters.worker.cli_cleanup_evidence as cli_cleanup_evidence
 import clio_relay.cluster_config as cluster_config
+from clio_relay.adapters.worker.session_lifecycle import (
+    MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
+    SessionLifecycleReport,
+    session_lifecycle_report_bytes,
+)
 from clio_relay.cluster_config import (
     ensure_private_configuration_windows_handle,
     open_private_configuration_windows_descriptor,
@@ -30,11 +35,6 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.errors import RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.adapters.worker.session_lifecycle import (
-    MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
-    SessionLifecycleReport,
-    session_lifecycle_report_bytes,
-)
 from clio_relay.validation_report import (
     durably_ensure_validation_directory,
 )

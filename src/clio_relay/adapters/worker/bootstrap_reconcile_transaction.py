@@ -17,7 +17,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay.adapters.worker.bootstrap_reconcile_constants import BOOTSTRAP_TRANSACTION_SCHEMA
-from clio_relay.adapters.worker.bootstrap_reconcile_primitives import _atomic_json, _read_bounded, _require_sha256
+from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
+    _atomic_json,
+    _read_bounded,
+    _require_sha256,
+)
 from clio_relay.errors import ConfigurationError
 
 

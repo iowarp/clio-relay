@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import NotFoundError, QueueConflictError
-from clio_relay.models import EndpointRegistration, EndpointRole, JobKind
 from clio_relay.adapters.worker.queue_diagnosis_constants import ACTIVE_STATES
 from clio_relay.adapters.worker.queue_worker_capacity import (
     _endpoint_concurrency,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     _kind_concurrency_configurations,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
+from clio_relay.errors import NotFoundError, QueueConflictError
+from clio_relay.models import EndpointRegistration, EndpointRole, JobKind
 
 
 @dataclass(frozen=True)

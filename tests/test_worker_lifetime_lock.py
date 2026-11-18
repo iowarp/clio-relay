@@ -22,10 +22,7 @@ import clio_relay.adapters.worker.endpoint as endpoint_module
 import clio_relay.adapters.worker.storage_runtime as storage_runtime_module
 from clio_relay import lock_holder_sidecar
 from clio_relay.adapters.worker import queue_legacy_audit, queue_startup, worker_lifetime_lock
-from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
-from clio_relay.errors import ConfigurationError
-from clio_relay.models import EndpointRole, JarvisRunSpec, JobKind, RelayEvent, RelayJob
 from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 from clio_relay.adapters.worker.worker_lifetime_lock import (
@@ -35,6 +32,9 @@ from clio_relay.adapters.worker.worker_lifetime_lock import (
     WorkerLifetimeLockUnavailable,
     exclusive_migration_lifetime,
 )
+from clio_relay.config import RelaySettings
+from clio_relay.errors import ConfigurationError
+from clio_relay.models import EndpointRole, JarvisRunSpec, JobKind, RelayEvent, RelayJob
 
 
 def _start_shared_lock_holder(core_dir: Path) -> subprocess.Popen[str]:

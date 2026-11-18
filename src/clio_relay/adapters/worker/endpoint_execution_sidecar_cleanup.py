@@ -51,7 +51,9 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
     EXECUTION_SIDECAR_QUARANTINE_SCHEMA,
     _RuntimeSidecarAnchor,
 )
-from clio_relay.adapters.worker.endpoint_windows_sidecar_handles import _remove_execution_sidecars_windows
+from clio_relay.adapters.worker.endpoint_windows_sidecar_handles import (
+    _remove_execution_sidecars_windows,
+)
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.models import RelayTask, utc_now
