@@ -6,6 +6,8 @@ These run without a site. The live checks are in the fixture modules.
 from __future__ import annotations
 
 import asyncio
+import shlex
+import signal
 import sys
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -315,6 +317,70 @@ def test_no_duration_renders_no_walltime(tmp_path: Path, scheduler: str) -> None
     assert walltime(timed) == timedelta(hours=3)
     rendered = adapter._render(timed, scheduler, root, job_dir, "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
     assert directive in rendered.files["submit.sh"]
+
+
+def _batch(tmp_path: Path, command: str) -> Path:
+    launcher = tmp_path / "single_launch.sh"
+    launcher.write_text(f"sh -c {shlex.quote(command)}\n")
+    rendered = f'#!/bin/bash\n\n/bin/bash {launcher} a b \n\necho "$?" > {tmp_path}/ec\n'
+    batch = tmp_path / "submit.sh"
+    batch.write_text(scripts.forward_signals(rendered, str(launcher)))
+    return batch
+
+
+@pytest.mark.asyncio
+async def test_a_signal_to_the_batch_shell_reaches_the_command(tmp_path: Path) -> None:
+    # Some Slurm sites signal only the batch shell on a cancel, as this test does.
+    started = tmp_path / "started"
+    command = (
+        f"trap 'echo stopping > {tmp_path}/log; exit 143' TERM; "
+        f"touch {started}; sleep 3600 & wait"
+    )
+    shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, command)))
+    while not started.exists():
+        assert shell.returncode is None
+        await asyncio.sleep(0.05)
+    shell.send_signal(signal.SIGTERM)
+    await shell.wait()
+    assert (tmp_path / "log").read_text() == "stopping\n"
+    assert (tmp_path / "ec").read_text() == "143\n"
+
+
+@pytest.mark.asyncio
+async def test_the_batch_shell_keeps_the_commands_exit_code(tmp_path: Path) -> None:
+    shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, "exit 7")))
+    assert await shell.wait() == 0
+    assert (tmp_path / "ec").read_text() == "7\n"
+
+
+@pytest.mark.parametrize(("scheduler", "wrapped"), [("slurm", True), ("pbs", False)])
+def test_slurm_scripts_pass_signals_on(tmp_path: Path, scheduler: str, wrapped: bool) -> None:
+    adapter = _adapter(tmp_path)
+    root = PurePosixPath("/home/someone/.clio-relay")
+    spec = JobSpec(executable="true")
+    rendered = adapter._render(spec, scheduler, root, root / "jobs" / "op_abc", "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    script = rendered.files["submit.sh"]
+    assert ("trap '_relay_pass TERM' TERM" in script) is wrapped
+    launch = next(line for line in script.splitlines() if "single_launch.sh" in line)
+    assert launch.endswith(" &") is wrapped
+    assert script.index("single_launch.sh") < script.index(".ec")
+
+
+def test_forward_signals_needs_a_launch_line() -> None:
+    with pytest.raises(ValueError, match="no launch line"):
+        scripts.forward_signals("#!/bin/bash\n# /x/single_launch.sh\n", "/x/single_launch.sh")
+
+
+def test_checks_of_remote_files_list_their_directory_first() -> None:
+    status = scripts.status_script(
+        "/j", mode="scheduler", status_command="squeue", native_id="53"
+    )
+    assert status.index("fresh .") < status.index("[ -f final ]")
+    assert status.index("fresh .") < status.index("53.ec")
+    check = scripts.check_script("~/.r", "op_1", "auto", ["ab" * 32])
+    assert check.index('fresh "$J" "$I"') < check.index('[ -f "$J/submit.rc" ]')
+    assert check.index('fresh "${c%/*}"') < check.index('[ -f "$c" ]')
+    assert scripts.FRESH in status and scripts.FRESH in check
 
 
 def test_render_detached(tmp_path: Path) -> None:

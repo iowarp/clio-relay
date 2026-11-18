@@ -386,6 +386,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if scheduler == "pbs":
             # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
             script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
+        elif scheduler == "slurm":
+            script = scripts.forward_signals(script, command[1])
         rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))

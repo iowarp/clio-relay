@@ -178,7 +178,8 @@ fi"""
         launcher = f"""L="$R/psij"/{q(launcher_dir)}
 if [ ! -d "$L" ]; then
   mkdir -p "$L.$$" && {copies} && chmod 755 "$L.$$"/* && mv "$L.$$" "$L" 2>/dev/null
-  rm -rf "$L.$$"
+  # If another submit installed it first, mv put this copy inside theirs.
+  rm -rf "$L.$$" "$L/${{L##*/}}.$$"
 fi
 """
     moves = "\n".join(f'  mv -f "$I"/{q(name)} "$J"/{q(name)}' for name in job_files)
@@ -215,6 +216,39 @@ fi
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo\n'
         + 'echo "@@err"; cat "$J/submit.err" 2>/dev/null; echo\n'
     )
+
+
+_FORWARD_SIGNALS = """# Some Slurm sites signal only this shell on a cancel and kill the rest after
+# KillWait. Run the launch in its own process group, pass signals on to it and wait.
+_relay_job=
+_relay_held=
+_relay_pass() {{
+  if [ -n "$_relay_job" ]; then kill -s "$1" -- "-$_relay_job" 2>/dev/null
+  else _relay_held=$1; fi
+}}
+trap '_relay_pass TERM' TERM
+trap '_relay_pass INT' INT
+trap '_relay_pass USR1' USR1
+trap '_relay_pass USR2' USR2
+set -m
+{launch} &
+_relay_job=$!
+[ -n "$_relay_held" ] && _relay_pass "$_relay_held"
+while :; do wait "$_relay_job"; _relay_rc=$?; kill -0 "$_relay_job" 2>/dev/null || break; done
+set +m
+_relay_return() {{ return "$1"; }}
+_relay_return "$_relay_rc"
+"""
+
+
+def forward_signals(script: str, launcher: str) -> str:
+    """Wrap the launch line of a rendered batch script so a cancel reaches the command."""
+    lines = script.split("\n")
+    for index, line in enumerate(lines):
+        if launcher in line and not line.lstrip().startswith("#"):
+            lines[index] = _FORWARD_SIGNALS.format(launch=line.rstrip()).rstrip("\n")
+            return "\n".join(lines)
+    raise ValueError("the rendered script has no launch line")
 
 
 DETACHED_SUBMIT = (
