@@ -83,6 +83,7 @@ def relay_http(relay_paths: RelayPaths, tmp_path: Path) -> Iterator[tuple[str, s
     """Serve relay over Streamable HTTP; yield its URL and bearer token."""
     port = _free_port()
     token_file = tmp_path / "token"
+    log = (tmp_path / "serve.log").open("wb")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -96,19 +97,22 @@ def relay_http(relay_paths: RelayPaths, tmp_path: Path) -> Iterator[tuple[str, s
             str(token_file),
         ],
         env=_env(relay_paths),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
     )
     url = f"http://127.0.0.1:{port}/mcp"
     try:
-        deadline = time.monotonic() + 30
+        # Importing the server takes about 30 s on a loaded shared login node.
+        deadline = time.monotonic() + 120
         while True:
             try:
                 httpx.get(url, timeout=1)
                 break
             except httpx.TransportError:
                 if time.monotonic() > deadline or process.poll() is not None:
-                    raise
+                    log.flush()
+                    output = (tmp_path / "serve.log").read_text(errors="replace")
+                    pytest.fail(f"relay serve did not come up: {output}")
                 time.sleep(0.2)
         assert oct(token_file.stat().st_mode & 0o777) == "0o600"
         yield url, token_file.read_text(encoding="utf-8").strip()
@@ -118,6 +122,7 @@ def relay_http(relay_paths: RelayPaths, tmp_path: Path) -> Iterator[tuple[str, s
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
+        log.close()
 
 
 def test_stdio_task(relay_paths: RelayPaths) -> None:
