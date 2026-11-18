@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -3278,6 +3279,18 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
     assert "from clio_relay.adapters.worker.safe_archive import safe_extract_tar" in script
     assert "candidate_safe_archive" not in script
     assert "BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/safe_archive.py" in script
+
+
+def test_payload_script_assigns_every_shell_variable_on_its_line() -> None:
+    """A backslash-newline in the template must not turn an assignment into a command."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+
+    split = re.findall(r"(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_]*=[ \t]+\S.*$", script)
+    assert split == []
+    assert (
+        'BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO="$BOOTSTRAP_CANDIDATE_WORKER/'
+        'bootstrap_provider_build_info.py"'
+    ) in script
 
 
 def test_legacy_planning_attests_private_candidate_before_transaction_or_fence() -> None:
