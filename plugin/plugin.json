@@ -16,6 +16,7 @@
   ],
   "extensions": {
     "ai.iowarp.clio": {
+      "title": "Relay",
       "tabs": [
         {
           "id": "compute",

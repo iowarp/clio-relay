@@ -1663,7 +1663,7 @@ Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (cli
 
 ## W14. Relay's CLIO plugin and the Compute tab
 
-Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (48536f8 pins relay a1b1b6f).
+Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (7d38476 pins relay f31b292).
 
 ### Decisions
 
@@ -1683,6 +1683,11 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
 - **Per-site degrade.** A site whose adapter or identity can't be read becomes one "Unavailable" row with Edit and Remove. The rest of the tab still renders.
 - **Server command (O9).** The server command lives in `plugin/mcp.json` beside `plugin.json`. clio-agent has no connector entry for relay.
 - **Skills (RL34).** `plugin/skills/use-relay/SKILL.md` points at `relay://skills/{name}` and `relay://sites/{site}/skill` and copies no skill text.
+- **The plugin's title.** `ai.iowarp.clio.title` is "Relay". CLIO sends it as `plugin_title` (clio-agent ebe5573), and the breadcrumb shows it. Agent Plugins 1.0.0 has no top-level title.
+- **Field errors are checks on the field.**
+  - An error that names a field puts `checks: [{condition: {path: <form>/valid/<key>}, message}]` on that TextField or CheckBox, and the form's `valid/<key>` is `false`. A literal `condition: false` reads as valid in web_core.
+  - The forms are `/drafts/add`, `/drafts/{site}` and `/catalog`. A catalog error names `catalog.site_id` (the Site ID field) or `catalog.id` (the picker).
+  - An error that names no field stays a caption. So does an error on a ChoicePicker, because the Basic ChoicePicker draws no check message.
 - **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
 
 ### Facts
@@ -1729,11 +1734,18 @@ All live on Ares, on my own stack:
   - `tests/relay_next tests/asks` gave 328 passed, 0 skipped.
   - The option-B gate passed against `clio-relay serve` over stdio, in both auto and legacy modes. A plain client sees 5 tools. An A2UI client sees 15, and the 10 app-only tools equal `ACTIONS`. A call without a token is refused, and so is one with a made-up token.
   - On the live agent, after a plugin update and a remount, relay runs `@ea56fc6… clio-relay serve`, and Connect on Stampede3 gives the same result as above.
+- **Field checks and the title (f31b292, 242044c), live** on clio-agent ebe5573 with gact-tui da11008 (iowarp/gact-tui#1320), plugin from marketplace 7d38476.
+  - Add site with an empty Site ID: "Enter a site ID" appears once, beneath the field, in the destructive colour at 14px, and the field's border turns red. No caption and no separator.
+  - Passed at 1440×900 and 390×844, in en and el. A valid add then clears the check.
+  - The breadcrumb reads "Relay", from `plugin_title`.
+  - Screenshots `lq28-{1440,390}-{en,el}-05-field-check.png` and `lq28-1440-en-b-06-check-cleared.png`.
+  - On Ares, `tests/relay_next tests/asks` gave 329 passed, 0 skipped at f31b292, with ruff and pyright clean. `test_plugin.py` and `test_compute_tab.py` gave 17 passed, 0 skipped at 242044c.
 
 ### Open items
 
 - **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
 - **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
+- **ChoicePicker errors are captions.** The Basic ChoicePicker, which CLIO uses for 8 options or fewer, draws no `validationErrors`. A check on a picker would show nothing, so relay keeps those errors as captions. This is for W12.
 - **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit, with `clio-relay serve` since the cutover. Repin to the integration commit after W1 merges.
 
 ### Run sheets for the person rows

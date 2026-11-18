@@ -36,7 +36,9 @@ def test_the_shipped_catalog_is_the_components_the_tab_draws_with() -> None:
 
 def test_the_manifest_names_the_tab_the_server_serves() -> None:
     manifest = _json(PLUGIN / "plugin.json")
+    assert "title" not in manifest
     clio = manifest["extensions"]["ai.iowarp.clio"]
+    assert clio["title"] == "Relay"
     assert [tab["resource"] for tab in clio["tabs"]] == [TAB_URI]
     assert [row["provider"] for row in clio["accounts"]] == ["globus"]
     assert clio["elicitation"] == {"loopback": True, "origins": ["https://tacc.tapis.io"]}

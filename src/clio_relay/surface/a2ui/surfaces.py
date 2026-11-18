@@ -17,7 +17,7 @@ from typing import Any, cast
 
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui.components import Tree, bound, event, open_url
-from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error
+from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error, valid_map
 from clio_relay.surface.a2ui.tokens import ActionTokens
 
 SITES_SURFACE = "relay-sites"
@@ -47,6 +47,15 @@ ACTIONS = (
 )
 
 HOST_SIGN_IN = "data_source/login/"
+
+# Where each form keeps its ``valid`` map, and the error keys that live in it.
+ADD_PATH = "/drafts/add"
+ADD_ERROR_PREFIXES = ("site.", "config.")
+EDIT_ERROR_PREFIXES = ("site.", "adapters.")
+CATALOG_PATH = "/catalog"
+CATALOG_ERROR = "catalog"
+CATALOG_SITE_ERROR = "catalog.id"
+CATALOG_ID_ERROR = "catalog.site_id"
 
 POLICY = Field(
     "policy",
@@ -209,6 +218,7 @@ def summary(views: list[SiteView], notice: str = "") -> str:
     return "\n".join(lines)
 
 
+
 # The sites surface
 
 
@@ -253,7 +263,7 @@ def _edit_form(
     path = f"/drafts/{site.id}"
     children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4")]
     children += form_error(tree, base, errors)
-    children += field_rows(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.")
+    children += field_rows(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.", path)
     children.append(tree.text(f"{base}-ways", "Ways in", "h5"))
     tabs: list[dict[str, str]] = []
     for name in _edit_order(site, forms):
@@ -275,7 +285,7 @@ def _edit_form(
                 )
             )
         rows += field_rows(
-            tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}."
+            tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}.", path
         )
         if not adapter_form.fields:
             rows.append(tree.text(f"{tab_base}-none", "No settings", "caption"))
@@ -469,7 +479,10 @@ def sites_surface(
     data: dict[str, Any] = {
         "switch": {view.site.id: {"adapter": [view.site.adapter]} for view in views},
         "drafts": {
-            view.site.id: edit_draft(view.site, forms)
+            view.site.id: {
+                **edit_draft(view.site, forms),
+                "valid": valid_map(state.errors.get(view.site.id, {}), EDIT_ERROR_PREFIXES),
+            }
             for view in views
             if view.site.id in state.editing
         },

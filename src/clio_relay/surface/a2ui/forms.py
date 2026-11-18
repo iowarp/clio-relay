@@ -237,13 +237,48 @@ def suggest_id(name: str) -> str:
 # Components for a form's fields
 
 
-def field_components(tree: Tree, base: str, item: Field, path: str, error: str | None) -> list[str]:
-    """Add one form field, its help and its error, and return their ids."""
+def _segment(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def valid_path(form_path: str, key: str) -> str:
+    """Return where a form keeps whether the field under error ``key`` is valid."""
+    return f"{form_path}/valid/{_segment(key)}"
+
+
+def valid_map(errors: dict[str, str], prefixes: tuple[str, ...]) -> dict[str, bool]:
+    """Return a form's ``valid`` data: false for each field with an error under ``prefixes``."""
+    return {key: False for key in errors if key and key.startswith(prefixes)}
+
+
+def error_checks(error: str | None, check_path: str | None) -> dict[str, Any]:
+    """Return a component's `checks`: one bound to `check_path` when there is an error."""
+    if not error or check_path is None:
+        return {}
+    return {"checks": [{"condition": bound(check_path), "message": error}]}
+
+
+def field_components(
+    tree: Tree,
+    base: str,
+    item: Field,
+    path: str,
+    error: str | None,
+    check_path: str | None = None,
+) -> list[str]:
+    """Add one form field, its help and its error, and return their ids.
+
+    A TextField or CheckBox shows its own error, through a check bound to
+    ``check_path`` that the form's data sets false. A ChoicePicker shows no check
+    message in every renderer, so its error stays a caption.
+    """
     label = f"{item.label} (required)" if item.required else item.label
     value = bound(path)
+    checks = error_checks(error, check_path)
     if item.kind == "bool":
-        ids = [tree.add(base, "CheckBox", label=label, value=value)]
+        ids = [tree.add(base, "CheckBox", label=label, value=value, **checks)]
     elif item.kind == "choice":
+        checks = {}
         ids = [
             tree.add(
                 base,
@@ -262,8 +297,8 @@ def field_components(tree: Tree, base: str, item: Field, path: str, error: str |
             "lines": "longText",
             "yaml": "longText",
         }.get(item.kind, "shortText")
-        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant)]
-    if error:
+        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant, **checks)]
+    if error and not checks:
         ids.append(tree.text(f"{base}-error", error, "caption"))
     if item.help:
         ids.append(tree.text(f"{base}-help", item.help, "caption"))
@@ -277,11 +312,18 @@ def field_rows(
     path: str,
     errors: dict[str, str],
     prefix: str,
+    form_path: str,
 ) -> list[str]:
     ids: list[str] = []
     for item in fields:
+        key = prefix + item.key
         ids += field_components(
-            tree, f"{base}-f-{item.key}", item, f"{path}/{item.key}", errors.get(prefix + item.key)
+            tree,
+            f"{base}-f-{item.key}",
+            item,
+            f"{path}/{item.key}",
+            errors.get(key),
+            valid_path(form_path, key),
         )
     return ids
 

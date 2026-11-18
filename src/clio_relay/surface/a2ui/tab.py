@@ -51,7 +51,12 @@ from clio_relay.surface.a2ui.forms import (
 from clio_relay.surface.a2ui.protocol import MIME_TYPE, A2UIClient, Message, a2ui_client, embedded
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
+    ADD_PATH,
     ADD_SURFACE,
+    CATALOG_ERROR,
+    CATALOG_ID_ERROR,
+    CATALOG_PATH,
+    CATALOG_SITE_ERROR,
     EDIT_FIELDS,
     SITES_SURFACE,
     SiteView,
@@ -432,7 +437,7 @@ class ComputeTab:
                 messages: list[Message] = []
                 for surface_id, (components, data) in (await self._surfaces(views)).items():
                     messages += protocol.update(client, surface_id, components, None)
-                    for path in outcome.resend.get(surface_id, ()):
+                    for path in self._resend(surface_id, outcome, data):
                         messages.append(
                             {
                                 "version": client.version,
@@ -461,6 +466,20 @@ class ComputeTab:
             surfaces.SWITCH_ADAPTER: self.switch_adapter,
             surfaces.CONNECT_SITE: self.connect_site,
         }
+
+    def _resend(self, surface_id: str, outcome: Outcome, data: dict[str, Any]) -> list[str]:
+        """Return the paths to send again: the action's, then every form's ``valid`` map.
+
+        The ``valid`` maps go every time, so a field's check follows the errors the
+        components were just built from.
+        """
+        if surface_id == ADD_SURFACE:
+            forms = [ADD_PATH, CATALOG_PATH]
+        else:
+            forms = [f"/drafts/{site_id}" for site_id in sorted(self.state.editing)]
+        valid = [f"{path}/valid" for path in forms]
+        paths = list(outcome.resend.get(surface_id, ()))
+        return paths + [path for path in valid if pointer(data, path) is not None]
 
     def _fail(self, key: str, errors: dict[str, str]) -> Outcome:
         self.state.errors[key] = errors
@@ -530,15 +549,15 @@ class ComputeTab:
         catalog_id = _first(values.get("id"))
         site_id = str(values.get("site_id") or "").strip() or None
         if not catalog_id:
-            return self._fail(ADD_SURFACE, {"catalog": "Choose a site from the catalog"})
+            return self._fail(ADD_SURFACE, {CATALOG_SITE_ERROR: "Choose a site from the catalog"})
         try:
             added = self.service.sites.add_from_catalog(catalog.site(catalog_id), site_id)
         except ValidationError:
-            return self._fail(
-                ADD_SURFACE, {"catalog": "A site ID takes lowercase letters, digits, - and _"}
-            )
+            message = "A site ID takes lowercase letters, digits, - and _"
+            return self._fail(ADD_SURFACE, {CATALOG_ID_ERROR: message})
         except Refusal as refusal:
-            return self._fail(ADD_SURFACE, {"catalog": _sentence(refusal.message)})
+            key = CATALOG_ID_ERROR if refusal.reason is RefusalReason.SITE_EXISTS else CATALOG_ERROR
+            return self._fail(ADD_SURFACE, {key: _sentence(refusal.message)})
         self.state.errors.pop(ADD_SURFACE, None)
         await self._saved(added, f"Added {added.title}.")
         return Outcome(ok=True, resend={ADD_SURFACE: ("/catalog",), SITES_SURFACE: ("/switch",)})

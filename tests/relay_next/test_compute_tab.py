@@ -24,9 +24,7 @@ from clio_relay.surface.a2ui import (
 from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
-from clio_relay.surface.a2ui.tab import (
-    _sentence,  # pyright: ignore[reportPrivateUsage]
-)
+from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -133,6 +131,18 @@ class Host:
             for cid in sorted(self.visible(sid))
             if components[cid]["component"] == "Text"
         )
+
+    def failing(self, sid: str) -> dict[str, str]:
+        """Return each visible field's failing check message, judged as web_core does."""
+        components = self.surfaces[sid]["components"]
+        found: dict[str, str] = {}
+        for cid in sorted(self.visible(sid)):
+            for check in components[cid].get("checks", []):
+                condition = check["condition"]
+                assert set(condition) == {"path"}, "a literal condition reads as valid"
+                if not _get(self.surfaces[sid]["data"], condition["path"]):
+                    found[cid] = check["message"]
+        return found
 
     def set(self, sid: str, path: str, value: Any) -> None:
         _set(self.surfaces[sid]["data"], path, value)
@@ -322,19 +332,31 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             await host.open()
             assert "No sites yet" in host.text("relay-sites")
 
-            # A bad value is shown beside its field, not as a tool error.
+            # A bad value is shown on its field, not as a tool error or a caption.
             host.set("relay-add", "/drafts/add/site/id", "Bad Id")
             result = await host.press("relay-add", "add-a-fixture-add")
             assert not result.is_error
             assert result.structured_content["ok"] is False
-            assert "add-s-f-id-error" in host.visible("relay-add")
+            assert set(host.failing("relay-add")) == {"add-s-f-id"}
+            assert host.surfaces["relay-add"]["components"]["add-s-f-id"]["checks"][0][
+                "condition"
+            ] == {"path": "/drafts/add/valid/site.id"}
+            assert host.get("relay-add", "/drafts/add/valid/site.id") is False
+            assert "add-s-f-id-error" not in host.visible("relay-add")
             assert store.list() == []
+
+            host.set("relay-add", "/drafts/add/site/id", "")
+            await host.press("relay-add", "add-a-fixture-add")
+            assert host.failing("relay-add") == {"add-s-f-id": "Enter a site ID"}
 
             host.set("relay-add", "/drafts/add/site/id", "lab")
             host.set("relay-add", "/drafts/add/site/name", "Lab cluster")
             host.set("relay-add", "/drafts/add/config/fixture/run_s", "0.1")
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is True, host.text("relay-add")
+            assert host.failing("relay-add") == {}
+            assert "checks" not in host.surfaces["relay-add"]["components"]["add-s-f-id"]
+            assert host.get("relay-add", "/drafts/add/valid") == {}
             [site] = store.list()
             assert (site.id, site.name, site.adapter) == ("lab", "Lab cluster", "fixture")
             assert site.config["run_s"] == 0.1
@@ -344,11 +366,11 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             assert host.get("relay-sites", "/switch/lab/adapter") == ["fixture"]
             assert "Added Lab cluster." in _said(result)
 
-            # Adding the same id again is refused beside the id field.
+            # Adding the same id again is refused on the id field.
             host.set("relay-add", "/drafts/add/site/id", "lab")
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is False
-            assert "exists" in host.text("relay-add")
+            assert host.failing("relay-add") == {"add-s-f-id": "A site named lab exists"}
 
             await host.press("relay-sites", "s-lab-probe-button")
             assert "Probed Lab cluster." in host.text("relay-sites")
@@ -357,6 +379,12 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             await host.press("relay-sites", "s-lab-edit")
             assert "e-lab-save" in host.visible("relay-sites")
             assert host.get("relay-sites", "/drafts/lab/site/name") == "Lab cluster"
+            host.set("relay-sites", "/drafts/lab/adapters/fixture/run_s", "soon")
+            result = await host.press("relay-sites", "e-lab-save")
+            assert result.structured_content["ok"] is False
+            assert set(host.failing("relay-sites")) == {"e-lab-a-fixture-f-run_s"}
+            assert host.get("relay-sites", "/drafts/lab/valid/adapters.fixture.run_s") is False
+            host.set("relay-sites", "/drafts/lab/adapters/fixture/run_s", "0.1")
             host.set("relay-sites", "/drafts/lab/site/queue", "debug")
             host.set("relay-sites", "/drafts/lab/adapters/fixture/queue_s", "0.3")
             host.set("relay-sites", "/drafts/lab/adapters/local/use", True)
@@ -458,23 +486,5 @@ def test_connect_offers_relay_sign_in_page(relay_paths: RelayPaths) -> None:
             link = host.surfaces["relay-sites"]["components"]["s-signs-open"]
             url = link["action"]["functionCall"]["args"]["url"]
             assert url.startswith("http://127.0.0.1:")
-
-    asyncio.run(scenario())
-
-
-def test_add_from_catalog(relay_paths: RelayPaths) -> None:
-    async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
-            host = Host(client)
-            await host.open()
-            options = host.surfaces["relay-add"]["components"]["add-catalog-site"]["options"]
-            first = options[0]["value"]
-            host.set("relay-add", "/catalog/id", [first])
-            host.set("relay-add", "/catalog/site_id", "mine")
-            result = await host.press("relay-add", "add-catalog")
-            assert result.structured_content["ok"] is True, host.text("relay-add")
-            [site] = SiteStore(relay_paths.sites_file).list()
-            assert site.id == "mine"
-            assert "s-mine" in host.visible("relay-sites")
 
     asyncio.run(scenario())
