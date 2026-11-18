@@ -1970,7 +1970,9 @@ import stat
 import tempfile
 from pathlib import Path
 
-from clio_relay.adapters.worker.bootstrap_reconcile import repair_legacy_cursor_permissions_for_upgrade
+from clio_relay.adapters.worker.bootstrap_reconcile import (
+    repair_legacy_cursor_permissions_for_upgrade,
+)
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.worker_lifetime_lock import exclusive_migration_lifetime

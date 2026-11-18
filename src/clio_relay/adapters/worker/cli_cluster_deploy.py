@@ -26,7 +26,8 @@ this module stays its owner.
 (``tests/test_cli_patch_seam.py``) -- cli.py itself reached them by bare
 import, so this module does too, matching cli.py's own prior style (the
 same reasoning ``cli_cluster.py``'s own docstring documents for
-``cluster_config.py``). ``clio_relay.adapters.worker.bootstrap``, ``clio_relay.adapters.worker.deployment``
+``cluster_config.py``). ``clio_relay.adapters.worker.bootstrap``,
+``clio_relay.adapters.worker.deployment``
 (module-level), ``clio_relay.adapters.worker.application_profiles``,
 ``clio_relay.adapters.worker.endpoint_service_status``, and ``clio_relay.bootstrap_
 acceptance`` ARE audited -- reached via ``import clio_relay.X as X`` then

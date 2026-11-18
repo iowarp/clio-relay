@@ -84,7 +84,8 @@ bootstrap_journal_action phase "$BOOTSTRAP_TRANSACTION_JOURNAL" \
 
 BOOTSTRAP_VERIFIED_DESIRED_FINGERPRINT="$(
   "$RELAY_PROVIDER_PYTHON" -c \
-    'import json,os; from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapDesiredState; '\
+    'import json,os; '\
+'from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapDesiredState; '\
 'value=json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"]); '\
 'value["agent_npm_package"]=os.environ["AGENT_NPM_PACKAGE"] or None; '\
 'value["agent_npm_bin"]=os.environ["AGENT_NPM_BIN"] or None; '\

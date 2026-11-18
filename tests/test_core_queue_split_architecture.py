@@ -684,7 +684,8 @@ def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
 # `f"{module_name}.attr"` inside a `for module_name in (...)` loop is invisible
 # to that hand-audit: F1/F2 (block-2 review) found a real dead seam this way --
 # `queue_legacy_audit.py` moved its real call off `clio_relay.adapters.worker.core_queue`, but
-# three test loops kept patching `clio_relay.adapters.worker.core_queue.ensure_private_configuration_directory`,
+# three test loops kept patching
+# `clio_relay.adapters.worker.core_queue.ensure_private_configuration_directory`,
 # which either raised AttributeError (no `raising=False`) or silently patched
 # nothing at all (`raising=False`). Neither is caught by the string-literal
 # audit. This extractor + guard makes that class of break fail loudly here

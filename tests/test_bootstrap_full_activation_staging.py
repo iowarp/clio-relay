@@ -1,4 +1,4 @@
-"""Failing-first tests for clio_relay.adapters.worker.bootstrap_full_activation_staging (clio-relay#257).
+"""Failing-first tests for bootstrap_full_activation_staging (clio-relay#257).
 
 The live defect: a full-mode `cluster bootstrap` reconcile chosen over a
 host whose `current` generation already exists (not just the #254

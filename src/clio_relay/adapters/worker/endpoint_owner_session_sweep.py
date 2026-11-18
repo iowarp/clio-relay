@@ -46,7 +46,8 @@ For each lease gone quiet past its own TTL:
    submissions) until an operator resumes it. Documented, not hidden: this
    is a vastly smaller blast radius than killing a live process, which is
    the alternative this exists to prevent.
-4. Reuses :func:`clio_relay.adapters.worker.session_cleanup_execution.execute_owned_session_teardown`
+4. Reuses
+   :func:`clio_relay.adapters.worker.session_cleanup_execution.execute_owned_session_teardown`
    -- the SAME cluster-local primitive the desktop's own ``session
    teardown`` invokes (over SSH, as ``session teardown-owned``) -- to kill
    the owned-session API process's systemd-contained scope and sanitize its

@@ -138,7 +138,11 @@ def identity(pid_raw, kind, markers):
     raise RuntimeError(f"owned {{kind}} process did not establish its identity")
 
 processes = [
-    identity(api_pid, "remote_relay_api", ["clio-relay", "worker", "api", "start", "--port", api_port]),
+    identity(
+        api_pid,
+        "remote_relay_api",
+        ["clio-relay", "worker", "api", "start", "--port", api_port],
+    ),
     identity(frpc_pid, "remote_connector", ["frpc", f"{{tmp}}/frpc.toml"]),
 ]
 metadata = {{

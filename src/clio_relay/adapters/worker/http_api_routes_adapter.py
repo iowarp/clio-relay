@@ -32,6 +32,8 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import ExecResult, FileAccess, JobHandle
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+
+_BODY: Any = Body(default_factory=dict)
 from clio_relay.jobs.spec import JobSpec
 
 ADAPTER_ROUTE_PREFIX = "/adapter"

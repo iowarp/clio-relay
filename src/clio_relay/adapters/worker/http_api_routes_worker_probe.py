@@ -6,7 +6,8 @@ per-operation ``ssh ... clio-relay worker endpoint worker-info|target-info``
 dial, even when a live owned-session channel already existed for a
 re-verification (``cli_remote_worker_attach.py``, ``cli_scheduler.py``'s
 scheduler-provider gate, ``cli_jarvis_mcp_validate.py``). Both facts are
-pure, side-effect-free reads of the serving process's own local state (``worker_runtime_info``: durable
+pure, side-effect-free reads of the serving process's own local state
+(``worker_runtime_info``: durable
 worker-heartbeat/installation records; the target document: hostname,
 machine-id marker, scheduler identity) -- the SAME computation
 ``cli_endpoint.py``'s ``endpoint worker-info``/``target-info`` commands
