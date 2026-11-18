@@ -458,6 +458,7 @@ def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPat
 @pytest.mark.asyncio
 async def test_transfer_stand_in_deletes_moves_and_makes_directories(tmp_path: Path) -> None:
     site = tmp_path / "site"
+    site.mkdir()
     service = LocalTransferService({SITE_COLLECTION: site})
     await service.mkdir(SITE_COLLECTION, "/d")
     await service.mkdir(SITE_COLLECTION, "/d")
