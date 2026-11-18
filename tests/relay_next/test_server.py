@@ -387,6 +387,28 @@ def test_client_without_elicitation_gets_a_typed_refusal_and_a_page(
     asyncio.run(scenario())
 
 
+def test_exec_without_a_limit_reports_quiet_stretches(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths)
+    notes: list[str] = []
+
+    async def progress(progress: float, total: float | None, message: str | None) -> None:
+        notes.append(message or "")
+
+    async def scenario() -> None:
+        server = create_server(relay_paths)
+        async with Client(server, mode="legacy") as client:
+            schema = next(t for t in await client.list_tools() if t.name == "exec").input_schema
+            assert "timeout_s" not in schema.get("required", [])
+            ran = await client.call_tool(
+                "exec", {"site": "fx", "command": ["quiet"]}, progress_handler=progress
+            )
+            assert _structured(ran)["exit_code"] == 0
+            assert not _structured(ran)["timed_out"]
+
+    asyncio.run(scenario())
+    assert any("still running" in note and "cancel" in note for note in notes), notes
+
+
 def test_exec_and_files(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
 

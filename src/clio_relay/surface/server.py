@@ -545,12 +545,30 @@ class RelayServer:
         return await self._deliver(ctx, record, wait_s)
 
     async def exec(
-        self, site: str, command: list[str], timeout_s: float, max_output_bytes: int
+        self,
+        ctx: Context,
+        site: str,
+        command: list[str],
+        timeout_s: float | None,
+        max_output_bytes: int,
     ) -> ToolResult:
-        """The ``exec`` verb."""
+        """The ``exec`` verb. With no ``timeout_s`` it runs until the command ends,
+        and tells the person when it goes quiet; cancelling the call stops it."""
+
+        async def quiet(idle_s: float, next_s: float) -> None:
+            note = (
+                f"no output for {idle_s:.0f} s; the command is still running; relay checks "
+                f"again in {next_s:.0f} s; cancel the call to stop it"
+            )
+            await ctx.report_progress(idle_s, message=note)
+
         try:
             result = await self.service.exec(
-                site, command, timeout_s=timeout_s, max_output_bytes=max_output_bytes
+                site,
+                command,
+                timeout_s=timeout_s,
+                max_output_bytes=max_output_bytes,
+                on_stall=quiet,
             )
         except Refusal as refusal:
             return refusal_result(refusal)
@@ -659,11 +677,17 @@ class RelayServer:
         async def exec_(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
             command: Annotated[list[str], Field(min_length=1, description="argv, no shell")],
-            timeout_s: Annotated[float, Field(gt=0, le=600)] = 60,
+            ctx: Context,
+            timeout_s: Annotated[
+                float | None,
+                Field(
+                    gt=0, description="Optional limit; by default the command runs until it ends"
+                ),
+            ] = None,
             max_output_bytes: Annotated[int, Field(ge=1, le=MAX_INLINE_BYTES)] = 65536,
         ) -> ToolResult:
             """Run one command on the site's login side and return bounded output."""
-            return await relay.exec(site, command, timeout_s, max_output_bytes)
+            return await relay.exec(ctx, site, command, timeout_s, max_output_bytes)
 
         @server.tool(
             name="files",
