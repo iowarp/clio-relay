@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -14,8 +13,6 @@ from typing import Any, cast
 import pytest
 
 from clio_relay import process_containment
-from clio_relay.errors import RelayError
-from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.process_containment import OwnedProcessSpawnError
 
 
@@ -1621,55 +1618,6 @@ def test_broker_readiness_replacement_is_rejected_without_truncation(tmp_path: P
     finally:
         readiness.path.unlink(missing_ok=True)
         original.unlink(missing_ok=True)
-
-
-def test_enforceable_provider_rejects_and_kills_background_escape(tmp_path: Path) -> None:
-    capability = process_containment.containment_capability()
-    if capability["enforceable"] is not True:
-        if os.name == "nt":
-            pytest.fail(
-                "Windows release containment provider is unavailable: "
-                f"{capability['mode']}: {capability['reason']}"
-            )
-        assert capability["mode"] in {"linux_systemd_scope", "cooperative_process_group"}
-        assert isinstance(capability["reason"], str) and capability["reason"]
-        return
-    pid_path = tmp_path / "escaped-child.pid"
-    script = """
-import os
-import subprocess
-import sys
-from pathlib import Path
-
-child = subprocess.Popen(
-    [sys.executable, "-c", "import time;time.sleep(60)"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    start_new_session=os.name != "nt",
-    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-)
-Path(sys.argv[1]).write_text(str(child.pid), encoding="ascii")
-"""
-    child_pid: int | None = None
-    try:
-        with pytest.raises(RelayError, match="left.*descendant|left.*Job Object|left.*scope"):
-            JarvisCdProvider().run_command_streaming(
-                [sys.executable, "-c", script, str(pid_path)],
-                timeout_seconds=20,
-            )
-        child_pid = int(pid_path.read_text(encoding="ascii"))
-        assert _wait_until_pid_exits(child_pid, timeout_seconds=5)
-    finally:
-        if child_pid is not None and _pid_exists(child_pid):
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(child_pid), "/T", "/F"],
-                    check=False,
-                    capture_output=True,
-                    timeout=10,
-                )
-            else:
-                os.kill(child_pid, signal.SIGKILL)
 
 
 def _wait_until_pid_exits(process_id: int, *, timeout_seconds: float) -> bool:

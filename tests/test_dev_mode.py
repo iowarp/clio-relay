@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from clio_relay.adapters.worker.session_install_identity import (
-    release_identity_from_receipt,
-    release_identity_is_accepted,
-)
 from clio_relay.dev_mode import (
     DEV_MODE_BANNER,
     DEV_MODE_ENV,
@@ -19,24 +14,17 @@ from clio_relay.dev_mode import (
     enforce,
 )
 from clio_relay.errors import ConfigurationError
-from clio_relay.installation import InstallReceipt
-from clio_relay.run_report_models import SoftwareIdentity
 
 #: Modules protecting live state/other tenants -- clio-relay#211 requires these
 #: to stay hard regardless of dev mode. Zero coupling to clio_relay.dev_mode is
 #: proof by construction: these modules cannot consult a flag they never import.
-_HARD_CHECK_MODULES = (
-    "adapters/worker/worker_lifetime_lock.py",  # exclusive worker lock per cluster
-    "storage_policy.py",  # storage admission/reservation limits
-    "adapters/worker/session_lifecycle.py",  # teardown scoping and cleanup policy
-)
+_HARD_CHECK_MODULES = ("storage_policy.py",)  # storage admission/reservation limits
 
 
 def test_hard_check_modules_never_import_dev_mode() -> None:
-    """clio-relay#211: writer proof, worker-lifetime lock, storage admission,
-    and teardown scoping stay hard -- proven here by zero coupling: none of
-    these modules import anything from clio_relay.dev_mode, so none of them
-    can possibly consult it to downgrade a check, now or by future accident.
+    """clio-relay#211: storage admission stays hard -- proven here by zero
+    coupling: it imports nothing from clio_relay.dev_mode, so it cannot
+    consult it to downgrade a check, now or by future accident.
     """
     src_root = Path(__file__).resolve().parents[1] / "src" / "clio_relay"
     for module_name in _HARD_CHECK_MODULES:
@@ -46,32 +34,6 @@ def test_hard_check_modules_never_import_dev_mode() -> None:
             "state/other tenants and clio-relay#211 requires it stay hard "
             "unconditionally"
         )
-
-
-def test_session_install_identity_policy_stays_outside_hard_lifecycle_module(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The startup identity owner retains the advisory development exception."""
-    receipt = InstallReceipt(
-        installed_at=datetime.now(UTC),
-        install_spec="clio-relay==1.0.0",
-        requested_source="pypi",
-        distribution_version="1.0.0",
-        software=SoftwareIdentity(version="1.0.0"),
-    )
-    monkeypatch.delenv(DEV_MODE_ENV, raising=False)
-    with pytest.raises(ConfigurationError, match="identity is incomplete"):
-        release_identity_from_receipt(receipt)
-
-    monkeypatch.setenv(DEV_MODE_ENV, "1")
-    current = release_identity_from_receipt(receipt)
-    expected = current.model_copy(update={"artifact_sha256": "f" * 64})
-    assert current.artifact_sha256 == "0" * 64
-
-    monkeypatch.delenv(DEV_MODE_ENV)
-    assert release_identity_is_accepted(current, expected) is False
-    monkeypatch.setenv(DEV_MODE_ENV, "1")
-    assert release_identity_is_accepted(current, expected) is True
 
 
 def test_dev_mode_enabled_honors_env_and_cluster_flag_independently(

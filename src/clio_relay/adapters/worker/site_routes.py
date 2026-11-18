@@ -19,7 +19,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Body, FastAPI
 from fastapi.params import Depends
@@ -70,7 +70,7 @@ def worker_adapter_root(ctx: SiteContext, namespace: str) -> Path:
 
 
 def _site_adapter(ctx: SiteContext, body: dict[str, Any]) -> LocalAdapter:
-    raw = body.get("config") or {}
+    raw: object = body.get("config") or {}
     if not isinstance(raw, dict):
         raise Refusal(RefusalReason.INVALID_CONFIG, "config must be an object")
     try:
@@ -216,7 +216,7 @@ def register_adapter_routes(
             if (
                 not isinstance(command, list)
                 or not command
-                or not all(isinstance(part, str) for part in command)
+                or not all(isinstance(part, str) for part in cast("list[object]", command))
             ):
                 raise Refusal(RefusalReason.INVALID_ARGUMENTS, "command must be a list of strings")
             if timeout_s is not None and (not isinstance(timeout_s, int | float) or timeout_s <= 0):

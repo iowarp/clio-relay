@@ -13,9 +13,7 @@ named it -- the same value can leak back out through free-form evidence
 text), :func:`redacted_invocation` scrubs a CLI argv echo, and
 :func:`redact_url` strips userinfo/query/fragment from a URL before it is
 recorded as evidence. :func:`redact_sensitive_values` is the whole-document
-entry point :func:`~clio_relay.run_report.write_validation_report`
-and the GACT/HTTP surfaces call before a report or response ever leaves the
-process.
+entry point callers use before a document leaves the process.
 """
 
 from __future__ import annotations
