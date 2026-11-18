@@ -1005,7 +1005,16 @@ On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) 
 - **The process-containment modules** (the six that need a user manager) passed 170 of 170 on the login node at af85a62.
 - **Targeted modules** (17 files: the edited tests plus the cli, scheduler, http api, service runtime and patch-seam modules) ran in Slurm (job 27799). 13 tests failed, all of them in develop's 142, so none are new: 12 in the two scheduler-cancel files ("relay-managed JARVIS installation receipt does not match this worker"), and `test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks`, which fails because the compute node has no user manager.
 - **pyright.** 5076 errors, under the 5583 baseline, measured with `uv run` at 8b34a44. The baseline is lowered to match. Run without the venv active, the count is 8987, because imports do not resolve then. That is a measuring mistake, not a regression.
-- **The full suite** runs once in Slurm at the request commit. Its result and the develop failures it retires go here when it ends.
+- **The full suite** ran once, in Slurm job 27809 at a4dc2cf, without the six user-manager modules (which run on the login node). The run counted 3913 dots (passing tests) and 8 skips, plus 126 failed node ids:
+  - **46 are in develop's list.** All are in kept or moved files: `test_endpoint` (18), the two scheduler-cancel files (12, "relay-managed JARVIS installation receipt does not match this worker"), `test_bootstrap_cluster_paths` (5), `test_jarvis_recovery_scheduling` (3), `test_endpoint_bounded_reads` (2), and one each in `test_endpoint_worker_lanes`, `test_frpc_proxy_scripts`, `test_owner_session_lease`, `test_scheduler_status`, `test_worker_concurrency` and `test_worker_lifetime_lock`. Their causes are the ones listed under "Develop's pre-existing failures".
+  - **78 failed because of where they ran.** W2's fixtures listen on the login node's loopback (`127.0.0.1:47100-47107`), which a compute node cannot reach (`relay_ssh`, `test_fixtures_smoke`, `asks/test_askpass_otp`). `relay_tapis` failed because W8's venv lacked the `tapis` extra.
+  - **2 more were not in develop's list.** `test_remote_cli` expected the remote command without the `worker` group; the test is fixed (24c6d6d). `test_remote_agent_runner` runs `python` from PATH, which Ares does not have outside the venv.
+  - **Rerun on the login node at 24c6d6d**, with the fixtures env, the `tapis` extra and the venv on PATH: `relay_ssh`, `relay_tapis`, `test_fixtures_smoke`, `asks/test_askpass_otp`, `test_remote_cli` and `test_remote_agent_runner` passed 178 of 178, none skipped. The six user-manager modules passed 170 of 170 there.
+- **Develop's failures retired.** W8's base list has 173 node ids. 127 no longer fail:
+  - 59 were in deleted files;
+  - 52 are in the user-manager modules, which pass on the login node;
+  - 16 in kept files now pass.
+  The 46 above remain. None of them is skipped or rerun to pass.
 
 ### Workflows
 
