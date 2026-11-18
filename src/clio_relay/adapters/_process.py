@@ -95,16 +95,33 @@ async def run_bounded(
             process.stdin.close()
 
     timed_out = False
-    work = asyncio.gather(
-        stdout.pump(process.stdout), stderr.pump(process.stderr), _feed(), process.wait()
-    )
+    work = [
+        asyncio.ensure_future(step)
+        for step in (
+            stdout.pump(process.stdout),
+            stderr.pump(process.stderr),
+            _feed(),
+            process.wait(),
+        )
+    ]
     try:
-        await asyncio.wait_for(work, timeout=timeout_s)
-    except TimeoutError:
-        timed_out = True
-        _kill(process)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(process.wait(), timeout=5)
+        _, pending = await asyncio.wait(work, timeout=timeout_s)
+        if pending:
+            timed_out = True
+            _kill(process)
+            # Read the pipes to their end so their transports close on this loop.
+            await asyncio.wait(work, timeout=5)
+        for step in work:
+            if step.done() and not step.cancelled() and (error := step.exception()) is not None:
+                raise error
+    except BaseException:
+        if process.returncode is None:
+            _kill(process)
+        raise
+    finally:
+        for step in work:
+            step.cancel()
+        await asyncio.gather(*work, return_exceptions=True)
     return ExecResult(
         argv=argv,
         exit_code=None if timed_out else process.returncode,
