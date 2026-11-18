@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -212,7 +213,7 @@ async def test_poll_waits_for_the_interval_unless_forced(
 
 
 @pytest.mark.asyncio
-async def test_an_expired_code_fails_and_a_new_one_is_issued(
+async def test_an_expired_code_is_reported_and_a_new_one_is_issued(
     stub: TapisStub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     use_memory_keyring(monkeypatch)
@@ -221,11 +222,32 @@ async def test_an_expired_code_fails_and_a_new_one_is_issued(
         settings=TaccSettings.resolve(None, base_url=stub.base_url), clock=lambda: now[0]
     )
     first = await found.begin()
+    assert first.poll_interval_s == 5.0
+    assert first.expires_at is not None
+    # Tapis sends the code's expiry as a date; the step carries about 600 s of it.
+    left = first.expires_at.timestamp() - now[0]
+    assert 590 <= left <= 600, left
     now[0] += 601
     assert found.pending() is None
-    assert (await found.poll(force=True)).state == "failed"
+    assert (await found.poll(force=True)).state == "expired"
     second = await found.begin()
     assert second.display["user_code"] != first.display["user_code"]
+
+
+@pytest.mark.asyncio
+async def test_tapis_saying_the_code_expired_is_reported_as_expired(
+    stub: TapisStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_memory_keyring(monkeypatch)
+    found = identity(stub)
+    await found.begin()
+    with stub.state.lock:
+        (grant,) = stub.state.devices.values()
+        grant.status = "Entered"
+        grant.expires_at = time.time() - 60
+    result = await found.poll(force=True)
+    assert result.state == "expired", result
+    assert found.pending() is None
 
 
 @pytest.mark.asyncio

@@ -83,6 +83,12 @@ async def _sign_in(adapter: TapisAdapter) -> int:
             _say("Signed in.")
             _print((await identity.status()).model_dump(mode="json"))
             return 0
+        if result.state == "expired":
+            step = await identity.begin()
+            _say("The code expired. Here is a new one.")
+            _say(identity.message(step))
+            _say(f"TACC page: {step.url}")
+            continue
         if result.state == "failed":
             _say(f"The sign-in did not finish: {result.message}")
             return 1
