@@ -250,9 +250,9 @@ async def test_slurm_partitions_become_logical_queues(
     site = "lq40-slurm"
     adapter = _adapter(stub, site, tmp_path)
     ssh = _ssh(fx, "fx-slurm")
-    partitions = ssh.partitions()
-    assert partitions, "the Slurm fixture has partitions"
     limits = ssh.partition_limits()
+    partitions = list(limits)
+    assert partitions, "the Slurm fixture has partitions"
     print(f"LQ40 slurm partition limits {limits}")
     try:
         registered = await register_host(adapter, ssh)

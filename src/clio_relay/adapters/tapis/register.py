@@ -115,10 +115,6 @@ class SshHost:
     def home(self) -> str:
         return self.run('printf %s "$HOME"', "reading the home directory").strip()
 
-    def partitions(self) -> list[str]:
-        """Slurm partitions, or an empty list when the host has no Slurm."""
-        return list(self.partition_limits())
-
     def partition_limits(self) -> dict[str, int | None]:
         """Slurm partitions and their time limits in minutes (None when unlimited)."""
         text = self.run(

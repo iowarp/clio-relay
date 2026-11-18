@@ -175,9 +175,6 @@ def _seconds(value: Any, default: float) -> float:
     return default
 
 
-ClientFactory = Callable[..., Any]
-
-
 class TaccIdentity:
     """The ``tacc`` identity provider."""
 
@@ -191,7 +188,6 @@ class TaccIdentity:
         settings: TaccSettings | None = None,
         store: TokenStore | None = None,
         clock: Callable[[], float] = time.time,
-        client_factory: ClientFactory | None = None,
     ) -> None:
         context_store: Any = getattr(context, "store", None)
         self.settings = settings or TaccSettings.resolve(getattr(context, "settings", None))
@@ -202,7 +198,6 @@ class TaccIdentity:
         else:
             self.store = default_store()
         self.clock = clock
-        self._client_factory = client_factory
         self.key = f"{PROVIDER}:{self.settings.base_url.rstrip('/')}"
 
     # the stored record
@@ -225,8 +220,7 @@ class TaccIdentity:
     def _client(self, access_token: str | None = None) -> Any:
         from clio_relay.adapters.tapis.client import make_client
 
-        factory = self._client_factory or make_client
-        return factory(self.settings.base_url, self.settings.tenant_id, access_token)
+        return make_client(self.settings.base_url, self.settings.tenant_id, access_token)
 
     def _client_id(self) -> str:
         if not self.settings.client_id:
