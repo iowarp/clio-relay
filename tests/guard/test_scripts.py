@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,8 @@ case "$1 $2" in
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
+  "ppl start") [ -z "${JARVIS_START_SLEEP:-}" ] || sleep "$JARVIS_START_SLEEP"
+    exit "${JARVIS_START_RC:-0}" ;;
 esac
 """
 
@@ -156,38 +159,95 @@ def test_the_runner_refuses_an_unknown_mode(tmp_path: Path) -> None:
     assert not (tmp_path / "jarvis.log").exists()
 
 
-def test_a_service_package_starts_then_stops_when_told(tmp_path: Path) -> None:
+def _service(tmp_path: Path, **extra: str) -> tuple[subprocess.Popen[str], Path]:
     job, digest = _job_dir(tmp_path)
     bin_dir = tmp_path / "bin"
     _program(bin_dir, "jarvis", FAKE_JARVIS)
-    log = tmp_path / "jarvis.log"
     runner = subprocess.Popen(
         ["/bin/bash", "-c", RUNNER, "clio-relay-package"]
         + [digest, "demo.hello", "jarvis", "", "service", "port=1"],
         cwd=job,
-        env=_env(tmp_path, bin_dir),
+        env=_env(tmp_path, bin_dir, **extra),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    return runner, tmp_path / "jarvis.log"
+
+
+def _wait_for(runner: subprocess.Popen[str], ready: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 60
+    while not ready():
+        assert runner.poll() is None, runner.communicate()
+        assert time.monotonic() < deadline, "the runner never got there"
+        time.sleep(0.1)
+
+
+def _commands(log: Path) -> list[str]:
+    return [line.split(" ", 1)[1] for line in log.read_text().splitlines()]
+
+
+def _finish(runner: subprocess.Popen[str]) -> str:
     try:
-        deadline = time.monotonic() + 60
-        while "ppl start" not in (log.read_text() if log.exists() else ""):
-            assert runner.poll() is None, runner.communicate()
-            assert time.monotonic() < deadline, "the runner never started the pipeline"
-            time.sleep(0.1)
-        time.sleep(0.5)
-        assert runner.poll() is None, "a service stays up after ppl start"
-        runner.send_signal(signal.SIGTERM)
         _, err = runner.communicate(timeout=60)
     finally:
         if runner.poll() is None:
             runner.kill()
             runner.communicate()
+    return err
+
+
+def _sleeping_child(runner: subprocess.Popen[str]) -> int | None:
+    found = subprocess.run(
+        ["pgrep", "-x", "-P", str(runner.pid), "sleep"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids = found.stdout.split()
+    return int(pids[0]) if pids else None
+
+
+def test_a_service_package_starts_then_stops_when_told(tmp_path: Path) -> None:
+    runner, log = _service(tmp_path)
+    _wait_for(runner, lambda: _sleeping_child(runner) is not None)
+    time.sleep(0.5)
+    assert runner.poll() is None, "a service stays up after ppl start"
+    runner.send_signal(signal.SIGTERM)
+    err = _finish(runner)
     assert runner.returncode == 0, err
-    commands = [line.split(" ", 1)[1] for line in log.read_text().splitlines()]
+    commands = _commands(log)
     assert commands[-3:] == ["ppl append demo.hello pkg port=1", "ppl start", "ppl stop"]
     assert "ppl run" not in commands
+
+
+def test_a_service_stops_when_its_wait_is_killed(tmp_path: Path) -> None:
+    # A Tapis FORK cancel is `pkill -9 -P <launcher>`: it kills only the sleep.
+    runner, log = _service(tmp_path)
+    _wait_for(runner, lambda: _sleeping_child(runner) is not None)
+    sleeper = _sleeping_child(runner)
+    assert sleeper is not None
+    os.kill(sleeper, signal.SIGKILL)
+    err = _finish(runner)
+    assert runner.returncode == 0, err
+    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
+
+
+def test_a_failed_start_stops_and_keeps_its_code(tmp_path: Path) -> None:
+    runner, log = _service(tmp_path, JARVIS_START_RC="3")
+    err = _finish(runner)
+    assert runner.returncode == 3, err
+    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
+
+
+def test_a_stop_before_the_first_wait_still_stops(tmp_path: Path) -> None:
+    runner, log = _service(tmp_path, JARVIS_START_SLEEP="2")
+    _wait_for(runner, lambda: log.exists() and "ppl start" in log.read_text())
+    runner.send_signal(signal.SIGTERM)
+    err = _finish(runner)
+    assert runner.returncode == 0, err
+    assert "unbound" not in err
+    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
 
 
 def test_the_runner_expands_a_home_jarvis_path(tmp_path: Path) -> None:

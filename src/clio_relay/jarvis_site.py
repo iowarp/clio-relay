@@ -312,9 +312,28 @@ fi
 "$jarvis" ppl append "$name" pkg "$@"
 [ -z "$workdir" ] || cd "$workdir"
 [ "$mode" = run ] && exec "$jarvis" ppl run
-trap 'trap - TERM INT HUP; kill $! 2>/dev/null || true; "$jarvis" ppl stop; exit 0' TERM INT HUP
-"$jarvis" ppl start
-while :; do sleep 60 & wait $!; done
+sleeper=
+stop() {
+  trap - TERM INT HUP
+  [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null || true
+  rc=0
+  "$jarvis" ppl stop || rc=$?
+  [ "$rc" -eq 0 ] || exit "$rc"
+  exit "$1"
+}
+trap 'stop 0' TERM INT HUP
+started=0
+"$jarvis" ppl start || started=$?
+if [ "$started" -ne 0 ]; then
+  trap - TERM INT HUP
+  "$jarvis" ppl stop || true
+  exit "$started"
+fi
+while :; do
+  sleep 60 &
+  sleeper=$!
+  wait "$sleeper" || stop 0
+done
 """
 
 
@@ -332,7 +351,10 @@ def package_job(spec: JobSpec, *, jarvis: str = "jarvis", service: bool = False)
 
     An application runs ``jarvis ppl run``, which is start then stop. A service
     (``service=True``) runs ``jarvis ppl start`` and stays up until the job is
-    told to stop (TERM, INT or HUP), then runs ``jarvis ppl stop`` and exits 0.
+    told to stop (TERM, INT or HUP), then runs ``jarvis ppl stop`` and exits 0
+    (or with the stop's code if the stop fails). A failed wait, such as a cancel
+    that kills only the sleeping child, stops it the same way. A failed start
+    runs ``jarvis ppl stop`` and exits with the start's code.
     """
     package = spec.package
     if package is None:
