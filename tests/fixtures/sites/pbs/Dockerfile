@@ -25,7 +25,7 @@ FROM ${BASE_IMAGE}
 LABEL clio-relay-rework="1" clio-relay-rework.owner="w2-fixtures"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        expat libedit2 postgresql postgresql-contrib postgresql-server-dev-all \
+        expat libedit2 postgresql postgresql-contrib \
         sendmail-bin tcl tk libical3 libcjson1 libhwloc15 libxt6 libxft2 \
     && rm -rf /var/lib/apt/lists/*
 # Only /opt/pbs: copying all of /out would replace Ubuntu's /lib symlink.
