@@ -212,13 +212,16 @@ def _remove_gc_candidate_posix(
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    descriptors: list[int] = []
+    # Each level is opened relative to its parent with O_NOFOLLOW, so only the
+    # current parent needs to stay open; holding every ancestor runs out of
+    # descriptors on trash deeper than the process's open-file limit.
+    descriptor: int | None = None
     try:
         descriptor = os.open(anchor, flags)
-        descriptors.append(descriptor)
         for part in parts[:-1]:
-            descriptor = os.open(part, flags, dir_fd=descriptor)
-            descriptors.append(descriptor)
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
         name = parts[-1]
         current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if not os.path.samestat(candidate_stat, current):
@@ -236,7 +239,7 @@ def _remove_gc_candidate_posix(
             logger=logger,
         ) from exc
     finally:
-        for descriptor in reversed(descriptors):
+        if descriptor is not None:
             os.close(descriptor)
 
 
