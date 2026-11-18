@@ -148,9 +148,10 @@ class RelayAskProvider:
 
     def operations(self) -> RecordStore[OperationRecord]:
         """Return the operation records."""
+        directory = self.context.state_dir / "operations"
         with self._lock:
             if self._operations is None:
-                self._operations = RecordStore(self.paths().operations_dir, OperationRecord)
+                self._operations = RecordStore(directory, OperationRecord)
             return self._operations
 
     # Where the page is
