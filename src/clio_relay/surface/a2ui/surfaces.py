@@ -218,7 +218,6 @@ def summary(views: list[SiteView], notice: str = "") -> str:
     return "\n".join(lines)
 
 
-
 # The sites surface
 
 

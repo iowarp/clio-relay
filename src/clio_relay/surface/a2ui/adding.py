@@ -76,7 +76,9 @@ def add_surface(
                 label="Site ID (optional)",
                 value=bound("/catalog/site_id"),
                 variant="shortText",
-                **error_checks(errors.get(CATALOG_ID_ERROR), valid_path(CATALOG_PATH, CATALOG_ID_ERROR)),
+                **error_checks(
+                    errors.get(CATALOG_ID_ERROR), valid_path(CATALOG_PATH, CATALOG_ID_ERROR)
+                ),
             )
         )
         message = errors.get(CATALOG_ERROR)

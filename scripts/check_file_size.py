@@ -1801,9 +1801,10 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 82.18
 #: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
 #: and tests/conftest.py, both under 500 lines.
 #: Raised to 77.43 (175/226) when the Compute tab's change tests moved to
-#: tests/relay_next/test_compute_tab_changes.py.
+#: tests/relay_next/test_compute_tab_changes.py, and to 77.53 (176/227) when its
+#: form tests moved to tests/relay_next/test_compute_tab_forms.py.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.43
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.53
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
