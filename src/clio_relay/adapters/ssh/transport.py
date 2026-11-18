@@ -328,9 +328,15 @@ class SshTransport:
                 f"{what} on {self.config.ssh_profile} did not answer; relay will try again",
                 site=self.site_id,
             )
-        if result.exit_code == 127 and not result.stdout and b"command not found" in result.stderr:
-            if result.argv and result.argv[0] in (self.config.ssh_command, self.config.scp_command):
-                raise Refusal(
+        local_programs = (self.config.ssh_command, self.config.scp_command)
+        if (
+            result.exit_code == 127
+            and not result.stdout
+            and b"command not found" in result.stderr
+            and result.argv
+            and result.argv[0] in local_programs
+        ):
+            raise Refusal(
                     RefusalReason.ADAPTER_UNAVAILABLE,
                     f"{result.argv[0]} is not installed on this machine",
                     site=self.site_id,

@@ -309,7 +309,9 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     else:
         body += (
             "c=$(cat child_pid 2>/dev/null)\n"
-            'if [ -n "$c" ]; then kill -TERM -- "-$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null; fi\n'
+            'if [ -n "$c" ]; then\n'
+            '  kill -TERM -- "-$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null\n'
+            "fi\n"
             'echo "@@rc 0"\n'
         )
     return body

@@ -40,7 +40,7 @@ def ssh_target(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _clean_remote(fx: dict[str, str]) -> Iterator[None]:
+def _clean_remote(fx: dict[str, str]) -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
     yield
     if os.environ.get("RELAY_SSH_KEEP"):
         return

@@ -648,7 +648,8 @@ def _launcher(executor: BatchSchedulerExecutor, job: Job) -> tuple[str, list[Pat
         )
     ensure()
     deployed = Path(launcher._deployed_script_path)  # pyright: ignore
-    files = [deployed.parent / path.name for path in launcher._files_to_deploy()]  # pyright: ignore
+    deploy = cast(list[Path], launcher._files_to_deploy())  # pyright: ignore
+    files = [deployed.parent / path.name for path in deploy]
     return deployed.parent.name, files
 
 
