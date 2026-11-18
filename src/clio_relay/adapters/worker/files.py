@@ -45,16 +45,29 @@ class WorkerFileAccess:
                 break
         return b"".join(chunks)
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
-        reported = await self._call(
-            "write",
-            {
-                "path": path,
-                "data": base64.b64encode(data).decode("ascii"),
-                "overwrite": overwrite,
-            },
-        )
-        return FileEntry.model_validate(reported)
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        body: dict[str, Any] = {
+            "path": path,
+            "data": base64.b64encode(data).decode("ascii"),
+            "overwrite": overwrite,
+        }
+        if offset == 0 and final:
+            return FileEntry.model_validate(await self._call("write", body))
+        # A separate op, so a site that predates chunks refuses it instead of
+        # writing one chunk as the whole file.
+        body.update(offset=offset, final=final)
+        return FileEntry.model_validate(await self._call("write-chunk", body))
+
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        await self._call("delete", {"path": path, "recursive": recursive})
 
     async def stage(self, data: bytes) -> str:
         digest = await self._call("stage", {"data": base64.b64encode(data).decode("ascii")})

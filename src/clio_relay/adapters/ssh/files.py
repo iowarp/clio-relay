@@ -13,6 +13,7 @@ from typing import Literal
 
 from clio_relay.adapters.ssh.scripts import FRESH, parse_sections, q, root_expression
 from clio_relay.adapters.ssh.transport import SshTransport
+from clio_relay.jobs.file_rules import check_relative, no_delete, whole_writes_only
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import SHA256_PATTERN
@@ -43,6 +44,7 @@ def _entry(line: str) -> FileEntry | None:
 def _start(path: str) -> str:
     if not path:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a path")
+    check_relative(path)
     # A job on another node may have just written the path; see scripts.FRESH.
     return (
         'cd "$HOME" 2>/dev/null\n' + f"p={q(path)}\n" + FRESH + 'fresh "$(dirname "$p")"\n' + _STAT
@@ -100,6 +102,7 @@ class SshFileAccess:
     async def read(self, path: str, *, offset: int = 0, limit: int | None = None) -> bytes:
         if offset < 0 or (limit is not None and limit < 0):
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "offset and limit are not negative")
+        check_relative(path)
         if limit == 0:
             await self.stat(path)
             return b""
@@ -125,7 +128,16 @@ class SshFileAccess:
             )
         return result.stdout
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        whole_writes_only(path, offset, final)
         script = (
             _start(path)
             + f"ow={1 if overwrite else 0}\n"
@@ -152,6 +164,9 @@ class SshFileAccess:
                 path=path,
             )
         return entry
+
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        raise no_delete(path)
 
     def _cas(self, digest: str) -> str:
         digest = digest.lower()

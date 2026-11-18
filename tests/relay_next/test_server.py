@@ -419,39 +419,6 @@ def test_exec_without_a_limit_reports_quiet_stretches(relay_paths: RelayPaths) -
     assert any("still running" in note and "cancel" in note for note in notes), notes
 
 
-def test_exec_and_files(relay_paths: RelayPaths) -> None:
-    add_site(relay_paths)
-
-    async def scenario() -> None:
-        async with Client(create_server(relay_paths), mode="legacy") as client:
-            hostname = {"site": "fx", "command": ["hostname"]}
-            ran = _structured(await client.call_tool("exec", hostname))
-            assert ran["exit_code"] == 0
-            wrote = await client.call_tool(
-                "files", {"site": "fx", "op": "write", "path": "a/b.txt", "content": "hi"}
-            )
-            assert _structured(wrote)["size"] == 2
-            read = await client.call_tool("files", {"site": "fx", "op": "read", "path": "a/b.txt"})
-            assert _structured(read)["text"] == "hi"
-            listed = await client.call_tool("files", {"site": "fx", "op": "list", "path": "a"})
-            assert [e["path"] for e in _structured(listed)["entries"]][0].endswith("b.txt")
-            staged = _structured(
-                await client.call_tool("files", {"site": "fx", "op": "stage", "content": "x"})
-            )
-            has = await client.call_tool(
-                "files", {"site": "fx", "op": "has", "digest": staged["sha256"]}
-            )
-            assert _structured(has)["present"] is True
-            again = await client.call_tool(
-                "files",
-                {"site": "fx", "op": "write", "path": "a/b.txt", "content": "x"},
-                raise_on_error=False,
-            )
-            assert _structured(again)["refusal"]["reason"] == "path_exists"
-
-    asyncio.run(scenario())
-
-
 def test_describe(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
 

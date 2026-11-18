@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from clio_relay.adapters.tapis.client import TapisCallError, acall
+from clio_relay.jobs.file_rules import not_empty_refusal, protected_refusal, whole_writes_only
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -122,7 +123,16 @@ class TapisFiles:
         body = data if isinstance(data, bytes) else str(data).encode("utf-8")
         return body if limit is None else body[:limit]
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        whole_writes_only(path, offset, final)
         target = self.resolve(path)
         if not overwrite and await self.exists(target):
             raise Refusal(RefusalReason.PATH_EXISTS, f"{path} already exists", path=path)
@@ -153,12 +163,19 @@ class TapisFiles:
         except TapisCallError as exc:
             raise exc.refusal(path=source) from None
 
-    async def delete(self, path: str) -> None:
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        if not path:
+            raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give the path to delete")
+        target = self.resolve(path)
+        if target in {"/", self.work_dir}:
+            raise protected_refusal(path)
+        entry = await self.stat(path)
+        if entry.kind == "dir" and not recursive and await self.list(path):
+            raise not_empty_refusal(path)
         try:
-            await self._call("delete", path=self.resolve(path).lstrip("/"))
+            await self._call("delete", path=target.lstrip("/"))
         except TapisCallError as exc:
-            if not exc.not_found:
-                raise exc.refusal(path=path) from None
+            raise self._missing(exc, path) from None
 
     async def stage(self, data: bytes) -> str:
         digest = hashlib.sha256(data).hexdigest()

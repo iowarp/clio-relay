@@ -21,14 +21,15 @@ answers the same five verbs:
 | `describe` | Lists the sites, describes one site, or observes one operation |
 | `run` | Submits a job, written as a PSI/J job spec, and follows it to the end |
 | `exec` | Runs one short command and returns its output |
-| `files` | Lists, reads, writes and stages files |
+| `files` | Lists, reads, writes, deletes and stages files, with resumable chunks for large ones |
 | `serve` | Starts a long-running service and forwards its ports to you |
 
 `run` and `serve` are MCP tasks when the client supports the tasks extension:
 the client gets progress on the task, can leave and come back, and answers
 questions (a one-time code, a spend approval) through the task. A client
 without tasks gets an operation id instead, which `describe(job=...)` follows.
-See [MCP tasks](docs/mcp-tasks.md).
+See [MCP tasks](docs/mcp-tasks.md). `files` behaves the same on every site; see
+[files](docs/files.md).
 
 A site that is `guarded` runs only reviewed packages, and asks before it spends
 an allocation. See [guarded sites](docs/guarded-sites.md).
@@ -91,6 +92,7 @@ clio-relay connect <handle>
 ## Documentation
 
 - [MCP tasks](docs/mcp-tasks.md): how `run` and `serve` behave as tasks, and without them
+- [files](docs/files.md): paths, large files and resuming, the same on every site
 - [guarded sites](docs/guarded-sites.md): what a guarded site runs, and how packages are reviewed
 - [rendezvous host](docs/rendezvous-host.md): the meeting point where a service and your machine both dial out
 - [architecture](docs/architecture.md)

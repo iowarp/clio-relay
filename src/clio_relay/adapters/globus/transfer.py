@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+from clio_relay.jobs.file_rules import check_relative, no_delete, whole_writes_only
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -191,6 +192,7 @@ class GlobusFileAccess:
 
     def resolve(self, path: str) -> str:
         """Return the path on the site's collection."""
+        check_relative(path)
         if path.startswith("/"):
             return posixpath.normpath(path)
         return posixpath.normpath(posixpath.join(self.root, path or "."))
@@ -260,7 +262,16 @@ class GlobusFileAccess:
 
         return await asyncio.to_thread(_read)
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        whole_writes_only(path, offset, final)
         if not overwrite and await self._exists(path) is not None:
             raise Refusal(
                 RefusalReason.PATH_EXISTS, f"{path} exists; pass overwrite to replace it", path=path
@@ -278,6 +289,9 @@ class GlobusFileAccess:
         finally:
             await asyncio.to_thread(staged.unlink, missing_ok=True)
         return await self.stat(path)
+
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        raise no_delete(path)
 
     def _cas(self, digest: str) -> str:
         return posixpath.join(self.content_dir, digest)
