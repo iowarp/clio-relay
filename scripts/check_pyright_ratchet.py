@@ -169,7 +169,10 @@ from typing import Any, NamedTuple
 # (a static attribute access on a name that no longer exists on
 # ``clio_relay.adapters.worker.cli``) plus one adjacent count movement. Net -2, measured
 # 7569 -> 7567.
-BASELINE_TOTAL = 7498
+# W8 (relay rework): the old relay_* surface, its tests and the move into
+# adapters/worker took the count from 7498 to 5583, measured on the merged
+# branch at 39f3764.
+BASELINE_TOTAL = 5583
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
