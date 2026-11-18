@@ -24,8 +24,10 @@ from clio_relay.surface.a2ui import (
 from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
-from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
-from clio_relay.surface.a2ui.tab import WATCH_INTERVAL_S
+from clio_relay.surface.a2ui.tab import (
+    WATCH_INTERVAL_S,
+    _sentence,  # pyright: ignore[reportPrivateUsage]
+)
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -448,6 +450,9 @@ def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) 
                 assert await heard.get() == TAB_URI
             await host.open()
             assert "s-cli" in host.visible("relay-sites")
+            # Rereading the tab, as a host does on the notification, is not a second change.
+            await asyncio.sleep(WATCH_INTERVAL_S * 2.5)
+            assert heard.empty()
 
     asyncio.run(scenario())
 
