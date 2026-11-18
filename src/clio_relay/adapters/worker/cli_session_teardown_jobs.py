@@ -23,12 +23,12 @@ import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
 import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
 import clio_relay.adapters.worker.core_queue as core_queue
-import clio_relay.validation_report as validation_report_module
+import clio_relay.run_report as run_report_module
 from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import CleanupEvidence, ValidationResource
+from clio_relay.run_report_models import CleanupEvidence, ValidationResource
 
 
 def _list_owned_jobs(
@@ -184,7 +184,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
     partial.resources.extend([admission_resource, api_resource])
     partial.cleanup.remaining_resources.extend([admission_resource, api_resource])
     state.canonical_report = partial
-    validation_report_module.write_validation_report(partial, canonical_report_path)
+    run_report_module.write_validation_report(partial, canonical_report_path)
     cleanup_intent = cli_owned_relay_jobs._quiesce_owner_session_intake(
         queue=queue,
         definition=definition,
@@ -208,7 +208,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
             "verified_after_operation": True,
         }
     )
-    validation_report_module.write_validation_report(partial, canonical_report_path)
+    run_report_module.write_validation_report(partial, canonical_report_path)
 
     def list_owned_jobs(
         *, include_terminal: bool = False
@@ -264,7 +264,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
             )
             partial.resources.append(resource)
             partial.cleanup.remaining_resources.append(resource)
-        validation_report_module.write_validation_report(partial, canonical_report_path)
+        run_report_module.write_validation_report(partial, canonical_report_path)
         raise RelayError(
             "owner-session cleanup found unversioned legacy jobs whose generation cannot be "
             "proven; no relay or scheduler cancellation was attempted: "
@@ -300,7 +300,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
                     "residual": True,
                 }
             )
-        validation_report_module.write_validation_report(partial, canonical_report_path)
+        run_report_module.write_validation_report(partial, canonical_report_path)
     gateway_scheduler_job_ids = (
         cli_owned_scheduler_cancel._owned_gateway_scheduler_job_ids(
             queue=queue,
@@ -341,7 +341,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
             }
         )
     if gateway_scheduler_job_ids:
-        validation_report_module.write_validation_report(partial, canonical_report_path)
+        run_report_module.write_validation_report(partial, canonical_report_path)
     scheduler_sentinel_pre_phases = cli_owned_scheduler_cancel._preflight_scheduler_sentinels(
         definition,
         scheduler_sentinel_ids,
@@ -385,7 +385,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
                             "detail": str(exc),
                         }
                     )
-            validation_report_module.write_validation_report(partial, canonical_report_path)
+            run_report_module.write_validation_report(partial, canonical_report_path)
             raise
         canceled_ids = set(canceled)
         for index, resource in enumerate(partial.resources):
@@ -408,7 +408,7 @@ def _run_teardown_jobs_phase(state: _TeardownState) -> None:
                         "residual": False,
                     }
                 )
-        validation_report_module.write_validation_report(partial, canonical_report_path)
+        run_report_module.write_validation_report(partial, canonical_report_path)
     gateway_reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(
         cluster=cluster,
         definition=definition,

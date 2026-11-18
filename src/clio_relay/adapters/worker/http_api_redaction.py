@@ -12,7 +12,7 @@ from typing import TypeVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay.validation_report import redact_sensitive_values
+from clio_relay.redaction import redact_sensitive_values
 
 ModelRecord = TypeVar("ModelRecord", bound=BaseModel)
 

@@ -25,7 +25,7 @@ import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_sessio
 import clio_relay.adapters.worker.cli_session_teardown_report as cli_session_teardown_report
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-import clio_relay.validation_report as validation_report_module
+import clio_relay.run_report as run_report_module
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
 from clio_relay.adapters.worker.owned_session_record import clear_owned_session_record
 from clio_relay.adapters.worker.session_lifecycle import (
@@ -40,7 +40,7 @@ from clio_relay.owner_session_admission import (
 from clio_relay.owner_session_admission import (
     desktop_owner_session_admission_id as _desktop_owner_session_admission_id,
 )
-from clio_relay.validation_report import ValidationResource
+from clio_relay.run_report_models import ValidationResource
 
 
 def _resolve_teardown_recovery(state: _TeardownState) -> bool:
@@ -97,7 +97,7 @@ def _resolve_teardown_recovery(state: _TeardownState) -> bool:
             recovery_resource.metadata["initial_status_error"] = initial_status_error
         seed_report.resources.append(recovery_resource)
         state.canonical_report = seed_report
-        validation_report_module.write_validation_report(seed_report, canonical_report_path)
+        run_report_module.write_validation_report(seed_report, canonical_report_path)
         session_generation_id = (
             cli_owned_session_recovery._verified_recovered_owner_session_generation(
                 recovery_status,

@@ -33,11 +33,9 @@ from clio_relay.cluster_config import (
     open_private_configuration_windows_descriptor,
     release_private_configuration_windows_parent_guard,
 )
+from clio_relay.durable_validation_write import durably_ensure_validation_directory
 from clio_relay.errors import RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.validation_report import (
-    durably_ensure_validation_directory,
-)
 
 MAX_LOCAL_CLEANUP_REPORT_CHUNK_BYTES = 8 * 1024 * 1024
 

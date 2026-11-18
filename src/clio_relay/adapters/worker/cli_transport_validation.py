@@ -11,17 +11,16 @@ from pathlib import Path
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.frp_check as frp_check
 from clio_relay.errors import RelayError
+from clio_relay.file_digest import sha256_file
 from clio_relay.relay_host import FrpcConfig
-from clio_relay.validation_report import (
+from clio_relay.run_report import default_report_path
+from clio_relay.run_report_models import (
     CleanupEvidence,
     EvidenceReference,
-    ValidationRecorder,
     ValidationResource,
     ValidationStatus,
-    default_report_path,
-    new_live_validation_report,
-    sha256_file,
 )
+from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
 
 
 def _run_transport_validation(  # pyright: ignore[reportUnusedFunction]

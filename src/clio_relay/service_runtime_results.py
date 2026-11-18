@@ -3,8 +3,8 @@
 Extracted from ``service_runtime.py`` (#231 rework slice): the three
 outcome dataclasses ``ServiceRuntimeStartResult``, ``ServiceRuntimePendingResult``,
 and ``ServiceRuntimeStopResult``, each carrying its own
-``to_live_validation_report`` conversion into the shared release-evidence
-shape (``clio_relay.validation_report``, imported at function scope in every
+``to_live_validation_report`` conversion into the shared run-report
+shape (``clio_relay.run_report_models``, imported at function scope in every
 method here to avoid a load-order cycle -- that module imports back from
 this package's models, not from ``service_runtime.py`` itself, but the
 deferral is kept consistent with the sibling methods that do need it), plus
@@ -32,7 +32,7 @@ from clio_relay.public_records import public_gateway_payload
 from clio_relay.session_wire_models import CleanupResource
 
 if TYPE_CHECKING:
-    from clio_relay.validation_report import (
+    from clio_relay.run_report_models import (
         CleanupEvidence,
         LiveValidationReport,
         ValidationResource,
@@ -71,13 +71,13 @@ class ServiceRuntimeStartResult:
         artifact_sha256: str | None = None,
     ) -> LiveValidationReport:
         """Convert a proven-ready runtime to canonical release evidence."""
-        from clio_relay.validation_report import (
+        from clio_relay.run_report_models import (
             EvidenceReference,
             ValidationCheck,
             ValidationResource,
             ValidationStatus,
-            new_live_validation_report,
         )
+        from clio_relay.run_report_recorder import new_live_validation_report
 
         report = new_live_validation_report(
             scenario="gateway-runtime",
@@ -234,13 +234,13 @@ class ServiceRuntimePendingResult:
         artifact_sha256: str | None = None,
     ) -> LiveValidationReport:
         """Record an honest nonterminal observation that cannot satisfy a release gate."""
-        from clio_relay.validation_report import (
+        from clio_relay.run_report_models import (
             EvidenceReference,
             ValidationCheck,
             ValidationResource,
             ValidationStatus,
-            new_live_validation_report,
         )
+        from clio_relay.run_report_recorder import new_live_validation_report
 
         report = new_live_validation_report(
             scenario="gateway-runtime",
@@ -406,7 +406,7 @@ class ServiceRuntimeStopResult:
 
     def to_cleanup_evidence(self) -> CleanupEvidence:
         """Convert this stop result to shared cleanup evidence."""
-        from clio_relay.validation_report import CleanupEvidence
+        from clio_relay.run_report_models import CleanupEvidence
 
         operation_intent_name = "detach_intent" if self.mode == "detach" else "teardown_intent"
         operation_intent = _primitives._object(self.session.gateway.get(operation_intent_name, {}))
@@ -435,13 +435,13 @@ class ServiceRuntimeStopResult:
         artifact_sha256: str | None = None,
     ) -> LiveValidationReport:
         """Convert runtime teardown to canonical release evidence."""
-        from clio_relay.validation_report import (
+        from clio_relay.run_report_models import (
             EvidenceReference,
             ValidationCheck,
             ValidationResource,
             ValidationStatus,
-            new_live_validation_report,
         )
+        from clio_relay.run_report_recorder import new_live_validation_report
 
         report = new_live_validation_report(
             scenario="gateway-runtime",

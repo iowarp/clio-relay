@@ -1,6 +1,6 @@
 """Snapshot-verified reads of one regular, non-symlink file (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Install-source
 detection (the uv-tool receipt and the process-ancestor walk that identifies
 the launching ``uv`` executable) needs to hash or read small trusted files

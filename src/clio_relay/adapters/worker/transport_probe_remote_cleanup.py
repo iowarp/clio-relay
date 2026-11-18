@@ -32,7 +32,7 @@ from clio_relay.adapters.worker.transport_probe_remote_cleanup_models import (
 )
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import TransportCleanupResourceEvidence
+from clio_relay.run_report_models import TransportCleanupResourceEvidence
 
 REMOTE_PROBE_CLEANUP_TIMEOUT_SECONDS = 120.0
 

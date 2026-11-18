@@ -129,7 +129,7 @@ from clio_relay.adapters.worker.bootstrap_reconcile import (
     execution_environment_identity,
     write_jarvis_wrapper,
 )
-from clio_relay.validation_report import sha256_file
+from clio_relay.file_digest import sha256_file
 
 generation = Path(sys.argv[1])
 execution_root = Path(os.environ["JARVIS_VENV"])

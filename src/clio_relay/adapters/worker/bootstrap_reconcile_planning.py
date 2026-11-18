@@ -39,8 +39,8 @@ from clio_relay.adapters.worker.bootstrap_reconcile_replacement_provider import 
     _verify_bootstrap_replacement_provider,
 )
 from clio_relay.errors import ConfigurationError
+from clio_relay.file_digest import sha256_file
 from clio_relay.installation import installation_info
-from clio_relay.validation_report import sha256_file
 
 
 def plan_bootstrap_reconcile(

@@ -29,6 +29,7 @@ from pytest import MonkeyPatch
 
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.session_wire_models as session_wire_models
+from clio_relay.run_report_models import SoftwareIdentity, ValidationResource
 from clio_relay.session_wire_models import (
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,
     MAX_SESSION_START_ERROR_CHARS,
@@ -50,7 +51,6 @@ from clio_relay.session_wire_models import (
     RemoteSessionStateEvidence,
     SessionApiReleaseIdentity,
 )
-from clio_relay.validation_report import SoftwareIdentity, ValidationResource
 
 # -- Extraction seam ---------------------------------------------------------
 

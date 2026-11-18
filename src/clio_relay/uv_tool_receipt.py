@@ -1,6 +1,6 @@
 """Bind an install-once ``uv tool`` invocation to its receipt and RECORD (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). ``launcher="uv-tool"``
 is the strongest install-source claim a validation report can make -- it
 means the running process is provably the exact console-script entry point
@@ -42,8 +42,8 @@ from clio_relay.regular_file_identity import (
     read_open_regular_file,
     regular_file_identity,
 )
+from clio_relay.run_report_models import InstallSourceKind
 from clio_relay.validation_limits import MAX_PYVENV_CONFIG_BYTES, MAX_UV_TOOL_RECEIPT_BYTES
-from clio_relay.validation_schema import InstallSourceKind
 
 
 def detect_persistent_uv_tool_receipt(

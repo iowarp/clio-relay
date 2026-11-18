@@ -32,10 +32,10 @@ from clio_relay.config import (
     MAX_INPUT_TOTAL_MAX_BYTES,
 )
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.run_report_models import SoftwareIdentity
 
 if TYPE_CHECKING:
-    from clio_relay.validation_report import ValidationResource
+    from clio_relay.run_report_models import ValidationResource
 
 # Bound the two Field() constraints below. Both are wire-contract constants
 # (a max_length/le on a model field), not general session_lifecycle.py
@@ -267,7 +267,7 @@ class CleanupResource(BaseModel):
 
     def to_validation_resource(self, *, cluster: str | None) -> ValidationResource:
         """Convert this cleanup result to canonical live-validation resource evidence."""
-        from clio_relay.validation_report import ValidationResource
+        from clio_relay.run_report_models import ValidationResource
 
         validation_kind = {
             "remote_relay_api": "relay_session",

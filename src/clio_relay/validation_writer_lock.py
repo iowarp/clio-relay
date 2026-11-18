@@ -1,6 +1,6 @@
 """Serialize validation-report replacement under one parent-wide lock (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Two concurrent
 processes durably writing a report into the same directory must not race:
 one open, owner-private lock file per parent

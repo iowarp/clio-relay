@@ -43,7 +43,7 @@ from clio_relay.adapters.worker.session_lifecycle import (
 )
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import LiveValidationReport, ValidationResource
+from clio_relay.run_report_models import LiveValidationReport, ValidationResource
 
 
 @dataclass

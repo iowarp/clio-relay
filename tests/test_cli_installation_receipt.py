@@ -9,7 +9,7 @@ group moves with the logic it exercises.
 
 ``installation-info`` has no dedicated ``CliRunner``-level test anywhere in
 the suite (only a slow ``uv tool install`` + subprocess smoke test in
-``tests/test_validation_report.py``, itself untouched -- it exercises the
+``tests/test_run_report.py``, itself untouched -- it exercises the
 real installed executable, not this module's internal wiring, so it needed
 no changes). ``bootstrap-inspect`` already has extensive dedicated coverage
 in ``tests/test_bootstrap_fast_path.py`` -- one of the four non-test_cli
@@ -37,7 +37,7 @@ from typer.testing import CliRunner
 import clio_relay.installation as installation_module
 from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.installation import InstallReceipt
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.run_report_models import SoftwareIdentity
 
 
 def test_installation_write_receipt_forwards_components_from(

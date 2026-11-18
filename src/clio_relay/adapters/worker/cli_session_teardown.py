@@ -57,11 +57,9 @@ import clio_relay.adapters.worker.cli_session_teardown_action as cli_session_tea
 import clio_relay.adapters.worker.cli_session_teardown_state as cli_session_teardown_state
 import clio_relay.adapters.worker.cli_support as cli_support
 import clio_relay.remote_cli as remote_cli
-import clio_relay.validation_report as validation_report_module
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    default_report_path,
-)
+import clio_relay.run_report as run_report_module
+from clio_relay.run_report import default_report_path
+from clio_relay.run_report_models import LiveValidationReport
 
 # Re-exported verbatim under its original name: tests/test_cli.py
 # monkeypatches it as an attribute of *this* module, and
@@ -174,7 +172,7 @@ def session_teardown(
             artifact=validation_artifact,
         )
         canonical_report: list[LiveValidationReport | None] = [seed_report]
-        validation_report_module.write_validation_report(seed_report, canonical_report_path)
+        run_report_module.write_validation_report(seed_report, canonical_report_path)
     except BaseException:
         cli_cleanup_evidence._release_cleanup_evidence_lock(evidence_lock)
         raise

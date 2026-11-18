@@ -1,6 +1,6 @@
 """Durably write a validation report through a pinned directory ancestry (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). This is the top-level
 orchestration for a durable validation write:
 :func:`durably_ensure_validation_directory` walks from the requested path up

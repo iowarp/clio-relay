@@ -40,7 +40,7 @@ import clio_relay.adapters.worker.session_start_query as session_start_query
 import clio_relay.cluster_config as cluster_config
 import clio_relay.installation as installation_module
 import clio_relay.remote_cli as remote_cli
-import clio_relay.validation_report as validation_report
+import clio_relay.run_report as run_report_module
 from clio_relay import __version__
 from clio_relay.adapters.worker import (
     cli,
@@ -90,19 +90,18 @@ from clio_relay.models import (
     SchedulerPhase,
     SchedulerStatus,
 )
-from clio_relay.service_runtime import (
-    ServiceRuntimeSupervisor,
-)
-from clio_relay.session_wire_models import RemoteSessionStateEvidence
-from clio_relay.validation_report import (
+from clio_relay.run_report_models import (
     EvidenceReference,
     InstallSource,
     InstallSourceKind,
     LiveValidationReport,
     SoftwareIdentity,
-    ValidationRecorder,
-    new_live_validation_report,
 )
+from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
+from clio_relay.service_runtime import (
+    ServiceRuntimeSupervisor,
+)
+from clio_relay.session_wire_models import RemoteSessionStateEvidence
 
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
     cli_session_teardown._persist_verified_cleanup_report_before_closure  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -4229,7 +4228,7 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
         return None, None
 
     written_reports: list[LiveValidationReport] = []
-    write_report = validation_report.write_validation_report
+    write_report = run_report_module.write_validation_report
 
     def capture_report(report: LiveValidationReport, path: Path) -> None:
         written_reports.append(report.model_copy(deep=True))
@@ -4246,7 +4245,7 @@ def test_cli_dead_session_teardown_uses_recovery_without_canceling_jobs(
     monkeypatch.setattr(
         cli_remote_worker_attach, "_observe_worker_before_cleanup", observe_no_worker
     )
-    monkeypatch.setattr(validation_report, "write_validation_report", capture_report)
+    monkeypatch.setattr(run_report_module, "write_validation_report", capture_report)
 
     result = CliRunner().invoke(
         app,

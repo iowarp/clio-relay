@@ -63,7 +63,7 @@ from clio_relay.adapters.worker.clio_kit_constants import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
 )
-from clio_relay.validation_report import sha256_file
+from clio_relay.file_digest import sha256_file
 
 desired_payload = json.loads(os.environ["BOOTSTRAP_DESIRED_STATE"])
 desired_payload["agent_npm_package"] = os.environ["AGENT_NPM_PACKAGE"] or None
@@ -341,7 +341,7 @@ import json
 import os
 from pathlib import Path
 
-from clio_relay.validation_report import sha256_file
+from clio_relay.file_digest import sha256_file
 
 generation = Path(os.environ["BOOTSTRAP_GENERATION"])
 manifest = {{

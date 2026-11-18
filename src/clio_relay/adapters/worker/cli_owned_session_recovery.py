@@ -33,9 +33,7 @@ from clio_relay.errors import RelayError
 from clio_relay.models import (
     OwnerSessionClosure,
 )
-from clio_relay.validation_report import (
-    ValidationResource,
-)
+from clio_relay.run_report_models import ValidationResource
 
 OWNED_SESSION_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 90.0
 

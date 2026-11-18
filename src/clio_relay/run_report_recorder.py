@@ -1,26 +1,12 @@
-"""Accumulate and construct live validation reports (#231).
+"""Accumulate and construct run reports.
 
-Extracted from :mod:`clio_relay.validation_report`
-(``docs/design/relay-architecture-2026-08.md``, #231). This module owns the
-report-construction concern: :class:`ValidationRecorder` accumulates checks,
-resources, and structured transport-probe cleanup evidence into a
-:class:`~clio_relay.validation_schema.LiveValidationReport` as a live
-validation run proceeds, and :func:`new_live_validation_report` builds the
-seeded report a run starts from (package/install-source identity plus
-evidence-trust provenance).
-
-One call site still reaches back into :mod:`clio_relay.validation_report`
-for a concern not yet extracted to its own owner module (install-source
-detection). That import is function-scoped -- not module-scoped -- because
-:mod:`clio_relay.validation_report` imports :class:`ValidationRecorder` from
-here for its own re-export surface; a module-scope import in the other
-direction would be a load-order circular import (the proven idiom -- see the
-module docstring precedent in :mod:`clio_relay.session_wire_models`). The
-function-scoped import gets re-pointed at the real owner module as that
-concern is extracted in turn (acceptance-line fact classification and
-invocation redaction already moved to :mod:`clio_relay.acceptance_facts` and
-:mod:`clio_relay.redaction`, both imported at module scope here since
-neither module has a back-reference of its own).
+:class:`ValidationRecorder` accumulates checks, resources and structured
+transport-probe cleanup evidence into a
+:class:`~clio_relay.run_report_models.LiveValidationReport` as a run
+proceeds, and :func:`new_live_validation_report` builds the seeded report a
+run starts from (package and install-source identity plus evidence-trust
+provenance). Writes go through :mod:`clio_relay.run_report` as a module
+attribute, so a test that patches its writer sees every write.
 """
 
 from __future__ import annotations
@@ -38,13 +24,15 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+import clio_relay.run_report as run_report_module
 from clio_relay.acceptance_facts import acceptance_scope, line_proves_success
+from clio_relay.durable_validation_write import atomic_write_text
 from clio_relay.errors import ConfigurationError
 from clio_relay.filesystem_paths import logical_filesystem_text
 from clio_relay.identifiers import DurableRecordId
+from clio_relay.install_identity import detect_install_source, detect_software_identity
 from clio_relay.redaction import redacted_invocation
-from clio_relay.validation_limits import TRANSPORT_PROBE_EVIDENCE_KEY
-from clio_relay.validation_schema import (
+from clio_relay.run_report_models import (
     EvidenceOrigin,
     EvidenceReference,
     EvidenceTrust,
@@ -55,6 +43,7 @@ from clio_relay.validation_schema import (
     ValidationStatus,
     parse_transport_probe_evidence,
 )
+from clio_relay.validation_limits import TRANSPORT_PROBE_EVIDENCE_KEY
 
 
 class ValidationRecorder:
@@ -426,15 +415,11 @@ class ValidationRecorder:
 
     def write(self, json_path: Path, markdown_path: Path | None = None) -> None:
         """Atomically write stable JSON and optional Markdown evidence."""
-        from clio_relay.validation_report import (
-            _atomic_write_text,
-            render_validation_markdown,
-            write_validation_report,
-        )
-
-        write_validation_report(self.report, json_path)
+        run_report_module.write_validation_report(self.report, json_path)
         if markdown_path is not None:
-            _atomic_write_text(markdown_path, render_validation_markdown(self.report))
+            atomic_write_text(
+                markdown_path, run_report_module.render_validation_markdown(self.report)
+            )
 
     def _record_passed_fact(self, check_id: str, summary: str, line: str) -> None:
         now = datetime.now(UTC)
@@ -470,8 +455,6 @@ def new_live_validation_report(
     report_id: DurableRecordId | None = None,
 ) -> LiveValidationReport:
     """Create a report seeded with package, source, and invocation provenance."""
-    from clio_relay.validation_report import detect_install_source, detect_software_identity
-
     return LiveValidationReport(
         report_id=(report_id if report_id is not None else f"validation_{uuid4().hex}"),
         scenario=scenario,

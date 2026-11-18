@@ -1,7 +1,7 @@
 """Verify a remote worker's receipt-bound components from their runtime evidence.
 
 Extracted from ``installation.py`` (iowarp/clio-relay#231): this owns the
-release-gate proof that a worker's component provenance (clio-kit,
+proof that a worker's component provenance (clio-kit,
 jarvis-cd) names an immutable, hash-bound official release artifact, plus
 the layer that reads the remote worker's self-reported runtime identity
 (``_remote_component_runtime_identity``) back out of the installation-info

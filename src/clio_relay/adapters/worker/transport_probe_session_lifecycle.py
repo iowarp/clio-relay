@@ -25,8 +25,8 @@ from clio_relay.adapters.worker.transport_probe_evidence import (
 )
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
+from clio_relay.run_report_models import TransportCleanupOutcome, TransportCleanupResourceEvidence
 from clio_relay.session_wire_models import CleanupResource, OwnedSessionStartResult
-from clio_relay.validation_report import TransportCleanupOutcome, TransportCleanupResourceEvidence
 
 
 def _remote_session_start_not_ready_error(

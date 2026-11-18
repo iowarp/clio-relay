@@ -5,7 +5,7 @@ helpers used by most of ``cli.py``'s 16 Typer sub-apps, not any single
 command group: ``_run_or_exit`` (74 call sites), ``_require_cluster`` (56),
 ``_write_failed_acceptance_report`` (19), ``_resolve_env_secret`` (19),
 ``_acceptance_report_command`` (17 applications), and ``default_report_path``
-(18, already owned by ``validation_report.py`` -- not duplicated here). §5's
+(18, already owned by ``run_report.py`` -- not duplicated here). §5's
 target-owner-module map assigns them to a new ``cli_support.py`` rather than
 letting the first command-module extraction (R8(ii), the ``relay-host``
 group) invent its own copy or reach backward into ``cli.py`` for logic that
@@ -85,20 +85,16 @@ from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError, St
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, default_registry_path
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.file_digest import sha256_file
 from clio_relay.models import (
     ArtifactUse,
     RelayJob,
     artifact_use_payload,
     validate_artifact_use_collection,
 )
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    ValidationRecorder,
-    ValidationStatus,
-    load_validation_report,
-    new_live_validation_report,
-    sha256_file,
-)
+from clio_relay.run_report import load_validation_report
+from clio_relay.run_report_models import LiveValidationReport, ValidationStatus
+from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
 
 _ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = "__clio_relay_acceptance_report_command__"
 

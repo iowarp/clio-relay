@@ -29,7 +29,7 @@ import clio_relay.adapters.worker.cli_cleanup_evidence as cli_cleanup_evidence
 import clio_relay.adapters.worker.cli_cleanup_report as cli_cleanup_report
 import clio_relay.adapters.worker.cli_owned_report_artifact as cli_owned_report_artifact
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.validation_report as validation_report_module
+import clio_relay.run_report as run_report_module
 from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
@@ -37,17 +37,17 @@ from clio_relay.adapters.worker.session_lifecycle import (
     SessionLifecycleReport,
 )
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import (
+from clio_relay.file_digest import sha256_file
+from clio_relay.redaction import redact_sensitive_values
+from clio_relay.run_report import load_validation_report
+from clio_relay.run_report_models import (
     CleanupEvidence,
     EvidenceReference,
     LiveValidationReport,
-    ValidationRecorder,
     ValidationResource,
     ValidationStatus,
-    load_validation_report,
-    redact_sensitive_values,
-    sha256_file,
 )
+from clio_relay.run_report_recorder import ValidationRecorder
 
 MAX_CLEANUP_VALIDATION_REPORT_BYTES = 8 * 1024 * 1024
 
@@ -175,7 +175,7 @@ def _checkpoint_finalized_cleanup_artifact(
             metadata={"cleanup_operation_id": operation_id},
         )
     )
-    validation_report_module.write_validation_report(pending, state.canonical_report_path)
+    run_report_module.write_validation_report(pending, state.canonical_report_path)
     cli_cleanup_evidence._verify_cleanup_evidence_lock(
         state.active_evidence_lock,
         expected_parent=cli_cleanup_evidence._cleanup_evidence_state_parent(),

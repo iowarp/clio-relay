@@ -84,17 +84,14 @@ import typer
 import clio_relay.adapters.worker.cli_support as cli_support
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.remote_cli as remote_cli
+import clio_relay.run_report as run_report_module
 import clio_relay.session_api as session_api
-import clio_relay.validation_report as validation_report_module
 from clio_relay.config import RelaySettings
 from clio_relay.dev_mode import VerificationFindings, dev_mode_enabled
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    ValidationStatus,
-    default_report_path,
-    sha256_file,
-)
+from clio_relay.file_digest import sha256_file
+from clio_relay.run_report import default_report_path
+from clio_relay.run_report_models import LiveValidationReport, ValidationStatus
 
 # `cli` (`clio_relay.adapters.worker.cli`) is deliberately NOT imported at module level -- see
 # this module's own docstring and `cli_relay_host.py`'s identical discipline.
@@ -395,7 +392,7 @@ def session_detach(
         artifact=validation_artifact,
     )
     canonical_report: list[LiveValidationReport | None] = [seed_report]
-    validation_report_module.write_validation_report(seed_report, canonical_report_path)
+    run_report_module.write_validation_report(seed_report, canonical_report_path)
     try:
         definition = cli._require_cluster(cluster)
     except BaseException as exc:
