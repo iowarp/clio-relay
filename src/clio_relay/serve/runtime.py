@@ -264,7 +264,8 @@ class ServeRuntime:
                 if record is not None and record.state.final:
                     continue
                 try:
-                    await self._ensure_forward(plan, None)
+                    async with self._lock(plan.operation_id):
+                        await self._ensure_forward(plan, None)
                 except Refusal as refusal:
                     self.notes[plan.operation_id] = str(refusal)
 
@@ -611,7 +612,7 @@ class ServeRuntime:
         if raw:
             with contextlib.suppress(ValueError):
                 stopped = json.loads(raw)
-        outputs = [item for item in status.outputs if _is_artifact(item)]
+        outputs = [item for item in status.outputs if is_artifact(item)]
         seen = {item.path for item in outputs}
         listing = await self._read(plan, adapter, "artifacts.txt")
         if listing and plan.job_dir:
@@ -694,9 +695,9 @@ def connect_handle(plan: ServePlan) -> str:
 _SERVE_FILES = {"service.log", "launch.log", "frpc.log"}
 
 
-def _is_artifact(item: OutputRef) -> bool:
+def is_artifact(item: OutputRef) -> bool:
     """Return whether an adapter-listed output is the service's, not the wrapper's."""
     parts = item.name.replace("\\", "/").split("/")
-    if "serve" in parts[:-1]:
-        return parts[-1] in _SERVE_FILES
+    if len(parts) == 2 and parts[0] == "serve":
+        return parts[1] in _SERVE_FILES
     return True

@@ -145,6 +145,7 @@ class Forward:
         self.task: asyncio.Task[None] | None = None
         self.restarts = 0
         self.rebound = 0
+        self.held = False
         self._respawned = False
         self.closing = False
         self.ssh_env: dict[str, str] = {}
@@ -200,7 +201,9 @@ class Forward:
         """Start the forward unless one already holds the ports."""
         if self.task is not None:
             return
-        if not self.bound():
+        if self.bound():
+            self.held = True
+        else:
             await self._spawn()
             self.on_restart(self.rebound, self.process.pid if self.process else None)
         self.task = asyncio.create_task(self._watch())
@@ -215,7 +218,11 @@ class Forward:
             if alive or (self.process is None and self.bound()):
                 if alive and self.bound():
                     backoff = 1.0
-                    if self._respawned:
+                    if not self.held:
+                        # The first hold is a bind, not a rebind, even after failed tries.
+                        self.held = True
+                        self._respawned = False
+                    elif self._respawned:
                         # Count a rebind only once the new forward holds the ports.
                         self._respawned = False
                         self.rebound += 1
