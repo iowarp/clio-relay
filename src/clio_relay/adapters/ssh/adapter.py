@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import pricing, scripts
+from clio_relay.adapters.ssh import pricing, scripts, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -456,7 +456,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
             result = await self.transport.ssh(
-                scripts.record_script(job_dir, line, final=True),
+                scripts.record_script(
+                    job_dir,
+                    line,
+                    final=True,
+                    root=str(handle.data["root"]),
+                    inputs=store.input_entries(sections.get("inputs", [])),
+                ),
                 data=payload,
                 timeout_s=self.config.command_timeout_s,
                 what="recording the job's end",

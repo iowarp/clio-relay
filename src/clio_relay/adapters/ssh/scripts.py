@@ -25,6 +25,8 @@ import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
+from clio_relay.adapters.ssh import store
+
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
     ("slurm", "sbatch"),
     ("pbs", "qsub"),
@@ -346,6 +348,7 @@ def status_script(
     body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
     body += 'echo "@@last"; tail -n 1 states 2>/dev/null\n'
+    body += 'echo "@@inputs"; cat inputs.json 2>/dev/null; echo\n'
     if mode == "scheduler" and status_command is not None and native_id is not None:
         ec = q(native_id + ".ec")
         body += (
@@ -373,12 +376,25 @@ def status_script(
     return body
 
 
-def record_script(job_dir: str, line: str, *, final: bool) -> str:
-    """Append a state change. With ``final``, standard input becomes the ``final`` file."""
+def record_script(
+    job_dir: str,
+    line: str,
+    *,
+    final: bool,
+    root: str | None = None,
+    inputs: Sequence[tuple[str, str]] = (),
+) -> str:
+    """Append a state change. With ``final``, standard input becomes the ``final`` file.
+
+    A final record also drops the inputs the job deleted from the content store
+    (see :mod:`clio_relay.adapters.ssh.store`).
+    """
     body = f"J={q(job_dir)}\n" + 'cd "$J" || exit 3\n'
     if final:
         body += "cat > final.tmp && mv -f final.tmp final\n"
     body += f"printf '%s %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" {q(line)} >> states\n"
+    if final and root is not None and inputs:
+        body += FRESH + store.drop_script(root, inputs)
     if final:
         body += _LISTING
     return body
