@@ -43,6 +43,8 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     name: ClassVar[str] = "tapis"
     Config: ClassVar[type[BaseModel]] = TapisConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
+    # The launcher's package mode runs a reviewed package through jarvis (tapisjob_app.sh).
+    runs_packages: ClassVar[bool] = True
 
     def __init__(
         self,
