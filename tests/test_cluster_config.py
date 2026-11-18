@@ -41,7 +41,6 @@ from clio_relay.cluster_config import (
     verify_private_configuration_path,
 )
 from clio_relay.errors import ConfigurationError
-from clio_relay.remote_mcp import default_remote_mcp_cache_path
 
 
 def test_cluster_definition_dev_mode_defaults_off_and_is_strict_bool() -> None:
@@ -77,33 +76,27 @@ def test_cluster_definition_requires_profile_for_graph_build_fallback() -> None:
         )
 
 
-def test_registry_and_schema_cache_defaults_are_absolute_and_stable(
+def test_registry_default_is_absolute_and_stable(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("CLIO_RELAY_CLUSTER_REGISTRY", raising=False)
-    monkeypatch.delenv("CLIO_RELAY_REMOTE_MCP_CACHE", raising=False)
     monkeypatch.chdir(tmp_path)
 
     registry_path = default_registry_path()
-    cache_path = default_remote_mcp_cache_path(registry_path=registry_path)
 
     assert registry_path == (tmp_path / ".clio-relay" / "clusters.json").resolve()
-    assert cache_path == (tmp_path / ".clio-relay" / "remote-mcp-cache.json").resolve()
     assert registry_path.is_absolute()
-    assert cache_path.is_absolute()
 
 
-def test_registry_and_schema_cache_environment_paths_are_resolved(
+def test_registry_environment_path_is_resolved(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", "state/clusters.json")
-    monkeypatch.setenv("CLIO_RELAY_REMOTE_MCP_CACHE", "state/cache.json")
 
     assert default_registry_path() == (tmp_path / "state" / "clusters.json").resolve()
-    assert default_remote_mcp_cache_path() == (tmp_path / "state" / "cache.json").resolve()
 
 
 def test_cluster_registry_save_uses_atomic_replace_and_fsync(

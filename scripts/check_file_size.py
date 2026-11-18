@@ -269,7 +269,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.
-    "src/clio_relay/browser_gateway.py": 853,
+    # browser_gateway.py: deleted with the old surface (W8), entry removed.
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest

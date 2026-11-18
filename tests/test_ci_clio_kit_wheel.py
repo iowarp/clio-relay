@@ -16,13 +16,7 @@ from clio_relay.jarvis_mcp import (
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
     CLIO_KIT_JARVIS_MCP_WHEEL_URL,
 )
-from clio_relay.remote_mcp import (
-    CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION,
-    CLIO_KIT_SPACK_USER_WHEEL_VERSION,
-)
 from tests import clio_kit_test_artifacts
-
-ROOT = Path(__file__).resolve().parents[1]
 
 # The bootstrap default install pin (clio-relay#190): the exact clio-kit
 # release a *fresh* deployment installs for its built-in JARVIS MCP server.
@@ -63,14 +57,6 @@ JARVIS_MCP_WHEEL_URL = (
 # 2.10.6 (v1.7.0 upstream wave) is a single-wheel-download version move
 # only -- byte-identical contract artifacts, confirmed by clio-kit's own
 # generator --check -- so no EXPECTED_CONTRACTS repair is required.
-CONTRACT_CERTIFICATION_WHEEL_FILENAME = "clio_kit-2.10.6-py3-none-any.whl"
-CONTRACT_CERTIFICATION_WHEEL_SHA256 = (
-    "bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d"
-)
-CONTRACT_CERTIFICATION_WHEEL_URL = (
-    "https://github.com/iowarp/clio-kit/releases/download/v2.10.6/"
-    f"{CONTRACT_CERTIFICATION_WHEEL_FILENAME}"
-)
 
 
 def _configure_fixture_wheel_pin(
@@ -142,26 +128,3 @@ def test_bootstrap_jarvis_mcp_install_pin_is_self_consistent() -> None:
     assert CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME == JARVIS_MCP_WHEEL_FILENAME
     assert CLIO_KIT_JARVIS_MCP_WHEEL_SHA256 == JARVIS_MCP_WHEEL_SHA256
     assert CLIO_KIT_JARVIS_MCP_WHEEL_URL == JARVIS_MCP_WHEEL_URL
-
-
-def test_contract_certification_pins_match_the_certified_release() -> None:
-    """spack/scientific-catalog are certified against the same released wheel.
-
-    clio-kit 2.7.2 shifted every locked MCP contract's wire/contract bytes
-    (jarvis, spack, scientific-catalog, slurm) by adding a "title" key to
-    every user-profile tool. #190/#191 moved only the bootstrap install pin
-    to 2.7.2 and deliberately left this certification pin on 2.6.6 as
-    tracked follow-up (clio-relay#199); that follow-up re-certified every
-    locked surface against 2.7.2, so the certification pin below now equals
-    the bootstrap install pin above instead of trailing it. clio-relay#288
-    (kit 2.10.5 recert) moved this pin again -- the spack v2.1 / scientific-
-    catalog v1.1 contract bytes/digests are byte-identical in 2.10.5 (live-
-    probe verified), so this is the single-wheel-download version tracking
-    the bootstrap pin forward, not a contract re-certification. 2.10.5 ->
-    2.10.6 (v1.7.0 upstream wave) repeats the same pattern: clio-kit's own
-    generator --check reported the 2.10.6 contract artifacts byte-identical
-    to 2.10.5, so this pin tracks the bootstrap pin forward again with no
-    contract re-certification.
-    """
-    assert CLIO_KIT_SPACK_USER_WHEEL_VERSION == "2.10.6"
-    assert CLIO_KIT_SCIENTIFIC_CATALOG_USER_WHEEL_VERSION == "2.10.6"

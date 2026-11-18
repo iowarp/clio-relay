@@ -17,7 +17,7 @@ from typing import Annotated
 
 import typer
 
-import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 import clio_relay.remote_cli as remote_cli
 
 # `cli` (`clio_relay.adapters.worker.cli`) is deliberately NOT imported at module level.
@@ -52,7 +52,7 @@ def scheduler_status_command(
         return
     cli._run_or_exit(
         lambda: typer.echo(
-            scheduler_providers.provider_for_scheduler(selected)
+            worker_scheduler.provider_for_scheduler(selected)
             .poll(scheduler_job_id)
             .model_dump_json(indent=2)
         )
@@ -97,7 +97,7 @@ def scheduler_status_batch_command(
         return
 
     def action() -> None:
-        scheduler = scheduler_providers.provider_for_scheduler(selected)
+        scheduler = worker_scheduler.provider_for_scheduler(selected)
         statuses = [
             scheduler.poll(scheduler_job_id).model_dump(mode="json")
             for scheduler_job_id in scheduler_job_ids
@@ -144,7 +144,7 @@ def scheduler_cancel_command(
         return
 
     def action() -> None:
-        result = scheduler_providers.provider_for_scheduler(selected).cancel(scheduler_job_id)
+        result = worker_scheduler.provider_for_scheduler(selected).cancel(scheduler_job_id)
         payload = {
             "scheduler": selected,
             "scheduler_job_id": scheduler_job_id,
