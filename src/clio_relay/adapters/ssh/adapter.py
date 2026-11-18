@@ -634,25 +634,24 @@ class SshAdapter(BaseAdapter[SshConfig]):
             return None
         if await self.transport.master_up():
             return None
-        if self.transport.register_sign_in():
-            return SignInNeed(
-                provider="ssh",
-                message=(
-                    f"Sign in to {self.config.ssh_profile}. Relay keeps that connection "
-                    "and reuses it, so you sign in once"
-                ),
-                url=None,
-            )
+        failed = ""
         if self.config.askpass:
-            # A configured program answers the prompts, so no person is needed.
-            env = self.transport.environment() or {}
+            # A configured program answers the prompts, so try it before asking anyone.
             try:
-                await self.transport.starter()(env)
+                await self.transport.starter()(self.transport.environment() or {})
             except RuntimeError as exc:
-                raise Refusal(
-                    RefusalReason.NEEDS_SIGN_IN, str(exc), site=self.context.site_id
-                ) from exc
-        return None
+                failed = f". The askpass program could not sign in: {exc}"
+            if not failed and await self.transport.master_up():
+                return None
+        self.transport.register_sign_in()
+        return SignInNeed(
+            provider="ssh",
+            message=(
+                f"Sign in to {self.config.ssh_profile}. Relay keeps that connection "
+                f"and reuses it, so you sign in once{failed}"
+            ),
+            url=None,
+        )
 
     async def sign_in_done(self, answer: dict[str, Any]) -> None:
         if self.config.interactive_sign_in and not await self.transport.master_up():

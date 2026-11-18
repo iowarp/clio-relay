@@ -83,7 +83,15 @@ def parse_sections(text: str) -> dict[str, list[str]]:
     return sections
 
 
-_PRELUDE = """\
+# On NFS a file another node wrote can stay invisible to ``[ -f ]``, ``cat`` and
+# ``stat`` for the attribute cache's lifetime (two minutes on some sites). Reading
+# the directory makes the client look again, so every check of a file another
+# host may have written lists its directory first.
+FRESH = 'fresh() { for d in "$@"; do ls -f "$d" >/dev/null 2>&1; done; }\n'
+
+_PRELUDE = (
+    FRESH
+    + """\
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 sha() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
@@ -92,6 +100,18 @@ sha() {
 }
 cas() { printf '%s/content/cas/sha256/%s/%s' "$R" "$(printf %s "$1" | cut -c1-2)" "$1"; }
 """
+)
+
+# Enter the job directory, looking again at its parent when it seems missing.
+_ENTER_JOB = (
+    FRESH
+    + 'cd "$J" 2>/dev/null || { fresh "$(dirname "$J")"; cd "$J" 2>/dev/null; } '
+    + '|| { echo "@@nodir"; exit 0; }\nfresh .\n'
+)
+
+
+# The job and upload directories, and their parents when the job seems missing.
+_SEE_JOB = '[ -d "$J" ] || fresh "$R/jobs"\nfresh "$J" "$I"\n'
 
 
 def _head(remote_dir: str, operation_id: str | None = None) -> str:
@@ -99,7 +119,8 @@ def _head(remote_dir: str, operation_id: str | None = None) -> str:
     if operation_id is not None:
         lines.append(f'J="$R/jobs/"{q(operation_id)}')
         lines.append(f'I="$R/incoming/"{q(operation_id)}')
-    return "\n".join(lines) + "\n" + _PRELUDE
+    see = _SEE_JOB if operation_id is not None else ""
+    return "\n".join(lines) + "\n" + _PRELUDE + see
 
 
 def _detect(choice: str) -> str:
@@ -115,7 +136,8 @@ def _detect(choice: str) -> str:
 def check_script(remote_dir: str, operation_id: str, scheduler: str, digests: Iterable[str]) -> str:
     """Before a submit: the root, the scheduler, which inputs the site has, any submission."""
     have = "\n".join(
-        f'[ -f "$(cas {q(digest)})" ] && echo "@@have {digest}"' for digest in sorted(set(digests))
+        f'c=$(cas {q(digest)}); fresh "${{c%/*}}"; [ -f "$c" ] && echo "@@have {digest}"'
+        for digest in sorted(set(digests))
     )
     return (
         _head(remote_dir, operation_id)
@@ -161,7 +183,7 @@ fi
 """
     moves = "\n".join(f'  mv -f "$I"/{q(name)} "$J"/{q(name)}' for name in job_files)
     links = "\n".join(
-        f"""  c=$(cas {q(digest)}); t="$J"/{q(name)}
+        f"""  c=$(cas {q(digest)}); t="$J"/{q(name)}; fresh "${{c%/*}}"
   if [ ! -f "$c" ]; then echo "@@missing {digest}"; ok=0
   else mkdir -p "$(dirname "$t")"; rm -f "$t"; ln "$c" "$t" 2>/dev/null || cp "$c" "$t"; fi"""
         for name, digest in inputs
@@ -185,7 +207,8 @@ fi
         + '  else rmdir "$J/.submit.lock"; fi\n'
         + "else\n"
         + "  n=0\n"
-        + '  while [ ! -f "$J/submit.rc" ] && [ $n -lt 600 ]; do sleep 1; n=$((n+1)); done\n'
+        + '  while [ ! -f "$J/submit.rc" ] && [ $n -lt 600 ]; do\n'
+        + '    sleep 1; fresh "$J"; n=$((n+1))\n  done\n'
         + "fi\n"
         + 'rm -rf "$I"\n'
         + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; fi\n'
@@ -270,7 +293,7 @@ def status_script(
     ``accounting_command`` runs only when the queue no longer lists the job and
     the job wrote no exit code, as the last evidence of how it ended.
     """
-    body = f"J={q(job_dir)}\n" + 'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
+    body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
     body += 'echo "@@last"; tail -n 1 states 2>/dev/null\n'
     if mode == "scheduler" and status_command is not None and native_id is not None:
@@ -314,8 +337,8 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     """Mark the job cancelled and stop it."""
     body = (
         f"J={q(job_dir)}\n"
-        'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
-        '[ -f final ] && { echo "@@final"; exit 0; }\n'
+        + _ENTER_JOB
+        + '[ -f final ] && { echo "@@final"; exit 0; }\n'
         ": > cancel\nprintf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
     )
     if cancel_command is not None:
