@@ -16,13 +16,13 @@ from typing import cast
 
 import pytest
 
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.session_lifecycle import OwnedSessionTeardownRequest
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import QueueConflictError, RelayError
 from clio_relay.models import EndpointRole, JobKind, JobState, RelayJob
 from clio_relay.models_job_specs import JarvisRunSpec
-from clio_relay.session_lifecycle import OwnedSessionTeardownRequest
 
 
 def _queue(tmp_path: Path) -> ClioCoreQueue:
@@ -449,7 +449,7 @@ def test_sweep_aborts_before_teardown_when_renewed_after_quiesce(
     """BLOCKER 3's second half: the sweep re-reads and re-checks is_due AFTER
     quiescing and BEFORE calling teardown (which would kill a live process).
     A renewal landing in exactly that window must abort before teardown."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -605,7 +605,7 @@ def test_sweep_reuses_its_own_quiesce_operation_id_for_teardown(
     (BLOCKER 1). Before the fix this raised ``QueueConflictError`` on every
     single sweep of every session, unconditionally.
     """
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -648,7 +648,7 @@ def test_sweep_reuses_its_own_quiesce_operation_id_for_teardown(
 
 
 def test_sweep_skips_generation_already_moved_on_but_reaps_the_lease(tmp_path: Path) -> None:
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -693,7 +693,7 @@ def test_sweep_skips_generation_already_moved_on_but_reaps_the_lease(tmp_path: P
 
 
 def test_sweep_closes_admission_and_marks_lease_when_teardown_succeeds(tmp_path: Path) -> None:
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -737,7 +737,7 @@ def test_sweep_closes_admission_and_marks_lease_when_teardown_succeeds(tmp_path:
 def test_sweep_marks_expired_with_running_jobs_and_appends_typed_job_events(
     tmp_path: Path,
 ) -> None:
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -789,7 +789,7 @@ def test_sweep_marks_expired_with_running_jobs_and_appends_typed_job_events(
 
 def test_sweep_continues_past_one_sessions_teardown_failure(tmp_path: Path) -> None:
     """One poisoned session must never wedge the whole worker cycle (#238 doctrine)."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -838,7 +838,7 @@ def test_sweep_honors_a_recorded_cleanup_intent_instead_of_hardcoding(
     with the REAL ``set_owner_session_closing`` precondition check, not a
     mock -- so the sweep must read and reuse the recorded intent instead.
     """
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -897,7 +897,7 @@ def test_sweep_defaults_to_conservative_policy_when_no_intent_is_recorded(
 ) -> None:
     """The ordinary crash case (no client ever ran quiesce-intake): the
     sweep's own all-``False`` default, not an inherited one."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     _start_generation(queue, owner_session_id="desktop-session-1", generation_id="generation-1")
@@ -945,7 +945,7 @@ def test_sweep_bounds_retries_and_quarantines_instead_of_spinning_forever(
     ``MAX_OWNER_SESSION_SWEEP_ATTEMPTS`` instead of spinning a fresh
     traceback every cycle forever (proven over N cycles, not asserted by
     inspection)."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
     from clio_relay.models_owner_session_lease import MAX_OWNER_SESSION_SWEEP_ATTEMPTS
 
     queue = _queue(tmp_path)
@@ -1004,7 +1004,7 @@ def test_client_teardown_closes_the_lease_as_client_close_not_expired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The two typed close paths (#277 design point 3) are never conflated."""
-    import clio_relay.cli_session_owned as cli_session_owned
+    import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
 
     core_dir = tmp_path / "core"
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
@@ -1045,7 +1045,7 @@ def test_client_teardown_lease_close_race_with_a_concurrent_sweep_is_non_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A client teardown racing an already-completed sweep must not crash."""
-    import clio_relay.cli_session_owned as cli_session_owned
+    import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
 
     core_dir = tmp_path / "core"
     monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
@@ -1095,7 +1095,7 @@ def test_run_once_sweeps_owner_session_leases_every_cycle(
     """The sweep joins run_once's existing per-cycle machinery -- including
     the FIRST cycle after a worker restart (#238/#240's "replay leases
     before accepting work" ask, for the owned-session-lease dimension)."""
-    import clio_relay.endpoint_serve_loop as endpoint_serve_loop
+    import clio_relay.adapters.worker.endpoint_serve_loop as endpoint_serve_loop
 
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     queue = ClioCoreQueue(settings.core_dir)
@@ -1124,7 +1124,7 @@ def test_run_once_sweeps_owner_session_leases_every_cycle(
 
 
 def test_lease_status_projection_returns_none_when_absent(tmp_path: Path) -> None:
-    from clio_relay.session_recovery_lease_projection import (
+    from clio_relay.adapters.worker.session_recovery_lease_projection import (
         owner_session_lease_status_projection,
     )
 
@@ -1142,7 +1142,7 @@ def test_lease_status_projection_returns_none_when_absent(tmp_path: Path) -> Non
 
 
 def test_lease_status_projection_returns_the_lease_as_a_plain_dict(tmp_path: Path) -> None:
-    from clio_relay.session_recovery_lease_projection import (
+    from clio_relay.adapters.worker.session_recovery_lease_projection import (
         owner_session_lease_status_projection,
     )
 
@@ -1177,8 +1177,8 @@ def test_lease_status_projection_returns_the_lease_as_a_plain_dict(tmp_path: Pat
 
 def test_cli_recovery_status_attaches_the_lease_projection(tmp_path: Path) -> None:
     """The wrapper that reaches the single-dial bootstrap script path."""
-    import clio_relay.cli_session_owned as cli_session_owned
-    from clio_relay.session_lifecycle import OwnedSessionRecoveryStatus
+    import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
+    from clio_relay.adapters.worker.session_lifecycle import OwnedSessionRecoveryStatus
 
     core_dir = tmp_path / "core"
     queue = ClioCoreQueue(core_dir)
@@ -1217,8 +1217,8 @@ def test_cli_recovery_status_attaches_the_lease_projection(tmp_path: Path) -> No
 def test_cli_recovery_status_projection_is_a_no_op_when_generation_is_unknown(
     tmp_path: Path,
 ) -> None:
-    import clio_relay.cli_session_owned as cli_session_owned
-    from clio_relay.session_lifecycle import OwnedSessionRecoveryStatus
+    import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
+    from clio_relay.adapters.worker.session_lifecycle import OwnedSessionRecoveryStatus
 
     bare_status = OwnedSessionRecoveryStatus(cluster="ares", session_id="desktop-session-1")
 
@@ -1235,7 +1235,7 @@ def test_cli_recovery_status_projection_is_a_no_op_when_generation_is_unknown(
 def test_clock_jump_detector_ignores_a_slow_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
     """A legitimately slow cycle (a long-running job between polls) advances
     BOTH clocks together and must never trip the detector."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     cluster = "clock-slow-cycle"
     sweep_module._LAST_SWEEP_CLOCKS.pop(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -1260,7 +1260,7 @@ def test_clock_jump_detector_catches_a_forward_wall_clock_jump(
     """A genuine wall-clock jump (NTP correction, manual date change) diverges
     the wall clock from the monotonic clock -- proven: 0 due -> would-be-12
     due becomes 0 swept because the whole cycle is skipped."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     cluster = "clock-jump"
     sweep_module._LAST_SWEEP_CLOCKS.pop(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -1284,7 +1284,7 @@ def test_sweep_skips_the_whole_cycle_on_a_detected_clock_jump(
 ) -> None:
     """End-to-end: a detected jump means the due-scan itself never runs --
     proven by a due lease that is NOT reaped despite being (falsely) due."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     cluster = "clock-jump-e2e"
     sweep_module._LAST_SWEEP_CLOCKS.pop(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -1331,7 +1331,7 @@ def test_sweep_degrades_when_the_due_scan_itself_fails(
 ) -> None:
     """A storage-layer safety-bound refusal (or any other scan failure) must
     degrade this ONE cycle, never propagate into the worker's own loop."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
 
@@ -1349,7 +1349,7 @@ def test_sweep_degrades_when_the_due_scan_itself_fails(
 def test_sweep_degrades_when_pruning_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Pruning is best-effort housekeeping: its own failure must not turn a
     cycle that otherwise made progress into one that raises."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
 
@@ -1417,7 +1417,7 @@ def test_prune_removes_only_terminal_leases_past_the_retention_window(tmp_path: 
 def test_sweep_prunes_terminal_leases_once_per_cycle(tmp_path: Path) -> None:
     """End-to-end proof the sweep actually calls pruning, not just that the
     queue primitive works in isolation."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -1446,7 +1446,7 @@ def test_running_job_ids_helper_records_truncation_when_pages_are_cut_short(
     """Deterministic unit proof, independent of real page-size defaults:
     a fake page source that ALWAYS claims more is available forces the
     bounded walk to stop at its own page cap and report truncated=True."""
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     queue = _queue(tmp_path)
 
@@ -1495,7 +1495,7 @@ def test_running_job_ids_helper_reports_no_truncation_when_pages_are_exhausted(
     )
     queue.update_job_state(job.job_id, JobState.RUNNING, message="running")
 
-    import clio_relay.endpoint_owner_session_sweep as sweep_module
+    import clio_relay.adapters.worker.endpoint_owner_session_sweep as sweep_module
 
     worker = _worker(queue, tmp_path / "core")
     job_ids, truncated = sweep_module._owned_generation_running_job_ids(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

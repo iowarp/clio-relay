@@ -15,13 +15,13 @@ from typing import Any
 import pytest
 import yaml
 
-import clio_relay.deployment as deployment
+import clio_relay.adapters.worker.deployment as deployment
 from clio_relay import __version__
-from clio_relay.application_profiles import (
+from clio_relay.adapters.worker.application_profiles import (
     install_cluster_app_over_ssh,
     render_cluster_app_install_script,
 )
-from clio_relay.bootstrap import (
+from clio_relay.adapters.worker.bootstrap import (
     CLIO_KIT_JARVIS_MCP_VERSION,
     CLIO_KIT_JARVIS_MCP_WHEEL_FILENAME,
     CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
@@ -42,7 +42,7 @@ from clio_relay.bootstrap import (
     install_local_frp,
     render_linux_user_bootstrap_script,
 )
-from clio_relay.bootstrap_one_pass_script import (
+from clio_relay.adapters.worker.bootstrap_one_pass_script import (
     ONE_PASS_PERSISTENT_RECEIPT_MARKER,
     ONE_PASS_TARGET_IDENTITY_MARKER,
     extract_one_pass_payloads,
@@ -93,7 +93,7 @@ def _assert_bootstrap_rejected_before_remote_call(
     relay_artifact_sha256: str | None = None,
 ) -> None:
     """Require wheel rejection after inspection but before any payload transport."""
-    from clio_relay import bootstrap
+    from clio_relay.adapters.worker import bootstrap
 
     remote_calls: list[list[str]] = []
 
@@ -152,12 +152,14 @@ def _install_site_profile(monkeypatch: pytest.MonkeyPatch) -> None:
         [
             FakeEntryPoint(
                 name="site-stack",
-                group="clio_relay.application_profiles",
+                group="clio_relay.adapters.worker.application_profiles",
                 loaded=SiteBootstrapProfile(),
             )
         ]
     )
-    monkeypatch.setattr("clio_relay.application_profiles.entry_points", lambda: entries)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.application_profiles.entry_points", lambda: entries
+    )
 
 
 def test_linux_user_bootstrap_script_installs_required_components() -> None:
@@ -226,7 +228,10 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"' in script
     assert '"$JARVIS_MCP_EXECUTABLE" --help' in script
     assert 'JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"' in script
-    assert "from clio_relay.mcp_call.runner import mcp_server_artifact_identity" in script
+    assert (
+        "from clio_relay.adapters.worker.server_artifact_identity "
+        "import mcp_server_artifact_identity"
+    ) in script
     assert "clio_kit_server_artifact = mcp_server_artifact_identity(" in script
     assert "verify_relay_jarvis_cd_lock=True" in script
     assert 'locked_server_runtime.get("server_name") == "jarvis"' in script
@@ -320,7 +325,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
         '  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
     ) in script
     assert "import clio_relay.bounded_command.pkg" in script
-    assert "clio_relay.mcp_call.pkg" in script
+    assert "clio_relay.mcp_call.pkg" not in script
     assert "clio_relay.remote_agent.pkg" in script
     assert "write_install_receipt" in script
     assert "receipt = make_bootstrap_receipt(" in script
@@ -365,7 +370,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert "spack install" not in script
     assert "site_stack=ready" not in script
     assert "CLIO_RELAY_CORE_DIR" in script
-    assert "clio-relay init" in script
+    assert "clio-relay worker init" in script
     assert "done < <(compgen -e)" in script
     assert "UV_*|PIP_*) unset" in script
     assert "--index-url https://pypi.org/simple --no-deps --only-binary=:all:" in script
@@ -405,7 +410,6 @@ def test_wheel_embeds_jarvis_package_modules_in_the_installed_namespace() -> Non
         "jarvis-packages": "clio_relay/assets/jarvis-packages",
         "jarvis-packages/clio_relay/clio_relay/_jarvis_api.py": "clio_relay/_jarvis_api.py",
         "jarvis-packages/clio_relay/clio_relay/bounded_command": "clio_relay/bounded_command",
-        "jarvis-packages/clio_relay/clio_relay/mcp_call": "clio_relay/mcp_call",
         "jarvis-packages/clio_relay/clio_relay/remote_agent": "clio_relay/remote_agent",
     }
 
@@ -569,7 +573,7 @@ def test_bootstrap_runner_uses_bounded_process_contract(
         calls.append(kwargs)
         return subprocess.CompletedProcess(["ssh", "host"], 0, stdout="ok", stderr="")
 
-    from clio_relay import bootstrap
+    from clio_relay.adapters.worker import bootstrap
 
     monkeypatch.setattr(bootstrap, "run_bounded_process", fake_run)
 
@@ -590,7 +594,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
     then one combined pass carrying the payload, install, receipt
     re-verification, and target-identity observation. No mkdir/scp/cat/rm
     dials remain."""
-    from clio_relay import bootstrap, bootstrap_receipt_validation
+    from clio_relay.adapters.worker import bootstrap, bootstrap_receipt_validation
 
     calls: list[list[str]] = []
     receipt_document: dict[str, object] = {
@@ -748,7 +752,7 @@ def test_bootstrap_over_ssh_returns_the_matching_durable_invocation_receipt(
 
 
 def test_bootstrap_over_ssh_rejects_option_like_destination(tmp_path: Path) -> None:
-    from clio_relay import bootstrap
+    from clio_relay.adapters.worker import bootstrap
 
     with pytest.raises(ConfigurationError, match="non-option destination"):
         bootstrap.bootstrap_cluster_over_ssh(
@@ -832,7 +836,7 @@ def test_bootstrap_over_ssh_rejects_relay_wheel_metadata_mismatch_before_ssh(
 def test_relay_wheel_preflight_accepts_canonical_filename_and_matching_metadata(
     tmp_path: Path,
 ) -> None:
-    from clio_relay import bootstrap
+    from clio_relay.adapters.worker import bootstrap
 
     wheel = tmp_path / f"clio_relay-{__version__}-py3-none-any.whl"
     _write_test_relay_wheel(wheel)
@@ -873,10 +877,12 @@ def test_local_frp_install_publishes_only_a_verified_staged_pair(
     def accept_pair(_frpc: Path, _frps: Path) -> None:
         return None
 
-    monkeypatch.setattr("clio_relay.bootstrap.platform.system", lambda: "Windows")
-    monkeypatch.setattr("clio_relay.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.bootstrap._install_frp_from_release_archive", fake_install)
-    monkeypatch.setattr("clio_relay.bootstrap._assert_frp_pair", accept_pair)
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap._assert_frp_pair", accept_pair)
 
     installed = install_local_frp(destination)
 
@@ -901,11 +907,13 @@ def test_local_frp_install_removes_destination_pair_when_final_verification_fail
         if frpc.parent == destination:
             raise ConfigurationError("installed executable cannot be hashed: quarantined")
 
-    monkeypatch.setattr("clio_relay.bootstrap.platform.system", lambda: "Windows")
-    monkeypatch.setattr("clio_relay.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.bootstrap._install_frp_from_release_archive", fake_install)
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
     monkeypatch.setattr(
-        "clio_relay.bootstrap._assert_frp_pair",
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._assert_frp_pair",
         quarantine_destination,
     )
 
@@ -927,9 +935,11 @@ def test_local_frp_install_never_publishes_a_staged_hash_mismatch(
         (staging / "frpc.exe").write_bytes(b"wrong-frpc")
         (staging / "frps.exe").write_bytes(b"wrong-frps")
 
-    monkeypatch.setattr("clio_relay.bootstrap.platform.system", lambda: "Windows")
-    monkeypatch.setattr("clio_relay.bootstrap.platform.machine", lambda: "AMD64")
-    monkeypatch.setattr("clio_relay.bootstrap._install_frp_from_release_archive", fake_install)
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.system", lambda: "Windows")
+    monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.bootstrap._install_frp_from_release_archive", fake_install
+    )
 
     with pytest.raises(ConfigurationError, match="SHA-256 mismatch"):
         install_local_frp(destination)
@@ -954,6 +964,8 @@ def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",
@@ -988,6 +1000,8 @@ def test_bootstrap_archive_uses_clean_git_checkout(tmp_path: Path) -> None:
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",
@@ -1078,6 +1092,8 @@ def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> Non
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",

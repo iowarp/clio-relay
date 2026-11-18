@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import JarvisRunSpec, JobKind, ProgressRecord, RelayJob
 
 

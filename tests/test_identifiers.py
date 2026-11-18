@@ -12,10 +12,14 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from clio_relay import mcp_server as mcp_server_module
-from clio_relay import queue_gateway_indexes, queue_layout, queue_store_read
+from clio_relay.adapters.worker import queue_gateway_indexes, queue_layout, queue_store_read
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
+from clio_relay.adapters.worker.session_lifecycle import (
+    RemoteSessionStateEvidence,
+    SessionLifecycleReport,
+)
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.identifiers import (
     DURABLE_RECORD_ID_MAX_BYTES,
@@ -26,7 +30,6 @@ from clio_relay.identifiers import (
     filesystem_key,
     validate_durable_record_id,
 )
-from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
     Cursor,
@@ -43,8 +46,6 @@ from clio_relay.models import (
     SchedulerCancelPending,
     TaskTimelineEvent,
 )
-from clio_relay.queue_store_lock import LegacyQueueStateError
-from clio_relay.session_lifecycle import RemoteSessionStateEvidence, SessionLifecycleReport
 from clio_relay.validation_report import CleanupEvidence
 
 
@@ -282,81 +283,6 @@ def test_durable_models_reject_unsafe_primary_and_reference_ids() -> None:
     lease = Lease.new(job.job_id, endpoint.endpoint_id, ttl_seconds=30)
     assert lease.job_id == job.job_id
     assert lease.endpoint_id == endpoint.endpoint_id
-
-
-def test_mcp_schemas_publish_durable_identifier_contract() -> None:
-    """Every static MCP durable-ID input advertises the enforced constraints."""
-    tools = {
-        str(tool["name"]): tool
-        for tool in mcp_server_module._all_tool_definitions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            clusters=[]
-        )
-    }
-    fields = {
-        "relay_status": "job_id",
-        "relay_cancel": "job_id",
-        "relay_observe": "job_id",
-        "relay_wait": "job_id",
-        "relay_get_job": "job_id",
-        "relay_monitor_job": "job_id",
-        "relay_record_task_event": "task_id",
-        "relay_watch_task_events": "task_id",
-        "relay_read_artifact": "artifact_id",
-        "relay_create_monitor_rule": "job_id",
-        "relay_get_gateway_session": "session_id",
-        "relay_update_gateway_session": "session_id",
-        "relay_close_gateway_session": "session_id",
-    }
-
-    for tool_name, field_name in fields.items():
-        schema = tools[tool_name]["inputSchema"]["properties"][field_name]
-        assert schema["pattern"] == DURABLE_RECORD_ID_PATTERN
-        assert schema["maxLength"] == DURABLE_RECORD_ID_MAX_BYTES
-        assert schema["minLength"] == 1
-    artifact_items = tools["relay_record_task_event"]["inputSchema"]["properties"]["artifact_refs"][
-        "items"
-    ]
-    assert artifact_items["pattern"] == DURABLE_RECORD_ID_PATTERN
-
-
-@pytest.mark.parametrize(
-    "hostile_job_id",
-    [
-        "../../sentinel",
-        r"..\..\sentinel",
-        "/tmp/clio-relay-sentinel",
-        r"C:\temp\clio-relay-sentinel",
-    ],
-)
-def test_relay_observe_rejects_hostile_job_ids_before_filesystem_io(
-    tmp_path: Path,
-    hostile_job_id: str,
-) -> None:
-    """The user MCP observation path cannot create cursors or touch sentinels."""
-    core_dir = tmp_path / "core"
-    sentinel = tmp_path / "sentinel.json"
-    sentinel.write_text("operator-owned", encoding="utf-8")
-    settings = RelaySettings(core_dir=core_dir, spool_dir=tmp_path / "spool")
-
-    response = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "relay_observe",
-                "arguments": {"job_id": hostile_job_id},
-            },
-        },
-        queue=ClioCoreQueue(core_dir),
-        settings=settings,
-        profile="user",
-    )
-
-    assert response is not None
-    assert "durable record ID" in response["error"]["message"]
-    assert sentinel.read_text(encoding="utf-8") == "operator-owned"
-    assert not core_dir.exists()
 
 
 def test_generation_and_operation_models_use_durable_identifier_contract(tmp_path: Path) -> None:

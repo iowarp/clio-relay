@@ -10,8 +10,8 @@ import pytest
 
 import clio_relay.relay_ops as relay_ops_module
 import clio_relay.spool as spool_module
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.bounded_payload import is_delivery_refusal
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.models import ArtifactRef, JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.relay_ops import (
@@ -213,28 +213,28 @@ def test_oversized_non_log_artifact_refusal_does_not_recommend_the_log_endpoint(
 ) -> None:
     """F10 (#231 R6 review): the cursor-based log endpoint only serves
     ``stdout``/``stderr`` streams (``relay_ops.read_job_log``) -- an
-    oversized ``mcp_result`` artifact (or any other non-log kind) must not
+    oversized ``output`` artifact (or any other non-log kind) must not
     be told to use it, since that endpoint has no path to serve it at all.
     """
     queue = ClioCoreQueue(tmp_path / "core")
     job = queue.submit_job(
         RelayJob(
             cluster="local",
-            kind=JobKind.MCP_CALL,
+            kind=JobKind.JARVIS,
             spec=JarvisRunSpec(command=["true"]),
-            idempotency_key="mcp-result-transfer-bound",
+            idempotency_key="output-transfer-bound",
         )
     )
     owned_root = tmp_path / "spool" / job.job_id
     owned_root.mkdir(parents=True)
-    artifact_path = owned_root / "mcp-result.json"
+    artifact_path = owned_root / "result.json"
     with artifact_path.open("wb") as stream:
         stream.truncate(MAX_ARTIFACT_CONTENT_BYTES + 1)
     artifact = queue.append_artifact(
         ArtifactRef(
             job_id=job.job_id,
             uri=artifact_path.as_uri(),
-            kind="mcp_result",
+            kind="output",
             size_bytes=MAX_ARTIFACT_CONTENT_BYTES + 1,
             metadata=_owned_artifact_metadata(owned_root),
         )

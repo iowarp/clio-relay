@@ -578,7 +578,534 @@ All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, aga
 
 ## W8. The worker adapter and the old surface's removal
 
+Branch `jaimecernuda-relay-rework-w8`, from `jaimecernuda-relay-rework` at 719104c (M1).
+
+### Inventory method
+
+- Source: the integration branch at 719104c. The import graph covers every `clio_relay.*` module in `src/`, from `import` statements and from module names in strings (monkeypatch targets, `python -m`, lazy imports).
+- What stays is what the roots reach without passing through a deleted family. The roots are:
+  - the new tree (`adapters`, `catalog`, `jobs`, `sites`, `surface`, `testing`, `cli_next`);
+  - W9's files (`service_runtime*`, `jarvis_service_runtime*`, `models_gateway`, `frp_*`);
+  - the worker's own roots (endpoint, HTTP API, owned session, bootstrap, queue, one-link connection, remote CLI) and the old `cli_*` modules that become the worker's operator commands.
+- The deleted families are `mcp_*`, `fastmcp_server`, `browser_gateway*`, `live_acceptance*`, `live_validation*`, `scheduler_providers/`, `remote_mcp*`, `cli_remote_mcp*`, `_mcp_call_runner_facade` and `session_runtime`, plus the old `cli` root, which W1 owns and replaces at the cutover.
+- Callers outside this repository were searched in clio-agent (develop f08dbde3a, then rechecked at its integration branch 4878fcc40), gact-tui (21163590c), clio-kit (main 490269fb1) and clio-agent-marketplace (develop).
+
+### The old tools
+
+There are 49 tools, not 45: 43 static `relay_*` tools in four catalog modules, and 6 virtual JARVIS tools. The admin, operator and all profiles list every tool. The user profile lists 14 (`USER_MCP_TOOL_NAMES`, `mcp_tool_catalog.py:57`). `relay_action` is a payload field, not a tool.
+
+The in-repo columns count files that name the tool. Every one of those `src/` files is in the deletion list, except `scripts/check_file_size.py`, which lists file names.
+
+| Tool | Catalog module | src files | test files | Docs and scripts that name it |
+| --- | --- | --- | --- | --- |
+| `relay_remote_mcp_context` | job_lifecycle | 3 | 2 | operations.md, ai/release-validation-0.9.22.md |
+| `relay_submit_agent` | job_lifecycle | 5 | 5 | operations.md, mcp-tasks.md, ai/release-validation-0.9.22.md |
+| `relay_status` | job_lifecycle | 5 | 5 | operations.md, ai/release-validation-0.9.22.md, check_file_size.py |
+| `relay_cancel` | job_lifecycle | 6 | 3 | operations.md, ai/release-validation-0.9.22.md, check_file_size.py |
+| `relay_observe` | job_lifecycle | 7 | 3 | operations.md, remote-mcp-federation.md, ai/release-validation-0.9.22.md, check_file_size.py |
+| `relay_wait` | job_lifecycle | 11 | 5 | operations.md, remote-mcp-federation.md, design/relay-architecture-2026-08.md, ai/release-validation-0.9.22.md, check_file_size.py |
+| `relay_submit_jarvis_pipeline` | job_lifecycle | 3 | 2 | none |
+| `relay_submit_jarvis_job` | job_lifecycle | 2 | 1 | none |
+| `relay_submit_remote_agent` | job_lifecycle | 4 | 2 | mcp-tasks.md |
+| `relay_submit_mcp_call` | job_lifecycle | 3 | 2 | remote-mcp-federation.md |
+| `relay_call_jarvis_mcp` | job_lifecycle | 4 | 1 | none |
+| `relay_get_job` | monitoring | 2 | 3 | operations.md |
+| `relay_get_job_status` | monitoring | 2 | 2 | operations.md |
+| `relay_monitor_job` | monitoring | 2 | 2 | none |
+| `relay_watch_job_events` | monitoring | 2 | 1 | none |
+| `relay_list_tasks` | monitoring | 2 | 2 | none |
+| `relay_record_task_event` | monitoring | 2 | 2 | README.md |
+| `relay_watch_task_events` | monitoring | 2 | 2 | README.md |
+| `relay_read_job_log` | monitoring | 2 | 1 | none |
+| `relay_list_artifacts` | monitoring | 6 | 6 | check_file_size.py |
+| `relay_artifact_lineage` | monitoring | 4 | 5 | README.md, operations.md, ai/interface-context.md, check_file_size.py |
+| `relay_record_progress` | monitoring | 2 | 1 | none |
+| `relay_list_progress` | monitoring | 2 | 2 | none |
+| `relay_read_artifact` | monitoring | 5 | 5 | design/relay-architecture-2026-08.md, check_file_size.py |
+| `relay_cancel_job` | monitoring | 2 | 1 | operations.md |
+| `relay_queue_list` | queue_retention | 3 | 2 | operations.md |
+| `relay_queue_diagnose` | queue_retention | 3 | 1 | operations.md |
+| `relay_queue_stale` | queue_retention | 3 | 1 | operations.md |
+| `relay_queue_cleanup_stale` | queue_retention | 2 | 1 | operations.md |
+| `relay_retention_plan` | queue_retention | 2 | 0 | none |
+| `relay_retention_status` | queue_retention | 2 | 0 | none |
+| `relay_retention_collect` | queue_retention | 2 | 1 | none |
+| `relay_worker_status` | queue_retention | 2 | 1 | none |
+| `relay_create_monitor_rule` | queue_retention | 2 | 2 | none |
+| `relay_list_monitor_rules` | queue_retention | 2 | 1 | none |
+| `relay_evaluate_monitor_rules` | queue_retention | 2 | 1 | none |
+| `relay_create_gateway_session` | gateway_session | 2 | 1 | none |
+| `relay_list_gateway_sessions` | gateway_session | 2 | 1 | none |
+| `relay_bind_jarvis_runtime` | gateway_session | 9 | 3 | README.md, operations.md, connection-model.md, one-link-control-plane.md, ai/interface-context.md, ai/system-context.md |
+| `relay_storage_status` | gateway_session | 3 | 2 | operations.md |
+| `relay_get_gateway_session` | gateway_session | 2 | 2 | none |
+| `relay_update_gateway_session` | gateway_session | 2 | 3 | none |
+| `relay_close_gateway_session` | gateway_session | 2 | 3 | none |
+| `jarvis_describe`, `jarvis_create_pipeline`, `jarvis_add_step`, `jarvis_edit_step`, `jarvis_run`, `jarvis_get_execution` | virtual, from `_contracts/jarvis-user-v3.7.2.json` (`jarvis_mcp.py:80`) | 0 by name | 0 by name | none |
+
+Callers in other repositories:
+
+- **clio-agent (no production tool calls).** Read at the integration branch `jaimecernuda-relay-rework` (4878fcc40). `scripts/check_task_replacement_removal.py:62` names the module `clio_agent.gact.relay_status`, not the tool. `tests/test_tools/test_mcp_dual_emission_consume.py` and `tools/gateway.py` no longer name a relay tool or the relay_ops namespace (they did on develop f08dbde3a). The other `relay_*` names appear only in CHANGELOG and design docs.
+- **clio-agent no longer calls the old command line.** On develop f08dbde3a, `src/clio_agent/gact/infrastructure/drivers.py:356-445` ran `clio-relay cluster ...` with `--scheduler-provider`. W4's RL38 commit 6801be185 removed that code, and it is on clio-agent's integration branch `jaimecernuda-relay-rework` (4878fcc40). W3 checked: nothing there calls `clio-relay cluster` or `--scheduler-provider`. Later clio-agent and marketplace checks read that integration branch, not develop.
+- **gact-tui:** `desktop/src-tauri/src/ssh_transport_command.rs:456` names `clio-relay` in a test only. The relay references in gact-tui's UI are W12's open item.
+- **clio-kit:** `jarvis_handler.py:2940` keeps compatibility aliases for clio-relay 0.x and calls no tool.
+- **clio-agent-marketplace:** no caller.
+
+### The deletion list
+
+Checked against W9's ownership before running: no `service_runtime*`, `jarvis_service_runtime*`, `models_gateway` or `frp_*` module is in the deletion list or the move list. The script asserts this before it deletes anything.
+
+**`src/clio_relay/`: 161 modules.** `scheduler_providers/` is deleted as a package. `cli.py` is listed because nothing kept imports it. W1 owns it and replaces it at the cutover; W8 does not edit it.
+
+- `_mcp_call_runner_facade`, `mcp_agent_input_guard`, `mcp_arguments`, `mcp_call_result_error`, `mcp_dispatch`, `mcp_gateway_tools`, `mcp_job_lifecycle`, `mcp_job_status`, `mcp_queue_tools`, `mcp_remote_catalog`, `mcp_remote_transport`, `mcp_result_verification`, `mcp_server`, `mcp_session_state_codec`, `mcp_stdio_validation`, `mcp_stdio_validation_contract`, `mcp_stdio_validation_executable`, `mcp_stdio_validation_jarvis_contract`, `mcp_stdio_validation_process`, `mcp_stdio_validation_process_io`, `mcp_stdio_validation_support`, `mcp_submission_agent`, `mcp_submission_mcp_call`, `mcp_submission_result`, `mcp_task_projection`, `mcp_task_runtime`, `mcp_tasks_extension`, `mcp_tool_catalog`, `mcp_tool_catalog_gateway_session`, `mcp_tool_catalog_job_lifecycle`, `mcp_tool_catalog_monitoring`, `mcp_tool_catalog_queue_retention`, `mcp_tool_provider`.
+- `artifact_routing`.
+- `bounded_file_io`.
+- `browser_gateway`, `browser_gateway_errors`.
+- `cli`, `cli_agent`, `cli_diagnostics`, `cli_gateway`, `cli_gateway_runtime`, `cli_jarvis_artifact_io`, `cli_jarvis_dispatch`, `cli_jarvis_execution_run`, `cli_jarvis_execution_types`, `cli_jarvis_intent_checkpoint`, `cli_jarvis_mcp`, `cli_jarvis_mcp_validate`, `cli_jarvis_package_search`, `cli_jarvis_pending_report`, `cli_jarvis_query_observation`, `cli_jarvis_remote_contract`, `cli_jarvis_resume_checkpoint`, `cli_job`, `cli_job_records`, `cli_monitor`, `cli_release`, `cli_remote_mcp`, `cli_remote_mcp_validate`, `cli_storage`.
+- `clio_kit_runtime_identity`, `clio_kit_wheel_archive`.
+- `constants`.
+- `doctor`.
+- `fastmcp_server`.
+- `input_staging`.
+- `jarvis_artifact_documents`, `jarvis_cd_lock_binding`, `jarvis_execution_query`, `jarvis_input_plane`, `jarvis_mcp_validation`, `jarvis_mcp_validation_contract`, `jarvis_mcp_validation_core`, `jarvis_mcp_validation_execution_query`, `jarvis_mcp_validation_lifecycle_progress`, `jarvis_mcp_validation_live_progress`, `jarvis_mcp_validation_package_search`, `jarvis_mcp_validation_progress_semantics`, `jarvis_mcp_validation_report`, `jarvis_mcp_validation_report_support`, `jarvis_native_execution_documents`.
+- `live_acceptance`, `live_acceptance_agent_prompt`, `live_acceptance_browser_evidence`, `live_acceptance_browser_http`, `live_acceptance_checkpoint`, `live_acceptance_handoff`, `live_acceptance_job_verification`, `live_acceptance_models`, `live_acceptance_packaged_mcp`, `live_acceptance_progress`, `live_acceptance_remote_io`, `live_acceptance_secret_redaction`, `live_acceptance_secure_runtime`, `live_acceptance_transport`, `live_acceptance_wait`, `live_validation_capacity`, `live_validation_cleanup`, `live_validation_constants`, `live_validation_jobs`, `live_validation_orchestrator`, `live_validation_process`, `live_validation_support`.
+- `observation`.
+- `params_and_manifest`.
+- `process_environment`.
+- `progress_bridge`.
+- `promotion_record`.
+- `protocol_messages`.
+- `pytest_platform_partition`, `pytest_release_gate`.
+- `python_console_distribution`, `python_external_distribution`.
+- `release_check_runtime`, `release_command_stream`, `release_pin_sites`, `release_pin_sites_jarvis_tests`, `release_pin_sites_kit`, `release_pin_validation`, `release_pins`, `release_validation`.
+- `remote_mcp`, `remote_mcp_acceptance_evidence`, `remote_mcp_acceptance_models`, `remote_mcp_acceptance_report`, `remote_mcp_admission`, `remote_mcp_aliasing`, `remote_mcp_cache`, `remote_mcp_catalog_build`, `remote_mcp_catalog_models`, `remote_mcp_contract_checks`, `remote_mcp_schema_validation`, `remote_mcp_schema_wrapping`, `remote_mcp_scientific_catalog_result`, `remote_mcp_spack_result_validation`, `remote_mcp_spack_transition_checks`, `remote_mcp_spack_transition_report`, `remote_mcp_stdio_evidence`, `remote_mcp_structured_result`, `remote_mcp_tool_schema`, `remote_mcp_validation`, `remote_mcp_wire_schemas`.
+- `result_document`.
+- `safe_archive`.
+- `scheduler_providers`.
+- `server_artifact_identity`.
+- `session_runtime`.
+- `stdio_io`.
+- `wheel_private_launch`, `wheel_snapshot_identity`.
+
+**`jarvis-packages/clio_relay/clio_relay/`:** `mcp_call/` (3 files), and the 22 modules that only it uses: `_mcp_call_runner_facade`, `bounded_file_io`, `bounded_payload`, `clio_kit_runtime_identity`, `clio_kit_wheel_archive`, `constants`, `jarvis_artifact_documents`, `jarvis_cd_lock_binding`, `jarvis_execution_query`, `jarvis_native_execution_documents`, `params_and_manifest`, `process_environment`, `progress_bridge`, `protocol_messages`, `python_console_distribution`, `python_external_distribution`, `result_document`, `server_artifact_identity`, `session_runtime`, `stdio_io`, `wheel_private_launch` and `wheel_snapshot_identity`. Kept: `__init__`, `_jarvis_api`, `bounded_command/`, `remote_agent/` and the 15 `process_containment*` modules, which are all `bounded_command` and `remote_agent` import.
+
+**Tests: 40 files.**
+
+`test_browser_gateway.py`, `test_builtin_jarvis_input_staging.py`, `test_cli_agent.py`, `test_cli_diagnostics.py`, `test_cli_gateway.py`, `test_cli_gateway_runtime.py`, `test_cli_jarvis_mcp.py`, `test_cli_jarvis_mcp_validate.py`, `test_cli_job.py`, `test_cli_job_records.py`, `test_cli_monitor.py`, `test_cli_release.py`, `test_cli_remote_mcp.py`, `test_clio_schemas_convergence.py`, `test_fastmcp_server.py`, `test_input_staging.py`, `test_jarvis_mcp_validation.py`, `test_live_acceptance.py`, `test_mcp_call_owner_modules.py`, `test_mcp_call_result_error.py`, `test_mcp_call_runner.py`, `test_mcp_call_runner_lifecycle.py`, `test_mcp_input_staging.py`, `test_mcp_server.py`, `test_mcp_stdio_validation.py`, `test_promotion_record.py`, `test_release_acceptance_runbook.py`, `test_release_command_stream.py`, `test_release_pins.py`, `test_release_validation.py`, `test_remote_mcp.py`, `test_remote_mcp_acceptance_models.py`, `test_remote_mcp_aliasing.py`, `test_remote_mcp_cache.py`, `test_remote_mcp_schema_validation.py`, `test_remote_mcp_schema_wrapping.py`, `test_remote_mcp_tool_schema.py`, `test_remote_mcp_wire_schemas.py`, `test_safe_archive.py`, `test_schema_equality.py`.
+
+**Docs:** `docs/remote-mcp-federation.md` and `docs/connection-model.md`. Links to them in the user docs are updated.
+
+**clio-schemas fixtures:** `tests/fixtures/clio_schemas_v0_2_0_projections.json`, `relay_schema_equality_v1.json`, `relay_state_map_v1.json` and `tests/generate_schema_equality_goldens.py`, with the two tests above that read them.
+
+**Kept tests that need edits: 57 files.** Each edit removes the cases for a deleted module and points the rest at the moved paths.
+
+| File | Deleted modules it names |
+| --- | --- |
+| `test_acceptance_report_defaults.py` | cli, cli_jarvis_artifact_io, cli_jarvis_dispatch, cli_jarvis_execution_run, cli_jarvis_package_search, cli_jarvis_remote_contract, jarvis_mcp_validation, live_acceptance, mcp_server, mcp_stdio_validation, release_validation, remote_mcp, scheduler_providers |
+| `test_artifact_cluster_routing.py` | artifact_routing, mcp_server |
+| `test_artifact_lineage.py` | cli, mcp_server |
+| `test_artifact_listing_by_execution_id.py` | cli, mcp_server |
+| `test_bootstrap_cluster_paths.py` | cli |
+| `test_bootstrap_fast_path.py` | cli, safe_archive |
+| `test_bounded_command_package.py` | input_staging |
+| `test_browser_attachment_queue.py` | browser_gateway |
+| `test_ci_clio_kit_wheel.py` | remote_mcp |
+| `test_cli.py` | cli, cli_jarvis_artifact_io, cli_jarvis_execution_run, cli_jarvis_execution_types, cli_jarvis_intent_checkpoint, cli_jarvis_package_search, cli_jarvis_pending_report, cli_jarvis_query_observation, cli_jarvis_remote_contract, cli_jarvis_resume_checkpoint, mcp_stdio_validation, scheduler_providers |
+| `test_cli_api.py` | cli |
+| `test_cli_cluster.py` | cli |
+| `test_cli_cluster_deploy.py` | cli |
+| `test_cli_endpoint.py` | cli, scheduler_providers |
+| `test_cli_init.py` | cli |
+| `test_cli_installation_receipt.py` | cli |
+| `test_cli_patch_seam.py` | cli |
+| `test_cli_queue.py` | cli |
+| `test_cli_queue_maintenance.py` | cli, scheduler_providers |
+| `test_cli_relay_host.py` | cli |
+| `test_cli_scheduler.py` | cli, scheduler_providers |
+| `test_cli_session.py` | cli |
+| `test_cli_session_owned.py` | cli |
+| `test_cli_worker.py` | cli |
+| `test_clio_kit_mcp_contracts.py` | remote_mcp |
+| `test_cluster_config.py` | remote_mcp |
+| `test_contract_gate.py` | remote_mcp |
+| `test_core_queue_split_architecture.py` | browser_gateway |
+| `test_dial_burndown_channel_routing.py` | cli_jarvis_artifact_io, cli_remote_mcp |
+| `test_doctor_and_relay_host.py` | doctor |
+| `test_door_errors.py` | browser_gateway, fastmcp_server, mcp_server |
+| `test_endpoint.py` | remote_mcp |
+| `test_endpoint_service_recovery.py` | cli |
+| `test_endpoint_worker_lanes.py` | cli |
+| `test_execution_watch.py` | remote_mcp |
+| `test_gateway_public_projection.py` | cli, mcp_server |
+| `test_http_api.py` | remote_mcp |
+| `test_identifiers.py` | mcp_server |
+| `test_jarvis_execution_artifacts.py` | mcp_server |
+| `test_jarvis_execution_recovery_guards.py` | remote_mcp |
+| `test_jarvis_lost_response_recovery.py` | remote_mcp |
+| `test_jarvis_pipeline_precheck.py` | remote_mcp |
+| `test_jarvis_run_failure_reporting.py` | remote_mcp |
+| `test_jarvis_service_runtime.py` | browser_gateway, cli, cli_jarvis_mcp, mcp_server, remote_mcp, scheduler_providers |
+| `test_production_admin_surfaces.py` | cli, mcp_server |
+| `test_remote_value_contract.py` | doctor, live_acceptance |
+| `test_scheduler_cancel_attempt_claims.py` | scheduler_providers |
+| `test_scheduler_cancel_refusal_idempotency.py` | scheduler_providers |
+| `test_scheduler_status.py` | scheduler_providers |
+| `test_service_runtime.py` | browser_gateway, cli |
+| `test_surface_pagination.py` | cli, mcp_server |
+| `test_transform_provenance.py` | cli, input_staging, mcp_server |
+| `test_user_profile_content_path.py` | mcp_server |
+| `test_validation_report.py` | remote_mcp |
+| `test_worker_concurrency.py` | cli |
+| `test_worker_lifetime_lock.py` | mcp_server |
+| `test_worker_service_policy.py` | cli |
+
+`test_service_runtime.py` and `test_jarvis_service_runtime.py` are W9's to migrate (below).
+
+### What moves into `adapters/worker/`
+
+263 modules move, unchanged apart from imports, to `src/clio_relay/adapters/worker/<same name>.py`. References to `clio_relay.<name>` are rewritten in `src`, `tests` and `scripts` (imports, monkeypatch targets, `python -m` strings). Remote command strings change from `clio-relay <group>` to `clio-relay worker <group>`.
+
+- `application_profiles`.
+- `bootstrap`, `bootstrap_acceptance`, `bootstrap_candidate_package_sources`, `bootstrap_candidate_uv_install_source`, `bootstrap_constants`, `bootstrap_frp_local_install`, `bootstrap_full_activation_staging`, `bootstrap_jarvis_staging`, `bootstrap_journal`, `bootstrap_one_pass_script`, `bootstrap_pin`, `bootstrap_pinned_copy_sources`, `bootstrap_preparing_root_source`, `bootstrap_provider_build_info`, `bootstrap_receipt_classifier_source`, `bootstrap_receipt_validation`, `bootstrap_reconcile`, `bootstrap_reconcile_activation_paths`, `bootstrap_reconcile_builtin_repos`, `bootstrap_reconcile_constants`, `bootstrap_reconcile_execution_identity`, `bootstrap_reconcile_generation_staging`, `bootstrap_reconcile_inspection`, `bootstrap_reconcile_jarvis_wrapper_binding`, `bootstrap_reconcile_locks`, `bootstrap_reconcile_models`, `bootstrap_reconcile_planning`, `bootstrap_reconcile_planning_support`, `bootstrap_reconcile_primitives`, `bootstrap_reconcile_readiness`, `bootstrap_reconcile_receipt`, `bootstrap_reconcile_replacement_provider`, `bootstrap_reconcile_repository`, `bootstrap_reconcile_script_activation`, `bootstrap_reconcile_script_commit`, `bootstrap_reconcile_script_generation_prepare`, `bootstrap_reconcile_script_recovery`, `bootstrap_reconcile_transaction`, `bootstrap_recovery`, `bootstrap_script_commit`, `bootstrap_script_jarvis_repo_setup`, `bootstrap_script_jarvis_state`, `bootstrap_script_preamble`, `bootstrap_script_provider_install`, `bootstrap_ssh_deploy`, `bootstrap_staged_provider_source`, `bootstrap_worker_fence_script`, `bootstrap_worker_proof_source`.
+- `cli_api`, `cli_cleanup_evidence`, `cli_cleanup_report`, `cli_cluster`, `cli_cluster_deploy`, `cli_endpoint`, `cli_init`, `cli_installation_receipt`, `cli_owned_relay_jobs`, `cli_owned_relay_jobs_remote_listing`, `cli_owned_report_artifact`, `cli_owned_runtime_cleanup`, `cli_owned_scheduler_cancel`, `cli_owned_session_recovery`, `cli_owner_session_teardown_verify`, `cli_queue`, `cli_queue_maintenance`, `cli_relay_host`, `cli_remote_collection_pagination`, `cli_remote_worker_attach`, `cli_remote_worker_probe`, `cli_scheduler`, `cli_session`, `cli_session_attach`, `cli_session_owned`, `cli_session_start`, `cli_session_teardown`, `cli_session_teardown_action`, `cli_session_teardown_finalize`, `cli_session_teardown_jobs`, `cli_session_teardown_recovery`, `cli_session_teardown_report`, `cli_session_teardown_state`, `cli_support`, `cli_transport_validation`, `cli_worker`.
+- `cluster_probe`.
+- `core_queue`.
+- `deployment`, `deployment_activation`, `deployment_ssh`, `deployment_unit`.
+- `door_error_adapters`, `door_error_messages`, `door_errors`.
+- `endpoint`, `endpoint_execution_cleanup_actions`, `endpoint_execution_lifecycle`, `endpoint_execution_output`, `endpoint_execution_sidecar_cleanup`, `endpoint_jarvis_dispatch`, `endpoint_jarvis_recovery`, `endpoint_jarvis_recovery_bookkeeping`, `endpoint_jarvis_recovery_query`, `endpoint_job_execution`, `endpoint_owner_session_sweep`, `endpoint_progress_ingest`, `endpoint_progress_log_io`, `endpoint_progress_trust`, `endpoint_recovery_directory`, `endpoint_result_finalization`, `endpoint_runtime_metadata_ingest`, `endpoint_runtime_metadata_persist`, `endpoint_runtime_sidecar_anchor`, `endpoint_runtime_sidecar_failure`, `endpoint_scheduler_cancel`, `endpoint_scheduler_cancel_actions`, `endpoint_scheduler_metadata`, `endpoint_scheduler_submission`, `endpoint_scheduler_submission_reconcile`, `endpoint_serve_loop`, `endpoint_service_status`, `endpoint_sidecar_types`, `endpoint_windows_sidecar_handles`, `endpoint_worker_environment`, `endpoint_worker_lanes`.
+- `frpc_proxy_bringup`, `frpc_proxy_receipt`, `frpc_proxy_scripts`, `frpc_unit`.
+- `http_api`, `http_api_auth`, `http_api_context`, `http_api_error_handlers`, `http_api_middleware`, `http_api_models`, `http_api_owner_session_lease_renewal`, `http_api_queue_paging`, `http_api_redaction`, `http_api_routes_artifacts`, `http_api_routes_events`, `http_api_routes_gateway`, `http_api_routes_jobs`, `http_api_routes_owner_session_admin`, `http_api_routes_queue`, `http_api_routes_scheduler`, `http_api_routes_session`, `http_api_routes_worker_probe`, `http_api_streaming`.
+- `jarvis_dispatch_failure`, `jarvis_execution`, `jarvis_execution_artifacts`, `jarvis_pipeline_precheck`, `jarvis_run_environment`.
+- `job_terminal_verdict`.
+- `owned_session_record`.
+- `progress_adapters`.
+- `queue_admission_simulation`, `queue_admission_snapshot`, `queue_artifact_lineage`, `queue_artifacts`, `queue_browser_attachments`, `queue_context`, `queue_diagnosis`, `queue_diagnosis_constants`, `queue_endpoints`, `queue_events`, `queue_execution_cleanup`, `queue_execution_cleanup_markers`, `queue_gateway_indexes`, `queue_gateways`, `queue_gc_storage`, `queue_idempotency`, `queue_index_discovery`, `queue_index_migration`, `queue_index_state`, `queue_input_ingest`, `queue_jarvis_inputs`, `queue_job_gc`, `queue_job_gc_protections`, `queue_jobs`, `queue_layout`, `queue_lease_admission`, `queue_lease_capacity_audit`, `queue_lease_capacity_state`, `queue_lease_indexes`, `queue_lease_records`, `queue_lease_recovery`, `queue_leases`, `queue_legacy_audit`, `queue_legacy_output_audit`, `queue_legacy_output_codec`, `queue_legacy_output_migration`, `queue_listing`, `queue_management`, `queue_monitor_rules`, `queue_order_index`, `queue_owner_session_lease`, `queue_owner_session_lifecycle`, `queue_owner_session_records`, `queue_progress`, `queue_scheduler_cancel_claims`, `queue_scheduler_cancel_records`, `queue_scheduler_cancel_state`, `queue_stale_recovery`, `queue_startup`, `queue_store_lock`, `queue_store_read`, `queue_store_write`, `queue_tasks`, `queue_transitions`, `queue_validation`, `queue_worker_capacity`, `queue_worker_status`.
+- `remote_channel_dispatch`, `remote_connection`, `remote_connection_lease`, `remote_connection_registry`, `remote_connection_stream_io`.
+- `retention`.
+- `scheduler_status`, `scheduler_validation`.
+- `session_api_readiness`, `session_attach`, `session_cleanup_execution`, `session_cleanup_reporting`, `session_cleanup_targets`, `session_install_identity`, `session_lifecycle`, `session_lifecycle_report`, `session_process_scope`, `session_recovery_attempt_status`, `session_recovery_cleaned_receipt`, `session_recovery_cleanup_receipt`, `session_recovery_inspection`, `session_recovery_lease_projection`, `session_remote_command`, `session_remote_scripts`, `session_start_attempt_validation`, `session_start_execution`, `session_start_execution_core`, `session_start_identity_challenge`, `session_start_promotion`, `session_start_query`, `session_start_wait`, `session_startup_receipt`, `session_transaction`, `session_validation`.
+- `storage_managed_queue`, `storage_managed_queue_admission`, `storage_managed_queue_leasing`, `storage_runtime`, `storage_runtime_core`, `storage_runtime_errors`.
+- `transport_probe`, `transport_probe_evidence`, `transport_probe_primitives`, `transport_probe_remote_cleanup`, `transport_probe_remote_cleanup_models`, `transport_probe_remote_script`, `transport_probe_session_lifecycle`.
+- `worker_concurrency`, `worker_lifetime_lock`, `worker_runtime_verification`.
+
+**RL39 files, moved as they are.** `bootstrap_reconcile_builtin_repos.py` and every module that holds the `managed_builtin_repo_registered` receipt validation move with no change in behaviour. Their new paths are:
+
+- `src/clio_relay/adapters/worker/bootstrap_reconcile_builtin_repos.py`;
+- `src/clio_relay/adapters/worker/bootstrap_receipt_validation.py`;
+- `src/clio_relay/adapters/worker/bootstrap_reconcile_execution_identity.py`;
+- `src/clio_relay/adapters/worker/bootstrap_reconcile_inspection.py`;
+- `src/clio_relay/adapters/worker/bootstrap_reconcile_models.py`.
+
+W1 changes them after this branch merges.
+
+**`core_queue` moves** because the execution plan names it. W9 imports it in two places, which need an import-only change (below).
+
+### What stays at the top level
+
+120 modules stay where they are. They are either imported directly by a W9 file, so W9 needs no edit, or reached by both W9 and the worker:
+
+- ``.
+- `acceptance_facts`.
+- `actions_artifact`.
+- `application_runtime_prediction`, `application_verdict`.
+- `artifact_identity_verification`.
+- `bounded_payload`, `bounded_process`.
+- `branch_protection`.
+- `candidate_provenance`.
+- `ci_run_status`, `ci_validation`.
+- `cluster_config`, `cluster_config_io`, `cluster_config_models`, `cluster_config_registry`, `cluster_config_windows_acl`, `cluster_config_windows_guard`, `cluster_config_windows_paths`, `cluster_config_windows_primitives`, `cluster_config_windows_read_verify`.
+- `command_evidence`.
+- `component_runtime_identity`, `component_verification_remote`.
+- `config`.
+- `console_stream`.
+- `contract_gate`.
+- `control_channel`.
+- `dev_mode`.
+- `distribution_archive`, `distribution_source_identity`.
+- `durable_validation_write`.
+- `errors`.
+- `execution_watch`, `execution_watch_prediction`.
+- `filesystem_paths`.
+- `identifiers`.
+- `installation`, `installation_receipt_models`.
+- `jarvis_mcp`, `jarvis_provider`.
+- `job_identity`.
+- `lock_holder_sidecar`.
+- `models`, `models_artifact_provenance`, `models_enums`, `models_jarvis_package`, `models_jarvis_pipeline`, `models_job`, `models_job_specs`, `models_job_telemetry`, `models_mcp_admission`, `models_owner_session_lease`, `models_scheduling`, `models_shared`.
+- `native_jarvis_contract`.
+- `owner_session_admission`.
+- `pagination`.
+- `payload_policy`.
+- `persistent_uv_tool_probe`.
+- `process_ancestry`, `process_containment`, `process_containment_broker`, `process_containment_broker_script`, `process_containment_environment`, `process_containment_popen`, `process_containment_posix`, `process_containment_recorded`, `process_containment_registry`, `process_containment_spawn`, `process_containment_systemd_core`, `process_containment_systemd_query`, `process_containment_systemd_scope`, `process_containment_termination`, `process_containment_types`, `process_containment_windows`.
+- `progress_provenance`.
+- `provenance_primitives`.
+- `public_records`.
+- `python_distribution_probe`.
+- `redaction`.
+- `regular_file_identity`.
+- `relay_host`, `relay_ops`.
+- `release_assets`, `release_gate_evaluation`, `release_gate_resources`, `release_gate_targets`, `release_identity`.
+- `remote_cli`, `remote_values`.
+- `runtime_metadata`, `runtime_metadata_coercion`, `runtime_metadata_core_model`, `runtime_metadata_mcp_normalize`, `runtime_metadata_merge`, `runtime_metadata_native_documents`, `runtime_metadata_native_normalize`, `runtime_metadata_native_validators`, `runtime_metadata_sidecar`, `runtime_metadata_types`.
+- `session_api`, `session_wire_models`.
+- `spack_transition_checks`.
+- `spool`.
+- `storage_file_io`, `storage_ledger_codec`, `storage_policy`, `storage_policy_types`, `storage_reservation_ledger`, `storage_snapshot`.
+- `uv_tool_receipt`.
+- `validation_directory_windows`, `validation_limits`, `validation_recorder`, `validation_report`, `validation_report_assets`, `validation_schema`, `validation_writer_lock`.
+- `wheel_record_closure`.
+
+### Cuts in kept code
+
+Kept modules that import a deleted one. Each import is removed, or replaced with the new path:
+
+- `endpoint_job_execution` and `job_terminal_verdict` use `mcp_call_result_error`. The `mcp_call` job kind goes, together with `McpCallSpec` and its fields in `models`.
+- `endpoint_jarvis_recovery`, `http_api_routes_jobs`, `jarvis_mcp`, `queue_tasks` and `session_api` use `remote_mcp`. The pinned control-query admission they need stays in the worker. The federation parts go.
+- `queue_browser_attachments` uses `browser_gateway`, for one record type. The type moves into the queue module.
+- `queue_validation` uses seven `live_validation_*` modules. That validation entry point goes.
+- 13 modules use `scheduler_providers`: `cli_endpoint`, `cli_owned_scheduler_cancel`, `cli_queue_maintenance`, `cli_scheduler`, `endpoint`, `endpoint_scheduler_cancel_actions`, `endpoint_scheduler_submission`, `endpoint_worker_environment`, `http_api_routes_scheduler`, `http_api_routes_worker_probe`, `jarvis_provider`, `scheduler_status` and `scheduler_validation`. RL18 replaces it with `psij-python`, which is already pinned. The worker submits, polls and cancels through psij's batch executors, with the job name `relay-<operation_id>` so `find` works after a restart.
+- 20 old `cli_*` modules import helpers from the old `cli` root. The helpers move into the worker's command line.
+
+The routes that only the old tools used go with them. These are gateway sessions, monitor rules, retention, queue diagnose, stale and cleanup, `/workers`, task events, progress recording and artifact lineage. The worker link keeps health, session identity and status, storage status, quiesce, admission status, worker and target info, job submit, status, get and cancel, logs, artifacts and input ingest.
+
+### LQ32 scope
+
+LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `scheduler_providers`. Today they appear in about 112 files outside the deletion list, mostly tests and the `mcp_call` job kind in the endpoint, queue and models. W8 removes them all from `src`, `tests`, `jarvis-packages`, `scripts`, `.github` and the user docs. The design docs under `docs/design/` and the dated validation notes under `docs/ai/` keep the names, because they record the history. Assumption: LQ32 reads the shipped tree and the user docs, not the design record.
+
+Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` were held, because W9's runtime still imported them. W9 dropped those imports at 5a01766. W8 merged W9's branch at that commit (91bcc3c), so the deletion could go ahead, and deleted the three groups with their tests (ba5ad4b). Nothing in `src`, `tests`, `jarvis-packages` or `scripts` imports them now. The worker's scheduler module is imported as `worker_scheduler`.
+
+Still to clear for LQ32, in a follow-up on this branch:
+- the `browser_gateway_overloaded` code and its adapter in `door_errors`;
+- the `mcp_call` job kind (`models_enums`, `models_job_specs`, and W9's `jarvis_service_runtime_validation`);
+- the `virtual_*_mcp_call` release-gate roles;
+- comments in W1's scripts;
+- the user docs (`architecture`, `mcp-tasks`, `operations`, `release-acceptance-1.0`). README is W1's.
+
+### clio-schemas
+
+Kept. This corrects the inventory, which said dropped. `jarvis-packages/clio_relay/clio_relay/remote_agent/runner.py:16` imports `ArtifactKind`, `ArtifactVersion`, `Custody`, `IdentityEvidence` and `Mechanism` from it, and `remote_agent` stays on the worker. Nothing in `src/` imports it. The schema-equality fixtures and their tests (`test_clio_schemas_convergence.py`, `test_schema_equality.py`) are deleted, because they compared relay's records with CLIO's schema package. So `clio-schemas==0.2.1` stays in `pyproject.toml`, and the earlier request to W1 to remove it is withdrawn. Dropping it needs `remote_agent` to stop using those five types.
+
+### The process-containment tests
+
+They do not go with the old surface. `process_containment*` is kept, because `bounded_command` and `remote_agent` use it on the worker, so `test_process_containment.py` and `test_storage_process_guard.py` stay.
+
+The cause is not random. The capability probe (`process_containment_systemd_scope.py:52-112`) runs `systemd-run --user --scope` once. On a compute node it succeeds only while some session of the same user keeps a user manager there, and the later spawn can then fail with "Failed to connect to bus". The develop baseline shows the same cause in the endpoint activation tests: `mkdir: cannot create directory '/run/user/1008': Permission denied` (9 failures).
+
+Decision: run them where a user manager exists. On Ares that is the login node, which has linger and a stable user bus, and where W1 measured 43 of 43 in 3 runs out of 3. The worker's endpoint service runs there too. W8's gate runs these modules on the login node, and runs the rest of the full suite in Slurm, so nothing is skipped and nothing is rerun to pass.
+
+### Develop's pre-existing failures
+
+develop 034117b on a compute node gives 139 failed and 3 errors, which is 142 node ids (`~/clio-relay-rework/w1-base.log`). By what W8 does to their file:
+
+| Their file | Node ids | Files |
+| --- | --- | --- |
+| Kept, edited | 116 | `test_doctor_and_relay_host.py` (50), `test_endpoint.py` (20), `test_execution_watch.py` (8), `test_scheduler_cancel_attempt_claims.py` (7), `test_bootstrap_cluster_paths.py` (5), `test_scheduler_cancel_refusal_idempotency.py` (5), `test_http_api.py` (4), `test_endpoint_worker_lanes.py` (3), `test_service_runtime.py` (3), `test_validation_report.py` (3), `test_worker_service_policy.py` (2), `test_bootstrap_fast_path.py` (1), `test_cli_queue_maintenance.py` (1), `test_jarvis_execution_recovery_guards.py` (1), `test_scheduler_status.py` (1), `test_worker_concurrency.py` (1), `test_worker_lifetime_lock.py` (1) |
+| Moved | 11 | `test_jarvis_recovery_scheduling.py` (3), `test_endpoint_bounded_reads.py` (2), `test_jarvis_handle_first_admission.py` (2), `test_control_query_admission.py` (1), `test_frpc_proxy_scripts.py` (1), `test_owner_session_lease.py` (1), `test_queue_validation.py` (1) |
+| Deleted | 14 | `test_mcp_server.py` (7), `test_release_acceptance_runbook.py` (3), `test_release_command_stream.py` (2), `test_mcp_stdio_validation.py` (1), `test_remote_mcp.py` (1) |
+| Kept as is | 1 | `test_wheel_record_closure.py` (1) |
+
+- The 14 in deleted files are retired by the deletion.
+- The 116 in edited files, the 11 in moved files and the 1 in `test_wheel_record_closure.py` stay. Their causes are the missing user manager on compute nodes (`/run/user/1008`, 9), old bootstrap receipt binding to clio-kit and jarvis artifacts, the uv version pin (`0.13.9` against `0.11.28`, 3), and the endpoint activation fixture outcomes (`preflight-unverified`, about 35).
+- W8 reruns them after the move. A failure that remains in a test of kept code is fixed or reported, not skipped.
+
+### The worker adapter
+
+- **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]` (`adapters/worker/adapter.py`). The config keys are:
+  - `ssh_profile`, the Host in `~/.ssh/config` used for sign-in and placement (the key W11's catalog entries use), and `ssh_config_file`;
+  - `scheduler`, `auto` or a psij executor name;
+  - `work_dir` and `remote_dir`;
+  - `rendezvous`: `address`, `port`, `protocol` (`tcp`, `websocket` or `wss`), `site_address`, `site_port`, `token_env` and `token_file`;
+  - `relay_wheel` or `relay_requirement`, `site_frpc`, `python` and `submit_timeout_s`.
+- **Placement.** In the one ssh pass relay installs itself in a private directory on the site, writes the worker's identity and starts `clio-relay worker site-serve` detached. That process serves the owned-session API on loopback and holds an frpc `stcp` proxy to the rendezvous. Relay reaches it over the one held link (`brokered_tcp`), and nothing uses SSH after that. `worker-link.json` (0600) in the adapter's state directory lets a restarted relay reconnect over frp without SSH.
+- **Verbs.** Each verb is one POST to the worker's `/adapter` routes. On the site the verbs run through the `local` adapter, so scheduler coverage is psij's (RL18), and a refusal on the site comes back as the same typed refusal.
+  - `describe`, `run`, `status`, `cancel`, `find` and `files` (`WorkerFileAccess`, `adapters/worker/files.py`).
+  - `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)` follows W1's exec contract: with no `timeout_s` it runs until the command ends, and stall progress comes from the site's polls.
+  - `serve` is `return await clio_relay.serve.start_for(self, spec, operation_id=operation_id)`, with a lazy import. Without the serve runtime it refuses `verb_not_implemented`.
+- **Sign-in (LQ10, LQ11).**
+  - `sign_in_needed()` returns `SignInNeed(provider="ssh", url=None, ...)` while the link is down.
+  - The adapter calls `askpass.register_sign_in(site_id, starter)`. The starter runs placement and the connect over ssh with `clio_relay.asks.askpass.environment(site=, operation_id=, title=)` and `BatchMode=no`.
+  - Deviation from W6's "close stdin": the connect pipes the placement script to the remote shell over ssh's stdin. Under `SSH_ASKPASS_REQUIRE=force` ssh never reads a prompt answer from stdin, so the prompt still goes to askpass. LQ10 and LQ11 passed this way.
+  - When W6 is not installed, a local stub with the same signatures stands in.
+- **The hop for W9.** `WorkerAdapter.hop_exec(command, *, timeout_s=None, max_output_bytes, on_stall=None) -> ExecResult` runs one command on the worker's host (the login side) over the held link, with the exec contract above. There is no ssh. Long-running service processes go through `run(spec)`. Service bytes stay on W9's frp connector and visitor.
+- **Operator commands (RL3).** `clio_relay.adapters.worker.cli:worker_app`, a Typer app mounted as `clio-relay worker`. Its groups are `endpoint`, `relay-host`, `cluster`, `api`, `session`, `queue` and `scheduler`. Its commands are `status`, `init`, `install-frp` and `installation-*`, and the hidden `bootstrap-inspect`, `jarvis-runtime-authority` and `site-serve`. The old `agent`, `job`, `monitor`, `gateway`, `jarvis`, `remote-mcp`, `storage`, `release`, `live-test` and `diagnostics` groups go. Their verbs are the new surface's `run`, `exec`, `files` and `describe`.
+- **Not covered by LQ4: wss.** The frpc config writer has no custom-CA option, so the fixture's self-signed wss endpoint cannot be trusted. LQ4 ran over tcp. A wss rendezvous with a public certificate needs no change.
+
+### Changes made during the move
+
+Fixes and edits beyond the mechanical move, in commit order:
+
+- **safe_archive.** The deletion list included `safe_archive.py`, but the bootstrap remote script imports it from a string. It is restored byte for byte as `adapters/worker/safe_archive.py`, with `tests/test_safe_archive.py` (1d1a900). A sweep for string references to deleted modules found no other real caller.
+- **The bootstrap candidate overlay.** It was flat and keyed by file name. Its keys are now paths under the candidate `clio_relay` package (`adapters/worker/X.py`), with `extend_path` inits for `adapters/` and `adapters/worker/`. The writer refuses absolute paths, `..` and symlinked parents. The overlay was never self-contained, even at base: it relies on `extend_path` falling back to the installed package (1d1a900).
+- **`package_source_root`** in `bootstrap.py` used `parents[2]`, the repo root before the move. It is `parents[4]` now (9a88f8c).
+- **The worker command prefix.** The bootstrap preamble and the readiness probe call `clio-relay worker endpoint worker-info`, and fall back to the unprefixed command for a relay placed before the move (2e223de). `test_bootstrap_fast_path` counts both.
+- **`jarvis_mcp.py`** no longer imports `remote_mcp`. It keeps the contract, the artifact checks and its own `server_artifact_digest`. The virtual JARVIS tools and the MCP server builders went with the old surface (8dd5260).
+- **Scheduler seams.** `http_api_routes_scheduler`, `test_cli`, `test_cli_endpoint`, `test_cli_scheduler` and the two scheduler-cancel tests use `clio_relay.adapters.worker.scheduler`, not the held `scheduler_providers` (80ebdaa).
+- **GC purge** kept one open descriptor per directory level, so trash deeper than `ulimit -n` could never be purged (EMFILE at 1024, the soft limit on Ares login and compute nodes). It keeps only the current parent open now. Each level is still opened with `O_NOFOLLOW` relative to its parent. This defect predates the move; `test_gc_purge_is_iterative_and_detects_directory_swap_races` fails the same way on base ee1a845 (140b02f).
+- **Tests.**
+  - The patch-seam guard (`test_cli_patch_seam.py`) knows both packages. 23 audited pairs went with their callers or owners, so its counts go from 61/32 to 38/18 (531053b).
+  - 15 test files import `worker_app as app`.
+  - Tests of removed commands are deleted: `job`, `gateway`, `storage`, `live-test` and `scheduler validate-lifecycle`.
+  - `test_ci_clio_kit_wheel.py` drops its three checks of the old ci and release steps. Its pin checks stay.
+  - `test_core_queue_split_architecture` accepts `clio_relay.adapters.worker` as an owner package. `queue_validation` leaves its non-owner lists. The `queue_startup` import budget goes from 550 to 552, for the two import lines the move wraps.
+  - `test_door_errors` expects 61 HTTP statuses, not 64. `jarvis_dispatch_refused`, `execution_not_found`, `mcp_submission_conflict` and `mcp_admission_refused` went with their routes.
+  - `test_bootstrap` disables commit signing for its scratch commits (46751cd). Ares sets `commit.gpgsign=true`, and gpg fails in Slurm.
+- **The bootstrap build-info line.** The payload template wrapped the `BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO` assignment across a swallowed line break, so bash ran the path as a command. Found by a live bootstrap on fx-slurm. It is assigned through `BOOTSTRAP_CANDIDATE_WORKER` now, with a regression test that every shell variable is assigned on its own line (dd1352c).
+- **The route-revision warning** in `cli_cluster` told the person to refresh remote MCP, which is gone. It is removed with its 3 tests (dd1352c, af85a62).
+- **The held modules.** `remote_mcp*`, `scheduler_providers/` and `browser_gateway*` are deleted after merging W9 at 5a01766 (91bcc3c, ba5ad4b). Test edits:
+  - `test_scheduler_status`: 26 old provider, connector and registry tests deleted; the selection and JARVIS isolation checks run against `adapters.worker.scheduler`.
+  - `test_door_errors`: the 3 browser gateway tests deleted.
+  - `test_validation_report`: the 3 remote MCP tests deleted.
+  - `test_ci_clio_kit_wheel`: the certification pin test deleted.
+  - `test_clio_kit_mcp_contracts`: 4 contract tests deleted; the 3 install receipt tests stay.
+  - `test_contract_gate`: imports `adapters.worker.clio_kit_constants`.
+  - `test_cluster_config`: the two cache-path tests check only the registry path now.
+- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` and `browser_gateway.py` entries. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: the baseline goes 7498 to 5583 (89fd6c8), then to 5076.
+- **W9's tests (import-only edits, and prunes that let them collect).** `test_service_runtime`, `test_jarvis_service_runtime` and `test_frp_transport_dials` import the moved modules from `adapters.worker`. 15 tests in `test_jarvis_service_runtime` are deleted, with the helper `_owner_token_values`. The first drove `cli_jarvis_mcp` and the rest drove `mcp_server`:
+    - `test_hidden_relay_authority_command_emits_one_private_json_document`
+    - `test_model_facing_mcp_projection_redacts_runtime_bearer_token`
+    - `test_verified_jarvis_wait_preserves_public_bearer_fingerprint`
+    - `test_jarvis_authorization_restore_rejects_non_public_descriptors`
+    - `test_arbitrary_mcp_cannot_expose_jarvis_shaped_authorization`
+    - `test_waited_execution_exposes_compact_verified_binding_before_large_result`
+    - `test_generic_mcp_wait_serializes_verified_result_before_bulk_evidence`
+    - `test_async_relay_wait_exposes_same_compact_verified_service_binding`
+    - `test_ssh_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_owned_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_multiple_ready_services_have_exact_unchanged_bindings`
+    - `test_bind_rejects_mixed_or_invalid_handoff_forms`
+    - `test_agent_bind_persists_urls_and_rejects_runtime_commands`
+    - `test_agent_bind_pending_replays_same_gateway_and_connector_intents`
+    - `test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission`
+
+### Gate evidence
+
+On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) was clean and touched no worker file.
+
+- **LQ4 (`worker`).** The conformance kit in `tests/worker` passed 11 of 11 with no skips. It ran on the login node against fx-slurm over a tcp rendezvous, with a fresh remote directory and the wheel built at that commit (sha256 `b81d0726206f…`). The kit includes the new exec-without-limit test and the `verb_not_implemented` checks.
+- **LQ10 and LQ11.** Passed on fx-otp through W6's askpass interface: the sign-in ran as asks, and the link came up with no terminal (`op_6774ddf180e7bcf14383b593`).
+- **Bootstrap.** A live `clio-relay worker cluster bootstrap` on fx-slurm gets past the overlay. It then fails exactly as base ee1a845 does: `systemctl: command not found`, and then "bootstrap existing executable digest changed" for `~/.local/bin/uv`. Another workstream put uv 0.13.9 there, and the bootstrap pins 0.11.28 and refuses to adopt it. No fixture has a systemd user manager, so a full bootstrap cannot finish on one. What this proves is that the moved bootstrap behaves like base.
+- **The process-containment modules** (the six that need a user manager) passed 170 of 170 on the login node at af85a62.
+- **Targeted modules** (17 files: the edited tests plus the cli, scheduler, http api, service runtime and patch-seam modules) ran in Slurm (job 27799). 13 tests failed, all of them in develop's 142, so none are new: 12 in the two scheduler-cancel files ("relay-managed JARVIS installation receipt does not match this worker"), and `test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks`, which fails because the compute node has no user manager.
+- **pyright.** 5076 errors, under the 5583 baseline, measured with `uv run` at 8b34a44. The baseline is lowered to match. Run without the venv active, the count is 8987, because imports do not resolve then. That is a measuring mistake, not a regression.
+- **The full suite** runs once in Slurm at the request commit. Its result and the develop failures it retires go here when it ends.
+
+### Workflows
+
+There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `live-validation-attest`, `main-provenance`, `release-gate`, `release`, `released-validation-attest` and `stage-candidate`. `ci` is rewritten to run `uv run ruff check`, `uv run ruff format --check`, `uv run pyright` and `uv run pytest` on the new tree. `release` is reduced to building and publishing the wheel. The other six only served the old release gate, which reads the deleted `release_*`, `live_validation*` and `promotion_record` modules, so they are deleted. Neither workflow is enabled or waited on.
+
+### Requests to other owners
+
+- **W9.**
+  - Done: W9 dropped its imports of the held modules (5a01766), and W8 deleted them (ba5ad4b). `BrowserAttachmentRecord` now has one definition, `adapters/worker/browser_attachment_record.py`, and nothing calls the `connector-step-*` commands. W8's branch contains W9 at 5a01766, so merging W8 brings it in.
+  - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
+  - `jarvis_service_runtime_validation.py:55` uses the `mcp_call` job kind. LQ32 needs it gone; W8 removes the kind once W9 drops that use.
+  - Test failures in W9's files on this branch, none of them rerun:
+    - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
+    - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list.
+- **W1.**
+  - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
+  - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
+- **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
+- **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
+
 ## W9. serve
+
+Branch `jaimecernuda-relay-rework-w9`; the commit sent to W1 is named in the report to the coordinator. Rows: RL19 to RL23, LQ12 to LQ15, the service half of LQ-L1, and LQ-L11. It feeds RL43 and RL45. Host page: [docs/rendezvous-host.md](../rendezvous-host.md).
+
+Files: `src/clio_relay/serve/` (config, plan, frp, forward, desktop, mount, runtime, store, descriptor, provenance, the vendored `schemas/view-descriptor.v1.json`, and `_site/launch.sh` and `_site/hop_proxy.py`, which run on the site), and `tests/serve/`. The old runtime files (`service_runtime*`, `jarvis_service_runtime*`, `models_gateway.py`, `frp_*`) and their tests stay W9's until the old surface goes.
+
+### Published interfaces
+
+- `clio_relay.serve.start_for(adapter, spec: ServiceSpec, *, operation_id) -> Endpoint`. An adapter that declares `serve` returns this from its `serve()` and never reaches into `serve/`. The runtime submits the wrapped job through `adapter.run` and reads it through `adapter.status`. It also uses three optional adapter methods:
+  - `ssh_argv()` and `transport.environment()` (W7) for the `ssh -L` path;
+  - `hop_exec(site, argv)` (W8), or `exec` where there is no `hop_exec`, to start the login hop.
+- The `ServeHook` comes from the `serve` entry point in `clio_relay.hooks` (`clio_relay.serve:factory`):
+  - `start`, `status` and `stop`;
+  - `attach(server, changes)` mounts served MCP servers and announces them with `changes.tools_list_changed()`;
+  - `ui_data(record)` gives `{"ports": {<name>: {"address", "url"?, "secret"?, "secret_env"?}}}`. W1 puts it in the serve result's `_meta["ai.iowarp.relay/service"]`. It is the only place a URL or a secret appears (RL22).
+- The CLI functions: `connect(handle, *, paths)` and `settings(paths, changes)`, behind `clio-relay connect` and `clio-relay rendezvous set|show`.
+- Settings. The file is `rendezvous.json`, found in this order: the `rendezvous_file` hook setting, then `CLIO_RELAY_RENDEZVOUS_FILE`, then `<state>/serve/rendezvous.json`.
+  - `rendezvous`: `address`, `port`, `protocol` (tcp, kcp, quic, websocket, wss), `token_file` or `token_env`, `ca_file`, `server_name`, `frpc`, and `direct` (XTCP first, STCP as the fallback).
+  - Per site, a `serve:` block in the site entry, or the file's `sites`:
+    - `path`: auto, frp or ssh;
+    - `address` and `port`: the rendezvous as the site sees it;
+    - `hop`: none, login or http_proxy, with `proxy_url`, `hop_bind` and `hop_advertise`;
+    - `frpc` or `frpc_binary`, and `python`;
+    - `stop_grace_s`, default 30.
+- In the job, `${CLIO_RELAY_PORT_<NAME>}` in args and env becomes the service's port on the node.
+- Mounted tools are named `<site>_<name>_<tool>`. Their MCP Apps metadata (`_meta.ui`) passes through unchanged.
+- `serve.descriptor`: the view descriptor schema, vendored byte for byte from clio-jarvis a6aba08 (identical at v0.1.0, 2d12dbb), sha256 `8773b9ed…1b076`, with `problems(descriptor)`.
+- `serve.provenance`: the neutral block `relay.provenance.v1` under an artifact's `metadata["provenance"]`, and `for_output(record, output)`. It names nothing CLIO-specific. `models_gateway.ArtifactRef` reads it first and the legacy `clio.provenance.v1` second.
+
+### Decisions
+
+- A service is never exposed publicly. Its frpc runs beside it inside the job and registers an STCP proxy (XTCP too when `direct` is set) with a per-service secret key. The desktop runs the visitor on a loopback port. With no rendezvous host and an adapter that gives `ssh_argv()`, relay forwards with `ssh -N -L` instead, adding `-J` when the job is on a compute node.
+- wss always verifies the certificate: frpc gets `trustedCaFile` (when `ca_file` is set) and `serverName` explicitly. This closes the open item on frpc not verifying the frps certificate.
+- Port protection (RL22): an `http` port must say how it is protected, or validation refuses it. If the port is already in use on the node, launch.sh refuses with exit 98 and names the port. The service that holds it is left alone.
+- Stop (RL23): relay writes a stop file, and launch.sh sends TERM to the service's process group. After `stop_grace_s` it sends KILL. Then it writes `final-artifact.json` and the artifacts list. The outputs are the service's own files plus `serve/{frpc,launch,service}.log`, stdout and stderr. The wrapper's own files, `.relay-package` and the package runner's JARVIS tree are left out, except `.relay-jarvis/shared/`.
+- Durable rebinding (LQ13): frpc logs in again on its own. The visitor rebinds the same local port. The plan, including the secret, is kept in `<state>/serve/plans/`, so a new relay rebinds the same port at startup (from the mount provider's lifespan). The ports of a service whose job has ended close when that operation is next observed.
+- One session (LQ14): the mount holds one client connection to one server instance for the life of the service, checked with W2's `server_instance`.
+- No time limits. Relay sets no duration on a service. The `ssh -L` forward is retried with visible restart lines, and readiness has no deadline.
+- Placement is the caller's choice. The headline driver puts pvserver on the run's node with the custom attribute `slurm.nodelist` and binds it with `lifetime.bound_to`. serve does not choose nodes.
+- Three cuts in the old runtime, approved by the coordinator. The new server has no compatibility path, and 1.6.8 stays on PyPI for the old surface.
+  - The allocation-scoped connector is retired. Starting one refuses and points to serve. Stopping or detaching an old session that has one reports a residual naming the Slurm job and step to `scancel`. The remote `connector-step-*` commands and every caller of them are gone.
+  - Browser attach is gone. Revoke on teardown stays for records an older relay left, through `adapters.worker.browser_attachment_record`.
+  - JARVIS MCP results that came through a registered `remote_mcp` route are refused, because that route came only from the deleted registry.
+- The old runtime no longer imports `browser_gateway`, `scheduler_providers`, `remote_mcp` or the old `cli`. `core_queue` comes from `clio_relay.adapters.worker.core_queue`. Tests of the retired connector, browser attach and the deleted gateway CLI commands were removed, and the rest were migrated.
+
+### Facts
+
+- At protocol 2026-07-28, `notifications/tools/list_changed` reaches a client only on a `subscriptions/listen` stream with `tools_list_changed: true`. A client that never opens one does not see mounts.
+- Ares `/mnt/common` is NFSv3 with a 120 s attribute cache. A file written on one node can stay invisible to `[ -f ]` on another node for up to two minutes; a readdir forces it. launch.sh checks the stop file with `ls`. Reading a growing output from another node can lag, so pvserver goes on the run's node.
+- On Ares, a compute node's sshd sometimes accepts the key and then closes every session ("Connection closed by UNKNOWN port 65535"), even for a plain `ssh ares-comp-03` from the login node. It happened while other short jobs started and ended on the same node under the shared account. The `ssh -L` forward recovered by retrying.
+- `jarvis ppl run` is `start()` then `stop()`, so a package runner that ends in `ppl run` stops a service as soon as it is ready.
+- An Ares venv must be synced again (`uv sync --all-extras`) when the entry points in `pyproject.toml` change. Otherwise a hook falls back to its stub with no message.
+- Strict pyright fails across the whole repository at every point. The count fell from 1940 errors at M1 (719104c) to 1729 on this branch, and no new error is in W9's files.
+
+### Evidence
+
+All runs on Ares from `~/clio-relay-rework/clio-relay-w9` with its own venv. Each is a plain MCP client over stdio to `clio-relay-next serve` at 2026-07-28 on the tasks path, unless marked otherwise. The fixture runs use site fx-slurm (W7's ssh adapter) and W2's frps at 47104. The site and the rendezvous were set with the CLI (`site add`, `rendezvous set`).
+
+- LQ12, `op_7aab27479b5e65d1952ed548`: the serve task reached `working` with "the service is running: web 127.0.0.1:25687". `serve(service=)` returned an endpoint with no URL. The secret and URL were only in `_meta["ai.iowarp.relay/service"]`, and describe carried no secret. `/health` gave 200, `/` without the secret gave 401 and with it 200 (hostname fx-slurm), and a WebSocket echo worked.
+- LQ13, through the surface, `op_cecb10b501c9c394694eb4db`: a scratch frps inside fx-slurm went down for 60 s and came back. The task stayed `working`, and `/health` came back on the same port 127.0.0.1:57819 about 20 s later. The echo worked before and after. An earlier hook-direct run, `op_4563a495…`, gave the same result.
+- LQ14, `op_3b4d3ed48567ff3ed011fbcd`: W2's counter MCP was mounted as `fx-slurm_counter_{count_slowly,increment,read,reset}`. The client heard `tools/list_changed` on its listen stream at mount and again at unmount. Three increments gave 1, 2 and 3, and read gave 3. `server_instance` stayed `34954cbd950d47b28d592c9f5c12cea1` (pid 42974) throughout, while `session_id` changed on every request. After stop, no tools were left under the prefix.
+- LQ15, `op_7aab27479b5e65d1952ed548`: `serve(stop=)` completed with "stopped". The task result listed `final-artifact.json`, `serve/{frpc,launch,service}.log`, stdout and stderr, and the desktop port closed. Whether CLIO shows these as artifacts is the client half.
+- Refusals: an unprotected http port is refused at validation ("port 'web' is http: say how it is protected (RL22)"). `op_e0642d468a4e401aa3d5edd3` failed with exit 98 and "refused: port 33867 (web) was already in use on fx-slurm", and the service holding the port kept running.
+- wss with the fixture CA (`FX_WSS_CA_FILE`, serverName fx-frps), `op_205e6c36b36e94547e5285be`: health 200 and echo. With a wrong CA, `op_c510b58cf681ce1b9ecf5044`: frpc refused ("x509: certificate signed by unknown authority"), the service never reported ready, and the status message named frpc's warning.
+- The login hop through relay's CONNECT proxy, `op_c5aacee8c9db63ba48fd3808`: health and echo worked, and the proxy closed afterwards.
+- `ssh -L` with no rendezvous, `op_8222d02b39b5abe644f900b4`: health and echo worked, and the forward closed afterwards.
+- `clio-relay connect <handle>` against a relay over HTTP printed "web: http://127.0.0.1:64319". The handle's port was already held by relay on the same machine, so connect picked a free one. Health, the secret and the echo passed, and connect's frpc exited on SIGTERM.
+- Relay restart, `op_37114594d3e2ddeb52e47464`: a new relay rebound the same port and secret at startup. `/health` gave 200 before any call, then the echo worked and stop completed.
+- No duration, `op_f03945ba4f85360941a309b9`, Slurm job 27750 on ares-comp-03 (site `ares`, pvserver): relay sent `{"queue_name": "debug"}` and nothing else, so squeue showed the partition's limit, 4-00:00:00. The service read `running` from 2.4 to 12.8 minutes. At 12.8 minutes pvpython rendered through the desktop port (screenshot read: "after 13 min: rendered on ares-comp-03"). Stop gave "completed, stopped", and the port closed afterwards.
+- LQ-L11 and the service half of LQ-L1, on site `ares` over `ssh -L` (Ares has no rendezvous host):
+  - pvserver alone, `op_9c61aa86f5da1a5712ec8801`: clio-jarvis's supervisor ran 2 ranks in persist mode on ares-comp-03 and was ready in about 7 s. Two separate pvpython clients rendered through the loopback port; both screenshots, read, show the wavelet contour captioned "rendered on ares-comp-03". Stop took about 12 s ("stopping: stopped", exit 0). The artifacts included `pv/pvserver-stop.json`, and the port closed afterwards.
+  - The headline chain, run `op_9c7046029b42d2e46b3f0fc8` and serve `op_5cd896ca3eb45c9ca0b74768`: Gray-Scott ran with 4 ranks, L128 and 15000 steps, writing BP5 on ares-comp-03. pvserver was served bound to the run and placed on its node. pvpython followed the growing output with ADIOS2VTXReader reloads at 8, 23, 39 and 54 steps; the screenshots, read, show 4 spots at step 8 and a full pattern at step 54. When the run completed, the bound service ended on its own ("completed, stopped") and the port closed. The agent then listed and read the run directory with `files`.
+- RL45, pvserver as a clio-jarvis package (`clio_jarvis.pvserver` v0.1.0, archive sha256 `43d9c882…f20419`), lowered by W13's `guard.prepare` (w13 6f6ad40 merged into a throwaway tree) on the ssh adapter. serve needed no change.
+  - Slurm 27780: clio-jarvis's contract refused `max_lifetime=0`.
+  - Slurm 27782, with `max_lifetime` 172800: pvserver became ready, then the runner's `jarvis ppl run` stopped it.
+  - The next runs used a runner tail of `jarvis ppl start`, then a wait, with `jarvis ppl stop` on TERM:
+    - Slurm 27783 held about 11 minutes. `serve(stop=)` sent TERM, `ppl stop` ran and pvserver exited 0.
+    - Slurm 27787: two pvpython clients rendered through 127.0.0.1:46691 on ares-comp-03, and the port was closed after stop.
+    - Slurm 27791: the same run, with clean outputs.
+  - The headline chain as a package: run `op_2a7c5f13547423ea0abafd29` (Slurm 27792, ares-comp-03) and serve `op_40c9386b921a742d4823146e` (Slurm 27793), bound to it. The view followed 4 rounds, from step 21 (t 3150) to step 67 (t 10050). The screenshots `follow-op_40c9386b…-1` and `-4`, read, show the pattern evolving. The bound service ended "completed, stopped", and the port was closed after.
+- Regression tests on Ares are in the gate report: `tests/serve`, `tests/relay_next`, `tests/test_service_runtime.py`, `tests/test_jarvis_service_runtime.py` and the `tests/test_frp*` modules, in a venv with all extras.
+
+### Requests to other owners
+
+- **W13:** the package runner must be service-aware. A service package needs `ppl start`, a wait, then `ppl stop` on TERM; an application package keeps `ppl run`. The tail above is proven. It needs a service flag from `_start_service` through `guard.prepare` (W1's interface) or `package_job(service=True)` (W13's file).
+- **W5:** the pvserver contract caps `max_lifetime` and `walltime` at 60 to 172800 s, and `max_lifetime` is required (default 14400). That conflicts with "no hard time limits".
+- **W1:** `OutputRef` has no metadata, so nothing can carry the provenance block yet, and no task progress carries a view descriptor (RL43). `serve.provenance.for_output` and `serve.descriptor.problems` are ready for whoever adds both.
+- **The owners of five non-W9 tests:** `remote_mcp*` is imported only by `test_ci_clio_kit_wheel`, `test_clio_kit_mcp_contracts`, `test_cluster_config`, `test_contract_gate` and `test_validation_report`. Deleting it belongs with them.
+- `scheduler_providers` stays, because W8's `adapters/worker/http_api_routes_scheduler.py` uses it.
+
+### Open
+
+- XTCP direct (`direct: true`) and the `http_proxy` hop are built and unit-tested but not proven live.
+- The service secrets and the frp token reach the job as the input `serve/secrets.env`. launch.sh deletes the job's copy once read, but the staged blob stays in the site's content store (`<remote_dir>/content/cas`), readable by the site account. Removing the blob after the job starts, or staging secrets outside the store, needs the adapter's staging (W7).
+- The `connect` handle carries no frps token. `connect` reads it from the person's own rendezvous setting.
+- W7's cancel did not let launch.sh run its trap. W7 fixed this in 337ca66, which is not yet in integration; it closes when merged. Relay's own stop never depended on it, because it writes the stop file first.
+- `plans/remote-visualization-scope.md` was not available. Its seven questions are answered by RL19 to RL23.
 
 ## W10. Tapis
 

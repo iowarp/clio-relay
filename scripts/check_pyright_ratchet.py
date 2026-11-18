@@ -167,9 +167,15 @@ from typing import Any, NamedTuple
 # cli_remote_worker_attach.py, were repointed at the module that actually
 # holds them now -- removing the one real ``reportAttributeAccessIssue``
 # (a static attribute access on a name that no longer exists on
-# ``clio_relay.cli``) plus one adjacent count movement. Net -2, measured
+# ``clio_relay.adapters.worker.cli``) plus one adjacent count movement. Net -2, measured
 # 7569 -> 7567.
-BASELINE_TOTAL = 7498
+# W8 (relay rework): the old relay_* surface, its tests and the move into
+# adapters/worker took the count from 7498 to 5583, measured on the merged
+# branch at 39f3764.
+# W8: deleting the held remote_mcp, scheduler_providers and browser_gateway
+# modules and their tests, with W9 at 5a01766 and integration at dae2774
+# merged, took it to 5076 (measured with `uv run` at 8b34a44).
+BASELINE_TOTAL = 5076
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

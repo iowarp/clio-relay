@@ -18,7 +18,7 @@ py``, ``cli_remote_worker_probe.py``, ``cli_remote_mcp.py``), two cases:
 Reuses ``tests/test_owned_session_channel.py``'s harness (``_Harness``,
 ``_install``, ``_connect``, ``_definition``, ``_settings``) -- the same
 fake ``http.client.HTTPConnection``/channel-process seam that harness
-already proves a real :class:`~clio_relay.remote_connection.RemoteConnection`
+already proves a real :class:`~clio_relay.adapters.worker.remote_connection.RemoteConnection`
 against, so "zero new dials, requests observed over the held channel" is
 asserted the same way the deployment-gate acceptance test is.
 """
@@ -34,16 +34,15 @@ from typing import cast
 
 import pytest
 
-import clio_relay.cli_owned_relay_jobs as cli_owned_relay_jobs
-import clio_relay.cli_owned_relay_jobs_remote_listing as cli_owned_relay_jobs_remote_listing
-import clio_relay.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
-import clio_relay.cli_remote_mcp as cli_remote_mcp
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.remote_channel_dispatch as remote_channel_dispatch
+import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
+import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
+from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.cluster_config_models import ClusterTargetIdentity
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.models import JobState
 from tests.test_owned_session_channel import (
@@ -79,7 +78,7 @@ def _install_for_channel_dispatch(monkeypatch: pytest.MonkeyPatch, harness: _Har
 
 def _cold_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """No live channel is held for any cluster -- every dispatch cold-falls-back."""
-    from clio_relay.remote_connection import RemoteConnectionRegistry
+    from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 
     monkeypatch.setattr(
         remote_channel_dispatch, "connection_registry", lambda: RemoteConnectionRegistry()
@@ -317,52 +316,6 @@ def test_remote_target_identity_falls_back_to_ssh_when_cold(
     assert len(calls) == 1
     assert calls[0][:2] == ["endpoint", "target-info"]
     assert _fallback_reasons("remote_target_identity")
-
-
-def test_mcp_result_artifact_read_stays_ssh_unconditionally(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """clio-relay#179 review B1: this dial site was DROPPED from the slice --
-    the discovery job carries no owner metadata, so GET /artifacts/{id}/
-    content 403s (resource_ownership_refused) even with a live channel.
-    Proves the ssh path runs unconditionally and no channel is ever
-    consulted, regardless of what the registry holds.
-    """
-    calls: list[list[str]] = []
-
-    def fake_remote(_definition: ClusterDefinition, args: list[str]) -> str:
-        calls.append(args)
-        return json.dumps({"encoding": "base64", "content": "eyJvayI6IHRydWV9"})
-
-    monkeypatch.setattr(remote_cli, "run_remote_clio", fake_remote)
-    monkeypatch.setattr(
-        "clio_relay.cli_jarvis_artifact_io._remote_artifact_records",
-        _fake_remote_artifact_records,
-    )
-    monkeypatch.setattr(
-        "clio_relay.cli_jarvis_artifact_io._decode_artifact_envelope",
-        _fake_decode_artifact_envelope,
-    )
-
-    artifact, payload = cli_remote_mcp._read_remote_mcp_result_artifact(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        _definition(), "job-1"
-    )
-
-    assert artifact["artifact_id"] == "artifact-1"
-    assert b"content" in payload
-    assert len(calls) == 1
-    assert calls[0][:2] == ["job", "read-artifact"]
-    assert _fallback_reasons("read_remote_mcp_result_artifact") == []
-
-
-def _fake_remote_artifact_records(
-    _definition: ClusterDefinition, _job_id: str
-) -> list[dict[str, object]]:
-    return [{"artifact_id": "artifact-1", "kind": "mcp_result"}]
-
-
-def _fake_decode_artifact_envelope(envelope: object) -> bytes:
-    return json.dumps(envelope).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import RelayError
 from clio_relay.models import EndpointRole, RelayTask
 

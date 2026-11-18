@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.models_owner_session_lease import (
     DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
     OwnerSessionLease,

@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
-from clio_relay.cli import app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.http_api import create_app
-from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
     JarvisRunSpec,
@@ -99,46 +95,6 @@ def _assert_exact_page(page: dict[str, Any], record_key: str) -> None:
     assert page["total"] == RECORD_COUNT
 
 
-def _mcp_call(
-    fixture: _PaginationFixture,
-    *,
-    tool: str,
-    arguments: dict[str, object],
-) -> dict[str, Any]:
-    response = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": tool,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        },
-        queue=fixture.queue,
-        settings=fixture.settings,
-        profile="admin",
-    )
-    assert response is not None
-    return cast(dict[str, Any], response["result"]["structuredContent"])
-
-
-def test_cli_pages_more_than_501_job_records(
-    pagination_fixture: _PaginationFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(pagination_fixture.settings.core_dir))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(pagination_fixture.settings.spool_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    runner = CliRunner()
-    commands = {
-        "tasks": ["job", "tasks", pagination_fixture.job_id],
-        "artifacts": ["job", "list-artifacts", pagination_fixture.job_id],
-        "progress": ["job", "progress", pagination_fixture.job_id],
-    }
-    for record_key, command in commands.items():
-        result = runner.invoke(app, [*command, "--cursor", "501", "--limit", "2"])
-        assert result.exit_code == 0, result.output
-        _assert_exact_page(json.loads(result.output), record_key)
-
-
 def test_http_pages_more_than_501_job_records(
     pagination_fixture: _PaginationFixture,
 ) -> None:
@@ -150,83 +106,3 @@ def test_http_pages_more_than_501_job_records(
         )
         assert response.status_code == 200
         _assert_exact_page(response.json(), record_key)
-
-
-def test_mcp_pages_more_than_501_job_records(
-    pagination_fixture: _PaginationFixture,
-) -> None:
-    for record_key, tool in (
-        ("tasks", "relay_list_tasks"),
-        ("artifacts", "relay_list_artifacts"),
-        ("progress", "relay_list_progress"),
-    ):
-        page = _mcp_call(
-            pagination_fixture,
-            tool=tool,
-            arguments={
-                "job_id": pagination_fixture.job_id,
-                "cursor": 501,
-                "limit": 2,
-            },
-        )
-        _assert_exact_page(page, record_key)
-
-
-def test_sparse_job_filters_return_empty_source_page_with_next_cursor(
-    pagination_fixture: _PaginationFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    expected: dict[str, object] = {
-        "jobs": [],
-        "source_cursor": 2,
-        "source_limit": 500,
-        "source_next_cursor": 502,
-        "source_total": RECORD_COUNT,
-    }
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(pagination_fixture.settings.core_dir))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(pagination_fixture.settings.spool_dir))
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "local")
-    cli_result = CliRunner().invoke(
-        app,
-        [
-            "queue",
-            "list",
-            "--cluster",
-            "sparse-match",
-            "--state",
-            "succeeded",
-            "--cursor",
-            "2",
-            "--limit",
-            "500",
-        ],
-    )
-    assert cli_result.exit_code == 0, cli_result.output
-    cli_page = json.loads(cli_result.output)
-    assert {key: cli_page[key] for key in expected} == expected
-
-    client = cast(Any, TestClient(create_app(pagination_fixture.settings)))
-    http_response = client.get(
-        "/queue",
-        params={
-            "cluster": "sparse-match",
-            "state": "succeeded",
-            "cursor": 2,
-            "limit": 500,
-        },
-    )
-    assert http_response.status_code == 200
-    http_page = http_response.json()
-    assert {key: http_page[key] for key in expected} == expected
-
-    mcp_page = _mcp_call(
-        pagination_fixture,
-        tool="relay_queue_list",
-        arguments={
-            "cluster": "sparse-match",
-            "state": "succeeded",
-            "cursor": 2,
-            "limit": 500,
-        },
-    )
-    assert {key: mcp_page[key] for key in expected} == expected

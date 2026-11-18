@@ -46,7 +46,7 @@ from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_remote_scripts import remote_stop_script as _remote_stop_script
 from clio_relay.jarvis_service_runtime import reverify_jarvis_service_runtime
 from clio_relay.models import GatewaySession, GatewaySessionState, ServiceRuntimeSpec, utc_now
-from clio_relay.scheduler_providers import provider_for_scheduler
+from clio_relay.service_runtime_scheduler_names import canonical_scheduler
 
 
 class _ServiceRuntimeStartMixin:
@@ -75,9 +75,9 @@ class _ServiceRuntimeStartMixin:
             raise ConfigurationError(
                 "owner_session_admission_id requires owner_session_id and generation"
             )
-        scheduler_provider = provider_for_scheduler(spec.scheduler)
-        if scheduler_provider.name != spec.scheduler:
-            spec = spec.model_copy(update={"scheduler": scheduler_provider.name})
+        scheduler_name = canonical_scheduler(spec.scheduler)
+        if scheduler_name != spec.scheduler:
+            spec = spec.model_copy(update={"scheduler": scheduler_name})
         self.queue.initialize()
         owner_metadata: dict[str, object] = {
             "owner": "clio-relay",

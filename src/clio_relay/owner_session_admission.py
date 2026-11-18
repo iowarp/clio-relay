@@ -13,12 +13,12 @@ from typing import cast
 from filelock import FileLock
 from pydantic import ValidationError
 
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import status_remote_session
 from clio_relay.cluster_config import ClusterDefinition, default_registry_path
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import RelayError
 from clio_relay.models import OwnerSessionClosure
 from clio_relay.remote_cli import run_remote_clio, should_execute_on_cluster
-from clio_relay.session_lifecycle import status_remote_session
 
 SessionStatusReader = Callable[..., dict[str, object]]
 AdmissionStatusReader = Callable[..., dict[str, object]]

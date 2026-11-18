@@ -113,16 +113,9 @@ def job_owned_by_session(
     already-authorized-by-construction lookup) must apply -- promoted out
     of ``RelayApiContext.owns_job`` (the door's own owned-resource
     boundary, ``http_api_context.py``, now a thin wrapper over this
-    function) so clio-relay#278's ``resolve_jarvis_run_owner_by_
-    execution_id`` can filter scan candidates by the SAME rule before its
-    exactly-one-owner check, at the MCP tool and CLI surfaces too, not just
-    the door. Without this, a second owner session's job that happens to
-    match the same bare execution_id (``jarvis_execution_artifacts.
-    _is_jarvis_run`` matches any admitted ``jarvis_run`` spec, trusted or
-    legacy) silently 404s the FIRST session's own, legitimately-owned
-    artifacts the moment the match count stops being exactly one --
-    ownership must gate the candidate set, never run only after resolution
-    already succeeded or failed on an unfiltered scan.
+    function) so every scanning surface applies the SAME rule, and
+    ownership gates the candidate set rather than running only after a
+    scan already resolved.
 
     ``owner_session_id is None`` (no owned-session API configured) or dev
     mode being enabled both mean every locally known job is visible, same

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 
-from clio_relay import bootstrap
+from clio_relay.adapters.worker import bootstrap
 
 # The exact shapes uv has emitted across releases.
 SUFFIXED = f"uv {bootstrap.UV_VERSION} (x86_64-unknown-linux-gnu)"

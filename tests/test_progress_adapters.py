@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay.errors import ConfigurationError
-from clio_relay.progress_adapters import (
+from clio_relay.adapters.worker.progress_adapters import (
     package_progress_acceptance_valid,
     package_progress_adapter_from_pipeline,
 )
+from clio_relay.errors import ConfigurationError
 from tests.plugin_fakes import (
     FakeEntryPoints,
     SiteSimulationProgressAdapter,
@@ -113,7 +113,7 @@ def test_explicit_named_provider_fails_when_no_provider_is_installed(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "clio_relay.progress_adapters.entry_points",
+        "clio_relay.adapters.worker.progress_adapters.entry_points",
         lambda: FakeEntryPoints(),
     )
     pipeline = (

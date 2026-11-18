@@ -23,9 +23,18 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-import clio_relay.owned_session_record as owned_session_record
-import clio_relay.session_attach as session_attach
-from clio_relay import remote_connection
+import clio_relay.adapters.worker.owned_session_record as owned_session_record
+import clio_relay.adapters.worker.session_attach as session_attach
+from clio_relay.adapters.worker import remote_connection
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.remote_connection import (
+    DEFAULT_OWNED_SESSION_API_PORT,
+    LogStreamChunk,
+    RemoteConnection,
+    RemoteConnectionRegistry,
+    resolve_remote_api_port,
+)
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -44,19 +53,10 @@ from clio_relay.control_channel import (
     build_transport,
     owned_session_channel_bootstrap_script,
 )
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
-from clio_relay.http_api import create_app
 from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS
-from clio_relay.remote_connection import (
-    DEFAULT_OWNED_SESSION_API_PORT,
-    LogStreamChunk,
-    RemoteConnection,
-    RemoteConnectionRegistry,
-    resolve_remote_api_port,
-)
 from clio_relay.session_api import OwnedSessionApiClient, session_identity_document
 
 NONCE = "1" * 64
@@ -293,8 +293,12 @@ def _install(monkeypatch: pytest.MonkeyPatch, harness: _Harness) -> _Harness:
 
     monkeypatch.setattr("clio_relay.control_channel.spawn_channel_process", process_factory)
     monkeypatch.setattr("clio_relay.control_channel._wait_for_channel_health", skip_health)
-    monkeypatch.setattr("clio_relay.remote_connection.secrets.token_hex", fixed_nonce)
-    monkeypatch.setattr("clio_relay.remote_connection.http.client.HTTPConnection", stream_factory)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.remote_connection.secrets.token_hex", fixed_nonce
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.remote_connection.http.client.HTTPConnection", stream_factory
+    )
     monkeypatch.setattr("clio_relay.session_api.connection_registry", lambda: harness.registry)
     return harness
 
@@ -617,7 +621,9 @@ def test_stream_log_chunks_rejects_unterminated_line(
     silently truncated or read forever."""
     harness = _install(monkeypatch, _Harness())
     connection = _connect(tmp_path, harness)
-    from clio_relay.remote_connection_stream_io import MAX_SESSION_API_RESPONSE_BYTES
+    from clio_relay.adapters.worker.remote_connection_stream_io import (
+        MAX_SESSION_API_RESPONSE_BYTES,
+    )
 
     harness.sse_responses["/jobs/job_1/logs/console/sse"] = [
         b"x" * MAX_SESSION_API_RESPONSE_BYTES,
@@ -1106,7 +1112,9 @@ def test_lease_renewal_failure_never_500s_a_valid_request(
 
     import logging
 
-    with caplog.at_level(logging.WARNING, logger="clio_relay.http_api_owner_session_lease_renewal"):
+    with caplog.at_level(
+        logging.WARNING, logger="clio_relay.adapters.worker.http_api_owner_session_lease_renewal"
+    ):
         response = client.get(
             "/session-status",
             headers={

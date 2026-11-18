@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from pytest import MonkeyPatch
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_artifact_lineage,
     queue_browser_attachments,
     queue_endpoints,
@@ -54,8 +54,10 @@ from clio_relay import (
     queue_tasks,
     queue_transitions,
 )
-from clio_relay.browser_gateway import BrowserAttachmentRecord
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.browser_attachment_record import BrowserAttachmentRecord
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_jarvis_inputs import QueueJarvisInputsMixin
+from clio_relay.adapters.worker.queue_layout import QueueLayout
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
@@ -79,20 +81,18 @@ from clio_relay.models import (
     deterministic_input_artifact_id,
     new_id,
 )
-from clio_relay.queue_jarvis_inputs import QueueJarvisInputsMixin
-from clio_relay.queue_layout import QueueLayout
 
 _SOURCE_ROOT = Path(__file__).parents[1] / "src" / "clio_relay"
+_QUEUE_ROOT = _SOURCE_ROOT / "adapters" / "worker"
 _TESTS_ROOT = Path(__file__).parent
 _NON_OWNER_QUEUE_MODULES = frozenset(
     {
         "queue_management",
-        "queue_validation",
         # The "queue diagnosis" surface (queue_diagnosis.py's own module
         # docstring: "listing, diagnosis, stale recovery, worker status"):
         # read-only introspection/simulation built ON TOP of the fully
         # assembled ``ClioCoreQueue`` facade -- every one of these six
-        # imports ``clio_relay.core_queue.ClioCoreQueue`` directly and takes
+        # imports ``clio_relay.adapters.worker.core_queue.ClioCoreQueue`` directly and takes
         # a live queue instance as a parameter, the opposite direction of an
         # owner (an owner is composed INTO the facade; these consume it
         # after composition). None defines a ``*Mixin`` class (verified by
@@ -284,7 +284,8 @@ _OWNER_BUDGETS = {
     "queue_job_gc_protections": 320,
     "queue_job_gc": 720,
     "queue_index_discovery": 380,
-    "queue_startup": 550,
+    # +2: the move into adapters/worker/ wraps one longer import path.
+    "queue_startup": 552,
     "queue_index_migration": 720,
     "queue_transitions": 280,
     # #277: measured 486 lines at landing; 500 keeps it at the file-size
@@ -481,12 +482,12 @@ def _discover_owner_manifest(source_root: Path) -> tuple[str, ...]:
     )
 
 
-_OWNER_MANIFEST = _discover_owner_manifest(_SOURCE_ROOT)
+_OWNER_MANIFEST = _discover_owner_manifest(_QUEUE_ROOT)
 
 
 def _owner_tree(owner: str) -> ast.Module:
     return ast.parse(
-        (_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8"),
+        (_QUEUE_ROOT / f"{owner}.py").read_text(encoding="utf-8"),
         filename=f"{owner}.py",
     )
 
@@ -498,7 +499,7 @@ def _imported_owner(
 ) -> str | None:
     if module is None:
         return None
-    normalized = module.removeprefix("clio_relay.")
+    normalized = module.removeprefix("clio_relay.adapters.worker.").removeprefix("clio_relay.")
     return normalized if normalized in owners else None
 
 
@@ -506,12 +507,15 @@ def _core_import_lines(tree: ast.Module) -> list[int]:
     violations: list[int] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(alias.name in {"core_queue", "clio_relay.core_queue"} for alias in node.names):
+            if any(
+                alias.name in {"core_queue", "clio_relay.adapters.worker.core_queue"}
+                for alias in node.names
+            ):
                 violations.append(node.lineno)
         elif isinstance(node, ast.ImportFrom) and (
-            node.module in {"core_queue", "clio_relay.core_queue"}
+            node.module in {"core_queue", "clio_relay.adapters.worker.core_queue"}
             or (
-                node.module in {None, "clio_relay"}
+                node.module in {None, "clio_relay", "clio_relay.adapters.worker"}
                 and any(alias.name == "core_queue" for alias in node.names)
             )
         ):
@@ -661,7 +665,7 @@ def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
                 collaborator = _imported_owner(node.module)
                 if collaborator is not None and collaborator != caller:
                     dependencies.add(_OwnerDependency(caller, collaborator))
-                if node.module in {None, "clio_relay"}:
+                if node.module in {None, "clio_relay", "clio_relay.adapters.worker"}:
                     for alias in node.names:
                         if alias.name in _OWNER_MANIFEST and alias.name != caller:
                             dependencies.add(_OwnerDependency(caller, alias.name))
@@ -680,8 +684,9 @@ def _owner_dependencies() -> tuple[_OwnerDependency, ...]:
 # sites are covered by the design §4 table by hand. A patch target built as
 # `f"{module_name}.attr"` inside a `for module_name in (...)` loop is invisible
 # to that hand-audit: F1/F2 (block-2 review) found a real dead seam this way --
-# `queue_legacy_audit.py` moved its real call off `clio_relay.core_queue`, but
-# three test loops kept patching `clio_relay.core_queue.ensure_private_configuration_directory`,
+# `queue_legacy_audit.py` moved its real call off `clio_relay.adapters.worker.core_queue`, but
+# three test loops kept patching
+# `clio_relay.adapters.worker.core_queue.ensure_private_configuration_directory`,
 # which either raised AttributeError (no `raising=False`) or silently patched
 # nothing at all (`raising=False`). Neither is caught by the string-literal
 # audit. This extractor + guard makes that class of break fail loudly here
@@ -769,10 +774,10 @@ def _resolve_dotted_attribute_chain(dotted: str) -> bool:
 
     Imports the longest possible module prefix, then ``getattr``-walks the
     remainder. This reaches attribute chains a single ``rpartition`` cannot:
-    ``clio_relay.queue_store_write.cluster_config.open_private_atomic_file``
+    ``clio_relay.adapters.worker.queue_store_write.cluster_config.open_private_atomic_file``
     is not an importable module path (``cluster_config`` is an attribute
     ``queue_store_write`` re-exports, not a submodule of it) -- it only
-    resolves by importing ``clio_relay.queue_store_write`` and then
+    resolves by importing ``clio_relay.adapters.worker.queue_store_write`` and then
     attribute-walking ``cluster_config``, ``open_private_atomic_file``.
     """
     parts = dotted.split(".")
@@ -803,7 +808,7 @@ def test_dynamic_fstring_loop_monkeypatch_targets_resolve_or_are_registered() ->
     string-literal patch table cannot see targets assembled as
     ``f"{module_name}.attr"`` inside a ``for module_name in (...)`` loop. Two
     sites used exactly that shape and went dead when CQ6 moved the real call
-    off ``clio_relay.core_queue`` without updating them: the three loops in
+    off ``clio_relay.adapters.worker.core_queue`` without updating them: the three loops in
     ``tests/test_fastmcp_server.py`` (F1) and the one in
     ``tests/test_service_runtime.py`` (F2).
     """
@@ -828,7 +833,7 @@ def test_guard_detects_a_dead_fstring_loop_seam_fixture() -> None:
         "def f(monkeypatch):\n"
         "    for module_name in (\n"
         '        "clio_relay.cluster_config",\n'
-        '        "clio_relay.core_queue",\n'
+        '        "clio_relay.adapters.worker.core_queue",\n'
         "    ):\n"
         "        monkeypatch.setattr(\n"
         '            f"{module_name}.ensure_private_configuration_directory",\n'
@@ -840,7 +845,7 @@ def test_guard_detects_a_dead_fstring_loop_seam_fixture() -> None:
 
     assert targets == (
         ("clio_relay.cluster_config.ensure_private_configuration_directory", True),
-        ("clio_relay.core_queue.ensure_private_configuration_directory", True),
+        ("clio_relay.adapters.worker.core_queue.ensure_private_configuration_directory", True),
     )
     # cluster_config really defines the function; core_queue does not -- this
     # is the live F1/F2 seam, byte-for-byte.
@@ -994,11 +999,15 @@ def test_guard_detects_a_dead_plain_object_seam_fixture() -> None:
         "    )\n"
     )
     tree = ast.parse(source)
-    tree_with_import = ast.parse("import clio_relay.core_queue as core_queue_module\n" + source)
+    tree_with_import = ast.parse(
+        "import clio_relay.adapters.worker.core_queue as core_queue_module\n" + source
+    )
     targets = _plain_object_setattr_targets(tree)
     assert targets == ()  # no import in this file -> the root name is unresolvable, skipped
     targets_with_import = _plain_object_setattr_targets(tree_with_import)
-    assert targets_with_import == (("clio_relay.core_queue.open_private_atomic_file", True),)
+    assert targets_with_import == (
+        ("clio_relay.adapters.worker.core_queue.open_private_atomic_file", True),
+    )
     assert _resolve_dotted_attribute_chain(targets_with_import[0][0]) is False
 
 
@@ -1055,7 +1064,7 @@ def test_split_owners_never_bare_import_cross_owner_functions() -> None:
 
 def _core_queue_module_tree() -> ast.Module:
     return ast.parse(
-        (_SOURCE_ROOT / "core_queue.py").read_text(encoding="utf-8"),
+        (_QUEUE_ROOT / "core_queue.py").read_text(encoding="utf-8"),
         filename="core_queue.py",
     )
 
@@ -1090,8 +1099,8 @@ def test_core_queue_module_aliases_each_have_a_named_production_consumer() -> No
     54 with zero consumers anywhere and 11 with test-only consumers -- both
     classes deleted (the 11 retargeted to their real owner module in the
     handful of tests that used them). A production consumer imports the name
-    directly from ``clio_relay.core_queue`` or accesses it as an attribute of
-    a module bound to ``clio_relay.core_queue``; a facade-internal consumer
+    directly from ``clio_relay.adapters.worker.core_queue`` or accesses it as an attribute of
+    a module bound to ``clio_relay.adapters.worker.core_queue``; a facade-internal consumer
     is an unqualified reference inside ``core_queue.py``'s own body. A name
     with neither is a dead re-export and must not re-accrete.
     """
@@ -1115,13 +1124,13 @@ def test_core_queue_module_aliases_each_have_a_named_production_consumer() -> No
     }
 
     production_consumers: set[str] = set()
-    for py_file in sorted(_SOURCE_ROOT.glob("*.py")) + sorted(_SOURCE_ROOT.rglob("*/*.py")):
+    for py_file in sorted(_SOURCE_ROOT.rglob("*.py")):
         if py_file.name == "core_queue.py":
             continue
         file_tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
         for node in ast.walk(file_tree):
             if isinstance(node, ast.ImportFrom) and node.module in {
-                "clio_relay.core_queue",
+                "clio_relay.adapters.worker.core_queue",
                 "core_queue",
             }:
                 production_consumers.update(
@@ -1146,15 +1155,18 @@ def test_core_queue_module_aliases_each_have_a_named_production_consumer() -> No
 
 def _local_names_bound_to_core_queue(tree: ast.Module) -> set[str]:
     """Return local names one file binds to the ``core_queue`` module object
-    (``import clio_relay.core_queue as X`` / ``from clio_relay import
+    (``import clio_relay.adapters.worker.core_queue as X`` / ``from clio_relay import
     core_queue as X``), for resolving ``X.NAME`` attribute-access consumers."""
     bound: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in {"clio_relay.core_queue", "core_queue"}:
+                if alias.name in {"clio_relay.adapters.worker.core_queue", "core_queue"}:
                     bound.add(alias.asname or alias.name.split(".")[-1])
-        elif isinstance(node, ast.ImportFrom) and node.module == "clio_relay":
+        elif isinstance(node, ast.ImportFrom) and node.module in {
+            "clio_relay",
+            "clio_relay.adapters.worker",
+        }:
             for alias in node.names:
                 if alias.name == "core_queue":
                     bound.add(alias.asname or "core_queue")
@@ -1188,7 +1200,7 @@ def test_all_landed_owners_are_discovered_and_within_design_budgets() -> None:
     assert set(_OWNER_MANIFEST) == set(_OWNER_BUDGETS)
     for owner in _OWNER_MANIFEST:
         budget = _OWNER_BUDGETS[owner]
-        line_count = len((_SOURCE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
+        line_count = len((_QUEUE_ROOT / f"{owner}.py").read_text(encoding="utf-8").splitlines())
         assert line_count <= budget, f"{owner}: {line_count} > {budget}"
 
 
@@ -1207,7 +1219,6 @@ def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None
         frozenset(
             {
                 "queue_management",
-                "queue_validation",
                 "queue_admission_simulation",
                 "queue_admission_snapshot",
                 "queue_diagnosis",
@@ -1231,7 +1242,7 @@ def test_non_owner_exemption_and_owner_rank_are_pinned_to_the_manifest() -> None
 
     # 3. Every module actually on disk is exactly either a ranked owner or an
     #    exempted non-owner -- no third, silently-ignored category.
-    all_queue_modules = frozenset(path.stem for path in _SOURCE_ROOT.glob("queue_*.py"))
+    all_queue_modules = frozenset(path.stem for path in _QUEUE_ROOT.glob("queue_*.py"))
     assert all_queue_modules == set(_OWNER_MANIFEST) | _NON_OWNER_QUEUE_MODULES
     assert set(_OWNER_MANIFEST) & _NON_OWNER_QUEUE_MODULES == set()
 
@@ -2450,7 +2461,7 @@ def test_cq19_startup_uses_the_legacy_audit_before_initialization_lookup(
     # facade-resident dispatch to the module-level ``queue_startup.
     # initialize`` function) -- see that module's docstring for why.
     assert not hasattr(queue_startup.QueueStartupMixin, "initialize")
-    assert ClioCoreQueue.initialize.__module__ == "clio_relay.core_queue"
+    assert ClioCoreQueue.initialize.__module__ == "clio_relay.adapters.worker.core_queue"
 
 
 def test_guard_rejects_absolute_bare_owner_import_fixture() -> None:
