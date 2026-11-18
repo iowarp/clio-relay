@@ -1,0 +1,27 @@
+# sshd for the clio-relay fixture sites. Key sign-in only, as on an open site.
+# Drop-ins come first so a site image (the one-time-code host) can override.
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/fixture/ssh_host_ed25519_key
+
+PermitRootLogin no
+AllowUsers relay
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+
+AllowTcpForwarding yes
+AllowStreamLocalForwarding yes
+GatewayPorts no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+MaxStartups 64:30:128
+MaxSessions 32
+ClientAliveInterval 30
+
+Subsystem sftp internal-sftp
