@@ -1723,7 +1723,7 @@ Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (cli
 
 ## W14. Relay's CLIO plugin and the Compute tab
 
-Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (pins the W14 head with the picker checks; see "The pin").
+Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (pins integration 3d0ff6b; see "The pin").
 
 ### Decisions
 
@@ -1815,7 +1815,7 @@ All live on Ares, on my own stack:
 
 - **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
 - **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
-- **The pin.** `plugin/mcp.json` and the marketplace pin the W14 commit that carries this ledger entry, with `clio-relay serve`. Integration 2db7d8d lacks the picker checks, so the pin trails W14 until W1 merges it. Repin to the integration commit after that merge.
+- **The pin.** `plugin/mcp.json` and the marketplace run `clio-relay serve` from integration 3d0ff6b, which has W14 ec6541e merged (4e81b94). A later relay change moves both pins together.
 - **Two `mcp_resource_updated` per tab action.** On the live stack, each tab action POST is followed by two adjacent `mcp_resource_updated namespace=relay uri=a2ui://clio-relay/compute` lines in the agent log, even for an action that only sets an error. Only one relay process is up. W1's tests show one notification per change inside relay, so the second is probably counted on the host side. This is for W3.
 
 ### Run sheets for the person rows
