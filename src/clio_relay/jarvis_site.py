@@ -4,8 +4,10 @@ A package archive is a gzipped tar of one JARVIS repository trimmed to one
 package. Its SHA-256 is the hash relay pins a review to (RL24). The layout is
 ``<repo>/<repo>/<package>/...``, so ``jarvis repo add <unpacked>/<repo>``
 registers the repository under its own name and ``<repo>.<package>`` resolves.
-Shared modules of the repository (``<repo>/<repo>/_*``) and the repository's
-top-level files ride along, because packages import them.
+Shared modules of the repository (``<repo>/<repo>/_*``), the repository's
+top-level files, and a ``schemas/`` directory next to the repository ride
+along, because packages import or read them (clio-jarvis's contract reads
+``<repo dir>/../schemas``).
 
 The package runner turns a package job into a plain bash job any batch adapter
 can submit. On the site it checks the archive's SHA-256 against the reviewed
@@ -24,6 +26,7 @@ import gzip
 import hashlib
 import io
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -44,15 +47,19 @@ SOURCE_FILE = ".clio-relay-source.json"
 ARCHIVE_DIR = ".relay-package"
 """Where the runner finds the archive, relative to the job directory."""
 
+SHARED_SIBLINGS = ("schemas",)
+"""Directories next to the repository directory that its packages read."""
+
 _SKIP_DIRS = frozenset({"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
 _SKIP_SUFFIXES = (".pyc", ".pyo")
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+_NAME_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def split_name(name: str) -> tuple[str, str]:
     """Split ``repo.package`` into its repository and package."""
     repo, dot, package = name.partition(".")
-    if not dot or not repo.isidentifier() or not package.isidentifier():
+    if not dot or not _NAME_PART.fullmatch(repo) or not _NAME_PART.fullmatch(package):
         raise Refusal(
             RefusalReason.INVALID_SPEC,
             f"a JARVIS package is named <repository>.<package>, not {name!r}",
@@ -106,6 +113,13 @@ def package_files(repo_dir: Path, name: str) -> list[tuple[str, Path]]:
         for path in chosen
         if path.name not in _SKIP_DIRS and not path.name.endswith(_SKIP_SUFFIXES)
     ]
+    for sibling in SHARED_SIBLINGS:
+        shared = repo_dir.parent / sibling
+        if shared.is_dir() and not shared.is_symlink():
+            entries += [
+                (str(PurePosixPath(sibling, *path.relative_to(shared).parts)), path)
+                for path in _files(shared)
+            ]
     return sorted(entries)
 
 
@@ -270,6 +284,8 @@ digest=$1 name=$2 jarvis=$3 workdir=$4
 shift 4
 case $jarvis in "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
 fail() { echo "clio-relay package runner: $2" >&2; exit "$1"; }
+printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$' \
+  || fail 64 "package name $name is not <repo>.<package>"
 archive="$PWD/.relay-package/$digest.tar.gz"
 [ -f "$archive" ] || fail 66 "the package archive $archive is missing"
 if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$archive" | cut -d' ' -f1)
@@ -280,7 +296,7 @@ repo=${name%%.*}
 rm -rf "$root"
 mkdir -p "$root/src"
 tar -xzf "$archive" -C "$root/src"
-[ -d "$root/src/$repo/$repo" ] || fail 65 "the archive has no $repo/$repo directory"
+[ -d "$root/src/$repo/$repo" ] || fail 66 "the archive has no $repo/$repo directory"
 command -v "$jarvis" >/dev/null 2>&1 || fail 69 "$jarvis is not on PATH on this site"
 export JARVIS_ROOT="$root"
 "$jarvis" init "$root/config" "$root/private" "$root/shared" >/dev/null

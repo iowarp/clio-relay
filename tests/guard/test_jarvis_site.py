@@ -44,6 +44,7 @@ def test_the_archive_holds_the_package_and_its_shared_code_only(tmp_path: Path) 
         "demo/demo/_contract/base.py",
         "demo/demo/hello/__init__.py",
         "demo/demo/hello/pkg.py",
+        "schemas/package-contract.v1.json",
     ]
 
 
@@ -101,8 +102,9 @@ def test_archive_refuses_a_name_the_repository_does_not_hold(tmp_path: Path) -> 
         archive_package(repo, "demo.missing")
     with pytest.raises(Refusal):
         archive_package(repo, "other.hello")
-    with pytest.raises(Refusal):
-        archive_package(repo, "nodot")
+    for bad in ("nodot", "demo.he-llo", "demo.hello.x", "1demo.hello", "dém.hello"):
+        with pytest.raises(Refusal):
+            archive_package(repo, bad)
 
 
 def test_read_archive_explains_how_to_stage(tmp_path: Path) -> None:

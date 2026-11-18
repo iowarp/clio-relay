@@ -97,6 +97,7 @@ def test_the_runner_builds_a_private_jarvis_pipeline_and_runs_it(tmp_path: Path)
     ]
     assert (root / "hostfile").read_text() == "n1\nn2\n"
     assert (root / "src" / "demo" / "demo" / "hello" / "pkg.py").is_file()
+    assert (root / "src" / "schemas" / "package-contract.v1.json").is_file()
     assert not (root / "src" / "demo" / "demo" / "other").exists()
 
 
@@ -113,6 +114,21 @@ def test_the_runner_runs_only_the_reviewed_bytes(tmp_path: Path) -> None:
     assert not (tmp_path / "jarvis.log").exists()
     missing = _runner(job, env, "e" * 64, "demo.hello", "jarvis", "")
     assert missing.returncode == 66
+
+
+def test_the_runner_checks_the_name_and_the_layout(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    bin_dir = tmp_path / "bin"
+    _program(bin_dir, "jarvis", FAKE_JARVIS)
+    env = _env(tmp_path, bin_dir)
+    for bad in ("hello", "demo.hello.x", "demo.he-llo", "demo/x.hello"):
+        done = _runner(job, env, digest, bad, "jarvis", "")
+        assert done.returncode == 64, bad
+        assert "is not <repo>.<package>" in done.stderr
+    wrong_repo = _runner(job, env, digest, "other.hello", "jarvis", "")
+    assert wrong_repo.returncode == 66
+    assert "no other/other directory" in wrong_repo.stderr
+    assert not (tmp_path / "jarvis.log").exists()
 
 
 def test_the_runner_says_when_jarvis_is_missing(tmp_path: Path) -> None:

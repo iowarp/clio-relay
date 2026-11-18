@@ -40,6 +40,10 @@ def make_repo(
         (inner / name / "__init__.py").write_text("")
         (inner / name / "pkg.py").write_text(PKG)
         (inner / name / "__pycache__" / "pkg.cpython-312.pyc").write_bytes(b"\0compiled")
+    (root / "schemas").mkdir(exist_ok=True)
+    (root / "schemas" / "package-contract.v1.json").write_text("{}\n")
+    (root / "unrelated").mkdir(exist_ok=True)
+    (root / "unrelated" / "big.bin").write_bytes(b"\0" * 16)
     return repo_dir
 
 

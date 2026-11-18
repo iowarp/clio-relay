@@ -18,7 +18,7 @@ import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -143,7 +143,7 @@ def _review_of(ask: Ask) -> Review | None:
         package=package.name,
         version=package.version,
         sha256=package.sha256,
-        source=source if isinstance(source, dict) else None,
+        source=cast(dict[str, Any], source) if isinstance(source, dict) else None,
         ask_id=ask.ask_id,
         answered_by=ask.answered_by,
         reviewed_at=ask.answered_at or utc_now(),

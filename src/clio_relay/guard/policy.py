@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext, BaseAdapter
@@ -191,9 +192,11 @@ class Guard:
         for record in self.operations.all():
             if record.site != site_id or record.kind != "run" or record.state.final:
                 continue
-            if record.spec.get("executable") != WARM_EXECUTABLE or record.handle is None:
+            handle = record.handle
+            if record.spec.get("executable") != WARM_EXECUTABLE or handle is None:
                 continue
-            held.add(record.handle.native_id)
+            if handle.native_id:
+                held.add(handle.native_id)
         return held
 
     async def check_exec(self, site: SiteEntry, command: list[str]) -> GuardDecision:
@@ -260,7 +263,8 @@ class Guard:
             content=self.content,
         )
         adapter = registry.build(name, config, context)
-        result: object = adapter.price(spec)  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownVariableType]
+        price = cast(Callable[[JobSpec], object], getattr(adapter, "price"))
+        result: object = price(spec)
         if inspect.isawaitable(result):
             result = await result
         return result if isinstance(result, Charge) else None
