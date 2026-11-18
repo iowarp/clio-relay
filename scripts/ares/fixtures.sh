@@ -224,8 +224,13 @@ wait_until() {
             log "$what ready"
             return 0
         fi
+        if [ "$(docker inspect -f '{{.State.Running}}' "$PREFIX-$what" 2>/dev/null)" = false ]; then
+            docker logs --tail 20 "$PREFIX-$what" >&2 || true
+            die "$what exited during start-up"
+        fi
         sleep 2
     done
+    docker logs --tail 20 "$PREFIX-$what" >&2 || true
     die "$what not ready after $((tries * 2))s"
 }
 

@@ -13,7 +13,7 @@ if [ ! -s /etc/munge/munge.key ]; then
 fi
 chown munge:munge /etc/munge/munge.key
 chmod 0400 /etc/munge/munge.key
-install -d -o munge -g munge -m 0700 /run/munge
+install -d -o munge -g munge -m 0755 /run/munge
 su -s /bin/sh munge -c /usr/sbin/munged
 fx_wait_for munge 30 munge -n
 
