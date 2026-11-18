@@ -893,11 +893,11 @@ Done in the follow-up (353ef89):
 - Links to the deleted `connection-model.md` and `remote-mcp-federation.md` now point at `docs/adapters/worker.md`, or are dropped.
 
 Left, with the reason:
-- The `mcp_call` job kind (`JobKind.MCP_CALL`, `McpCallSpec`) has no producer and no runner on the worker. W9's `jarvis_service_runtime_validation.py:55` still reads it, so W8 removes it after W9 drops that use. Its test hits go with it.
-- The `virtual_*_mcp_call` roles are vocabulary of the old 1.0 release gate: `release_gate_resources`, `validation_report` and `docs/release-gate-1.0.yaml`. That code is reached through `validation_report`, which the bootstrap and session code still use. Renaming a role changes recorded reports for no gain. Whether the 1.0 release-gate machinery goes is a decision for the coordinator.
+- The `mcp_call` job kind (`JobKind.MCP_CALL`, `McpCallSpec`) has no producer and no runner on the worker. W9 removed its last use (`jarvis_service_runtime_validation.py:55`) at 5035e8c. W8 removes the kind once that reaches integration, with its test hits.
+- The `virtual_*_mcp_call` roles are gone, with the 1.0 release gate (see "The 1.0 release gate" under "Changes made during the move").
 - Some history comments in W1's scripts name deleted modules. W8 leaves W1's files alone beyond the approved edits.
 - `README.md` (lines 42, 62, 130, 253) and `docs/mcp-tasks.md:127` belong to W1.
-- `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). It needs a rewrite owner once the cutover settles the command names.
+- `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). W8 rewrites it for the `clio-relay worker cluster ...` paths after the cutover (coordinator decision).
 
 ### clio-schemas
 
@@ -994,8 +994,26 @@ Fixes and edits beyond the mechanical move, in commit order:
     - `test_agent_bind_persists_urls_and_rejects_runtime_commands`
     - `test_agent_bind_pending_replays_same_gateway_and_connector_intents`
     - `test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission`
+- **The 1.0 release gate (coordinator decision, 67f6488).** The LQ and RL rows replace it.
+  - Deleted: `release_gate_evaluation`, `release_gate_resources` and `release_gate_targets`. Also the modules only the gate reached: `spack_transition_checks`, `ci_validation`, `validation_report_assets`, `actions_artifact`, `branch_protection`, `candidate_provenance`, `ci_run_status`, `payload_policy`, `release_assets`, `release_identity`, `distribution_archive` and `provenance_primitives`. Their tests went too (`test_ci_validation`, `test_distribution_archive`, `test_provenance_primitives`, `test_release_external_runtime`), as did `docs/release-gate-1.0.yaml` with its `virtual_*_mcp_call` roles, `docs/release-acceptance-1.0.md` and `examples/release-gate/`. The set is the import closure of the gate modules minus everything that kept code still imports.
+  - The report code that bootstrap and session commands use moves out of `validation_report`, `validation_schema` and `validation_recorder`, which are deleted, into plain names:
+    - `run_report_models` (the report wire models);
+    - `run_report` (default path, write, load, markdown);
+    - `run_report_recorder` (`ValidationRecorder`, `new_live_validation_report`);
+    - `install_identity` (`detect_software_identity`, `detect_install_source`);
+    - `file_digest` (`sha256_file`).
+    Callers import from the owner directly; there is no re-export facade. The wire shape is unchanged: persisted reports load with `extra="forbid"`, and W9's runtime builds them.
+  - `tests/test_validation_report.py` becomes `tests/test_run_report.py`. Its 35 gate tests and gate helpers are deleted, and 48 stay. `test_gateway_start_and_stop_reports_record_their_checks` keeps the report half of the old combined test.
+  - `test_bootstrap_uv_pin_matches_release_policy` read the YAML. It is now `test_bootstrap_uv_pin_is_digest_bound`, with the digest asserts only.
+  - The four bootstrap remote scripts import `sha256_file` from `clio_relay.file_digest`.
+  - Also changed: `.gitattributes` (the `examples/release-gate` lines), `docs/ai/testing-context.md` (the release CI section and the command list), and `docs/ai/interface-context.md` (`release validate-local` and `release gate`). The `--allow-login-scoped` help no longer says "release-gate eligible".
+  - W9's `service_runtime_results.py` gets import lines and one docstring line only. W1's scripts are not edited: their comments still name the deleted files, and `check_file_size.py` reports ratchet-down room only.
 
 ### Gate evidence
+
+**The 1.0 release gate removal (67f6488).** Pyright on Ares counts 4929 errors, under the 5050 baseline (W1's script; W1 lowers it). The targeted modules ran on the login node, with the fixtures env and uv on PATH: `test_run_report`, `test_cli`, `test_installation`, `test_service_runtime`, `test_session_wire_models`, `test_transport_probe`, `test_bootstrap`, `test_bootstrap_reconcile`, `test_acceptance_report_defaults`, `test_cli_installation_receipt`, `test_cli_relay_host`, `test_dev_mode`, `test_identifiers`, `test_session_lifecycle` and `tests/serve`. 798 passed and none skipped. Four did not pass:
+- 3 errors in `test_run_report` (`test_real_uv_tool_scopes_launcher_to_isolated_bin`, `test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt`, `test_real_uvx_no_cache_temporary_environment_is_not_a_verified_receipt`). They are develop's 3 `test_validation_report` failures, under the new file name: `~/.local/bin/uv` is 0.13.9, and the tests pin 0.11.28.
+- `test_service_runtime::test_local_connector_does_not_retain_captured_cli_pipes` (W9's). It gives a child CLI 2 s to import `service_runtime_command_runner`, spawn and exit. That import alone takes 3.8 s on the Ares login node, and 7.4 s at load 20. It takes the same time at 126f8cd, before this change, so the removal did not cause it. It is a timing test that fails under load; reported to W9 through the coordinator, not rerun.
 
 On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) was clean and touched no worker file.
 
@@ -1025,14 +1043,16 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 - **W9.**
   - Done: W9 dropped its imports of the held modules (5a01766), and W8 deleted them (ba5ad4b). `BrowserAttachmentRecord` now has one definition, `adapters/worker/browser_attachment_record.py`, and nothing calls the `connector-step-*` commands. W8's branch contains W9 at 5a01766, so merging W8 brings it in.
   - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
-  - `jarvis_service_runtime_validation.py:55` uses the `mcp_call` job kind. LQ32 needs it gone; W8 removes the kind once W9 drops that use.
+  - `jarvis_service_runtime_validation.py:55` used the `mcp_call` job kind. W9 removed it at 5035e8c; W8 removes the kind once that is in integration.
   - Test failures in W9's files on this branch, none of them rerun:
     - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
-    - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list.
+    - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list. Cause found at 67f6488: the test gives the child CLI a fixed 2 s, and importing `service_runtime_command_runner` alone takes 3.8 s on the Ares login node (7.4 s at load 20), the same before and after W8's change. It is a timing test that fails under load; W9 should drop the fixed budget.
 - **W1.**
+  - Lower the pyright baseline in `scripts/check_pyright_ratchet.py` to 4929 (measured at 67f6488).
   - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
   - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
 - **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
+- **Residual.** W8's scratch from LQ10 and LQ11, `~/w8-live` on fx-otp, is still there. Removing it needs a keyboard-interactive sign-in to fx-otp. W8's other Ares and fx-slurm scratch is removed, except `state/w8-live/worker-gate.json`, which the post-cutover LQ1 and LQ32 runs use.
 - **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
 
 ## W9. serve
