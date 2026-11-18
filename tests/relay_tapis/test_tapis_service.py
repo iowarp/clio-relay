@@ -12,11 +12,12 @@ import pytest
 
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.tapis import TapisAdapter, TapisConfig, register
-from clio_relay.adapters.tapis.mapping import TAPISLOCAL
+from clio_relay.adapters.tapis.mapping import NO_WALLTIME_MINUTES, TAPISLOCAL, max_minutes
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobSpec
+from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from tests.fixtures.tapis_stub import TapisStub
@@ -107,6 +108,8 @@ async def test_run_survives_a_restart(
     assert file_input["sourceUrl"].startswith(f"{TAPISLOCAL}/")
     assert file_input["sourceUrl"].endswith(digest)
     assert file_input["targetPath"] == "input.txt"
+    # No walltime in the spec: relay asks for a year, never Tapis's 10 minute default.
+    assert body["maxMinutes"] == NO_WALLTIME_MINUTES
     print(f"LQ36 operation {record.operation_id} Tapis job {uuid} app {body['appId']}")
     print(f"LQ36 history {[change.state.value for change in done.history]}")
     print(f"LQ36 stub job history {job.history}")
@@ -228,3 +231,73 @@ async def test_a_tacc_host_gets_a_tms_credential_and_no_key(
     removed = await register.unregister_host(adapter, None)
     assert removed == {"system_id": tacc_system, "credential": True}
     assert tacc_system in stub.state.systems, "relay never deletes a system it did not make"
+
+
+async def test_the_site_hook_on_a_tacc_host_registers_once(
+    stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``on_site_added`` with no ssh way in: a TMS credential, then nothing on a second run."""
+    use_memory_keyring(monkeypatch)
+    await sign_in(stub)
+    tacc_system = "vista-tapis-stub"
+    stub.seed_system(tacc_system, host="vista.tacc.utexas.edu", jobWorkingDir=str(tmp_path))
+    entry = SiteEntry.model_validate(
+        {
+            "id": "vista",
+            "adapter": "tapis",
+            "config": tapis_config(stub, authn="tms", system_id=tacc_system),
+        }
+    )
+    context = AdapterContext(
+        site_id="vista", state_dir=tmp_path / "relay", content=ContentStore(tmp_path / "c")
+    )
+    adapter = TapisAdapter(TapisConfig.model_validate(entry.config), context)
+    first = await adapter.on_site_added(entry)
+    print(f"tms site hook {first}")
+    assert first is not None and first["registered"] is True and first["authn"] == "tms"
+    assert not first["key_installed"]
+    assert stub.state.credentials[(tacc_system, USERNAME)]["tms"] is True
+    again = await adapter.on_site_added(entry)
+    assert again == {"system_id": tacc_system, "registered": False, "credential": "ok"}
+    await register.unregister_host(adapter, None)
+
+
+async def test_max_minutes_never_falls_to_the_tapis_default() -> None:
+    """Tapis fails a job past ``maxMinutes`` and defaults it to 10, so relay always sends one."""
+    fork = {"id": "s"}
+    batch = {
+        "id": "b",
+        "batchDefaultLogicalQueue": "normal",
+        "batchLogicalQueues": [
+            {"name": "normal", "maxMinutes": 2880},
+            {"name": "open", "maxJobs": -1},
+        ],
+    }
+    plain = JobSpec(executable="true")
+    assert max_minutes(plain, fork, "FORK") == NO_WALLTIME_MINUTES
+    assert max_minutes(plain, batch, "BATCH") == 2880
+    open_queue = JobSpec.model_validate({"executable": "true", "attributes": {"queue_name": "open"}})
+    assert max_minutes(open_queue, batch, "BATCH") == NO_WALLTIME_MINUTES
+    timed = JobSpec.model_validate(
+        {"executable": "true", "attributes": {"duration": 90.5, "queue_name": "open"}}
+    )
+    assert max_minutes(timed, batch, "BATCH") == 2
+    assert max_minutes(timed, fork, "FORK") == 2
+
+
+@pytest.mark.parametrize(
+    ("limit", "minutes"),
+    [
+        ("2-00:00:00", 2880),
+        ("1:00:00", 60),
+        ("30:00", 30),
+        ("30:01", 31),
+        ("45", 45),
+        ("infinite", None),
+        ("UNLIMITED", None),
+        ("", None),
+        ("0:00", None),
+    ],
+)
+async def test_slurm_time_limits_become_minutes(limit: str, minutes: int | None) -> None:
+    assert register.slurm_minutes(limit) == minutes

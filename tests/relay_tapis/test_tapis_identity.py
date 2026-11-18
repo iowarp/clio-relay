@@ -347,3 +347,42 @@ async def test_sign_out_revokes_and_forgets(
     assert access in stub.state.revoked
     assert not store.values
     assert (await identity(stub).status()).state == "signed_out"
+
+
+@pytest.mark.asyncio
+async def test_relays_device_loop_asks_again_on_an_expired_code_then_signs_in(
+    stub: TapisStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    from clio_relay.identity.base import SignInContext, SignInStep
+    from clio_relay.identity.device import follow
+    from clio_relay.identity.store import TokenStore
+    from tests.fixtures.tapis_stub.support import USERNAME
+
+    use_memory_keyring(monkeypatch)
+    found = identity(stub)
+    first = await found.begin()
+    with stub.state.lock:
+        (grant,) = (
+            g for g in stub.state.devices.values() if g.user_code == first.display["user_code"]
+        )
+        grant.status = "Entered"
+        grant.expires_at = time.time() - 60
+    steps: list[SignInStep] = []
+
+    def new_step(step: SignInStep) -> None:
+        steps.append(step)
+        assert stub.state.approve(step.display["user_code"], USERNAME)
+
+    async with httpx.AsyncClient() as http:
+        result = await follow(
+            found,
+            SignInContext(store=TokenStore("memory"), http=http),
+            first,
+            on_new_step=new_step,
+        )
+    assert result is not None and result.state == "done", result
+    assert len(steps) == 1
+    assert steps[0].display["user_code"] != first.display["user_code"]
+    assert (await found.status()).state == "signed_in"

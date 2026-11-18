@@ -29,6 +29,8 @@ from clio_relay.adapters.tapis.register import (
 )
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.surface.service import RelayService
+from clio_relay.surface.settings import RelayPaths
 from tests.fixtures.tapis_stub import TapisStub
 from tests.fixtures.tapis_stub.support import (
     USERNAME,
@@ -37,6 +39,8 @@ from tests.fixtures.tapis_stub.support import (
     tapis_config,
     use_memory_keyring,
 )
+
+from .conftest import add_site
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
@@ -108,6 +112,55 @@ async def test_register_installs_a_working_key_and_removal_leaves_nothing(
     finally:
         # A failed run must not leave a line in the shared fixture's authorized_keys.
         ssh.remove_key(comment)
+
+
+async def test_adding_the_site_registers_the_host_once(
+    stub: TapisStub,
+    fx: dict[str, str],
+    tmp_path: Path,
+    relay_paths: RelayPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The site hook: adding the site registers the host, and running it again changes nothing."""
+    use_memory_keyring(monkeypatch)
+    (tmp_path / "keys").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "keys"))
+    await sign_in(stub)
+    site = "lq40hook"
+    found = system_id(site)
+    ssh = _ssh(fx, "fx-ssh")
+    comment = key_comment(found)
+    add_site(
+        relay_paths,
+        {
+            "id": site,
+            "adapter": "tapis",
+            "identity": "tacc",
+            "config": tapis_config(stub),
+            "alternatives": {
+                "ssh": {"ssh_profile": "fx-ssh", "ssh_config": fx["FX_SSH_CONFIG"]}
+            },
+        },
+    )
+    service = RelayService(relay_paths)
+    try:
+        first = await service.site_added(site)
+        print(f"LQ40 site hook {first}")
+        tapis = first["tapis"]
+        assert tapis["registered"] is True, first
+        assert tapis["key_installed"] and tapis["private_key_deleted"], first
+        assert ssh.has_key(comment)
+        credential = dict(stub.state.credentials[(found, USERNAME)])
+        again = await service.site_added(site)
+        print(f"LQ40 site hook again {again}")
+        assert again["tapis"] == {"system_id": found, "registered": False, "credential": "ok"}
+        assert stub.state.credentials[(found, USERNAME)] == credential
+        assert _private_files(tmp_path / "keys") == []
+    finally:
+        with contextlib.suppress(Refusal):
+            await unregister_host(_adapter(stub, site, tmp_path), ssh)
+        ssh.remove_key(comment)
+        await service.close()
 
 
 async def _register_and_remove(
@@ -201,12 +254,17 @@ async def test_slurm_partitions_become_logical_queues(
     ssh = _ssh(fx, "fx-slurm")
     partitions = ssh.partitions()
     assert partitions, "the Slurm fixture has partitions"
+    limits = ssh.partition_limits()
+    print(f"LQ40 slurm partition limits {limits}")
     try:
         registered = await register_host(adapter, ssh)
         print(f"LQ40 slurm registration {registered}")
         system = stub.state.systems[system_id(site)]
         assert system["batchScheduler"] == "SLURM"
         assert [item["name"] for item in system["batchLogicalQueues"]] == partitions
+        assert {
+            item["name"]: item.get("maxMinutes") for item in system["batchLogicalQueues"]
+        } == limits
         assert registered.queues == partitions
         assert (await adapter.describe()).facts["job_type"] == "BATCH"
     finally:
