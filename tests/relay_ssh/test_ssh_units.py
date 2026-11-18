@@ -395,6 +395,28 @@ async def test_a_signal_to_the_batch_shell_reaches_the_command(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_the_batch_shell_waits_for_a_trap_the_launcher_does_not(tmp_path: Path) -> None:
+    # PSI/J's launcher dies on the TERM while the command's trap is still at work.
+    started = tmp_path / "started"
+    command = (
+        f"trap 'sleep 1; echo stopped > {tmp_path}/log; exit 143' TERM; "
+        f"touch {started}; sleep 3600 & wait"
+    )
+    launcher = tmp_path / "single_launch.sh"
+    launcher.write_text(f"sh -c {shlex.quote(command)} &\nwait\n")
+    rendered = f"#!/bin/bash\n\n/bin/bash {launcher}\n\necho done > {tmp_path}/batch\n"
+    batch = tmp_path / "submit.sh"
+    batch.write_text(scripts.forward_signals(rendered, str(launcher), str(tmp_path)))
+    shell = await asyncio.create_subprocess_exec("bash", str(batch))
+    while not started.exists():
+        assert shell.returncode is None
+        await asyncio.sleep(0.05)
+    shell.send_signal(signal.SIGTERM)
+    await shell.wait()
+    assert (tmp_path / "log").read_text() == "stopped\n"
+    assert (tmp_path / "batch").read_text() == "done\n"
+
+@pytest.mark.asyncio
 async def test_the_batch_shell_keeps_the_commands_exit_code(tmp_path: Path) -> None:
     shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, "exit 7")))
     assert await shell.wait() == 0
