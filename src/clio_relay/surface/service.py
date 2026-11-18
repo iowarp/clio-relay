@@ -42,6 +42,7 @@ from clio_relay.sites.store import SiteStore
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.guarding import approval_message, review_asks
+from clio_relay.surface.outputs import marked_status
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 from clio_relay.surface.transient import drop_transient
@@ -651,6 +652,7 @@ class RelayService:
                 return record
             record.move(_JOB_TO_OPERATION[status.state], status.message)
             record.exit_code = status.exit_code
+            status = marked_status(record, status)
             record.outputs = status.outputs
             result = dict(record.result or {})
             if status.progress is not None:
