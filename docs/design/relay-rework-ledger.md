@@ -17,6 +17,14 @@ Written by W16 at qualification.
 | Row | Owner | State | Evidence |
 | --- | --- | --- | --- |
 
+## Open items
+
+Kept by W1 as the ledger's header owner. The coordinator assigns owners.
+
+| Item | Raised by | Owner | Notes |
+| --- | --- | --- | --- |
+| Linux fence egress bypass | W4 | TBD (coordinator) | The Linux Codex profile grants network "enabled" (host netns), so egress that does not go through the CONNECT proxy is neither recorded nor gated. Tracked outside W4 |
+
 ## W1. Relay core
 
 ### Decisions taken from W3's contract
@@ -104,6 +112,8 @@ Everything else is refused with the existing reasons: `elicitation_url_insecure_
 - Tabs are per session. The relay plugin goes in the default agent (W14).
 
 ## W4. CLIO removals and SSH through the fence
+
+RL37 done in clio-agent (W4, `jaimecernuda-relay-rework-w4`). Fenced-shell ssh, scp, sftp and Git over SSH run through `runtime/net_connect.py`, a CONNECT helper used as ProxyCommand. The shims come from `runtime/fence_ssh.py` and are on PATH only inside an enforced fence. LQ29 passed on Ares inside codex-linux-sandbox 0.167.0: `ssh <host> hostname` succeeded and net.egress showed host and port 22. scp, sftp, `git ls-remote` and `git clone` over SSH passed. A host the policy denies is refused with an explicit message. Open: the Linux Codex profile grants network "enabled" (host netns), so egress that does not go through the proxy is neither recorded nor gated.
 
 ## W5. clio-jarvis
 
