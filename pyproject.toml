@@ -70,6 +70,7 @@ clio-relay-next = "clio_relay.cli_next:main"
 
 [project.entry-points."clio_relay.adapters"]
 local = "clio_relay.adapters.local:LocalAdapter"
+ssh = "clio_relay.adapters.ssh:SshAdapter"
 fixture = "clio_relay.testing.fixture_adapter:FixtureAdapter"
 
 [project.optional-dependencies]
