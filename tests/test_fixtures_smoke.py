@@ -367,9 +367,7 @@ def _frpc_config(protocol: str, token: str, extra: str = "") -> str:
 
 
 @pytest.mark.parametrize("protocol", ["tcp", "websocket", "wss"])
-def test_frps_carries_an_stcp_tunnel_to_the_secret_service(
-    protocol: str, tmp_path: Path
-) -> None:
+def test_frps_carries_an_stcp_tunnel_to_the_secret_service(protocol: str, tmp_path: Path) -> None:
     _needs("frps")
     _needs("secret")
     tag = uuid.uuid4().hex[:12]
@@ -463,7 +461,14 @@ def test_counter_mcp_runs_over_ssh_stdio() -> None:
 
     transport = StdioTransport(
         command="ssh",
-        args=["-F", FX["FX_SSH_CONFIG"], "-o", "BatchMode=yes", "fx-ssh", "clio-fixture-counter-mcp"],
+        args=[
+            "-F",
+            FX["FX_SSH_CONFIG"],
+            "-o",
+            "BatchMode=yes",
+            "fx-ssh",
+            "clio-fixture-counter-mcp",
+        ],
     )
 
     async def scenario() -> None:

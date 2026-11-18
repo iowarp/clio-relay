@@ -74,7 +74,9 @@ def build_server(state: CounterState | None = None) -> FastMCP:
         return counter.report(counter.observe(ctx))
 
     @mcp.tool(task=True)
-    async def count_slowly(ctx: Context, steps: int = 3, delay_seconds: float = 0.5) -> dict[str, Any]:
+    async def count_slowly(
+        ctx: Context, steps: int = 3, delay_seconds: float = 0.5
+    ) -> dict[str, Any]:
         """Add one per step, reporting progress, as a task when the client negotiates one."""
         session_id = counter.observe(ctx)
         for step in range(steps):
