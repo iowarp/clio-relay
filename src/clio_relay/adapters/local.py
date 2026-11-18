@@ -476,7 +476,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             if current.state.final:
                 return current
             await asyncio.sleep(0.25)
-        return current
+        return await self.status(handle)
 
     @staticmethod
     def _signal_supervised(job_dir: Path) -> None:

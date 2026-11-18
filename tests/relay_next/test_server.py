@@ -52,6 +52,11 @@ def _structured(result: Any) -> dict[str, Any]:
     return structured  # pyright: ignore[reportUnknownVariableType]
 
 
+def _dumped(request: Any) -> dict[str, Any]:
+    if isinstance(request, dict):
+        return dict(request)  # pyright: ignore[reportUnknownArgumentType]
+    return request.model_dump(by_alias=True)
+
 async def _approve(
     message: str, response_type: Any, params: Any, context: Any
 ) -> dict[str, Any] | ElicitResult[Any]:
@@ -188,7 +193,7 @@ def test_task_asks_with_input_required_and_takes_tasks_update(relay_paths: Relay
             assert parked.input_requests is not None
             (ask_id,) = parked.input_requests
             request = parked.input_requests[ask_id]
-            dumped = request if isinstance(request, dict) else request.model_dump(by_alias=True)  # pyright: ignore[reportUnknownMemberType]
+            dumped = _dumped(request)
             assert dumped["params"]["requestedSchema"]["properties"]["approve"]["type"] == (
                 "boolean"
             )
@@ -341,7 +346,7 @@ def test_task_url_sign_in(relay_paths: RelayPaths) -> None:
             assert parked.input_requests is not None
             (ask_id,) = parked.input_requests
             request = parked.input_requests[ask_id]
-            dumped = request if isinstance(request, dict) else request.model_dump(by_alias=True)  # pyright: ignore[reportUnknownMemberType]
+            dumped = _dumped(request)
             assert dumped["params"]["mode"] == "url"
             assert await asyncio.to_thread(answer_page, dumped["params"]["url"]) == 200
             await client.session.send_request(
@@ -370,11 +375,11 @@ def test_client_without_elicitation_gets_a_typed_refusal_and_a_page(
             assert result.is_error
             refusal = _structured(result)["refusal"]
             assert refusal["reason"] == "needs_approval"
-            (ask,) = refusal["asks"]
+            (ask,) = refusal["data"]["asks"]
             assert ask["page"].startswith("http://127.0.0.1:")
             assert await asyncio.to_thread(answer_page, ask["page"]) == 200
             resumed = await client.call_tool(
-                "run", {"resume": refusal["operation_id"], "wait_s": 30}
+                "run", {"resume": refusal["data"]["operation_id"], "wait_s": 30}
             )
             assert _structured(resumed)["state"] == "completed"
 
