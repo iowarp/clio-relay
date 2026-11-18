@@ -182,6 +182,7 @@ async def test_a_job_without_a_duration_gets_the_schedulers_limit(
         finally:
             await adapter.cancel(handle)
 
+
 async def test_lq6_the_pbs_script_and_status_come_from_psij(
     fx: dict[str, str], tmp_path: Path
 ) -> None:
