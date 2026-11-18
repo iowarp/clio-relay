@@ -118,9 +118,7 @@ def test_artifacts_list_each_file_once_without_the_schedulers_records(
     link = tmp_path / "home"
     link.symlink_to(root)
     port = free_loopback_port()
-    job = Job(
-        root, port, env={"CLIO_RELAY_SERVICE_DIR": str(link), "SLURM_JOB_ID": "4242"}
-    )
+    job = Job(root, port, env={"CLIO_RELAY_SERVICE_DIR": str(link), "SLURM_JOB_ID": "4242"})
     jobs.append(job)
     wait_for(lambda: (job.serve / "ready.json").is_file())
     (root / "4242.out").write_text("Terminated\n", encoding="utf-8")
@@ -134,9 +132,7 @@ def test_artifacts_list_each_file_once_without_the_schedulers_records(
     assert "4242.out" not in names and "signalled" not in names
 
 
-def test_a_taken_port_is_refused_before_the_program_starts(
-    tmp_path: Path, jobs: list[Job]
-) -> None:
+def test_a_taken_port_is_refused_before_the_program_starts(tmp_path: Path, jobs: list[Job]) -> None:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         sock.listen()
