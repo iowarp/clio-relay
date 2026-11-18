@@ -82,6 +82,7 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
             assert list(protocols)[:7] == order
             assert protocols["sky"]["label"] == "SkyPilot"
             assert protocols["ssh"]["description"]
+            assert all(protocols[name].get("icon") for name in order)
             security = _options(table, "security")
             assert {key: item["label"] for key, item in security.items()} == {
                 "guarded": "Secure",
