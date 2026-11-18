@@ -148,7 +148,7 @@ class FileEntry(BaseModel):
 
 @runtime_checkable
 class FileAccess(Protocol):
-    """File operations on one site. Paths are the site's own paths."""
+    """File operations on one site, under the rules in ``clio_relay.jobs.file_rules``."""
 
     async def list(self, path: str) -> list[FileEntry]:
         """List a directory."""
@@ -159,11 +159,28 @@ class FileAccess(Protocol):
         ...
 
     async def read(self, path: str, *, offset: int = 0, limit: int | None = None) -> bytes:
-        """Read bytes from a file."""
+        """Read bytes from a file. A dropped download resumes at ``offset``."""
         ...
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
-        """Write a file. Refuses with ``path_exists`` unless ``overwrite``."""
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        """Write a file. Refuses with ``path_exists`` unless ``overwrite``.
+
+        With ``offset == 0`` and ``final`` the write is whole. Otherwise it is
+        one chunk of an upload into ``<path>.relay-part``, which the chunk
+        with ``final`` moves into place; a chunk returns the part's entry.
+        """
+        ...
+
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        """Delete a file, a symlink or a directory (``recursive`` if not empty)."""
         ...
 
     async def stage(self, data: bytes) -> str:

@@ -134,6 +134,21 @@ async def _file_op(adapter: LocalAdapter, op: str, body: dict[str, Any]) -> Any:
             _text(body, "path"), _decode(body.get("data")), overwrite=body.get("overwrite") is True
         )
         return written.model_dump(mode="json")
+    if op == "write-chunk":
+        offset = body.get("offset", 0)
+        if not isinstance(offset, int):
+            raise Refusal(RefusalReason.INVALID_ARGUMENTS, "offset must be an integer")
+        written = await files.write(
+            _text(body, "path"),
+            _decode(body.get("data")),
+            overwrite=body.get("overwrite") is True,
+            offset=offset,
+            final=body.get("final") is True,
+        )
+        return written.model_dump(mode="json")
+    if op == "delete":
+        await files.delete(_text(body, "path"), recursive=body.get("recursive") is True)
+        return None
     if op == "stage":
         return await files.stage(_decode(body.get("data")))
     if op == "has":

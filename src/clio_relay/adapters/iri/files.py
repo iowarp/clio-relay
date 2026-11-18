@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
+from clio_relay.jobs.file_rules import check_relative, no_delete, whole_writes_only
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -88,6 +89,7 @@ class IriFileAccess:
 
     def resolve(self, path: str) -> str:
         """Return the absolute path on the facility."""
+        check_relative(path)
         if path.startswith("/"):
             return posixpath.normpath(path)
         if self.root is None:
@@ -177,7 +179,16 @@ class IriFileAccess:
         start = max(0, offset)
         return data[start:] if limit is None else data[start : start + max(0, limit)]
 
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
+    async def write(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        overwrite: bool = False,
+        offset: int = 0,
+        final: bool = True,
+    ) -> FileEntry:
+        whole_writes_only(path, offset, final)
         if len(data) > FILE_SIZE_LIMIT:
             raise Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
@@ -194,6 +205,9 @@ class IriFileAccess:
             await self.mkdir(parent)
         await self._task("upload", {"path": target}, content=data)
         return await self.stat(target)
+
+    async def delete(self, path: str, *, recursive: bool = False) -> None:
+        raise no_delete(path)
 
     def _cas(self, digest: str) -> str:
         return posixpath.join(self.content_dir, digest)

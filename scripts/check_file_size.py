@@ -789,7 +789,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # `endpoint_*.py` owner modules, one per cohesive concern, each a
     # ``*Mixin`` class -- the same composed-mixin pattern
     # `core_queue.py`/`ClioCoreQueue` already established for exactly this
-    # "one class, too many methods" shape (core-queue-split-2026-08.md).
+    # "one class, too many methods" shape.
     # `endpoint.py` now defines only lifecycle
     # (`__init__`/`close`/`__del__`/`_require_open_queue_identity`/
     # `register`) and composes `class EndpointWorker(ServeLoopMixin,
@@ -1787,7 +1787,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
 #: Raised to 82.18 (452/550) when W1 split the Compute tab's add form and
 #: message builders out of W14's surfaces.py.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 82.29
+SRC_DISTRIBUTION_BASELINE_PERCENT = 82.33
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -1801,7 +1801,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 82.29
 #: tests/relay_next/test_compute_tab_changes.py, and to 77.53 (176/227) when its
 #: form tests moved to tests/relay_next/test_compute_tab_forms.py.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.97
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 78.07
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
