@@ -373,7 +373,7 @@ requires-dist = [
     { name = "fastmcp-slim", extras = ["client", "server"], specifier = "==4.2.1" },
     { name = "fastmcp-tasks", specifier = "==4.2.1" },
     { name = "filelock", specifier = ">=3.15" },
-    { name = "globus-compute-sdk", marker = "extra == 'globus'", specifier = ">=4.21,<5" },
+    { name = "globus-compute-sdk", marker = "extra == 'globus'", specifier = ">=4.21,<4.22" },
     { name = "globus-sdk", marker = "extra == 'globus'", specifier = ">=4.10,<5" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "jsonschema", specifier = ">=4.23" },
@@ -714,7 +714,7 @@ wheels = [
 
 [[package]]
 name = "globus-compute-sdk"
-version = "4.22.0a0"
+version = "4.21.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama" },
@@ -729,9 +729,9 @@ dependencies = [
     { name = "tblib" },
     { name = "texttable" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/68/12ce8000a133db426a49f7428b5d9c67727931f07207724d4047f880b670/globus_compute_sdk-4.22.0a0.tar.gz", hash = "sha256:a74084fb2018009e4cd7e1d8947d5621d8d095dd210d253c270e6aa1ee066fb6", size = 66412, upload-time = "2026-11-13T15:26:36.84Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/9a/1d62990d0b612b5bcf2cf21b221aa263a670e57849abf96e241cc8285747/globus_compute_sdk-4.21.0.tar.gz", hash = "sha256:5bdb60df36caad4f90acab2ba6d217c594721c238144f40fc2d561af2242ce09", size = 65623, upload-time = "2026-11-11T15:51:23.382Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/f7/b5c5a34623be0b9f81f44f5c7cef443abbcfbc0f736a145f2128cb357902/globus_compute_sdk-4.22.0a0-py3-none-any.whl", hash = "sha256:9f4fe5ded10eb4824784f0a61c32667008ce7bca271f484cdd4c343d86a76ecd", size = 75430, upload-time = "2026-11-13T15:26:35.465Z" },
+    { url = "https://files.pythonhosted.org/packages/be/ab/3b20492cf2a6ee8e0b27fc9fa221045fa6e109189f1e66502f3b4c8c5bd8/globus_compute_sdk-4.21.0-py3-none-any.whl", hash = "sha256:94351a74ecd42742c39cb5b23da337af409303c22646f199231e08820e10c4af", size = 74719, upload-time = "2026-11-11T15:51:22.038Z" },
 ]
 
 [[package]]

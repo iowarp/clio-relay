@@ -84,7 +84,7 @@ asks = "clio_relay.asks:create_provider"
 
 [project.optional-dependencies]
 tapis = ["tapipy==25.4.0"]
-globus = ["globus-sdk>=4.10,<5", "globus-compute-sdk>=4.21,<5"]
+globus = ["globus-sdk>=4.10,<5", "globus-compute-sdk>=4.21,<4.22"]
 iri = []
 testing = [
     "keyrings.alt>=5",
