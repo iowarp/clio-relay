@@ -2004,7 +2004,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 79.32
+SRC_DISTRIBUTION_BASELINE_PERCENT = 79.38
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -2015,7 +2015,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 79.32
 #: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
 #: and tests/conftest.py, both under 500 lines.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 69.37
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 69.84
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

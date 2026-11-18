@@ -1,4 +1,4 @@
-"""What ``describe`` reports for relay as a whole and for one site (LQ2, RL5)."""
+"""What ``describe`` reports for relay as a whole and for one site (LQ2, RL5, RL34)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface.skills import skill_link, skills
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -34,6 +35,8 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
     """List every site with its status, the installed adapters and the verbs."""
     entries = service.sites.list()
     statuses = await asyncio.gather(*(site_status(service, entry) for entry in entries))
+    config_dir = service.paths.config_dir
+    known = await asyncio.to_thread(skills, config_dir)
     return {
         "sites": [
             {
@@ -43,6 +46,7 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
                 "alternatives": sorted(entry.alternatives),
                 "policy": entry.policy,
                 "status": status,
+                "skill": skill_link(entry, config_dir, known),
             }
             for entry, status in zip(entries, statuses, strict=True)
         ],
@@ -56,6 +60,7 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
         "routes": [item.model_dump(mode="json") for item in service.site_routes(site)],
+        "skill": await asyncio.to_thread(skill_link, site, service.paths.config_dir),
     }
     try:
         adapter = service.adapter_for(site, "describe")

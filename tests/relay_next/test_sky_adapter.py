@@ -104,6 +104,20 @@ async def test_price_comes_from_skypilot_in_dollars(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_price_without_a_duration_has_no_amount(tmp_path: Path) -> None:
+    class NoCall(SkyAdapter):
+        async def call(self, op: str, request: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError(f"price called SkyPilot ({op}) with no walltime")
+
+    adapter = _build(tmp_path, cls=NoCall)
+    charge = await adapter.price(JobSpec(executable="true", resources=JobResources(node_count=2)))
+    assert charge.amount is None
+    assert charge.walltime_s is None
+    assert charge.node_hours is None
+    assert (charge.nodes, charge.unit, charge.site) == (2, "USD", "aws")
+
+
+@pytest.mark.asyncio
 async def test_price_follows_spot_and_job_overrides(tmp_path: Path) -> None:
     spot = await _build(tmp_path, use_spot=True).price(_hour())
     assert spot.amount == pytest.approx(0.192 * 0.125)

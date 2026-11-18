@@ -78,7 +78,8 @@ A job can override any resource setting with a `sky.` custom attribute, such as
 walltime, times its node count, and returns it in US dollars. It works offline,
 with no cloud account. For example, two `m6i.large` nodes on AWS for one hour
 come to 0.192 USD on demand. The spend gate shows this price before the job
-starts.
+starts. A job with no walltime has no upper bound, so its price has no amount,
+and the spend gate asks before it starts.
 
 ## How a job runs
 

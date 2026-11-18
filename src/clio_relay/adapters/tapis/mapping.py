@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.jobs.handles import JobState
 from clio_relay.jobs.spec import JobSpec
 
 MIB = 1024 * 1024
 TAPISLOCAL = "tapislocal://exec.tapis"
+# Tapis has no "no limit" for maxMinutes, so a job with no walltime asks for a year.
+NO_WALLTIME_MINUTES = 365 * 24 * 60
 
 QUEUED = frozenset(
     {
@@ -81,6 +83,7 @@ def job_request(
     job_dir: str,
     content_dir_host: str,
     launcher_arg: str,
+    max_minutes: int,
 ) -> dict[str, Any]:
     """Build the body of ``jobs.submitJob``."""
     resources = spec.resources
@@ -112,7 +115,7 @@ def job_request(
         ],
         "tags": ["clio-relay"],
         "parameterSet": params,
-        **_max_minutes(spec),
+        "maxMinutes": max_minutes,
     }
     if resources.node_count is not None:
         request["nodeCount"] = resources.node_count
@@ -128,12 +131,23 @@ def job_request(
     return request
 
 
-def _max_minutes(spec: JobSpec) -> dict[str, int]:
-    """Send ``maxMinutes`` only when the spec sets a walltime; otherwise Tapis applies its own."""
+def max_minutes(spec: JobSpec, system: dict[str, Any], system_type: str) -> int:
+    """The job's ``maxMinutes``.
+
+    Tapis fails a job that runs past it, and when the request leaves it out Tapis
+    uses 10 minutes. So a spec with no walltime asks for the most the system
+    allows: the logical queue's own limit on a batch system, else a year.
+    """
     duration = spec.attributes.duration
-    if duration is None:
-        return {}
-    return {"maxMinutes": max(1, math.ceil(duration.total_seconds() / 60))}
+    if duration is not None:
+        return max(1, math.ceil(duration.total_seconds() / 60))
+    if system_type == "BATCH":
+        name = spec.attributes.queue_name or system.get("batchDefaultLogicalQueue")
+        for queue in cast(list[dict[str, Any]], system.get("batchLogicalQueues") or []):
+            limit = queue.get("maxMinutes")
+            if queue.get("name") == name and isinstance(limit, int) and limit > 0:
+                return limit
+    return NO_WALLTIME_MINUTES
 
 
 def description(operation_id: str) -> str:

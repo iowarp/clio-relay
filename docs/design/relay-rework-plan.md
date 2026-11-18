@@ -608,7 +608,7 @@ Fixtures the session builds: an SSH host in a container, the same with Slurm, th
 
 | ID | Scenario | Passes when |
 | --- | --- | --- |
-| LQ1 | List the server's tools | Exactly `describe`, `run`, `exec`, `files`, `serve`, plus any mounted by a running service |
+| LQ1 | List the server's tools | Exactly five model-visible tools, `describe`, `run`, `exec`, `files` and `serve`, plus any mounted by a running service. A `tools/list` request whose `_meta` declares `org.a2ui/a2ui` also lists the Compute tab's action tools, marked `_meta.ui.visibility: ["app"]`. A client without A2UI sees exactly the five, and every action call needs its single-use action token |
 | LQ2 | `describe` with no site, then for the SSH fixture | The list shows status. The site report shows the route for each verb |
 | LQ3 | Install a fixture adapter package | It appears in `describe` and in the add-site form with no change to relay |
 | LQ4 | The conformance kit on `local`, `ssh` and `worker` | All pass. Unimplemented verbs are refused with a typed reason |
