@@ -42,10 +42,14 @@ CLIO_KIT_NATIVE_OPERATIONS = (
 )
 JARVIS_CD_NATIVE_OPERATIONS = (
     "execution_handle.progress",
-    "execution_store.resolve_service_runtime_authority",
     "pipeline.get_execution",
     "pipeline.get_execution_progress",
     "pipeline.run",
+)
+# Receipts written before relay stopped calling these still list them. They are
+# ignored when matching, so those installations keep passing.
+RETIRED_JARVIS_CD_NATIVE_OPERATIONS = frozenset(
+    {"execution_store.resolve_service_runtime_authority"}
 )
 
 
@@ -144,7 +148,6 @@ import json
 
 from jarvis_cd.core.execution import (
     ExecutionHandle,
-    ExecutionStore,
     HANDLE_SCHEMA,
     PROGRESS_SNAPSHOT_SCHEMA,
     RECORD_SCHEMA,
@@ -153,9 +156,6 @@ from jarvis_cd.core.pipeline import Pipeline
 
 operations = {{
     "execution_handle.progress": callable(getattr(ExecutionHandle, "progress", None)),
-    "execution_store.resolve_service_runtime_authority": callable(
-        getattr(ExecutionStore, "resolve_service_runtime_authority", None)
-    ),
     "pipeline.get_execution": callable(getattr(Pipeline, "get_execution", None)),
     "pipeline.get_execution_progress": callable(
         getattr(Pipeline, "get_execution_progress", None)
@@ -489,9 +489,32 @@ def _native_capability_matches_component(
         )
     if component_name == "jarvis-cd":
         return (
-            capability.operations == list(JARVIS_CD_NATIVE_OPERATIONS)
+            _current_jarvis_cd_operations(capability) == list(JARVIS_CD_NATIVE_OPERATIONS)
             and capability.contract_id is None
             and capability.contract_schema_version is None
             and capability.contract_sha256 is None
         )
     return False
+
+
+def _current_jarvis_cd_operations(capability: NativeJarvisExecutionCapability) -> list[str]:
+    """Return a capability's operations without the retired JARVIS-CD ones."""
+    return [
+        operation
+        for operation in capability.operations
+        if operation not in RETIRED_JARVIS_CD_NATIVE_OPERATIONS
+    ]
+
+
+def native_capabilities_agree(
+    observed: NativeJarvisExecutionCapability,
+    expected: NativeJarvisExecutionCapability,
+) -> bool:
+    """Return whether a probed JARVIS-CD capability agrees with its receipt.
+
+    Retired operations are ignored on both sides, so a receipt written before
+    they were retired agrees with a probe that no longer reports them.
+    """
+    return observed.model_copy(
+        update={"operations": _current_jarvis_cd_operations(observed)}
+    ) == expected.model_copy(update={"operations": _current_jarvis_cd_operations(expected)})

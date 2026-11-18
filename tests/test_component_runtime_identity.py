@@ -53,7 +53,6 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     capability = NativeJarvisExecutionCapability(
         operations=[
             "execution_handle.progress",
-            "execution_store.resolve_service_runtime_authority",
             "pipeline.get_execution",
             "pipeline.get_execution_progress",
             "pipeline.run",
@@ -145,6 +144,19 @@ def test_native_jarvis_runtime_accepts_canonical_source_aliases(
     assert identity["runtime_artifact_path_verified"] is True
     assert identity["execution_interpreter_verified"] is True
     assert identity["verified"] is True
+
+    # A receipt written before relay stopped requiring the runtime-authority
+    # operation still agrees with a probe that no longer reports it.
+    older_receipt = component.model_copy(
+        update={
+            "native_execution": NativeJarvisExecutionCapability(
+                operations=sorted(
+                    [*capability.operations, "execution_store.resolve_service_runtime_authority"]
+                )
+            )
+        }
+    )
+    assert runtime_identity_probe(older_receipt)["verified"] is True
 
     other = canonical_home / "other" / wheel.name
     other.parent.mkdir()

@@ -28,6 +28,7 @@ from clio_relay.installation_receipt_models import (
 )
 from clio_relay.native_jarvis_contract import (
     _native_capability_matches_component,
+    native_capabilities_agree,
     probe_clio_kit_native_execution_contract,
     probe_jarvis_native_execution_capability,
 )
@@ -396,7 +397,8 @@ def _native_jarvis_component_runtime_identity(
         execution_native_error = str(exc)
     execution_native_execution_capability_verified = (
         expected_native_capability is not None
-        and execution_native_capability == expected_native_capability
+        and execution_native_capability is not None
+        and native_capabilities_agree(execution_native_capability, expected_native_capability)
     )
     native_execution_capability_verified = (
         expected_native_capability is not None
