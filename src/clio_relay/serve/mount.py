@@ -9,9 +9,10 @@ services offer the same URI, the first mounted wins.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,21 @@ class MountProvider(Provider):
     def __init__(self) -> None:
         super().__init__()
         self.mounts: dict[str, Mount] = {}
+        self.on_start: Callable[[], Coroutine[Any, Any, None]] | None = None
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self) -> AsyncGenerator[None]:
+        """Run the startup work, such as re-binding ports, when relay's server starts."""
+        task: asyncio.Task[None] | None = None
+        if self.on_start is not None:
+            task = asyncio.get_running_loop().create_task(self.on_start())
+        try:
+            yield
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     async def _list_tools(self) -> Sequence[Tool]:
         return [tool for mount in self.mounts.values() for tool in mount.tools]

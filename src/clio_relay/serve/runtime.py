@@ -15,6 +15,7 @@ import contextlib
 import inspect
 import json
 import logging
+import re
 import shlex
 import time
 from pathlib import Path
@@ -59,6 +60,8 @@ EXEC_OUTPUT = 65536
 STOP_MARGIN_S = 30.0
 CANCEL_RETRY_S = 60.0
 LOG_TAIL = 4096
+# frpc's log line: "2026-11-18 12:38:59.277 [W] [client/service.go:319] text".
+_FRPC_LINE = re.compile(r"^\S+ \S+ \[([A-Z])\] \[[^\]]*\] (.*)$")
 
 _runtime: ServeRuntime | None = None
 
@@ -224,6 +227,7 @@ class ServeRuntime:
     def attach(self, server: Any, changes: Any) -> None:
         """Let the runtime mount served MCP servers on relay's own server (RL21)."""
         self.mounter.attach(server, changes)
+        self.mounter.provider.on_start = self.resume
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(self.resume())
 
@@ -256,6 +260,9 @@ class ServeRuntime:
         for plan in self.store.all():
             self.plans.setdefault(plan.operation_id, plan)
             if plan.final is None and plan.ready_at is not None and plan.stop_requested_at is None:
+                record = self.records.get(plan.operation_id)
+                if record is not None and record.state.final:
+                    continue
                 try:
                     await self._ensure_forward(plan, None)
                 except Refusal as refusal:
@@ -462,6 +469,22 @@ class ServeRuntime:
         lines = [line for line in data.decode(errors="replace").splitlines() if line.strip()]
         return self._redact(plan, lines[-1][-300:]) if lines else None
 
+    async def _frpc_problem(self, plan: ServePlan, adapter: Any) -> str | None:
+        """Return frpc's latest warning or error on the site, unless it logged in after it."""
+        if plan.mode != "frp":
+            return None
+        data = await self._read(plan, adapter, "frpc.log", tail=LOG_TAIL)
+        if not data:
+            return None
+        lines = [line for line in data.decode(errors="replace").splitlines() if line.strip()]
+        for line in reversed(lines):
+            if "login to server success" in line:
+                return None
+            match = _FRPC_LINE.match(line)
+            if match is not None and match.group(1) in ("W", "E"):
+                return self._redact(plan, match.group(2).strip()[-300:])
+        return None
+
     async def _running(
         self, plan: ServePlan, adapter: Any, status: JobStatus
     ) -> tuple[JobStatus, Endpoint | None]:
@@ -469,9 +492,14 @@ class ServeRuntime:
             raw = await self._read(plan, adapter, "ready.json")
             if raw is None:
                 line = await self._service_line(plan, adapter)
+                problem = await self._frpc_problem(plan, adapter)
                 message = "starting: waiting for the service's ports to answer"
+                if plan.mode == "frp":
+                    message += " and for frpc to register them"
                 if line:
                     message += f". Last service output: {line}"
+                if problem:
+                    message += f". frpc on the site, retrying: {problem}"
                 return status.model_copy(update={"message": message}), None
             with contextlib.suppress(ValueError):
                 ready: dict[str, Any] = json.loads(raw)
@@ -515,7 +543,7 @@ class ServeRuntime:
             transport = getattr(adapter, "transport", None)
             environment = getattr(transport, "environment", None)
             if callable(environment):
-                forward.ssh_env = dict(await _maybe(environment()))
+                forward.ssh_env = dict(await _maybe(environment()) or {})
         await forward.start()
         return forward
 

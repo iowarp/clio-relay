@@ -13,6 +13,8 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,8 +23,8 @@ from pydantic import ValidationError
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.serve import config as serve_settings
-from clio_relay.serve.forward import Forward
-from clio_relay.serve.plan import PortPlan, ServePlan
+from clio_relay.serve.forward import Forward, port_bound
+from clio_relay.serve.plan import PortPlan, ServePlan, free_loopback_port
 from clio_relay.surface.settings import RelayPaths
 
 
@@ -49,6 +51,12 @@ def visitor_plan(
     listed: list[tuple[str, Any, int]] = [
         (str(name), protocol, int(local)) for name, protocol, local in payload["ports"]
     ]
+    locals_: dict[str, int] = {}
+    for name, _protocol, local in listed:
+        wanted = chosen.get(name, local)
+        if name not in chosen and port_bound(wanted):
+            wanted = free_loopback_port()
+        locals_[name] = wanted
     return ServePlan(
         operation_id=str(payload["op"]),
         site="connect",
@@ -56,10 +64,8 @@ def visitor_plan(
         service="connect",
         mode="frp",
         ports=[
-            PortPlan(
-                name=name, protocol=protocol, remote_port=0, local_port=chosen.get(name, local)
-            )
-            for name, protocol, local in listed
+            PortPlan(name=name, protocol=protocol, remote_port=0, local_port=locals_[name])
+            for name, protocol, _local in listed
         ],
         secret_key=str(payload["sk"]),
         rendezvous=rendezvous.model_copy(update={"direct": bool(payload.get("direct"))}),
@@ -74,13 +80,18 @@ async def hold(plan: ServePlan, directory: Path) -> None:
             print(f"the forward ended; bound again (restart {count})", file=sys.stderr)
 
     forward = Forward(plan, directory, restarted)
+    stop = asyncio.Event()
+    if os.name != "nt":
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            loop.add_signal_handler(signum, stop.set)
     await forward.start()
     try:
         while not forward.bound():
             await asyncio.sleep(1)
         for port in plan.ports:
-            print(f"{port.name}: {port.url() or f'127.0.0.1:{port.local_port}'}")
-        await asyncio.Event().wait()
+            print(f"{port.name}: {port.url() or f'127.0.0.1:{port.local_port}'}", flush=True)
+        await stop.wait()
     finally:
         await forward.close()
 
