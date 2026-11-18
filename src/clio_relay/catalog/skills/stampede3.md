@@ -3,6 +3,14 @@
 TACC's Stampede3, reached through TACC's Tapis service. It needs a TACC allocation
 on Stampede3; without one, `describe` reports that the credential check failed.
 
+## Setting up
+
+- The site names the host but not the Tapis system. Until `system_id` is set,
+  adding the site refuses `invalid_config` and lists the systems on Stampede3 in
+  `candidates`. Ask the person which one to use; do not pick for them.
+- If `describe` refuses because the system's working directory is not a plain
+  path, ask the person for a `work_dir` under their work directory.
+
 ## Rules on this site
 
 - The site is guarded. `run` accepts only a reviewed clio-jarvis package, given by
