@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -23,8 +24,27 @@ from clio_relay.surface.settings import RelayPaths
 
 app = typer.Typer(no_args_is_help=True, help="Relay: run work on the sites you use.")
 site_app = typer.Typer(no_args_is_help=True, help="Add, edit and remove sites.")
-asks_app = typer.Typer(no_args_is_help=True, help="See and answer what relay is asking.")
+rendezvous_app = typer.Typer(no_args_is_help=True, help="Where services meet relay's forwards.")
 app.add_typer(site_app, name="site")
+app.add_typer(rendezvous_app, name="rendezvous")
+
+
+def _installed_asks_app() -> typer.Typer | None:
+    try:
+        from clio_relay.cli_asks import (  # pyright: ignore[reportMissingImports]
+            app as installed,  # pyright: ignore[reportUnknownVariableType]
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "clio_relay.cli_asks":
+            raise
+        return None
+    return cast(typer.Typer, installed)
+
+
+_asks_app = _installed_asks_app()
+asks_app = _asks_app or typer.Typer(
+    no_args_is_help=True, help="See and answer what relay is asking."
+)
 app.add_typer(asks_app, name="asks")
 
 
@@ -41,6 +61,17 @@ def _fail(refusal: Refusal) -> None:
     raise typer.Exit(2)
 
 
+def _grant_files(values: list[str]) -> dict[str, Path]:
+    grants: dict[str, Path] = {}
+    for value in values:
+        provider, sep, target = value.partition("=")
+        if not sep or not provider.strip() or not target.strip():
+            typer.echo(f"--grant-file takes PROVIDER=PATH, not {value!r}", err=True)
+            raise typer.Exit(2)
+        grants[provider.strip().lower()] = Path(target.strip())
+    return grants
+
+
 @app.command()
 def serve(
     http: Annotated[bool, typer.Option(help="Serve Streamable HTTP instead of stdio")] = False,
@@ -50,14 +81,25 @@ def serve(
     token_file: Annotated[
         Path | None, typer.Option(help="File holding the HTTP bearer token")
     ] = None,
+    grant_file: Annotated[
+        list[str] | None,
+        typer.Option(help="PROVIDER=PATH: a grant file the host keeps current. Repeatable"),
+    ] = None,
+    tls_cert: Annotated[Path | None, typer.Option(help="TLS certificate, for HTTPS")] = None,
+    tls_key: Annotated[Path | None, typer.Option(help="TLS private key, for HTTPS")] = None,
 ) -> None:
     """Serve relay as an MCP server."""
     from clio_relay.surface.server import create_server
 
     paths = _paths()
+    if grant_file:
+        paths = replace(paths, grant_files={**paths.grant_files, **_grant_files(grant_file)})
     if not http:
         create_server(paths, transport="stdio").run(transport="stdio", show_banner=False)
         return
+    if (tls_cert is None) != (tls_key is None):
+        typer.echo("give both --tls-cert and --tls-key, or neither", err=True)
+        raise typer.Exit(2)
     token = os.environ.get("CLIO_RELAY_TOKEN")
     if token is None:
         target = token_file or paths.state_dir / "http-token"
@@ -71,10 +113,85 @@ def serve(
         typer.echo(f"bearer token in {target}", err=True)
     normalized = "/" + path.strip("/")
     public = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    origin = f"{'https' if tls_cert else 'http'}://{public}:{port}"
     server = create_server(
-        paths, transport="http", token=token, base_url=f"http://{public}:{port}{normalized}"
+        paths,
+        transport="http",
+        token=token,
+        base_url=f"{origin}{normalized}",
+        public_base_url=origin,
     )
-    server.run(transport="http", host=host, port=port, path=normalized, show_banner=False)
+    # Page URLs carry single-use tokens, so requests are never logged.
+    uvicorn_config: dict[str, Any] = {"access_log": False}
+    if tls_cert is not None and tls_key is not None:
+        uvicorn_config.update(ssl_certfile=str(tls_cert), ssl_keyfile=str(tls_key))
+    server.run(
+        transport="http",
+        host=host,
+        port=port,
+        path=normalized,
+        show_banner=False,
+        uvicorn_config=uvicorn_config,
+    )
+
+
+@app.command()
+def connect(handle: Annotated[str, typer.Argument(help="A service's operation id")]) -> None:
+    """Forward a running service's ports to this machine and hold them open."""
+    try:
+        from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
+            connect as connect_service,  # pyright: ignore[reportUnknownVariableType]
+        )
+    except ModuleNotFoundError as exc:
+        _no_service_runtime(exc)
+        return
+    try:
+        connect_service(handle, paths=_paths())
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@rendezvous_app.command("show")
+def rendezvous_show() -> None:
+    """Show the rendezvous settings."""
+    _print(_rendezvous(None))
+
+
+@rendezvous_app.command("set")
+def rendezvous_set(
+    values: Annotated[list[str], typer.Argument(help="KEY=VALUE settings to change")],
+) -> None:
+    """Change rendezvous settings."""
+    changes: dict[str, str] = {}
+    for value in values:
+        key, sep, setting = value.partition("=")
+        if not sep or not key.strip():
+            typer.echo(f"settings are KEY=VALUE, not {value!r}", err=True)
+            raise typer.Exit(2)
+        changes[key.strip()] = setting.strip()
+    _print(_rendezvous(changes))
+
+
+def _rendezvous(changes: dict[str, str] | None) -> Any:
+    try:
+        from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
+            settings as rendezvous_settings,  # pyright: ignore[reportUnknownVariableType]
+        )
+    except ModuleNotFoundError as exc:
+        _no_service_runtime(exc)
+        return None
+    try:
+        return rendezvous_settings(_paths(), changes)  # pyright: ignore[reportUnknownVariableType]
+    except Refusal as refusal:
+        _fail(refusal)
+        return None
+
+
+def _no_service_runtime(exc: ModuleNotFoundError) -> None:
+    if exc.name not in ("clio_relay.serve", "clio_relay"):
+        raise exc
+    typer.echo("verb_not_implemented: the service runtime is not installed", err=True)
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -201,7 +318,6 @@ def site_switch(site_id: str, adapter: str) -> None:
     _print(switched.model_dump(mode="json"))
 
 
-@asks_app.command("list")
 def asks_list(
     all_asks: Annotated[bool, typer.Option("--all", help="Include answered asks")] = False,
 ) -> None:
@@ -217,7 +333,6 @@ def asks_list(
     _print(shown)
 
 
-@asks_app.command("answer")
 def asks_answer(
     ask_id: str,
     decline: Annotated[bool, typer.Option(help="Say no")] = False,
@@ -254,6 +369,11 @@ def asks_answer(
             _print({"ask": ask_id, "state": ask.state})
     except Refusal as refusal:
         _fail(refusal)
+
+
+if _asks_app is None:
+    asks_app.command("list")(asks_list)
+    asks_app.command("answer")(asks_answer)
 
 
 def main() -> None:
