@@ -31,8 +31,7 @@ check the response's HMAC against -- see ``OwnedSessionChannelBootstrap``'s
 docstring); only the later re-proof in
 ``remote_connection.verify_session_identity`` closes that gap. The
 ``preshared_link_secret`` anchor (§8.3) does not cover the LOCAL bind end (the
-loopback port) either -- see ``docs/connection-model.md``'s "Still deviating"
-entry.
+loopback port) either -- see §8.6's R1 entry.
 
 That anchor gap is why §8.3 requires a cluster to explicitly opt into
 ``preshared_link_secret`` before either mode may be used at all;
@@ -43,10 +42,9 @@ from ``control_channel.py``).
 
 ``udp_rendezvous``'s hole-punch failure is a typed :class:`TransportPunchFailed`
 refusal in this slice, not the automatic in-mode fallback to ``brokered_tcp``'s
-stcp visitor that ``docs/connection-model.md`` and §8.4 describe as the mode's
-eventual sanctioned behavior -- see that class's docstring and
-``docs/connection-model.md``'s "Still deviating" entry for the tracked
-follow-up. This path must never render OR spawn an stcp visitor -- proven at
+stcp visitor that §8.4 describes as the mode's eventual sanctioned behavior --
+see that class's docstring and §8.5's correction for the tracked follow-up.
+This path must never render OR spawn an stcp visitor -- proven at
 the render call itself, not only by inspecting rendered text
 (``tests/test_frp_transport_dials.py``'s sabotage twin spies on
 ``frp_link.render_visitor_config``): ``transport_probe.py``'s probe-only
@@ -112,8 +110,8 @@ class TransportPunchFailed(RelayError):
     """The ``udp_rendezvous`` hole-punch handshake did not establish a tunnel.
 
     This is a typed refusal, not the "fall back to brokered_tcp" degradation
-    ``docs/connection-model.md`` and §8.4 describe as the mode's eventual
-    sanctioned behavior: automatically switching this held visitor's proxy type
+    §8.4 describes as the mode's eventual sanctioned behavior (§8.5 records the
+    correction): automatically switching this held visitor's proxy type
     mid-connection is a bigger, separate change this slice does not build, and
     this path must never render or spawn an stcp visitor to simulate it.
     Reconnecting after this error retries the same xtcp handshake in the same
@@ -197,9 +195,8 @@ class _FrpChannelTransport:
         """Neither mode blocks on an interactive prompt.
 
         Both relays simply dial out to the already-deployed relay point
-        (§8.4's dial-count invariants; ``connection-model.md``'s "at most 1
-        [ssh]... skipped when already deployed" covers only the separate,
-        skippable deploy step, not this tunnel).
+        (§8.4's dial-count invariants; that table's "at most 1 ssh (deploy,
+        skippable)" covers only the separate deploy step, not this tunnel).
         """
         return False
 
@@ -455,8 +452,8 @@ def _verify_pinned_identity(
     pinned cluster/session/generation/nonce could still pass this specific
     check -- only the later re-proof
     (``remote_connection.verify_session_identity``, against THIS document)
-    closes that gap. See ``docs/connection-model.md``'s "Still deviating"
-    entry: the preshared anchor does not cover the local bind end.
+    closes that gap. See ``docs/design/relay-architecture-2026-08.md`` §8.6's
+    R1 entry: the preshared anchor does not cover the local bind end.
     """
     if identity.get("schema_version") != SESSION_IDENTITY_SCHEMA or any(
         identity.get(field) != expected
