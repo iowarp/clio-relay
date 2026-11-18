@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import stat
 import subprocess
 import sys
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,7 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle, JobStatus
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import InputRef, JobSpec
+from clio_relay.jobs.spec import InputRef, JobAttributes, JobSpec
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
@@ -124,6 +126,137 @@ async def test_lq5_a_slurm_job_completes_after_relay_restarts(
     # A second run of the same operation submits nothing new.
     again = await second.run(spec, operation_id=operation_id)
     assert again.native_id == handle.native_id
+
+
+async def test_a_job_the_scheduler_forgot_is_read_from_its_own_record(
+    fx: dict[str, str], tmp_path: Path
+) -> None:
+    """Relay is down longer than Slurm's MinJobAge (300 s on fx-slurm and Ares)."""
+    first = build(fx, tmp_path / "before", "fx-slurm")
+    done_op, killed_op = new_id("op"), new_id("op")
+    done = await first.run(
+        JobSpec(executable="sh", arguments=["-c", "echo purged-done"]), operation_id=done_op
+    )
+    killed = await first.run(
+        JobSpec(executable="sleep", arguments=["3600"]), operation_id=killed_op
+    )
+    for handle in (done, killed):
+        script = (await (await first.files()).read(f"{handle.data['job_dir']}/submit.sh")).decode()
+        assert f'#SBATCH --job-name="{handle.data["job_name"]}"' in script
+    del first
+    # Someone other than relay ends the second job, so it writes no exit code.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1800
+    while killed.native_id not in site_shell(fx, "fx-slurm", "squeue -h --me -t R -o %i").split():
+        assert loop.time() < deadline
+        await asyncio.sleep(2)
+    site_shell(fx, "fx-slurm", f"scancel {killed.native_id}")
+    while True:
+        listed = site_shell(fx, "fx-slurm", "squeue -h --me -t all -o %i").split()
+        if done.native_id not in listed and killed.native_id not in listed:
+            break
+        assert loop.time() < deadline, "Slurm still lists the jobs"
+        await asyncio.sleep(10)
+
+    second = build(fx, tmp_path / "after", "fx-slurm")
+    found = await second.find(done_op)
+    assert found is not None and found.native_id == done.native_id
+    final = await second.status(found)
+    assert final.state.value == "completed", final
+    assert final.exit_code == 0
+    assert final.native_state == "gone"
+    stdout = await (await second.files()).read(f"{found.data['job_dir']}/stdout")
+    assert stdout.strip() == b"purged-done"
+
+    found = await second.find(killed_op)
+    assert found is not None and found.native_id == killed.native_id
+    ended = await second.status(found)
+    # fx-slurm keeps accounting, so sacct says how it ended. Without accounting
+    # the state is unknown rather than failed.
+    assert ended.state.value == "cancelled", ended
+    assert ended.native_state == "CANCELLED"
+
+
+def site_shell(fx: dict[str, str], profile: str, command: str) -> str:
+    done = subprocess.run(
+        ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", profile, command],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return done.stdout
+
+
+def scheduler_limit(fx: dict[str, str], profile: str, native_id: str) -> str | None:
+    """Return the walltime the scheduler holds for a job, as it reports it."""
+    if profile == "fx-slurm":
+        line = site_shell(fx, profile, f"scontrol show job -o {native_id}")
+        return next(
+            field.split("=", 1)[1] for field in line.split() if field.startswith("TimeLimit=")
+        )
+    report = json.loads(
+        site_shell(fx, profile, f"PATH=/opt/pbs/bin:$PATH qstat -f -F json {native_id}")
+    )
+    (job,) = report["Jobs"].values()
+    return job.get("Resource_List", {}).get("walltime")
+
+
+@pytest.mark.parametrize("profile", ["fx-slurm", "fx-pbs"])
+async def test_a_job_without_a_duration_gets_the_schedulers_limit(
+    fx: dict[str, str], tmp_path: Path, profile: str
+) -> None:
+    """Relay sets no walltime of its own: no directive, and no 10 minute cap."""
+    adapter = build(fx, tmp_path, profile)
+    files = await adapter.files()
+    # The fixture's default Slurm partition and PBS queue set no walltime.
+    unset = {"fx-slurm": "UNLIMITED", "fx-pbs": None}[profile]
+    timed = {"fx-slurm": "00:15:00", "fx-pbs": "00:15:00"}[profile]
+    cases: list[tuple[JobSpec, bool, str | None]] = [
+        (JobSpec(executable="sleep", arguments=["3600"]), False, unset),
+        (
+            JobSpec(
+                executable="sleep",
+                arguments=["3600"],
+                attributes=JobAttributes(duration=timedelta(minutes=15)),
+            ),
+            True,
+            timed,
+        ),
+    ]
+    for spec, directive, limit in cases:
+        handle = await adapter.run(spec, operation_id=new_id("op"))
+        try:
+            script = (await files.read(f"{handle.data['job_dir']}/submit.sh")).decode()
+            has_directive = "#SBATCH --time=" in script or "#PBS -l walltime=" in script
+            assert has_directive == directive, script
+            assert handle.native_id is not None
+            assert scheduler_limit(fx, profile, handle.native_id) == limit
+        finally:
+            await adapter.cancel(handle)
+
+
+async def test_cancelling_exec_stops_the_remote_command(fx: dict[str, str], tmp_path: Path) -> None:
+    adapter = build(fx, tmp_path, "fx-ssh")
+    pid_file = f"{RUN_DIR}/exec-{new_id('x')}.pid"
+    site_shell(fx, "fx-ssh", f"mkdir -p {RUN_DIR}")
+    call = asyncio.ensure_future(
+        adapter.exec(["sh", "-c", f"echo $$ > {pid_file}; exec sleep 3600"], max_output_bytes=4096)
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DEADLINE_S
+    while not (pid := site_shell(fx, "fx-ssh", f"cat {pid_file} 2>/dev/null; true").strip()):
+        assert not call.done()
+        assert loop.time() < deadline
+        await asyncio.sleep(0.5)
+    alive = f"kill -0 {pid} 2>/dev/null && echo alive || echo gone"
+    assert site_shell(fx, "fx-ssh", alive).strip() == "alive"
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    while site_shell(fx, "fx-ssh", alive).strip() == "alive":
+        assert loop.time() < deadline, "the remote command outlived the cancelled exec"
+        await asyncio.sleep(0.5)
 
 
 async def test_lq6_the_pbs_script_and_status_come_from_psij(

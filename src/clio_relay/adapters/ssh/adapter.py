@@ -22,6 +22,7 @@ import logging
 import shlex
 import shutil
 import threading
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -108,6 +109,19 @@ def _remote_path(base: PurePosixPath, value: str | None) -> PurePosixPath | None
 def job_name(operation_id: str) -> str:
     """Return the scheduler job name relay gives an operation, for reconciling."""
     return f"relay-{operation_id}"
+
+
+def walltime(spec: JobSpec) -> timedelta | None:
+    """Return the walltime the spec asks for, or None when it gives none.
+
+    ``JobAttributes`` fills ``duration`` with a default, so a duration counts only
+    when it was given: by the caller, or by the site's ``defaults.duration``.
+    """
+    attributes = spec.attributes
+    duration: timedelta | None = getattr(attributes, "duration", None)
+    if duration is None or "duration" not in attributes.model_fields_set:
+        return None
+    return duration
 
 
 class _Rendered:
@@ -346,6 +360,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
         executor = _executor(scheduler, self.render_dir)
         psij_spec = spec.to_psij(name=name)
+        # Relay never sets a walltime of its own (RL18). With none in the spec, PSI/J
+        # gets None and writes no directive, so the scheduler's default applies.
+        psij_attributes: Any = psij_spec.attributes
+        psij_attributes.duration = walltime(spec)
         # PSI/J would make these absolute against this machine. They are the site's paths.
         psij_spec._directory = workdir  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         psij_spec._stdout_path = stdout  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
@@ -392,14 +410,23 @@ class SshAdapter(BaseAdapter[SshConfig]):
         mode = str(handle.data.get("mode", "scheduler"))
         executor: BatchSchedulerExecutor | None = None
         status_command: str | None = None
+        accounting_command: str | None = None
         if mode == "scheduler":
             scheduler = cast(SchedulerName, handle.data["scheduler"])
             executor = _executor(scheduler, self.render_dir)
             assert handle.native_id is not None
             status_command = shlex.join(executor.get_status_command([handle.native_id]))
+            if scheduler == "slurm":
+                accounting_command = shlex.join(
+                    ["sacct", "-X", "-n", "-P", "-j", handle.native_id, "-o", "State,ExitCode"]
+                )
         text = await self._ssh(
             scripts.status_script(
-                job_dir, mode=mode, status_command=status_command, native_id=handle.native_id
+                job_dir,
+                mode=mode,
+                status_command=status_command,
+                native_id=handle.native_id,
+                accounting_command=accounting_command,
             ),
             "status",
         )
@@ -414,12 +441,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
             status = _stored_final(sections["final"])
             status.outputs = self._outputs(handle, sections.get("outputs", []))
             return status
-        if executor is not None:
-            status = self._scheduler_status(executor, handle, sections)
-        else:
-            status = _detached_status(sections)
         last = (sections.get("last") or [""])[0].split()
         recorded = last[1] if len(last) > 1 else None
+        if executor is not None:
+            status = self._scheduler_status(executor, handle, sections, recorded)
+        else:
+            status = _detached_status(sections)
         if status.state.final:
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
@@ -447,6 +474,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         executor: BatchSchedulerExecutor,
         handle: JobHandle,
         sections: dict[str, list[str]],
+        recorded: str | None = None,
     ) -> JobStatus:
         native_id = handle.native_id
         assert native_id is not None
@@ -475,10 +503,20 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 return JobStatus(state=state, exit_code=exit_code, native_state="gone")
             if cancelled:
                 return JobStatus(state=JobState.CANCELLED, native_state="gone")
+            accounted = accounted_status(sections.get("acct", []))
+            if accounted is not None:
+                return accounted
+            # Schedulers forget finished jobs (Slurm after MinJobAge). With no exit
+            # code and no accounting, how the job ended is unknown, not a failure.
+            # The state stays open, so a later poll can still read an exit code,
+            # and cancel ends it.
             return JobStatus(
-                state=JobState.FAILED,
-                native_state="gone",
-                message="the job left the queue without writing an exit code",
+                state=JobState.QUEUED if recorded == JobState.QUEUED.value else JobState.RUNNING,
+                native_state="unknown",
+                message=(
+                    f"the scheduler no longer lists job {native_id}, and the job left no "
+                    "exit code; how it ended is unknown"
+                ),
             )
         state = _PSIJ_STATES.get(observed.state.name, JobState.RUNNING)
         if state == JobState.COMPLETED and exit_code not in (None, 0):
@@ -552,14 +590,14 @@ class SshAdapter(BaseAdapter[SshConfig]):
     ) -> ExecResult:
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a command")
-        # Quiet-stretch reports (on_stall) are W7's to wire into the transport.
-        guard = None if timeout_s is None else int(timeout_s) + 5
         result = await self.transport.ssh(
-            scripts.exec_script(command, guard),
+            scripts.exec_script(command),
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
             what="exec",
             check_timeout=False,
+            hold_stdin=True,
+            on_stall=on_stall,
         )
         exec_result = result.to_exec_result()
         exec_result.argv = list(command)
@@ -659,6 +697,44 @@ def _launcher(executor: BatchSchedulerExecutor, job: Job) -> tuple[str, list[Pat
     deploy = cast(list[Path], launcher._files_to_deploy())  # pyright: ignore
     files = [deployed.parent / path.name for path in deploy]
     return deployed.parent.name, files
+
+
+_ACCOUNTED_FAILURES = (
+    "FAILED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "PREEMPTED",
+)
+
+
+def accounted_status(lines: list[str]) -> JobStatus | None:
+    """Read Slurm accounting (``State|ExitCode``) for a job the queue has forgotten."""
+    for line in lines:
+        state, _, code = line.strip().partition("|")
+        if not state:
+            continue
+        native = state.split()[0]
+        exit_code = _int(code.split(":", 1)[0]) if code else None
+        if native == "COMPLETED":
+            return JobStatus(
+                state=JobState.COMPLETED if exit_code in (0, None) else JobState.FAILED,
+                exit_code=exit_code,
+                native_state=native,
+            )
+        if native == "CANCELLED":
+            return JobStatus(state=JobState.CANCELLED, exit_code=exit_code, native_state=native)
+        if native in _ACCOUNTED_FAILURES:
+            return JobStatus(
+                state=JobState.FAILED,
+                exit_code=exit_code,
+                native_state=native,
+                message=f"Slurm accounting says {state.lower()}",
+            )
+        return None
+    return None
 
 
 def _stored_final(lines: list[str]) -> JobStatus:
