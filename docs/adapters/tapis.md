@@ -166,6 +166,24 @@ allocation on the host.
 5. `status` reads the Tapis job status, and the exit code once the job ends.
    `cancel` calls `cancelJob`.
 
+A package runs through the `jarvis` on the system's PATH. Its name is
+`<repo>.<package>`, for example `clio_jarvis.gray_scott`, and its archive
+holds `<repo>/<repo>/<package>/...` at its root, with anything the repo reads
+beside it (clio-jarvis's `schemas/`). The launcher checks the archive's
+SHA-256, unpacks it once into `<work dir>/packages/<sha256>/`, and runs jarvis
+with a `JARVIS_ROOT` of the job's own, in `<job dir>/.relay-jarvis`:
+
+```bash
+jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared"
+jarvis repo add "<unpacked>/<repo>"
+jarvis ppl create "relay_<job uuid>"
+jarvis ppl append "<repo>.<package>" pkg key=value ...
+jarvis ppl run
+```
+
+So a job never reads or changes your own `~/.ppi-jarvis`, and two jobs never
+share a pipeline. jarvis's output is the job's `stdout` and `stderr`.
+
 Tapis stops any job that runs past its time limit, and gives a job 10 minutes
 when none is asked for. So relay always asks for one. A job with a duration
 gets that, rounded up to whole minutes. A job with none gets its queue's own
