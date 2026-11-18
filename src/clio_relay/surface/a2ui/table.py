@@ -51,6 +51,16 @@ from clio_relay.surface.a2ui.tokens import ActionTokens
 # clio-workspace/v1 caps labels at 120 characters and descriptions at 500.
 _LABEL = 120
 _TEXT = 500
+# Names from clio-workspace/v1's Icon enum.
+_PROTOCOL_ICON = {
+    "ssh": "terminal",
+    "worker": "memory",
+    "tapis": "hub",
+    "globus": "public",
+    "iri": "dns",
+    "sky": "cloud",
+    "local": "computer",
+}
 _SECURITY_LOOK = {"guarded": ("lock", "positive"), "open": ("lockOpen", "warning")}
 _STATUS = {
     "ready": ("Ready", "Answers and needs nothing from you", "check", "positive"),
@@ -65,6 +75,8 @@ def _columns(forms: dict[str, Form], views: list[SiteView]) -> list[dict[str, An
     protocols: list[dict[str, Any]] = []
     for name in names:
         option: dict[str, Any] = {"value": name, "label": protocol_name(name)}
+        if name in _PROTOCOL_ICON:
+            option["icon"] = _PROTOCOL_ICON[name]
         if PROTOCOLS.get(name):
             option["description"] = PROTOCOLS[name][1]
         protocols.append(option)
@@ -177,8 +189,10 @@ def _detail(
         children.append(edit_form(tree, site, forms, tokens, errors, pending))
     if not children:
         return None
-    heading = tree.text(f"{base}-detail-title", site.title, "h4")
-    return tree.card(f"{base}-detail", tree.column(f"{base}-detail-body", [heading, *children]))
+    if site.id not in state.editing:
+        # The edit form has its own heading.
+        children.insert(0, tree.text(f"{base}-detail-title", site.title, "h4"))
+    return tree.card(f"{base}-detail", tree.column(f"{base}-detail-body", children))
 
 
 def _clip(text: str, limit: int) -> str:
@@ -215,7 +229,8 @@ def endpoints_surface(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return the endpoints surface as one table, and its data model."""
     tree = Tree()
-    children = [tree.text("sites-title", "Endpoints", "h2")]
+    # The page header and the table's own label name the page, so there is no heading.
+    children: list[str] = []
     if state.notice:
         children.append(tree.text("sites-notice", state.notice))
     rows = [_row(view, state, tokens) for view in views]
