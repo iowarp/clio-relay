@@ -56,13 +56,16 @@ def _free_port() -> int:
 
 
 def _stdio(paths: RelayPaths) -> StdioServerParameters:
-    return StdioServerParameters(command=sys.executable, args=["-c", ENTRY, "serve"], env=_env(paths))
+    return StdioServerParameters(
+        command=sys.executable, args=["-c", ENTRY, "serve"], env=_env(paths)
+    )
 
 
 async def _answer(
-    _context: ClientRequestContext, params: mcp_types.ElicitRequestParams
+    context: ClientRequestContext, params: mcp_types.ElicitRequestParams
 ) -> mcp_types.ElicitResult:
     """A person who approves: opens the page for a URL question, says yes to a form."""
+    del context
     if isinstance(params, mcp_types.ElicitRequestURLParams):
         assert await asyncio.to_thread(answer_page, params.url) == 200
         return mcp_types.ElicitResult(action="accept")
