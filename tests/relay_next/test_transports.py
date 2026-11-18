@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from fastmcp_tasks.client import (
 )
 from mcp import Client
 from mcp.client.context import ClientRequestContext
+from mcp.client.session import ElicitationFnT
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
@@ -61,12 +62,7 @@ def _stdio(paths: RelayPaths) -> StdioServerParameters:
     )
 
 
-Answer = Callable[
-    [ClientRequestContext, mcp_types.ElicitRequestParams], Awaitable[mcp_types.ElicitResult]
-]
-
-
-def _answerer(auth: tuple[str, str] | None = None) -> Answer:
+def _answerer(auth: tuple[str, str] | None = None) -> ElicitationFnT:
     """A person who approves: opens the page for a URL question, says yes to a form."""
 
     async def answer(
