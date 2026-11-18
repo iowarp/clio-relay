@@ -75,9 +75,13 @@ def visitor_plan(
 async def hold(plan: ServePlan, directory: Path) -> None:
     """Hold the visitor until interrupted, binding the same ports again after a drop."""
 
+    shown = 0
+
     def restarted(count: int, _pid: int | None) -> None:
-        if count:
-            print(f"the forward ended; bound again (restart {count})", file=sys.stderr)
+        nonlocal shown
+        if count > shown:
+            shown = count
+            print(f"the forward dropped and holds the same port again ({count})", file=sys.stderr)
 
     forward = Forward(plan, directory, restarted)
     stop = asyncio.Event()

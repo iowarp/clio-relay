@@ -144,6 +144,8 @@ class Forward:
         self.process: asyncio.subprocess.Process | None = None
         self.task: asyncio.Task[None] | None = None
         self.restarts = 0
+        self.rebound = 0
+        self._respawned = False
         self.closing = False
         self.ssh_env: dict[str, str] = {}
         self.marker = (
@@ -200,7 +202,7 @@ class Forward:
             return
         if not self.bound():
             await self._spawn()
-            self.on_restart(self.restarts, self.process.pid if self.process else None)
+            self.on_restart(self.rebound, self.process.pid if self.process else None)
         self.task = asyncio.create_task(self._watch())
 
     async def _watch(self) -> None:
@@ -213,6 +215,11 @@ class Forward:
             if alive or (self.process is None and self.bound()):
                 if alive and self.bound():
                     backoff = 1.0
+                    if self._respawned:
+                        # Count a rebind only once the new forward holds the ports.
+                        self._respawned = False
+                        self.rebound += 1
+                        self.on_restart(self.rebound, self.process.pid if self.process else None)
                 continue
             self.restarts += 1
             self._log(
@@ -227,7 +234,8 @@ class Forward:
             except Refusal as exc:
                 self._log(str(exc))
                 continue
-            self.on_restart(self.restarts, self.process.pid if self.process else None)
+            self._respawned = True
+            self.on_restart(self.rebound, self.process.pid if self.process else None)
 
     def _log(self, line: str) -> None:
         with contextlib.suppress(OSError), self.log_path.open("a", encoding="utf-8") as handle:

@@ -111,6 +111,14 @@ write_json() {
     printf '%s\n' "$2" > "$S/$1.tmp" && mv -f "$S/$1.tmp" "$S/$1"
 }
 
+# Relay writes serve/stop from another machine. On NFS a plain test can keep a
+# cached "absent" for the mount's acdirmax (120 s on some clusters); reading
+# the directory revalidates it.
+stop_asked() {
+    [ -f "$S/stop" ] && return 0
+    ls -a "$S" 2>/dev/null | grep -qx stop
+}
+
 finish() {
     reason=$1
     code=$2
@@ -181,7 +189,7 @@ trap 'reason=signal' TERM INT HUP
 ready=0
 idle_for=0
 while :; do
-    [ -f "$S/stop" ] && reason=${reason:-stopped}
+    stop_asked && reason=${reason:-stopped}
     [ -n "$reason" ] && break
     if ! alive "$svc"; then
         reason=exited
