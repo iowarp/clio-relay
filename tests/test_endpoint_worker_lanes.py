@@ -5,7 +5,7 @@ Two layers:
 1. Fast, isolated unit tests of :mod:`clio_relay.adapters.worker.endpoint_worker_lanes`
    itself (``run_worker_lane_iteration``) against a small recording fake --
    no queue, no worker, no subprocess.
-2. A process-level test that starts the real ``clio-relay endpoint start
+2. A process-level test that starts the real ``clio-relay worker endpoint start
    --role worker`` CLI against a temp core (issue #238's acceptance item
    1): daemon-mode registers every slot and keeps heartbeating, and an
    admitted ``remote_agent`` job reaches ``attempts == 1``,

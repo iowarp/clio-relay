@@ -254,7 +254,7 @@ def test_status_document_classifies_a_masked_proxy_distinctly_not_as_not_install
     assert document.installed is False
     assert document.load_state_category == "masked"
     assert "not installed" not in document.diagnosis
-    assert "run `clio-relay relay-host install-proxy`" not in document.diagnosis
+    assert "run `clio-relay worker relay-host install-proxy`" not in document.diagnosis
     assert "unmask" in document.diagnosis
 
 

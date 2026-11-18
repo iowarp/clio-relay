@@ -1736,7 +1736,7 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     assert len(delivered) == 1
     remote_script = delivered[0].decode("utf-8")
     classifier = remote_script.index('relay.get("persistent_tool")')
-    old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" bootstrap-inspect')
+    old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" worker bootstrap-inspect')
     assert classifier < old_relay
     assert "bootstrap_preflight_unsupported=legacy_relay_provider" in remote_script
     assert 'if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(' in remote_script
@@ -2117,7 +2117,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     monkeypatch.setattr(cli_remote_worker_probe, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "cluster",
             "bootstrap",
@@ -2183,7 +2183,7 @@ def test_public_release_bootstrap_requires_artifact_digest(
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         ["cluster", "bootstrap", "--cluster", "cluster-a"],
     )
 
@@ -2294,7 +2294,7 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
     monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         ["bootstrap-inspect", "--invocation-id", "bootstrap_fail_closed", "--repair"],
     )
 
@@ -2477,7 +2477,7 @@ def test_payload_free_inspector_short_circuits_proven_generation_mismatch(
         "--repair" if repair else "--inspect-only",
     ]
 
-    result = CliRunner().invoke(cli.app, arguments)
+    result = CliRunner().invoke(cli.worker_app, arguments)
 
     assert result.exit_code == 0, result.output
     payload_line = next(
@@ -2539,7 +2539,7 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
     monkeypatch.setattr(installation, "installation_info", deep_inspection)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "bootstrap-inspect",
             "--invocation-id",
@@ -3395,7 +3395,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     cursor_repair = recovery.index("bootstrap_candidate_action repair-legacy-cursors")
     recovery_fence = recovery.index('bootstrap_fence_recovered_service "$service_name"')
     recovery_lock = recovery.index("exec 8<>")
-    queue_init = recovery.index('"$HOME/.local/bin/clio-relay" init --migrate-legacy-output')
+    queue_init = recovery.index('"$HOME/.local/bin/clio-relay" worker init --migrate-legacy-output')
     assert recovery_fence < recovery_lock < cursor_repair < queue_init
     cursor_repair_prefix = recovery[max(0, cursor_repair - 160) : cursor_repair]
     assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in (
@@ -3549,8 +3549,8 @@ def test_repair_recovery_replays_only_binding_queue_and_readiness_work() -> None
     end = script.index("\n}\n\nbootstrap_recover_previous_transaction()", start)
     recovery = script[start:end]
     binding = recovery.index("bootstrap_candidate_action repair-managed-binding")
-    queue_check = recovery.index('"$HOME/.local/bin/clio-relay" queue readiness-info')
-    queue_repair = recovery.index("clio-relay init --migrate-legacy-output")
+    queue_check = recovery.index('"$HOME/.local/bin/clio-relay" worker queue readiness-info')
+    queue_repair = recovery.index("clio-relay worker init --migrate-legacy-output")
     restart = recovery.index("if ! bootstrap_bounded_worker_restart", queue_repair)
 
     assert binding < queue_check < queue_repair < restart

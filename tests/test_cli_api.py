@@ -38,7 +38,7 @@ import clio_relay.adapters.worker.cli_api as cli_api
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.installation as installation_module
 from clio_relay.adapters.worker import cli
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from tests.test_cli import (
     _installation_identity,
     _session_api_release_identity,

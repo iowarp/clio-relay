@@ -145,7 +145,7 @@ def _bootstrap_preflight_over_ssh(
                 'BOOTSTRAP_PREFLIGHT_OUTPUT="$(timeout --signal=TERM --kill-after=2s '
                 f"{remote_timeout}s "
                 f'"{bootstrap_pin.BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE}" '
-                f"bootstrap-inspect --invocation-id {shlex.quote(invocation_id)} "
+                f"worker bootstrap-inspect --invocation-id {shlex.quote(invocation_id)} "
                 + ("--repair " if repair else "--inspect-only ")
                 + '2>&1)"'
             ),
@@ -154,7 +154,7 @@ def _bootstrap_preflight_over_ssh(
             'if [ "$BOOTSTRAP_PREFLIGHT_STATUS" -ne 0 ]; then',
             "  if printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" | "
             "grep -Eqi "
-            "'no such command.*bootstrap-inspect|bootstrap-inspect.*no such command'; then",
+            "'no such command.*(bootstrap-inspect|worker)|(bootstrap-inspect|worker).*no such command'; then",
             "    echo bootstrap_preflight_unsupported=missing_command",
             "    exit 0",
             "  fi",

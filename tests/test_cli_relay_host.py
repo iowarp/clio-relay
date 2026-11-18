@@ -50,7 +50,7 @@ from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.adapters.worker.transport_probe as transport_probe
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.validation_report import (

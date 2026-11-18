@@ -39,7 +39,7 @@ import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.session_api as session_api
 from clio_relay.adapters.worker import cli
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource, SessionLifecycleReport
 from clio_relay.cluster_config import ClusterDefinition

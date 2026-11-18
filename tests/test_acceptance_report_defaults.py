@@ -35,7 +35,7 @@ def _local_cli(  # pyright: ignore[reportUnusedFunction]
     "share" / "clio-relay"`` by default -- which is keyed on the user's home
     directory, NOT the process cwd, so ``monkeypatch.chdir(tmp_path)`` alone
     never isolates it: every test process on this machine, and any real
-    concurrently-running ``clio-relay session teardown``, contend on the
+    concurrently-running ``clio-relay worker session teardown``, contend on the
     exact same lock file regardless of cwd (live-proven evidence: a real
     ares recovery teardown collided with this suite's own session-teardown
     tests, both racing for that one shared home-scoped lock, producing

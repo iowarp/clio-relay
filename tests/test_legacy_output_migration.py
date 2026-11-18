@@ -82,7 +82,7 @@ def test_legacy_output_migration_requires_explicit_authorization(tmp_path: Path)
     with pytest.raises(LegacyQueueStateError) as raised:
         ClioCoreQueue(root).initialize()
 
-    assert "clio-relay init --migrate-legacy-output" in raised.value.report["action"]
+    assert "clio-relay worker init --migrate-legacy-output" in raised.value.report["action"]
     assert _event_path(root, "job_legacy_output", 1).read_bytes() == original
     assert not (root / "legacy_output_archives").exists()
     assert not (root / "legacy_output_receipts").exists()

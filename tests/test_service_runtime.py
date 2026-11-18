@@ -39,7 +39,7 @@ import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
 from clio_relay.adapters.worker import cli as relay_cli
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 from clio_relay.browser_gateway import (

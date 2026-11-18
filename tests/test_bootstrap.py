@@ -367,7 +367,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert "spack install" not in script
     assert "site_stack=ready" not in script
     assert "CLIO_RELAY_CORE_DIR" in script
-    assert "clio-relay init" in script
+    assert "clio-relay worker init" in script
     assert "done < <(compgen -e)" in script
     assert "UV_*|PIP_*) unset" in script
     assert "--index-url https://pypi.org/simple --no-deps --only-binary=:all:" in script

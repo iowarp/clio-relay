@@ -68,7 +68,7 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     writer_proof = 'if ! python3 - "$WORKER_CLUSTER_NAME"'
     install = 'install -m 0755 "frp_${FRP_VERSION}_linux_amd64/frpc"'
     relay_replace = "uv tool install --force --python 3.12 --no-config"
-    migrate = "clio-relay init --migrate-legacy-output"
+    migrate = "clio-relay worker init --migrate-legacy-output"
     restart = 'systemctl --user "$CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION" --no-block'
     full = script[script.rindex("bootstrap_journal_action create") :]
     first_proof = full.index(writer_proof)
@@ -518,8 +518,8 @@ def test_standalone_bootstrap_cannot_mutate_legacy_output() -> None:
 
     assert "WORKER_SERVICE_NAME=''" in fresh_transaction
     assert "systemctl --user stop" not in fresh_transaction
-    assert "clio-relay init --migrate-legacy-output" not in fresh_transaction
-    assert "clio-relay init" in fresh_transaction
+    assert "clio-relay worker init --migrate-legacy-output" not in fresh_transaction
+    assert "clio-relay worker init" in fresh_transaction
 
 
 def _fake_proc_process(
@@ -1322,7 +1322,7 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
     )
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "cluster",
             "bootstrap",

@@ -118,10 +118,12 @@ def test_frp_http_probe_starts_remote_proxy_and_local_visitor(monkeypatch: Monke
     assert "transport-probes/$probe_id" in remote_script
     assert '"owner": "clio-relay"' in remote_script
     assert "CLIO_RELAY_API_TOKEN='api-token'" in remote_script
-    assert "clio-relay api start --host 127.0.0.1 --port 8765 --require-token" in remote_script
+    assert (
+        "clio-relay worker api start --host 127.0.0.1 --port 8765 --require-token" in remote_script
+    )
     assert "remote API port is already occupied: 8765" in remote_script
     assert remote_script.index("remote API port is already occupied") < remote_script.index(
-        "clio-relay api start"
+        "clio-relay worker api start"
     )
     assert "pkill" not in remote_script
     assert 'kill -- "-$api_pid"' in remote_script

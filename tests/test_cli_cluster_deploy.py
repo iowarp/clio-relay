@@ -851,7 +851,7 @@ def test_cluster_probe_command_reports_a_typed_state(
     report = json.loads(result.output)
     assert report["schema_version"] == "clio-relay.cluster-probe.v1"
     assert report["state"] == "relay_executable_missing"
-    assert report["repair"] == "clio-relay cluster bootstrap --cluster ares"
+    assert report["repair"] == "clio-relay worker cluster bootstrap --cluster ares"
 
 
 def test_dead_pin_repair_loop_probe_bootstrap_probe(
