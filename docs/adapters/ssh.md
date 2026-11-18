@@ -54,6 +54,10 @@ Relay asks the scheduler for no walltime of its own. A job's walltime is its
 neither, the batch script has no time line, and the scheduler's default for
 the partition or queue applies.
 
+The spend gate's charge is in node-hours: nodes times walltime. A job with no
+walltime has an unknown cost, so its charge has no amount and no node-hours,
+and the gate asks for it unless the site's `spend.ask` is `never`.
+
 ## How a job runs
 
 1. Relay renders the batch script on your machine with

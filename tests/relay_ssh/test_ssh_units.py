@@ -23,7 +23,8 @@ from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_proce
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobAttributes, JobSpec, PackageRef
+from clio_relay.jobs.spec import JobAttributes, JobResources, JobSpec, PackageRef
+from clio_relay.sites.models import SpendPolicy
 
 pytestmark = pytest.mark.release_platform("posix")
 
@@ -343,6 +344,27 @@ def test_no_duration_renders_no_walltime(tmp_path: Path, scheduler: str) -> None
     assert walltime(timed) == timedelta(hours=3)
     rendered = adapter._render(timed, scheduler, root, job_dir, "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
     assert directive in rendered.files["submit.sh"]
+
+
+def test_a_job_without_a_walltime_has_an_unknown_charge(tmp_path: Path) -> None:
+    adapter = _adapter(tmp_path)
+    bare = JobSpec(
+        executable="true",
+        resources=JobResources(node_count=2),
+        attributes=JobAttributes(queue_name="debug", account="proj"),
+    )
+    charge = asyncio.run(adapter.price(bare))
+    assert (charge.site, charge.queue, charge.account, charge.nodes) == ("unit", "debug", "proj", 2)
+    assert (charge.walltime_s, charge.node_hours, charge.amount) == (None, None, None)
+    assert SpendPolicy(ask=1000.0).needs_approval(charge.node_hours)
+    assert not SpendPolicy(ask="never").needs_approval(charge.node_hours)
+    timed = bare.model_copy(
+        update={"attributes": JobAttributes(queue_name="debug", duration=timedelta(minutes=90))}
+    )
+    charge = asyncio.run(adapter.price(timed))
+    assert (charge.walltime_s, charge.node_hours, charge.amount) == (5400.0, 3.0, 3.0)
+    assert charge.unit == "node-hours"
+    assert not SpendPolicy(ask=4.0).needs_approval(charge.node_hours)
 
 
 def _batch(tmp_path: Path, command: str) -> Path:
