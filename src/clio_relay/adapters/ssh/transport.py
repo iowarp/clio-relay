@@ -148,20 +148,29 @@ async def run_process(
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             process.stdin.close()
 
-    work = asyncio.gather(
-        out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait()
+    work = asyncio.ensure_future(
+        asyncio.gather(out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait())
     )
     timed_out = False
     try:
-        await asyncio.wait_for(work, timeout=timeout_s)
-    except TimeoutError:
-        timed_out = True
-        _kill(process)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(process.wait(), timeout=5)
+        done, _ = await asyncio.wait({work}, timeout=timeout_s)
+        if not done:
+            timed_out = True
+            _kill(process)
+            # The whole process group is gone, so the pipes reach EOF and the pumps end.
+            done, _ = await asyncio.wait({work}, timeout=10)
+            if not done:
+                work.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await work
     except asyncio.CancelledError:
         _kill(process)
+        work.cancel()
         raise
+    finally:
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
     return Completed(
         argv=command,
         exit_code=None if timed_out else process.returncode,
