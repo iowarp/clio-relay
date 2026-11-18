@@ -168,7 +168,7 @@ from typing import Any, NamedTuple
 # the old job kind's helpers to 4925 (W8 at ac9b06d).
 # W1: W9's McpCallSpec retirement (c4e94d4) took it to 4558, measured on
 # Ares at ee5b0d7 with `uv sync --all-extras`.
-BASELINE_TOTAL = 4558
+BASELINE_TOTAL = 4535
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

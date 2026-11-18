@@ -167,7 +167,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # ONE source of truth, instead of the same literal duplicated in two
     # files with no guard against them drifting apart. A justified,
     # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
-    "src/clio_relay/adapters/worker/bootstrap.py": 924,
+    "src/clio_relay/adapters/worker/bootstrap.py": 922,
     # clio-relay#265/#183/#248/#162 "honest verdict" slice, adversarial-
     # review fix round (item 2): the first version of this slice added a
     # NEW baseline entry here at 819 for a file that measured 791 with NO
@@ -258,7 +258,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # _replacement_provider.py (245), _planning.py (409 -- one function,
     # plan_bootstrap_reconcile, deliberately kept alone since a further cut
     # would mean rewriting its body), _planning_support.py (242),
-    # _receipt.py (358), _builtin_repos.py (213), _repository.py (443).
+    # _receipt.py (358), _repository.py (443).
     # Under DEFAULT_MAX_LINES -- entry removed per ground rule 5.
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
@@ -382,8 +382,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # bootstrap-inspect top-level command-module extraction
     # (cli_installation_receipt.py, 446 lines): -346 net lines.
     # #231 cli.py decomposition: jarvis-mcp top-level command-group extraction
-    # -- the thin command layer only (jarvis-runtime-authority/mcp-call/
-    # jarvis-mcp-call/jarvis-mcp-refresh/mcp-server into cli_jarvis_mcp.py,
+    # -- the thin command layer only (jarvis-mcp-call/jarvis-mcp-refresh/mcp-server into cli_jarvis_mcp.py,
     # 662 lines; jarvis-mcp-validate alone into cli_jarvis_mcp_validate.py,
     # 538 lines, since combined they would exceed the 800-line cap). The
     # ~2,450-line JARVIS execution-query engine these commands call stays
@@ -985,13 +984,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # their field validators are built on) moved to the new
     # jarvis_service_runtime_models.py (390 lines).
     # What stays resident is only the cluster that reads/re-verifies the
-    # durable relay queue and resolves a private JARVIS authority bearer --
-    # every function reachable from one of the six externally-patched
-    # collaborators this module's own test suite targets by module attribute
-    # (`monkeypatch.setattr(jarvis_service_runtime, "read_artifact_bytes",
-    # ...)` and five more: `should_execute_on_cluster`, `run_remote_clio`,
-    # `run_remote_jarvis_runtime_authority`, `OwnedSessionApiClient`,
-    # `JarvisCdProvider`), since a bare-name call only observes a patch on
+    # durable relay queue -- every function reachable from one of the
+    # externally-patched collaborators this module's own test suite targets
+    # by module attribute (`monkeypatch.setattr(jarvis_service_runtime,
+    # "read_artifact_bytes", ...)` and the others), since a bare-name call only observes a patch on
     # the module its own global namespace resolves through -- moving one of
     # those functions to an owner module would silently break the patch, not
     # just move it. 1171 -> 550, under the 800-line default cap -- entry
