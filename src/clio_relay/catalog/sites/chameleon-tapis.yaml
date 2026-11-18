@@ -1,0 +1,20 @@
+id: chameleon-tapis
+name: Chameleon node (through Tapis)
+description: >-
+  A leased Chameleon node with a floating IP, reached through TACC's Tapis. Relay
+  registers the node as the person's own Tapis system and runs jobs there as FORK jobs.
+source: https://chameleoncloud.readthedocs.io/en/latest/getting-started/index.html
+address: null
+adapter: tapis
+identity: tacc
+config:
+  base_url: https://tacc.tapis.io
+  tenant_id: tacc
+  authn: pki
+alternatives:
+  ssh:
+    ssh_profile: chameleon
+policy: open
+spend:
+  ask: never
+skill: chameleon-tapis
