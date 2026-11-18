@@ -287,7 +287,7 @@ class FakeIriFacility:
         if command == "ls":
             if not target.is_dir():
                 return missing
-            items = []
+            items: list[dict[str, Any]] = []
             for child in sorted(target.iterdir(), key=lambda item: item.name):
                 info = child.lstat()
                 items.append(

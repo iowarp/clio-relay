@@ -159,8 +159,9 @@ class IriClient:
         """Return the compute resources the API lists."""
         response = await self.request("GET", "/compute/resources", doing="listing resources")
         body: Any = response.json()
-        items: Any = body if isinstance(body, list) else []
-        return [cast(dict[str, Any], item) for item in cast(list[Any], items)]
+        if not isinstance(body, list):
+            return []
+        return [cast(dict[str, Any], item) for item in cast(list[Any], body)]
 
     async def file_task(
         self,

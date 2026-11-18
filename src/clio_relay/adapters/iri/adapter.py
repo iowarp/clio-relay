@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from clio_relay.adapters._process import run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.globus import tokens
-from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, ApiVersion, IriClient
+from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
 from clio_relay.adapters.iri.files import IriFileAccess
 from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import write_json_atomic
@@ -142,7 +142,7 @@ class IriAdapter(BaseAdapter[IriConfig]):
         self.records = context.state_dir / "iri-jobs"
         self.client = IriClient(
             config.base_url,
-            cast(ApiVersion, config.api_version),
+            config.api_version,
             self._token,
             transport=self._transport(),
             poll_s=config.poll_s,
