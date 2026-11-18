@@ -57,6 +57,7 @@ def _dumped(request: Any) -> dict[str, Any]:
         return dict(request)  # pyright: ignore[reportUnknownArgumentType]
     return request.model_dump(by_alias=True)
 
+
 async def _approve(
     message: str, response_type: Any, params: Any, context: Any
 ) -> dict[str, Any] | ElicitResult[Any]:
