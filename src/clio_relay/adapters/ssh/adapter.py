@@ -41,6 +41,7 @@ from clio_relay.jobs.handles import (
     JobState,
     JobStatus,
     OutputRef,
+    StallReport,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -542,11 +543,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # exec
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a command")
-        guard = int(timeout_s) + 5
+        # Quiet-stretch reports (on_stall) are W7's to wire into the transport.
+        guard = None if timeout_s is None else int(timeout_s) + 5
         result = await self.transport.ssh(
             scripts.exec_script(command, guard),
             timeout_s=timeout_s,

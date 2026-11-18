@@ -345,9 +345,12 @@ def describe_script(scheduler: str) -> str:
     )
 
 
-def exec_script(command: Sequence[str], guard_s: int) -> str:
-    """Run one command from the home directory, with a cleanup guard on the site."""
+def exec_script(command: Sequence[str], guard_s: int | None) -> str:
+    """Run one command from the home directory, with a cleanup guard on the site
+    when it has a time limit."""
     joined = shlex.join(list(command))
+    if guard_s is None:
+        return f'cd "$HOME" 2>/dev/null\nexec {joined} </dev/null\n'
     return (
         'cd "$HOME" 2>/dev/null\n'
         "if command -v timeout >/dev/null 2>&1; then\n"
