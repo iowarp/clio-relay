@@ -9,6 +9,12 @@ system: it unpacks relay's launcher and runs ``tapisjob_app.sh``, which runs
 the package through the ``jarvis`` on PATH. Run it where the package's
 programs are, for example inside a Slurm allocation. It prints the Tapis job,
 the jarvis output and the job directory's files.
+
+``--service`` runs the package as a service (RL45): the driver waits for the
+``--ready`` glob under the job directory, cancels the job through Tapis, and
+waits for the launcher's clean stop. ``--batch <partition>`` makes the site a
+Slurm system that allows a cmdPrefix and sends the job to the real Slurm with
+sbatch, so the cancel is a real scancel.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,9 +42,9 @@ from tests.fixtures.tapis_stub.support import (
 )
 
 
-def guarded_adapter(stub: TapisStub, work: Path, site: str = "pkg") -> TapisAdapter:
+def guarded_adapter(stub: TapisStub, work: Path, site: str = "pkg", **system: Any) -> TapisAdapter:
     """A guarded tapis site on this machine, as the person's own system."""
-    seed_host(stub, site, work / "site")
+    seed_host(stub, site, work / "site", **system)
     config = TapisConfig.model_validate(tapis_config(stub, launcher="guarded"))
     context = AdapterContext(
         site_id=site, state_dir=work / "relay", content=ContentStore(work / "content")
@@ -59,6 +66,43 @@ async def run_package(
     return handle, status, stub.state.host_path(system, str(handle.data["job_dir"]))
 
 
+def slurm_system(partition: str, minutes: int) -> dict[str, Any]:
+    """The system fields of a Slurm site that lets a batch job exec the launcher."""
+    return {
+        "canRunBatch": True,
+        "batchScheduler": "SLURM",
+        "enableCmdPrefix": True,
+        "batchDefaultLogicalQueue": partition,
+        "batchLogicalQueues": [
+            {"name": partition, "hpcQueueName": partition, "maxMinutes": minutes}
+        ],
+    }
+
+
+async def cancel_when_ready(
+    stub: TapisStub, adapter: TapisAdapter, spec: JobSpec, operation_id: str, ready: str
+) -> tuple[JobHandle, JobStatus, Path, bool]:
+    """Start a service, cancel it through Tapis once ``ready`` matches, wait for the stop.
+
+    ``ready`` is a glob under the job directory.
+    """
+    handle = await adapter.run(spec, operation_id=operation_id)
+    system = str(handle.data["system_id"])
+    job_dir = stub.state.host_path(system, str(handle.data["job_dir"]))
+    while not (found := sorted(job_dir.glob(ready))):
+        status = await adapter.status(handle)
+        if status.state.final:
+            return handle, status, job_dir, False
+        await asyncio.sleep(1)
+    print(f"ready: {found[0]}")
+    print(found[0].read_text(errors="replace"))
+    status = await adapter.cancel(handle)
+    print(f"cancelled through Tapis: {status.state.value}")
+    while not (job_dir / "tapisjob.exitcode").exists():
+        await asyncio.sleep(1)
+    return handle, await adapter.status(handle), job_dir, True
+
+
 def _tail(path: Path, lines: int = 25) -> str:
     if not path.is_file():
         return f"({path.name} missing)"
@@ -67,19 +111,32 @@ def _tail(path: Path, lines: int = 25) -> str:
 
 async def _main(stub: TapisStub, args: argparse.Namespace) -> int:
     await sign_in(stub)
-    adapter = guarded_adapter(stub, Path(args.work))
+    system = slurm_system(args.batch, args.minutes) if args.batch else {}
+    stub.state.slurm = bool(args.batch)
+    adapter = guarded_adapter(stub, Path(args.work), **system)
     archive = package_archive(Path(args.root).resolve(), args.include)
     digest = adapter.context.content.put(archive)
     parameters = dict(item.split("=", 1) for item in args.set)
     spec = JobSpec(
         package=PackageRef(
-            name=args.package, version=args.version, sha256=digest, parameters=parameters
+            name=args.package,
+            version=args.version,
+            sha256=digest,
+            parameters=parameters,
+            service=args.service,
         )
     )
     print(f"package {args.package} {args.version} sha256 {digest} ({len(archive)} bytes)")
-    handle, status, job_dir = await run_package(stub, adapter, spec, args.operation)
+    if args.service:
+        handle, status, job_dir, held = await cancel_when_ready(
+            stub, adapter, spec, args.operation, args.ready
+        )
+    else:
+        handle, status, job_dir = await run_package(stub, adapter, spec, args.operation)
+        held = True
     job = stub.state.jobs[str(handle.native_id)]
-    print(f"Tapis job {handle.native_id} history {job.history}")
+    print(f"Tapis job {handle.native_id} history {job.history} remote {job.remote_job_id}")
+    print(f"launcher exit {_tail(job_dir / 'relay.exitcode')}")
     print(f"status {status.model_dump(mode='json', exclude={'observed_at'})}")
     print(f"job directory {job_dir}")
     for item in sorted(job_dir.iterdir()):
@@ -92,6 +149,9 @@ async def _main(stub: TapisStub, args: argparse.Namespace) -> int:
     print(f"--- {root}")
     for item in sorted(root.glob("*/*")):
         print(f"  {item.relative_to(root)}")
+    if args.service:
+        clean = held and (job_dir / "relay.exitcode").read_text().strip() == "0"
+        return 0 if clean and status.state == JobState.CANCELLED else 1
     return 0 if status.state == JobState.COMPLETED else 1
 
 
@@ -106,7 +166,13 @@ def main() -> int:
     parser.add_argument("--set", action="append", default=[], help="key=value")
     parser.add_argument("--work", required=True)
     parser.add_argument("--operation", default="op-live-package")
+    parser.add_argument("--service", action="store_true", help="run it as a service")
+    parser.add_argument("--ready", help="with --service: a glob under the job directory")
+    parser.add_argument("--batch", metavar="PARTITION", help="send the job to Slurm")
+    parser.add_argument("--minutes", type=int, default=30, help="with --batch: the time limit")
     args = parser.parse_args()
+    if args.service and not args.ready:
+        parser.error("--service needs --ready")
     env = pytest.MonkeyPatch()
     use_memory_keyring(env)
     try:

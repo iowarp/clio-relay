@@ -184,6 +184,24 @@ jarvis ppl run
 So a job never reads or changes your own `~/.ppi-jarvis`, and two jobs never
 share a pipeline. jarvis's output is the job's `stdout` and `stderr`.
 
+A service package, such as a ParaView server, runs `jarvis ppl start` in place
+of `jarvis ppl run` and stays up until the job is cancelled. On cancel, the
+launcher runs `jarvis ppl stop`, and the job ends with the stop's exit code.
+If the service fails to start, the launcher still runs `jarvis ppl stop` and
+the job fails with the start's exit code.
+
+How the cancel reaches the launcher depends on the job type:
+
+- On a `FORK` system, Tapis kills the launcher's children. The launcher sees
+  its wait end and stops the service.
+- On a `BATCH` system, Slurm sends `TERM` only to the batch step's main
+  process. Relay asks Tapis to start the launcher with `exec` (`cmdPrefix`), so
+  the launcher is that process and gets `TERM` with the scheduler's grace time.
+  Tapis takes `cmdPrefix` only on a system with `enableCmdPrefix`, which relay
+  sets on the systems it creates. On a system without it, such as TACC's own,
+  a cancel ends the job at once with no stop step. The scheduler still ends
+  every process the job started.
+
 Tapis stops any job that runs past its time limit, and gives a job 10 minutes
 when none is asked for. So relay always asks for one. A job with a duration
 gets that, rounded up to whole minutes. A job with none gets its queue's own

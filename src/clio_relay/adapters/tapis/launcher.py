@@ -68,9 +68,12 @@ def decode(arg: str) -> list[str]:
 
 def record(spec: JobSpec, *, content_dir: str, package_root: str, guarded: bool) -> list[str]:
     """Build the launcher's fields for ``spec``. ``guarded`` refuses free-form jobs."""
+    mode = "exec"
+    if spec.package is not None:
+        mode = "package-service" if spec.package.service else "package"
     head = [
         LAUNCHER_FORMAT,
-        "package" if spec.package is not None else "exec",
+        mode,
         spec.directory or "",
         spec.stdin_path or "",
         spec.stdout_path or "",
