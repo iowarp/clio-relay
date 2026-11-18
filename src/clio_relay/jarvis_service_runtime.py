@@ -1,7 +1,7 @@
 """JARVIS service runtime models and the retired binding.
 
-Relay used to bind a JARVIS service runtime from a durable ``mcp_call`` result
-(``jarvis_get_execution``). That job kind is retired, so relay no longer
+Relay used to bind a JARVIS service runtime from the durable result of an MCP
+tool-call job (``jarvis_get_execution``). That job kind is retired, so relay no longer
 creates or re-verifies those bindings: ``reverify_jarvis_service_runtime``
 refuses and names what a stored binding still owns, so a person can stop it.
 Services are served through ``clio_relay.serve``.
@@ -64,8 +64,8 @@ from clio_relay.jarvis_service_runtime_models import (
 )
 
 _RETIRED_BINDING = (
-    "relay no longer binds JARVIS service runtimes: a binding came from an mcp_call "
-    "job, which relay no longer runs"
+    "relay no longer binds JARVIS service runtimes: a binding came from an MCP "
+    "tool-call job, which relay no longer runs"
 )
 
 
@@ -100,6 +100,6 @@ def reverify_jarvis_service_runtime(
     settings: RelaySettings | None = None,
     binding_document: object,
 ) -> VerifiedJarvisServiceRuntime:
-    """Refuse: a stored binding's mcp_call source can no longer be re-verified."""
+    """Refuse: a stored binding's MCP tool-call source can no longer be re-verified."""
     del queue, definition, settings
     raise ValueError(retired_jarvis_binding_message(binding_document))

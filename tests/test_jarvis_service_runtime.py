@@ -1,6 +1,6 @@
 """JARVIS service runtime models and the retired binding.
 
-Relay no longer binds JARVIS service runtimes (their ``mcp_call`` source job
+Relay no longer binds JARVIS service runtimes (their MCP tool-call source job
 kind is retired). These tests keep the stored-record models readable, prove a
 stored binding is refused with what a person must stop.
 """
