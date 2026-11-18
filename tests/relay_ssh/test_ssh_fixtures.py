@@ -192,6 +192,7 @@ async def test_lq8_a_detached_job_is_read_by_a_later_poll(
     await asyncio.sleep(10)
     later = build(fx, tmp_path / "after", "fx-ssh")
     found = await later.find(operation_id)
+    assert found is not None
     assert found == handle
     final = await wait_final(later, found)
     assert final.state.value == "failed"
