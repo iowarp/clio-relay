@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from clio_relay.identity.store import TokenStore
 
 IdentityState = Literal["signed_in", "signed_out", "expired"]
-TokenSource = Literal["grant", "keyring"]
+TokenSource = Literal["grant", "keyring", "file"]
 SignInState = Literal["pending", "done", "failed", "slow_down", "expired"]
 
 # A token this close to expiry counts as expired, so a caller never gets one
@@ -60,6 +60,19 @@ class IdentityStatus(BaseModel):
     expires_at: datetime | None = None
     scopes: list[str] = Field(default_factory=list[str])
     detail: str | None = None
+    stored_in: Literal["keyring", "file", "memory"] | None = Field(
+        default=None, description="Where relay keeps its own sign-in for this identity"
+    )
+    store_path: str | None = Field(
+        default=None, description="The private file, when ``stored_in`` is ``file``"
+    )
+
+    def with_store(self, store: TokenStore) -> IdentityStatus:
+        """Say where ``store`` keeps relay's own sign-ins. It reads no entry."""
+        where = store.location()
+        self.stored_in = store.kind
+        self.store_path = where["path"]
+        return self
 
 
 class SignInStep(BaseModel):

@@ -424,7 +424,11 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
   - **A device flow** sets `poll_interval_s` on its step. Relay polls at that interval whether `relay_page` is true or false, and adds 5 s when the provider answers `slow_down`. When the code expires (`poll` returns `expired`, or the step's optional `expires_at` passes), relay calls `begin` again and shows the new link and code on the same ask's page. The ask stays pending, and nothing limits how long the person takes. `clio_relay.identity.device.follow` is the shared loop, used by both the page and `asks sign-in`.
 - **Shared identities for adapters.** `clio_relay.identity.shared()` returns the `Identities` the serving relay uses, so it sees `--grant-file`. Outside a serving relay it builds one from `CLIO_RELAY_GRANT_FILE_<PROVIDER>` and the keyring. `shared().get("globus")` returns a built provider.
 - **Grant files.** `GrantFiles` reads `CLIO_RELAY_GRANT_FILE_<PROVIDER>`, overridden by `--grant-file PROVIDER=PATH`. It re-reads a file when its mtime, size or inode changes. A grant token comes before a keyring token. On a change, `GrantWatcher` probes the sites that name that identity (`identity/probe.py`; results in `<state>/identity/probes.json`).
-- **The keyring.** `TokenStore` uses keyring service `clio-relay` with JSON entries. Secrets typed on the page are kept as `secret:<name>`, read with `TokenStore().secret(name)`, and written with `set_secret` and `delete_secret`. `CLIO_RELAY_KEYRING=memory` keeps entries in the process, for tests.
+- **The token store.** `TokenStore` (`identity/store.py`) is relay's one credential store, and tacc uses it too. It keeps JSON entries under the service `clio-relay`. Secrets typed on the page are kept as `secret:<name>`, read with `TokenStore().secret(name)`, and written with `set_secret` and `delete_secret`.
+  - Where entries live: the OS keyring when one is usable. Otherwise they go to `<config_dir>/credentials.json`, mode 0600, written whole through a 0600 temporary file and a rename. A keyring is unusable when it is the `fail` or `null` backend or a read-only probe fails.
+  - `CLIO_RELAY_KEYRING` picks one: `keyring`, `file`, or `memory` (in the process, for tests). Unset means the keyring, falling back to the file.
+  - A failed read is signed out. A failed write refuses `adapter_unavailable`. A file readable by others is set back to 0600 with a warning.
+  - `IdentityStatus.stored_in` (`keyring`, `file` or `memory`) and `store_path` say where, and `Token.source` is `file` for a token from the file. Tapis `describe` shows them as `facts.credentials`.
 - **`clio-relay-next asks`** (mounted by `cli_next`):
   - `list [--all]`, `show`, `page`;
   - `answer <ask> [--decline] [--value]`, `decline`;
@@ -433,7 +437,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
 
 ### Answers for W11
 
-- `Token` is a pydantic model: `resource_server: str | None`, `access_token: SecretStr` (read it with `.get_secret_value()`), `token_type = "Bearer"`, `expires_at: datetime | None`, `scopes: list[str]`, `source: "grant" | "keyring"`, and `live()`. It is not a tuple.
+- `Token` is a pydantic model: `resource_server: str | None`, `access_token: SecretStr` (read it with `.get_secret_value()`), `token_type = "Bearer"`, `expires_at: datetime | None`, `scopes: list[str]`, `source: "grant" | "keyring" | "file"`, and `live()`. It is not a tuple.
 - `status()` and `token()` are async, as are `begin`, `poll`, `callback` and `sign_out`.
 - Use `clio_relay.identity.shared().get("globus")`, not `identity.get("globus")`: `get` returns the factory, not a provider.
 - Cloud keys: the service `clio-relay` is W6's, so use `TokenStore().secret("aws-access-key-id")` rather than raw keyring entries. The names under `secret:` are W11's to choose. To have the person type one on relay's page, raise `SignInNeed(provider="keyring:aws-access-key-id")`.
@@ -447,6 +451,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
 - **A standalone askpass prompt** (one not tied to an operation) is seen only through `clio-relay-next asks list` and `page`. No MCP request carries it.
 - **Globus sign-in** is a native-app PKCE flow: the person pastes the code on relay's page. GitHub uses the device flow, with its code shown on relay's page and not in the transcript. The client ids come from `CLIO_RELAY_GLOBUS_CLIENT_ID` and `CLIO_RELAY_GITHUB_CLIENT_ID`, or from `settings`.
 - **Production keeps the OS keyring.** `keyrings.alt` is only in the `testing` extra, for headless Ares.
+- **With no usable keyring, relay keeps sign-ins in a 0600 file in its own config dir** (W14's bug, decided by the coordinator). Under the CLIO fence there is no Secret Service, and `NoKeyringError` used to escape tacc's own keyring store and break `describe`, the Compute tab and `site add-from-catalog`. tacc now uses the one `TokenStore`. This is generic relay behaviour, with no host-specific setting; `describe` names the place so the person can see it. Grant files work as before.
 
 ### Facts
 
@@ -495,6 +500,14 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
     - Restart while Slurm still lists the job: `op_7752f84c897ba04b72395965` was killed after Slurm accepted job **27745** (`relay-op_7752…`, PENDING, no native id in the record). The restart reconciled by name. History: `submitting` ("job name relay-op_…"), `queued` ("reconciled after an interrupted submit"), `running`, `completed`. Slurm had exactly one job for it, and stdout was `ares-comp-03` and `lq42-crash`.
     - Restart after Slurm forgot the job: `op_07e8c69c4cc2c58895a47f45` was killed after acceptance of job **27751**. Relay was restarted only once squeue no longer listed the job (MinJobAge passed, 07:39 to 07:44). The restart found it through `<job_dir>/scheduler_id` and recorded `queued` ("reconciled after an interrupted submit") and then `completed`, with output read back. One job.
 - **Not covered here.** `files` transfer, `serve` service and stop, A2UI, and the tab token belong to W1, W9 and W14, and are left to their owners' LQ42 runs.
+
+**No keyring backend, live on Ares, 2026-11-18** (`PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring`, `CLIO_RELAY_KEYRING` unset, config and state in scratch):
+- At integration 9f00ef6, `clio-relay-next site add-from-catalog stampede3` exits 1 with `NoKeyringError`, and MCP `describe site=stampede3` (official `fastmcp` client over stdio) is a tool error with the same message.
+- With the fix, `add-from-catalog` exits 0. MCP `describe` returns the site report, with Tapis's own refusal (`invalid_config` with no TACC client id, `unreachable` with the stub's) and no keyring error.
+- Against the Tapis stub (site `tacc-stub`, port 47181): `status` is signed_out with `stored_in: file`. `sign-in` showed code `GTYURQJE`, which was approved on the stub; it exited 0.
+- From fresh processes afterwards: `status` is signed_in, account `w6tester`, `source: file`. The driver's `describe` and MCP `describe` through a new `clio-relay-next serve` both give `signed_in: true` and `credentials: {stored_in: file, path: <config>/credentials.json}`. `asks identities` lists every provider with `stored_in: file`.
+- `credentials.json` and its lock are 0600. The access and refresh tokens appear in none of the seven outputs or the stub log.
+- Tests at 0f4b5b5 (`CLIO_RELAY_KEYRING=memory`): `tests/asks` plus `tests/relay_tapis`, **129 passed, 0 skipped, 0 failed**. W11's globus, iri and sky modules, with the globus extra, **95 passed, 0 skipped**. ruff, format and pyright clean on the touched paths.
 
 ### Halves of other rows
 

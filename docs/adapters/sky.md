@@ -49,8 +49,8 @@ version.
 
 SkyPilot also reads the cloud profiles already on your machine, such as
 `~/.aws/credentials`. With `credentials`, relay instead reads each key from its
-own secret store (the operating system's keyring, kept by relay's identity
-layer) under the name you give, and hands it to SkyPilot as that variable. A
+own secret store (the operating system's keyring, or relay's private
+`credentials.json` when there is no usable keyring) under the name you give, and hands it to SkyPilot as that variable. A
 missing key shows the site as needing sign-in, and relay's page asks you to
 type it.
 

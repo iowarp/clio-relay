@@ -214,6 +214,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         status = await self.identity.status()
         facts["signed_in"] = status.state == "signed_in"
         facts["account"] = status.account
+        facts["credentials"] = {"stored_in": status.stored_in, "path": status.store_path}
         info = SiteInfo(adapter=self.name, verbs=sorted(self.implements))
         if status.state != "signed_in":
             facts["system_id"] = self.config.system_id
