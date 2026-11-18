@@ -1,7 +1,7 @@
 """Route one owned-session CLI operation over the held channel, or take the
 typed, visible per-operation ssh fallback (iowarp/clio-relay#179).
 
-The 2FA doctrine (docs/connection-model.md:141-157) makes an unattended
+The 2FA doctrine (docs/design/relay-architecture-2026-08.md §8.4) makes an unattended
 per-operation ssh dial to a 2FA-protected cluster a design violation: the
 held channel established once at connection bring-up
 (:mod:`clio_relay.adapters.worker.remote_connection`) exists precisely so operations ride

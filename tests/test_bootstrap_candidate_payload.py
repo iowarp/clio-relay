@@ -68,7 +68,6 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
         # owner modules must travel with the candidate too, or the facade's
         # sibling imports can't resolve inside a standalone deployment.
         "adapters/worker/bootstrap_reconcile_activation_paths.py",
-        "adapters/worker/bootstrap_reconcile_builtin_repos.py",
         "adapters/worker/bootstrap_reconcile_constants.py",
         "adapters/worker/bootstrap_reconcile_execution_identity.py",
         "adapters/worker/bootstrap_reconcile_generation_staging.py",

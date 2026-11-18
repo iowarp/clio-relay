@@ -92,8 +92,6 @@ def inspect_exact_bootstrap_noop(
         reasons.append("JARVIS is not initialized")
     if not jarvis_state.managed_repo_registered:
         reasons.append("the exact relay-managed JARVIS repository is not registered")
-    if not jarvis_state.managed_builtin_repo_registered:
-        reasons.append("the exact JARVIS-managed builtin repository slot is not registered")
 
     queue_ready = _queue_readiness_verified(queue_evidence)
     if not queue_ready:
@@ -236,7 +234,6 @@ def _inspect_installation_identity(
     expected_components = {
         "clio-kit": desired.clio_kit_version,
         "jarvis-cd": desired.jarvis_cd_version,
-        "jarvis-util": desired.jarvis_util_commit,
     }
     if not isinstance(raw_components, dict):
         reasons.append("install receipt omitted component identities")

@@ -15,7 +15,6 @@ from clio_relay.adapters.worker.bootstrap_constants import (
     JARVIS_CD_WHEEL_FILENAME,
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
-    JARVIS_UTIL_COMMIT,
     UV_LINUX_AMD64_ARCHIVE_SHA256,
     UV_LINUX_AMD64_EXECUTABLE_SHA256,
     UV_VERSION,
@@ -179,29 +178,6 @@ else:
     if completed.returncode != 0 or version_fields[:2] != ["uv", "{UV_VERSION}"]:
         raise SystemExit("bootstrap cannot adopt an existing uv version")
 
-jarvis_util = home / ".local/src/jarvis-util"
-if classify(jarvis_util) is None:
-    owned["jarvis_util"] = {{"path": str(jarvis_util), "kind": "directory"}}
-else:
-    if jarvis_util.is_symlink() or not (jarvis_util / ".git").is_dir():
-        raise SystemExit("bootstrap cannot adopt the existing jarvis-util path")
-    commit = subprocess.run(
-        ["git", "-C", str(jarvis_util), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    ).stdout.strip()
-    status = subprocess.run(
-        ["git", "-C", str(jarvis_util), "status", "--porcelain=v1", "--untracked-files=all"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    ).stdout
-    if commit != "{JARVIS_UTIL_COMMIT}" or status:
-        raise SystemExit("bootstrap cannot mutate an existing jarvis-util checkout")
-
 jarvis_venv_entry = (
     # clio-relay#254: a staging transaction never claims the LIVE jarvis-venv
     # as absent -- it owns only the staged replacement, promoted in later by
@@ -262,7 +238,6 @@ bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" generation
 BOOTSTRAP_FULL_PREPARE_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 BOOTSTRAP_FRP_DOWNLOADED=0
 BOOTSTRAP_UV_DOWNLOADED=0
-BOOTSTRAP_JARVIS_UTIL_DOWNLOADED=0
 BOOTSTRAP_JARVIS_CD_DOWNLOADED=0
 BOOTSTRAP_CLIO_KIT_DOWNLOADED=0
 BOOTSTRAP_RELAY_DOWNLOAD_COUNT=0
@@ -334,25 +309,6 @@ else
 fi
 uv venv --python 3.12 --seed "$JARVIS_VENV"
 . "$JARVIS_VENV/bin/activate"
-JARVIS_UTIL_COMMIT="{JARVIS_UTIL_COMMIT}"
-if [ ! -d "$HOME/.local/src/jarvis-util/.git" ]; then
-  bootstrap_journal_action mkdir-owned "$BOOTSTRAP_TRANSACTION_JOURNAL" jarvis_util
-  git clone --no-checkout https://github.com/grc-iit/jarvis-util.git \
-    "$HOME/.local/src/jarvis-util"
-  git -C "$HOME/.local/src/jarvis-util" fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"
-  BOOTSTRAP_JARVIS_UTIL_DOWNLOADED=1
-  git -C "$HOME/.local/src/jarvis-util" checkout --detach "$JARVIS_UTIL_COMMIT"
-else
-  test "$(git -C "$HOME/.local/src/jarvis-util" rev-parse HEAD)" = \
-    "$JARVIS_UTIL_COMMIT"
-  test -z "$(
-    git -C "$HOME/.local/src/jarvis-util" status --porcelain=v1 --untracked-files=all
-  )"
-fi
-test "$(git -C "$HOME/.local/src/jarvis-util" rev-parse HEAD)" = "$JARVIS_UTIL_COMMIT"
-python -m pip install --isolated --index-url https://pypi.org/simple \\
-  -r "$HOME/.local/src/jarvis-util/requirements.txt"
-python -m pip install --isolated --no-deps "$HOME/.local/src/jarvis-util"
 JARVIS_CD_VERSION="{JARVIS_CD_VERSION}"
 JARVIS_CD_WHEEL_URL="{JARVIS_CD_WHEEL_URL}"
 JARVIS_CD_WHEEL_SHA256="{JARVIS_CD_WHEEL_SHA256}"

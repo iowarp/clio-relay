@@ -192,9 +192,6 @@ deviations from the one-link model, not sanctioned exceptions, and the
 campaign issue [#182](https://github.com/iowarp/clio-relay/issues/182) carries
 them:
 
-- `relay_bind_jarvis_runtime` admission reads its status through
-  `remote_cli.run_remote_clio`, which opens one SSH connection per call; the
-  bind flow was measured at four. It needs a server-side admission endpoint.
 - the `jarvis_service_runtime` scheduler bridge dials SSH per operation at
   roughly twenty sites.
 - cluster-targeted CLI dispatch under `CLIO_RELAY_CLI_MODE=auto` opens one SSH

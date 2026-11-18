@@ -124,7 +124,6 @@ def _desired(*, uv_sha256: str, frpc_sha256: str, frps_sha256: str) -> Bootstrap
         frps_sha256=frps_sha256,
         uv_version="0.11.28",
         uv_sha256=uv_sha256,
-        jarvis_util_commit="commit",
         jarvis_cd_version="1.4.4",
         jarvis_cd_wheel_url="https://example.test/jarvis.whl",
         jarvis_cd_wheel_sha256="c" * 64,
@@ -208,7 +207,6 @@ def _installation_info(desired: BootstrapDesiredState) -> dict[str, object]:
                 "clio-relay": "1.5.0",
                 "clio-kit": desired.clio_kit_version,
                 "jarvis-cd": desired.jarvis_cd_version,
-                "jarvis-util": desired.jarvis_util_commit,
             },
         },
         "component_runtime": {
@@ -361,27 +359,26 @@ def test_managed_repository_converges_home_alias_to_one_lexical_stable_path(
     evidence = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
-        managed_builtin_repo=root / "builtin",
         previous_managed_repos=(previous,),
         exchange_identity=desired.fingerprint,
     )
 
+    # Relay leaves the existing builtin registration exactly as it was (RL39).
     assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
         lexical_managed,
         operator,
-        lexical_builtin,
+        canonical_builtin,
     ]
     assert evidence["managed_repo"] == lexical_managed
-    assert evidence["added_managed_repos"] == [lexical_managed, lexical_builtin]
+    assert evidence["added_managed_repos"] == [lexical_managed]
     assert evidence["removed_previous_managed_repos"] == [canonical_previous]
     after = inspect_jarvis_state(desired, home=lexical_home)
     assert after.managed_repo_registered is True
-    assert after.managed_builtin_repo_registered is True
+    assert after.managed_builtin_repo_registered is False
 
     repeated = reconcile_managed_jarvis_repository(
         repos_file,
         managed,
-        managed_builtin_repo=root / "builtin",
         previous_managed_repos=(previous,),
         exchange_identity=desired.fingerprint,
     )
@@ -402,11 +399,7 @@ def test_managed_repository_converges_home_alias_to_one_lexical_stable_path(
         encoding="utf-8",
     )
     with pytest.raises(ConfigurationError, match="multiple path aliases"):
-        reconcile_managed_jarvis_repository(
-            repos_file,
-            managed,
-            managed_builtin_repo=root / "builtin",
-        )
+        reconcile_managed_jarvis_repository(repos_file, managed)
 
 
 def test_matching_receipt_with_tampered_runtime_is_not_a_noop(
@@ -577,6 +570,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     stable_jarvis = bin_dir / "jarvis"
     stable_jarvis.write_bytes(b"stable-jarvis")
     stable_jarvis.chmod(0o755)
+    # A leftover checkout from an older bootstrap is ignored and never probed.
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -677,7 +671,7 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     # plan_bootstrap_reconcile (the caller) now lives in
     # bootstrap_reconcile_planning.py, _verify_uv (which calls
     # run_bounded_process) in bootstrap_reconcile_readiness.py, and
-    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # _bounded_subprocess (which must not probe that checkout) in
     # bootstrap_reconcile_planning_support.py -- patch each collaborator on
     # its own caller's module (iowarp/clio-relay#255).
     monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
@@ -689,16 +683,6 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
 
     def bounded_identity(command: list[str], *, maximum: int) -> str:
         assert maximum > 0
-        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
-            return "commit" if "rev-parse" in command else ""
-        if command[0] == str(legacy_python):
-            return json.dumps(
-                {
-                    "name": "jarvis-util",
-                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
-                    "record": True,
-                }
-            )
         raise AssertionError(command)  # pragma: no cover
 
     monkeypatch.setattr(
@@ -738,7 +722,6 @@ def test_first_legacy_upgrade_stages_an_unbound_relay_execution_runtime(
     assert plan.component_actions == {
         "clio-relay": "replace",
         "jarvis-cd": "reuse" if expected_mode == "relay-only" else "replace",
-        "jarvis-util": "reuse",
         "clio-kit": "reuse" if expected_mode == "relay-only" else "replace",
         "frp": "reuse",
         "uv": "reuse",
@@ -1084,6 +1067,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
         return resolve_path(path, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", resolve_stable_wrapper)
+    # A leftover checkout from an older bootstrap is ignored and never probed.
     jarvis_util_checkout = tmp_path / ".local/src/jarvis-util"
     (jarvis_util_checkout / ".git").mkdir(parents=True)
     receipt_path = tmp_path / ".local/share/clio-relay/install-receipt.json"
@@ -1124,7 +1108,7 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     # plan_bootstrap_reconcile (the caller) now lives in
     # bootstrap_reconcile_planning.py, _verify_uv (which calls
     # run_bounded_process) in bootstrap_reconcile_readiness.py, and
-    # _verify_jarvis_util_reuse (which calls _bounded_subprocess) in
+    # _bounded_subprocess (which must not probe that checkout) in
     # bootstrap_reconcile_planning_support.py (iowarp/clio-relay#255).
     monkeypatch.setattr(bootstrap_reconcile_planning, "installation_info", read_installation)
 
@@ -1134,16 +1118,6 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
 
     def bounded_identity(command: list[str], *, maximum: int) -> str:
         assert maximum > 0
-        if command[:3] == ["git", "-C", str(jarvis_util_checkout)]:
-            return "commit" if "rev-parse" in command else ""
-        if command[0] == str(legacy_python):
-            return json.dumps(
-                {
-                    "name": "jarvis-util",
-                    "direct_url": json.dumps({"url": jarvis_util_checkout.resolve().as_uri()}),
-                    "record": True,
-                }
-            )
         raise AssertionError(command)  # pragma: no cover
 
     monkeypatch.setattr(bootstrap_reconcile_readiness, "run_bounded_process", identity_command)
@@ -1160,7 +1134,6 @@ def test_existing_jarvis_144_plans_staged_component_upgrade_to_148(
     assert plan.component_actions == {
         "clio-relay": "replace",
         "jarvis-cd": "replace",
-        "jarvis-util": "reuse",
         "clio-kit": "replace",
         "frp": "reuse",
         "uv": "reuse",
@@ -1272,8 +1245,8 @@ def test_existing_operator_jarvis_roots_are_adopted_without_mutation(tmp_path: P
     assert (root / "resource_graph.yaml").read_bytes() == graph_before
 
 
-def test_jarvis_state_requires_the_managed_builtin_slot_for_exact_reuse(tmp_path: Path) -> None:
-    """Bootstrap evidence distinguishes relay packages from JARVIS builtins."""
+def test_jarvis_state_records_the_builtin_slot_as_evidence_only(tmp_path: Path) -> None:
+    """The builtin slot is recorded but no longer required for exact reuse (RL39)."""
     desired = _desired(uv_sha256="a" * 64, frpc_sha256="b" * 64, frps_sha256="c" * 64)
     root, _config, _graph = _write_jarvis_state(tmp_path, desired)
 
@@ -1362,129 +1335,52 @@ def test_managed_repo_migration_preserves_operator_repo_and_resolves_jarvis_pack
 
 
 @pytest.mark.parametrize("environment_kind", ["legacy", "generation"])
-def test_relay_owned_jarvis_builtin_reconcile_preserves_operator_repositories(
+def test_managed_repo_reconcile_leaves_builtin_registrations_alone(
     tmp_path: Path,
     environment_kind: str,
 ) -> None:
-    """Only a RECORD-proven builtin under a relay-owned venv is migrated."""
+    """Relay neither adds nor removes any JARVIS builtin registration (RL39)."""
     relay_root = tmp_path / ".local/share/clio-relay"
     if environment_kind == "legacy":
         environment = relay_root / "jarvis-venv"
-        supplied_environments: tuple[Path, ...] = ()
     else:
         environment = relay_root / "generations" / ("a" * 64) / "jarvis-venv"
-        supplied_environments = (environment,)
     relay_builtin = _write_jarvis_cd_builtin_distribution(environment)
-    operator_environment = tmp_path / "operator/jarvis-venv"
-    operator_builtin = _write_jarvis_cd_builtin_distribution(operator_environment)
+    operator_builtin = _write_jarvis_cd_builtin_distribution(tmp_path / "operator/jarvis-venv")
+    jarvis_builtin = tmp_path / ".ppi-jarvis/builtin"
     managed = relay_root / "clio_relay"
     managed.mkdir(parents=True)
-    repos_file = tmp_path / "repos.yaml"
+    repos_file = tmp_path / ".ppi-jarvis/repos.yaml"
+    repos_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = [
+        str(relay_builtin.absolute()),
+        str(operator_builtin.absolute()),
+        str(jarvis_builtin.absolute()),
+    ]
     repos_file.write_text(
         yaml.safe_dump(
-            {
-                "repos": [
-                    str(relay_builtin.absolute()),
-                    str(operator_builtin.absolute()),
-                    str(managed.absolute()),
-                ],
-                "operator_extension": {"preserve": True},
-            },
+            {"repos": existing, "operator_extension": {"preserve": True}},
             sort_keys=False,
         ),
         encoding="utf-8",
     )
 
-    proven = bootstrap_reconcile_module._relay_owned_jarvis_builtin_repositories(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        home=tmp_path,
-        execution_environments=supplied_environments,
-    )
-    evidence = reconcile_managed_jarvis_repository(
-        repos_file,
-        managed,
-        managed_builtin_repo=tmp_path / "builtin",
-        previous_managed_repos=proven,
-    )
+    evidence = reconcile_managed_jarvis_repository(repos_file, managed)
     document = yaml.safe_load(repos_file.read_text(encoding="utf-8"))
 
-    assert proven == (relay_builtin,)
-    assert evidence["added_managed_repos"] == [
-        str(managed.absolute()),
-        str((tmp_path / "builtin").absolute()),
-    ]
-    assert evidence["removed_previous_managed_repos"] == [str(relay_builtin.absolute())]
-    assert document["repos"] == [
-        str(managed.absolute()),
-        str((tmp_path / "builtin").absolute()),
-        str(operator_builtin.absolute()),
-    ]
+    assert evidence["added_managed_repos"] == [str(managed.absolute())]
+    assert evidence["removed_previous_managed_repos"] == []
+    assert document["repos"] == [str(managed.absolute()), *existing]
     assert document["operator_extension"] == {"preserve": True}
 
-
-def test_managed_builtin_slot_replaces_stale_relay_path_without_operator_promotion(
-    tmp_path: Path,
-) -> None:
-    """Stable builtin binding retains explicit operator repository precedence."""
-    repos_file = tmp_path / ".ppi-jarvis/repos.yaml"
-    repos_file.parent.mkdir()
-    managed = tmp_path / ".local/share/clio-relay/clio_relay"
-    managed.mkdir(parents=True)
-    operator_builtin = tmp_path / "operator/builtin"
-    operator_builtin.mkdir(parents=True)
-    stale_builtin = _write_jarvis_cd_builtin_distribution(
-        tmp_path / ".local/share/clio-relay/jarvis-venv"
-    )
-    operator_other = tmp_path / "operator/science"
-    operator_other.mkdir(parents=True)
-    repos_file.write_text(
-        yaml.safe_dump(
-            {
-                "repos": [
-                    str(operator_builtin.absolute()),
-                    str(stale_builtin.absolute()),
-                    str(operator_other.absolute()),
-                ]
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-
-    evidence = reconcile_managed_jarvis_repository(
-        repos_file,
-        managed,
-        managed_builtin_repo=repos_file.parent / "builtin",
-        previous_managed_repos=(stale_builtin,),
-    )
-
-    assert yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] == [
-        str(managed.absolute()),
-        str(operator_builtin.absolute()),
-        str((repos_file.parent / "builtin").absolute()),
-        str(operator_other.absolute()),
+    fresh_file = tmp_path / "fresh/repos.yaml"
+    fresh_file.parent.mkdir()
+    fresh_file.write_text("repos: []\n", encoding="utf-8")
+    fresh = reconcile_managed_jarvis_repository(fresh_file, managed)
+    assert fresh["added_managed_repos"] == [str(managed.absolute())]
+    assert yaml.safe_load(fresh_file.read_text(encoding="utf-8"))["repos"] == [
+        str(managed.absolute())
     ]
-    assert evidence["added_managed_repos"] == [
-        str(managed.absolute()),
-        str((repos_file.parent / "builtin").absolute()),
-    ]
-    assert evidence["removed_previous_managed_repos"] == [str(stale_builtin.absolute())]
-
-
-def test_relay_owned_jarvis_builtin_requires_distribution_record_proof(tmp_path: Path) -> None:
-    """A lookalike directory in relay's legacy venv is not sufficient provenance."""
-    environment = tmp_path / ".local/share/clio-relay/jarvis-venv"
-    if os.name == "nt":
-        builtin = environment / "Lib/site-packages/builtin"
-    else:
-        builtin = environment / "lib/python3.12/site-packages/builtin"
-    builtin.mkdir(parents=True)
-
-    assert (
-        bootstrap_reconcile_module._relay_owned_jarvis_builtin_repositories(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            home=tmp_path,
-        )
-        == ()
-    )
 
 
 def test_managed_repo_reconcile_refuses_concurrent_operator_edit(
@@ -2183,7 +2079,6 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         path: Path,
         managed: Path,
         *,
-        managed_builtin_repo: Path | None = None,
         previous_managed_repos: tuple[Path, ...] = (),
         exchange_identity: str | None = None,
     ) -> dict[str, object]:
@@ -2194,7 +2089,6 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
         evidence = original_reconcile(
             path,
             managed,
-            managed_builtin_repo=managed_builtin_repo,
             previous_managed_repos=previous_managed_repos,
             exchange_identity=exchange_identity,
         )
@@ -2230,10 +2124,11 @@ def test_staged_activation_resumes_across_repository_crash_boundaries(
     )
 
     repositories = yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"]
+    # The old venv builtin registration stays where it was (RL39).
     assert repositories == [
         str(managed_repo.absolute()),
         str(operator_repo.absolute()),
-        str((jarvis_root / "builtin").absolute()),
+        str(stale_builtin_repo.absolute()),
     ]
     first_repository = cast(dict[str, object], first_completed["jarvis_repository"])
     second_repository = cast(dict[str, object], second_completed["jarvis_repository"])
@@ -2701,6 +2596,25 @@ def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
         desired=desired,
         installation=installation,
     )
+
+    # A full-mode generation also records its activation paths; that key is allowed
+    # as an object, and any other extra key or shape is still refused.
+    manifest["full_activation_paths"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        generation,
+        desired=desired,
+        installation=installation,
+    )
+    for extra in ({"full_activation_paths": "not-an-object"}, {"unexpected": {}}):
+        manifest_path.write_text(json.dumps({**manifest, **extra}), encoding="utf-8")
+        with pytest.raises(ConfigurationError, match="manifest has an unknown shape"):
+            bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                generation,
+                desired=desired,
+                installation=installation,
+            )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     _replacement_root, replacement_python, _replacement_jarvis, replacement_identity = (
         make_execution_root("replacement")

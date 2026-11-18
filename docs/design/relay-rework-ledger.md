@@ -843,15 +843,7 @@ Checked against W9's ownership before running: no `service_runtime*`, `jarvis_se
 - `transport_probe`, `transport_probe_evidence`, `transport_probe_primitives`, `transport_probe_remote_cleanup`, `transport_probe_remote_cleanup_models`, `transport_probe_remote_script`, `transport_probe_session_lifecycle`.
 - `worker_concurrency`, `worker_lifetime_lock`, `worker_runtime_verification`.
 
-**RL39 files, moved as they are.** `bootstrap_reconcile_builtin_repos.py` and every module that holds the `managed_builtin_repo_registered` receipt validation move with no change in behaviour. Their new paths are:
-
-- `src/clio_relay/adapters/worker/bootstrap_reconcile_builtin_repos.py`;
-- `src/clio_relay/adapters/worker/bootstrap_receipt_validation.py`;
-- `src/clio_relay/adapters/worker/bootstrap_reconcile_execution_identity.py`;
-- `src/clio_relay/adapters/worker/bootstrap_reconcile_inspection.py`;
-- `src/clio_relay/adapters/worker/bootstrap_reconcile_models.py`.
-
-W1 changes them after this branch merges.
+**RL39 files.** `bootstrap_reconcile_builtin_repos.py` and the modules that hold the `managed_builtin_repo_registered` receipt validation moved with no change in behaviour. The coordinator then gave the RL39 change to W8 (option A, under "Changes made during the move"). `bootstrap_reconcile_builtin_repos.py` is deleted there, and the others stay under `src/clio_relay/adapters/worker/`.
 
 **`core_queue` moves** because the execution plan names it. W9 imports it in two places, which need an import-only change (below).
 
@@ -1064,7 +1056,51 @@ Fixes and edits beyond the mechanical move, in commit order:
   - Also changed: `.gitattributes` (the `examples/release-gate` lines), `docs/ai/testing-context.md` (the release CI section and the command list), and `docs/ai/interface-context.md` (`release validate-local` and `release gate`). The `--allow-login-scoped` help no longer says "release-gate eligible".
   - W9's `service_runtime_results.py` gets import lines and one docstring line only. W1's scripts are not edited: their comments still name the deleted files, and `check_file_size.py` reports ratchet-down room only.
 
+- **RL39, option A (cd5e9cf).** The worker bootstrap no longer adds or requires the `builtin` slot.
+  - `reconcile_managed_jarvis_repository` takes no builtin path. It inserts the managed repo first, removes only proven previous relay repos, and keeps every other entry, a `builtin` entry included, in its place. `bootstrap_script_commit`, `bootstrap_reconcile_generation_staging` and `repair_managed_jarvis_binding` stop passing builtin and relay-venv builtin paths.
+  - The inspection no longer reports "builtin slot not registered", and the execution identity no longer refuses builtin aliases.
+  - `bootstrap_receipt_validation` no longer requires `managed_builtin_repo_registered`; the receipt keeps it as evidence. The checks on `added_managed_repos` and `removed_previous_managed_repos` still accept the builtin entries that older bootstraps wrote, because preflight revalidates a stored receipt (`bootstrap_ssh_deploy.py:396`). New code never writes them.
+  - `bootstrap_reconcile_builtin_repos.py` had no caller left, so it is deleted, with its re-exports, its two constants and its candidate-package entry.
+  - Tests: `test_managed_repo_reconcile_leaves_builtin_registrations_alone` (legacy, generation and fresh repos files), the alias test now keeps the canonical builtin, and `test_bootstrap_fast_path` validates a receipt without builtin. The two builtin provenance tests are deleted.
+- **The full-mode manifest key (2a3dd4b).** Since #257, a full bootstrap writes `full_activation_paths` into the generation manifest, but the wrapper binding check demanded an exact key set and refused it ("active generation manifest has an unknown shape"). Every fresh full bootstrap failed its exact inspection, release 1.6.7 included. The check now accepts that key when it is an object, and still refuses any other extra key. `test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper` covers both.
+- **Stale docs (cd5e9cf).** Deleted: `docs/ai/release-validation-0.9.5.md`, `-0.9.9.md`, `-0.9.14.md`, `-0.9.17.md` and `docs/ai/lifecycle-scheduler-live-validation.md`. `docs/ai/system-context.md` and `docs/ai/testing-context.md` describe the five verbs, the adapters and `clio-relay worker`, not the old tools, `connection-model.md` or `clio-relay live-test`. The `relay_bind_jarvis_runtime` bullet in `docs/one-link-control-plane.md` is gone, and the comments that pointed at `connection-model.md` in the worker modules, `session_api.py` and one test now point at `docs/adapters/worker.md`.
+- **Citations of the deleted connection-model page (178d3f9).** Those eight comments (six worker modules, `session_api.py` and `test_bootstrap_preflight_transport.py`) now cite `docs/design/relay-architecture-2026-08.md` §8.4, "Dial-count invariants per mode", as W9 did for its own files.
+- **jarvis-util dropped from the bootstrap (deec1d0, d56458b).** jarvis-cd 1.8.1, the pinned wheel, does not import `jarvis_util`: its `Requires-Dist` is pyyaml, pandas, podman-compose and pywin32 (Windows only), and the only mentions are comments and wiki links. `grc-iit/jarvis-util` is private and archived.
+  - The bootstrap no longer clones, pins, installs or verifies it. `JARVIS_UTIL_COMMIT`, the `jarvis_util_commit` desired-state field, the reuse check, the plan action, the staged-venv installs, the download and receipt entries and the clean-worktree check are gone.
+  - An existing `~/.local/src/jarvis-util` is left alone: nothing adopts, probes or removes it. The journal's recovery roots keep that path, so a journal written by an older bootstrap still recovers.
+  - Receipts are no longer required to list jarvis-util, and an older receipt that lists it (`reused` or `prepared`) still validates and still passes the reuse acceptance check. Tests cover both.
+  - Version skew. An installed rework-era relay rejects the new desired state (`error: bootstrap desired state is invalid`), because its model still requires `jarvis_util_commit`. The preflight script now reports that exact line as `bootstrap_preflight_unsupported=desired_state_schema`, and the controller does a full bootstrap. Any other inspector error still fails. `test_preflight_reinstalls_a_relay_that_rejects_the_desired_state_schema` runs the script against both. Pre-rework relays already map to `missing_command`.
+- **The JARVIS runtime-authority path deleted (0800e35, cb706f1, 9985a56).** After W9 retired the binding chain (c4e94d4), `/internal/jarvis-runtime-authority` always answered 409. Deleted:
+  - the route in `http_api_routes_session.py`, its `JarvisRuntimeAuthorityRequest` model, and the door-error reasons `jarvis_runtime_authority_unavailable` and `jarvis_runtime_authority_conflict`;
+  - the hidden `clio-relay worker jarvis-runtime-authority` command (`cli_jarvis_runtime_authority.py`);
+  - `remote_cli.run_remote_jarvis_runtime_authority` and its private-command helpers, which nothing else used;
+  - in W9's `jarvis_service_runtime.py` and `jarvis_service_runtime_models.py`, as the coordinator directed: the local authority resolver, `JarvisServiceRuntimeAuthority`, `JarvisPrivateServiceAuthorization` and the authority schema id;
+  - in W9's `test_jarvis_service_runtime.py`: the tests of the authority transport and endpoint. The owned-session API still refuses to start without an API token, so that test stays as `test_owned_session_api_cannot_start_without_api_token`.
+  - The door-error pins move to 66 reasons, 52 R9 HTTP statuses, 110 routed sites (125 with middleware) and 57 exception-backed sites.
+  - Left in place: `native_jarvis_contract.py:45` and `:156` still require jarvis-cd's `ExecutionStore.resolve_service_runtime_authority` in the installation check. That is a capability check on jarvis-cd, not relay's path, and dropping it changes what an installation accepts, so it is a question for the coordinator.
+- **LQ32 wording (2cc93c2).** W9's retired-binding refusal and docstrings named `mcp_call`. They now say "MCP tool-call job". The refusal still starts with "relay no longer binds JARVIS service runtimes".
+
 ### Gate evidence
+
+**At 2cc93c2 (integration 2db7d8d merged in b21aed4).** On Ares.
+- **LQ1.** A wheel built at 2cc93c2 in a clean venv: `clio-relay` and `python -m clio_relay` each list exactly `describe`, `exec`, `files`, `run` and `serve` to an MCP stdio client, on 2026-07-28 and 2025-11-25, with and without A2UI. No app-only tools.
+- **LQ32.** No hits for `relay_submit`, `mcp_call`, `browser_gateway` or `scheduler_providers` in the tree outside `docs/design`, in tracked paths, in the wheel (595 files) or in the installed package.
+- **Tests.** `test_jarvis_service_runtime`, `test_door_errors`, `test_cli`, `test_installation`, `test_component_runtime_identity`, `test_http_api`, `test_http_api_dial_burndown_routes`, `test_remote_cli`, `test_service_runtime`, `test_session_api`, `tests/serve` and `tests/worker`: 510 passed after the pin updates, none failed or skipped. `ruff check` and `ruff format --check` are clean. Pyright counts 4535, under the 4558 baseline. `check_file_size.py` passes once the jarvis-util comment line in `bootstrap_journal.py` is removed.
+
+**After the cutover (2a3dd4b, on integration c214d4f plus the commits above).** On Ares.
+- **LQ1.** A wheel built at 2a3dd4b (sha256 `66bd2abcdc36…`) is installed in a clean venv. `clio-relay --help` and `python -m clio_relay --help` list serve, connect, adapters, site, rendezvous, asks and worker. An MCP stdio client lists exactly `describe`, `exec`, `files`, `run` and `serve` through both entry points, on 2026-07-28 and on 2025-11-25, with and without A2UI in the request; no app-only tools are listed.
+- **LQ32.** No path in the tree, the wheel (590 files) or the installed package names `relay_submit`, `mcp_call`, `browser_gateway` or `scheduler_providers`. Outside `docs/design` the tree has one hit: W9's dated note `docs/ai/jarvis-service-runtime-binding-validation-2026-07-15.md`, which W9's c4e94d4 deletes.
+- **RL39, fresh bootstrap.** `clio-relay worker cluster bootstrap` on fx-ssh, a host with no `~/.local` and no `~/.ppi-jarvis`, finished with outcome `full` (rc 0).
+  - The script printed `jarvis_managed_repo=updated`. `repos.yaml` is `[<managed clio_relay repo>, <jarvis-venv>/site-packages/builtin]`. The `builtin` entry is jarvis-cd's own default, which `jarvis init` writes when no `repos.yaml` exists (`jarvis_cd/core/config.py:245-250`). Relay left it in place and added only its managed repo in front.
+  - The receipt has `managed_builtin_repo_registered: false` before and after, and validated. Before RL39 that value failed validation.
+  - Two stand-ins, both recorded here. fx-ssh has no systemd user manager, so a logging `systemctl` stub answered the fence queries (unit not found, inactive). It saw five calls, all queries. And `grc-iit/jarvis-util` is a private, archived repository, so the pinned checkout (`c91bfdc9…`, clean) was placed at `~/.local/src/jarvis-util` first, which the script accepts as reused. The stub stood in for systemd only.
+  - A second bootstrap on the same host stops at "bounded systemd inspection failed: is-active". That check does not use PATH, so the stub cannot answer it, and a re-bootstrap needs a real user manager. `repos.yaml` was byte-identical after it.
+- **Tests at 2a3dd4b.** `tests/test_bootstrap_*.py` passed with uv on PATH, none skipped. `ruff check` is clean. Pyright counts 4905, under the 4925 baseline.
+- **jarvis-util, fresh bootstrap (wheel at d56458b, sha256 `e98861b574f6…`).** On fx-ssh, a host with no `~/.local`, no `~/.local/src/jarvis-util`, no `~/.gitconfig`, no gh or netrc credentials and only `authorized_keys` in `~/.ssh`, `clio-relay worker cluster bootstrap` finished with outcome `full` (rc 0), and the report's checks all passed.
+  - The receipt components are clio-kit, clio-relay, frp, jarvis-cd and uv. The report, the command output and the installed `install-receipt.json` name jarvis-util nowhere.
+  - In the installed relay, `import jarvis_cd.core.pkg, jarvis_cd.core.repository` works and `import jarvis_util` raises ModuleNotFoundError. No file in the installed `jarvis_cd` or `builtin` has an uncommented `jarvis_util` import.
+  - The same `systemctl` stub stood in for the missing user manager. Nothing was pre-seeded.
+- **Tests at d56458b.** `tests/test_bootstrap_*.py`: 301 passed, none failed or skipped. `ruff check` and `ruff format --check` are clean. Pyright counts 4902, under the 4925 baseline.
 
 **The `mcp_call` kind removal (504693a, and 2da1c49).** Pyright on Ares counts 4925 errors, under the 4929 baseline. The targeted modules ran on the login node, with the fixtures env and uv on PATH: `test_cli`, `test_cli_endpoint`, `test_jarvis_service_runtime`, `test_bootstrap`, `test_core_queue_split_architecture`, `test_run_report`, `test_owner_session_lease` and `tests/serve`. Of 440 tests, 436 passed and none were skipped. The 3 errors are the `test_run_report` uv pin errors described below. The failure was `test_owner_session_lease::test_run_once_sweeps_owner_session_leases_every_cycle`, which is in develop's list. Its worker resolved `jarvis` from PATH, found the relay install in the Ares home (`~/.local/bin/jarvis` and its receipt), and refused it because the receipt does not match this checkout. The test now gives the worker a `jarvis_bin` under its tmp directory, as `test_endpoint` does (2da1c49), and the module passes 47 of 47.
 
@@ -1110,6 +1146,17 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
   - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
   - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
   - Rewrite or drop the "CLI Surfaces" list in `docs/ai/interface-context.md` (lines 94-175). The operator commands are under `clio-relay worker`, and `job`, `gateway`, `agent`, `remote-mcp`, `live-test` and `storage` are gone. Lines 90-92 also name the deleted `docs/connection-model.md`.
+- **W1, at 2a3dd4b.**
+  - Lower `BASELINE_TOTAL` to 4905 (4902 at d56458b).
+  - `check_file_size.py:261` names the deleted `_builtin_repos.py (213)` in a comment.
+- **W1, at 2cc93c2.**
+  - Lower `BASELINE_TOTAL` to 4535.
+  - `check_file_size.py` lines 385 and 986-993 describe the deleted `jarvis-runtime-authority` command, the authority resolver and `run_remote_jarvis_runtime_authority`. The script also offers ratchet-downs (for example `bootstrap.py` 924 to 922) and distribution raises.
+- **Open findings for the coordinator.**
+  - Should the installation check stop requiring jarvis-cd's `ExecutionStore.resolve_service_runtime_authority` (`native_jarvis_contract.py:45`, `:156`)? Relay no longer calls it.
+  - Resolved (deec1d0): a fresh worker bootstrap cloned the private, archived `grc-iit/jarvis-util`, so it stopped at `git clone` on a host without GitHub credentials. The coordinator decided to drop it, and the bootstrap no longer needs it.
+  - In full mode, the receipt's `jarvis_preservation.repositories` block is the default (`action: reused`, no added repos), because the full path does not pass its reconcile evidence into `make_bootstrap_receipt`. This predates the rework and does not change validation; the script's `jarvis_managed_repo=` line is the live evidence.
+- **W9 (done on W9's branch).** `frp_transport.py` named the deleted `connection-model.md` at lines 34, 46, 48, 115, 200 and 458.
 - **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
 - **Residual.** W8's scratch from LQ10 and LQ11, `~/w8-live` on fx-otp, is still there. Removing it needs a keyboard-interactive sign-in to fx-otp. W8's other Ares and fx-slurm scratch is removed, except `state/w8-live/worker-gate.json`, which the post-cutover LQ1 and LQ32 runs use.
 - **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).

@@ -30,7 +30,6 @@ what it owns:
 * ``bootstrap_reconcile_planning`` -- ``plan_bootstrap_reconcile``
 * ``bootstrap_reconcile_planning_support`` -- its legacy-reuse helpers
 * ``bootstrap_reconcile_receipt`` -- acceptance receipt construction
-* ``bootstrap_reconcile_builtin_repos`` -- JARVIS builtin-repository provenance
 * ``bootstrap_reconcile_repository`` -- exact-path repository reconciliation
 """
 
@@ -51,14 +50,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_activation_paths import (
     _verify_stable_symlink,  # noqa: F401
     reconcile_staged_activation_links,  # noqa: F401
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_builtin_repos import (
-    _is_python_library_directory,  # noqa: F401
-    _jarvis_cd_builtin_repository,  # noqa: F401
-    _jarvis_cd_metadata,  # noqa: F401
-    _jarvis_site_package_directories,  # noqa: F401
-    _record_installs_jarvis_builtin,  # noqa: F401
-    _relay_owned_jarvis_builtin_repositories,  # noqa: F401
-)
 from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     _AT_FDCWD,  # noqa: F401
     _FCHMOD,  # noqa: F401
@@ -73,8 +64,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_constants import (
     LEGACY_MANAGED_JARVIS_REPO_PATH,  # noqa: F401
     MANAGED_JARVIS_REPO_PATH,  # noqa: F401
     MAX_JARVIS_CONFIG_BYTES,  # noqa: F401
-    MAX_JARVIS_DISTRIBUTION_METADATA_BYTES,  # noqa: F401
-    MAX_JARVIS_DISTRIBUTION_RECORD_BYTES,  # noqa: F401
     MAX_JARVIS_GRAPH_BYTES,  # noqa: F401
     MAX_JARVIS_REPOS_BYTES,  # noqa: F401
 )
@@ -121,7 +110,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_planning_support import (
     _bounded_subprocess,  # noqa: F401
     _full_plan,  # noqa: F401
     _managed_generation_jarvis_environment,  # noqa: F401
-    _verify_jarvis_util_reuse,  # noqa: F401
 )
 from clio_relay.adapters.worker.bootstrap_reconcile_primitives import (
     _atomic_exchange_paths,  # noqa: F401

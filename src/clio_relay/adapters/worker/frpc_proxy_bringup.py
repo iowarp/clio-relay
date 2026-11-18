@@ -3,7 +3,7 @@
 clio-relay#279. Composes ``frpc_unit.py``'s pure renderers +
 ``frpc_proxy_scripts.py``'s pure script text into ONE ``ssh <host> bash -s``
 dial per operation -- never more, matching every other transport operation's
-budget in ``docs/connection-model.md`` -- and parses the typed framed
+budget in ``docs/design/relay-architecture-2026-08.md §8.4`` -- and parses the typed framed
 receipt each script prints via ``frpc_proxy_receipt.py``. Mirrors
 ``deployment_ssh.py``/``endpoint_service_status.py``'s own split almost
 exactly: this module owns the ssh/subprocess boundary, the two sibling

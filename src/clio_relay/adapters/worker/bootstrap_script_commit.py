@@ -59,21 +59,13 @@ def script_commit(
     transaction dispatch, and the final receipt/version echo.
     """
     return f"""from clio_relay.adapters.worker.bootstrap_reconcile import (
-    _relay_owned_jarvis_builtin_repositories,
     reconcile_managed_jarvis_repository,
 )
-
-relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(home=Path.home())
 
 evidence = reconcile_managed_jarvis_repository(
     Path(os.environ["JARVIS_REPOS_FILE"]),
     Path(os.environ["MANAGED_JARVIS_REPO"]),
-    managed_builtin_repo=Path(os.environ["JARVIS_REPOS_FILE"]).parent / "builtin",
-    previous_managed_repos=(
-        Path(sys.argv[1]),
-        Path(sys.argv[2]),
-        *relay_owned_builtin_repos,
-    ),
+    previous_managed_repos=(Path(sys.argv[1]), Path(sys.argv[2])),
 )
 print(f"jarvis_managed_repo={{evidence['action']}}")
 __CLIO_RELAY_JARVIS_REPO_RECONCILE__
@@ -151,7 +143,6 @@ plan = BootstrapReconcilePlan(
     component_actions={{
         "clio-relay": "replace",
         "jarvis-cd": "replace",
-        "jarvis-util": "replace",
         "clio-kit": "replace",
         "frp": "replace",
         "uv": "replace",
@@ -392,7 +383,7 @@ export BOOTSTRAP_JARVIS_INIT_DURATION_NS BOOTSTRAP_COMPLETED_NS
 export BOOTSTRAP_JARVIS_GRAPH_DURATION_NS BOOTSTRAP_JARVIS_COMMANDS_JSON
 export BOOTSTRAP_JARVIS_BUILTIN_RESULT_FILE JARVIS_INIT_ACTION JARVIS_GRAPH_ACTION
 export BOOTSTRAP_FRP_DOWNLOADED BOOTSTRAP_UV_DOWNLOADED
-export BOOTSTRAP_JARVIS_UTIL_DOWNLOADED BOOTSTRAP_JARVIS_CD_DOWNLOADED
+export BOOTSTRAP_JARVIS_CD_DOWNLOADED
 export BOOTSTRAP_CLIO_KIT_DOWNLOADED BOOTSTRAP_RELAY_DOWNLOAD_COUNT
 
 "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_BOOTSTRAP_RECEIPT__'
@@ -450,7 +441,7 @@ prepare_duration = (
     - int(os.environ["BOOTSTRAP_FULL_PREPARE_STARTED_NS"])
 ) / 1_000_000_000
 components = {{}}
-for name in ("clio-relay", "clio-kit", "jarvis-cd", "jarvis-util", "frp", "uv"):
+for name in ("clio-relay", "clio-kit", "jarvis-cd", "frp", "uv"):
     artifact = install_receipt.component_artifacts.get(name)
     observed = (
         artifact.model_dump(mode="json")
@@ -465,7 +456,6 @@ for name in ("clio-relay", "clio-kit", "jarvis-cd", "jarvis-util", "frp", "uv"):
 download_sources = {{
     "frp": f"github-release:{{desired.frp_version}}",
     "uv": f"github-release:{{desired.uv_version}}",
-    "jarvis-util": f"git-commit:{{desired.jarvis_util_commit}}",
     "jarvis-cd": desired.jarvis_cd_wheel_url,
     "clio-kit": desired.clio_kit_install_spec,
     "clio-relay": desired.relay_install_spec,
@@ -473,7 +463,6 @@ download_sources = {{
 download_flags = {{
     "frp": "BOOTSTRAP_FRP_DOWNLOADED",
     "uv": "BOOTSTRAP_UV_DOWNLOADED",
-    "jarvis-util": "BOOTSTRAP_JARVIS_UTIL_DOWNLOADED",
     "jarvis-cd": "BOOTSTRAP_JARVIS_CD_DOWNLOADED",
     "clio-kit": "BOOTSTRAP_CLIO_KIT_DOWNLOADED",
     "clio-relay": "BOOTSTRAP_RELAY_DOWNLOAD_COUNT",

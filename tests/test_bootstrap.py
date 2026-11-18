@@ -32,7 +32,6 @@ from clio_relay.adapters.worker.bootstrap import (
     JARVIS_CD_WHEEL_FILENAME,
     JARVIS_CD_WHEEL_SHA256,
     JARVIS_CD_WHEEL_URL,
-    JARVIS_UTIL_COMMIT,
     UV_LINUX_AMD64_ARCHIVE_SHA256,
     UV_LINUX_AMD64_EXECUTABLE_SHA256,
     UV_VERSION,
@@ -188,12 +187,12 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert "CLIO_RELAY_AGENT_ADAPTER=exec" in script
     assert "CLIO_RELAY_AGENT_ARGS=''" in script
     assert "github.com/grc-iit/jarvis-cd.git" not in script
-    assert f'JARVIS_UTIL_COMMIT="{JARVIS_UTIL_COMMIT}"' in script
+    assert "JARVIS_UTIL" not in script
+    assert "grc-iit/jarvis-util" not in script
     assert f'JARVIS_CD_VERSION="{JARVIS_CD_VERSION}"' in script
     assert f'JARVIS_CD_WHEEL_URL="{JARVIS_CD_WHEEL_URL}"' in script
     assert f'JARVIS_CD_WHEEL_SHA256="{JARVIS_CD_WHEEL_SHA256}"' in script
     assert f'JARVIS_CD_WHEEL="$JARVIS_CD_WHEEL_DIR/{JARVIS_CD_WHEEL_FILENAME}"' in script
-    assert 'fetch --depth 1 origin "$JARVIS_UTIL_COMMIT"' in script
     assert 'fetch --depth 1 origin "$JARVIS_CD_COMMIT"' not in script
     assert "bootstrap_fetch_exact_artifact" in script
     assert '"$JARVIS_CD_WHEEL_URL" "$JARVIS_CD_WHEEL_SHA256" "$JARVIS_CD_STAGING"' in script
@@ -272,7 +271,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert '"provider": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON"]' in script
     assert '"clio-kit": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"]' in script
     assert "clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis" not in script
-    assert script.count("status --porcelain=v1 --untracked-files=all") == 1
+    assert "status --porcelain=v1 --untracked-files=all" not in script
     assert 'ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"' not in script
     assert 'RELAY_INSTALL_SPEC="$DEST"' in script
     assert "uv tool install --force --python 3.12 --no-config" in script

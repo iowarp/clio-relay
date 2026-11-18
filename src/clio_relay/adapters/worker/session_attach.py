@@ -25,7 +25,7 @@ RemoteConnection.state`:
   reuse it untouched. Zero new dials: "resume in place".
 * ``state == "authorization_required"`` (the channel dropped) -- this attach
   call IS the one explicit, user-authorized reconnect the 2FA doctrine
-  requires (docs/connection-model.md:141-157): exactly one new dial via
+  requires (docs/design/relay-architecture-2026-08.md §8.4): exactly one new dial via
   :meth:`~clio_relay.adapters.worker.remote_connection.RemoteConnectionRegistry.reconnect`,
   never a silent redial from inside an operation.
 

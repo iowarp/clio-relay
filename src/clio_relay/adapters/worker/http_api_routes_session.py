@@ -24,19 +24,11 @@ from clio_relay.adapters.worker import door_errors
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import (
     InputArtifactIngestRequest,
-    JarvisRuntimeAuthorityRequest,
     _decode_input_artifact_payload,
 )
 from clio_relay.adapters.worker.http_api_redaction import _public_payload, _public_record
 from clio_relay.adapters.worker.storage_runtime import StorageAdmissionError
-from clio_relay.errors import ConfigurationError, NotFoundError, QueueConflictError, RelayError
-from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.jarvis_service_runtime import (
-    OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
-    private_jarvis_service_runtime_authority_document,
-    resolve_local_verified_jarvis_service_runtime_authority,
-    reverify_jarvis_service_runtime,
-)
+from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     InputArtifactIngestPolicy,
     InputArtifactSpec,
@@ -59,7 +51,7 @@ def register_session_routes(
     auth_dependency: Depends,
     session_submission_dependency: Depends,
 ) -> None:
-    """Register the healthz/session-identity/storage/JARVIS-authority/ingest routes."""
+    """Register the healthz/session-identity/storage/ingest routes."""
 
     @app.get("/healthz")
     def healthz() -> dict[str, object]:
@@ -130,52 +122,6 @@ def register_session_routes(
     def storage_status() -> dict[str, object]:
         """Return the machine-readable queue admission and storage decision."""
         return _public_payload(ctx.queue.storage_runtime.status())
-
-    @app.post(
-        OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
-        dependencies=[auth_dependency],
-        include_in_schema=False,
-    )
-    def resolve_owned_jarvis_runtime_authority(
-        request: JarvisRuntimeAuthorityRequest,
-    ) -> dict[str, object]:
-        """Resolve one private capability on its exact receipt-owning cluster host."""
-        if (
-            ctx.resolved.owner_session_id is None
-            or ctx.owner_session_cluster_definition is None
-            or not ctx.resolved.api_token
-        ):
-            raise door_errors.http_problem(
-                "jarvis_runtime_authority_unavailable",
-                "owned JARVIS runtime authority resolver is unavailable",
-            )
-        binding = request.binding
-        try:
-            ctx.require_owned_job(validate_durable_record_id(binding.source_relay_job_id))
-            ctx.require_owned_artifact(validate_durable_record_id(binding.source_relay_artifact_id))
-            verified = reverify_jarvis_service_runtime(
-                queue=ctx.queue,
-                definition=ctx.owner_session_cluster_definition,
-                settings=None,
-                binding_document=binding.model_dump(mode="json"),
-            )
-            authority = resolve_local_verified_jarvis_service_runtime_authority(
-                jarvis_bin=ctx.resolved.jarvis_bin,
-                verified=verified,
-            )
-            if authority is None:
-                raise ConfigurationError("legacy JARVIS service runtimes have no private authority")
-            # This one response is intentionally not passed through the public
-            # payload redactor. It travels only on the authenticated,
-            # identity-bound owned-session connection and is never persisted.
-            return private_jarvis_service_runtime_authority_document(authority)
-        except NotFoundError as exc:
-            raise door_errors.http_problem("jarvis_runtime_authority_unavailable", exc=exc) from exc
-        except (ConfigurationError, RelayError, ValueError) as exc:
-            raise door_errors.http_problem(
-                "jarvis_runtime_authority_conflict",
-                exc=door_errors.public_message_error(exc),
-            ) from exc
 
     @app.post(
         "/input-artifacts/ingest",

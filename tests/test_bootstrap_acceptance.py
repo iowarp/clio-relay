@@ -43,7 +43,6 @@ def _receipt(outcome: str = "noop_verified") -> dict[str, object]:
             "clio-relay": {"action": "reused"},
             "clio-kit": {"action": "reused"},
             "jarvis-cd": {"action": "reused"},
-            "jarvis-util": {"action": "reused"},
             "frp": {"action": "reused"},
             "uv": {"action": "reused"},
         },
@@ -103,6 +102,18 @@ def test_reuse_acceptance_rejects_missing_required_component() -> None:
 
     with pytest.raises(RelayError, match="omitted required components: uv"):
         bootstrap_reuse_acceptance_evidence(receipt, elapsed_seconds=1)
+
+
+def test_reuse_acceptance_accepts_a_legacy_jarvis_util_component() -> None:
+    receipt = _receipt()
+    components = receipt["components"]
+    assert isinstance(components, dict)
+    components["jarvis-util"] = {"action": "reused"}
+
+    evidence = bootstrap_reuse_acceptance_evidence(receipt, elapsed_seconds=1)
+
+    assert evidence is not None
+    assert cast(dict[str, str], evidence["component_actions"])["jarvis-util"] == "reused"
 
 
 @pytest.mark.parametrize(

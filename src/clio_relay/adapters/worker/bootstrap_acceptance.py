@@ -15,7 +15,6 @@ _REQUIRED_REUSE_COMPONENTS = {
     "clio-relay",
     "clio-kit",
     "jarvis-cd",
-    "jarvis-util",
     "frp",
     "uv",
 }

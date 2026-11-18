@@ -45,7 +45,6 @@ class BootstrapDesiredState(BaseModel):
     frps_sha256: str
     uv_version: str
     uv_sha256: str
-    jarvis_util_commit: str
     jarvis_cd_version: str
     jarvis_cd_wheel_url: str
     jarvis_cd_wheel_sha256: str

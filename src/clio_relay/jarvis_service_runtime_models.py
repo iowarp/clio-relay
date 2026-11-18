@@ -19,7 +19,7 @@ import math
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments
@@ -33,7 +33,6 @@ JARVIS_DATASET_DESCRIPTOR_SCHEMA = "jarvis.dataset-descriptor.v1"
 RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V1 = "clio-relay.jarvis-service-runtime-binding.v1"
 RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2 = "clio-relay.jarvis-service-runtime-binding.v2"
 RELAY_JARVIS_RUNTIME_BINDING_SCHEMA = RELAY_JARVIS_RUNTIME_BINDING_SCHEMA_V2
-JARVIS_SERVICE_RUNTIME_AUTHORITY_SCHEMA = "jarvis.execution.service-runtime-authority.v1"
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
 
@@ -162,55 +161,6 @@ class JarvisServiceAuthorization(BaseModel):
         if len(value) != 64 or any(character not in _HEX_DIGITS for character in value):
             raise ValueError("service runtime token_sha256 must be 64 lowercase hex characters")
         return value
-
-
-class JarvisPrivateServiceAuthorization(BaseModel):
-    """Process-local bearer returned only by JARVIS's trusted resolver."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
-
-    scheme: Literal["bearer"]
-    token: SecretStr
-
-    @field_validator("token")
-    @classmethod
-    def validate_token(cls, value: SecretStr) -> SecretStr:
-        """Require the exact 256-bit lowercase hexadecimal capability shape."""
-        token = value.get_secret_value()
-        if len(token) != 64 or any(character not in _HEX_DIGITS for character in token):
-            raise ValueError("service runtime bearer token must be 64 lowercase hex characters")
-        return value
-
-
-class JarvisServiceRuntimeAuthority(BaseModel):
-    """Identity-checked private authority for one exact current service revision."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
-
-    schema_version: Literal["jarvis.execution.service-runtime-authority.v1"]
-    execution_id: str = Field(min_length=1, max_length=512)
-    pipeline_id: str = Field(min_length=1, max_length=512)
-    package_id: str = Field(min_length=1, max_length=256)
-    service_instance_id: str = Field(min_length=1, max_length=512)
-    revision: int = Field(ge=1)
-    token_sha256: str
-    authorization: JarvisPrivateServiceAuthorization
-
-    @field_validator("token_sha256")
-    @classmethod
-    def validate_token_sha256(cls, value: str) -> str:
-        """Require the canonical public identity of the resolved private token."""
-        return _canonical_sha256(value, "service runtime authority token_sha256")
-
-    @model_validator(mode="after")
-    def validate_authority_digest(self) -> JarvisServiceRuntimeAuthority:
-        """Bind the private bearer to the public digest in the same response."""
-        observed = hashlib.sha256(
-            self.authorization.token.get_secret_value().encode("ascii")
-        ).hexdigest()
-        if not hmac.compare_digest(observed, self.token_sha256):
-            raise ValueError("service runtime authority token did not match token_sha256")
-        return self
 
 
 class JarvisServiceRuntime(BaseModel):

@@ -18,9 +18,6 @@ from clio_relay.adapters.worker.bootstrap_reconcile_activation_paths import (
     _verify_stable_symlink,
     reconcile_staged_activation_links,
 )
-from clio_relay.adapters.worker.bootstrap_reconcile_builtin_repos import (
-    _relay_owned_jarvis_builtin_repositories,
-)
 from clio_relay.adapters.worker.bootstrap_reconcile_constants import LEGACY_MANAGED_JARVIS_REPO_PATH
 from clio_relay.adapters.worker.bootstrap_reconcile_execution_identity import (
     execution_environment_identity,
@@ -289,19 +286,10 @@ def finish_staged_activation(
     managed_repo = _expand_home(desired.managed_jarvis_repo, lexical_home)
     legacy_managed_repo = _expand_home(LEGACY_MANAGED_JARVIS_REPO_PATH, lexical_home)
     previous_repo = lexical_home / ".local/src/clio-relay/jarvis-packages/clio_relay"
-    relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(
-        home=lexical_home,
-        execution_environments=(Path(legacy_venv), generation / "jarvis-venv"),
-    )
     repositories = reconcile_managed_jarvis_repository(
         _expand_home(desired.jarvis_root, lexical_home) / "repos.yaml",
         managed_repo,
-        managed_builtin_repo=_expand_home(desired.jarvis_root, lexical_home) / "builtin",
-        previous_managed_repos=(
-            legacy_managed_repo,
-            previous_repo,
-            *relay_owned_builtin_repos,
-        ),
+        previous_managed_repos=(legacy_managed_repo, previous_repo),
         exchange_identity=desired.fingerprint,
     )
     expected_managed_target = (

@@ -1101,7 +1101,6 @@ with tempfile.TemporaryDirectory() as value:
         frps_sha256=digest(binaries["frps"]),
         uv_version="0.11.28",
         uv_sha256=digest(binaries["uv"]),
-        jarvis_util_commit="commit",
         jarvis_cd_version="1.4.4",
         jarvis_cd_wheel_url="https://example.test/jarvis.whl",
         jarvis_cd_wheel_sha256="c" * 64,
@@ -1202,11 +1201,9 @@ with tempfile.TemporaryDirectory() as value:
         "storage:\n  nvme:\n    capacity: 100\n", encoding="utf-8"
     )
     managed_repo = home / ".local/share/clio-relay/clio_relay"
-    managed_builtin_repo = jarvis_root / "builtin"
     first_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
-        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1223,7 +1220,6 @@ with tempfile.TemporaryDirectory() as value:
                 "clio-relay": "1.5.0",
                 "clio-kit": desired.clio_kit_version,
                 "jarvis-cd": desired.jarvis_cd_version,
-                "jarvis-util": desired.jarvis_util_commit,
             },
             "component_artifacts": {
                 "jarvis-cd": {
@@ -1275,7 +1271,6 @@ with tempfile.TemporaryDirectory() as value:
     second_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
-        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1297,11 +1292,9 @@ with tempfile.TemporaryDirectory() as value:
     if first_repository["action"] != "updated" or second_repository["action"] != "reused":
         raise SystemExit("repository alias did not converge exactly once")
     lexical_managed = str(home / ".local/share/clio-relay/clio_relay")
-    lexical_builtin = str(home / ".ppi-jarvis/builtin")
     if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
         lexical_managed,
         "/operator/clio_relay",
-        lexical_builtin,
     ]:
         raise SystemExit(
             "repository registration did not retain stable lexical managed paths"
@@ -1961,6 +1954,124 @@ print("repairable-preflight-ok")
     execution = _run_posix_embedded_driver(execution_driver, remote_script)
     assert execution.returncode == 0, execution.stdout + execution.stderr
     assert execution.stdout.strip() == "repairable-preflight-ok"
+
+
+@pytest.mark.release_platform("posix")
+def test_preflight_reinstalls_a_relay_that_rejects_the_desired_state_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed relay that cannot parse this desired state gets a full bootstrap."""
+    identity = bootstrap.bootstrap_relay_identity(
+        source_root=tmp_path / "release",
+        relay_wheel=None,
+        relay_artifact_sha256="a" * 64,
+    )
+    desired = bootstrap._bootstrap_desired_state(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        identity=identity,
+        cluster="ares",
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        frp_version=bootstrap.FRP_VERSION,
+        clio_kit_install_spec=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_URL,
+        clio_kit_artifact_sha256=bootstrap.CLIO_KIT_JARVIS_MCP_WHEEL_SHA256,
+        agent_adapter="exec",
+        agent_npm_package=None,
+        agent_npm_bin=None,
+        agent_args=[],
+        jarvis_resource_graph_profile="ares",
+    )
+    delivered: list[bytes] = []
+
+    def run(
+        command: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if input_bytes is not None:
+            delivered.append(input_bytes)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "bootstrap_preflight_unsupported=desired_state_schema\n",
+            "",
+        )
+
+    monkeypatch.setattr(bootstrap, "_run", run)
+    result = bootstrap._bootstrap_preflight_over_ssh(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ssh_host="ares",
+        invocation_id="bootstrap_test",
+        desired=desired,
+        core_dir=bootstrap.DEFAULT_REMOTE_CORE_DIR,
+        spool_dir=bootstrap.DEFAULT_REMOTE_SPOOL_DIR,
+        repair=False,
+        timeout_seconds=30,
+    )
+
+    assert result.action == "payload_required"
+    assert len(delivered) == 1
+    remote_script = delivered[0].decode("utf-8")
+    execution_driver = r"""
+import base64
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script = base64.b64decode(sys.argv[1]).decode()
+
+
+def execute(message):
+    with tempfile.TemporaryDirectory() as value:
+        home = Path(value)
+        (home / ".local/share/clio-relay/core").mkdir(parents=True)
+        relay = home / ".local/bin/clio-relay"
+        relay.parent.mkdir(parents=True)
+        relay.write_text(
+            "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(message) + " >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        relay.chmod(0o700)
+        receipt = home / ".local/share/clio-relay/install-receipt.json"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "component_artifacts": {
+                        "clio-relay": {"persistent_tool": {"kind": "uv-tool"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "HOME": str(home)},
+            check=False,
+        )
+
+
+stale = execute("error: bootstrap desired state is invalid")
+if stale.returncode != 0 or stale.stdout.strip() != (
+    "bootstrap_preflight_unsupported=desired_state_schema"
+):
+    raise SystemExit(stale.stdout + stale.stderr)
+
+other = execute("error: bootstrap desired state is invalid for another reason")
+if other.returncode == 0 or "desired_state_schema" in other.stdout:
+    raise SystemExit("an inexact inspector error was classified as a stale schema")
+
+print("desired-state-schema-preflight-ok")
+"""
+    execution = _run_posix_embedded_driver(execution_driver, remote_script)
+    assert execution.returncode == 0, execution.stdout + execution.stderr
+    assert execution.stdout.strip() == "desired-state-schema-preflight-ok"
 
 
 @pytest.mark.release_platform("posix")
@@ -2643,7 +2754,6 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
         "clio-relay": "replaced",
         "clio-kit": "replaced",
         "jarvis-cd": "replaced",
-        "jarvis-util": "reused",
         "frp": "reused",
         "uv": "reused",
     }
@@ -2693,6 +2803,44 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
 
     bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+
+    # RL39: current bootstraps add only relay's repository and no longer
+    # require the builtin slot; its registration is evidence only.
+    without_builtin = copy.deepcopy(receipt)
+    without_builtin_preservation = cast(dict[str, object], without_builtin["jarvis_preservation"])
+    cast(dict[str, object], without_builtin_preservation["after"])[
+        "managed_builtin_repo_registered"
+    ] = False
+    without_builtin_binding = cast(dict[str, object], without_builtin_preservation["repositories"])
+    cast(dict[str, object], without_builtin_binding["repositories"])["added_managed_repos"] = [
+        managed_repo
+    ]
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
+        without_builtin,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+
+    # Receipts written before jarvis-util was dropped still validate.
+    legacy_jarvis_util = copy.deepcopy(receipt)
+    cast(dict[str, object], legacy_jarvis_util["components"])["jarvis-util"] = {
+        "action": "reused",
+        "observed_identity": {"identity": "c91bfdc9bba802e4b03bfb1babe614ffa3e09644"},
+        "duration_seconds": 1.0,
+    }
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
+        legacy_jarvis_util,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
         desired_fingerprint=desired.fingerprint,
@@ -2919,7 +3067,7 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
             "observed_identity": {},
             "duration_seconds": 1.0,
         }
-        for name in ("clio-relay", "clio-kit", "jarvis-cd", "jarvis-util", "frp", "uv")
+        for name in ("clio-relay", "clio-kit", "jarvis-cd", "frp", "uv")
     }
     loaded_builtin_result: dict[str, object] = {
         "schema_version": "jarvis.resource-graph-builtin.v1",
@@ -2972,6 +3120,22 @@ def test_fresh_bootstrap_receipt_allows_explicit_pending_service_install(
     service = receipt["service"]
     assert isinstance(service, dict)
     assert service["pending_install"] is True
+    # Receipts written before jarvis-util was dropped still validate.
+    legacy_jarvis_util = copy.deepcopy(receipt)
+    cast(dict[str, object], legacy_jarvis_util["components"])["jarvis-util"] = {
+        "action": "prepared",
+        "observed_identity": {"identity": "c91bfdc9bba802e4b03bfb1babe614ffa3e09644"},
+        "duration_seconds": 1.0,
+    }
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
+        legacy_jarvis_util,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
 
     # JARVIS normalizes the graph while activating it (expands ${USER}, fills
     # derived fields), so the activated digest legitimately differs from the

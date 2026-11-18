@@ -103,7 +103,6 @@ def _desired_state() -> Any:
                 "jarvis_cd_version": "1.8.0",
                 "jarvis_cd_wheel_url": "https://example.test/jarvis_cd-1.8.0-py3-none-any.whl",
                 "jarvis_cd_wheel_sha256": "e" * 64,
-                "jarvis_util_commit": "f" * 40,
                 "clio_kit_version": "2.7.2",
                 "clio_kit_install_spec": "https://example.test/clio_kit-2.7.2-py3-none-any.whl",
                 "clio_kit_artifact_sha256": "0" * 64,
@@ -715,7 +714,7 @@ def test_cold_bootstrap_costs_exactly_two_ssh_dials(
     Enumerated: (1) the preflight discovery pass (unavoidable -- it is what
     tells warm from cold) and (2) the ONE combined install pass this slice
     introduces. That is the total authenticated ssh session count for a cold
-    bootstrap, <= the 2-dial budget docs/connection-model.md:141-157 sets
+    bootstrap, <= the 2-dial budget docs/design/relay-architecture-2026-08.md §8.4 sets
     (the held link is a later, separate phase and is not one of these two).
     This test must fail the moment any code path adds a third dial back.
     """
