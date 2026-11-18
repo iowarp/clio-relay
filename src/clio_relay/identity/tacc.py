@@ -23,12 +23,11 @@ import base64
 import contextlib
 import json
 import os
-import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, cast
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -58,14 +57,18 @@ DEFAULT_POLL_S = 5.0
 DEFAULT_DEVICE_CODE_S = 600.0
 
 
+class MemoryStore(TokenStore):
+    """Relay's one store, held in this process's memory, for tests."""
+
+    def __init__(self) -> None:
+        super().__init__("memory")
+
+
 def default_store() -> TokenStore:
     """Relay's one store: the keyring, its private file, or memory for tests (RL28)."""
+    if os.environ.get("CLIO_RELAY_KEYRING") == "memory":
+        return MemoryStore()
     return TokenStore()
-
-
-# W10's tests name the store ``MemoryStore``; under ``CLIO_RELAY_KEYRING=memory``
-# it is relay's one store, whose ``values`` are this process's entries.
-MemoryStore = TokenStore
 
 
 # Settings and the stored record.

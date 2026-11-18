@@ -25,7 +25,7 @@ import stat
 import sys
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -146,7 +146,7 @@ class _FileBackend:
             self._lock = _file_locks.setdefault(path, threading.Lock())
 
     @contextlib.contextmanager
-    def _locked(self) -> Iterator[None]:
+    def _locked(self) -> Generator[None]:
         """Hold the file against this process's threads and, on POSIX, other processes."""
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
