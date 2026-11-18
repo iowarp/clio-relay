@@ -48,8 +48,8 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     assert list(servers) == ["relay"]
     server = servers["relay"]
     scripts = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]["scripts"]
-    assert server["args"][-2:] == ["clio-relay-next", "serve"]
-    assert "clio-relay-next" in scripts
+    assert server["args"][-2:] == ["clio-relay", "serve"]
+    assert "clio-relay" in scripts
     source = server["args"][server["args"].index("--from") + 1]
     pinned = r"clio-relay @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}"
     assert re.fullmatch(pinned, source)

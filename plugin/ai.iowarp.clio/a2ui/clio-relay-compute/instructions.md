@@ -14,4 +14,4 @@ tab.
 Each button calls one of relay's app-only `compute_*` tools with a
 single-use token the surface carries. Relay refuses a call without a fresh
 token, so an agent cannot press the tab's buttons for the person. The tab
-changes the same site store as the `clio-relay-next site` commands.
+changes the same site store as the `clio-relay site` commands.

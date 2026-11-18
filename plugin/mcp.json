@@ -7,7 +7,7 @@
       "args": [
         "--from",
         "clio-relay @ git+https://github.com/iowarp/clio-relay@a0e28029a7eef0986620c532291b5586d20d010d",
-        "clio-relay-next",
+        "clio-relay",
         "serve"
       ],
       "env": {

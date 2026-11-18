@@ -49,4 +49,4 @@ are things to tell the person, not to retry.
 ## Sites are the person's
 
 Do not add, edit or remove sites. The person manages them in the Compute tab
-or with `clio-relay-next site` on the command line.
+or with `clio-relay site` on the command line.

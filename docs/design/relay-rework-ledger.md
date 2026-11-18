@@ -1714,15 +1714,21 @@ All live on Ares, on my own stack:
   - Screenshots `lq27-00` to `lq27-12` (`.png`) are in the session artifacts.
 - **LQ28 (visual QA).** Screenshots at 390×844 in en, 1440×900 in el and 390×844 in el.
 - **Keyring.** Stampede3 first degraded to "Unavailable (NoKeyringError)" on Ares, which has no keyring backend. W6 fixed this at 723c9a2: a 0600 file fallback, and `describe` shows `facts.credentials.stored_in`.
+- **CLI change with the tab open (part of LQ27), passed live** on clio-agent cfd4747 (W3's fix for both host bugs).
+  - A CLI `site add` showed in the open tab and a `site remove` disappeared from it, before and after a PATCH remove/add remount. Screenshots `lq27-13` and `lq27-14`.
+  - Revisions: a CLI add moves only `relay-sites`, which rises by one per change. Re-reads with no change keep every revision.
+  - W3 also noticed that `relay-add` took fresh action tokens on every read and re-rendered, which could wipe a half-filled form. Fixed at 1f26714: an unspent token for the same action and subject is reused while more than half its lifetime is left. A new relay process re-mints once.
+- **Connect on Stampede3, live** at a0e2802 with W6's fix.
+  - The card reads TACC, Signed out, Unavailable, "Relay registers one after you sign in", with Connect. Pressing Connect raises the host permission card "Sign in to a site". After Allow once, relay answers that it has no OAuth client for the TACC tenant, on the card and as the tab notice. Screenshots `lq27-15` to `lq27-17`.
+  - A real TACC sign-in needs `CLIO_RELAY_TACC_CLIENT_ID`, which this stack doesn't have. That is the W10 owner blocker, not a tab gap.
+  - Found and fixed on the way: notices passed refusal text through `str.capitalize`, which lowercased TACC and the env names (a0e2802).
+- **Tests.** On Ares at 1f26714, `tests/relay_next tests/asks` gave 326 passed, 0 skipped. At a0e2802, `test_compute_tab.py` gave 12 passed, 0 skipped, with ruff and pyright clean on `surface/a2ui`.
 
 ### Open items
 
-- **CLI change with the tab open (part of LQ27).** Relay sends the update, and the host re-reads and publishes it. It doesn't show for two host bugs, routed to W3:
-  - The per-surface revision doesn't move on a re-read.
-  - The resource watch isn't set up again after a namespace remount.
-  - Screenshots `lq27-13` and `lq27-14` show the failure. I'll re-run them on W3's fix.
-- **Connect on Stampede3.** To re-run once W6 723c9a2 is in integration and the pin moves to it.
-- **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit. Repin to the integration commit after W1 merges.
+- **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
+- **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
+- **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit, with `clio-relay serve` since the cutover. Repin to the integration commit after W1 merges.
 
 ### Run sheets for the person rows
 
@@ -1771,9 +1777,9 @@ Needs:
 
 Steps:
 1. Add relay with the host's documented command, using the integration commit `<sha>`:
-   - Claude Code: `claude mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay-next serve`.
-   - Copilot CLI: `copilot mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay-next serve`.
-2. In a terminal, run `uvx --from "clio-relay @ git+…@<sha>" clio-relay-next site add-from-catalog ares`, then `site show ares`. Before step 4, `ssh ares hostname` must work without a prompt.
+   - Claude Code: `claude mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay serve`.
+   - Copilot CLI: `copilot mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay serve`.
+2. In a terminal, run `uvx --from "clio-relay @ git+…@<sha>" clio-relay site add-from-catalog ares`, then `site show ares`. Before step 4, `ssh ares hostname` must work without a prompt.
 3. Start the host and list its tools. It must show exactly the five relay verbs and no action tools, because it doesn't declare A2UI.
 4. Ask: "submit hostname to Ares and tell me the node".
 
