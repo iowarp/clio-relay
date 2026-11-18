@@ -171,7 +171,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # ONE source of truth, instead of the same literal duplicated in two
     # files with no guard against them drifting apart. A justified,
     # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
-    "src/clio_relay/adapters/worker/bootstrap.py": 926,
+    "src/clio_relay/adapters/worker/bootstrap.py": 924,
     # clio-relay#265/#183/#248/#162 "honest verdict" slice, adversarial-
     # review fix round (item 2): the first version of this slice added a
     # NEW baseline entry here at 819 for a file that measured 791 with NO
@@ -953,7 +953,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # same call sites, different file. Comfortably under DEFAULT_MAX_LINES
     # -- entry removed per this script's own ground rule 5 ("remove the
     # entry once the file is under DEFAULT_MAX_LINES").
-    "src/clio_relay/input_staging.py": 814,
+    # input_staging.py was deleted with the old relay surface (W8); entry removed.
     # installation.py's own ratchet-baseline entry and history comment were
     # removed here (iowarp/clio-relay#231 split/installation): the file is
     # now 409 lines (an assembly/facade over its owner modules --
@@ -1036,7 +1036,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_remote_command_failure` helper, before falling into the generic
     # "remote command failed: <blob>" that discarded the refusal's own
     # typed code/message. A justified, minimal ratchet-up.
-    "src/clio_relay/live_acceptance.py": 868,
+    # live_acceptance.py was deleted with the old relay surface (W8); entry removed.
     # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
     # bounded_payload.is_delivery_refusal on the envelope
     # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
@@ -1781,7 +1781,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # scope for a mechanical extraction slice. Matches the
     # queue_management.py/queue_validation.py precedent of a ratcheted,
     # justified new-file cap above the 800-line default.
-    "src/clio_relay/adapters/worker/session_recovery_inspection.py": 838,
+    "src/clio_relay/adapters/worker/session_recovery_inspection.py": 837,
     # session_lifecycle.py itself has no RATCHET_BASELINE entry here: the
     # split above already took it under the 800-line default cap (582 lines).
     # develop (pre-split) still carries its own "session_lifecycle.py": 7840

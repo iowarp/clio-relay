@@ -15,7 +15,12 @@ import pytest
 from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
-from clio_relay.adapters.worker import bootstrap, bootstrap_receipt_validation, cli
+from clio_relay.adapters.worker import (
+    bootstrap,
+    bootstrap_receipt_validation,
+    bootstrap_worker_proof_source,
+    cli,
+)
 from clio_relay.adapters.worker.bootstrap import (
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
@@ -594,7 +599,7 @@ def _run_writer_proof(
         [
             sys.executable,
             "-c",
-            vars(bootstrap)["_WORKER_WRITER_PROOF_PYTHON"],
+            vars(bootstrap_worker_proof_source)["_WORKER_WRITER_PROOF_PYTHON"],
             cluster,
             str(core_dir),
             str(proc_root),

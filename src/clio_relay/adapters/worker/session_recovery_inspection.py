@@ -24,7 +24,7 @@ import stat
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
 import clio_relay.adapters.worker.session_process_scope as session_process_scope
 import clio_relay.adapters.worker.session_recovery_attempt_status as session_recovery_attempt_status
@@ -36,6 +36,7 @@ from clio_relay.adapters.worker import (
 )
 from clio_relay.adapters.worker.session_transaction import (
     _MAX_OWNED_SESSION_DOCUMENT_BYTES,
+    _OwnedSessionTransaction,
     open_owned_session_transaction,
 )
 from clio_relay.adapters.worker.session_validation import _validate_session
@@ -47,10 +48,6 @@ from clio_relay.session_wire_models import (
     OwnedSessionRecoveryStatus,
     SessionApiReleaseIdentity,
 )
-
-if TYPE_CHECKING:
-    from clio_relay.adapters.worker.session_process_scope import _OwnedGenerationProcess
-    from clio_relay.adapters.worker.session_transaction import _OwnedSessionTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -514,7 +511,7 @@ def inspect_owned_session_recovery_status(
     ] = "unverified"
     running = False
     process_absence_verified = False
-    generation_processes: list[_OwnedGenerationProcess] = []
+    generation_processes: list[session_process_scope._OwnedGenerationProcess] = []
     generation_process_scan_verified = False
     if (
         metadata_verified

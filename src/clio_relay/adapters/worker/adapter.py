@@ -40,11 +40,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
+from clio_relay.adapters.worker.files import WorkerFileAccess
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
     FileAccess,
-    FileEntry,
     JobHandle,
     JobStatus,
     StallReport,
@@ -57,7 +57,6 @@ WORKER_LINK_FILE = "worker-link.json"
 ADAPTER_ROUTE_PREFIX = "/adapter"
 READY_MARKER = "CLIO_RELAY_WORKER_READY "
 # The worker's API answers at most 8 MiB per response; base64 adds a third.
-_READ_CHUNK_BYTES = 4 * 1024 * 1024
 _MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024
 _CONNECT_ATTEMPTS = 20
 _CALL_S = 120.0
@@ -765,54 +764,3 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
 
     async def sign_in_done(self, answer: dict[str, Any]) -> None:
         await self._connection()
-
-
-class WorkerFileAccess:
-    """File access on the site, over the worker's link."""
-
-    def __init__(self, adapter: WorkerAdapter) -> None:
-        self._adapter = adapter
-
-    async def _call(self, op: str, body: dict[str, Any], timeout_s: float = 300) -> Any:
-        return await self._adapter.call(f"/files/{op}", body, timeout_s=timeout_s)
-
-    async def list(self, path: str) -> list[FileEntry]:
-        reported = await self._call("list", {"path": path})
-        return [FileEntry.model_validate(entry) for entry in reported]
-
-    async def stat(self, path: str) -> FileEntry:
-        return FileEntry.model_validate(await self._call("stat", {"path": path}))
-
-    async def read(self, path: str, *, offset: int = 0, limit: int | None = None) -> bytes:
-        chunks: list[bytes] = []
-        position = max(0, offset)
-        remaining = limit
-        while remaining is None or remaining > 0:
-            size = _READ_CHUNK_BYTES if remaining is None else min(remaining, _READ_CHUNK_BYTES)
-            encoded = await self._call("read", {"path": path, "offset": position, "limit": size})
-            chunk = base64.b64decode(encoded)
-            chunks.append(chunk)
-            position += len(chunk)
-            if remaining is not None:
-                remaining -= len(chunk)
-            if len(chunk) < size:
-                break
-        return b"".join(chunks)
-
-    async def write(self, path: str, data: bytes, *, overwrite: bool = False) -> FileEntry:
-        reported = await self._call(
-            "write",
-            {
-                "path": path,
-                "data": base64.b64encode(data).decode("ascii"),
-                "overwrite": overwrite,
-            },
-        )
-        return FileEntry.model_validate(reported)
-
-    async def stage(self, data: bytes) -> str:
-        digest = await self._call("stage", {"data": base64.b64encode(data).decode("ascii")})
-        return str(digest)
-
-    async def has(self, digest: str) -> bool:
-        return bool(await self._call("has", {"digest": digest}))

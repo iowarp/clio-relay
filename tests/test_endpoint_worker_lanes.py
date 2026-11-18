@@ -175,7 +175,7 @@ def _spawn_daemon_worker(
     cmd = [
         sys.executable,
         "-c",
-        "from clio_relay.adapters.worker.cli import app; app()",
+        "from clio_relay.adapters.worker.cli import worker_app; worker_app()",
         "endpoint",
         "start",
         "--role",

@@ -69,9 +69,7 @@ from clio_relay.adapters.worker.bootstrap_preparing_root_source import (
 from clio_relay.adapters.worker.bootstrap_receipt_classifier_source import (
     _BOOTSTRAP_RECEIPT_CLASSIFIER_SOURCE,  # noqa: F401 -- re-exported facade surface
 )
-from clio_relay.adapters.worker.bootstrap_reconcile import (
-    BootstrapDesiredState,
-)
+from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapDesiredState
 from clio_relay.adapters.worker.bootstrap_reconcile_script_activation import (
     reconcile_script_activation,
 )
@@ -94,10 +92,6 @@ from clio_relay.adapters.worker.bootstrap_staged_provider_source import (
     _STAGED_PROVIDER_EXEC_PROGRAM,
 )
 from clio_relay.adapters.worker.bootstrap_worker_fence_script import _worker_upgrade_fence_script
-from clio_relay.adapters.worker.bootstrap_worker_proof_source import (  # noqa: F401 -- re-exported test/debug reads
-    _WORKER_LIFETIME_EXCLUSIVE_GUARD_PYTHON,
-    _WORKER_WRITER_PROOF_PYTHON,
-)
 from clio_relay.adapters.worker.deployment import endpoint_user_service_name
 from clio_relay.bounded_process import (
     BoundedProcessError,
