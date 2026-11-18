@@ -242,7 +242,8 @@ def test_a_short_step_between_looks_still_counts_as_use(tmp_path: Path) -> None:
     ended = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start + 3))
     # squeue never sees a step, but sacct says one ended three seconds after the start.
     _program(bin_dir, "squeue", "#!/bin/sh\nprintf '7.batch\\n'\n")
-    _program(bin_dir, "sacct", f"#!/bin/sh\nprintf '7|Unknown\\n7.batch|Unknown\\n7.0|{ended}\\n'\n")
+    steps = f"7|Unknown\\n7.batch|Unknown\\n7.0|{ended}\\n"
+    _program(bin_dir, "sacct", f"#!/bin/sh\nprintf '{steps}'\n")
     began = time.monotonic()
     done = _holder(_env(tmp_path, bin_dir, SLURM_JOB_ID="7"), tmp_path, limit=2, step=1)
     assert done.returncode == 0, done.stderr
