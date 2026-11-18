@@ -12,11 +12,13 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from pydantic import BaseModel, SecretStr
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
@@ -384,6 +386,63 @@ async def test_status_of_accepts_enums_and_coroutines() -> None:
             return Status.SIGNED_IN
 
     assert await tokens.status_of(Async()) == "signed_in"
+
+
+class W6Token(BaseModel):
+    """The shape of W6's ``Token``: the access token is a ``SecretStr``."""
+
+    resource_server: str | None = None
+    access_token: SecretStr
+    token_type: str = "Bearer"
+
+
+class W6Status(BaseModel):
+    """The shape of W6's ``IdentityStatus``."""
+
+    provider: str
+    state: str
+
+
+class W6Provider:
+    """A provider with W6's signatures: both calls async, ``resource_server`` optional."""
+
+    async def token(self, resource_server: str | None = None) -> W6Token | None:
+        if resource_server == tokens.COMPUTE_RESOURCE_SERVER:
+            return W6Token(resource_server=resource_server, access_token=SecretStr("secret-1"))
+        return None
+
+    async def status(self) -> W6Status:
+        return W6Status(provider="globus", state="expired")
+
+
+@pytest.mark.asyncio
+async def test_w6_token_and_status_shapes() -> None:
+    source = W6Provider()
+    assert await tokens.bearer(source, tokens.COMPUTE_RESOURCE_SERVER, what="x") == "secret-1"
+    with pytest.raises(Refusal) as refused:
+        await tokens.bearer(source, tokens.TRANSFER_RESOURCE_SERVER, what="files")
+    assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+    assert await tokens.status_of(source) == "expired"
+    assert "secret-1" not in repr(await source.token(tokens.COMPUTE_RESOURCE_SERVER))
+
+
+def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    built = W6Provider()
+    asked: list[str] = []
+
+    class Identities:
+        def get(self, name: str) -> W6Provider | None:
+            asked.append(name)
+            return built if name == "globus" else None
+
+    shared = Identities()
+    fake = types.ModuleType("clio_relay.identity")
+    fake.__dict__["shared"] = lambda: shared
+    fake.__dict__["get"] = lambda name: pytest.fail("get returns the factory, not a provider")
+    monkeypatch.setitem(sys.modules, "clio_relay.identity", fake)
+    assert tokens.provider("globus") is built
+    assert isinstance(tokens.provider("nobody"), tokens.GrantFileProvider)
+    assert asked == ["globus", "nobody"]
 
 
 def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:
