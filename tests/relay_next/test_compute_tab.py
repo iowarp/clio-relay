@@ -384,6 +384,14 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is False
             assert host.failing("relay-add") == {"add-s-f-id": "A site named lab exists"}
+            # A policy outside the picker's options is refused on the picker.
+            host.set("relay-add", "/drafts/add/site/id", "lab2")
+            host.set("relay-add", "/drafts/add/site/policy", ["nowhere"])
+            result = await host.press("relay-add", "add-a-fixture-add")
+            assert result.structured_content["ok"] is False
+            assert set(host.failing("relay-add")) == {"add-s-f-policy"}
+            assert host.get("relay-add", "/drafts/add/valid/site.policy") is False
+            host.set("relay-add", "/drafts/add/site/policy", ["guarded"])
 
             await host.press("relay-sites", "s-lab-probe-button")
             assert "Probed Lab cluster." in host.text("relay-sites")
