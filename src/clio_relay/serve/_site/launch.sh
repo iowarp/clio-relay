@@ -23,6 +23,8 @@ GRACE=${CLIO_RELAY_STOP_GRACE:-30}
 IDLE=${CLIO_RELAY_IDLE_S:-0}
 FRPC=${CLIO_RELAY_FRPC:-}
 SVC_DIR=${CLIO_RELAY_SERVICE_DIR:-$JOB}
+# One directory can reach the job under two names (a /home link to /mnt/common).
+[ "$(cd "$SVC_DIR" 2>/dev/null && pwd -P)" = "$(pwd -P)" ] && SVC_DIR=$JOB
 
 note() {
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$S/launch.log"
@@ -128,13 +130,15 @@ finish() {
         [ -d "$dir" ] || continue
         if [ "$dir" = "$JOB" ]; then
             # The package runner's archive and JARVIS tree are relay's own; package
-            # outputs land in .relay-jarvis/shared.
+            # outputs land in .relay-jarvis/shared. The adapter's own records and the
+            # scheduler's <job id>.* files are not the program's.
             (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
                 ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
                 ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
                 ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
                 ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
-                ! -name cancel ! -name states 2>/dev/null) |
+                ! -name cancel ! -name states ! -name signalled ! -name final \
+                ! -name "${SLURM_JOB_ID:-/}.*" ! -name "${PBS_JOBID:-/}.*" 2>/dev/null) |
                 while IFS= read -r file; do
                     printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "${file#./}"
                 done >> "$S/artifacts.txt.tmp"

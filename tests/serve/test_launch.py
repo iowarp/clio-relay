@@ -46,7 +46,9 @@ def wait_for(check: Callable[[], bool]) -> None:
 
 
 class Job:
-    def __init__(self, root: Path, port: int, *extra: str, idle: int = 0) -> None:
+    def __init__(
+        self, root: Path, port: int, *extra: str, idle: int = 0, env: dict[str, str] | None = None
+    ) -> None:
         self.dir = root
         self.serve = root / "serve"
         self.serve.mkdir(parents=True)
@@ -56,17 +58,18 @@ class Job:
             "export SVC_SECRET='s3cret'\nexport CLIO_RELAY_FRP_TOKEN='tok'\n", encoding="utf-8"
         )
         (root / "service.py").write_text(SERVICE, encoding="utf-8")
-        env = {
+        environment = {
             **os.environ,
             "CLIO_RELAY_STOP_GRACE": "30",
             "CLIO_RELAY_IDLE_S": str(idle),
             "CLIO_RELAY_OPERATION": "op_test",
+            **(env or {}),
         }
-        env.pop("CLIO_RELAY_FRPC", None)
+        environment.pop("CLIO_RELAY_FRPC", None)
         self.process = subprocess.Popen(
             ["/bin/sh", "serve/launch.sh", "--", sys.executable, "service.py", str(port), *extra],
             cwd=root,
-            env=env,
+            env=environment,
             stdin=subprocess.DEVNULL,
         )
 
@@ -107,7 +110,33 @@ def test_ready_then_stop_lists_artifacts(tmp_path: Path, jobs: list[Job]) -> Non
     assert not any(name.startswith("serve/") for name in names)
 
 
-def test_a_taken_port_is_refused_before_the_program_starts(tmp_path: Path, jobs: list[Job]) -> None:
+def test_artifacts_list_each_file_once_without_the_schedulers_records(
+    tmp_path: Path, jobs: list[Job]
+) -> None:
+    root = tmp_path / "real"
+    root.mkdir()
+    link = tmp_path / "home"
+    link.symlink_to(root)
+    port = free_loopback_port()
+    job = Job(
+        root, port, env={"CLIO_RELAY_SERVICE_DIR": str(link), "SLURM_JOB_ID": "4242"}
+    )
+    jobs.append(job)
+    wait_for(lambda: (job.serve / "ready.json").is_file())
+    (root / "4242.out").write_text("Terminated\n", encoding="utf-8")
+    (root / "signalled").write_text("TERM\n", encoding="utf-8")
+    (job.serve / "stop").write_text("", encoding="utf-8")
+    job.stopped()
+    artifacts = (job.serve / "artifacts.txt").read_text(encoding="utf-8").splitlines()
+    names = [line.split("\t", 1)[1] for line in artifacts]
+    assert sorted(names) == sorted(set(names)), names
+    assert "final.json" in names
+    assert "4242.out" not in names and "signalled" not in names
+
+
+def test_a_taken_port_is_refused_before_the_program_starts(
+    tmp_path: Path, jobs: list[Job]
+) -> None:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         sock.listen()
