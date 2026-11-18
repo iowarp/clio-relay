@@ -11,7 +11,6 @@ legacy one, and otherwise as a typed refusal that names the ask and its page.
 
 from __future__ import annotations
 
-import base64
 import hmac
 import json
 from collections.abc import AsyncGenerator, Sequence
@@ -46,19 +45,22 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
-from clio_relay.adapters.hooks import Ask, Transport
+from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
-from clio_relay.surface.service import RelayService
+from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
+from clio_relay.surface.service import RelayService, endpoint_summary, service_ready
 from clio_relay.surface.settings import RelayPaths
 
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
 TASK_POLL_INTERVAL_MS = 2000
 OPERATION_META = "ai.iowarp.relay/operation"
-MAX_INLINE_BYTES = 4 * 1024 * 1024
+SERVICE_META = "ai.iowarp.relay/service"
+TASK_TOOLS = frozenset({"run", "serve"})
+_NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
 
@@ -91,6 +93,10 @@ def _summary(view: dict[str, Any]) -> str:
         line += f" with exit code {view['exit_code']}"
     line += "."
     result: dict[str, Any] = view.get("result") or {}
+    endpoint: dict[str, Any] = result.get("endpoint") or {}
+    ports: list[dict[str, Any]] = endpoint.get("ports") or []
+    for port in ports:
+        line += f"\n{port['name']}: {port['host']}:{port['port']}"
     tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
@@ -107,6 +113,16 @@ def operation_result(view: dict[str, Any]) -> ToolResult:
         meta={OPERATION_META: view["operation_id"]},
         is_error=view["state"] == OperationState.FAILED.value,
     )
+
+
+def record_result(service: RelayService, record: OperationRecord) -> ToolResult:
+    """Render an operation, with a service's panel data in ``_meta`` only (RL22)."""
+    result = operation_result(service.view(record))
+    if record.kind == "serve":
+        ui = service.serve_hook.ui_data(record)
+        if ui is not None:
+            result.meta = {**(result.meta or {}), SERVICE_META: ui}
+    return result
 
 
 def _modern(ctx: Context) -> bool:
@@ -240,6 +256,8 @@ class RelayTasksExtension(ServerExtension):
             if self.service.outstanding(record):
                 return "waiting for the person to answer"
             return "waiting for a sign-in to finish"
+        if service_ready(record):
+            return f"the service is running: {endpoint_summary(record)}"
         return f"relay operation is {record.state.value}"
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
@@ -268,7 +286,7 @@ class RelayTasksExtension(ServerExtension):
                 },
             )
         if record.state.final:
-            result = operation_result(self.service.view(record))
+            result = record_result(self.service, record)
             final = mcp_types.CallToolResult.model_validate(
                 {
                     "content": result.content,
@@ -322,9 +340,12 @@ class RelayTasksExtension(ServerExtension):
         context: Context,
         call_next: Any,
     ) -> Any:
-        """Turn a task ``run`` into a task once its operation is recorded."""
+        """Turn a task ``run`` or ``serve`` that starts an operation into a task."""
         outcome = await call_next()
-        if params.name != "run" or not _tasks_opted_in(context):
+        if params.name not in TASK_TOOLS or not _tasks_opted_in(context):
+            return outcome
+        arguments = params.arguments or {}
+        if any(arguments.get(name) is not None for name in _NOT_A_START):
             return outcome
         if not isinstance(outcome, ToolResult) or isinstance(outcome, InputRequiredToolResult):
             return outcome
@@ -418,7 +439,7 @@ class RelayServer:
         record = await self.service.wait(record.operation_id, wait_s)
         if record.state == OperationState.AWAITING_INPUT:
             return self._needs_person(record)
-        return operation_result(self.service.view(record))
+        return record_result(self.service, record)
 
     async def run(
         self,
@@ -433,7 +454,7 @@ class RelayServer:
         try:
             if cancel is not None:
                 record = await self.service.cancel(cancel)
-                return operation_result(self.service.view(record))
+                return record_result(self.service, record)
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
@@ -452,13 +473,64 @@ class RelayServer:
         except Refusal as refusal:
             return refusal_result(refusal)
 
+    async def serve(
+        self,
+        ctx: Context,
+        site: str | None,
+        spec: ServiceSpec | None,
+        service: str | None,
+        stop: str | None,
+        wait_s: float,
+    ) -> ToolResult | InputRequiredToolResult:
+        """The ``serve`` verb: start, observe or stop a service."""
+        try:
+            if stop is not None:
+                record = await self.service.cancel(self._service_op(stop).operation_id)
+                return record_result(self.service, record)
+            if ctx.request_state and ctx.input_responses is not None:
+                return await self._resume_round(ctx, site, spec, wait_s)
+            if service is not None:
+                record = await self.service.advance(self._service_op(service).operation_id)
+                return await self._deliver(ctx, record, wait_s)
+            if site is None or spec is None:
+                raise Refusal(
+                    RefusalReason.INVALID_ARGUMENTS,
+                    "serve needs site and spec, or service, or stop",
+                )
+            task = _tasks_opted_in(ctx)
+            record = await self.service.start_serve(site, spec, task=task)
+            if task:
+                return record_result(self.service, record)
+            return await self._deliver(ctx, record, wait_s)
+        except Refusal as refusal:
+            return refusal_result(refusal)
+
+    def _service_op(self, operation_id: str) -> OperationRecord:
+        record = self.service.operation(operation_id)
+        if record.kind != "serve":
+            raise Refusal(
+                RefusalReason.INVALID_ARGUMENTS,
+                f"{operation_id!r} is a {record.kind} operation, not a service",
+                operation_id=operation_id,
+            )
+        return record
+
     async def _resume_round(
-        self, ctx: Context, site: str | None, spec: JobSpec | None, wait_s: float
+        self,
+        ctx: Context,
+        site: str | None,
+        spec: JobSpec | ServiceSpec | None,
+        wait_s: float,
     ) -> ToolResult | InputRequiredToolResult:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
         if site is not None and spec is not None:
-            current = self.service.apply_defaults(self.service.site(site), spec)
+            entry = self.service.site(site)
+            current = (
+                self.service.prepare_service(entry, spec)
+                if isinstance(spec, ServiceSpec)
+                else self.service.apply_defaults(entry, spec)
+            )
             if site != record.site or current.digest() != record.spec_digest:
                 raise Refusal(
                     RefusalReason.APPROVAL_MISMATCH,
@@ -506,81 +578,24 @@ class RelayServer:
     ) -> ToolResult:
         """The ``files`` verb."""
         try:
-            entry = self.service.site(site)
-            adapter = self.service.adapter_for(entry, "files")
-            access = await adapter.files()
-            structured: dict[str, Any]
-            if op == "list":
-                listing = await access.list(path or "")
-                structured = {"entries": [item.model_dump(mode="json") for item in listing]}
-                text = "\n".join(
-                    f"{item.kind[0]} {item.size or 0:>12} {item.path}" for item in listing
-                )
-            elif op == "stat":
-                stat = await access.stat(_need(path, "path"))
-                structured = stat.model_dump(mode="json")
-                text = _text(structured)
-            elif op == "read":
-                cap = min(limit or MAX_INLINE_BYTES, MAX_INLINE_BYTES)
-                data = await access.read(_need(path, "path"), offset=offset, limit=cap)
-                try:
-                    decoded = data.decode("utf-8")
-                    structured = {
-                        "path": path,
-                        "offset": offset,
-                        "size": len(data),
-                        "text": decoded,
-                    }
-                    text = decoded
-                except UnicodeDecodeError:
-                    encoded = base64.b64encode(data).decode("ascii")
-                    structured = {
-                        "path": path,
-                        "offset": offset,
-                        "size": len(data),
-                        "content_base64": encoded,
-                    }
-                    text = f"{len(data)} bytes of binary data, in structuredContent.content_base64"
-            elif op in ("write", "stage"):
-                data = _payload(content, content_base64)
-                if op == "write":
-                    written = await access.write(_need(path, "path"), data, overwrite=overwrite)
-                    structured = written.model_dump(mode="json")
-                    text = f"wrote {written.size} bytes to {written.path}"
-                else:
-                    staged = await access.stage(data)
-                    structured = {"sha256": staged, "size": len(data)}
-                    text = f"staged {len(data)} bytes as {staged}"
-            elif op == "has":
-                present = await access.has(_need(digest, "digest"))
-                structured = {"sha256": digest, "present": present}
-                text = "present" if present else "absent"
-            else:
-                raise Refusal(
-                    RefusalReason.VERB_NOT_IMPLEMENTED,
-                    f"files op {op!r} is not available yet",
-                    op=op,
-                )
+            structured, text = await files_call(
+                self.service,
+                site,
+                op,
+                path,
+                content,
+                content_base64,
+                offset,
+                limit,
+                overwrite,
+                digest,
+            )
         except Refusal as refusal:
             return refusal_result(refusal)
         return ToolResult(
             content=[mcp_types.TextContent(type="text", text=text)],
             structured_content=structured,
         )
-
-    async def serve(self, site: str, spec: ServiceSpec) -> ToolResult:
-        """The ``serve`` verb, through the serve hook."""
-        try:
-            entry = self.service.site(site)
-            adapter = self.service.adapter_for(entry, "serve")
-            raise Refusal(
-                RefusalReason.VERB_NOT_IMPLEMENTED,
-                "serve needs a service runtime, and none is installed",
-                adapter=adapter.name,
-                spec_digest=spec.digest(),
-            )
-        except Refusal as refusal:
-            return refusal_result(refusal)
 
     def build(self, *, auth: AuthProvider | None = None) -> FastMCP[Any]:
         """Return the FastMCP server."""
@@ -634,19 +649,7 @@ class RelayServer:
             wait_s and returns the operation, which describe(job=...) observes."""
             return await relay.run(ctx, site, spec, cancel, resume, wait_s)
 
-        run_tool = FunctionTool.from_function(
-            run,
-            name="run",
-            title="Run a job on a site",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
-            task=TaskConfig(
-                mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
-            ),
-        )
-        # Tasks are the 2026-07-28 extension only. A 2025-11-25 client gets the
-        # handle path, so its listing must not claim core task support.
-        run_tool.execution = mcp_types.ToolExecution(task_support="forbidden")
-        server.add_tool(run_tool)
+        server.add_tool(_task_optional(run, "run", "Run a job on a site"))
 
         @server.tool(
             name="exec",
@@ -686,20 +689,31 @@ class RelayServer:
                 site, op, path, content, content_base64, offset, limit, overwrite, digest
             )
 
-        @server.tool(
-            name="serve",
-            title="Start a service on a site",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
-        )
-        async def serve(  # pyright: ignore[reportUnusedFunction]
-            site: Annotated[str, Field(description="The site id")],
-            spec: ServiceSpec,
-        ) -> ToolResult:
-            """Start a job with ports and return how to reach it."""
-            return await relay.serve(site, spec)
+        async def serve(
+            ctx: Context,
+            site: Annotated[str | None, Field(description="The site id")] = None,
+            spec: Annotated[
+                ServiceSpec | None, Field(description="The service: a job with ports")
+            ] = None,
+            service: Annotated[
+                str | None, Field(description="A service's operation id, to observe it")
+            ] = None,
+            stop: Annotated[
+                str | None, Field(description="A service's operation id, to stop it")
+            ] = None,
+            wait_s: Annotated[
+                float, Field(ge=0, le=300, description="Seconds to wait without a task")
+            ] = 20,
+        ) -> ToolResult | InputRequiredToolResult:
+            """Start a job with ports and return how to reach it. With tasks this returns
+            a task whose status names the endpoint; without, it waits up to wait_s for
+            the service to be ready. service observes one; stop ends it."""
+            return await relay.serve(ctx, site, spec, service, stop, wait_s)
 
+        server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
         server.add_extension(self.tasks)
         self.changes.install(server)
+        self.service.serve_hook.attach(server, self.changes)
         return server
 
     @asynccontextmanager
@@ -711,30 +725,20 @@ class RelayServer:
             await self.service.close()
 
 
-def _need(value: str | None, name: str) -> str:
-    if not value:
-        raise Refusal(RefusalReason.INVALID_ARGUMENTS, f"this op needs {name}")
-    return value
-
-
-def _payload(content: str | None, content_base64: str | None) -> bytes:
-    if (content is None) == (content_base64 is None):
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS, "give exactly one of content or content_base64"
-        )
-    if content is not None:
-        data = content.encode("utf-8")
-    else:
-        try:
-            data = base64.b64decode(content_base64 or "", validate=True)
-        except ValueError as exc:
-            raise Refusal(RefusalReason.INVALID_ARGUMENTS, "content_base64 is not base64") from exc
-    if len(data) > MAX_INLINE_BYTES:
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            f"inline content is limited to {MAX_INLINE_BYTES} bytes; stage larger files",
-        )
-    return data
+def _task_optional(fn: Any, name: str, title: str) -> FunctionTool:
+    tool = FunctionTool.from_function(
+        fn,
+        name=name,
+        title=title,
+        annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
+        task=TaskConfig(
+            mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
+        ),
+    )
+    # Tasks are the 2026-07-28 extension only. A 2025-11-25 client gets the
+    # handle path, so its listing must not claim core task support.
+    tool.execution = mcp_types.ToolExecution(task_support="forbidden")
+    return tool
 
 
 def create_server(
@@ -743,12 +747,22 @@ def create_server(
     transport: Transport = "stdio",
     token: str | None = None,
     base_url: str | None = None,
+    public_base_url: str | None = None,
 ) -> FastMCP[Any]:
-    """Build relay's MCP server. HTTP needs a bearer token."""
-    service = RelayService(paths or RelayPaths.from_env(), transport=transport)
+    """Build relay's MCP server. HTTP needs a bearer token.
+
+    ``public_base_url`` is the origin people reach relay's HTTP server at. The
+    ask provider gets it in its settings and, when it serves pages, mounts them.
+    """
+    service = RelayService(
+        paths or RelayPaths.from_env(), transport=transport, public_base_url=public_base_url
+    )
     auth: AuthProvider | None = None
     if transport == "http":
         if not token or not base_url:
             raise ValueError("HTTP transport needs a bearer token and a base URL")
         auth = RelayBearer(token, base_url=base_url)
-    return RelayServer(service).build(auth=auth)
+    server = RelayServer(service).build(auth=auth)
+    if transport == "http" and isinstance(service.ask_provider, MountsPages):
+        service.ask_provider.mount(server)
+    return server

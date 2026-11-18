@@ -81,10 +81,11 @@ fixture = "clio_relay.testing.fixture_adapter:FixtureAdapter"
 
 [project.entry-points."clio_relay.hooks"]
 asks = "clio_relay.asks:create_provider"
+serve = "clio_relay.serve:factory"
 
 [project.optional-dependencies]
 tapis = ["tapipy==25.4.0"]
-globus = ["globus-sdk>=4.10,<5", "globus-compute-sdk>=4.21,<5"]
+globus = ["globus-sdk>=4.10,<5", "globus-compute-sdk>=4.21,<4.22"]
 iri = []
 testing = [
     "keyrings.alt>=5",

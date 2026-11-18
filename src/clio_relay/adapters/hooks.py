@@ -14,7 +14,7 @@ from datetime import datetime
 from importlib.metadata import EntryPoint, entry_points
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,11 @@ from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
+    from clio_relay.surface.changes import ServerChanges
 
 HOOK_GROUP = "clio_relay.hooks"
 
@@ -129,6 +134,19 @@ class AskProvider(Protocol):
         ...
 
 
+@runtime_checkable
+class MountsPages(Protocol):
+    """An ask provider that serves its pages on relay's own HTTP server.
+
+    Optional: relay calls ``mount`` after building an HTTP server when the
+    provider has it.
+    """
+
+    def mount(self, server: FastMCP[Any]) -> None:
+        """Add the provider's routes to ``server``."""
+        ...
+
+
 class Charge(BaseModel):
     """What a job may cost, as the spend gate shows it (RL25)."""
 
@@ -179,7 +197,15 @@ class GuardHook(Protocol):
 
 @runtime_checkable
 class ServeHook(Protocol):
-    """The service runtime (RL19 to RL23). W9 implements it."""
+    """The service runtime (RL19 to RL23). W9 implements it.
+
+    Relay keeps the operation record. The hook keeps its own job handles under
+    ``state_dir/serve/``, keyed by the record's operation id.
+    """
+
+    def attach(self, server: FastMCP[Any], changes: ServerChanges) -> None:
+        """Mount the hook's tools on ``server``. Called once, while relay builds it."""
+        ...
 
     async def start(
         self,
@@ -201,6 +227,14 @@ class ServeHook(Protocol):
         self, site: SiteEntry, adapter: BaseAdapter[Any], record: OperationRecord
     ) -> JobStatus:
         """Stop a service, giving it its grace period."""
+        ...
+
+    def ui_data(self, record: OperationRecord) -> dict[str, Any] | None:
+        """Return what the service's panel needs, secret-bearing URLs included.
+
+        Relay puts it only in the serve result's ``_meta``, never in describe
+        or a task status (RL22).
+        """
         ...
 
     async def close(self) -> None:

@@ -80,6 +80,21 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
 - **Grant files.** Relay reads `CLIO_RELAY_GRANT_FILE_<PROVIDER>` or `--grant-file <provider>=<path>`. It never reads a CLIO name (HS4a above).
 - **Change events at `2026-07-28`.** FastMCP 4.2.1 does not serve `subscriptions/listen`, so relay registers the SDK's `ListenHandler` over an `InMemorySubscriptionBus` itself (`src/clio_relay/surface/changes.py`). `RelayServer.changes.resource_updated(uri)`, `resources_list_changed()` and `tools_list_changed()` publish on the bus. They also send the bare notification to every `2025-11-25` connection relay has seen. Relay keeps the connection, because mcp 2.3's `ServerSession` lasts only one request. Why: W3's HS3 server obligation. W14's Compute tab resource calls `resource_updated`.
 - **The old surface stays.** The new command is `clio-relay-next` beside the old `clio-relay` until W8 removes the old one ("Old and new surfaces during the rework").
+- **Adapter extras and the universal lock (coordinator, wave 1).** uv's lock is universal, so an extra's caps apply to every install.
+  - `tapis = ["tapipy==25.4.0"]`. Its openapi-core 0.16 lowers jsonschema-path to 0.3.4, pathable to 0.4.4 and referencing to 0.36.2. Accepted.
+  - `globus` pins `globus-compute-sdk>=4.21,<4.22`. Without the cap, relay's `prerelease = "allow"` picks the 4.22.0a0 alpha. Every globus-compute-sdk caps `rich<15`, so rich is 14.3.4. Accepted.
+  - There is no `sky` extra. skypilot 0.14.3 caps `click<8.2` and `uvicorn<0.36`. W11 runs skypilot from its own environment as a subprocess.
+  - keyring is in core (W6), and `keyrings.alt` is in the `testing` extra.
+- **Hook entry points fall back when their module is missing.** `hook_factory` uses the stub when a hook's own module is not installed. Any other import error is raised. Why: an entry point can be registered before its workstream merges, and the guard stub refuses guarded sites, so the fallback is safe.
+- **The serve flow follows run (W9's spec).** `RelayService.start_serve` runs the guard check and price on `spec.job`, creates a `kind="serve"` record with the spend and sign-in asks, and calls `serve_hook.start`. `refresh` calls `serve_hook.status` and `cancel` calls `serve_hook.stop`. `record.result["endpoint"]` holds the endpoint, `record.result["message"]` the latest `JobStatus.message`, and `record.outputs` the stop artifacts. `serve` is task-optional like `run`. A running serve task is `working`, and its status message names each port as `name: host:port`. `wait` also returns once the service is ready.
+- **Secret URLs reach the UI only.** The record, `describe` and the task status keep an endpoint's ports without their `url`. The serve result carries `_meta["ai.iowarp.relay/service"]` from `ServeHook.ui_data(record)`. Why: RL22. A test caught that the endpoint first reached the record with its URLs.
+- **The stub serve hook refuses up front.** With no serve runtime installed, `serve` refuses with `verb_not_implemented` and writes no record. `ServeHook.attach(server, changes)` is called in `RelayServer.build`, and the stub's `attach` and `ui_data` do nothing. `local` lists `serve` and imports `clio_relay.serve` lazily; without it, `local.serve` refuses the same way.
+- **Under tasks, `run(cancel=)` and `run(resume=)` return a plain result.** Only a new run or serve becomes a task. The same holds for `serve(service=)` and `serve(stop=)`.
+- **Ask pages mount on the HTTP server (W6).** `MountsPages` is an optional Protocol (`mount(server)`). `create_server` calls it after `build()` for HTTP when the ask provider implements it. W9's `attach` follows the same pattern. `HookContext.settings["public_base_url"]` holds the server's public origin.
+- **`serve` over HTTP.** The command line takes `--grant-file PROVIDER=PATH` (repeatable). It did not exist at M1, though the published interfaces listed it. It also takes `--tls-cert` and `--tls-key`, given together, which make the origin https for RL25a. Uvicorn's access log is off, because page addresses carry single-use tokens.
+- **The job name is recorded before submit.** A run's SUBMITTING move stores `result["job_name"]` with the note "job name X" (RL25a).
+- **The asks command group comes from W6 when installed.** `clio-relay-next asks` mounts `clio_relay.cli_asks.app`. Without it, the built-in `list` and `answer` remain.
+- **Bounded commands leave nothing behind.** `run_bounded` reads both pipes to their end after a timeout kill. When its caller is cancelled, it kills the process group before it re-raises. This fixed a leaked subprocess transport ("Event loop is closed") from the local conformance tests, which was already present at M1. The relay_next suite now runs with `PytestUnraisableExceptionWarning` as an error.
 
 ### Published interfaces (M1)
 
@@ -90,9 +105,10 @@ Owned by W1, not frozen. A change goes through W1, which reruns every consumer's
 - Records: `OperationRecord`, `OperationState`, `RecordStore`. Layout: `<state>/operations/`, `<state>/asks/`, `<state>/sites/<site>/<adapter>/`, and `sites.yaml` in the config directory.
 - Content store: `ContentStore` at `<state>/content/cas/sha256/<first two hex>/<digest>`.
 - `RefusalReason`, 24 typed reasons: `verb_not_implemented`, `site_not_found`, `site_exists`, `unknown_adapter`, `adapter_unavailable`, `invalid_config`, `invalid_spec`, `invalid_arguments`, `guard_unavailable`, `policy_refused`, `needs_approval`, `needs_sign_in`, `declined`, `interactive_auth_required`, `operation_not_found`, `ask_not_found`, `approval_mismatch`, `input_missing`, `path_not_found`, `path_exists`, `not_cancellable`, `submit_failed`, `unreachable`, `timeout`.
-- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` for W9.
+- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` (`start`, `status`, `stop`, `attach`, `ui_data`) for W9; the optional `MountsPages` (`mount`) for an ask provider's pages.
+- Serve runtime, provided by W9 and imported lazily: `clio_relay.serve.factory`, `start_for(adapter, spec, *, operation_id)`, `connect(handle, *, paths)` and `settings(paths, changes)`, where `changes` is None to show. `SiteEntry.serve` holds a site's serve settings.
 - Change events: `ServerChanges` (above).
-- Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token), `adapters`, `site`, `asks`.
+- Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token, `--grant-file`, `--tls-cert` and `--tls-key`), `adapters`, `site`, `asks`, `connect <handle>`, `rendezvous set|show`.
 
 ### Conformance kit
 
