@@ -8,8 +8,7 @@ cross-process transition lock (``_gateway_transition_lock_path``,
 durable-session helpers (``_validate_gateway_transition_session``,
 ``_runtime_start_session_after_lock``, ``_update``,
 ``_set_ownership_intent``, ``_gateway_with_ownership_intent``), the shared
-remote-command transport (``_ssh``), JARVIS authorization resolution
-(``_jarvis_runtime_authorization``), and the two durable-failure recorders
+remote-command transport (``_ssh``), and the two durable-failure recorders
 (``_record_runtime_start_failure``, ``_record_attach_failure``).
 
 This is a mixin, not a standalone class: it depends on ``self.settings``,
@@ -45,10 +44,6 @@ from clio_relay.cluster_config import ClusterDefinition, ensure_private_configur
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
-from clio_relay.jarvis_service_runtime import (
-    VerifiedJarvisServiceRuntime,
-    resolve_jarvis_service_runtime_authorization,
-)
 from clio_relay.models import GatewaySession, GatewaySessionState, utc_now
 
 _GATEWAY_TEARDOWN_LOCK_TIMEOUT_SECONDS = 60.0
@@ -78,17 +73,6 @@ class _ServiceRuntimeCoreMixin:
         self.secret_key = secret_key
         self.runner = runner or _command_runner.SubprocessCommandRunner()
         self.sleep = sleep
-
-    def _jarvis_runtime_authorization(
-        self,
-        verified: VerifiedJarvisServiceRuntime,
-    ) -> str | None:
-        """Resolve per operation; callers may stdin-transfer only to the owned memory proxy."""
-        return resolve_jarvis_service_runtime_authorization(
-            definition=self.definition,
-            settings=self.settings,
-            verified=verified,
-        )
 
     def _validate_gateway_transition_session(self, session: GatewaySession) -> None:
         """Require one exact relay-owned session before and after lock acquisition."""
