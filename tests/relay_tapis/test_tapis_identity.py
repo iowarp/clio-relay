@@ -240,9 +240,11 @@ async def test_tapis_saying_the_code_expired_is_reported_as_expired(
 ) -> None:
     use_memory_keyring(monkeypatch)
     found = identity(stub)
-    await found.begin()
+    step = await found.begin()
     with stub.state.lock:
-        (grant,) = stub.state.devices.values()
+        (grant,) = (
+            g for g in stub.state.devices.values() if g.user_code == step.display["user_code"]
+        )
         grant.status = "Entered"
         grant.expires_at = time.time() - 60
     result = await found.poll(force=True)
