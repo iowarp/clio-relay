@@ -194,6 +194,7 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
     assert served_copy.package.service is True
     assert served_copy.package.sha256 == digest
 
+
 @pytest.mark.asyncio
 async def test_prepare_refuses_a_free_form_job_on_a_guarded_site(guard: Guard) -> None:
     adapter = fixture(guard)
