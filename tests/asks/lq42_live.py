@@ -48,9 +48,7 @@ class Live:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.token = Path(args.token_file).read_text().strip() if args.token_file else None
-        self.operator = (
-            Path(args.operator_file).read_text().strip() if args.operator_file else None
-        )
+        self.operator = Path(args.operator_file).read_text().strip() if args.operator_file else None
         self.verify: Any = args.cacert or True
 
     @asynccontextmanager
