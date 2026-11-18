@@ -5,8 +5,9 @@ settings. A header row holds the defaults for new endpoints, then there is one
 row per endpoint. Each row has inline Protocol and Security pickers, its Status,
 and a menu of Probe, Edit and Remove. Picking a value calls
 :data:`~clio_relay.surface.a2ui.surfaces.SET_VALUE` with the row's token, and the
-host adds the column and value. An open edit form or remove confirmation is
-rendered as Basic components under its row, through the row's ``detail``.
+host adds the column and value. An open edit form, remove confirmation or
+sign-in link is rendered as a Basic card after the table, headed by its
+endpoint's name, so the table keeps to the component's published schema.
 
 A client that renders only the Basic catalog gets the cards of
 :mod:`clio_relay.surface.a2ui.surfaces` instead.
@@ -143,7 +144,7 @@ def _menu(view: SiteView, state: TabState, tokens: ActionTokens) -> list[dict[st
 def _detail(
     tree: Tree, view: SiteView, state: TabState, forms: dict[str, Form], tokens: ActionTokens
 ) -> str | None:
-    """Add what shows under a row: a sign-in link, a remove confirmation, the edit form."""
+    """Add an endpoint's open card: a sign-in link, a remove confirmation, the edit form."""
     site = view.site
     base = f"s-{site.id}"
     children: list[str] = []
@@ -173,12 +174,11 @@ def _detail(
         children.append(edit_form(tree, site, forms, tokens, errors, pending))
     if not children:
         return None
-    return tree.column(f"{base}-detail", children)
+    heading = tree.text(f"{base}-detail-title", site.title, "h4")
+    return tree.card(f"{base}-detail", tree.column(f"{base}-detail-body", [heading, *children]))
 
 
-def _row(
-    tree: Tree, view: SiteView, state: TabState, forms: dict[str, Form], tokens: ActionTokens
-) -> dict[str, Any]:
+def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any]:
     site = view.site
     values = {"protocol": site.adapter, "security": site.policy}
     status = str(view.status.get("state", ""))
@@ -199,9 +199,6 @@ def _row(
     error = state.errors.get(site.id, {}).get(FORM_ERROR)
     if error and site.id not in state.editing:
         row["error"] = error
-    detail = _detail(tree, view, state, forms, tokens)
-    if detail:
-        row["detail"] = detail
     return row
 
 
@@ -213,7 +210,7 @@ def endpoints_surface(
     children = [tree.text("sites-title", "Endpoints", "h2")]
     if state.notice:
         children.append(tree.text("sites-notice", state.notice))
-    rows = [_row(tree, view, state, forms, tokens) for view in views]
+    rows = [_row(view, state, tokens) for view in views]
     children.append(
         tree.add(
             "endpoints",
@@ -234,6 +231,10 @@ def endpoints_surface(
             empty="No endpoints yet.",
         )
     )
+    for view in views:
+        detail = _detail(tree, view, state, forms, tokens)
+        if detail:
+            children.append(detail)
     tree.column("root", children)
     data: dict[str, Any] = {
         "drafts": {

@@ -21,6 +21,13 @@ from .a2ui_host import Host, a2ui_client, basic_client, said
 from .conftest import add_site
 
 
+# What CLIO's choice-table renderer accepts: rows and the table are strict.
+ROW_KEYS = {"id", "title", "subtitle", "caption", "icon", "values", "inherited", "error"}
+ROW_KEYS |= {"context", "menu"}
+TABLE_KEYS = {"id", "component", "label", "columns", "rows", "defaults", "onChoose", "rowMenu"}
+TABLE_KEYS |= {"add", "empty", "accessibility", "weight"}
+
+
 def _options(table: dict[str, Any], column: str) -> dict[str, dict[str, Any]]:
     [found] = [item for item in table["columns"] if item["id"] == column]
     return {option["value"]: option for option in found["options"]}
@@ -65,7 +72,8 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
             assert row["values"] == {"protocol": "fixture", "security": "open", "status": "ready"}
             assert [item["id"] for item in row["menu"]] == ["probe", "edit", "remove"]
             assert row["menu"][-1]["destructive"] is True
-            assert "detail" not in row
+            assert set(row) <= ROW_KEYS and set(table) <= TABLE_KEYS
+            assert "s-fx-detail" not in host.visible("relay-sites")
             for surface in host.surfaces.values():
                 for component in surface["components"].values():
                     assert component["component"] in COMPONENTS
@@ -155,7 +163,7 @@ def test_a_protocol_that_needs_settings_opens_them_under_its_row(relay_paths: Re
             assert result.structured_content["ok"] is True, said(result)
             assert "Fill in lab's SSH settings, then save to use SSH." in said(result)
             assert store.get("lab").adapter == "local", "nothing changes before the save"
-            assert host.row("lab")["detail"] == "s-lab-detail"
+            assert "s-lab-detail" in host.visible("relay-sites")
             assert "e-lab-save" in host.visible("relay-sites")
             assert host.get("relay-sites", "/drafts/lab/adapters/ssh/use") is True
             assert [item["id"] for item in host.row("lab")["menu"]] == ["probe", "remove"]
@@ -172,7 +180,7 @@ def test_a_protocol_that_needs_settings_opens_them_under_its_row(relay_paths: Re
             assert site.adapter == "ssh" and site.config["ssh_profile"] == "lab-login"
             assert "local" in site.alternatives
             assert "It now uses SSH." in said(result)
-            assert "detail" not in host.row("lab")
+            assert "s-lab-detail" not in host.visible("relay-sites")
 
             # Cancelling a picked protocol leaves the endpoint as it was.
             await host.choose("lab", "protocol", "iri")
@@ -181,7 +189,7 @@ def test_a_protocol_that_needs_settings_opens_them_under_its_row(relay_paths: Re
             await host.press("relay-sites", "e-lab-cancel")
             assert store.get("lab").adapter == "ssh"
             assert "iri" not in store.get("lab").alternatives
-            assert "detail" not in host.row("lab")
+            assert "s-lab-detail" not in host.visible("relay-sites")
 
     asyncio.run(scenario())
 
@@ -281,7 +289,7 @@ def test_connect_is_in_the_menu_of_an_endpoint_that_needs_a_sign_in(
             assert row["caption"].startswith("Needs a ")
             result = await host.menu("signs", "connect")
             assert result.structured_content["ok"] is True, said(result)
-            assert host.row("signs")["detail"] == "s-signs-detail"
+            assert "s-signs-detail" in host.visible("relay-sites")
             link = host.surfaces["relay-sites"]["components"]["s-signs-open"]
             assert link["action"]["functionCall"]["args"]["url"].startswith("http://127.0.0.1:")
             assert all(

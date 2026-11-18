@@ -102,7 +102,7 @@ class Host:
         return messages
 
     def visible(self, sid: str) -> set[str]:
-        """Return the ids reachable from the surface's root, through tables' row details."""
+        """Return the ids reachable from the surface's root."""
         components = self.surfaces[sid]["components"]
         seen: set[str] = set()
         stack = ["root"]
@@ -116,8 +116,6 @@ class Host:
             if "child" in component:
                 stack.append(component["child"])
             stack += [tab["child"] for tab in component.get("tabs", [])]
-            if component["component"] == TABLE:
-                stack += [row["detail"] for row in component["rows"] if "detail" in row]
         return seen
 
     def text(self, sid: str) -> str:

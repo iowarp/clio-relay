@@ -486,50 +486,147 @@
         },
         {
           "type": "object",
-          "description": "CLIO's choice table: a defaults row and one row per item, each with inline pickers, read-only status cells and a row menu. Provisional until CLIO publishes its schema.",
+          "description": "CLIO's choice table (gact-tui #1320): a defaults row and one row per item, each with inline pickers, read-only status cells and a row menu.",
           "properties": {
             "component": {
               "const": "clio.choice-table.v1"
             },
             "label": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1
             },
             "columns": {
               "type": "array",
+              "minItems": 1,
               "maxItems": 6,
               "items": {
                 "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "title",
+                  "options"
+                ],
                 "properties": {
                   "id": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "title": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "help": {
                     "type": "string"
                   },
                   "editable": {
                     "type": "boolean",
-                    "default": true
+                    "description": "false: read-only status cell. Default true."
                   },
                   "options": {
                     "type": "array",
+                    "minItems": 1,
                     "maxItems": 24,
                     "items": {
                       "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "value",
+                        "label"
+                      ],
                       "properties": {
                         "value": {
-                          "type": "string"
+                          "type": "string",
+                          "minLength": 1
                         },
                         "label": {
-                          "type": "string"
+                          "type": "string",
+                          "minLength": 1
                         },
                         "description": {
                           "type": "string"
                         },
                         "icon": {
-                          "type": "string"
+                          "type": "string",
+                          "enum": [
+                            "accountCircle",
+                            "add",
+                            "alertCircle",
+                            "alertTriangle",
+                            "arrowBack",
+                            "arrowForward",
+                            "attachFile",
+                            "calendarToday",
+                            "call",
+                            "camera",
+                            "cancel",
+                            "check",
+                            "checkCircle",
+                            "close",
+                            "cloud",
+                            "computer",
+                            "delete",
+                            "dns",
+                            "download",
+                            "edit",
+                            "error",
+                            "event",
+                            "fastForward",
+                            "favorite",
+                            "favoriteOff",
+                            "folder",
+                            "help",
+                            "home",
+                            "hub",
+                            "info",
+                            "key",
+                            "lan",
+                            "locationOn",
+                            "lock",
+                            "lockOpen",
+                            "mail",
+                            "memory",
+                            "menu",
+                            "moreHoriz",
+                            "moreVert",
+                            "notifications",
+                            "notificationsOff",
+                            "pause",
+                            "payment",
+                            "person",
+                            "phone",
+                            "photo",
+                            "play",
+                            "print",
+                            "public",
+                            "refresh",
+                            "rewind",
+                            "search",
+                            "security",
+                            "send",
+                            "settings",
+                            "share",
+                            "shield",
+                            "shoppingCart",
+                            "skipNext",
+                            "skipPrevious",
+                            "star",
+                            "starHalf",
+                            "starOff",
+                            "stop",
+                            "storage",
+                            "terminal",
+                            "upload",
+                            "verifiedUser",
+                            "visibility",
+                            "visibilityOff",
+                            "volumeDown",
+                            "volumeMute",
+                            "volumeOff",
+                            "volumeUp",
+                            "warning"
+                          ],
+                          "description": "Material-style name; kebab or snake case also accepted. Unknown names render no glyph."
                         },
                         "tone": {
                           "type": "string",
@@ -540,56 +637,31 @@
                             "negative"
                           ]
                         }
-                      },
-                      "required": [
-                        "value",
-                        "label"
-                      ],
-                      "additionalProperties": false
+                      }
                     }
                   }
-                },
-                "required": [
-                  "id",
-                  "title",
-                  "options"
-                ],
-                "additionalProperties": false
-              }
-            },
-            "defaults": {
-              "type": "object",
-              "properties": {
-                "title": {
-                  "type": "string"
-                },
-                "values": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string"
-                  }
-                },
-                "context": {
-                  "type": "object"
                 }
-              },
-              "required": [
-                "title",
-                "values"
-              ],
-              "additionalProperties": false
+              }
             },
             "rows": {
               "type": "array",
               "maxItems": 500,
               "items": {
                 "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "title",
+                  "values"
+                ],
                 "properties": {
                   "id": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "title": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "subtitle": {
                     "type": "string"
@@ -598,34 +670,128 @@
                     "type": "string"
                   },
                   "icon": {
-                    "type": "string"
+                    "type": "string",
+                    "enum": [
+                      "accountCircle",
+                      "add",
+                      "alertCircle",
+                      "alertTriangle",
+                      "arrowBack",
+                      "arrowForward",
+                      "attachFile",
+                      "calendarToday",
+                      "call",
+                      "camera",
+                      "cancel",
+                      "check",
+                      "checkCircle",
+                      "close",
+                      "cloud",
+                      "computer",
+                      "delete",
+                      "dns",
+                      "download",
+                      "edit",
+                      "error",
+                      "event",
+                      "fastForward",
+                      "favorite",
+                      "favoriteOff",
+                      "folder",
+                      "help",
+                      "home",
+                      "hub",
+                      "info",
+                      "key",
+                      "lan",
+                      "locationOn",
+                      "lock",
+                      "lockOpen",
+                      "mail",
+                      "memory",
+                      "menu",
+                      "moreHoriz",
+                      "moreVert",
+                      "notifications",
+                      "notificationsOff",
+                      "pause",
+                      "payment",
+                      "person",
+                      "phone",
+                      "photo",
+                      "play",
+                      "print",
+                      "public",
+                      "refresh",
+                      "rewind",
+                      "search",
+                      "security",
+                      "send",
+                      "settings",
+                      "share",
+                      "shield",
+                      "shoppingCart",
+                      "skipNext",
+                      "skipPrevious",
+                      "star",
+                      "starHalf",
+                      "starOff",
+                      "stop",
+                      "storage",
+                      "terminal",
+                      "upload",
+                      "verifiedUser",
+                      "visibility",
+                      "visibilityOff",
+                      "volumeDown",
+                      "volumeMute",
+                      "volumeOff",
+                      "volumeUp",
+                      "warning"
+                    ],
+                    "description": "Material-style name; kebab or snake case also accepted. Unknown names render no glyph."
                   },
                   "values": {
                     "type": "object",
                     "additionalProperties": {
                       "type": "string"
-                    }
+                    },
+                    "description": "column id -> option value"
                   },
                   "inherited": {
                     "type": "array",
                     "items": {
                       "type": "string"
-                    }
+                    },
+                    "description": "column ids whose value follows the defaults"
+                  },
+                  "error": {
+                    "type": "string"
                   },
                   "context": {
-                    "type": "object"
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Merged into onChoose context for this row; row/column/value win."
                   },
                   "menu": {
                     "type": "array",
                     "maxItems": 8,
                     "items": {
                       "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "id",
+                        "label",
+                        "action"
+                      ],
                       "properties": {
                         "id": {
-                          "type": "string"
+                          "type": "string",
+                          "minLength": 1
                         },
                         "label": {
-                          "type": "string"
+                          "type": "string",
+                          "minLength": 1
                         },
                         "destructive": {
                           "type": "boolean"
@@ -633,58 +799,103 @@
                         "action": {
                           "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
                         }
-                      },
-                      "required": [
-                        "id",
-                        "label",
-                        "action"
-                      ],
-                      "additionalProperties": false
-                    }
-                  },
-                  "error": {
+                      }
+                    },
+                    "description": "Replaces rowMenu for this row. Each item's context gets {row}."
+                  }
+                }
+              }
+            },
+            "defaults": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "title",
+                "values"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "values": {
+                  "type": "object",
+                  "additionalProperties": {
                     "type": "string"
-                  },
-                  "detail": {
-                    "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentId"
                   }
                 },
-                "required": [
-                  "id",
-                  "title",
-                  "values"
-                ],
-                "additionalProperties": false
+                "context": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Merged into onChoose context for the defaults row (row: \"\")."
+                }
               }
             },
             "onChoose": {
-              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action",
+              "description": "Fired on a pick. Context = event.context, then row/defaults context, then {row, column, value}. The pick shows optimistically until the server re-sends the surface (10 s cap)."
+            },
+            "rowMenu": {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "label",
+                  "action"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "label": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "destructive": {
+                    "type": "boolean"
+                  },
+                  "action": {
+                    "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+                  }
+                }
+              }
             },
             "add": {
               "type": "object",
-              "properties": {
-                "label": {
-                  "type": "string"
-                },
-                "action": {
-                  "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
-                }
-              },
+              "additionalProperties": false,
               "required": [
                 "label",
                 "action"
               ],
-              "additionalProperties": false
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "action": {
+                  "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+                }
+              }
             },
             "empty": {
               "type": "string"
+            },
+            "accessibility": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/AccessibilityAttributes"
+            },
+            "weight": {
+              "type": "number"
             }
           },
           "required": [
             "component",
+            "label",
             "columns",
-            "rows",
-            "onChoose"
+            "rows"
           ]
         }
       ],
