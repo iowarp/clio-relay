@@ -135,6 +135,24 @@ never types into ssh itself.
 program of your own that reads codes from a token. With such a program, relay
 signs in by itself and only asks you if the program fails.
 
+## Files
+
+`files` follows [the files contract](../files.md). A relative path is under
+`remote_dir`, `~/` is your home on the site, and an absolute path is the
+site's own. Each operation is one `ssh` call, and the bytes travel on its
+standard input and output.
+
+A chunk goes into a temporary file first and joins `<path>.relay-part` only
+once all of it has arrived, so a link that drops partway adds nothing. A chunk
+sent again after its answer was lost is recognised by the part's size and the
+hash of its last bytes, and taken without change; so is the last chunk sent
+again after the part was moved into place. `delete` never follows a symlink and
+refuses the work directory, your home and `/`, even through a symlink to them.
+
+On Ares, from the login node, a 4 MiB chunk takes about 2 s through the
+adapter, of which 0.9 s is opening the ssh connection, and a 4 MiB read about
+0.8 s.
+
 ## Serving a port
 
 `serve` forwards a port from the site with `ssh -L`, adding `-J` through the
@@ -150,9 +168,10 @@ site, a submit first looks for the job it may already have submitted, and
 `status` and `cancel` only read or stop. A job keeps running on the site while
 the link is down.
 
-Two calls are repeated only when the connection never opened, because the
-command may already have run: `exec`, and a `files` write that may not
-overwrite. Such a call fails with `unreachable` and the caller decides.
+Three calls are repeated only when the connection never opened, because the
+command may already have run: `exec`, a whole `files` write that may not
+overwrite, and `files` delete. Such a call fails with `unreachable` and the
+caller decides. Chunks of a `files` write are always repeated.
 
 A failed login, an unknown or changed host key and a missing key are not
 repeated: trying again would give the same answer.
