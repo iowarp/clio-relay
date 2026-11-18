@@ -154,10 +154,12 @@ async def test_lq7_a_rerun_stages_nothing(fx: dict[str, str], tmp_path: Path) ->
     digest = adapter.context.content.put(data)
     del data
     uploads: list[list[Path]] = []
+    sizes: list[int] = []
     upload = adapter.transport.upload
 
     async def recording(sources: list[Path], destination: str) -> None:
         uploads.append(list(sources))
+        sizes.extend(path.stat().st_size for path in sources)
         await upload(sources, destination)
 
     adapter.transport.upload = recording  # pyright: ignore[reportAttributeAccessIssue]
@@ -165,6 +167,7 @@ async def test_lq7_a_rerun_stages_nothing(fx: dict[str, str], tmp_path: Path) ->
     spec = JobSpec(
         executable="sha256sum", arguments=["big.bin"], inputs=[InputRef(name="big.bin", sha256=digest)]
     )
+    first_sizes = 0
     for attempt in range(2):
         handle = await adapter.run(spec, operation_id=new_id("op"))
         final = await wait_final(adapter, handle)
@@ -174,7 +177,9 @@ async def test_lq7_a_rerun_stages_nothing(fx: dict[str, str], tmp_path: Path) ->
         assert stdout.split()[0] == digest
         staged = [path for path in uploads[attempt] if path == blob]
         assert staged == ([blob] if attempt == 0 else []), uploads[attempt]
-    assert all(path.stat().st_size < 1024 * 1024 for path in uploads[1])
+        if attempt == 0:
+            first_sizes = len(sizes)
+    assert all(size < 1024 * 1024 for size in sizes[first_sizes:]), sizes
 
 
 async def test_lq8_a_detached_job_is_read_by_a_later_poll(
