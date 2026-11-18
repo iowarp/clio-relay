@@ -2196,7 +2196,6 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
     )
     binding = {
         **cast(dict[str, object], started.session.gateway["jarvis_runtime_binding"]),
-        "scheduler_provider": "slurm",
         "scheduler_native_id": "12345",
     }
     queue.update_gateway_session(
