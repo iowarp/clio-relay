@@ -25,9 +25,11 @@ from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
 from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
+from clio_relay.surface.a2ui.tab import WATCH_INTERVAL_S
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.testing.fixture_adapter import FixtureAdapter
 
 from .conftest import add_site
 
@@ -282,12 +284,18 @@ def test_tab_uses_only_the_catalog_components(relay_paths: RelayPaths) -> None:
                 for component in surface["components"].values():
                     assert component["component"] in COMPONENTS
             # The add form has a tab per installed adapter, each with its config fields.
+            # A test-only adapter is not offered, but a site already on one can edit it.
             visible = host.visible("relay-add")
             for name in registry.names():
+                if not registry.load(name).listed:
+                    assert f"add-a-{name}-add" not in visible
+                    continue
                 assert f"add-a-{name}-add" in visible
                 schema = form(name, registry.config_schema(name))
                 for field in schema.fields:
                     assert f"add-a-{name}-f-{field.key}" in visible
+            assert host.get("relay-add", "/drafts/add/config/fixture") is None
+            assert host.get("relay-sites", "/drafts/fx/adapters/fixture") is not None
 
     asyncio.run(scenario())
 
@@ -303,6 +311,8 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
         return await original(self, site_id)
 
     monkeypatch.setattr(RelayService, "site_added", site_added)
+    # The fixture is test-only, so this test lists it to add a site through the form.
+    monkeypatch.setattr(FixtureAdapter, "listed", True)
     store = SiteStore(relay_paths.sites_file)
 
     async def scenario() -> None:
@@ -438,6 +448,33 @@ def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) 
                 assert await heard.get() == TAB_URI
             await host.open()
             assert "s-cli" in host.visible("relay-sites")
+
+    asyncio.run(scenario())
+
+
+def test_an_out_of_date_button_refreshes_the_tab_once(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths)
+    heard: list[str] = []
+
+    async def on_message(message: Any) -> None:
+        if isinstance(message, mcp_types.ResourceUpdatedNotification):
+            heard.append(str(message.params.uri))
+
+    async def scenario() -> None:
+        async with Client(
+            create_server(relay_paths),
+            mode="legacy",
+            extensions=[advertise(EXTENSION_ID, AD)],
+            message_handler=on_message,
+        ) as client:
+            await Host(client).open()
+            result = await client.call_tool(
+                "compute_probe_site", {"token": "made-up"}, raise_on_error=False
+            )
+            assert result.is_error
+            # The watcher looks at the state file this refusal wrote and must stay quiet.
+            await asyncio.sleep(WATCH_INTERVAL_S * 2.5)
+            assert heard == [TAB_URI]
 
     asyncio.run(scenario())
 

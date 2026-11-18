@@ -81,6 +81,8 @@ class Form:
 
     adapter: str
     fields: tuple[Field, ...] = field(default_factory=tuple[Field, ...])
+    # Offered for a new site or a new way to reach one. A test-only adapter is not.
+    listed: bool = True
 
 
 def _resolve(schema: dict[str, Any], defs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -121,7 +123,7 @@ def _kind(schema: dict[str, Any]) -> Kind:
     return "yaml"
 
 
-def form(adapter: str, schema: dict[str, Any]) -> Form:
+def form(adapter: str, schema: dict[str, Any], *, listed: bool = True) -> Form:
     """Return the form for an adapter's ``Config`` schema."""
     defs = cast(dict[str, Any], schema.get("$defs") or {})
     required = set(cast(list[str], schema.get("required") or []))
@@ -142,7 +144,7 @@ def form(adapter: str, schema: dict[str, Any]) -> Form:
                 default=own.get("default"),
             )
         )
-    return Form(adapter=adapter, fields=tuple(fields))
+    return Form(adapter=adapter, fields=tuple(fields), listed=listed)
 
 
 def draft_value(item: Field, value: Any) -> Any:

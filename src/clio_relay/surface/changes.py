@@ -4,7 +4,8 @@ At ``2026-07-28`` a bare ``notifications/resources/updated`` or ``list_changed``
 no longer reaches a client: change events travel only on a
 ``subscriptions/listen`` stream, which FastMCP does not serve. Relay registers
 the SDK's listen handler itself and publishes each change on its bus. Older
-clients still get the bare notification on the connections relay has seen.
+clients still get the bare notification on the connections relay has seen,
+unless they opened a listen stream, which already carries the change.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import mcp_types
 from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from mcp.server.connection import Connection
+from mcp.server.context import ServerRequestContext
 from mcp.server.session import ServerSession
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
 from mcp.shared.subscriptions import (
@@ -38,18 +40,20 @@ class ServerChanges:
     Producers (the Compute tab resource, site skills, mounted tools) call
     :meth:`resource_updated`, :meth:`resources_list_changed` or
     :meth:`tools_list_changed`. A ``2026-07-28`` client hears it on its listen
-    stream; a ``2025-11-25`` client gets the bare notification.
+    stream; a ``2025-11-25`` client gets the bare notification, once: a connection
+    with an open listen stream hears it there and nowhere else.
     """
 
     def __init__(self) -> None:
         self.bus = InMemorySubscriptionBus()
         self.listen = ListenHandler(self.bus)
         self._legacy: weakref.WeakSet[Connection] = weakref.WeakSet()
+        self._listening: weakref.WeakKeyDictionary[Connection, int] = weakref.WeakKeyDictionary()
 
     def install(self, server: FastMCP[Any]) -> None:
         """Serve ``subscriptions/listen`` on ``server`` and remember legacy connections."""
         server._mcp_server.add_request_handler(  # pyright: ignore[reportPrivateUsage]
-            LISTEN_METHOD, mcp_types.SubscriptionsListenRequestParams, self.listen
+            LISTEN_METHOD, mcp_types.SubscriptionsListenRequestParams, self._serve_listen
         )
         server.add_middleware(_SessionRecorder(self))
 
@@ -58,8 +62,23 @@ class ServerChanges:
         connection: Connection = session._connection  # pyright: ignore[reportPrivateUsage]
         if connection.protocol_version in MODERN_PROTOCOL_VERSIONS:
             return
-        if connection.has_standalone_channel:
+        if connection.has_standalone_channel and connection not in self._listening:
             self._legacy.add(connection)
+
+    async def _serve_listen(
+        self, ctx: ServerRequestContext[Any, Any], params: mcp_types.SubscriptionsListenRequestParams
+    ) -> mcp_types.SubscriptionsListenResult:
+        connection: Connection = ctx.session._connection  # pyright: ignore[reportPrivateUsage]
+        self._listening[connection] = self._listening.get(connection, 0) + 1
+        self._legacy.discard(connection)
+        try:
+            return await self.listen(ctx, params)
+        finally:
+            left = self._listening.get(connection, 1) - 1
+            if left > 0:
+                self._listening[connection] = left
+            else:
+                self._listening.pop(connection, None)
 
     async def resource_updated(self, uri: str) -> None:
         await self._publish(ResourceUpdated(uri=uri))
@@ -77,6 +96,8 @@ class ServerChanges:
     async def _publish(self, event: ServerEvent) -> None:
         await self.bus.publish(event)
         for connection in list(self._legacy):
+            if connection in self._listening:
+                continue
             try:
                 if isinstance(event, ResourceUpdated):
                     await connection.send_resource_updated(event.uri)

@@ -286,7 +286,7 @@ def _common_draft(site: SiteEntry) -> dict[str, Any]:
 
 def _edit_order(site: SiteEntry, forms: dict[str, Form]) -> list[str]:
     order = [site.adapter, *site.alternatives]
-    return order + [name for name in forms if name not in order]
+    return order + [name for name, item in forms.items() if item.listed and name not in order]
 
 
 def edit_draft(site: SiteEntry, forms: dict[str, Form]) -> dict[str, Any]:
@@ -543,7 +543,7 @@ def add_draft(forms: dict[str, Form]) -> dict[str, Any]:
     """Return the add form's empty draft."""
     return {
         "site": draft(ADD_FIELDS, {"policy": "guarded", "spend": "always"}),
-        "config": {name: draft(item.fields, {}) for name, item in forms.items()},
+        "config": {name: draft(item.fields, {}) for name, item in forms.items() if item.listed},
     }
 
 
@@ -600,6 +600,8 @@ def add_surface(
     children.append(tree.text("add-ways", "How relay reaches it", "h5"))
     tabs: list[dict[str, str]] = []
     for name, adapter_form in forms.items():
+        if not adapter_form.listed:
+            continue
         base = f"add-a-{name}"
         rows = _fields(
             tree,

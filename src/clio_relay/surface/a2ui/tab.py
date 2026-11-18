@@ -215,11 +215,12 @@ class ComputeTab:
     # What the tab shows
 
     def forms(self) -> dict[str, Form]:
-        """Return a form for each installed adapter, by name."""
+        """Return a form for each installed adapter, by name, marking the test-only ones."""
         found: dict[str, Form] = {}
         for name in registry.names():
             try:
-                found[name] = form(name, registry.config_schema(name))
+                cls = registry.load(name)
+                found[name] = form(name, cls.Config.model_json_schema(), listed=cls.listed)
             except Refusal:
                 continue
         return found
@@ -387,6 +388,8 @@ class ComputeTab:
                 await asyncio.to_thread(self._load_state)
                 self.state.notice = "That button was out of date, so the tab has been refreshed."
                 await asyncio.to_thread(self._save_state)
+                # Announced here, so the watcher must not announce the same write again.
+                self._seen = await asyncio.to_thread(self._snapshot)
             await self.changes.resource_updated(TAB_URI)
             refusal = Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
