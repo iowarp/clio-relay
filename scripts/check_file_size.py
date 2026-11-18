@@ -382,7 +382,8 @@ RATCHET_BASELINE: dict[str, int] = {
     # bootstrap-inspect top-level command-module extraction
     # (cli_installation_receipt.py, 446 lines): -346 net lines.
     # #231 cli.py decomposition: jarvis-mcp top-level command-group extraction
-    # -- the thin command layer only (jarvis-mcp-call/jarvis-mcp-refresh/mcp-server into cli_jarvis_mcp.py,
+    # -- the thin command layer only (jarvis-mcp-call/jarvis-mcp-refresh/
+    # mcp-server into cli_jarvis_mcp.py,
     # 662 lines; jarvis-mcp-validate alone into cli_jarvis_mcp_validate.py,
     # 538 lines, since combined they would exceed the 800-line cap). The
     # ~2,450-line JARVIS execution-query engine these commands call stays
@@ -1786,7 +1787,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
 #: Raised to 82.18 (452/550) when W1 split the Compute tab's add form and
 #: message builders out of W14's surfaces.py.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 82.18
+SRC_DISTRIBUTION_BASELINE_PERCENT = 82.29
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -1800,7 +1801,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 82.18
 #: tests/relay_next/test_compute_tab_changes.py, and to 77.53 (176/227) when its
 #: form tests moved to tests/relay_next/test_compute_tab_forms.py.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.53
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.97
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
