@@ -171,7 +171,9 @@ class RelayService:
             return spec
         return spec.model_copy(update={"attributes": attributes.model_copy(update=changes)})
 
-    async def start_run(self, site_id: str, spec: JobSpec, *, task: bool = False) -> OperationRecord:
+    async def start_run(
+        self, site_id: str, spec: JobSpec, *, task: bool = False
+    ) -> OperationRecord:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
         spec = self.apply_defaults(site, spec)
@@ -462,7 +464,9 @@ class RelayService:
         deadline = loop.time() + max(0.0, timeout_s)
         while True:
             record = await self.refresh(operation_id)
-            if record.state.final or record.state == OperationState.AWAITING_INPUT:
+            if record.state.final:
+                return record
+            if record.state == OperationState.AWAITING_INPUT and self.outstanding(record):
                 return record
             if loop.time() >= deadline:
                 return record
@@ -484,9 +488,7 @@ class RelayService:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
         (await self.guard.check_exec(site, command)).raise_if_refused()
         adapter = self.adapter_for(site, "exec")
-        result = await adapter.exec(
-            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes
-        )
+        result = await adapter.exec(command, timeout_s=timeout_s, max_output_bytes=max_output_bytes)
         return result.model_dump(mode="json")
 
     # views

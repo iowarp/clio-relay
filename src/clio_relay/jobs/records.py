@@ -11,7 +11,7 @@ import json
 import os
 import secrets
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
@@ -113,7 +113,7 @@ class RecordStore[RecordT: BaseModel]:
         self._locks.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     @contextmanager
-    def locked(self, record_id: str, timeout: float = 30.0) -> Iterator[None]:
+    def locked(self, record_id: str, timeout: float = 30.0) -> Generator[None]:
         """Hold the record's lock, across processes."""
         self._ensure()
         with FileLock(str(self._locks / f"{_safe_id(record_id)}.lock"), timeout=timeout):

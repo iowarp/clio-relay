@@ -72,7 +72,9 @@ INSTRUCTIONS = (
 def refusal_result(refusal: Refusal) -> ToolResult:
     """Render a refusal as an error tool result with a typed reason."""
     return ToolResult(
-        content=[mcp_types.TextContent(type="text", text=f"{refusal.reason.value}: {refusal.message}")],
+        content=[
+            mcp_types.TextContent(type="text", text=f"{refusal.reason.value}: {refusal.message}")
+        ],
         structured_content={"refusal": refusal.to_dict()},
         is_error=True,
     )
@@ -87,8 +89,8 @@ def _summary(view: dict[str, Any]) -> str:
     if view.get("exit_code") is not None:
         line += f" with exit code {view['exit_code']}"
     line += "."
-    result = view.get("result") or {}
-    tail = result.get("stdout_tail")
+    result: dict[str, Any] = view.get("result") or {}
+    tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
     if view.get("error"):
@@ -266,25 +268,30 @@ class RelayTasksExtension(ServerExtension):
             )
         if record.state.final:
             result = operation_result(self.service.view(record))
-            return GetTaskResult(
-                **fields,
-                result=result.to_mcp_result().model_dump(by_alias=True, mode="json", exclude_none=True)
-                if hasattr(result, "to_mcp_result")
-                else {
-                    "content": [item.model_dump(mode="json") for item in result.content],
+            final = mcp_types.CallToolResult.model_validate(
+                {
+                    "content": result.content,
                     "structuredContent": result.structured_content,
                     "isError": result.is_error,
-                },
+                    "_meta": result.meta,
+                }
+            )
+            return GetTaskResult(
+                **fields, result=final.model_dump(by_alias=True, mode="json", exclude_none=True)
             )
         return GetTaskResult(**fields)
 
-    async def _get(self, ctx: ServerRequestContext[Any, Any], params: GetTaskParams) -> GetTaskResult:
+    async def _get(
+        self, ctx: ServerRequestContext[Any, Any], params: GetTaskParams
+    ) -> GetTaskResult:
         self._require(ctx)
         self._record(params.task_id)
         try:
             record = await self.service.refresh(params.task_id)
         except Refusal as refusal:
-            raise MCPError(code=-32603, message=refusal.message, data=refusal.to_dict()) from refusal
+            raise MCPError(
+                code=-32603, message=refusal.message, data=refusal.to_dict()
+            ) from refusal
         return await self.task_result(record)
 
     async def _update(
@@ -516,7 +523,12 @@ class RelayServer:
                 data = await access.read(_need(path, "path"), offset=offset, limit=cap)
                 try:
                     decoded = data.decode("utf-8")
-                    structured = {"path": path, "offset": offset, "size": len(data), "text": decoded}
+                    structured = {
+                        "path": path,
+                        "offset": offset,
+                        "size": len(data),
+                        "text": decoded,
+                    }
                     text = decoded
                 except UnicodeDecodeError:
                     encoded = base64.b64encode(data).decode("ascii")
@@ -583,9 +595,9 @@ class RelayServer:
         @server.tool(
             name="describe",
             title="Describe relay, a site, or an operation",
-            annotations=mcp_types.ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+            annotations=mcp_types.ToolAnnotations(read_only_hint=True, open_world_hint=True),
         )
-        async def describe(
+        async def describe(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str | None, Field(description="A site id")] = None,
             job: Annotated[str | None, Field(description="An operation id")] = None,
         ) -> ToolResult:
@@ -605,15 +617,17 @@ class RelayServer:
         @server.tool(
             name="run",
             title="Run a job on a site",
-            annotations=mcp_types.ToolAnnotations(destructiveHint=False, openWorldHint=True),
+            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
             task=TaskConfig(
                 mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
             ),
         )
-        async def run(
+        async def run(  # pyright: ignore[reportUnusedFunction]
             ctx: Context,
             site: Annotated[str | None, Field(description="The site id")] = None,
-            spec: Annotated[JobSpec | None, Field(description="The job, as a PSI/J JobSpec")] = None,
+            spec: Annotated[
+                JobSpec | None, Field(description="The job, as a PSI/J JobSpec")
+            ] = None,
             cancel: Annotated[str | None, Field(description="An operation id to cancel")] = None,
             resume: Annotated[
                 str | None, Field(description="An operation id waiting on a person")
@@ -629,9 +643,9 @@ class RelayServer:
         @server.tool(
             name="exec",
             title="Run one short command on a site",
-            annotations=mcp_types.ToolAnnotations(destructiveHint=True, openWorldHint=True),
+            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
         )
-        async def exec_(
+        async def exec_(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
             command: Annotated[list[str], Field(min_length=1, description="argv, no shell")],
             timeout_s: Annotated[float, Field(gt=0, le=600)] = 60,
@@ -643,9 +657,9 @@ class RelayServer:
         @server.tool(
             name="files",
             title="List, read, write and stage files on a site",
-            annotations=mcp_types.ToolAnnotations(destructiveHint=True, openWorldHint=True),
+            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
         )
-        async def files(
+        async def files(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
             op: Literal["list", "stat", "read", "write", "stage", "has"],
             path: str | None = None,
@@ -667,9 +681,9 @@ class RelayServer:
         @server.tool(
             name="serve",
             title="Start a service on a site",
-            annotations=mcp_types.ToolAnnotations(destructiveHint=False, openWorldHint=True),
+            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
         )
-        async def serve(
+        async def serve(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
             spec: ServiceSpec,
         ) -> ToolResult:

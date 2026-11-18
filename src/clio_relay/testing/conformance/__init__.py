@@ -280,9 +280,7 @@ class AdapterConformance:
         handle = await adapter.run(spec, operation_id=new_id("op"))
         status, _ = await wait_final(adapter, handle, target.job_timeout_s, target.poll_s)
         assert status.state == JobState.COMPLETED, status
-        missing = spec.model_copy(
-            update={"inputs": [InputRef(name="input.txt", sha256="0" * 64)]}
-        )
+        missing = spec.model_copy(update={"inputs": [InputRef(name="input.txt", sha256="0" * 64)]})
         with pytest.raises(Refusal) as refused:
             await adapter.run(missing, operation_id=new_id("op"))
         assert refused.value.reason == RefusalReason.INPUT_MISSING

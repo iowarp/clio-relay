@@ -8,7 +8,7 @@ import os
 import secrets
 import sys
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import typer
 import yaml
@@ -122,7 +122,11 @@ def site_add(
 ) -> None:
     """Add a site."""
     try:
-        settings = yaml.safe_load(config) or {}
+        loaded: Any = yaml.safe_load(config) or {}
+        if not isinstance(loaded, dict):
+            typer.echo("config must be a mapping", err=True)
+            raise typer.Exit(2)
+        settings = cast(dict[str, Any], loaded)
         registry.validate_config(adapter, settings)
         ask: Any = spend if spend in ("always", "never") else float(spend)
         entry = SiteEntry.model_validate(
@@ -233,7 +237,7 @@ def asks_answer(
         if current.kind == "approve":
             content = {"approve": not decline}
         elif current.kind == "choose":
-            properties = (current.requested_schema or {}).get("properties") or {}
+            properties: dict[str, Any] = (current.requested_schema or {}).get("properties") or {}
             field = next(iter(properties), "value")
             content = {field: value}
         ask = service.answer(ask_id, "decline" if decline else "accept", content, by="cli")

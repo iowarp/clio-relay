@@ -70,7 +70,7 @@ class LoopbackPages:
         port = server.server_address[1]
         return f"http://{self.host}:{port}/asks/{ask.ask_id}?t={tokens.page}"
 
-    def _check(self, ask_id: str, page: str, form: str | None) -> _PageTokens | None:
+    def check(self, ask_id: str, page: str, form: str | None) -> _PageTokens | None:
         with self._lock:
             tokens = self._tokens.get(ask_id)
         if tokens is None or not secrets.compare_digest(tokens.page, page):
@@ -79,7 +79,7 @@ class LoopbackPages:
             return None
         return tokens
 
-    def _spend(self, ask_id: str) -> None:
+    def spend(self, ask_id: str) -> None:
         with self._lock:
             self._tokens.pop(ask_id, None)
 
@@ -143,7 +143,7 @@ class _Handler(BaseHTTPRequestHandler):
         ask_id = self._ask_id()
         query = parse_qs(urlsplit(self.path).query)
         page = (query.get("t") or [""])[0]
-        tokens = self.owner._check(ask_id, page, None) if ask_id else None  # noqa: SLF001
+        tokens = self.owner.check(ask_id, page, None) if ask_id else None
         ask = self.owner.asks.get(ask_id) if ask_id and tokens else None
         if ask is None or tokens is None:
             self._send(HTTPStatus.NOT_FOUND, _page("Not found", "<p>This page has expired.</p>"))
@@ -159,13 +159,13 @@ class _Handler(BaseHTTPRequestHandler):
         fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
         page = (fields.get("t") or [""])[0]
         form = (fields.get("csrf") or [""])[0]
-        if self.owner._check(ask_id, page, form) is None:  # noqa: SLF001
+        if self.owner.check(ask_id, page, form) is None:
             self._send(HTTPStatus.FORBIDDEN, _page("Expired", "<p>This page has expired.</p>"))
             return
         action = (fields.get("action") or ["decline"])[0]
         value = (fields.get("value") or [None])[0]
         ask = self.owner.answer(ask_id, action, value)
-        self.owner._spend(ask_id)  # noqa: SLF001
+        self.owner.spend(ask_id)
         if ask is None:
             self._send(HTTPStatus.NOT_FOUND, _page("Not found", "<p>This ask is gone.</p>"))
             return
