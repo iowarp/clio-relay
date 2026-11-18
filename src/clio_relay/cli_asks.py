@@ -234,9 +234,7 @@ async def _sign_in(name: str) -> str:
             def error(refusal: Refusal) -> None:
                 typer.echo(f"{refusal.message}. Trying again.", err=True)
 
-            found = await device.follow(
-                identity, ctx, step, on_new_step=new_step, on_error=error
-            )
+            found = await device.follow(identity, ctx, step, on_new_step=new_step, on_error=error)
             if found is None:
                 _fail("the sign-in did not finish")
             result = found

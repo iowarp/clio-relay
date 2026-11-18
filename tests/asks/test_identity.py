@@ -33,8 +33,8 @@ from clio_relay.identity import (
     SignInStep,
     Token,
     TokenStore,
+    device,
 )
-from clio_relay.identity import device
 from clio_relay.identity import probe as probe_module
 from clio_relay.identity.github import GitHubIdentity
 from clio_relay.identity.globus import GlobusIdentity
@@ -655,7 +655,9 @@ async def test_follow_asks_again_and_stops_when_told() -> None:
         stopped = await device.follow(stub, ctx, ctx.step, running=lambda: False)
         assert stopped is None
     assert not device.polls(SignInStep(url="https://x.invalid/", relay_page=False))
-    assert not device.polls(SignInStep(url="https://x.invalid/", relay_page=True, accepts_code=True))
+    assert not device.polls(
+        SignInStep(url="https://x.invalid/", relay_page=True, accepts_code=True)
+    )
 
 
 # Probing

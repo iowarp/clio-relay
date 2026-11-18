@@ -381,6 +381,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
   - A factory takes `IdentityContext(store, grants, settings)`.
   - A provider meets the `IdentityProvider` Protocol in `identity/base.py`: `name` and `title`, plus async `status()`, `token(resource_server=None)`, `begin(ctx)`, `poll(ctx, step)`, `callback(ctx, params)` and `sign_out()`.
   - A redirect provider keeps its OAuth state in `step.data["state"]`. `step.data` is never shown or written down.
+  - **A device flow** sets `poll_interval_s` on its step. Relay polls at that interval whether `relay_page` is true or false, and adds 5 s when the provider answers `slow_down`. When the code expires (`poll` returns `expired`, or the step's optional `expires_at` passes), relay calls `begin` again and shows the new link and code on the same ask's page. The ask stays pending, and nothing limits how long the person takes. `clio_relay.identity.device.follow` is the shared loop, used by both the page and `asks sign-in`.
 - **Shared identities for adapters.** `clio_relay.identity.shared()` returns the `Identities` the serving relay uses, so it sees `--grant-file`. Outside a serving relay it builds one from `CLIO_RELAY_GRANT_FILE_<PROVIDER>` and the keyring. `shared().get("globus")` returns a built provider.
 - **Grant files.** `GrantFiles` reads `CLIO_RELAY_GRANT_FILE_<PROVIDER>`, overridden by `--grant-file PROVIDER=PATH`. It re-reads a file when its mtime, size or inode changes. A grant token comes before a keyring token. On a change, `GrantWatcher` probes the sites that name that identity (`identity/probe.py`; results in `<state>/identity/probes.json`).
 - **The keyring.** `TokenStore` uses keyring service `clio-relay` with JSON entries. Secrets typed on the page are kept as `secret:<name>`, read with `TokenStore().secret(name)`, and written with `set_secret` and `delete_secret`. `CLIO_RELAY_KEYRING=memory` keeps entries in the process, for tests.
@@ -419,7 +420,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
 
 ### Evidence
 
-`tests/asks` on Ares at 8b13e42 (`CLIO_RELAY_KEYRING=memory`): **68 passed, 0 skipped**. That includes `test_askpass_otp`: real ssh to fx-otp (127.0.0.1:47103), with the key and then a TOTP typed on relay's page, answered and declined. ruff, `ruff format --check` and strict pyright are clean on the W6 files.
+`tests/asks` on Ares at 8b13e42 (`CLIO_RELAY_KEYRING=memory`): **68 passed, 0 skipped**. After the device-flow fix: **71 passed, 0 skipped, 0 failed**. That includes `test_askpass_otp`: real ssh to fx-otp (127.0.0.1:47103), with the key and then a TOTP typed on relay's page, answered and declined. ruff, `ruff format --check` and strict pyright are clean on the W6 files.
 
 `tests/relay_next` with W6 installed: everything passes except `test_transports.py::test_plain_mcp_client_over_http[legacy]` and `[auto]`. W1's helper opens the HTTP page without the operator credential, and the stub it was written against had none. This is a request to W1 (see Open).
 
