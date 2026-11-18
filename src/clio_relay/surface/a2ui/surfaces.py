@@ -1,9 +1,9 @@
-"""The Compute tab's two surfaces: the sites and the add-site form (RL32, RL50).
+"""The Compute tab's sites surface and the names both surfaces share (RL32, RL50).
 
 These builders are pure. They take what the tab knows about each site, mint one
 action token per button, and return components and a data model. The tab
 (:mod:`clio_relay.surface.a2ui.tab`) gathers the facts and wraps the result in
-A2UI messages.
+A2UI messages. The add-site form is in :mod:`clio_relay.surface.a2ui.adding`.
 
 Text is English. No locale reaches an MCP server, so CLIO shows relay's words as
 relay sends them.
@@ -17,8 +17,7 @@ from typing import Any, cast
 
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui.components import Tree, bound, event, open_url
-from clio_relay.surface.a2ui.forms import Field, Form, draft
-from clio_relay.surface.a2ui.protocol import A2UIClient, Message
+from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error
 from clio_relay.surface.a2ui.tokens import ActionTokens
 
 SITES_SURFACE = "relay-sites"
@@ -48,7 +47,6 @@ ACTIONS = (
 )
 
 HOST_SIGN_IN = "data_source/login/"
-FORM_ERROR = ""
 
 POLICY = Field(
     "policy",
@@ -211,63 +209,6 @@ def summary(views: list[SiteView], notice: str = "") -> str:
     return "\n".join(lines)
 
 
-# Fields
-
-
-def field_components(tree: Tree, base: str, item: Field, path: str, error: str | None) -> list[str]:
-    """Add one form field, its help and its error, and return their ids."""
-    label = f"{item.label} (required)" if item.required else item.label
-    value = bound(path)
-    if item.kind == "bool":
-        ids = [tree.add(base, "CheckBox", label=label, value=value)]
-    elif item.kind == "choice":
-        ids = [
-            tree.add(
-                base,
-                "ChoicePicker",
-                label=label,
-                options=item.option_labels(),
-                value=value,
-                variant="mutuallyExclusive",
-                displayStyle="chips",
-            )
-        ]
-    else:
-        variant = {
-            "number": "number",
-            "integer": "number",
-            "lines": "longText",
-            "yaml": "longText",
-        }.get(item.kind, "shortText")
-        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant)]
-    if error:
-        ids.append(tree.text(f"{base}-error", error, "caption"))
-    if item.help:
-        ids.append(tree.text(f"{base}-help", item.help, "caption"))
-    return ids
-
-
-def _fields(
-    tree: Tree,
-    base: str,
-    fields: tuple[Field, ...],
-    path: str,
-    errors: dict[str, str],
-    prefix: str,
-) -> list[str]:
-    ids: list[str] = []
-    for item in fields:
-        ids += field_components(
-            tree, f"{base}-f-{item.key}", item, f"{path}/{item.key}", errors.get(prefix + item.key)
-        )
-    return ids
-
-
-def _form_error(tree: Tree, base: str, errors: dict[str, str]) -> list[str]:
-    message = errors.get(FORM_ERROR)
-    return [tree.text(f"{base}-error", message, "caption")] if message else []
-
-
 # The sites surface
 
 
@@ -311,8 +252,8 @@ def _edit_form(
     base = f"e-{site.id}"
     path = f"/drafts/{site.id}"
     children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4")]
-    children += _form_error(tree, base, errors)
-    children += _fields(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.")
+    children += form_error(tree, base, errors)
+    children += field_rows(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.")
     children.append(tree.text(f"{base}-ways", "Ways in", "h5"))
     tabs: list[dict[str, str]] = []
     for name in _edit_order(site, forms):
@@ -333,7 +274,7 @@ def _edit_form(
                     value=bound(f"{adapter_path}/use"),
                 )
             )
-        rows += _fields(
+        rows += field_rows(
             tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}."
         )
         if not adapter_form.fields:
@@ -463,7 +404,7 @@ def site_card(
         children.append(tree.button(f"{base}-open", "Open the sign-in page", open_url(link)))
     errors = state.errors.get(site.id, {})
     if site.id not in state.editing:
-        children += _form_error(tree, base, errors)
+        children += form_error(tree, base, errors)
     buttons: list[str] = []
     connect = _connect_button(tree, base, view, tokens)
     if connect:
@@ -534,143 +475,3 @@ def sites_surface(
         },
     }
     return tree.components, data
-
-
-# The add surface
-
-
-def add_draft(forms: dict[str, Form]) -> dict[str, Any]:
-    """Return the add form's empty draft."""
-    return {
-        "site": draft(ADD_FIELDS, {"policy": "guarded", "spend": "always"}),
-        "config": {name: draft(item.fields, {}) for name, item in forms.items() if item.listed},
-    }
-
-
-def add_surface(
-    forms: dict[str, Form],
-    catalog: list[SiteEntry],
-    state: TabState,
-    tokens: ActionTokens,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return the add-site surface's components and data model."""
-    tree = Tree()
-    errors = state.errors.get(ADD_SURFACE, {})
-    children = [tree.text("add-title", "Add a site", "h2")]
-    if catalog:
-        children.append(tree.text("add-catalog-title", "From the catalog", "h4"))
-        children.append(
-            tree.add(
-                "add-catalog-site",
-                "ChoicePicker",
-                label="Site",
-                options=[{"label": entry.title, "value": entry.id} for entry in catalog],
-                value=bound("/catalog/id"),
-                variant="mutuallyExclusive",
-                displayStyle="chips",
-            )
-        )
-        children.append(
-            tree.add(
-                "add-catalog-id",
-                "TextField",
-                label="Site ID (optional)",
-                value=bound("/catalog/site_id"),
-                variant="shortText",
-            )
-        )
-        message = errors.get("catalog")
-        if message:
-            children.append(tree.text("add-catalog-error", message, "caption"))
-        children.append(
-            tree.button(
-                "add-catalog",
-                "Add from catalog",
-                event(
-                    ADD_FROM_CATALOG,
-                    {"token": tokens.mint(ADD_FROM_CATALOG), "values": bound("/catalog")},
-                ),
-                "primary",
-            )
-        )
-        children.append(tree.divider("add-divider"))
-    children.append(tree.text("add-own-title", "Your own", "h4"))
-    children += _form_error(tree, "add", errors)
-    children += _fields(tree, "add-s", ADD_FIELDS, "/drafts/add/site", errors, "site.")
-    children.append(tree.text("add-ways", "How relay reaches it", "h5"))
-    tabs: list[dict[str, str]] = []
-    for name, adapter_form in forms.items():
-        if not adapter_form.listed:
-            continue
-        base = f"add-a-{name}"
-        rows = _fields(
-            tree,
-            base,
-            adapter_form.fields,
-            f"/drafts/add/config/{name}",
-            errors,
-            f"config.{name}.",
-        )
-        if not adapter_form.fields:
-            rows.append(tree.text(f"{base}-none", "No settings", "caption"))
-        rows.append(
-            tree.button(
-                f"{base}-add",
-                "Add site",
-                event(
-                    ADD_SITE, {"token": tokens.mint(ADD_SITE, name), "values": bound("/drafts/add")}
-                ),
-                "primary",
-            )
-        )
-        tabs.append({"title": name, "child": tree.column(f"{base}-col", rows)})
-    if tabs:
-        children.append(tree.add("add-tabs", "Tabs", tabs=tabs))
-    tree.column("root", children)
-    data: dict[str, Any] = {
-        "catalog": {"id": [catalog[0].id] if catalog else [], "site_id": ""},
-        "drafts": {"add": add_draft(forms)},
-    }
-    return tree.components, data
-
-
-# Messages
-
-
-def create(
-    client: A2UIClient, surface_id: str, components: list[dict[str, Any]], data: dict[str, Any]
-) -> list[Message]:
-    """Return the messages that create a surface (a tab read)."""
-    return [
-        {
-            "version": client.version,
-            "createSurface": {"surfaceId": surface_id, "catalogId": client.catalog_id},
-        },
-        *update(client, surface_id, components, data),
-    ]
-
-
-def update(
-    client: A2UIClient,
-    surface_id: str,
-    components: list[dict[str, Any]],
-    data: dict[str, Any] | None,
-) -> list[Message]:
-    """Return the messages that redraw a surface CLIO already holds (a tool result).
-
-    ``data`` None keeps the person's drafts as they are.
-    """
-    messages: list[Message] = [
-        {
-            "version": client.version,
-            "updateComponents": {"surfaceId": surface_id, "components": components},
-        }
-    ]
-    if data is not None:
-        messages.append(
-            {
-                "version": client.version,
-                "updateDataModel": {"surfaceId": surface_id, "path": "/", "value": data},
-            }
-        )
-    return messages

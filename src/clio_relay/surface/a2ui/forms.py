@@ -20,6 +20,11 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from clio_relay.surface.a2ui.components import Tree, bound
+
+FORM_ERROR = ""
+"""The error key for a message about the whole form, not one field."""
+
 Kind = Literal["text", "number", "integer", "bool", "choice", "lines", "yaml"]
 
 _WORDS = {
@@ -227,3 +232,61 @@ _ID = re.compile(r"[^a-z0-9_-]+")
 def suggest_id(name: str) -> str:
     """Return a site id made from a display name."""
     return _ID.sub("-", name.lower()).strip("-")[:63]
+
+
+# Components for a form's fields
+
+
+def field_components(tree: Tree, base: str, item: Field, path: str, error: str | None) -> list[str]:
+    """Add one form field, its help and its error, and return their ids."""
+    label = f"{item.label} (required)" if item.required else item.label
+    value = bound(path)
+    if item.kind == "bool":
+        ids = [tree.add(base, "CheckBox", label=label, value=value)]
+    elif item.kind == "choice":
+        ids = [
+            tree.add(
+                base,
+                "ChoicePicker",
+                label=label,
+                options=item.option_labels(),
+                value=value,
+                variant="mutuallyExclusive",
+                displayStyle="chips",
+            )
+        ]
+    else:
+        variant = {
+            "number": "number",
+            "integer": "number",
+            "lines": "longText",
+            "yaml": "longText",
+        }.get(item.kind, "shortText")
+        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant)]
+    if error:
+        ids.append(tree.text(f"{base}-error", error, "caption"))
+    if item.help:
+        ids.append(tree.text(f"{base}-help", item.help, "caption"))
+    return ids
+
+
+def field_rows(
+    tree: Tree,
+    base: str,
+    fields: tuple[Field, ...],
+    path: str,
+    errors: dict[str, str],
+    prefix: str,
+) -> list[str]:
+    ids: list[str] = []
+    for item in fields:
+        ids += field_components(
+            tree, f"{base}-f-{item.key}", item, f"{path}/{item.key}", errors.get(prefix + item.key)
+        )
+    return ids
+
+
+def form_error(tree: Tree, base: str, errors: dict[str, str]) -> list[str]:
+    message = errors.get(FORM_ERROR)
+    return [tree.text(f"{base}-error", message, "caption")] if message else []
+

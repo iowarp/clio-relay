@@ -38,14 +38,21 @@ from clio_relay.identity.probe import probe_site, probes_file
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface.a2ui import surfaces
-from clio_relay.surface.a2ui.forms import Field, Form, FormError, form, parse, parse_value
+from clio_relay.surface.a2ui import adding, protocol, surfaces
+from clio_relay.surface.a2ui.forms import (
+    FORM_ERROR,
+    Field,
+    Form,
+    FormError,
+    form,
+    parse,
+    parse_value,
+)
 from clio_relay.surface.a2ui.protocol import MIME_TYPE, A2UIClient, Message, a2ui_client, embedded
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
     ADD_SURFACE,
     EDIT_FIELDS,
-    FORM_ERROR,
     SITES_SURFACE,
     SiteView,
     TabState,
@@ -326,7 +333,7 @@ class ComputeTab:
         forms = self.forms()
         return {
             SITES_SURFACE: surfaces.sites_surface(views, self.state, forms, self.tokens),
-            ADD_SURFACE: surfaces.add_surface(forms, self._catalog(), self.state, self.tokens),
+            ADD_SURFACE: adding.add_surface(forms, self._catalog(), self.state, self.tokens),
         }
 
     async def read(self, client: A2UIClient | None) -> ResourceResult:
@@ -340,7 +347,7 @@ class ComputeTab:
             )
         messages: list[Message] = []
         for surface_id, (components, data) in (await self._surfaces(views)).items():
-            messages += surfaces.create(client, surface_id, components, data)
+            messages += protocol.create(client, surface_id, components, data)
         return ResourceResult([ResourceContent(json.dumps(messages), MIME_TYPE)])
 
     # Watching for changes made elsewhere
@@ -424,7 +431,7 @@ class ComputeTab:
             if client is not None:
                 messages: list[Message] = []
                 for surface_id, (components, data) in (await self._surfaces(views)).items():
-                    messages += surfaces.update(client, surface_id, components, None)
+                    messages += protocol.update(client, surface_id, components, None)
                     for path in outcome.resend.get(surface_id, ()):
                         messages.append(
                             {

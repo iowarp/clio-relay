@@ -92,3 +92,42 @@ def embedded(uri: str, messages: list[Message]) -> mcp_types.EmbeddedResource:
             uri=uri, mime_type=MIME_TYPE, text=json.dumps(messages)
         ),
     )
+
+
+def create(
+    client: A2UIClient, surface_id: str, components: list[dict[str, Any]], data: dict[str, Any]
+) -> list[Message]:
+    """Return the messages that create a surface (a tab read)."""
+    return [
+        {
+            "version": client.version,
+            "createSurface": {"surfaceId": surface_id, "catalogId": client.catalog_id},
+        },
+        *update(client, surface_id, components, data),
+    ]
+
+
+def update(
+    client: A2UIClient,
+    surface_id: str,
+    components: list[dict[str, Any]],
+    data: dict[str, Any] | None,
+) -> list[Message]:
+    """Return the messages that redraw a surface CLIO already holds (a tool result).
+
+    ``data`` None keeps the person's drafts as they are.
+    """
+    messages: list[Message] = [
+        {
+            "version": client.version,
+            "updateComponents": {"surfaceId": surface_id, "components": components},
+        }
+    ]
+    if data is not None:
+        messages.append(
+            {
+                "version": client.version,
+                "updateDataModel": {"surfaceId": surface_id, "path": "/", "value": data},
+            }
+        )
+    return messages

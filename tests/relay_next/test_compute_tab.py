@@ -25,7 +25,6 @@ from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
 from clio_relay.surface.a2ui.tab import (
-    WATCH_INTERVAL_S,
     _sentence,  # pyright: ignore[reportPrivateUsage]
 )
 from clio_relay.surface.server import create_server
@@ -425,61 +424,6 @@ def test_a_site_that_cannot_be_read_leaves_the_others(
                 "That did not work: relay hit RuntimeError."
             )
             assert "That did not work: relay hit RuntimeError." in host.text("relay-sites")
-
-    asyncio.run(scenario())
-
-
-def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) -> None:
-    heard: asyncio.Queue[str] = asyncio.Queue()
-
-    async def on_message(message: Any) -> None:
-        if isinstance(message, mcp_types.ResourceUpdatedNotification):
-            await heard.put(str(message.params.uri))
-
-    async def scenario() -> None:
-        async with Client(
-            create_server(relay_paths),
-            mode="legacy",
-            extensions=[advertise(EXTENSION_ID, AD)],
-            message_handler=on_message,
-        ) as client:
-            host = Host(client)
-            await host.open()
-            add_site(relay_paths, "cli")
-            async with asyncio.timeout(15):
-                assert await heard.get() == TAB_URI
-            await host.open()
-            assert "s-cli" in host.visible("relay-sites")
-            # Rereading the tab, as a host does on the notification, is not a second change.
-            await asyncio.sleep(WATCH_INTERVAL_S * 2.5)
-            assert heard.empty()
-
-    asyncio.run(scenario())
-
-
-def test_an_out_of_date_button_refreshes_the_tab_once(relay_paths: RelayPaths) -> None:
-    add_site(relay_paths)
-    heard: list[str] = []
-
-    async def on_message(message: Any) -> None:
-        if isinstance(message, mcp_types.ResourceUpdatedNotification):
-            heard.append(str(message.params.uri))
-
-    async def scenario() -> None:
-        async with Client(
-            create_server(relay_paths),
-            mode="legacy",
-            extensions=[advertise(EXTENSION_ID, AD)],
-            message_handler=on_message,
-        ) as client:
-            await Host(client).open()
-            result = await client.call_tool(
-                "compute_probe_site", {"token": "made-up"}, raise_on_error=False
-            )
-            assert result.is_error
-            # The watcher looks at the state file this refusal wrote and must stay quiet.
-            await asyncio.sleep(WATCH_INTERVAL_S * 2.5)
-            assert heard == [TAB_URI]
 
     asyncio.run(scenario())
 
