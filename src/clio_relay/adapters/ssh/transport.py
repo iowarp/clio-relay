@@ -21,9 +21,9 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from clio_relay.adapters.ssh.config import SshConfig
+from clio_relay.asks import askpass
 from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -246,15 +246,6 @@ def is_network_failure(result: Completed) -> bool:
     return result.exit_code == 255 and any(marker in text for marker in _NETWORK_MARKERS)
 
 
-def _askpass_module() -> Any | None:
-    try:
-        from clio_relay.asks import askpass  # pyright: ignore
-
-        return askpass  # pyright: ignore
-    except ImportError:
-        return None
-
-
 def _short_dir(preferred: Path) -> Path:
     """Return a directory whose socket paths fit the 104-byte Unix limit."""
     if len(str(preferred)) + 42 < 100:
@@ -301,10 +292,8 @@ class SshTransport:
         return options
 
     def _use_askpass(self) -> bool:
-        """Return whether a sign-in can answer the site's prompts (W6's page or a program)."""
-        return self.config.interactive_sign_in and (
-            _askpass_module() is not None or bool(self.config.askpass)
-        )
+        """Return whether ssh's prompts go to relay's askpass (the page, or a program)."""
+        return self.config.interactive_sign_in
 
     def ssh_argv(self) -> list[str]:
         """Return the base ``ssh`` argv: program, options and host.
@@ -323,18 +312,13 @@ class SshTransport:
         if not self._use_askpass():
             return None
         env = dict(os.environ)
-        askpass = _askpass_module()
-        if askpass is not None:
-            env.update(
-                askpass.environment(
-                    site=self.site_id,
-                    operation_id=operation_id,
-                    title=f"Sign in to {self.site_id}",
-                )
+        env.update(
+            askpass.environment(
+                site=self.site_id,
+                operation_id=operation_id,
+                title=f"Sign in to {self.site_id}",
             )
-        else:
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env.setdefault("DISPLAY", ":0")
+        )
         if self.config.askpass:
             env["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
         return env
@@ -524,13 +508,9 @@ class SshTransport:
 
         return _start
 
-    def register_sign_in(self) -> bool:
-        """Offer the starter to the askpass page. Return whether askpass is installed."""
-        askpass = _askpass_module()
-        if askpass is None:
-            return False
+    def register_sign_in(self) -> None:
+        """Offer the starter to relay's sign-in page."""
         askpass.register_sign_in(self.site_id, self.starter())
-        return True
 
     async def stop_master(self) -> None:
         """Close the signed-in master connection, if one is up."""

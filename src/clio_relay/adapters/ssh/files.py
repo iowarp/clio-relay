@@ -11,7 +11,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Literal
 
-from clio_relay.adapters.ssh.scripts import parse_sections, q, root_expression
+from clio_relay.adapters.ssh.scripts import FRESH, parse_sections, q, root_expression
 from clio_relay.adapters.ssh.transport import SshTransport
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -43,7 +43,10 @@ def _entry(line: str) -> FileEntry | None:
 def _start(path: str) -> str:
     if not path:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a path")
-    return 'cd "$HOME" 2>/dev/null\n' + f"p={q(path)}\n" + _STAT
+    # A job on another node may have just written the path; see scripts.FRESH.
+    return (
+        'cd "$HOME" 2>/dev/null\n' + f"p={q(path)}\n" + FRESH + 'fresh "$(dirname "$p")"\n' + _STAT
+    )
 
 
 class SshFileAccess:
@@ -66,6 +69,7 @@ class SshFileAccess:
             _start(path)
             + '[ -e "$p" ] || { echo "@@missing"; exit 0; }\n'
             + '[ -d "$p" ] || { echo "@@notdir"; exit 0; }\n'
+            + 'fresh "$p"\n'
             + 'echo "@@entries"\n'
             + 'for f in "$p"/* "$p"/.[!.]* "$p"/..?*; do\n'
             + '  [ -e "$f" ] || [ -L "$f" ] || continue; st "$f" 2>/dev/null\ndone\n'
@@ -83,6 +87,7 @@ class SshFileAccess:
         script = (
             _start(path)
             + '[ -e "$p" ] || { echo "@@missing"; exit 0; }\n'
+            + '[ -f "$p" ] && : < "$p" 2>/dev/null\n'  # opening it refreshes its size
             + 'echo "@@entry"; st "$p"\n'
         )
         result = await self.transport.ssh(script, timeout_s=self.timeout_s, what="stat")
@@ -104,6 +109,8 @@ class SshFileAccess:
         script = (
             'cd "$HOME" 2>/dev/null\n'
             + f"p={q(path)}\n"
+            + FRESH
+            + 'fresh "$(dirname "$p")"\n'
             + '[ -f "$p" ] || { echo "missing" >&2; exit 44; }\n'
             + f"{command}\n"
         )
@@ -154,6 +161,8 @@ class SshFileAccess:
         script = (
             f"R={root_expression(self.remote_dir)}\n"
             + f"c={self._cas(digest)}\n"
+            + FRESH
+            + 'fresh "${c%/*}"\n'
             + 'if [ -f "$c" ]; then cat >/dev/null; echo "@@have"; exit 0; fi\n'
             + 'mkdir -p "$(dirname "$c")" || exit 45\n'
             + 't="$c.$$"; cat > "$t" || { rm -f "$t"; exit 45; }\n'
@@ -174,7 +183,10 @@ class SshFileAccess:
     async def has(self, digest: str) -> bool:
         script = (
             f"R={root_expression(self.remote_dir)}\n"
-            + f'[ -f {self._cas(digest)} ] && echo "@@have"\nexit 0\n'
+            + f"c={self._cas(digest)}\n"
+            + FRESH
+            + 'fresh "${c%/*}"\n'
+            + '[ -f "$c" ] && echo "@@have"\nexit 0\n'
         )
         result = await self.transport.ssh(script, timeout_s=self.timeout_s, what="checking")
         return "have" in parse_sections(result.text())

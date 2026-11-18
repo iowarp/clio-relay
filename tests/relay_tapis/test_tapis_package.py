@@ -63,6 +63,7 @@ async def test_a_package_runs_through_a_jarvis_of_its_own(
     use_memory_keyring(monkeypatch)
     await sign_in(stub)
     adapter = guarded_adapter(stub, tmp_path)
+    assert adapter.runs_packages
     digest = adapter.context.content.put(package_archive(demo_checkout(tmp_path), ["w10demo"]))
     spec = JobSpec(
         package=PackageRef(
