@@ -72,7 +72,7 @@ class LocalGlobusAdapter(GlobusAdapter):
 
 
 @pytest.fixture(autouse=True)
-def _registered() -> Any:
+def registered_adapter() -> Any:
     registry.register(LocalGlobusAdapter, "globus-local")
     yield
     registry.unregister("globus-local")

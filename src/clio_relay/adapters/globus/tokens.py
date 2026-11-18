@@ -162,14 +162,16 @@ async def status_of(source: TokenProvider) -> str:
     return str(text)
 
 
-async def bearer(source: TokenProvider, resource_server: str, *, what: str) -> str:
+async def bearer(
+    source: TokenProvider, resource_server: str, *, what: str, provider: str = "globus"
+) -> str:
     """Return an access token for ``resource_server`` or refuse with ``needs_sign_in``."""
     token = access_token(await source.token(resource_server=resource_server))
     if token is None:
         raise Refusal(
             RefusalReason.NEEDS_SIGN_IN,
-            f"sign in to Globus so relay can reach {what}",
-            provider="globus",
+            f"sign in to {provider.capitalize()} so relay can reach {what}",
+            provider=provider,
             resource_server=resource_server,
         )
     return token

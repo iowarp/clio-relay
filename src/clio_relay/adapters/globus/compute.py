@@ -146,7 +146,9 @@ class SdkComputeService:
             raise
         except Exception as exc:
             raise _refusal(exc, RefusalReason.SUBMIT_FAILED, "submitting the job") from exc
-        tasks: Any = response.get("tasks", {}) if isinstance(response, dict) else {}
+        tasks: Any = (
+            cast(dict[str, Any], response).get("tasks") if isinstance(response, dict) else None
+        )
         ids: Any = cast(dict[str, Any], tasks).get(function_id) if isinstance(tasks, dict) else None
         if not isinstance(ids, list) or not ids:
             raise Refusal(

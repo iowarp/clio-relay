@@ -28,6 +28,7 @@ def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PL
     import subprocess
     import tempfile
     import time
+    import typing
 
     job_dir = os.path.normpath(os.path.expanduser(str(payload["job_dir"])))
     os.makedirs(job_dir, exist_ok=True)
@@ -47,7 +48,7 @@ def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PL
                 loaded = json.load(handle)
         except (OSError, ValueError):
             return {}
-        return loaded if isinstance(loaded, dict) else {}
+        return typing.cast("dict[str, Any]", loaded) if isinstance(loaded, dict) else {}
 
     def write_state(**fields: "Any") -> "dict[str, Any]":
         state = read_state()
