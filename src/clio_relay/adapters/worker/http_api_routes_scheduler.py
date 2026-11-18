@@ -6,7 +6,7 @@ scheduler status|status-batch|cancel`` dial -- the SAME shape the local
 (on-cluster) CLI subcommands already run when NOT dialing remotely
 (``cli_scheduler.py``'s ``scheduler_status_command``/``_status_batch_
 command``/``_cancel_command``, each delegating to
-``scheduler_providers.provider_for_scheduler(...).poll``/``.cancel`` when
+``worker_scheduler.provider_for_scheduler(...).poll``/``.cancel`` when
 ``should_execute_on_cluster`` is false). These routes expose that exact
 same local capability over the held owned-session channel instead, so
 ``session teardown``'s scheduler-sentinel preflight/cancellation rides the
@@ -37,7 +37,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.params import Depends
 
-from clio_relay import scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 from clio_relay.adapters.worker import door_errors
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.adapters.worker.http_api_models import (
@@ -146,7 +146,7 @@ def register_scheduler_routes(
         _require_owned_scheduler_job(ctx, scheduler_job_id)
         try:
             return _public_record(
-                scheduler_providers.provider_for_scheduler(provider).poll(scheduler_job_id)
+                worker_scheduler.provider_for_scheduler(provider).poll(scheduler_job_id)
             )
         except ConfigurationError as exc:
             raise door_errors.http_problem(
@@ -168,7 +168,7 @@ def register_scheduler_routes(
         refused_ids = sorted(sid for sid in request.scheduler_job_ids if sid not in owned_ids)
         owned_requested = [sid for sid in request.scheduler_job_ids if sid in owned_ids]
         try:
-            scheduler = scheduler_providers.provider_for_scheduler(request.provider)
+            scheduler = worker_scheduler.provider_for_scheduler(request.provider)
             statuses = [
                 scheduler.poll(scheduler_job_id).model_dump(mode="json")
                 for scheduler_job_id in owned_requested
@@ -192,7 +192,7 @@ def register_scheduler_routes(
     ) -> dict[str, object]:
         _require_owned_scheduler_job(ctx, scheduler_job_id)
         try:
-            result = scheduler_providers.provider_for_scheduler(request.provider).cancel(
+            result = worker_scheduler.provider_for_scheduler(request.provider).cancel(
                 scheduler_job_id
             )
         except ConfigurationError as exc:

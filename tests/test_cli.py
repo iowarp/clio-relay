@@ -33,7 +33,7 @@ import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.adapters.worker.cli_session_start as cli_session_start
 import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
-import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
 import clio_relay.adapters.worker.session_start_query as session_start_query
@@ -4953,7 +4953,7 @@ def test_scheduler_sentinel_conflict_fails_before_provider_poll(
     def forbidden_provider(_provider: str | None) -> ForbiddenScheduler:
         return ForbiddenScheduler()
 
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", forbidden_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", forbidden_provider)
     jobs = [
         cli_owned_relay_jobs._OwnedRelayJob(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             job_id="relay-owned",
@@ -5024,7 +5024,7 @@ def test_gateway_scheduler_sentinel_conflict_fails_before_any_destructive_cleanu
         raise AssertionError("gateway sentinel conflict must fail before gateway stop")
 
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", forbidden_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", forbidden_provider)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbidden_teardown)
     monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", forbidden_stop)
     report_path = tmp_path / "gateway-sentinel-conflict.json"
@@ -5090,7 +5090,7 @@ def test_scheduler_sentinel_rejects_unsafe_post_cancel_phase(
     def unsafe_provider(_provider: str | None) -> UnsafeScheduler:
         return UnsafeScheduler()
 
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", unsafe_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", unsafe_provider)
     resources, errors = cli_owned_scheduler_cancel._scheduler_sentinel_preservation_resources(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="ares", ssh_host="ares", scheduler_provider="slurm"),
         {"unrelated-sentinel": "running"},
@@ -5241,7 +5241,7 @@ def test_scheduler_natural_completion_during_cancel_allows_cleanup_without_false
     def completing_provider(_provider: str | None) -> CompletingScheduler:
         return CompletingScheduler()
 
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", completing_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", completing_provider)
     scheduler_resource, error = cli_owned_scheduler_cancel._cancel_owned_scheduler_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ClusterDefinition(name="local", ssh_host="localhost", scheduler_provider="slurm"),
         "scheduler-1",

@@ -10,7 +10,7 @@ through this command group moves with the logic it exercises.
 directly, a separate cli.py-local helper used by session teardown, not one
 of this group's eleven commands.
 
-``monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", ...)``
+``monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", ...)``
 already patched the real owner module directly (the R8(i) idiom, unaffected
 by which file calls it), so no patch-target re-pointing was needed here.
 
@@ -33,7 +33,7 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 from tests.test_cli import (
@@ -76,7 +76,7 @@ def test_scheduler_status_batch_command_returns_each_exact_identity(
     def resolve_provider(_provider: str) -> Any:
         return scheduler
 
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", resolve_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", resolve_provider)
 
     result = CliRunner().invoke(
         app,

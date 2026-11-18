@@ -11,7 +11,7 @@ monolith into their own capped module, per ground rule 2 (SS2) --
 five commands and nothing more.
 
 **Domain logic stays where it lives.** The commands below delegate to
-``endpoint.EndpointWorker``, ``scheduler_providers.provider_for_scheduler``,
+``endpoint.EndpointWorker``, ``worker_scheduler.provider_for_scheduler``,
 ``core_queue.ClioCoreQueue``, and ``installation.worker_runtime_info``
 exactly as they did inside ``cli.py`` -- all already-correct owner modules,
 module-attribute imported since all four are audited patch-seam
@@ -32,7 +32,7 @@ this campaign's broader regression sweep and corrected in place.
 
 **Reassigned patch-seam caller.** ``endpoint.EndpointWorker`` had exactly
 one call site in the whole of ``cli.py`` -- ``endpoint_start`` itself --
-unlike ``scheduler_providers.provider_for_scheduler`` (16 call sites, stays
+unlike ``worker_scheduler.provider_for_scheduler`` (16 call sites, stays
 ``"cli"``) and ``core_queue.ClioCoreQueue``/``installation.
 worker_runtime_info`` (both used by several other groups remaining in
 ``cli.py``, also stay ``"cli"``). This slice reassigns ``EndpointWorker``'s
@@ -75,7 +75,7 @@ import typer
 
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.endpoint as endpoint
-import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 import clio_relay.installation as installation
 from clio_relay.adapters.worker.deployment import (
     render_endpoint_user_service,
@@ -181,7 +181,7 @@ def endpoint_start(
         concurrency=resolved_concurrency,
         kind_concurrency=resolved_kind_concurrency,
         scheduler_provider=(
-            scheduler_providers.provider_for_scheduler(selected_scheduler)
+            worker_scheduler.provider_for_scheduler(selected_scheduler)
             if role == EndpointRole.WORKER
             else None
         ),
@@ -357,7 +357,7 @@ def endpoint_target_info(
     import clio_relay.adapters.worker.cli as cli
 
     def action() -> None:
-        provider = scheduler_providers.provider_for_scheduler(scheduler_provider)
+        provider = worker_scheduler.provider_for_scheduler(scheduler_provider)
         scheduler_cluster_name = provider.scheduler_cluster_name()
         typer.echo(
             json.dumps(

@@ -14,7 +14,7 @@ import typer
 import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
-import clio_relay.adapters.worker.scheduler as scheduler_providers
+import clio_relay.adapters.worker.scheduler as worker_scheduler
 import clio_relay.remote_cli as remote_cli
 from clio_relay.adapters.worker import cli_remote_collection_pagination
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource
@@ -478,7 +478,7 @@ def _scheduler_phase_after_operation(
             if phase == SchedulerPhase.UNKNOWN.value and active_record_found is False:
                 return "missing", None
             return (str(phase), None) if isinstance(phase, str) else (None, None)
-        status = scheduler_providers.provider_for_scheduler(provider).poll(scheduler_job_id)
+        status = worker_scheduler.provider_for_scheduler(provider).poll(scheduler_job_id)
         if status.phase is SchedulerPhase.UNKNOWN and status.active_record_found is False:
             return "missing", None
         return status.phase.value, None
@@ -693,7 +693,7 @@ def _cancel_owned_scheduler_job(
                 stdout_text = raw_stdout.strip() if isinstance(raw_stdout, str) else ""
                 cancel_detail = stderr_text or stdout_text or None
         else:
-            result = scheduler_providers.provider_for_scheduler(provider).cancel(scheduler_job_id)
+            result = worker_scheduler.provider_for_scheduler(provider).cancel(scheduler_job_id)
             accepted = result.returncode == 0
             cancel_detail = result.stderr.strip() or result.stdout.strip() or None
     except (RelayError, json.JSONDecodeError) as exc:
@@ -720,7 +720,7 @@ def _cancel_owned_scheduler_job(
                 last_phase = str(phase) if phase is not None else "unknown"
             else:
                 last_phase = (
-                    scheduler_providers.provider_for_scheduler(provider)
+                    worker_scheduler.provider_for_scheduler(provider)
                     .poll(scheduler_job_id)
                     .phase.value
                 )

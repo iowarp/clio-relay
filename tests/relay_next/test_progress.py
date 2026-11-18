@@ -28,11 +28,12 @@ from .conftest import add_site
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
 VIEW: dict[str, Any] = {
+    "schema": "clio.view-descriptor.v1",
     "path": "/scratch/run/data.bp",
+    "path_kind": "directory",
     "format": "adios2-bp5",
     "reader": "ADIOS2VTXReader",
-    "reader_config": {"engine": "BP5"},
-    "live": True,
+    "growing": True,
 }
 PROVENANCE: dict[str, Any] = {"package": "xcompact3d", "version": "1.0", "hash": "sha256:abc"}
 STEP = JobProgress(
@@ -82,7 +83,13 @@ async def test_a_reported_step_reaches_the_operation_and_the_task(
 
     setattr(adapter, "status", status)  # noqa: B010
     seen = await service.refresh(record.operation_id)
-    assert (seen.result or {})["progress"] == STEP.model_dump(mode="json")
+    stored = (seen.result or {})["progress"]
+    expected = STEP.model_dump(mode="json")
+    assert {key: stored[key] for key in ("step", "total", "message", "data")} == {
+        key: expected[key] for key in ("step", "total", "message", "data")
+    }
+    assert [item["name"] for item in stored["outputs"]] == ["snapshots", "log"]
+    assert stored["outputs"][1]["metadata"]["provenance"]["operation_id"] == record.operation_id
     view = service.view(seen)
     assert view["result"]["progress"]["outputs"][0]["metadata"]["view"] == VIEW
     assert view["outputs"][0]["metadata"]["provenance"] == PROVENANCE

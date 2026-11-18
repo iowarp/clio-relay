@@ -269,7 +269,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.
-    "src/clio_relay/browser_gateway.py": 853,
+    # browser_gateway.py: deleted with the old surface (W8), entry removed.
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest
@@ -1809,7 +1809,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # (mcp_job_lifecycle.py/mcp_remote_transport.py), so both owners share
     # one constant instead of each defining their own. A justified, minimal
     # ratchet-up: 1023 -> 1070.
-    "src/clio_relay/spool.py": 1070,
+    "src/clio_relay/spool.py": 1064,
     # split/storage-policy-w2: storage_policy.py's own ratchet-baseline entry
     # (1826) is removed here. The wire types/limits/error vocabulary moved to
     # storage_policy_types.py (280 lines), the ledger content codec to
@@ -2004,7 +2004,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 79.44
+SRC_DISTRIBUTION_BASELINE_PERCENT = 81.05
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -2015,7 +2015,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 79.44
 #: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
 #: and tests/conftest.py, both under 500 lines.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 70.07
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 75.92
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

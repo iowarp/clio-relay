@@ -198,9 +198,9 @@ for name, payload in sources.items():
         raise SystemExit(f"bootstrap candidate source identity changed: {{name}}")
     print(f"bootstrap_candidate_source={{name}}:{{hashlib.sha256(observed).hexdigest()}}")
 __CLIO_RELAY_CANDIDATE_PACKAGE__
-BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/bootstrap_reconcile.py"
-BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO=\
-  "$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/bootstrap_provider_build_info.py"
+BOOTSTRAP_CANDIDATE_WORKER="$BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker"
+BOOTSTRAP_CANDIDATE_RECONCILE="$BOOTSTRAP_CANDIDATE_WORKER/bootstrap_reconcile.py"
+BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO="$BOOTSTRAP_CANDIDATE_WORKER/bootstrap_provider_build_info.py"
 BOOTSTRAP_CANDIDATE_PROCESS_CONTAINMENT="$BOOTSTRAP_CANDIDATE_PACKAGE/process_containment.py"
 echo "{candidate_reconcile_sha256} *$BOOTSTRAP_CANDIDATE_RECONCILE" | \
   sha256sum --check --strict -

@@ -24,7 +24,7 @@ because none is individually large enough to earn its own file:
   ``_optional_metadata``.
 
 Depends only on stdlib and already-stable clio_relay modules (models,
-scheduler_providers, command_evidence, filesystem_paths, installation,
+worker_scheduler, command_evidence, filesystem_paths, installation,
 storage_runtime, jarvis_provider) -- none of this module's own callers or
 callees live in any other ``endpoint_*.py`` owner module, so it is a pure
 leaf with no cross-owner-module dependency at all.

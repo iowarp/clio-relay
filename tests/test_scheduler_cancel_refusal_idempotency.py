@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.scheduler import ExternalSchedulerProvider
 from clio_relay.config import RelaySettings
 from clio_relay.models import (
     Cursor,
@@ -21,7 +22,6 @@ from clio_relay.models import (
     SchedulerCancelDispositionState,
 )
 from clio_relay.relay_ops import cancel_job
-from clio_relay.scheduler_providers import ExternalSchedulerProvider
 
 
 class _RecordingExternalScheduler(ExternalSchedulerProvider):

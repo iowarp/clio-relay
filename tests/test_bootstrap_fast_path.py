@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -3280,6 +3281,18 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
     assert "BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/safe_archive.py" in script
 
 
+def test_payload_script_assigns_every_shell_variable_on_its_line() -> None:
+    """A backslash-newline in the template must not turn an assignment into a command."""
+    script = bootstrap.render_linux_user_bootstrap_script(cluster="cluster-a")
+
+    split = re.findall(r"(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_]*=[ \t]+\S.*$", script)
+    assert split == []
+    assert (
+        'BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO="$BOOTSTRAP_CANDIDATE_WORKER/'
+        'bootstrap_provider_build_info.py"'
+    ) in script
+
+
 def test_legacy_planning_attests_private_candidate_before_transaction_or_fence() -> None:
     """A legacy relay cannot authorize its own replacement or touch stable state."""
     script = bootstrap.render_linux_user_bootstrap_script(
@@ -3407,7 +3420,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     # Six calls plus the preamble's fallback for a pre-worker installed relay.
     assert script.count("endpoint worker-info") == 7
     assert script.count("worker endpoint worker-info") == 6
-    assert script.count("--readiness-only") == 4
+    assert script.count("--readiness-only") == 5
     assert "printf '%s\\n' \"bootstrap_reconcile_plan=$BOOTSTRAP_PLAN_JSON\" >&2" in script
     assert 'mv -Tf "$HOME/.local/share/clio-relay/.current.' not in script
     assert 'readlink "$HOME/.local/share/clio-relay/current"' not in script

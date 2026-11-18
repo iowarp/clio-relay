@@ -14,6 +14,7 @@ from pytest import MonkeyPatch
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.endpoint import EndpointWorker
+from clio_relay.adapters.worker.scheduler import ExternalSchedulerProvider
 from clio_relay.config import RelaySettings
 from clio_relay.errors import RelayError
 from clio_relay.models import (
@@ -31,7 +32,6 @@ from clio_relay.models import (
     SchedulerStatus,
 )
 from clio_relay.relay_ops import cancel_job
-from clio_relay.scheduler_providers import ExternalSchedulerProvider
 
 
 class _BarrierScheduler(ExternalSchedulerProvider):

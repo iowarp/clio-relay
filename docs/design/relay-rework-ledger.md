@@ -103,9 +103,11 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
 - **The conformance kit no longer skips.** For a verb the adapter does not implement, each kit test asserts the typed `verb_not_implemented` refusal and passes, instead of skipping. A new kit test runs `exec` with no time limit.
 - **Wave 1 merges.** Each was merged into `jaimecernuda-relay-rework-w1`, gated on Ares and then pushed to the integration branch:
   - W11 at 785dcba, then at b8c9cf4 (merge f8a02d2), which moves globus and sky onto W6's identity API. Then at 745308c (merge 3f2d571), which adds regression tests for my duration compat edits in globus, iri and sky. The `credentials.service` setting is gone, and a config that still sets it is refused with `invalid_config`.
-  - W7 at c30e348 (merge 82a2302), then its follow-up at cbf2e39 (merge 9490a62). Its exec replaces my compat stopgap c5ea18b. Then at 337ca66 (merge b6b97f1), b6535ae (merge 0ebdaff) and 31f4aca (merge d641426): askpass fallback dropped, a remote file check lists its directory first, Slurm runs in its own process group so cancel traps run, `walltime()` is the duration, and `SshAdapter.price` charges node-hours (no amount without a walltime), kept in `adapters/ssh/pricing.py` so `adapter.py` stays under the size cap. relay_ssh is 88 passed, 0 skipped.
+  - W7 at c30e348 (merge 82a2302), then its follow-up at cbf2e39 (merge 9490a62). Its exec replaces my compat stopgap c5ea18b. Then at 337ca66 (merge b6b97f1), b6535ae (merge 0ebdaff) and 31f4aca (merge d641426): askpass fallback dropped, a remote file check lists its directory first, Slurm runs in its own process group so cancel traps run, `walltime()` is the duration, and `SshAdapter.price` charges node-hours (no amount without a walltime), kept in `adapters/ssh/pricing.py` so `adapter.py` stays under the size cap. Then at ae221c7 (merge f85e85a), which drops a job's deleted inputs from the site's content store at its final state, and at f8ff1a4 (merge 1739438), which drops transient inputs on the site and has the batch shell wait for the command's trap after passing on a TERM or INT. relay_ssh is 88 passed, 0 skipped at 31f4aca.
   - W6 at 4bad7cb, then at 03c2819 (merge a27a8b2), with the device-flow fix. Then at 0945b1a, which adds the crash rerun's evidence and Package, Version and Source rows on the approval page for package reviews.
   - W10 at c5b6c3c, then at 09d1cf8 (merge 303524b), then at 0388291, with `on_site_added` for Tapis and W6's types, then at 5681806 (merge f770403), with Tapis service packages held until cancel (RL45). W10 replaced my compat `_max_minutes`. When Tapis gets no `maxMinutes`, it falls back to the app's limit, then the system's, then 10 minutes, and kills the job. So the mapping always sends one: the duration, else the queue's `maxMinutes` for BATCH jobs, else 525600. At the cutover, the W10 run sheets that name `clio-relay-next` get renamed.
+  - W8 at a4dc2cf (merge f8cb43c), which removes the old surface and brings W9 in at 5a01766 (W8's 91bcc3c). The `worker` adapter's CLI is the old `clio-relay` app for now. The old `remote_mcp*`, `scheduler_providers` and `browser_gateway` modules are gone. The gate at f8cb43c: core with tests/serve 453, asks 72, relay_tapis 50, relay_ssh 88, all 0 skipped. The pyright ratchet fell to 5050.
+  - W9 at 48bfc40 (merge 0bc5baf), on top of W8: provenance on a service's outputs (7618c7c) and the scancel trap.
   - Fixes at merge: `conftest.answer_page(..., auth=)`, and `test_transports` passes the operator token to the ask page over HTTP.
 - **Relay never imposes a walltime or a duration (coordinator decision, the person's rule).** `JobAttributes.duration` is `timedelta | None` with no default, for run and serve specs alike. When it is unset, the site's `defaults.duration` applies if the site sets one. Otherwise no walltime is sent, and the scheduler's own default applies. `to_psij` passes `duration=None` explicitly, because psij's own default is 10 minutes. `JobSpec.node_hours()` returns `None` when the duration is unknown, and `Charge.walltime_s` and `Charge.node_hours` may be `None`, meaning unknown. The globus, iri, tapis and sky adapters send no walltime when the spec has none. These are compat edits in W10's and W11's files, for their owners to review. Sky prices such a job with no amount.
 - **An unknown cost always asks (coordinator decision).** `SpendPolicy.needs_approval(None)` is true unless the site's `ask` is `never`. The approval message says plainly: "sets no walltime, so its duration and cost are unknown: the scheduler's default limit applies".
@@ -130,7 +132,8 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - `OutputRef.metadata: dict[str, Any]` (default empty) is JSON the adapter or package attaches; relay passes it on unchanged. Two keys have a set meaning, named by constants in `jobs/handles.py`: `view` (`VIEW_METADATA`) holds the output's view descriptor (path or path pattern, format, ParaView reader and its configuration, whether it is still being written), and `provenance` (`PROVENANCE_METADATA`) holds the package version and hash and its input digests. W9's `serve.provenance` goes there.
   - `JobStatus.progress: JobProgress | None` is the latest step an adapter observed: `step`, `total`, `message`, `outputs` (what the step wrote, each with its descriptor) and `data` (adapter-owned JSON). On each observation relay stores it in the operation's `result["progress"]`, so `describe`, the operation's structured result and the final task result carry it in full.
   - The task's `statusMessage` names it: "relay operation is running: step 3 of 10; wrote snapshot 3; views: snapshots" (`surface/progress.py`). The full descriptor is not put in `tasks/get` while the task is working, because the tasks extension's `GetTaskResult` has no `_meta` (its schema forbids extra properties). A client reads the step from the operation instead. This keeps relay a plain MCP server: no client needs a relay-only field to follow a run.
-
+- **Transient inputs never outlive their job (coordinator decision, closing W7's and W9's secret gaps, RL16).** `InputRef.transient: bool = False`. At the final state, whatever the state, each copy of a transient input goes: the adapter drops the site's blob and the job directory's copy, and relay drops its own content-store copy (`surface/transient.py`, `drop_transient`, called wherever a record becomes final). Relay keeps a blob that another open operation still lists in its `input_digests`, so two runs sharing one secret do not break each other. The `local` adapter shares relay's store and unlinks the job copy before it lists outputs, so a transient input never appears as an output. A later run that needs the same bytes stages them again, since `stage` is idempotent. A run opened between the check and the drop can find the blob gone and refuse with `input_missing`; restaging fixes it. Like `PackageRef.service`, the new field enters every spec's digest: stored operations keep their digest, and only a resume that re-sends an old spec refuses with `approval_mismatch`. W9 marks `secrets.env` transient; W7 does the ssh side.
+- **Every stored output carries provenance, and view descriptors are checked (W9's RL43 request).** `RelayService._apply` passes each status through `surface/outputs.py`'s `marked_status` before it stores it. That applies to run and serve alike, and to the final outputs and the progress step's outputs. Each output gets W9's `relay.provenance.v1` block under `metadata["provenance"]` (`serve.provenance.with_provenance`), unless it brought its own block. A `metadata["view"]` descriptor is checked with `serve.descriptor.problems`. One that fails the schema is taken off the output, so no client opens a broken view, and its reasons go under `metadata["view_problems"]`.
 ### Published interfaces (M1)
 
 Owned by W1, not frozen. A change goes through W1, which reruns every consumer's contract tests first.
@@ -514,9 +517,11 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
 - RL10 governs, per the coordinator: relay renders the submit script on this machine with psij-python, then sends the script, its PSI/J launcher and any missing inputs with one `scp`, and submits with one `ssh` command. The site needs a POSIX shell and its scheduler, not Python or psij. Status and cancel commands, and the parsing of their output, are PSI/J's executors, run over the same `ssh`.
 - The remote job directory (RL17) is `<remote_dir>/jobs/<operation_id>`. It holds `submit.sh`, `spec.json`, `inputs.json`, `scheduler`, `states`, `final`, `stdout` and `stderr`. Its name is the operation id, so `find(operation_id)` reconciles by looking at that directory, and a second `run` of the same operation returns the first job. A lock directory makes the submit happen once even if two relays race. `final` is written by the first poll that sees a final state, so later reads need no scheduler.
 - Staging (RL16) is content addressed on the site under `<remote_dir>/content/cas/sha256`. Each `run` first asks which digests the site already has, sends only the missing ones, checks every digest on arrival and refuses with `input_missing` on a mismatch. Inputs are hard links into the store (copies when the filesystem refuses links). An input the job did not replace is not listed as an output.
+  - An input the job deletes from its directory is dropped from the store when the job's final state is recorded, for a cancelled job too, unless another job still links the blob (link count 1, by `find -links 1`). Reason: W9's `secrets.env` is read and deleted by its launcher, and the store's copy outlived it. The rule is general, with no file named in the adapter. The poll reads `inputs.json` to know the names. A job cancelled before it started still holds its copy, and so does the store.
 - With no scheduler (`scheduler: none` or none detected), a small `sh` supervisor is started detached with `setsid` (`nohup` where there is no `setsid`). It records the pid, the child's pid and the exit code in the job directory, so a later poll from a new relay reads the result (LQ8). The native id is `pid:<n>`.
 - Every `ssh` and `scp` uses `BatchMode=yes`. A site that asks for a code refuses with `interactive_auth_required`, naming `worker` as the adapter to use, unless `interactive_sign_in` is set. Then `sign_in_needed()` returns `SignInNeed(provider="ssh")` and registers a starter with W6's `askpass.register_sign_in`; the starter brings up a ControlMaster (`ControlMaster=yes`, no `-M`) with `askpass.environment(site=..., operation_id=..., title="Sign in to <site>")` merged into its environment, and every later call reuses it with `BatchMode=yes`. The fallback from before W6 merged is gone (integration `87da62d`). An `askpass:` program in the config replaces `SSH_ASKPASS` and keeps W6's other variables; with one, `sign_in_needed()` first tries the starter itself and asks the person only if that fails.
 - Cancel signals: `cancel` runs PSI/J's command (`scancel -Q`, `qdel`). On Ares only the batch shell gets `SIGTERM`, and the job's other processes get `SIGKILL` after `KillWait`, so a trap in the command never ran (W9's finding in LQ-L11). The rendered Slurm script now starts PSI/J's launcher in its own process group (`set -m`), traps TERM, INT, USR1 and USR2, and passes them on to that group, then waits and keeps PSI/J's `.ec` line. A signal that arrives before the launcher starts is held and sent once it has. Where Slurm signals every process itself (fx-slurm), the launcher has already died a second later, so the batch shell does not send it again. PBS scripts are unchanged: `qdel` signals every process of the job.
+  - After passing on a TERM or INT, the batch shell waits until the command's whole process group has gone (`kill -0 -- -<group>`), not just PSI/J's launcher (W9's patch, from job 27808). PSI/J's `single_launch.sh` dies on the forwarded TERM, so the batch shell used to exit at once and Slurm then killed the cgroup with the command's trap half done. USR1 and USR2 are passed on without the wait, since no kill follows them and the job would otherwise stay held until its walltime.
   - Because the batch shell now outlives the signal, PSI/J's `.ec` line runs and records 143 for a stopped job. So the trap also writes TERM or INT into the job's `signalled` file. For a job the queue has forgotten, a `signalled` record sends the adapter to accounting as if there were no exit code: `sacct` says `CANCELLED`, `TIMEOUT` or `PREEMPTED`. With no accounting, a nonzero exit code is `failed` with a message naming the signal and the three possible causes. A cancel through relay is still read from relay's own `cancel` record first.
 - NFS: every check of a file another host may have written lists its directory first (`fresh`, an `ls -f`), because an NFS client keeps a negative lookup and stale sizes for its attribute cache's lifetime. The job directory and its parent, the upload directory, CAS shard directories, the submit wait loop, the status and cancel scripts, and the files verb's `read`, `stat`, `list`, `stage` and `has` all do it; `stat` also opens a regular file so its size is current. exec needs none (its watchdog uses the ssh session's standard input), and the detached supervisor runs on one host.
 - The PSI/J launcher install no longer leaves a nested copy behind when two first submits race (`mv` into an existing directory).
@@ -573,8 +578,15 @@ All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, aga
   - After it, at `829d348`: Ares 27771 and 27772 on `ares-comp-10` log `stopping: signal TERM` 2 s after the cancel; fx-slurm 211 and 212 and fx-pbs `123.fx-pbs` and `124.fx-pbs` log it once, at 0 s. All four end `cancelled`.
     - Again at `6023709`, after the `signalled` record: Ares 27784 and 27785 (2 s), fx-slurm 273 and 274 and fx-pbs `165.fx-pbs` and `166.fx-pbs` (0 s); each trap ran once and every job ended `cancelled`.
     - Units: `test_a_signal_to_the_batch_shell_reaches_the_command` (only the batch shell is signalled; the grandchild's trap runs and `.ec` reads 143) and `test_the_batch_shell_keeps_the_commands_exit_code` (7).
+  - A trap that takes time, at `c549780`: the command is `sleep 3600 & wait $!` with a TERM trap that logs `stopping`, sleeps 3 s, logs `stopped` and exits 143. Ares 27815 logs `stopping` 2 s after the cancel and `stopped` at 5 s; fx-slurm 413 at 0 s and 3 s; fx-pbs `246.fx-pbs` at 1 s and 4 s. All three end `cancelled`. Before the change, W9's Ares job 27808 left no `stopped.json`. Unit: `test_the_batch_shell_waits_for_a_trap_the_launcher_does_not` (the launcher exits on TERM while the command's trap is still sleeping; the trap's log line is written and the batch shell goes on), which fails on `c624d82`.
   - A forgotten job whose batch shell wrote `.ec` 143 after a signal still asks `sacct`, so the forgotten-job test above keeps reading `cancelled`. Units: `test_a_forgotten_job_the_scheduler_stopped_asks_accounting[CANCELLED|TIMEOUT|none]`.
 - At `6023709` (on integration `87da62d`): `pytest tests/relay_ssh`, `87 passed in 479.31s`, none skipped. `ruff check`, `ruff format` and `pyright` clean.
+- Deleted inputs leave the store (W9's `secrets.env`), at `540decd`:
+  - Units in `test_ssh_store.py`: a final record drops the blob of an input the job deleted, keeps one it kept, one it replaced, and one another job still links; `input_entries` gives nothing for unreadable `inputs.json`.
+  - `test_an_input_the_job_deletes_leaves_no_copy_in_the_store[fx-slurm|fx-pbs|fx-ssh]`: a job sources `serve/secrets.env`, deletes it and ends; its blob is gone, `kept.txt`'s blob and the job's link stay. A second job deletes its copy and sleeps: the blob stays while it runs and is gone once it is `cancelled`.
+  - Live on Ares Slurm with `remote_dir: clio-relay-rework/w7-scratch/blob-remote`: job 27803 `completed`, stdout the token, secret blob gone, kept blob present; job 27804 deleted its copy, the blob stayed while it ran, then `cancelled` and the blob was gone, the kept one present.
+  - The store code is `adapters/ssh/store.py` and its tests have their own modules, so `scripts.py`, `test_ssh_units.py` and `test_ssh_fixtures.py` stay under 500 lines. `check_file_size.py`: OK, with src 79.44% and tests 70.07% under 500 lines.
+  - `pytest tests/relay_ssh`, `93 passed in 550.07s`, none skipped. `ruff check`, `ruff format` and `pyright` clean.
 
 ## W8. The worker adapter and the old surface's removal
 
@@ -873,9 +885,18 @@ The routes that only the old tools used go with them. These are gateway sessions
 
 LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `scheduler_providers`. Today they appear in about 112 files outside the deletion list, mostly tests and the `mcp_call` job kind in the endpoint, queue and models. W8 removes them all from `src`, `tests`, `jarvis-packages`, `scripts`, `.github` and the user docs. The design docs under `docs/design/` and the dated validation notes under `docs/ai/` keep the names, because they record the history. Assumption: LQ32 reads the shipped tree and the user docs, not the design record.
 
+Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` were held, because W9's runtime still imported them. W9 dropped those imports at 5a01766. W8 merged W9's branch at that commit (91bcc3c), so the deletion could go ahead, and deleted the three groups with their tests (ba5ad4b). Nothing in `src`, `tests`, `jarvis-packages` or `scripts` imports them now. The worker's scheduler module is imported as `worker_scheduler`.
+
+Still to clear for LQ32, in a follow-up on this branch:
+- the `browser_gateway_overloaded` code and its adapter in `door_errors`;
+- the `mcp_call` job kind (`models_enums`, `models_job_specs`, and W9's `jarvis_service_runtime_validation`);
+- the `virtual_*_mcp_call` release-gate roles;
+- comments in W1's scripts;
+- the user docs (`architecture`, `mcp-tasks`, `operations`, `release-acceptance-1.0`). README is W1's.
+
 ### clio-schemas
 
-Dropped. Nothing in `src/` imports it, and the worker link does not use it. It is used only by the schema-equality fixtures, their generator, `test_clio_schemas_convergence.py` and `test_schema_equality.py`. Those tests check relay's records against CLIO's schema package, which is CLIO-only coupling (user rule 1). They are deleted, and W1 removes `clio-schemas==0.2.1` from `pyproject.toml`.
+Kept. This corrects the inventory, which said dropped. `jarvis-packages/clio_relay/clio_relay/remote_agent/runner.py:16` imports `ArtifactKind`, `ArtifactVersion`, `Custody`, `IdentityEvidence` and `Mechanism` from it, and `remote_agent` stays on the worker. Nothing in `src/` imports it. The schema-equality fixtures and their tests (`test_clio_schemas_convergence.py`, `test_schema_equality.py`) are deleted, because they compared relay's records with CLIO's schema package. So `clio-schemas==0.2.1` stays in `pyproject.toml`, and the earlier request to W1 to remove it is withdrawn. Dropping it needs `remote_agent` to stop using those five types.
 
 ### The process-containment tests
 
@@ -902,28 +923,84 @@ develop 034117b on a compute node gives 139 failed and 3 errors, which is 142 no
 
 ### The worker adapter
 
-- **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]`, with this config:
-  - `host`, the ssh destination used only for placement and sign-in;
-  - `scheduler`, a psij executor name or `none`;
-  - `rendezvous`, the frps address;
-  - `state_dir`;
-  - `install`, the wheel or version to place.
-- **Verbs.**
-  - `describe` and `status` read the owned session and worker info.
-  - `run`, `cancel` and `find` go through the job routes; `find` uses the job name `relay-<operation_id>`.
-  - `exec` runs a `bounded_command` job.
-  - `files` uses artifacts and input ingest.
-  - `serve` is `return await clio_relay.serve.start_for(self, spec, operation_id=operation_id)`, with a lazy import, as W9 asked.
+- **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]` (`adapters/worker/adapter.py`). The config keys are:
+  - `ssh_profile`, the Host in `~/.ssh/config` used for sign-in and placement (the key W11's catalog entries use), and `ssh_config_file`;
+  - `scheduler`, `auto` or a psij executor name;
+  - `work_dir` and `remote_dir`;
+  - `rendezvous`: `address`, `port`, `protocol` (`tcp`, `websocket` or `wss`), `site_address`, `site_port`, `token_env` and `token_file`;
+  - `relay_wheel` or `relay_requirement`, `site_frpc`, `python` and `submit_timeout_s`.
+- **Placement.** In the one ssh pass relay installs itself in a private directory on the site, writes the worker's identity and starts `clio-relay worker site-serve` detached. That process serves the owned-session API on loopback and holds an frpc `stcp` proxy to the rendezvous. Relay reaches it over the one held link (`brokered_tcp`), and nothing uses SSH after that. `worker-link.json` (0600) in the adapter's state directory lets a restarted relay reconnect over frp without SSH.
+- **Verbs.** Each verb is one POST to the worker's `/adapter` routes. On the site the verbs run through the `local` adapter, so scheduler coverage is psij's (RL18), and a refusal on the site comes back as the same typed refusal.
+  - `describe`, `run`, `status`, `cancel`, `find` and `files` (`WorkerFileAccess`, `adapters/worker/files.py`).
+  - `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)` follows W1's exec contract: with no `timeout_s` it runs until the command ends, and stall progress comes from the site's polls.
+  - `serve` is `return await clio_relay.serve.start_for(self, spec, operation_id=operation_id)`, with a lazy import. Without the serve runtime it refuses `verb_not_implemented`.
 - **Sign-in (LQ10, LQ11).**
-  - `sign_in_needed()` returns `SignInNeed(provider="ssh", url=None, ...)` while the worker link is down.
-  - The adapter calls `askpass.register_sign_in(site_id, starter)`. The starter runs bootstrap and the one-link connect over ssh. Its environment is `clio_relay.asks.askpass.environment(site=, operation_id=, title=)`, with `BatchMode=no` and stdin closed.
-  - After the worker dials the rendezvous, the ssh process exits and nothing uses SSH again.
-  - Until W6 merges, a local stub with the same signatures stands in.
-- **The hop for W9.** `WorkerAdapter.hop_exec(site: str, argv: list[str], *, env: Mapping[str, str] | None = None, stdin: bytes = b"") -> ExecResult` (async).
-  - It runs one bounded command on the login side through the held worker link, as a `bounded_command` job on the worker HTTP API. There is no ssh.
-  - It replaces the `remote_cli.remote_env` and ssh calls in `frp_remote_scripts.py`, `service_runtime_connector_step_scripts.py`, `service_runtime_submission_scripts.py` and `jarvis_service_runtime.py`.
-  - Long-running service processes go through `run(spec)`. Service bytes stay on W9's frp connector and visitor.
-- **Operator commands (RL3).** `clio_relay.adapters.worker.cli:worker_app`, a Typer app that W1 mounts as `clio-relay worker`. Its groups are `cluster`, `endpoint`, `api`, `session`, `relay-host`, `queue`, `scheduler` and `runtime` (the old `worker` group). Its commands are `init`, `install-frp`, `installation-*` and `bootstrap-inspect`. The old `agent`, `job`, `monitor`, `gateway`, `jarvis`, `remote-mcp`, `storage`, `release` and `diagnostics` groups go. Their verbs are the new surface's `run`, `exec`, `files` and `describe`.
+  - `sign_in_needed()` returns `SignInNeed(provider="ssh", url=None, ...)` while the link is down.
+  - The adapter calls `askpass.register_sign_in(site_id, starter)`. The starter runs placement and the connect over ssh with `clio_relay.asks.askpass.environment(site=, operation_id=, title=)` and `BatchMode=no`.
+  - Deviation from W6's "close stdin": the connect pipes the placement script to the remote shell over ssh's stdin. Under `SSH_ASKPASS_REQUIRE=force` ssh never reads a prompt answer from stdin, so the prompt still goes to askpass. LQ10 and LQ11 passed this way.
+  - When W6 is not installed, a local stub with the same signatures stands in.
+- **The hop for W9.** `WorkerAdapter.hop_exec(command, *, timeout_s=None, max_output_bytes, on_stall=None) -> ExecResult` runs one command on the worker's host (the login side) over the held link, with the exec contract above. There is no ssh. Long-running service processes go through `run(spec)`. Service bytes stay on W9's frp connector and visitor.
+- **Operator commands (RL3).** `clio_relay.adapters.worker.cli:worker_app`, a Typer app mounted as `clio-relay worker`. Its groups are `endpoint`, `relay-host`, `cluster`, `api`, `session`, `queue` and `scheduler`. Its commands are `status`, `init`, `install-frp` and `installation-*`, and the hidden `bootstrap-inspect`, `jarvis-runtime-authority` and `site-serve`. The old `agent`, `job`, `monitor`, `gateway`, `jarvis`, `remote-mcp`, `storage`, `release`, `live-test` and `diagnostics` groups go. Their verbs are the new surface's `run`, `exec`, `files` and `describe`.
+- **Not covered by LQ4: wss.** The frpc config writer has no custom-CA option, so the fixture's self-signed wss endpoint cannot be trusted. LQ4 ran over tcp. A wss rendezvous with a public certificate needs no change.
+
+### Changes made during the move
+
+Fixes and edits beyond the mechanical move, in commit order:
+
+- **safe_archive.** The deletion list included `safe_archive.py`, but the bootstrap remote script imports it from a string. It is restored byte for byte as `adapters/worker/safe_archive.py`, with `tests/test_safe_archive.py` (1d1a900). A sweep for string references to deleted modules found no other real caller.
+- **The bootstrap candidate overlay.** It was flat and keyed by file name. Its keys are now paths under the candidate `clio_relay` package (`adapters/worker/X.py`), with `extend_path` inits for `adapters/` and `adapters/worker/`. The writer refuses absolute paths, `..` and symlinked parents. The overlay was never self-contained, even at base: it relies on `extend_path` falling back to the installed package (1d1a900).
+- **`package_source_root`** in `bootstrap.py` used `parents[2]`, the repo root before the move. It is `parents[4]` now (9a88f8c).
+- **The worker command prefix.** The bootstrap preamble and the readiness probe call `clio-relay worker endpoint worker-info`, and fall back to the unprefixed command for a relay placed before the move (2e223de). `test_bootstrap_fast_path` counts both.
+- **`jarvis_mcp.py`** no longer imports `remote_mcp`. It keeps the contract, the artifact checks and its own `server_artifact_digest`. The virtual JARVIS tools and the MCP server builders went with the old surface (8dd5260).
+- **Scheduler seams.** `http_api_routes_scheduler`, `test_cli`, `test_cli_endpoint`, `test_cli_scheduler` and the two scheduler-cancel tests use `clio_relay.adapters.worker.scheduler`, not the held `scheduler_providers` (80ebdaa).
+- **GC purge** kept one open descriptor per directory level, so trash deeper than `ulimit -n` could never be purged (EMFILE at 1024, the soft limit on Ares login and compute nodes). It keeps only the current parent open now. Each level is still opened with `O_NOFOLLOW` relative to its parent. This defect predates the move; `test_gc_purge_is_iterative_and_detects_directory_swap_races` fails the same way on base ee1a845 (140b02f).
+- **Tests.**
+  - The patch-seam guard (`test_cli_patch_seam.py`) knows both packages. 23 audited pairs went with their callers or owners, so its counts go from 61/32 to 38/18 (531053b).
+  - 15 test files import `worker_app as app`.
+  - Tests of removed commands are deleted: `job`, `gateway`, `storage`, `live-test` and `scheduler validate-lifecycle`.
+  - `test_ci_clio_kit_wheel.py` drops its three checks of the old ci and release steps. Its pin checks stay.
+  - `test_core_queue_split_architecture` accepts `clio_relay.adapters.worker` as an owner package. `queue_validation` leaves its non-owner lists. The `queue_startup` import budget goes from 550 to 552, for the two import lines the move wraps.
+  - `test_door_errors` expects 61 HTTP statuses, not 64. `jarvis_dispatch_refused`, `execution_not_found`, `mcp_submission_conflict` and `mcp_admission_refused` went with their routes.
+  - `test_bootstrap` disables commit signing for its scratch commits (46751cd). Ares sets `commit.gpgsign=true`, and gpg fails in Slurm.
+- **The bootstrap build-info line.** The payload template wrapped the `BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO` assignment across a swallowed line break, so bash ran the path as a command. Found by a live bootstrap on fx-slurm. It is assigned through `BOOTSTRAP_CANDIDATE_WORKER` now, with a regression test that every shell variable is assigned on its own line (dd1352c).
+- **The route-revision warning** in `cli_cluster` told the person to refresh remote MCP, which is gone. It is removed with its 3 tests (dd1352c, af85a62).
+- **The held modules.** `remote_mcp*`, `scheduler_providers/` and `browser_gateway*` are deleted after merging W9 at 5a01766 (91bcc3c, ba5ad4b). Test edits:
+  - `test_scheduler_status`: 26 old provider, connector and registry tests deleted; the selection and JARVIS isolation checks run against `adapters.worker.scheduler`.
+  - `test_door_errors`: the 3 browser gateway tests deleted.
+  - `test_validation_report`: the 3 remote MCP tests deleted.
+  - `test_ci_clio_kit_wheel`: the certification pin test deleted.
+  - `test_clio_kit_mcp_contracts`: 4 contract tests deleted; the 3 install receipt tests stay.
+  - `test_contract_gate`: imports `adapters.worker.clio_kit_constants`.
+  - `test_cluster_config`: the two cache-path tests check only the registry path now.
+- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` and `browser_gateway.py` entries. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: the baseline goes 7498 to 5583 (89fd6c8), then to 5076.
+- **W9's tests (import-only edits, and prunes that let them collect).** `test_service_runtime`, `test_jarvis_service_runtime` and `test_frp_transport_dials` import the moved modules from `adapters.worker`. 15 tests in `test_jarvis_service_runtime` are deleted, with the helper `_owner_token_values`. The first drove `cli_jarvis_mcp` and the rest drove `mcp_server`:
+    - `test_hidden_relay_authority_command_emits_one_private_json_document`
+    - `test_model_facing_mcp_projection_redacts_runtime_bearer_token`
+    - `test_verified_jarvis_wait_preserves_public_bearer_fingerprint`
+    - `test_jarvis_authorization_restore_rejects_non_public_descriptors`
+    - `test_arbitrary_mcp_cannot_expose_jarvis_shaped_authorization`
+    - `test_waited_execution_exposes_compact_verified_binding_before_large_result`
+    - `test_generic_mcp_wait_serializes_verified_result_before_bulk_evidence`
+    - `test_async_relay_wait_exposes_same_compact_verified_service_binding`
+    - `test_ssh_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_owned_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_multiple_ready_services_have_exact_unchanged_bindings`
+    - `test_bind_rejects_mixed_or_invalid_handoff_forms`
+    - `test_agent_bind_persists_urls_and_rejects_runtime_commands`
+    - `test_agent_bind_pending_replays_same_gateway_and_connector_intents`
+    - `test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission`
+
+### Gate evidence
+
+On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) was clean and touched no worker file.
+
+- **LQ4 (`worker`).** The conformance kit in `tests/worker` passed 11 of 11 with no skips. It ran on the login node against fx-slurm over a tcp rendezvous, with a fresh remote directory and the wheel built at that commit (sha256 `b81d0726206f…`). The kit includes the new exec-without-limit test and the `verb_not_implemented` checks.
+- **LQ10 and LQ11.** Passed on fx-otp through W6's askpass interface: the sign-in ran as asks, and the link came up with no terminal (`op_6774ddf180e7bcf14383b593`).
+- **Bootstrap.** A live `clio-relay worker cluster bootstrap` on fx-slurm gets past the overlay. It then fails exactly as base ee1a845 does: `systemctl: command not found`, and then "bootstrap existing executable digest changed" for `~/.local/bin/uv`. Another workstream put uv 0.13.9 there, and the bootstrap pins 0.11.28 and refuses to adopt it. No fixture has a systemd user manager, so a full bootstrap cannot finish on one. What this proves is that the moved bootstrap behaves like base.
+- **The process-containment modules** (the six that need a user manager) passed 170 of 170 on the login node at af85a62.
+- **Targeted modules** (17 files: the edited tests plus the cli, scheduler, http api, service runtime and patch-seam modules) ran in Slurm (job 27799). 13 tests failed, all of them in develop's 142, so none are new: 12 in the two scheduler-cancel files ("relay-managed JARVIS installation receipt does not match this worker"), and `test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks`, which fails because the compute node has no user manager.
+- **pyright.** 5076 errors, under the 5583 baseline, measured with `uv run` at 8b34a44. The baseline is lowered to match. Run without the venv active, the count is 8987, because imports do not resolve then. That is a measuring mistake, not a regression.
+- **The full suite** runs once in Slurm at the request commit. Its result and the develop failures it retires go here when it ends.
 
 ### Workflows
 
@@ -932,17 +1009,16 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 ### Requests to other owners
 
 - **W9.**
-  - In `jarvis_service_runtime.py:35` and `service_runtime_core.py:45`, change the import `clio_relay.core_queue` to `clio_relay.adapters.worker.core_queue`.
-  - Drop the `browser_gateway` imports in `service_runtime_browser`, `service_runtime_local_start` and `service_runtime_readiness`.
-  - Drop the `scheduler_providers` imports in `service_runtime_observation`, `service_runtime_remote_connector` and `service_runtime_start`. Use psij or `hop_exec` instead.
-  - Drop the `remote_mcp` import in `jarvis_service_runtime_validation`.
-  - Change the remote command strings `clio-relay scheduler connector-step-*` in `frp_remote_scripts.py:156,197` to `clio-relay worker scheduler connector-step-*`.
-  - Migrate `test_service_runtime.py` and `test_jarvis_service_runtime.py` off the old `cli`, `browser_gateway` and `scheduler_providers`.
+  - Done: W9 dropped its imports of the held modules (5a01766), and W8 deleted them (ba5ad4b). `BrowserAttachmentRecord` now has one definition, `adapters/worker/browser_attachment_record.py`, and nothing calls the `connector-step-*` commands. W8's branch contains W9 at 5a01766, so merging W8 brings it in.
+  - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
+  - `jarvis_service_runtime_validation.py:55` uses the `mcp_call` job kind. LQ32 needs it gone; W8 removes the kind once W9 drops that use.
+  - Test failures in W9's files on this branch, none of them rerun:
+    - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
+    - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list.
 - **W1.**
-  - Remove `clio-schemas` and the `mcp_call` force-include (`pyproject.toml` lines 9 and 48 to 53).
-  - Add the `worker` entry point in `clio_relay.adapters`.
-  - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker`.
-  - At the cutover, replace the old `cli.py` root.
+  - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
+  - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
+- **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
 - **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
 
 ## W9. serve
