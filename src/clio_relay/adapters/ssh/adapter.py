@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import pricing, scripts
+from clio_relay.adapters.ssh import pricing, scripts, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -461,7 +461,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                     line,
                     final=True,
                     root=str(handle.data["root"]),
-                    inputs=scripts.input_entries(sections.get("inputs", [])),
+                    inputs=store.input_entries(sections.get("inputs", [])),
                 ),
                 data=payload,
                 timeout_s=self.config.command_timeout_s,

@@ -21,14 +21,11 @@ per change), ``cancel`` once cancelled, and ``final`` once the job ended.
 
 from __future__ import annotations
 
-import json
-import re
 import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
-from typing import cast
 
-_HEX = re.compile(r"[0-9a-f]{64}")
+from clio_relay.adapters.ssh import store
 
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
     ("slurm", "sbatch"),
@@ -389,25 +386,15 @@ def record_script(
 ) -> str:
     """Append a state change. With ``final``, standard input becomes the ``final`` file.
 
-    A final record also drops from the content store each input the job deleted
-    from its directory, unless another job still links it, so a file the job
-    threw away (such as one holding secrets) is not kept on the site.
+    A final record also drops the inputs the job deleted from the content store
+    (see :mod:`clio_relay.adapters.ssh.store`).
     """
     body = f"J={q(job_dir)}\n" + 'cd "$J" || exit 3\n'
     if final:
         body += "cat > final.tmp && mv -f final.tmp final\n"
     body += f"printf '%s %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" {q(line)} >> states\n"
     if final and root is not None and inputs:
-        body += FRESH + f"R={q(root)}\n"
-        for name, digest in inputs:
-            shard = f'"$R"/content/cas/sha256/{q(digest[:2])}'
-            store = f"{shard}/{q(digest)}"
-            body += (
-                f"fresh {q(str(PurePosixPath(name).parent))} {shard}\n"
-                f"if [ ! -e {q(name)} ] && [ -f {store} ] && "
-                f'[ -n "$(find {store} -links 1 2>/dev/null)" ]; then\n'
-                f'  rm -f {store} && echo "@@dropped {digest}"\nfi\n'
-            )
+        body += FRESH + store.drop_script(root, inputs)
     if final:
         body += _LISTING
     return body
@@ -502,22 +489,4 @@ def listing_entries(lines: Iterable[str]) -> list[tuple[str, int]]:
         except ValueError:
             continue
         found.append((parts[1][2:], size))
-    return found
-
-
-def input_entries(lines: Iterable[str]) -> list[tuple[str, str]]:
-    """Parse the job's ``inputs.json`` into ``(name, sha256)`` pairs; nothing if unreadable."""
-    try:
-        items = json.loads("\n".join(lines) or "[]")
-    except ValueError:
-        return []
-    if not isinstance(items, list):
-        return []
-    found: list[tuple[str, str]] = []
-    for item in cast(list[object], items):
-        if isinstance(item, dict):
-            entry = cast(dict[str, object], item)
-            name, digest = entry.get("name"), entry.get("sha256")
-            if isinstance(name, str) and isinstance(digest, str) and _HEX.fullmatch(digest):
-                found.append((name, digest))
     return found
