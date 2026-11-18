@@ -49,9 +49,7 @@ from clio_relay.surface.a2ui.protocol import (
     embedded,
 )
 from clio_relay.surface.a2ui.surfaces import (
-    ADD_PATH,
     ADD_SURFACE,
-    CATALOG_PATH,
     SITES_SURFACE,
     SiteView,
     TabState,

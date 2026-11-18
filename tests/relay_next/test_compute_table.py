@@ -46,7 +46,8 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
                 "Status",
             ]
             protocols = _options(table, "protocol")
-            assert list(protocols)[:7] == ["ssh", "worker", "tapis", "globus", "iri", "sky", "local"]
+            order = ["ssh", "worker", "tapis", "globus", "iri", "sky", "local"]
+            assert list(protocols)[:7] == order
             assert protocols["sky"]["label"] == "SkyPilot"
             assert protocols["ssh"]["description"]
             security = _options(table, "security")

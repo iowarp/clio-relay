@@ -216,7 +216,6 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is True, host.text("relay-add")
             assert host.failing("relay-add") == {}
-            assert "checks" not in host.surfaces["relay-add"]["components"]["add-s-f-id"]
             assert host.get("relay-add", "/drafts/add/valid") == {}
             [site] = store.list()
             assert (site.id, site.name, site.adapter) == ("lab", "Lab cluster", "fixture")
@@ -230,6 +229,7 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
 
             # Adding the same id again is refused on the id field.
             await host.press("relay-sites", "sites-add")
+            assert "checks" not in host.surfaces["relay-add"]["components"]["add-s-f-id"]
             host.set("relay-add", "/drafts/add/site/id", "lab")
             result = await host.press("relay-add", "add-a-fixture-add")
             assert result.structured_content["ok"] is False
