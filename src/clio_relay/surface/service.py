@@ -287,6 +287,9 @@ class RelayService:
         (await self.guard.check_run(site, job)).raise_if_refused()
         charge = await self.guard.price(site, job)
         operation_id = new_id("op")
+        result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
+        if skipped:
+            result["skipped"] = [item.model_dump() for item in skipped]
         record = OperationRecord(
             operation_id=operation_id,
             kind=kind,
@@ -298,10 +301,8 @@ class RelayService:
             state=OperationState.AWAITING_INPUT,
             history=[StateChange(state=OperationState.AWAITING_INPUT)],
             task=task,
-            result={"charge": charge.model_dump(mode="json")},
+            result=result,
         )
-        if skipped:
-            record.result["skipped"] = [item.model_dump() for item in skipped]
         asks: list[Ask] = []
         need = await adapter.sign_in_needed()
         if need is not None:

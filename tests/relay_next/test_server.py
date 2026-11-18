@@ -391,7 +391,7 @@ def test_exec_without_a_limit_reports_quiet_stretches(relay_paths: RelayPaths) -
     add_site(relay_paths)
     notes: list[str] = []
 
-    async def progress(value: float, total: float | None, message: str | None) -> None:
+    async def progress(progress: float, total: float | None, message: str | None) -> None:
         notes.append(message or "")
 
     async def scenario() -> None:
