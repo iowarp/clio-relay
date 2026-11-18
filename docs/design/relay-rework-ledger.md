@@ -935,7 +935,11 @@ Left, with the reason. The search at 504693a, outside `docs/design/`, finds only
 - `McpCallSpec` stays in the `JobSpec` union, because W9's `jarvis_service_runtime_validation.py` still reads it. It does not match the LQ32 search, but without the kind no job can carry it. See the request to W9.
 - `docs/ai/jarvis-service-runtime-binding-validation-2026-07-15.md` (lines 18 and 51) is W9's dated note for that validation path.
 - History comments in W1's scripts: `check_file_size.py` (lines 57, 117, 183-184, 270-272, 1307-1311 and 1518-1523) and `check_pyright_ratchet.py` (lines 123 and 175). See the request to W1.
-- `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). W8 rewrites it for the `clio-relay worker cluster ...` paths after the cutover (coordinator decision).
+- `docs/ai/interface-context.md` "CLI Surfaces" (lines 94-175) still lists the old top-level commands, including the deleted `job`, `gateway`, `agent`, `remote-mcp` and `live-test`. It is W1's file. See the request to W1.
+
+Done after the cutover decision:
+- `docs/operations.md` is rewritten for the `clio-relay worker ...` paths: cluster setup and the endpoint service, capacity, the queue and its leases, queue upgrades, output limits, the transports with the lasting frpc proxy, sessions, and running the API or an endpoint directly. The job, gateway, remote MCP and validator sections are gone with their commands.
+- `docs/connect-desktop-homelab-cluster.md` is deleted. Nothing linked it. Its setup steps are covered by `docs/adapters/worker.md`, `docs/rendezvous-host.md` and `operations.md`, its proxy section moved into `operations.md`, and the rest documented the deleted `agent`, `job` and `gateway` commands and the old `jarvis_*` tools.
 
 ### clio-schemas
 
@@ -1092,6 +1096,7 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
   - For LQ32, drop the history comments that name `mcp_call`, `browser_gateway` and `scheduler_providers` in `check_file_size.py` (lines 57, 117, 183-184, 270-272, 1307-1311 and 1518-1523) and `check_pyright_ratchet.py` (lines 123 and 175).
   - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
   - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
+  - Rewrite or drop the "CLI Surfaces" list in `docs/ai/interface-context.md` (lines 94-175). The operator commands are under `clio-relay worker`, and `job`, `gateway`, `agent`, `remote-mcp`, `live-test` and `storage` are gone. Lines 90-92 also name the deleted `docs/connection-model.md`.
 - **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
 - **Residual.** W8's scratch from LQ10 and LQ11, `~/w8-live` on fx-otp, is still there. Removing it needs a keyboard-interactive sign-in to fx-otp. W8's other Ares and fx-slurm scratch is removed, except `state/w8-live/worker-gate.json`, which the post-cutover LQ1 and LQ32 runs use.
 - **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
