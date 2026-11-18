@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 IdentityState = Literal["signed_in", "signed_out", "expired"]
 TokenSource = Literal["grant", "keyring"]
-SignInState = Literal["pending", "done", "failed", "slow_down"]
+SignInState = Literal["pending", "done", "failed", "slow_down", "expired"]
 
 # A token this close to expiry counts as expired, so a caller never gets one
 # that dies in flight.
@@ -70,12 +70,18 @@ class SignInStep(BaseModel):
     code, a link) and the ask points at relay's page, so nothing in ``display``
     reaches the transcript. ``data`` is the provider's private state (a PKCE
     verifier, a device code) and is never shown or written down.
+
+    ``poll_interval_s`` marks a device flow: relay polls at that interval
+    whether ``relay_page`` is true or false. When the code expires (``poll``
+    returns ``expired``, or ``expires_at`` passes), relay calls ``begin`` again
+    and shows the new step on the same ask's page.
     """
 
     url: str
     relay_page: bool = False
     display: dict[str, str] = Field(default_factory=dict[str, str])
     poll_interval_s: float | None = None
+    expires_at: datetime | None = None
     accepts_code: bool = Field(
         default=False, description="Relay's page offers a box to paste a code into"
     )

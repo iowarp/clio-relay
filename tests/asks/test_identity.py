@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -21,7 +22,6 @@ import pytest
 from clio_relay import identity
 from clio_relay.adapters.base import SignInNeed
 from clio_relay.adapters.hooks import Ask
-from clio_relay.asks import signin
 from clio_relay.asks.provider import RelayAskProvider
 from clio_relay.identity import (
     GrantFiles,
@@ -34,6 +34,7 @@ from clio_relay.identity import (
     Token,
     TokenStore,
 )
+from clio_relay.identity import device
 from clio_relay.identity import probe as probe_module
 from clio_relay.identity.github import GitHubIdentity
 from clio_relay.identity.globus import GlobusIdentity
@@ -458,23 +459,27 @@ class GitHubStub:
     def __init__(self, answers: list[str]) -> None:
         self.answers = answers
         self.polls = 0
+        self.codes = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         form = parse_qs(request.content.decode())
         assert form["client_id"] == ["stub-github-client"]
         if request.url.path == "/login/device/code":
+            self.codes += 1
+            first = self.codes == 1
             return httpx.Response(
                 200,
                 json={
-                    "device_code": "dev-code",
-                    "user_code": "WDJB-MJHT",
+                    "device_code": "dev-code" if first else f"dev-code-{self.codes}",
+                    "user_code": "WDJB-MJHT" if first else f"NEW{self.codes}-CODE",
                     "verification_uri": f"{GITHUB}/login/device",
                     "interval": 0.05,
                     "expires_in": 900,
                 },
             )
         assert request.url.path == "/login/oauth/access_token"
-        assert form["device_code"] == ["dev-code"]
+        wanted = "dev-code" if self.codes == 1 else f"dev-code-{self.codes}"
+        assert form["device_code"] == [wanted]
         answer = self.answers[min(self.polls, len(self.answers) - 1)]
         self.polls += 1
         if answer == "done":
@@ -490,7 +495,7 @@ async def test_github_device_sign_in(
 ) -> None:
     monkeypatch.setenv("CLIO_RELAY_GITHUB_CLIENT_ID", "stub-github-client")
     monkeypatch.setenv("CLIO_RELAY_GITHUB_URL", GITHUB)
-    monkeypatch.setattr(signin, "SLOW_DOWN_STEP_S", 0.05)
+    monkeypatch.setattr(device, "SLOW_DOWN_STEP_S", 0.05)
     add_site(relay_paths)
     service = RelayService(relay_paths)
     provider = provider_of(service)
@@ -548,9 +553,109 @@ async def test_github_poll_states() -> None:
         ctx = SignInContext(store=context.store, http=http)
         step = await github.begin(ctx)
         assert step.relay_page and step.display["code"] == "WDJB-MJHT"
+        assert step.expires_at is not None and not device.code_expired(step)
         assert "device_code" not in step.model_dump()
         states = [(await github.poll(ctx, step)).state for _ in answers]
-    assert states == ["pending", "slow_down", "failed", "failed", "done"]
+    assert states == ["pending", "slow_down", "expired", "failed", "done"]
+
+
+@pytest.mark.asyncio
+async def test_github_expired_code_is_asked_again(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_GITHUB_CLIENT_ID", "stub-github-client")
+    monkeypatch.setenv("CLIO_RELAY_GITHUB_URL", GITHUB)
+    add_site(relay_paths)
+    service = RelayService(relay_paths)
+    provider = provider_of(service)
+    stub = GitHubStub(["authorization_pending", "expired_token", "authorization_pending"])
+    _stubbed(provider, stub.handler)
+    ask = await _identity_ask(service, "github")
+    assert ask.url is not None
+    assert submit(ask.url, "start").status_code == 303
+
+    def new_code_page() -> str | None:
+        text = httpx.get(ask.url or "", timeout=30).text
+        return text if "NEW2-CODE" in text else None
+
+    page = eventually(new_code_page, "the new code on the page")
+    assert "WDJB-MJHT" not in page and "expired" in page
+    assert _completed(service, ask.ask_id) is None
+    stub.answers.append("done")
+    eventually(lambda: _completed(service, ask.ask_id), "the sign-in with the new code")
+    assert stub.codes == 2
+    await service.close()
+
+
+class _DeviceStub(_Stub):
+    """A device flow on the provider's own page, as TACC's is."""
+
+    name = "devstub"
+    title = "Device stub"
+    begun: ClassVar[list[str]] = []
+    polled: ClassVar[list[str]] = []
+
+    async def begin(self, ctx: SignInContext) -> SignInStep:
+        n = len(self.begun) + 1
+        code = f"CODE-{n}"
+        self.begun.append(code)
+        # The first code is already past its expiry; relay must not poll it.
+        expires = utc_now() + (timedelta(seconds=-1) if n == 1 else timedelta(hours=1))
+        return SignInStep(
+            url=f"https://device.stub.invalid/activate?code={code}",
+            relay_page=False,
+            display={"code": code},
+            poll_interval_s=0.05,
+            expires_at=expires,
+            data={"code": code},
+        )
+
+    async def poll(self, ctx: SignInContext, step: SignInStep) -> SignInResult:
+        self.polled.append(str(step.data["code"]))
+        if len(self.polled) < 3:
+            return SignInResult(state="pending")
+        return SignInResult(state="done")
+
+
+@pytest.mark.asyncio
+async def test_device_flow_on_the_providers_page_is_polled(relay_paths: RelayPaths) -> None:
+    _DeviceStub.begun.clear()
+    _DeviceStub.polled.clear()
+    identity.register("devstub", _DeviceStub)
+    try:
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        ask = await _identity_ask(service, "devstub")
+        assert ask.url is not None
+        assert submit(ask.url, "start").status_code == 303
+        eventually(lambda: _completed(service, ask.ask_id), "the device sign-in")
+        assert _DeviceStub.begun == ["CODE-1", "CODE-2"]
+        assert _DeviceStub.polled == ["CODE-2", "CODE-2", "CODE-2"]
+        await service.close()
+    finally:
+        identity.register("devstub", None)
+
+
+@pytest.mark.asyncio
+async def test_follow_asks_again_and_stops_when_told() -> None:
+    _DeviceStub.begun.clear()
+    _DeviceStub.polled.clear()
+    stub = _DeviceStub(_context())
+    async with httpx.AsyncClient() as http:
+        ctx = SignInContext(store=stub.context.store, http=http)
+        first = await stub.begin(ctx)
+        assert device.polls(first) and device.code_expired(first)
+        seen: list[str] = []
+        result = await device.follow(
+            stub, ctx, first, on_new_step=lambda step: seen.append(step.display["code"])
+        )
+        assert result is not None and result.state == "done"
+        assert seen == ["CODE-2"] and ctx.step is not None
+        assert ctx.step.display["code"] == "CODE-2"
+        stopped = await device.follow(stub, ctx, ctx.step, running=lambda: False)
+        assert stopped is None
+    assert not device.polls(SignInStep(url="https://x.invalid/", relay_page=False))
+    assert not device.polls(SignInStep(url="https://x.invalid/", relay_page=True, accepts_code=True))
 
 
 # Probing

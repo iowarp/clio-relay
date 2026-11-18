@@ -11,6 +11,7 @@ Settings: ``settings["github"]`` or ``CLIO_RELAY_GITHUB_<KEY>``, with keys
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from clio_relay.identity.base import (
@@ -73,6 +74,12 @@ class GitHubIdentity(OAuthIdentity):
             )
         link = verification if isinstance(verification, str) else f"{self.base_url}/login/device"
         interval = body.get("interval")
+        expires_in = body.get("expires_in")
+        expires_at = (
+            datetime.now(UTC) + timedelta(seconds=float(expires_in))
+            if isinstance(expires_in, (int, float)) and expires_in > 0
+            else None
+        )
         return SignInStep(
             url=link,
             relay_page=True,
@@ -82,6 +89,7 @@ class GitHubIdentity(OAuthIdentity):
                 "instructions": "Open the link, sign in to GitHub and enter the code.",
             },
             poll_interval_s=float(interval) if isinstance(interval, (int, float)) else 5.0,
+            expires_at=expires_at,
             data={"device_code": device_code},
         )
 
@@ -101,9 +109,7 @@ class GitHubIdentity(OAuthIdentity):
         if error == "slow_down":
             return SignInResult(state="slow_down")
         if error == "expired_token":
-            return SignInResult(
-                state="failed", message="GitHub's code expired. Start the sign-in again."
-            )
+            return SignInResult(state="expired", message="GitHub's code expired.")
         if error == "access_denied":
             return SignInResult(state="failed", message="The sign-in was declined on GitHub.")
         if status != 200 or not body.get("access_token"):

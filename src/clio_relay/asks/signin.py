@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from clio_relay.asks import askpass
 from clio_relay.asks.askpass import AskpassSession, Prompt
+from clio_relay.identity import device
 from clio_relay.identity.base import SignInContext, SignInStep
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal
@@ -40,8 +41,6 @@ logger = logging.getLogger(__name__)
 Mode = Literal["external", "identity", "keyring", "askpass", "prompt", "confirm"]
 SignInState = Literal["idle", "running", "done", "failed"]
 MODES: tuple[Mode, ...] = ("external", "identity", "keyring", "askpass", "prompt", "confirm")
-SLOW_DOWN_STEP_S = 5.0
-DEFAULT_POLL_S = 5.0
 
 
 @dataclass
@@ -150,7 +149,7 @@ class SignIns:
             return
         item.step = step
         ctx.step = step
-        if step.relay_page and not step.accepts_code:
+        if device.polls(step):
             item.tasks.append(self.owner.runner.spawn(self._poll(item, ctx)))
 
     async def _poll(self, item: SignIn, ctx: SignInContext) -> None:
@@ -158,25 +157,32 @@ class SignIns:
         step = item.step
         if identity is None or step is None:
             return
-        interval = step.poll_interval_s or DEFAULT_POLL_S
-        while item.state == "running":
-            await asyncio.sleep(interval)
-            try:
-                result = await identity.poll(ctx, step)
-            except Refusal as refusal:
-                # A provider that cannot be reached for a moment is retried.
-                item.message = refusal.message
-                continue
-            if result.state == "pending":
-                continue
-            if result.state == "slow_down":
-                interval += SLOW_DOWN_STEP_S
-                continue
-            if result.state == "done":
-                await self.complete(item)
-            else:
-                self._fail(item, result.message or "the sign-in did not finish")
+
+        def new_step(fresh: SignInStep) -> None:
+            item.step = fresh
+            item.message = "The code expired, so relay asked for a new one."
+
+        def error(refusal: Refusal) -> None:
+            item.message = refusal.message
+
+        try:
+            result = await device.follow(
+                identity,
+                ctx,
+                step,
+                running=lambda: item.state == "running",
+                on_new_step=new_step,
+                on_error=error,
+            )
+        except Refusal as refusal:
+            self._fail(item, refusal.message)
             return
+        if result is None:
+            return
+        if result.state == "done":
+            await self.complete(item)
+        else:
+            self._fail(item, result.message or "the sign-in did not finish")
 
     async def _start_askpass(self, item: SignIn) -> None:
         start = askpass.starter(item.site)
