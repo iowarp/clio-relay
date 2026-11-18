@@ -50,6 +50,15 @@ ACTIONS = (
 HOST_SIGN_IN = "data_source/login/"
 FORM_ERROR = ""
 
+# Where each form keeps its ``valid`` map, and the error keys that live in it.
+ADD_PATH = "/drafts/add"
+ADD_ERROR_PREFIXES = ("site.", "config.")
+EDIT_ERROR_PREFIXES = ("site.", "adapters.")
+CATALOG_PATH = "/catalog"
+CATALOG_ERROR = "catalog"
+CATALOG_SITE_ERROR = "catalog.id"
+CATALOG_ID_ERROR = "catalog.site_id"
+
 POLICY = Field(
     "policy",
     "Policy",
@@ -214,13 +223,47 @@ def summary(views: list[SiteView], notice: str = "") -> str:
 # Fields
 
 
-def field_components(tree: Tree, base: str, item: Field, path: str, error: str | None) -> list[str]:
-    """Add one form field, its help and its error, and return their ids."""
+def _segment(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def valid_path(form_path: str, key: str) -> str:
+    """Return where a form keeps whether the field under error ``key`` is valid."""
+    return f"{form_path}/valid/{_segment(key)}"
+
+
+def valid_map(errors: dict[str, str], prefixes: tuple[str, ...]) -> dict[str, bool]:
+    """Return a form's ``valid`` data: false for each field with an error under ``prefixes``."""
+    return {key: False for key in errors if key and key.startswith(prefixes)}
+
+
+def _checks(error: str | None, check_path: str | None) -> dict[str, Any]:
+    if not error or check_path is None:
+        return {}
+    return {"checks": [{"condition": bound(check_path), "message": error}]}
+
+
+def field_components(
+    tree: Tree,
+    base: str,
+    item: Field,
+    path: str,
+    error: str | None,
+    check_path: str | None = None,
+) -> list[str]:
+    """Add one form field, its help and its error, and return their ids.
+
+    A TextField or CheckBox shows its own error, through a check bound to
+    ``check_path`` that the form's data sets false. A ChoicePicker shows no check
+    message in every renderer, so its error stays a caption.
+    """
     label = f"{item.label} (required)" if item.required else item.label
     value = bound(path)
+    checks = _checks(error, check_path)
     if item.kind == "bool":
-        ids = [tree.add(base, "CheckBox", label=label, value=value)]
+        ids = [tree.add(base, "CheckBox", label=label, value=value, **checks)]
     elif item.kind == "choice":
+        checks = {}
         ids = [
             tree.add(
                 base,
@@ -239,8 +282,8 @@ def field_components(tree: Tree, base: str, item: Field, path: str, error: str |
             "lines": "longText",
             "yaml": "longText",
         }.get(item.kind, "shortText")
-        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant)]
-    if error:
+        ids = [tree.add(base, "TextField", label=label, value=value, variant=variant, **checks)]
+    if error and not checks:
         ids.append(tree.text(f"{base}-error", error, "caption"))
     if item.help:
         ids.append(tree.text(f"{base}-help", item.help, "caption"))
@@ -254,11 +297,18 @@ def _fields(
     path: str,
     errors: dict[str, str],
     prefix: str,
+    form_path: str,
 ) -> list[str]:
     ids: list[str] = []
     for item in fields:
+        key = prefix + item.key
         ids += field_components(
-            tree, f"{base}-f-{item.key}", item, f"{path}/{item.key}", errors.get(prefix + item.key)
+            tree,
+            f"{base}-f-{item.key}",
+            item,
+            f"{path}/{item.key}",
+            errors.get(key),
+            valid_path(form_path, key),
         )
     return ids
 
@@ -312,7 +362,7 @@ def _edit_form(
     path = f"/drafts/{site.id}"
     children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4")]
     children += _form_error(tree, base, errors)
-    children += _fields(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.")
+    children += _fields(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.", path)
     children.append(tree.text(f"{base}-ways", "Ways in", "h5"))
     tabs: list[dict[str, str]] = []
     for name in _edit_order(site, forms):
@@ -334,7 +384,7 @@ def _edit_form(
                 )
             )
         rows += _fields(
-            tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}."
+            tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}.", path
         )
         if not adapter_form.fields:
             rows.append(tree.text(f"{tab_base}-none", "No settings", "caption"))
@@ -528,7 +578,10 @@ def sites_surface(
     data: dict[str, Any] = {
         "switch": {view.site.id: {"adapter": [view.site.adapter]} for view in views},
         "drafts": {
-            view.site.id: edit_draft(view.site, forms)
+            view.site.id: {
+                **edit_draft(view.site, forms),
+                "valid": valid_map(state.errors.get(view.site.id, {}), EDIT_ERROR_PREFIXES),
+            }
             for view in views
             if view.site.id in state.editing
         },
@@ -570,6 +623,9 @@ def add_surface(
                 displayStyle="chips",
             )
         )
+        message = errors.get(CATALOG_SITE_ERROR)
+        if message:
+            children.append(tree.text("add-catalog-site-error", message, "caption"))
         children.append(
             tree.add(
                 "add-catalog-id",
@@ -577,9 +633,10 @@ def add_surface(
                 label="Site ID (optional)",
                 value=bound("/catalog/site_id"),
                 variant="shortText",
+                **_checks(errors.get(CATALOG_ID_ERROR), valid_path(CATALOG_PATH, CATALOG_ID_ERROR)),
             )
         )
-        message = errors.get("catalog")
+        message = errors.get(CATALOG_ERROR)
         if message:
             children.append(tree.text("add-catalog-error", message, "caption"))
         children.append(
@@ -596,7 +653,7 @@ def add_surface(
         children.append(tree.divider("add-divider"))
     children.append(tree.text("add-own-title", "Your own", "h4"))
     children += _form_error(tree, "add", errors)
-    children += _fields(tree, "add-s", ADD_FIELDS, "/drafts/add/site", errors, "site.")
+    children += _fields(tree, "add-s", ADD_FIELDS, "/drafts/add/site", errors, "site.", ADD_PATH)
     children.append(tree.text("add-ways", "How relay reaches it", "h5"))
     tabs: list[dict[str, str]] = []
     for name, adapter_form in forms.items():
@@ -608,6 +665,7 @@ def add_surface(
             f"/drafts/add/config/{name}",
             errors,
             f"config.{name}.",
+            ADD_PATH,
         )
         if not adapter_form.fields:
             rows.append(tree.text(f"{base}-none", "No settings", "caption"))
@@ -626,8 +684,12 @@ def add_surface(
         children.append(tree.add("add-tabs", "Tabs", tabs=tabs))
     tree.column("root", children)
     data: dict[str, Any] = {
-        "catalog": {"id": [catalog[0].id] if catalog else [], "site_id": ""},
-        "drafts": {"add": add_draft(forms)},
+        "catalog": {
+            "id": [catalog[0].id] if catalog else [],
+            "site_id": "",
+            "valid": valid_map(errors, (CATALOG_ID_ERROR,)),
+        },
+        "drafts": {"add": {**add_draft(forms), "valid": valid_map(errors, ADD_ERROR_PREFIXES)}},
     }
     return tree.components, data
 

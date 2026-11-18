@@ -1,6 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "clio-relay",
+  "title": "Relay",
   "version": "1.6.8",
   "description": "Relay: run jobs, commands, file transfers and services on your compute sites, and manage those sites in the Compute tab.",
   "author": {
