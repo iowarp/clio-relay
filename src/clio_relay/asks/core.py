@@ -24,7 +24,7 @@ from clio_relay.asks.pages import (
     options,
     response,
 )
-from clio_relay.asks.signin import SignIn
+from clio_relay.asks.signin import SignIn, mode_of
 from clio_relay.jobs.records import OperationRecord, OperationState, RecordStore
 from clio_relay.jobs.spec import canonical_digest
 
@@ -332,6 +332,8 @@ class PageCore:
     ) -> PageResponse:
         signins = self.owner.signins
         value = fields.get("value", "")
+        if action == "accept" and mode_of(ask) in ("confirm", "external"):
+            action = "done"
         if action == "start":
             await signins.start(ask)
         elif action == "code" and value.strip():
