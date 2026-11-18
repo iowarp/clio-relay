@@ -983,9 +983,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # split/jarvis-service-runtime-w2: the wire/data models (14 Pydantic
     # classes plus the canonical digest/path/UTF-8 validation primitives
     # their field validators are built on) moved to the new
-    # jarvis_service_runtime_models.py (390 lines); the source-job/MCP-result
-    # provenance checks and ready-service selection/package-identity checks
-    # moved to the new jarvis_service_runtime_validation.py (231 lines).
+    # jarvis_service_runtime_models.py (390 lines).
     # What stays resident is only the cluster that reads/re-verifies the
     # durable relay queue and resolves a private JARVIS authority bearer --
     # every function reachable from one of the six externally-patched
@@ -1146,23 +1144,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # (mcp_dispatch.py's `_call_tool` reaches them only through the
     # `_mcp_server.<name>` back-reference too); the two internal helpers
     # need no re-export since nothing outside this module calls them.
-    #
-    # split/mcp-server-w3 slice 6 (#231): the gateway-session / monitor-rule /
-    # progress MCP tools (_monitor_rule_from_arguments, _record_progress,
-    # _record_task_event, _create_gateway_session, _bind_jarvis_runtime,
-    # _jarvis_runtime_binding_selectors, _update_gateway_session,
-    # _reject_generic_gateway_runtime_fields, _required_environment_secret)
-    # move to mcp_gateway_tools.py. Two names `_bind_jarvis_runtime` calls are
-    # directly monkeypatched by tests (`_remote_cluster_definition`, which
-    # also stays defined in mcp_server.py since many other functions call it
-    # too, and `resolve_jarvis_service_runtime`, imported from
-    # clio_relay.jarvis_service_runtime everywhere else but reached here
-    # through the back-reference specifically because of the monkeypatch) --
-    # both go through the `_mcp_server.<name>` function-scope back-reference.
-    # mcp_server.py re-exports both of the dispatcher/monkeypatch-reached
-    # names it needs (resolve_jarvis_service_runtime plus the six tool
-    # functions mcp_dispatch.py's `_call_tool` reaches only through its own
-    # back-reference).
     # mcp_stdio_validation.py's own ratchet-baseline entry and history comment
     # (the #231 R9 fix round 3 timeout-diagnostic note) were removed here
     # (split/mcp-stdio-validation-w2): the file is now 265 lines (an
@@ -1487,176 +1468,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # import lines (CQ15 §10.7 precedent: retarget a moved-symbol import to
     # its real new owner, never a facade re-export).
     "src/clio_relay/adapters/worker/retention.py": 952,
-    # split/runtime-metadata-w2: runtime_metadata.py becomes a 113-line
-    # assembly/facade only (re-exports, no logic) after its nine concerns --
-    # schema/state vocabulary (runtime_metadata_types.py), the normalized
-    # JarvisRuntimeMetadata document (runtime_metadata_core_model.py), loose
-    # payload coercion (runtime_metadata_coercion.py), strict native field
-    # validators (runtime_metadata_native_validators.py), the exact native
-    # JARVIS document family + clio-kit projection
-    # (runtime_metadata_native_documents.py), merge/lifecycle-regression
-    # guards (runtime_metadata_merge.py), native-document normalization
-    # (runtime_metadata_native_normalize.py), MCP-result/legacy compatibility
-    # decoding (runtime_metadata_mcp_normalize.py), and the authenticated
-    # sidecar record codec (runtime_metadata_sidecar.py) -- each its own
-    # owner module, all comfortably under DEFAULT_MAX_LINES. Entry removed
-    # per ground rule 5 -- ratchet down.
-    # #231 R10: the local owned-visitor render/write/spawn path now delegates
-    # to frp_link.py, while the three remote frpc start/stop script generators
-    # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.
-    # #231 CQ16 cross-file fix: +4 net lines -- _revoke_browser_attachment's
-    # except clause now discriminates BrowserAttachmentIdentityConflictError
-    # by type instead of a substring match on QueueConflictError (the banned
-    # prose-match pattern). Campaign merge: 9391 base -5 (#242 gating)
-    # +4 (CQ16) = 9390, the measured merged count.
-    # #231 service-runtime split, slice 1: the zero-dependency primitives
-    # (untyped-dict coercion helpers, two small connector-config validators,
-    # the cleanup-resource gateway binder, and the just-started-process-group
-    # rollback helper) moved to the new service_runtime_primitives.py (96
-    # lines). Every internal call site was requalified to `_primitives.<name>`
-    # so the existing `monkeypatch.setattr(service_runtime, ...)` tests that
-    # target these names keep failing loudly instead of silently no-op'ing;
-    # the one test that patched `_terminate_just_started_process_group`
-    # in-place was repointed to the new module. Net -46 lines even though 49
-    # lines moved out: qualifying ~220 call sites pushed several lines past
-    # the 100-col limit and `ruff format` reflowed them across more lines.
-    # 9390 -> 9344.
-    # #231 service-runtime split, slice 2: the ten zero-dependency wire/result
-    # types and the CommandRunner protocol (three narrow RelayError
-    # subclasses, five frozen dataclasses, the Protocol) moved to the new
-    # service_runtime_types.py (161 lines). 9344 -> 9211.
-    # #231 service-runtime split, slice 3: the mutually-coupled
-    # scheduler-submission-parsing + gateway-intent + completed-resource
-    # validation cluster moved to the new service_runtime_scheduler_contracts.py
-    # (800 lines, at the cap -- two sibling concerns that call back into each
-    # other, documented in the module docstring rather than force-split).
-    # 9211 -> 8502.
-    # #231 service-runtime split, slice 4: the local desktop-connector
-    # process discovery/identity/signaling cluster (POSIX pidfd primitives +
-    # Windows CIM enumeration) moved to the new
-    # service_runtime_connector_identity.py (682 lines). 8502 -> 7866.
-    # #231 service-runtime split, slice 5: the concrete SubprocessCommandRunner
-    # (CommandRunner protocol default implementation) plus its stdin-delivery
-    # helper moved to the new service_runtime_command_runner.py (154 lines).
-    # 7866 -> 7740.
-    # #231 service-runtime split, slice 6: the absolute-deadline bounded HTTP
-    # readiness reader plus loopback-port and browser-attachment-support
-    # helpers moved to the new service_runtime_readiness.py (242 lines).
-    # 7740 -> 7537.
-    # #231 service-runtime split, slice 7: the SSH-delivered embedded
-    # shell/Python script generators for scheduler-submission tracking
-    # (reserve/capture/verify one exact submission through a durable,
-    # race-safe sidecar) moved to the new
-    # service_runtime_submission_scripts.py (627 lines). 7537 -> 6948.
-    # #231 service-runtime split, slice 8: the SSH-delivered embedded
-    # shell/Python script generators for the scheduler-allocation
-    # connector-step lifecycle (step status/cancel/reconcile, remote HTTP
-    # health probe, connector discovery/status by durable identity sidecar)
-    # moved to the new service_runtime_connector_step_scripts.py (448
-    # lines). This closes out the module-level function extractions named
-    # in the concern inventory; service_runtime.py is now imports + module
-    # constants + the ServiceRuntimeSupervisor class only. 6948 -> 6523.
-    # #231 service-runtime split, slice 9: the three frozen outcome
-    # dataclasses (ServiceRuntimeStartResult/ServiceRuntimePendingResult/
-    # ServiceRuntimeStopResult) plus their to_live_validation_report
-    # conversions and the ten RUNTIME_*_CHECK_ID identifiers moved to the
-    # new service_runtime_results.py (722 lines); re-exported here under a
-    # `# noqa: F401` header since cli.py/mcp_server.py/live_acceptance.py
-    # bare-import them and cli.py is out of this split's scope to edit.
-    # This was the last extractable module-level content -- everything
-    # remaining is imports, module constants, and the
-    # ServiceRuntimeSupervisor class itself. 6523 -> 5840.
-    # #231 service-runtime split, slice 10 (class-mixin split begins): the
-    # ServiceRuntimeSupervisor.__init__ construction, the per-gateway
-    # cross-process transition lock, durable-session update helpers, the
-    # shared SSH transport, JARVIS authorization resolution, and the two
-    # durable-failure recorders moved to the new
-    # service_runtime_core.py (282 lines) as `_ServiceRuntimeCoreMixin` --
-    # the first slice of the class body itself (module-level content is
-    # exhausted; from here every slice peels one mixin off
-    # ServiceRuntimeSupervisor, which now derives from the mixin as its
-    # first base). 5840 -> 5613.
-    # #231 service-runtime split, slice 11: the start/resume-start state
-    # machine (start, resume_start, _resume_start_locked,
-    # _complete_runtime_start_locked, the connector reuse/launch/recovery
-    # predicates, _ready_start_result, _rollback_runtime_start) moved to the
-    # new service_runtime_start.py (796 lines, at the sweet-spot cap -- one
-    # cohesive state machine, documented in the module docstring rather than
-    # force-split) as `_ServiceRuntimeStartMixin`. The shared
-    # _RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS constant (used by this
-    # mixin plus the not-yet-extracted jarvis-bind and browser clusters)
-    # moved to service_runtime_readiness.py, which every caller already
-    # imports, rather than being duplicated three times. 5613 -> 4873.
-    # #231 service-runtime split, slice 12: the JARVIS-bound runtime binding
-    # cluster (bind_verified_jarvis_runtime, its identity/policy helpers,
-    # _validate_jarvis_binding_session, _resume_jarvis_binding_locked,
-    # _jarvis_connector_start_intent, _rollback_jarvis_binding, plus the two
-    # schema constants that move with their only callers) moved to the new
-    # service_runtime_jarvis_bind.py (768 lines, at the sweet-spot cap -- one
-    # cohesive state machine, documented in the module docstring rather than
-    # force-split) as `_ServiceRuntimeJarvisBindMixin`. 4873 -> 4169.
-    # #231 service-runtime split, slice 13: the browser sandbox attach/detach
-    # cluster (browser_attach, browser_detach, their serialized
-    # implementations, the shared _revoke_browser_attachment revocation, and
-    # _revoke_browser_for_runtime_cleanup) moved to the new
-    # service_runtime_browser.py (465 lines) as `_ServiceRuntimeBrowserMixin`.
-    # 4169 -> 3749.
-    # #231 service-runtime split, slice 14: the teardown (stop) cluster --
-    # stop, _stop_serialized, and the teardown-policy quartet it exclusively
-    # calls (_prepare_teardown_intent, _prepare_teardown_policy,
-    # _validate_teardown_policy, _completed_teardown_result), pulled together
-    # from two non-adjacent spans since the quartet sits physically after the
-    # detach/attach cluster -- moved to the new service_runtime_stop.py (688
-    # lines) as `_ServiceRuntimeStopMixin`. The two teardown schema constants
-    # move with their only callers. 3749 -> 3107.
-    # #231 service-runtime split, slice 15: desktop-connector-only detach --
-    # detach, _detach_serialized, _prepare_detach_intent,
-    # _completed_detach_result, _consume_completed_detach_for_attach, and the
-    # three resumability predicates (interleaved with the intent helpers in
-    # the original source since they are one concern: what a detached
-    # generation proves and who may resume it) -- moved to the new
-    # service_runtime_detach.py (564 lines) as `_ServiceRuntimeDetachMixin`.
-    # The attach mixin calls back into this module's predicates via `self`.
-    # 3107 -> 2596.
-    # #231 service-runtime split, slice 16: desktop-connector reattachment --
-    # attach, _attach_serialized -- moved to the new service_runtime_attach.py
-    # (353 lines) as `_ServiceRuntimeAttachMixin`. It calls back into the
-    # detach mixin's resumability predicates via `self`. 2596 -> 2292.
-    # #231 service-runtime split, slice 17: ownership-intent reconciliation --
-    # the crash-recovery core _reconcile_ownership_intents (recovers
-    # scheduler submission and connector identities written before a hard
-    # exit by consulting each durable intent's SSH-observed sidecar),
-    # _reconcile_allocation_connector_intent, the two identity-binding
-    # validators it calls, _connector_records_match, and
-    # _local_connector_intent -- moved to the new
-    # service_runtime_reconciliation.py (732 lines) as
-    # `_ServiceRuntimeReconciliationMixin`. 2292 -> 1614.
-    # #231 service-runtime split, slice 18: scheduler/runtime observation and
-    # verification -- _verified_scheduler_submission,
-    # _quiesced_owner_source_recovery_is_authorized,
-    # _observe_allocation_and_health_once (the single-shot, never-blocking
-    # observation core) and its _record_runtime_observation_pending
-    # persister, _retained_scheduler_resource, and the scheduler-polling
-    # primitives -- moved to the new service_runtime_observation.py (673
-    # lines) as `_ServiceRuntimeObservationMixin`. Slice 18b: the shared
-    # desktop-connector stop primitive _stop_local_connector (called from
-    # five other mixins) and its _remove_unpublished_local_connector_files
-    # cleanup split out separately into service_runtime_local_connector.py
-    # (171 lines) as `_ServiceRuntimeLocalConnectorMixin`, since bundling it
-    # with observation would have crossed the 800-line cap. 1614 -> 854.
-    # #231 service-runtime split, slice 19 (final): the last two clusters --
-    # remote/allocation connector lifecycle (_start_remote_connector,
-    # _allocation_connector_identity, _poll_allocation_connector_step,
-    # _stop_allocation_connector, _retained_allocation_connector_resource)
-    # moved to the new service_runtime_remote_connector.py (497 lines) as
-    # `_ServiceRuntimeRemoteConnectorMixin`; local process start + HTTP
-    # health waits (_start_local_visitor, _start_browser_proxy,
-    # _wait_for_jarvis_health, _wait_for_browser_health,
-    # _wait_for_local_health) moved to the new service_runtime_local_start.py
-    # (376 lines) as `_ServiceRuntimeLocalStartMixin`. service_runtime.py is
-    # now assembly-only: imports, the mixin composition list, and the class
-    # docstring recording it. 854 -> 78. #231 CLOSED for this file.
-    "src/clio_relay/service_runtime.py": 78,
     # #231 R8(iii) (design doc §4.4, issue #237): the wire-model cluster
     # (`:890-1433` -- one frozen dataclass + 16 pydantic.BaseModel types, 542
     # lines) plus its 2 bound constants moved to the new
@@ -1977,7 +1788,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 81.80
+SRC_DISTRIBUTION_BASELINE_PERCENT = 82.10
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
