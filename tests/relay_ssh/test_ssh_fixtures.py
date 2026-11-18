@@ -8,12 +8,16 @@ take longer.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
@@ -24,6 +28,7 @@ import pytest
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter
+from clio_relay.asks import askpass
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle, JobStatus
 from clio_relay.jobs.records import new_id
@@ -345,16 +350,8 @@ async def test_lq8_a_detached_job_is_read_by_a_later_poll(
     assert (await files.read(f"{job_dir}/stderr")).strip() == b"lq8-err"
 
 
-@pytest.mark.parametrize("interactive", [False, True])
-async def test_lq9_a_code_site_refuses_and_names_worker(
-    fx: dict[str, str], tmp_path: Path, interactive: bool
-) -> None:
-    config: dict[str, Any] = {"interactive_sign_in": True} if interactive else {}
-    adapter = build(fx, tmp_path, "fx-otp", **config)
-    from clio_relay.adapters.ssh import transport
-
-    if interactive and transport._askpass_module() is not None:  # pyright: ignore[reportPrivateUsage]
-        pytest.skip("W6's askpass is installed, so this site can ask; see the sign-in test")
+async def test_lq9_a_code_site_refuses_and_names_worker(fx: dict[str, str], tmp_path: Path) -> None:
+    adapter = build(fx, tmp_path, "fx-otp")
     assert await adapter.sign_in_needed() is None
     for call in (
         adapter.describe(),
@@ -365,6 +362,100 @@ async def test_lq9_a_code_site_refuses_and_names_worker(
         assert refused.value.reason == RefusalReason.INTERACTIVE_AUTH_REQUIRED
         assert refused.value.data["adapter"] == "worker"
         assert "worker" in refused.value.message
+
+
+async def test_lq9_with_interactive_sign_in_the_code_site_asks_for_a_sign_in(
+    fx: dict[str, str], tmp_path: Path
+) -> None:
+    adapter = build(fx, tmp_path, "fx-otp", interactive_sign_in=True)
+    site = adapter.transport.site_id
+    try:
+        need = await adapter.sign_in_needed()
+        assert need is not None and need.provider == "ssh"
+        assert askpass.starter(site) is not None
+        with pytest.raises(Refusal) as refused:
+            await adapter.describe()
+        assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+    finally:
+        askpass.register_sign_in(site, None)
+
+
+def totp_code(fx: dict[str, str]) -> str:
+    """Return fx-otp's current code."""
+    secret = Path(fx["FX_OTP_SECRET_FILE"]).read_text().strip()
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+    offset = digest[-1] & 15
+    code = (struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF) % 1000000
+    return f"{code:06d}"
+
+
+async def close_otp(fx: dict[str, str], adapter: SshAdapter) -> None:
+    subprocess.run(
+        [
+            "ssh",
+            "-F",
+            fx["FX_SSH_CONFIG"],
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ControlPath={adapter.transport.control_path}",
+            "fx-otp",
+            f"rm -rf {RUN_DIR}",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    await adapter.transport.stop_master()
+    assert not await adapter.transport.master_up()
+
+
+async def signed_in_job(adapter: SshAdapter) -> None:
+    """With the master up, every verb works without another prompt."""
+    assert await adapter.transport.master_up()
+    await adapter.sign_in_done({})
+    info = await adapter.describe()
+    assert info.facts["host"]
+    handle = await adapter.run(
+        JobSpec(executable="sh", arguments=["-c", "echo otp-in"]), operation_id=new_id("op")
+    )
+    final = await wait_final(adapter, handle)
+    assert final.state.value == "completed", final
+    files = await adapter.files()
+    assert (await files.read(f"{handle.data['job_dir']}/stdout")).strip() == b"otp-in"
+
+
+async def test_lq9_the_code_site_gets_in_through_relays_askpass(
+    fx: dict[str, str], tmp_path: Path
+) -> None:
+    """The person's answer travels through W6's helper and broker, as on relay's page."""
+    adapter = build(fx, tmp_path, "fx-otp", interactive_sign_in=True)
+    site = adapter.transport.site_id
+    prompts: list[str] = []
+
+    def person(session: askpass.AskpassSession, prompt: askpass.Prompt) -> None:
+        prompts.append(prompt.text.strip())
+        if session.site == site and "code" in prompt.text.lower():
+            session.answer(prompt.prompt_id, totp_code(fx))
+        else:
+            session.decline(prompt.prompt_id)
+
+    askpass.broker().add_listener(person)
+    try:
+        need = await adapter.sign_in_needed()
+        assert need is not None and need.provider == "ssh"
+        env = askpass.environment(site=site, title=f"Sign in to {site}")
+        assert Path(env["SSH_ASKPASS"]).name.startswith(askpass.PROGRAM)
+        start = askpass.starter(site)
+        assert start is not None
+        await start(env)  # what "Start sign-in" on relay's page runs
+        await signed_in_job(adapter)
+        assert len(prompts) == 1, prompts  # one sign-in served every call
+    finally:
+        askpass.broker().remove_listener(person)
+        askpass.register_sign_in(site, None)
+        await close_otp(fx, adapter)
 
 
 def totp_helper(fx: dict[str, str], directory: Path) -> tuple[Path, Path]:
@@ -392,45 +483,15 @@ print(f"{{code:06d}}")
     return helper, log
 
 
-async def test_lq9_the_code_site_gets_in_once_askpass_answers(
+async def test_lq9_an_askpass_program_signs_in_without_a_person(
     fx: dict[str, str], tmp_path: Path
 ) -> None:
     helper, log = totp_helper(fx, tmp_path)
     adapter = build(fx, tmp_path / "state", "fx-otp", interactive_sign_in=True, askpass=str(helper))
     try:
-        need = await adapter.sign_in_needed()
-        if need is not None:  # W6's page would run this when the person presses start
-            assert need.provider == "ssh"
-            await adapter.transport.starter()(adapter.transport.environment() or {})
-        assert await adapter.transport.master_up()
-        await adapter.sign_in_done({})
-        info = await adapter.describe()
-        assert info.facts["host"]
-        handle = await adapter.run(
-            JobSpec(executable="sh", arguments=["-c", "echo otp-in"]), operation_id=new_id("op")
-        )
-        final = await wait_final(adapter, handle)
-        assert final.state.value == "completed", final
-        files = await adapter.files()
-        assert (await files.read(f"{handle.data['job_dir']}/stdout")).strip() == b"otp-in"
+        assert await adapter.sign_in_needed() is None
+        await signed_in_job(adapter)
         prompts = [line for line in log.read_text().splitlines() if line]
         assert len(prompts) == 1, prompts  # one sign-in served every call
     finally:
-        subprocess.run(
-            [
-                "ssh",
-                "-F",
-                fx["FX_SSH_CONFIG"],
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ControlPath={adapter.transport.control_path}",
-                "fx-otp",
-                f"rm -rf {RUN_DIR}",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=60,
-        )
-        await adapter.transport.stop_master()
-        assert not await adapter.transport.master_up()
+        await close_otp(fx, adapter)
