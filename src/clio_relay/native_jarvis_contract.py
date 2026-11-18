@@ -46,11 +46,8 @@ JARVIS_CD_NATIVE_OPERATIONS = (
     "pipeline.get_execution_progress",
     "pipeline.run",
 )
-# Receipts written before relay stopped calling these still list them. They are
-# ignored when matching, so those installations keep passing.
-RETIRED_JARVIS_CD_NATIVE_OPERATIONS = frozenset(
-    {"execution_store.resolve_service_runtime_authority"}
-)
+# Older receipts still list these; matching ignores them so those installations pass.
+RETIRED_JARVIS_CD_OPERATIONS = frozenset({"execution_store.resolve_service_runtime_authority"})
 
 
 def probe_clio_kit_native_execution_contract(
@@ -489,32 +486,10 @@ def _native_capability_matches_component(
         )
     if component_name == "jarvis-cd":
         return (
-            _current_jarvis_cd_operations(capability) == list(JARVIS_CD_NATIVE_OPERATIONS)
+            capability.without_operations(RETIRED_JARVIS_CD_OPERATIONS).operations
+            == list(JARVIS_CD_NATIVE_OPERATIONS)
             and capability.contract_id is None
             and capability.contract_schema_version is None
             and capability.contract_sha256 is None
         )
     return False
-
-
-def _current_jarvis_cd_operations(capability: NativeJarvisExecutionCapability) -> list[str]:
-    """Return a capability's operations without the retired JARVIS-CD ones."""
-    return [
-        operation
-        for operation in capability.operations
-        if operation not in RETIRED_JARVIS_CD_NATIVE_OPERATIONS
-    ]
-
-
-def native_capabilities_agree(
-    observed: NativeJarvisExecutionCapability,
-    expected: NativeJarvisExecutionCapability,
-) -> bool:
-    """Return whether a probed JARVIS-CD capability agrees with its receipt.
-
-    Retired operations are ignored on both sides, so a receipt written before
-    they were retired agrees with a probe that no longer reports them.
-    """
-    return observed.model_copy(
-        update={"operations": _current_jarvis_cd_operations(observed)}
-    ) == expected.model_copy(update={"operations": _current_jarvis_cd_operations(expected)})

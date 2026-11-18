@@ -15,8 +15,8 @@ from clio_relay.jarvis_mcp import (
 from clio_relay.native_jarvis_contract import (
     CLIO_KIT_JARVIS_CONTRACT_ID,
     JARVIS_CD_NATIVE_OPERATIONS,
+    RETIRED_JARVIS_CD_OPERATIONS,
     _native_capability_matches_component,  # pyright: ignore[reportPrivateUsage]
-    native_capabilities_agree,
     probe_clio_kit_native_execution_contract,
 )
 
@@ -94,6 +94,13 @@ def test_clio_kit_probe_rejects_execution_query_without_artifact_selector(
 _RETIRED_OPERATION = "execution_store.resolve_service_runtime_authority"
 
 
+def _agree(
+    observed: NativeJarvisExecutionCapability, expected: NativeJarvisExecutionCapability
+) -> bool:
+    retired = RETIRED_JARVIS_CD_OPERATIONS
+    return observed.without_operations(retired) == expected.without_operations(retired)
+
+
 def _jarvis_cd_capability(operations: list[str]) -> NativeJarvisExecutionCapability:
     return NativeJarvisExecutionCapability(operations=sorted(operations))
 
@@ -112,8 +119,8 @@ def test_jarvis_cd_receipt_that_lists_the_retired_operation_still_passes() -> No
     current = _jarvis_cd_capability(list(JARVIS_CD_NATIVE_OPERATIONS))
 
     assert _native_capability_matches_component(older, component_name="jarvis-cd")
-    assert native_capabilities_agree(current, older)
-    assert native_capabilities_agree(older, current)
+    assert _agree(current, older)
+    assert _agree(older, current)
 
 
 def test_jarvis_cd_contract_still_refuses_other_operation_changes() -> None:
@@ -124,5 +131,5 @@ def test_jarvis_cd_contract_still_refuses_other_operation_changes() -> None:
 
     assert not _native_capability_matches_component(missing, component_name="jarvis-cd")
     assert not _native_capability_matches_component(extra, component_name="jarvis-cd")
-    assert not native_capabilities_agree(missing, current)
-    assert not native_capabilities_agree(extra, current)
+    assert not _agree(missing, current)
+    assert not _agree(extra, current)
