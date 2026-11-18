@@ -5,15 +5,17 @@ job. It goes through the spend gate like any run. Relay submits a holder in
 its place, and ``exec`` reaches the held nodes with
 ``srun --jobid=<native id> --overlap <command>``.
 
-The holder releases the allocation after ten idle minutes. Idle means no job
-step besides the batch and extern steps, so a running ``srun`` keeps it, and
-the holder never stops anything that is running: it only lets its own batch
-script end once nothing else is. When it cannot tell (the scheduler does not
-answer), it counts the time as busy.
+The holder releases the allocation once ten minutes have passed since anything
+last used it. It measures that by the clock from the latest of: a step it sees
+running (``squeue -s``), the end time of the latest finished step (``sacct``,
+so a short ``srun`` that ran between two looks still counts), and the time the
+job directory's ``.relay-warm-active`` file last changed. A running ``srun``
+keeps it, and the holder never stops anything that is running: it only lets its
+own batch script end once nothing else is. When the scheduler does not answer,
+it counts the time as busy.
 
-Without Slurm steps to watch, a holder counts the time since the job
-directory's ``.relay-warm-active`` file last changed; ``touch`` it to keep the
-allocation (open sites only, since ``touch`` is not read-only).
+Without Slurm, only the marker counts: ``touch`` it to keep the allocation
+(open sites only, since ``touch`` is not read-only).
 """
 
 from __future__ import annotations
@@ -27,21 +29,32 @@ HOLDER = r"""limit=$1 step=$2
 marker="$PWD/.relay-warm-active"
 job=${SLURM_JOB_ID:-${PBS_JOBID:-}}
 echo "relay warm allocation $job: held; released after $limit s with nothing running"
+slurm() { [ -n "${SLURM_JOB_ID:-}" ] && command -v squeue >/dev/null 2>&1; }
 busy() {
-  if [ -n "${SLURM_JOB_ID:-}" ] && command -v squeue >/dev/null 2>&1; then
-    steps=$(squeue -h -s -j "$SLURM_JOB_ID" -o %i 2>/dev/null) || return 0
-    printf '%s\n' "$steps" | grep -Eq '\.[0-9]+(\+[0-9]+)?$' && return 0
-    return 1
-  fi
-  [ -e "$marker" ] || return 1
-  changed=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 0
-  [ $(( $(date +%s) - changed )) -lt "$step" ]
+  slurm || return 1
+  steps=$(squeue -h -s -j "$SLURM_JOB_ID" -o %i 2>/dev/null) || return 0
+  printf '%s\n' "$steps" | grep -Eq '\.[0-9]+(\+[0-9]+)?$'
 }
-idle=0
+used() {
+  if [ -e "$marker" ]; then
+    stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null
+  fi
+  if slurm && command -v sacct >/dev/null 2>&1; then
+    sacct -n -P -j "$SLURM_JOB_ID" -o JobID,End 2>/dev/null |
+      while IFS='|' read -r id end; do
+        case $id in *.[0-9]*) ;; *) continue ;; esac
+        case $end in ''|Unknown|None) continue ;; esac
+        date -d "$end" +%s 2>/dev/null || true
+      done
+  fi
+}
+last=$(date +%s)
 while :; do
-  if busy; then idle=0; else idle=$((idle + step)); fi
-  if [ "$idle" -ge "$limit" ] && ! busy; then
-    echo "relay warm allocation $job: idle for $idle s; released at $(date -u +%FT%TZ)"
+  now=$(date +%s)
+  if busy; then last=$now; fi
+  for t in $(used); do [ "$t" -gt "$last" ] && last=$t; done
+  if [ $((now - last)) -ge "$limit" ] && ! busy; then
+    echo "relay warm allocation $job: idle for $((now - last)) s; released at $(date -u +%FT%TZ)"
     exit 0
   fi
   sleep "$step"

@@ -152,7 +152,8 @@ allocation, and `exec` reaches it with
 read-only on a guarded site. Only allocations relay holds on that site are
 reachable this way.
 
-A warm allocation nobody uses for ten minutes releases itself. That is an idle
+A warm allocation releases itself once ten minutes have passed since anything
+last ran in it, counted from the end of the last command. That is an idle
 timer on an allocation, not a limit on anything running: while a step runs in
 the allocation it stays, and the holder never stops a running step. Cancel it
 sooner with `run` and `cancel`.
