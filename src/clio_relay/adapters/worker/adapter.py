@@ -3,7 +3,7 @@
 The person signs in to the site once. In that one ssh pass relay installs
 itself in a private directory on the site, writes the worker's identity and
 starts ``clio-relay worker site-serve`` detached. That process serves the
-owned-session API on loopback and holds an frpc ``stcp`` proxy to the
+worker's API on loopback and holds an frpc ``stcp`` proxy to the
 rendezvous server. Relay then reaches it over the one held link
 (``brokered_tcp``), and nothing uses SSH after that.
 
@@ -13,8 +13,10 @@ is psij's (RL18). Every verb crosses the link as one POST to the worker's
 here.
 
 What relay keeps between restarts is ``worker-link.json`` in the adapter's
-state directory (0600): ids, the API token, the stcp secret and the port. A
-restarted relay reconnects from it over frp, again without SSH.
+state directory (0600): ids, the API token, the session owner token, the stcp
+secret and the port. A restarted relay reconnects from it over frp, again
+without SSH. A worker an older relay placed is refused with a sign-in, which
+places a current one (:mod:`clio_relay.adapters.worker.link`).
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import shutil
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -52,6 +54,9 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+
+if TYPE_CHECKING:
+    from clio_relay.adapters.worker.link import WorkerConnection
 
 WORKER_LINK_FILE = "worker-link.json"
 ADAPTER_ROUTE_PREFIX = "/adapter"
@@ -150,6 +155,8 @@ class WorkerLink(BaseModel):
     proxy_name: str
     port: int
     remote_dir: str
+    # Links stored by an older relay lack it; their worker is placed again.
+    session_owner_token: str | None = None
 
 
 # --- the askpass seam (W6) -------------------------------------------------
@@ -440,8 +447,10 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             proxy_name=f"clio-worker-{secrets.token_hex(8)}",
             port=0,
             remote_dir=self._remote_dir(),
+            session_owner_token=secrets.token_urlsafe(48),
         )
-        script = self.placement_script(link, session_owner_token=secrets.token_urlsafe(48))
+        assert link.session_owner_token is not None
+        script = self.placement_script(link, session_owner_token=link.session_owner_token)
         self._drop_connection()
         # No time limit: the person may be typing a code on the sign-in page.
         process = await asyncio.create_subprocess_exec(
@@ -484,8 +493,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if held is not None:
             held.close()
 
-    async def _connection(self, *, attempts: int = 1) -> Any:
-        from clio_relay.adapters.worker.remote_connection import RemoteConnection
+    async def _connection(self, *, attempts: int = 1) -> WorkerConnection:
+        from clio_relay.adapters.worker.link import WorkerConnection, WorkerOutdated
         from clio_relay.config import RelaySettings
 
         link = self.load_link()
@@ -496,6 +505,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 site=self.context.site_id,
                 provider="ssh",
             )
+        if link.session_owner_token is None:
+            raise self._outdated("its link was stored by an older relay")
         key = self._connection_key(link)
         with _connections_lock:
             held = _connections.get(key)
@@ -507,32 +518,23 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         local = self._definition(link, site_view=False)
         os.environ[local.frp_transport.token_env] = token
         os.environ[local.frp_transport.stcp_secret_env] = link.stcp_secret
-        settings = RelaySettings.from_env().model_copy(
-            update={
-                "owner_session_id": link.session_id,
-                "owner_session_generation_id": link.generation_id,
-                "owner_session_cluster": link.cluster,
-                "owner_session_api_port": link.port,
-                "api_token": link.api_token,
-                "remote_cluster": None,
-                "remote_transport_mode": "brokered_tcp",
-                "remote_transport_interactive": False,
-            }
-        )
         last: Exception | None = None
         for attempt in range(attempts):
-            connection = RemoteConnection(
+            connection = WorkerConnection(
                 definition=local,
-                settings=settings,
+                session_id=link.session_id,
+                generation_id=link.generation_id,
                 remote_api_port=link.port,
-                transport_mode="brokered_tcp",
-                allow_interactive_authorization=False,
+                api_token=link.api_token,
+                session_owner_token=link.session_owner_token,
+                frpc_bin=RelaySettings.from_env().frpc_bin,
             )
             try:
                 await asyncio.to_thread(connection.connect)
+            except WorkerOutdated as exc:
+                raise self._outdated(str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - every failure is the same refusal
                 last = exc
-                await asyncio.to_thread(connection.close)
                 if attempt + 1 < attempts:
                     await asyncio.sleep(1.0)
                 continue
@@ -543,6 +545,15 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             RefusalReason.UNREACHABLE,
             f"the worker on {self.config.ssh_profile} did not answer over the rendezvous: {last}",
             site=self.context.site_id,
+        )
+
+    def _outdated(self, why: str) -> Refusal:
+        return Refusal(
+            RefusalReason.NEEDS_SIGN_IN,
+            f"the worker on {self.config.ssh_profile} is from an older relay ({why}); sign in "
+            "again so relay can replace it",
+            site=self.context.site_id,
+            provider="ssh",
         )
 
     def _site_config(self) -> dict[str, Any]:

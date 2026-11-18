@@ -27,7 +27,6 @@ from pydantic import ValidationError
 
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.local import LocalAdapter, LocalConfig
-from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import ExecResult, FileAccess, JobHandle
 from clio_relay.jobs.records import new_id
@@ -51,7 +50,15 @@ class _RunningExec:
 _NAMESPACE = re.compile(r"^[0-9a-f]{8,64}$")
 
 
-def worker_adapter_root(ctx: RelayApiContext, namespace: str) -> Path:
+@dataclass(frozen=True)
+class SiteContext:
+    """What the site's routes need: whose worker this is, and where it keeps state."""
+
+    cluster: str
+    state_dir: Path
+
+
+def worker_adapter_root(ctx: SiteContext, namespace: str) -> Path:
     """Return where one relay's jobs and content live on this site.
 
     Each relay that holds a link here sends its own namespace, so two relays
@@ -59,10 +66,10 @@ def worker_adapter_root(ctx: RelayApiContext, namespace: str) -> Path:
     """
     if _NAMESPACE.fullmatch(namespace) is None:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, "namespace is not valid")
-    return Path(ctx.resolved.core_dir).expanduser().parent / "adapter" / namespace
+    return ctx.state_dir / "adapter" / namespace
 
 
-def _site_adapter(ctx: RelayApiContext, body: dict[str, Any]) -> LocalAdapter:
+def _site_adapter(ctx: SiteContext, body: dict[str, Any]) -> LocalAdapter:
     raw = body.get("config") or {}
     if not isinstance(raw, dict):
         raise Refusal(RefusalReason.INVALID_CONFIG, "config must be an object")
@@ -72,7 +79,7 @@ def _site_adapter(ctx: RelayApiContext, body: dict[str, Any]) -> LocalAdapter:
         raise Refusal(RefusalReason.INVALID_CONFIG, str(exc)) from exc
     root = worker_adapter_root(ctx, str(body.get("namespace") or ""))
     context = AdapterContext(
-        site_id=ctx.owner_session_cluster or "worker",
+        site_id=ctx.cluster,
         state_dir=root,
         content=ContentStore(root / "content"),
     )
@@ -136,11 +143,11 @@ async def _file_op(adapter: LocalAdapter, op: str, body: dict[str, Any]) -> Any:
 
 def register_adapter_routes(
     app: FastAPI,
-    ctx: RelayApiContext,
+    ctx: SiteContext,
     *,
     auth_dependency: Depends,
 ) -> None:
-    """Register the adapter verbs on an owned session's API."""
+    """Register the adapter verbs on the worker's API."""
     prefix = ADAPTER_ROUTE_PREFIX
 
     @app.post(f"{prefix}/describe", dependencies=[auth_dependency])
