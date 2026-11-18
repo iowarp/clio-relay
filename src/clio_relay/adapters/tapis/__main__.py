@@ -55,28 +55,33 @@ def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None]:
 
 
 def _print(value: Any) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True, default=str))
+    print(json.dumps(value, indent=2, sort_keys=True, default=str), flush=True)
+
+
+def _say(text: str) -> None:
+    # Flushed, so a person or a script reading a pipe sees the code at once.
+    print(text, flush=True)
 
 
 async def _sign_in(adapter: TapisAdapter) -> int:
     identity = adapter.identity
     if await identity.token() is not None:
-        print("Already signed in to TACC.")
+        _say("Already signed in to TACC.")
         _print((await identity.status()).model_dump(mode="json"))
         return 0
     step = await identity.begin()
-    print(identity.message(step))
-    print(f"TACC page: {step.url}")
-    print("Waiting for the sign-in. Press Ctrl-C to stop.")
+    _say(identity.message(step))
+    _say(f"TACC page: {step.url}")
+    _say("Waiting for the sign-in. Press Ctrl-C to stop.")
     while True:
         await asyncio.sleep(step.poll_interval_s or 5.0)
         result = await identity.poll()
         if result.state == "done":
-            print("Signed in.")
+            _say("Signed in.")
             _print((await identity.status()).model_dump(mode="json"))
             return 0
         if result.state == "failed":
-            print(f"The sign-in did not finish: {result.message}")
+            _say(f"The sign-in did not finish: {result.message}")
             return 1
 
 
@@ -86,7 +91,7 @@ async def _main(args: argparse.Namespace) -> int:
         return await _sign_in(adapter)
     if args.command == "sign-out":
         await adapter.identity.sign_out()
-        print("Signed out of TACC.")
+        _say("Signed out of TACC.")
         return 0
     if args.command == "status":
         _print((await adapter.identity.status()).model_dump(mode="json"))

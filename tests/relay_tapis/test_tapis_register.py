@@ -9,8 +9,13 @@ fixture's ``authorized_keys`` are left as they are.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -53,6 +58,35 @@ def _private_files(root: Path) -> list[Path]:
     return sorted(Path(item) for item in root.glob("clio-relay-tapis-key-*"))
 
 
+_opened: list[list[str]] = []
+_hooked = False
+
+
+def _record_open(event: str, args: tuple[object, ...]) -> None:
+    if event == "open" and _opened and args and isinstance(args[0], str | bytes | os.PathLike):
+        _opened[-1].append(os.fsdecode(cast("str | bytes | os.PathLike[str]", args[0])))
+
+
+@contextlib.contextmanager
+def _files_opened() -> Iterator[list[str]]:
+    """Record every file this process opens inside the block (an audit hook)."""
+    global _hooked
+    if not _hooked:
+        sys.addaudithook(_record_open)
+        _hooked = True
+    seen: list[str] = []
+    _opened.append(seen)
+    try:
+        yield seen
+    finally:
+        _opened.remove(seen)
+
+
+def _key_dirs(fx: dict[str, str]) -> list[Path]:
+    """Where the person's own keys live: ~/.ssh and the fixture's ssh directory."""
+    return [(Path.home() / ".ssh").resolve(), Path(fx["FX_SSH_CONFIG"]).resolve().parent]
+
+
 async def test_register_installs_a_working_key_and_removal_leaves_nothing(
     stub: TapisStub,
     fx: dict[str, str],
@@ -85,8 +119,18 @@ async def _register_and_remove(
     found: str,
 ) -> None:
     comment = key_comment(found)
-    registered = await register_host(adapter, ssh)
+    with _files_opened() as opened:
+        registered = await register_host(adapter, ssh)
     print(f"LQ40 registration {registered}")
+    config_file = Path(fx["FX_SSH_CONFIG"]).resolve()
+    key_reads = [
+        path
+        for path in opened
+        if Path(path).resolve() != config_file
+        and any(Path(path).resolve().is_relative_to(root) for root in _key_dirs(fx))
+    ]
+    print(f"LQ40 files opened {len(opened)}, under the person's key directories {key_reads}")
+    assert key_reads == [], "relay read a file where the person's keys live"
     assert registered.system_id == found
     assert registered.created_system
     assert registered.login_user == fx["FX_USER"]
