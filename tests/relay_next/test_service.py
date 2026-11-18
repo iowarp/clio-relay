@@ -226,6 +226,25 @@ def answer_page_status(url: str) -> int:
     return httpx.get(url, timeout=10).status_code
 
 
+async def test_a_sign_in_finished_elsewhere_closes_the_url_ask(relay_paths: RelayPaths) -> None:
+    """A device-flow sign-in finishes at the provider; nobody answers relay's ask."""
+    add_site(relay_paths, config={"queue_s": 0.1, "run_s": 0.2, "sign_in": True})
+    service = RelayService(relay_paths)
+    record = await service.start_run("fx", ECHO)
+    (ask,) = service.outstanding(record)
+    assert ask.kind == "url"
+    assert (await service.advance(record.operation_id)).state == OperationState.AWAITING_INPUT
+    adapter = service.adapter_named(service.site("fx"), record.adapter)
+    await adapter.sign_in_done({})
+    await service.advance(record.operation_id)
+    stored: Ask | None = service.asks.get(ask.ask_id)
+    assert stored is not None and stored.state == "accepted"
+    assert stored.completed_at is not None
+    done = await service.wait(record.operation_id, 20, poll_s=0.1)
+    assert done.state == OperationState.COMPLETED
+    await service.close()
+
+
 async def test_exec_and_describe(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
     service = RelayService(relay_paths)

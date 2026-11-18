@@ -396,6 +396,25 @@ class RelayService:
         await adapter.sign_in_done(ask.answer or {})
         return await adapter.sign_in_needed() is None
 
+    async def _signed_in_elsewhere(self, ask: Ask, record: OperationRecord) -> bool:
+        """Close a pending sign-in ask the person finished outside relay's page.
+
+        A device-flow sign-in completes at the provider, so nobody answers the
+        ask; the adapter saying it no longer needs a sign-in is the answer.
+        """
+        site = self.site(record.site)
+        adapter = self.adapter_named(site, record.adapter)
+        if await adapter.sign_in_needed() is not None:
+            return False
+        with self.asks.locked(ask.ask_id):
+            stored = self.asks.get(ask.ask_id)
+            if stored is not None and stored.state == "pending":
+                stored.resolve("accepted", {"action": "accept", "content": None}, "adapter")
+                if stored.completed_at is None:
+                    stored.completed_at = utc_now()
+                self.asks.put(ask.ask_id, stored)
+        return True
+
     async def advance(self, operation_id: str) -> OperationRecord:
         """Move an operation past its asks once they are all answered."""
         record = self.operation(operation_id)
@@ -410,6 +429,8 @@ class RelayService:
                     Refusal(RefusalReason.DECLINED, f"the person declined: {ask.message}"),
                 )
             if ask.state == "pending":
+                if ask.kind == "url" and await self._signed_in_elsewhere(ask, record):
+                    continue
                 waiting = True
                 continue
             if ask.kind == "approve" and (
