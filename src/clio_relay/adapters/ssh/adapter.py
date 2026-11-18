@@ -348,6 +348,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         psij_spec._stderr_path = stderr  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         psij_spec._stdin_path = stdin  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         job = Job(psij_spec)
+        # PSI/J's templates name the job from ``job.name``, which its Job lacks.
+        job.name = name  # pyright: ignore[reportAttributeAccessIssue]
         launcher_dir, launcher_files = _launcher(executor, job)
         context: dict[str, Any] = executor._create_script_context(job)  # pyright: ignore[reportPrivateUsage]
         psij_context = cast(dict[str, Any], context["psij"])
