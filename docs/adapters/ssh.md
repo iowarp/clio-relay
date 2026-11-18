@@ -39,7 +39,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run |
 | `connect_timeout_s` | 30 | ssh's `ConnectTimeout` |
 | `command_timeout_s` | 300 | When a `describe`, `status` or `cancel` call counts as stalled. The next poll tries again |
-| `transfer_retries` | 3 | Retries for a transfer the connection dropped |
+| `retries` | 5 | How many times relay repeats a call or copy whose connection failed or dropped, waiting 2, 4, 8, 16, then 30 seconds. exec, and a write that may not overwrite, are repeated only when the connection never opened |
 
 Jobs and transfers have no time limit. A long upload or a job that runs for
 days is allowed to finish.
@@ -48,6 +48,13 @@ days is allowed to finish.
 prints nothing, the caller hears that it is still running. When the call ends,
 times out or is cancelled, or the connection drops, the command and everything
 it started are stopped on the site.
+
+`exec` runs its argument list from your home directory, with no shell in
+between, so `$HOME`, `*` or `;` in an argument reach the program as they are.
+A program that is only defined by your login shell, such as `module` from
+Lmod, runs in a login shell (`bash -l`), which gets the same argument list
+unchanged. On a guarded site, `exec` runs only the read-only list; anything
+else is refused with `policy_refused`.
 
 Relay asks the scheduler for no walltime of its own. A job's walltime is its
 `duration`, or the site's `defaults.duration` when the job gives none. With
@@ -133,12 +140,38 @@ signs in by itself and only asks you if the program fails.
 `serve` forwards a port from the site with `ssh -L`, adding `-J` through the
 login node when the service runs on a compute node.
 
+## When the connection drops
+
+Every call is its own ssh run, so a dropped link costs only the call it hit.
+Relay repeats that call up to `retries` times, waiting 2, 4, 8, 16 and then
+30 seconds, and logs each attempt as "retry n of N". The repeat is safe
+because each step checks before it acts: a copy skips content already on the
+site, a submit first looks for the job it may already have submitted, and
+`status` and `cancel` only read or stop. A job keeps running on the site while
+the link is down.
+
+Two calls are repeated only when the connection never opened, because the
+command may already have run: `exec`, and a `files` write that may not
+overwrite. Such a call fails with `unreachable` and the caller decides.
+
+A failed login, an unknown or changed host key and a missing key are not
+repeated: trying again would give the same answer.
+
 ## Troubleshooting
 
 | Refusal | What it means |
 | --- | --- |
-| `unreachable` | ssh could not connect or log in: check the network, VPN, host name and key. The message carries ssh's own error |
+| `unreachable` | ssh could not connect or log in. The message says why and what to do, and `data.cause` names it (below) |
 | `timeout` | A `describe`, `status` or `cancel` call stalled. The next poll tries again |
 | `interactive_auth_required` | The site asks for a code. Turn on `interactive_sign_in`, or use the `worker` adapter |
 | `needs_sign_in` | The signed-in connection closed. Sign in again on relay's page |
 | `adapter_unavailable` | `ssh` or `scp` is not installed on this machine |
+
+| `cause` | What to do |
+| --- | --- |
+| `host_key_unknown` | Connect once with `ssh <host>`, check the fingerprint and accept it. Relay never accepts a host key it cannot check |
+| `host_key_changed` | The host's key differs from the one in `known_hosts`. Ask the site whether it changed; if it did, remove the old line with `ssh-keygen -R <host>` |
+| `key_refused` | The site took no key relay offered. Add the key to your agent (`ssh-add`) or name it with `IdentityFile`; the message names key files it could not read |
+| `unknown_host` | The host name does not resolve. Check the name and your VPN |
+| `network` | The connection failed or dropped after the retries. Check the network and VPN |
+| `ssh` | Any other ssh failure. The message carries ssh's last line |

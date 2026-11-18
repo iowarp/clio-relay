@@ -135,7 +135,10 @@ class SshFileAccess:
             + 'cat > "$t" && mv -f "$t" "$p" || { rm -f "$t"; exit 45; }\n'
             + 'echo "@@entry"; st "$p"\n'
         )
-        result = await self.transport.ssh(script, data=data, timeout_s=None, what="writing")
+        # Without overwrite, a second try would find the first one's file and refuse.
+        result = await self.transport.ssh(
+            script, data=data, timeout_s=None, what="writing", retry=overwrite
+        )
         sections = parse_sections(result.text())
         if "exists" in sections:
             raise Refusal(

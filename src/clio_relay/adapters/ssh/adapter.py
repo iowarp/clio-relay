@@ -625,6 +625,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             check_timeout=False,
             hold_stdin=True,
             on_stall=on_stall,
+            retry=False,  # the command may have run before the connection dropped
         )
         exec_result = result.to_exec_result()
         exec_result.argv = list(command)

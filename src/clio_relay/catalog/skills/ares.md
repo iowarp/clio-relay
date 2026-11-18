@@ -49,8 +49,9 @@ hyperthreading) and 48 GB of memory. `describe` shows the current numbers.
 
 Software is under Lmod (`module avail`, `module load`). Lmod is set up by
 login shells, so a job that needs a module should start with
-`bash -lc 'module load <name> && <command>'`. Spack is available for custom
-toolchains.
+`bash -lc 'module load <name> && <command>'`. `exec` of `module avail` works
+as it is: relay runs a program only a login shell defines in one. Spack is
+available for custom toolchains.
 
 ## Good manners
 

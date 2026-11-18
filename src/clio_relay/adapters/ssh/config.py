@@ -61,8 +61,12 @@ class SshConfig(BaseModel):
             "relay calls it stalled. The next poll tries again. Jobs and transfers have no limit"
         ),
     )
-    transfer_retries: int = Field(
-        default=3,
+    retries: int = Field(
+        default=5,
         ge=0,
-        description="How many times relay retries a transfer the connection dropped",
+        description=(
+            "How many times relay repeats a call or copy whose connection failed or dropped, "
+            "waiting 2, 4, 8, 16, then 30 seconds. exec is repeated only when the "
+            "connection never opened"
+        ),
     )
