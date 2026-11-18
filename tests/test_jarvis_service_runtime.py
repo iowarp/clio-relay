@@ -413,7 +413,7 @@ def test_owned_session_authority_endpoint_reverifies_owned_artifact_before_resol
     foreign_job = queue.submit_job(
         RelayJob(
             cluster=definition.name,
-            kind=JobKind.MCP_CALL,
+            kind=JobKind.JARVIS,
             spec=job.spec,
             idempotency_key="foreign-runtime-authority-source",
             metadata={
@@ -2246,7 +2246,7 @@ def _source_result(
     job = queue.submit_job(
         RelayJob(
             cluster="test-cluster",
-            kind=JobKind.MCP_CALL,
+            kind=JobKind.JARVIS,
             spec=McpCallSpec(
                 server=server,
                 server_args=["mcp-server", "jarvis"],

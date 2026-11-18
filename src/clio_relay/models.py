@@ -96,7 +96,6 @@ from clio_relay.models_job import (
     TerminalJobGcResult,  # noqa: F401
     WaitObservation,  # noqa: F401
     _empty_artifact_uses,  # noqa: F401
-    prepare_owned_jarvis_run_submission,  # noqa: F401
 )
 from clio_relay.models_job_specs import (
     InputArtifactIngestPolicy,  # noqa: F401
@@ -106,9 +105,6 @@ from clio_relay.models_job_specs import (
     McpCallSpec,  # noqa: F401
     RemoteAgentTaskSpec,  # noqa: F401
     deterministic_input_artifact_id,  # noqa: F401
-    deterministic_jarvis_execution_id,  # noqa: F401
-    is_owned_jarvis_run_spec,  # noqa: F401
-    validate_jarvis_execution_id,  # noqa: F401
 )
 from clio_relay.models_job_telemetry import (
     Cursor,  # noqa: F401

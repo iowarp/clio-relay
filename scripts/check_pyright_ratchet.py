@@ -119,16 +119,6 @@ from typing import Any, NamedTuple
 # all four, and endpoint.py's forward re-exports) repointed. Net: 7663 ->
 # 7636, verified via a full baseline-vs-fixed diff.
 #
-# Third-round adversarial-review verification pass (item 4): the
-# jarvis-packages/clio_relay/clio_relay/mcp_call/runner.py blocker fix
-# (importing structured_result_from_protocol_result instead of the
-# renamed-away _structured_result) plus the two test call-site fixes and
-# the new import-smoke guard test removed 5 more reportPrivateUsage-
-# adjacent errors than they added. Measured (not hardcoded from the
-# reviewer's own prediction, confirmed to match it) via
-# `uv run --no-sync python scripts/check_pyright_ratchet.py` from the
-# synced worktree venv: 7636 -> 7631.
-#
 # Post-rebase onto develop (which carries #209's own -5): the two deltas
 # compound independently (disjoint files); re-measured on the rebased tree
 # at 7626 and ratcheted down accordingly.
@@ -172,10 +162,11 @@ from typing import Any, NamedTuple
 # W8 (relay rework): the old relay_* surface, its tests and the move into
 # adapters/worker took the count from 7498 to 5583, measured on the merged
 # branch at 39f3764.
-# W8: deleting the held remote_mcp, scheduler_providers and browser_gateway
-# modules and their tests, with W9 at 5a01766 and integration at dae2774
-# merged, took it to 5076 (measured with `uv run` at 8b34a44).
-BASELINE_TOTAL = 4929
+# W8: deleting the remaining old-surface modules and their tests, with W9 at
+# 5a01766 and integration at dae2774 merged, took it to 5076 (measured with
+# `uv run` at 8b34a44). Deleting the 1.0 release gate took it to 4929, and
+# the old job kind's helpers to 4925 (W8 at ac9b06d).
+BASELINE_TOTAL = 4925
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

@@ -53,10 +53,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # jarvis_artifact_documents.py, progress_bridge.py, session_runtime.py,
     # and friends -- mirrored here byte-identical to src/clio_relay, per the
     # isolated-runtime-mirror test), so this entry is removed rather than
-    # ratcheted down. Owner modules live at the clio_relay top level rather
-    # than nested under mcp_call/ because clio_relay.mcp_call is force-
-    # included into the wheel but not part of an editable dev install --
-    # see runner.py's module docstring.
+    # ratcheted down.
     # process_containment.py split iowarp/clio-relay#231: the facade is now
     # 197 lines with the implementation moved into fifteen
     # process_containment_*.py owner modules (mirrored here byte-identical
@@ -113,8 +110,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # 2026-08-19 (+23, justified; coordinator-approved): #257 staged
     # whole-generation activation -- three extraction rounds moved 88% of
     # the growth into bootstrap_full_activation_staging.py; the residual
-    # is dependency-free heredoc that cannot leave the renderer (same
-    # shape as the mcp_call/runner.py +28 precedent).
+    # is dependency-free heredoc that cannot leave the renderer.
     # #255: -7442 net lines -- the renderer decomposition. Pure-constant/
     # embedded-source blocks move to bootstrap_constants.py,
     # bootstrap_staged_provider_source.py, bootstrap_receipt_classifier_
@@ -180,9 +176,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # ("A file not in RATCHET_BASELINE may not exceed DEFAULT_MAX_LINES --
     # a brand-new god-file fails the check"). Fixed by extraction instead:
     # the two 5-branch terminal-verdict rendering chains (message=/error=)
-    # moved to the new owner module job_terminal_verdict.py, and mcp_call_
-    # result_error.py's mcp_call_dispatch_failure_detail absorbed its own
-    # priority guard instead of `_run_job_impl` computing it inline.
+    # moved to the new owner module job_terminal_verdict.py.
     # Second-round adversarial-review fix batch (Ruling B: gate the
     # outputs_missing failure verdict the same way application_verdict_
     # failure already is) trimmed a further ~9 lines to keep real margin
@@ -266,10 +260,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # would mean rewriting its body), _planning_support.py (242),
     # _receipt.py (358), _builtin_repos.py (213), _repository.py (443).
     # Under DEFAULT_MAX_LINES -- entry removed per ground rule 5.
-    # #231 R9 fix batch: -32 net lines after moving overload/error rendering
-    # into browser_gateway_errors.py; every former ad-hoc gateway response now
-    # uses the door owner without recreating the core/gateway import cycle.
-    # browser_gateway.py: deleted with the old surface (W8), entry removed.
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest
@@ -1303,13 +1293,9 @@ RATCHET_BASELINE: dict[str, int] = {
     # attribute lookup forward.
     #
     # split/mcp-server-w3 slice 9 (#231, final slice -- completes the
-    # decomposition): the submission cluster (_submit_jarvis_job,
-    # _submit_jarvis_pipeline, _submit_remote_agent, _submit_mcp_call,
-    # _submit_jarvis_mcp_call, plus their shared idempotency/staging/input-
-    # binding helpers) moves out, split along its own seam into
-    # mcp_submission_agent.py (jarvis/pipeline/remote-agent job submission),
-    # mcp_submission_mcp_call.py (mcp_call/jarvis_mcp_call submission and the
-    # virtual-JARVIS routing it shares with them), and
+    # decomposition): the submission cluster and its shared idempotency/
+    # staging/input-binding helpers move out, split along their own seam into
+    # per-kind submission modules and
     # mcp_submission_result.py (the owned/local result-binding tail every
     # submission path funnels through). mcp_server.py is now 708 lines --
     # under DEFAULT_MAX_LINES -- entry removed per this script's own
@@ -1515,18 +1501,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # sidecar record codec (runtime_metadata_sidecar.py) -- each its own
     # owner module, all comfortably under DEFAULT_MAX_LINES. Entry removed
     # per ground rule 5 -- ratchet down.
-    # scheduler_providers.py (1153 lines) split into a package: protocols.py,
-    # external.py, slurm_provider.py, slurm_connector.py (the
-    # _SlurmConnectorMixin), slurm_connector_launcher.py, slurm_status.py,
-    # validation.py, command.py, registry.py, and constants.py, assembled by
-    # scheduler_providers/__init__.py (169 lines, a re-export-only facade --
-    # every prior `clio_relay.scheduler_providers.X` import and monkeypatch
-    # target, including the ones dotted-string-patched by test_scheduler_
-    # status.py, keeps resolving unchanged). Every new file is under
-    # DEFAULT_MAX_LINES; entry removed per ground rule 5 -- ratchet down.
-    # (NOTE: this branch forked before runtime-metadata-w2 landed and still
-    # carried its stale "runtime_metadata.py": 1749 entry; omitted for the
-    # same reason as the other stale-fork-point merges in this train.)
     # #231 R10: the local owned-visitor render/write/spawn path now delegates
     # to frp_link.py, while the three remote frpc start/stop script generators
     # moved to the under-800-line frp_remote_scripts.py owner.  -772 net lines.

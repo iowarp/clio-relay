@@ -2,26 +2,21 @@
 
 Covers the four submittable job intents (:class:`InputArtifactSpec`,
 :class:`JarvisRunSpec`, :class:`RemoteAgentTaskSpec`, :class:`McpCallSpec`),
-the :data:`JobSpec` union DSPy/Pydantic dispatches a submission on, and the
-deterministic identity helpers that bind a trusted ``jarvis_run`` MCP call to
-one relay-owned execution ID.
+and the :data:`JobSpec` union DSPy/Pydantic dispatches a submission on.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.models_enums import JobKind, McpAdmissionClass, McpOperation
+from clio_relay.models_enums import McpAdmissionClass, McpOperation
 from clio_relay.models_jarvis_pipeline import JarvisRunInputManifest
 from clio_relay.models_shared import (
-    REGISTERED_JARVIS_EXECUTION_CONTRACTS,
     REGISTERED_JARVIS_USER_CONTRACT,
     validate_mcp_env_from,
 )
@@ -242,75 +237,3 @@ JobSpec = Annotated[
     JarvisRunSpec | RemoteAgentTaskSpec | McpCallSpec | InputArtifactSpec,
     Field(union_mode="left_to_right"),
 ]
-
-
-def deterministic_jarvis_execution_id(
-    *,
-    cluster: str,
-    idempotency_key: str,
-    job_id: str,
-) -> str:
-    """Return the JARVIS execution identity owned by one relay admission."""
-    canonical = json.dumps(
-        {
-            "schema_version": "clio-relay.jarvis-run-execution-identity.v2",
-            "cluster": cluster,
-            "idempotency_key": idempotency_key,
-            "job_id": job_id,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    return f"jarvis_{hashlib.sha256(canonical).hexdigest()[:32]}"
-
-
-def is_owned_jarvis_run_spec(kind: JobKind, spec: JobSpec) -> bool:
-    """Recognize an artifact-bound built-in or registered JARVIS run."""
-    if kind is not JobKind.MCP_CALL or not isinstance(spec, McpCallSpec):
-        return False
-    normalized_tool = (spec.tool or "").replace("-", "_").lower()
-    artifact_bound_jarvis = (
-        spec.operation is McpOperation.TOOLS_CALL
-        and normalized_tool == "jarvis_run"
-        and spec.expected_server_artifact_digest is not None
-    )
-    if not artifact_bound_jarvis:
-        return False
-    return (
-        spec.expected_jarvis_cd_lock_binding is not None
-        and spec.expected_registered_contract is None
-    ) or (
-        spec.expected_jarvis_cd_lock_binding is None
-        and spec.expected_registered_contract in REGISTERED_JARVIS_EXECUTION_CONTRACTS
-    )
-
-
-def validate_jarvis_execution_id(value: object) -> str:
-    """Validate the portable execution-id contract exposed by JARVIS-CD.
-
-    clio-relay#278: also the one shape check every caller-facing surface
-    that resolves a bare ``execution_id`` (the door's execution-scoped
-    route, ``relay_list_artifacts``'s ``execution_id`` branch, and the
-    CLI's ``--execution-id`` flag) applies before doing anything with it --
-    an O(all local jobs) resolution scan on obvious garbage, or an opaque
-    remote-transport failure on a value containing e.g. a space or ``#``,
-    is a worse failure mode than a typed local refusal.
-    """
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None
-    ):
-        raise ValueError("trusted jarvis_run execution_id must be 1-128 portable ASCII characters")
-    reserved_stem = value.split(".", 1)[0].upper()
-    reserved = {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{number}" for number in range(1, 10)),
-        *(f"LPT{number}" for number in range(1, 10)),
-    }
-    if value.endswith(".") or reserved_stem in reserved:
-        raise ValueError("trusted jarvis_run execution_id is not a portable path component")
-    return value

@@ -4,19 +4,16 @@ These files are for coding agents and review agents. Human-facing docs should st
 
 Read in this order:
 
-1. `../connection-model.md`
-2. `system-context.md`
-3. `testing-context.md`
-4. `interface-context.md`
-5. `release-validation-0.9.17.md`
+1. `../design/relay-rework-plan.md`: the contract (RL, HS and LQ rows).
+2. `interface-context.md`: the command line, the MCP surface and the extension points.
+3. `../design/relay-rework-ledger.md`: the published interfaces and the decisions behind them.
+4. `system-context.md`
+5. `testing-context.md`
 6. `../../README.md`
 7. `../architecture.md`
-8. `../operations.md`
+8. `../operations.md`: the `worker` adapter's operator commands.
 
-`../connection-model.md` is normative and comes first: one link per connection,
-the ssh budget, the 2FA operating assumption, reconnect, one local relay for
-many remotes, and relay-owned input staging. Where another page or the shipped
-code disagrees with it, it is the other page or the code that is wrong.
+Where another page or the shipped code disagrees with the contract, the other page or the code is wrong.
 
 Do not treat examples as hardcoded product semantics. Examples show one configured target or workload.
 

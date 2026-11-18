@@ -425,7 +425,7 @@ class RelayServer:
         refusal = Refusal(
             RefusalReason.NEEDS_SIGN_IN if url_only else RefusalReason.NEEDS_APPROVAL,
             "relay needs the person before it can go on. Open the page, or run "
-            "`clio-relay-next asks answer`, then call run with resume set to the operation id",
+            "`clio-relay asks answer`, then call run with resume set to the operation id",
             operation_id=record.operation_id,
             asks=shown,
         )
