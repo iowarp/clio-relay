@@ -22,10 +22,13 @@ from .conftest import add_site
 
 
 # What CLIO's choice-table renderer accepts: rows and the table are strict.
-ROW_KEYS = {"id", "title", "subtitle", "caption", "icon", "values", "inherited", "error"}
-ROW_KEYS |= {"context", "menu"}
-TABLE_KEYS = {"id", "component", "label", "columns", "rows", "defaults", "onChoose", "rowMenu"}
-TABLE_KEYS |= {"add", "empty", "accessibility", "weight"}
+ROW_KEYS = frozenset(
+    ["id", "title", "subtitle", "caption", "icon", "values", "inherited", "error", "context", "menu"]
+)
+TABLE_KEYS = frozenset(
+    ["id", "component", "label", "columns", "rows", "defaults", "onChoose", "rowMenu", "add"]
+    + ["empty", "accessibility", "weight"]
+)
 
 
 def _options(table: dict[str, Any], column: str) -> dict[str, dict[str, Any]]:
