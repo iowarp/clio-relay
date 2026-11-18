@@ -2163,12 +2163,12 @@ def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
 
 
 @pytest.mark.parametrize("operation", ["stop", "detach"])
-def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_binding(
+def test_cleanup_refuses_a_scheduler_identity_left_only_in_the_jarvis_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
-    """Cleanup cannot close or detach without an exact scheduler disposition."""
+    """Cleanup refuses an old binding whose scheduler identity the session no longer has."""
     queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
@@ -2196,6 +2196,7 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
     )
     binding = {
         **cast(dict[str, object], started.session.gateway["jarvis_runtime_binding"]),
+        "scheduler_provider": "slurm",
         "scheduler_native_id": "12345",
     }
     queue.update_gateway_session(
@@ -2218,7 +2219,7 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
     monkeypatch.setattr(supervisor, "_ssh", ssh)
     cleanup = supervisor.stop if operation == "stop" else supervisor.detach
 
-    with pytest.raises(RelayError, match="scheduler job identity disagrees"):
+    with pytest.raises(RelayError, match="scheduler provider disagrees"):
         cleanup(session_id=started.session.session_id)
 
     persisted = queue.get_gateway_session(started.session.session_id)
