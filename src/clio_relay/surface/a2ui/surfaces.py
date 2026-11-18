@@ -64,9 +64,7 @@ SPEND = Field(
     "text",
     help="always, never, or the node-hours above which relay asks",
 )
-SKILL = Field(
-    "skill", "Skill", "text", help="A skill name, or the path of your own Markdown skill"
-)
+SKILL = Field("skill", "Skill", "text", help="A skill name, or the path of your own Markdown skill")
 NAME = Field("name", "Name", "text")
 ADD_FIELDS = (
     Field("id", "Site ID", "text", help="Lowercase letters, digits, - and _", required=True),
@@ -262,16 +260,17 @@ def edit_draft(site: SiteEntry, forms: dict[str, Form]) -> dict[str, Any]:
         adapter_form = forms.get(name)
         if adapter_form is None:
             continue
-        if name == site.adapter:
-            config = site.config
-        else:
-            config = site.alternatives.get(name, {})
+        config = site.config if name == site.adapter else site.alternatives.get(name, {})
         adapters[name] = {"use": name in site.alternatives, **draft(adapter_form.fields, config)}
     return {"site": _common_draft(site), "adapters": adapters}
 
 
 def _edit_form(
-    tree: Tree, site: SiteEntry, forms: dict[str, Form], tokens: ActionTokens, errors: dict[str, str]
+    tree: Tree,
+    site: SiteEntry,
+    forms: dict[str, Form],
+    tokens: ActionTokens,
+    errors: dict[str, str],
 ) -> str:
     base = f"e-{site.id}"
     path = f"/drafts/{site.id}"

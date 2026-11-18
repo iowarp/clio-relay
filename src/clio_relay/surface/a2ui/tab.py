@@ -223,7 +223,12 @@ class ComputeTab:
         try:
             status: Any = await provider.status()
         except Refusal as refusal:
-            return {"provider": name, "title": name, "state": "signed_out", "detail": refusal.message}
+            return {
+                "provider": name,
+                "title": name,
+                "state": "signed_out",
+                "detail": refusal.message,
+            }
         return cast(dict[str, Any], status.model_dump(mode="json"))
 
     async def _reviewed(self, site: SiteEntry) -> int | None:
@@ -351,7 +356,11 @@ class ComputeTab:
                 action=action,
             )
             return ToolResult(
-                content=[mcp_types.TextContent(type="text", text=f"{refusal.reason.value}: {refusal.message}")],
+                content=[
+                    mcp_types.TextContent(
+                        type="text", text=f"{refusal.reason.value}: {refusal.message}"
+                    )
+                ],
                 structured_content={"refusal": refusal.to_dict()},
                 is_error=True,
             )
@@ -418,9 +427,9 @@ class ComputeTab:
             self.state.notice = f"{done} Setting it up failed: {refusal.message}."
             return
         failed = [
-            f"{name} could not set it up ({result['refusal'].get('message', '')})"
+            f"{name} could not set it up ({_dict(_dict(result).get('refusal')).get('message', '')})"
             for name, result in results.items()
-            if isinstance(result, dict) and "refusal" in result
+            if "refusal" in _dict(result)
         ]
         self.state.notice = " ".join([done, *(item + "." for item in failed)])
 
@@ -449,9 +458,7 @@ class ComputeTab:
             )
             added = self.service.sites.add(entry)
         except ValidationError as exc:
-            return self._fail(
-                ADD_SURFACE, _located(exc.errors(include_url=False), "site.", known)
-            )
+            return self._fail(ADD_SURFACE, _located(exc.errors(include_url=False), "site.", known))
         except Refusal as refusal:
             if refusal.reason is RefusalReason.SITE_EXISTS:
                 return self._fail(ADD_SURFACE, {"site.id": f"A site named {common['id']} exists"})

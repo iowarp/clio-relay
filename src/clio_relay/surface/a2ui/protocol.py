@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import mcp_types
 from fastmcp import Context
@@ -47,8 +47,8 @@ def _settings(ctx: Context) -> dict[str, Any] | None:
     extensions: Any = getattr(capabilities, "extensions", None) if capabilities else None
     if not isinstance(extensions, dict):
         return None
-    legacy: Any = extensions.get(EXTENSION_ID)  # pyright: ignore[reportUnknownMemberType]
-    return dict(legacy) if isinstance(legacy, dict) else None  # pyright: ignore[reportUnknownArgumentType]
+    legacy: Any = cast(dict[str, Any], extensions).get(EXTENSION_ID)
+    return cast(dict[str, Any], legacy) if isinstance(legacy, dict) else None
 
 
 def _strings(value: Any) -> list[str]:
@@ -66,12 +66,17 @@ def a2ui_client(ctx: Context | None) -> A2UIClient | None:
         return None
     offered = _strings(settings.get("versions")) or list(VERSIONS)
     capabilities: Any = settings.get("clientCapabilities") or {}
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    per_versions = cast(dict[str, Any], capabilities)
     for version in VERSIONS:
         if version not in offered:
             continue
-        per_version: Any = capabilities.get(version) if isinstance(capabilities, dict) else None  # pyright: ignore[reportUnknownMemberType]
+        per_version: Any = per_versions.get(version)
         catalogs = _strings(
-            per_version.get("supportedCatalogIds") if isinstance(per_version, dict) else None  # pyright: ignore[reportUnknownMemberType]
+            cast(dict[str, Any], per_version).get("supportedCatalogIds")
+            if isinstance(per_version, dict)
+            else None
         )
         for catalog_id in (RELAY_CATALOG_ID, BASIC_CATALOG_ID):
             if catalog_id in catalogs:

@@ -3,8 +3,9 @@
 Every button relay renders carries a token bound to one action and one subject
 (a site id, or the adapter an add form is for). The action tools take the
 subject from the token, never from the call, and refuse a call without a token,
-with a token for another action, or with a token already spent. Tokens live in memory: a restarted relay
-has spent them all, and the tab's next read renders fresh ones.
+with a token for another action, or with a token already spent. A token tried
+for the wrong action is spent too. Tokens live in memory: a restarted relay has
+spent them all, and the tab's next read renders fresh ones.
 """
 
 from __future__ import annotations

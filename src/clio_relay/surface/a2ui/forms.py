@@ -40,7 +40,10 @@ _WORDS = {
 
 
 def humanize(key: str) -> str:
-    """Return a field label for a property name: ``connect_timeout_s`` is ``Connect timeout (seconds)``."""
+    """Return a field label for a property name.
+
+    ``connect_timeout_s`` becomes ``Connect timeout (seconds)``.
+    """
     seconds = key.endswith("_s")
     words = (key[:-2] if seconds else key).split("_")
     shown = [_WORDS.get(word, word) for word in words if word]
@@ -66,7 +69,10 @@ class Field:
     def option_labels(self) -> list[dict[str, str]]:
         """Return the choice's options as ChoicePicker options."""
         shown = self.labels or self.options
-        return [{"label": label, "value": value} for label, value in zip(shown, self.options)]
+        return [
+            {"label": label, "value": value}
+            for label, value in zip(shown, self.options, strict=True)
+        ]
 
 
 @dataclass(frozen=True)
@@ -85,7 +91,7 @@ def _resolve(schema: dict[str, Any], defs: dict[str, Any]) -> tuple[dict[str, An
         kept = [
             cast(dict[str, Any], item)
             for item in cast(list[Any], branches)
-            if isinstance(item, dict) and item.get("type") != "null"
+            if isinstance(item, dict) and cast(dict[str, Any], item).get("type") != "null"
         ]
         nullable = len(kept) < len(cast(list[Any], branches))
         schema = {**schema, **kept[0]} if len(kept) == 1 else {**schema, "type": "object"}

@@ -7,6 +7,7 @@ import copy
 import json
 from typing import Any, cast
 
+import mcp_types
 import pytest
 from fastmcp import Client
 from mcp.client.extension import advertise
@@ -38,6 +39,17 @@ AD = {
 
 def a2ui_client(paths: RelayPaths) -> Client[Any]:
     return Client(create_server(paths), extensions=[advertise(EXTENSION_ID, AD)])
+
+
+def _body(contents: object) -> str:
+    assert isinstance(contents, mcp_types.TextResourceContents), contents
+    return contents.text
+
+
+def _said(result: Any) -> str:
+    first = result.content[0]
+    assert isinstance(first, mcp_types.TextContent), first
+    return first.text
 
 
 def _unescape(part: str) -> str:
@@ -87,7 +99,7 @@ class Host:
     async def open(self) -> list[dict[str, Any]]:
         contents = await self.client.read_resource(TAB_URI)
         assert len(contents) == 1 and contents[0].mime_type == MIME_TYPE
-        messages = json.loads(getattr(contents[0], "text"))
+        messages = json.loads(_body(contents[0]))
         assert "createSurface" in messages[0]
         self.surfaces = {}
         self.apply(messages)
@@ -127,22 +139,25 @@ class Host:
     def action(self, sid: str, button: str) -> tuple[str, dict[str, Any]]:
         assert button in self.visible(sid), f"{button} is not on {sid}"
         event = self.surfaces[sid]["components"][button]["action"]["event"]
-        context = {
-            key: _get(self.surfaces[sid]["data"], value["path"])
-            if isinstance(value, dict) and set(cast(dict[str, Any], value)) == {"path"}
-            else value
-            for key, value in event["context"].items()
-        }
-        return event["name"], context
+        context: dict[str, Any] = {}
+        for key, value in cast(dict[str, Any], event["context"]).items():
+            bound = cast(dict[str, Any], value) if isinstance(value, dict) else None
+            if bound is not None and set(bound) == {"path"}:
+                context[key] = _get(self.surfaces[sid]["data"], str(bound["path"]))
+            else:
+                context[key] = value
+        return str(event["name"]), context
 
     async def press(self, sid: str, button: str) -> Any:
         name, context = self.action(sid, button)
         result = await self.client.call_tool(name, context, raise_on_error=False)
         assert result.content[0].type == "text"
         if not result.is_error:
-            embedded = [item for item in result.content if item.type == "resource"]
+            embedded = [
+                item for item in result.content if isinstance(item, mcp_types.EmbeddedResource)
+            ]
             assert len(embedded) == 1
-            messages = json.loads(getattr(embedded[0].resource, "text"))
+            messages = json.loads(_body(embedded[0].resource))
             assert not any("createSurface" in message for message in messages)
             self.apply(messages)
         return result
@@ -181,15 +196,17 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
             for args in ({}, {"token": "made-up"}):
                 result = await client.call_tool("compute_probe_site", args, raise_on_error=False)
                 assert result.is_error
-                assert "out of date" in result.content[0].text
+                assert "out of date" in _said(result)
 
             host = Host(client)
             await host.open()
             name, context = host.action("relay-sites", "s-fx-probe-button")
-            result = await client.call_tool(
-                "compute_remove_site", context, raise_on_error=False
-            )
+            result = await client.call_tool("compute_remove_site", context, raise_on_error=False)
             assert result.is_error, "a token is for one action only"
+            again = await client.call_tool(name, context, raise_on_error=False)
+            assert again.is_error, "a token misused once is spent"
+            await host.open()
+            name, context = host.action("relay-sites", "s-fx-probe-button")
             result = await client.call_tool(name, context, raise_on_error=False)
             assert not result.is_error
             again = await client.call_tool(name, context, raise_on_error=False)
@@ -262,7 +279,7 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
             assert added == ["lab"]
             assert host.get("relay-add", "/drafts/add/site/id") == ""
             assert host.get("relay-sites", "/switch/lab/adapter") == ["fixture"]
-            assert "Added Lab cluster." in result.content[0].text
+            assert "Added Lab cluster." in _said(result)
 
             # Adding the same id again is refused beside the id field.
             host.set("relay-add", "/drafts/add/site/id", "lab")
@@ -310,7 +327,32 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
     asyncio.run(scenario())
 
 
-def test_edits_from_the_command_line_reach_the_tab(relay_paths: RelayPaths) -> None:
+def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) -> None:
+    heard: asyncio.Queue[str] = asyncio.Queue()
+
+    async def on_message(message: Any) -> None:
+        if isinstance(message, mcp_types.ResourceUpdatedNotification):
+            await heard.put(str(message.params.uri))
+
+    async def scenario() -> None:
+        async with Client(
+            create_server(relay_paths),
+            mode="legacy",
+            extensions=[advertise(EXTENSION_ID, AD)],
+            message_handler=on_message,
+        ) as client:
+            host = Host(client)
+            await host.open()
+            add_site(relay_paths, "cli")
+            async with asyncio.timeout(15):
+                assert await heard.get() == TAB_URI
+            await host.open()
+            assert "s-cli" in host.visible("relay-sites")
+
+    asyncio.run(scenario())
+
+
+def test_a_removed_site_leaves_the_tab(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
@@ -319,10 +361,10 @@ def test_edits_from_the_command_line_reach_the_tab(relay_paths: RelayPaths) -> N
             await host.open()
             assert "s-cli" in host.visible("relay-sites")
             SiteStore(relay_paths.sites_file).remove("cli")
-            name, context = host.action("relay-sites", "s-cli-edit")
-            result = await client.call_tool(name, context, raise_on_error=False)
+            result = await host.press("relay-sites", "s-cli-edit")
             assert result.structured_content["ok"] is False
-            assert "s-cli" not in host.visible("relay-sites") or "not" in result.content[0].text
+            assert "s-cli" not in host.visible("relay-sites")
+            assert "No site is named 'cli'." in host.text("relay-sites")
 
     asyncio.run(scenario())
 
