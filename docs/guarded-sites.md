@@ -9,7 +9,7 @@ allocation.
 Mark a site guarded when you add it (guarded is the default):
 
 ```powershell
-clio-relay-next site add polaris --adapter ssh --config '{ssh_profile: polaris}' --policy guarded --spend always
+clio-relay site add polaris --adapter ssh --config '{ssh_profile: polaris}' --policy guarded --spend always
 ```
 
 ## What the agent can and cannot do
@@ -86,7 +86,7 @@ The question shows:
 - the parameters of this run.
 
 You answer where you answer any relay question: in your MCP host if it can
-ask you, on the approval page relay links, or with `clio-relay-next asks
+ask you, on the approval page relay links, or with `clio-relay asks
 answer`. A yes records the review for that site and that hash. The next run of
 the same archive needs no review. A changed file changes the hash, so an
 edited package is a new package and is reviewed again. A review on one site

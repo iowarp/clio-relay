@@ -1,7 +1,7 @@
 """W13's live client for LQ16 to LQ21: the official ``mcp`` SDK, no tasks, no elicitation.
 
 Not a test module. Each step opens its own stdio connection to
-``clio-relay-next serve`` (so each step is also a reconnect) and prints one
+``clio-relay serve`` (so each step is also a reconnect) and prints one
 JSON line. The person's side of the page is plain HTTP, like a browser. Run it
 on Ares with relay's venv and a guarded site::
 
@@ -25,7 +25,7 @@ import httpx
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters
 
-ENTRY = "from clio_relay.cli_next import main; main()"
+ENTRY = "from clio_relay.cli import main; main()"
 
 
 @asynccontextmanager

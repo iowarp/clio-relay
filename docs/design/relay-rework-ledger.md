@@ -153,7 +153,7 @@ Owned by W1, not frozen. A change goes through W1, which reruns every consumer's
 - Change events: `ServerChanges` (above).
 - Skills (`clio_relay.surface.skills`): `skill_uri(name)`, `site_skill_uri(site)`, `skills(config_dir)`, `site_skill`, `skill_link`, and the `SkillResources` provider.
 - Routing (`clio_relay.sites.routing`): `route(entry, verb, check) -> Routed(adapter, config, skipped)`, `routes(entry, check) -> list[Route]`, and `Skipped(site, adapter, reason, message)` in `Route.skipped`.
-- Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token, `--grant-file`, `--tls-cert` and `--tls-key`), `adapters`, `site`, `asks`, `connect <handle>`, `rendezvous set|show`.
+- Command line `clio-relay` (`clio-relay-next` before the cutover): `serve` (stdio, or HTTP with a bearer token, `--grant-file`, `--tls-cert` and `--tls-key`), `adapters`, `site`, `asks`, `connect <handle>`, `rendezvous set|show`, `worker`.
 
 ### Conformance kit
 
@@ -1287,7 +1287,7 @@ Also on Ares:
 
 ### Run sheets for the live rows
 
-All three are **pending**, never passed. They wait on the owner blockers below. The person signs in and supplies credentials; W10 runs the rows. Before each run: `ssh ares`, `cd ~/clio-relay-rework/clio-relay-w10`, `git pull`, `~/.local/bin/uv sync --extra tapis`. The person sets the OAuth client in the shell themselves (`export CLIO_RELAY_TACC_CLIENT_ID=...` and `CLIO_RELAY_TACC_CLIENT_KEY=...`); neither is pasted into a chat. `T=python -m clio_relay.adapters.tapis`; `R=clio-relay-next` (the new CLI, until W1 renames it `clio-relay`).
+All three are **pending**, never passed. They wait on the owner blockers below. The person signs in and supplies credentials; W10 runs the rows. Before each run: `ssh ares`, `cd ~/clio-relay-rework/clio-relay-w10`, `git pull`, `~/.local/bin/uv sync --extra tapis`. The person sets the OAuth client in the shell themselves (`export CLIO_RELAY_TACC_CLIENT_ID=...` and `CLIO_RELAY_TACC_CLIENT_KEY=...`); neither is pasted into a chat. `T=python -m clio_relay.adapters.tapis`; `R=clio-relay` (the new CLI; it was `clio-relay-next` before the cutover).
 
 **Sign-in (shared by all three).** `S` is the row's site: `chameleon-tapis` or `ares-tapis`.
 1. `uv run $R site add-from-catalog $S`. For `chameleon-tapis`, then set the person's SSH profile for the node: `uv run $R site edit $S '{alternatives: {ssh: {ssh_profile: <profile>}}}'` (`ares-tapis` already names `ares`). Check `ssh <profile> hostname` first. Signed out, each prints `set_up` with a `needs_sign_in` refusal, and the site is saved; with no OAuth client in the shell, the refusal is `invalid_config` naming the two variables instead.

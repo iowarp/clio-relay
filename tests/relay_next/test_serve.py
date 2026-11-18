@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 from collections.abc import Iterator
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ from fastmcp_tasks.client import (
 )
 from typer.testing import CliRunner
 
-from clio_relay import cli_next
+from clio_relay import cli
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import HookContext, set_hook
 from clio_relay.jobs.handles import Endpoint, EndpointPort, JobState, JobStatus, OutputRef
@@ -301,19 +303,34 @@ def test_local_adapter_serve_refuses_without_the_runtime(
 def test_cli_grant_files_and_missing_service_runtime(
     relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert cli_next._grant_files(["Globus=/run/g.json", " tapis = /run/t.json "]) == {  # pyright: ignore[reportPrivateUsage]
+    assert cli._grant_files(["Globus=/run/g.json", " tapis = /run/t.json "]) == {  # pyright: ignore[reportPrivateUsage]
         "globus": Path("/run/g.json"),
         "tapis": Path("/run/t.json"),
     }
     runner = CliRunner()
-    bad = runner.invoke(cli_next.app, ["serve", "--grant-file", "nope"])
+    bad = runner.invoke(cli.app, ["serve", "--grant-file", "nope"])
     assert bad.exit_code == 2 and "PROVIDER=PATH" in bad.output
-    half = runner.invoke(cli_next.app, ["serve", "--http", "--tls-cert", "/x.pem"])
+    half = runner.invoke(cli.app, ["serve", "--http", "--tls-cert", "/x.pem"])
     assert half.exit_code == 2 and "--tls-key" in half.output
     monkeypatch.setenv("CLIO_RELAY_CONFIG_DIR", str(relay_paths.config_dir))
     monkeypatch.setenv("CLIO_RELAY_STATE_DIR", str(relay_paths.state_dir))
     monkeypatch.setitem(sys.modules, "clio_relay.serve", None)
     for argv in (["connect", "op-1"], ["rendezvous", "show"], ["rendezvous", "set", "a=b"]):
-        missing = runner.invoke(cli_next.app, argv)
+        missing = runner.invoke(cli.app, argv)
         assert missing.exit_code == 2, (argv, missing.output)
         assert "service runtime is not installed" in missing.output
+
+
+def test_clio_relay_runs_the_new_surface() -> None:
+    scripts = {item.name: item.value for item in metadata.entry_points(group="console_scripts")}
+    assert scripts["clio-relay"] == "clio_relay.cli:main"
+    assert "clio-relay-next" not in scripts
+    shown = subprocess.run(
+        [sys.executable, "-m", "clio_relay", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+    for command in ("serve", "site", "asks", "connect", "rendezvous", "worker"):
+        assert command in shown

@@ -65,8 +65,7 @@ include = [
 ]
 
 [project.scripts]
-clio-relay = "clio_relay.cli:app"
-clio-relay-next = "clio_relay.cli_next:main"
+clio-relay = "clio_relay.cli:main"
 clio-relay-askpass = "clio_relay.asks.askpass:main"
 
 [project.entry-points."clio_relay.adapters"]

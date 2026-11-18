@@ -38,7 +38,7 @@ from .conftest import add_site, answer_page
 pytestmark = pytest.mark.release_platform("posix")
 
 ECHO: dict[str, Any] = {"executable": "echo", "arguments": ["over-the-wire"]}
-ENTRY = "from clio_relay.cli_next import main; main()"
+ENTRY = "from clio_relay.cli import main; main()"
 MODES = ["legacy", "auto"]
 
 

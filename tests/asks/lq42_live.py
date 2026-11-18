@@ -1,7 +1,7 @@
 """LQ42's live client: the official ``mcp`` SDK, with no tasks and no elicitation.
 
 Not a test module. Each step opens its own connection, so every step after the
-first is a reconnect. Over stdio it starts ``clio-relay-next serve``; over
+first is a reconnect. Over stdio it starts ``clio-relay serve``; over
 Streamable HTTP it talks to a relay someone else started. Each step prints one
 JSON line. Run it on Ares with the relay's venv::
 
@@ -29,7 +29,7 @@ from mcp import Client
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
-ENTRY = "from clio_relay.cli_next import main; main()"
+ENTRY = "from clio_relay.cli import main; main()"
 
 
 def spec(tag: str, seconds: int = 0) -> dict[str, Any]:
