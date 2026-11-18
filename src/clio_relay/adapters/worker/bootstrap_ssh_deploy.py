@@ -154,7 +154,8 @@ def _bootstrap_preflight_over_ssh(
             'if [ "$BOOTSTRAP_PREFLIGHT_STATUS" -ne 0 ]; then',
             "  if printf '%s\\n' \"$BOOTSTRAP_PREFLIGHT_OUTPUT\" | "
             "grep -Eqi "
-            "'no such command.*(bootstrap-inspect|worker)|(bootstrap-inspect|worker).*no such command'; then",
+            "'no such command.*(bootstrap-inspect|worker)|"
+            "(bootstrap-inspect|worker).*no such command'; then",
             "    echo bootstrap_preflight_unsupported=missing_command",
             "    exit 0",
             "  fi",

@@ -141,7 +141,8 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
         "ExecStartPre=%h/.local/bin/clio-relay worker queue migrate-indexes --all --batch-size 500"
     ) in rendered
     assert (
-        "ExecStart=%h/.local/bin/clio-relay worker endpoint start --role worker --cluster test-cluster"
+        "ExecStart=%h/.local/bin/clio-relay worker endpoint start --role worker "
+        "--cluster test-cluster"
     ) in rendered
     assert (
         'Environment="PATH=%h/.local/share/clio-relay/current/bin:'
