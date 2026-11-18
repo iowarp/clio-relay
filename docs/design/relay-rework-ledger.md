@@ -361,7 +361,7 @@ Branch `jaimecernuda-relay-rework-w8`, from `jaimecernuda-relay-rework` at 71910
   - W9's files (`service_runtime*`, `jarvis_service_runtime*`, `models_gateway`, `frp_*`);
   - the worker's own roots (endpoint, HTTP API, owned session, bootstrap, queue, one-link connection, remote CLI) and the old `cli_*` modules that become the worker's operator commands.
 - The deleted families are `mcp_*`, `fastmcp_server`, `browser_gateway*`, `live_acceptance*`, `live_validation*`, `scheduler_providers/`, `remote_mcp*`, `cli_remote_mcp*`, `_mcp_call_runner_facade` and `session_runtime`, plus the old `cli` root, which W1 owns and replaces at the cutover.
-- Callers outside this repository were searched in clio-agent (develop f08dbde3a), gact-tui (21163590c), clio-kit (main 490269fb1) and clio-agent-marketplace (develop).
+- Callers outside this repository were searched in clio-agent (develop f08dbde3a, then rechecked at its integration branch 4878fcc40), gact-tui (21163590c), clio-kit (main 490269fb1) and clio-agent-marketplace (develop).
 
 ### The old tools
 
@@ -418,15 +418,8 @@ The in-repo columns count files that name the tool. Every one of those `src/` fi
 
 Callers in other repositories:
 
-- **clio-agent (no production tool calls).** `relay_wait` is in `tests/test_tools/test_mcp_dual_emission_consume.py:27,152,162,172`. `relay_status` is in `scripts/check_task_replacement_removal.py:62`. `relay_submit_agent`, `relay_observe`, `relay_list_artifacts`, `relay_read_artifact` and `relay_artifact_lineage` appear only in CHANGELOG and design docs.
-- **clio-agent calls the old command line.** `src/clio_agent/gact/infrastructure/drivers.py:356-445` runs:
-  - `clio-relay cluster endpoint-service-status`;
-  - `uv tool install clio-relay==<version>`;
-  - `clio-relay cluster add --scheduler-provider slurm --agent-adapter exec`;
-  - `clio-relay cluster bootstrap --relay-artifact-sha256`;
-  - `clio-relay cluster install-endpoint-service --start --enable`;
-  - `uv tool uninstall clio-relay`.
-  These commands move under `clio-relay worker`, and `--scheduler-provider` goes with RL18. `tools/gateway.py:244` names the relay_ops namespace. The clio-agent owners (W3 and W4) are told through the coordinator.
+- **clio-agent (no production tool calls).** Read at the integration branch `jaimecernuda-relay-rework` (4878fcc40). `scripts/check_task_replacement_removal.py:62` names the module `clio_agent.gact.relay_status`, not the tool. `tests/test_tools/test_mcp_dual_emission_consume.py` and `tools/gateway.py` no longer name a relay tool or the relay_ops namespace (they did on develop f08dbde3a). The other `relay_*` names appear only in CHANGELOG and design docs.
+- **clio-agent no longer calls the old command line.** On develop f08dbde3a, `src/clio_agent/gact/infrastructure/drivers.py:356-445` ran `clio-relay cluster ...` with `--scheduler-provider`. W4's RL38 commit 6801be185 removed that code, and it is on clio-agent's integration branch `jaimecernuda-relay-rework` (4878fcc40). W3 checked: nothing there calls `clio-relay cluster` or `--scheduler-provider`. Later clio-agent and marketplace checks read that integration branch, not develop.
 - **gact-tui:** `desktop/src-tauri/src/ssh_transport_command.rs:456` names `clio-relay` in a test only. The relay references in gact-tui's UI are W12's open item.
 - **clio-kit:** `jarvis_handler.py:2940` keeps compatibility aliases for clio-relay 0.x and calls no tool.
 - **clio-agent-marketplace:** no caller.
@@ -723,7 +716,7 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
   - Add the `worker` entry point in `clio_relay.adapters`.
   - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker`.
   - At the cutover, replace the old `cli.py` root.
-- **W3 and W4 (clio-agent).** `drivers.py:356-445` uses `clio-relay cluster ...` and `--scheduler-provider`, and both change at the cutover.
+- **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
 
 ## W9. serve
 
