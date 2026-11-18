@@ -21,7 +21,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import httpx2
@@ -89,9 +89,9 @@ class Live:
 
 def structured(result: Any) -> dict[str, Any]:
     """Return a tool result's structured content."""
-    content = result.structured_content
+    content: Any = result.structured_content
     assert isinstance(content, dict), result
-    return dict(content)  # pyright: ignore[reportUnknownArgumentType]
+    return cast(dict[str, Any], content)
 
 
 def operation(result: Any) -> dict[str, Any]:
@@ -116,7 +116,7 @@ def operation(result: Any) -> dict[str, Any]:
 
 async def call(client: Client, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Call a tool and return the operation it names."""
-    return operation(await client.call_tool(tool, arguments, raise_on_error=False))
+    return operation(await client.call_tool(tool, arguments))
 
 
 async def ask_for(live: Live, client: Client, tag: str, seconds: int = 0) -> dict[str, Any]:
