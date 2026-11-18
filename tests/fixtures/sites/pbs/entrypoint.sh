@@ -1,6 +1,6 @@
 #!/bin/bash
 # SSH host that is also a one-node OpenPBS server, mom and scheduler.
-# shellcheck source=../common/site-lib.sh
+# shellcheck source=SCRIPTDIR/../common/site-lib.sh
 source /opt/clio-fixtures/site-lib.sh
 
 if [ "$#" -gt 0 ]; then

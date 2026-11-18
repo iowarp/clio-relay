@@ -1,6 +1,6 @@
 #!/bin/bash
 # SSH host that is also a one-node Slurm cluster with accounting.
-# shellcheck source=../common/site-lib.sh
+# shellcheck source=SCRIPTDIR/../common/site-lib.sh
 source /opt/clio-fixtures/site-lib.sh
 
 if [ "$#" -gt 0 ]; then
