@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "relay": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "clio-relay @ git+https://github.com/iowarp/clio-relay@ea56fc678664624a455caee92cdd1a0666551810",
+        "clio-relay",
+        "serve"
+      ],
+      "env": {
+        "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
+        "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
+        "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}"
+      }
+    }
+  }
+}
