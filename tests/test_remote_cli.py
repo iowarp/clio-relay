@@ -53,7 +53,7 @@ def test_remote_clio_uses_the_configured_digest_bound_executable(
 
     assert run_remote_clio(definition, ["queue", "list"]) == "{}"
     assert observed == [
-        remote_env(definition) + ' "/srv/releases/relay-a1b2/bin/clio-relay" queue list'
+        remote_env(definition) + ' "/srv/releases/relay-a1b2/bin/clio-relay" worker queue list'
     ]
     assert (
         'export CLIO_RELAY_VALIDATION_TOOL_EXECUTABLE="/srv/releases/relay-a1b2/bin/clio-relay";'
