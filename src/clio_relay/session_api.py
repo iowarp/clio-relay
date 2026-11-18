@@ -58,7 +58,7 @@ class ChannelReconnectRequired(RelayError):
     operation that discovers the drop) -- whenever a
     :class:`~clio_relay.control_channel.ChannelDropped` reaches an
     owned-session operation. Per the 2FA operating assumption
-    (docs/one-link-control-plane.md) this is never turned into a redial
+    (docs/design/relay-architecture-2026-08.md §8.4) this is never turned into a redial
     here, or anywhere upstream of an explicit user action: the connection's
     own :attr:`~clio_relay.adapters.worker.remote_connection.RemoteConnection.state` is
     already ``"authorization_required"`` by the time this is raised (the
