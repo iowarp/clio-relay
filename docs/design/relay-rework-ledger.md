@@ -922,11 +922,19 @@ Done in the follow-up (353ef89):
 - In the user docs, the sections for the deleted commands are removed: `operations.md` (agent, `mcp-server`, remote JARVIS MCP, remote MCP federation, `live-test`) and `architecture.md` (remote MCP catalogs, the `mcp_call` row).
 - Links to the deleted `connection-model.md` and `remote-mcp-federation.md` now point at `docs/adapters/worker.md`, or are dropped.
 
-Left, with the reason:
-- The `mcp_call` job kind (`JobKind.MCP_CALL`, `McpCallSpec`) has no producer and no runner on the worker. W9 removed its last use (`jarvis_service_runtime_validation.py:55`) at 5035e8c. W8 removes the kind once that reaches integration, with its test hits.
+Done in 504693a, after W9's 5035e8c reached integration:
+- `JobKind.MCP_CALL` is removed. So are the helpers that only served it, which had no callers left: `is_owned_jarvis_run_spec`, `prepare_owned_jarvis_run_submission`, `deterministic_jarvis_execution_id` and `validate_jarvis_execution_id`, with their re-exports in `models`.
+- Tests that used the kind as a placeholder use `JobKind.JARVIS`: `test_cli`, `test_cli_endpoint`, and two lines in W9's `test_jarvis_service_runtime`. `test_bootstrap` drops an assert on the old `clio_relay.mcp_call.pkg` path. `test_core_queue_split_architecture` uses a neutral tool name in place of `relay_submit_agent`.
+- `docs/ai/system-context.md` and `docs/ai/interface-context.md` drop their `mcp_call` paragraphs. The dated note `docs/ai/release-validation-0.9.22.md` is deleted: it recorded the old `relay_submit_*` profile and the `mcp_call` runner, and nothing links to it.
+- `tests/fixtures/relay_state_map_v1.json` is deleted. It was on the inventory's clio-schemas list but had been missed, and no test reads it since `test_schema_equality.py` went. This also settles W1's note about its `_source` line.
+- Durable queue records with kind `mcp_call` no longer load. Assumption: the worker uses a fresh private directory, so no old queue is read.
 - The `virtual_*_mcp_call` roles are gone, with the 1.0 release gate (see "The 1.0 release gate" under "Changes made during the move").
-- Some history comments in W1's scripts name deleted modules. W8 leaves W1's files alone beyond the approved edits.
-- `README.md` (lines 42, 62, 130, 253) and `docs/mcp-tasks.md:127` belong to W1.
+- W1's rewrite (4504753) removed the README and `docs/mcp-tasks.md` hits.
+
+Left, with the reason. The search at 504693a, outside `docs/design/`, finds only these:
+- `McpCallSpec` stays in the `JobSpec` union, because W9's `jarvis_service_runtime_validation.py` still reads it. It does not match the LQ32 search, but without the kind no job can carry it. See the request to W9.
+- `docs/ai/jarvis-service-runtime-binding-validation-2026-07-15.md` (lines 18 and 51) is W9's dated note for that validation path.
+- History comments in W1's scripts: `check_file_size.py` (lines 57, 117, 183-184, 270-272, 1307-1311 and 1518-1523) and `check_pyright_ratchet.py` (lines 123 and 175). See the request to W1.
 - `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). W8 rewrites it for the `clio-relay worker cluster ...` paths after the cutover (coordinator decision).
 
 ### clio-schemas
@@ -1007,7 +1015,7 @@ Fixes and edits beyond the mechanical move, in commit order:
   - `test_clio_kit_mcp_contracts`: 4 contract tests deleted; the 3 install receipt tests stay.
   - `test_contract_gate`: imports `adapters.worker.clio_kit_constants`.
   - `test_cluster_config`: the two cache-path tests check only the registry path now.
-- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` and `browser_gateway.py` entries. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: the baseline goes 7498 to 5583 (89fd6c8), then to 5076.
+- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` and `browser_gateway.py` entries. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path, and (504693a) its comment no longer names `mcp_call`. `scripts/check_pyright_ratchet.py`: the baseline goes 7498 to 5583 (89fd6c8), then to 5076.
 - **W9's tests (import-only edits, and prunes that let them collect).** `test_service_runtime`, `test_jarvis_service_runtime` and `test_frp_transport_dials` import the moved modules from `adapters.worker`. 15 tests in `test_jarvis_service_runtime` are deleted, with the helper `_owner_token_values`. The first drove `cli_jarvis_mcp` and the rest drove `mcp_server`:
     - `test_hidden_relay_authority_command_emits_one_private_json_document`
     - `test_model_facing_mcp_projection_redacts_runtime_bearer_token`
@@ -1041,6 +1049,8 @@ Fixes and edits beyond the mechanical move, in commit order:
 
 ### Gate evidence
 
+**The `mcp_call` kind removal (504693a, and 2da1c49).** Pyright on Ares counts 4925 errors, under the 4929 baseline. The targeted modules ran on the login node, with the fixtures env and uv on PATH: `test_cli`, `test_cli_endpoint`, `test_jarvis_service_runtime`, `test_bootstrap`, `test_core_queue_split_architecture`, `test_run_report`, `test_owner_session_lease` and `tests/serve`. Of 440 tests, 436 passed and none were skipped. The 3 errors are the `test_run_report` uv pin errors described below. The failure was `test_owner_session_lease::test_run_once_sweeps_owner_session_leases_every_cycle`, which is in develop's list. Its worker resolved `jarvis` from PATH, found the relay install in the Ares home (`~/.local/bin/jarvis` and its receipt), and refused it because the receipt does not match this checkout. The test now gives the worker a `jarvis_bin` under its tmp directory, as `test_endpoint` does (2da1c49), and the module passes 47 of 47.
+
 **The 1.0 release gate removal (67f6488).** Pyright on Ares counts 4929 errors, under the 5050 baseline (W1's script; W1 lowers it). The targeted modules ran on the login node, with the fixtures env and uv on PATH: `test_run_report`, `test_cli`, `test_installation`, `test_service_runtime`, `test_session_wire_models`, `test_transport_probe`, `test_bootstrap`, `test_bootstrap_reconcile`, `test_acceptance_report_defaults`, `test_cli_installation_receipt`, `test_cli_relay_host`, `test_dev_mode`, `test_identifiers`, `test_session_lifecycle` and `tests/serve`. 798 passed and none skipped. Four did not pass:
 - 3 errors in `test_run_report` (`test_real_uv_tool_scopes_launcher_to_isolated_bin`, `test_real_uvx_0_11_28_produces_verified_os_bound_launcher_receipt`, `test_real_uvx_no_cache_temporary_environment_is_not_a_verified_receipt`). They are develop's 3 `test_validation_report` failures, under the new file name: `~/.local/bin/uv` is 0.13.9, and the tests pin 0.11.28.
 - `test_service_runtime::test_local_connector_does_not_retain_captured_cli_pipes` (W9's). It gives a child CLI 2 s to import `service_runtime_command_runner`, spawn and exit. That import alone takes 3.8 s on the Ares login node, and 7.4 s at load 20. It takes the same time at 126f8cd, before this change, so the removal did not cause it. W9 rewrote the test to check order instead of time (956b43b, in W9's merge request 36c5bd7).
@@ -1073,12 +1083,13 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 - **W9.**
   - Done: W9 dropped its imports of the held modules (5a01766), and W8 deleted them (ba5ad4b). `BrowserAttachmentRecord` now has one definition, `adapters/worker/browser_attachment_record.py`, and nothing calls the `connector-step-*` commands. W8's branch contains W9 at 5a01766, so merging W8 brings it in.
   - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
-  - `jarvis_service_runtime_validation.py:55` used the `mcp_call` job kind. W9 removed it at 5035e8c; W8 removes the kind once that is in integration.
+  - The `mcp_call` kind is removed (504693a). `jarvis_service_runtime_validation.py` still validates a source job carrying `McpCallSpec` and `McpOperation` (`_validate_source_job`, `_validate_mcp_result`), and no job can carry that spec now. Retire that path, and then `McpCallSpec` and the dated note `docs/ai/jarvis-service-runtime-binding-validation-2026-07-15.md`, which names `mcp_call` and `test_browser_gateway.py`. W8 edited two lines in `test_jarvis_service_runtime.py` (the kind becomes `JobKind.JARVIS`).
   - Test failures in W9's files on this branch, none of them rerun:
     - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
     - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list. Cause found at 67f6488: the test gives the child CLI a fixed 2 s, and importing `service_runtime_command_runner` alone takes 3.8 s on the Ares login node (7.4 s at load 20), the same before and after W8's change. W9 rewrote it to check order instead of time (956b43b).
 - **W1.**
-  - Lower the pyright baseline in `scripts/check_pyright_ratchet.py` to 4929 (measured at 67f6488).
+  - Lower the pyright baseline in `scripts/check_pyright_ratchet.py` to 4925 (measured at 504693a).
+  - For LQ32, drop the history comments that name `mcp_call`, `browser_gateway` and `scheduler_providers` in `check_file_size.py` (lines 57, 117, 183-184, 270-272, 1307-1311 and 1518-1523) and `check_pyright_ratchet.py` (lines 123 and 175).
   - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
   - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
 - **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
