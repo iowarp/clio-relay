@@ -1718,11 +1718,15 @@ All live on Ares, on my own stack:
   - A CLI `site add` showed in the open tab and a `site remove` disappeared from it, before and after a PATCH remove/add remount. Screenshots `lq27-13` and `lq27-14`.
   - Revisions: a CLI add moves only `relay-sites`, which rises by one per change. Re-reads with no change keep every revision.
   - W3 also noticed that `relay-add` took fresh action tokens on every read and re-rendered, which could wipe a half-filled form. Fixed at 1f26714: an unspent token for the same action and subject is reused while more than half its lifetime is left. A new relay process re-mints once.
-- **Connect on Stampede3, live** at a0e2802 with W6's fix.
+- **Connect on Stampede3, live** at a0e2802 and again at ea56fc6, with W6's fix.
   - The card reads TACC, Signed out, Unavailable, "Relay registers one after you sign in", with Connect. Pressing Connect raises the host permission card "Sign in to a site". After Allow once, relay answers that it has no OAuth client for the TACC tenant, on the card and as the tab notice. Screenshots `lq27-15` to `lq27-17`.
   - A real TACC sign-in needs `CLIO_RELAY_TACC_CLIENT_ID`, which this stack doesn't have. That is the W10 owner blocker, not a tab gap.
   - Found and fixed on the way: notices passed refusal text through `str.capitalize`, which lowercased TACC and the env names (a0e2802).
 - **Tests.** On Ares at 1f26714, `tests/relay_next tests/asks` gave 326 passed, 0 skipped. At a0e2802, `test_compute_tab.py` gave 12 passed, 0 skipped, with ruff and pyright clean on `surface/a2ui`.
+- **After the cutover (integration c214d4f, merged at 66ffa34).** The plugin runs `clio-relay serve`, pinned at ea56fc6 (309df86), and the marketplace is at 89c56a1.
+  - `tests/relay_next tests/asks` gave 328 passed, 0 skipped.
+  - The option-B gate passed against `clio-relay serve` over stdio, in both auto and legacy modes. A plain client sees 5 tools. An A2UI client sees 15, and the 10 app-only tools equal `ACTIONS`. A call without a token is refused, and so is one with a made-up token.
+  - On the live agent, after a plugin update and a remount, relay runs `@ea56fc6… clio-relay serve`, and Connect on Stampede3 gives the same result as above.
 
 ### Open items
 
