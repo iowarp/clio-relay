@@ -523,26 +523,4 @@ def create_app(state: StubState) -> FastAPI:
         ok = state.approve(str(data["user_code"]), str(data.get("username") or "testuser"))
         return _envelope({"approved": ok}, status=200 if ok else 404)
 
-    @app.post("/_stub/jobs/{job_uuid}/release")
-    async def release(job_uuid: str) -> Response:
-        job = state.jobs.get(job_uuid)
-        if job is None:
-            return _error(404, "no such job")
-        job.released.set()
-        return _envelope({"released": True})
-
-    @app.post("/_stub/jobs/{job_uuid}/status")
-    async def force_status(job_uuid: str, request: Request) -> Response:
-        data = await request.json()
-        job = state.jobs.get(job_uuid)
-        if job is None:
-            return _error(404, "no such job")
-        with state.lock:
-            job.forced = True
-            job.status = str(data["status"])
-            job.history.append(job.status)
-            job.last_message = str(data.get("lastMessage") or job.last_message)
-        job.released.set()
-        return _envelope(job_view(job))
-
     return app

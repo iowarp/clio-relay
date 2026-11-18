@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import os
 import tarfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -70,10 +69,6 @@ def seed_host(
 
 def tapis_config(stub: TapisStub, **extra: Any) -> dict[str, Any]:
     return {"base_url": stub.base_url, "tenant_id": "tacc", "client_id": CLIENT_ID} | extra
-
-
-def login_name() -> str:
-    return os.environ.get("USER") or os.environ.get("LOGNAME") or "relay"
 
 
 def package_archive(root: Path, names: Iterable[str]) -> bytes:

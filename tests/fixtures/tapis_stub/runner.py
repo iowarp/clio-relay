@@ -50,7 +50,6 @@ class StubJob:
     remote_job_id: str | None = None
     process: subprocess.Popen[bytes] | None = None
     released: threading.Event = field(default_factory=threading.Event)
-    forced: bool = False
     in_slurm: bool = False
     history: list[str] = field(default_factory=list[str])
 
@@ -66,7 +65,7 @@ class JobRunner:
 
     def _move(self, job: StubJob, status: str, message: str = "") -> bool:
         with self.state.lock:
-            if job.status in FINAL_STATES or job.forced:
+            if job.status in FINAL_STATES:
                 return False
             job.status = status
             job.history.append(status)
@@ -94,7 +93,7 @@ class JobRunner:
                 return
             job.remote_job_id = str(10_000 + len(state.jobs))
             while state.hold and not job.released.is_set():
-                if job.status in FINAL_STATES or job.forced:
+                if job.status in FINAL_STATES:
                     return
                 job.released.wait(0.05)
             if not self._move(job, "RUNNING"):
@@ -126,7 +125,7 @@ class JobRunner:
                 code = self._local(job, exec_dir, out_dir, env, command)
             (out_dir / "tapisjob.exitcode").write_text(f"{code}\n", encoding="utf-8")
             with state.lock:
-                if job.status == "CANCELLED" or job.forced:
+                if job.status == "CANCELLED":
                     return
             if code != 0:
                 self._move(job, "FAILED", f"application exited with code {code}")
