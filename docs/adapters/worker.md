@@ -91,13 +91,14 @@ the link, and the worker answers with the same results or refusals.
 - `files` reads and writes under the worker's directory, in chunks.
 - `serve` starts a service job and carries its traffic over the same link.
 
-## Operator commands
+## Upgrades
 
-The commands for managing clusters, sessions and the queue by hand, which
-earlier relay versions had at the top level, are under `clio-relay worker`:
+A worker that an older relay placed is not used. Calls to its site are refused
+with `needs_sign_in`, and the next sign-in stops it and places a current worker
+in the same directory. Jobs and staged content there stay.
 
-```
-clio-relay worker cluster add --name ares --ssh-host ares
-clio-relay worker cluster list
-clio-relay worker --help
-```
+## On the cluster
+
+The worker has no commands to run by hand. Placement starts it as
+`clio-relay worker site-serve`. [Operations](../operations.md) lists what it
+keeps in its directory and how to check, stop or remove it.

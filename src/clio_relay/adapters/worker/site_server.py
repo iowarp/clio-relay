@@ -1,8 +1,8 @@
-"""The worker's site process: one owned API plus the frpc proxy that exposes it.
+"""The worker's site process: its API plus the frpc proxy that exposes it.
 
 ``clio-relay worker site-serve --state-dir D`` is what the ``worker`` adapter's
 placement starts on the site, detached, after its one ssh pass. It reads what
-placement wrote under ``D/run``, binds the owned-session API on loopback,
+placement wrote under ``D/run``, binds the worker's API on loopback,
 holds an frpc ``stcp`` proxy to the rendezvous server, and writes
 ``D/run/ready.json`` once both are up. It needs no systemd user manager, so it
 runs on hosts that have none.
@@ -11,7 +11,7 @@ Files placement writes (all 0600):
 
 - ``run/settings.json``: cluster, session and generation ids, the API token and
   the session owner token.
-- ``run/registry.json``: a one-cluster registry, the process-bound authority.
+- ``run/registry.json``: a one-cluster registry, for the frp settings.
 - ``run/frp.env``: the rendezvous token and the stcp secret, ``NAME=value`` lines.
 """
 
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import os
 import socket
@@ -109,39 +108,27 @@ def serve_site(state_dir: Path) -> None:
     import uvicorn
 
     from clio_relay.adapters.worker.frpc_unit import render_frpc_proxy_toml
-    from clio_relay.cluster_config import (
-        CLUSTER_REGISTRY_ENV,
-        ClusterRegistry,
-        cluster_route_revision,
-    )
+    from clio_relay.adapters.worker.site_app import SiteSettings, site_app
+    from clio_relay.cluster_config import ClusterRegistry
 
     run = state_dir / "run"
     settings: dict[str, Any] = json.loads((run / SETTINGS_FILE).read_text(encoding="utf-8"))
-    registry_path = run / REGISTRY_FILE
-    registry_bytes = registry_path.read_bytes()
-    registry = ClusterRegistry.model_validate_json(registry_bytes)
+    registry = ClusterRegistry.model_validate_json((run / REGISTRY_FILE).read_bytes())
     cluster = str(settings["cluster"])
     definition = registry.require(cluster)
     frp_secrets = _read_env_file(run / FRP_ENV_FILE)
     port = _free_loopback_port()
-
-    os.environ.update(
-        {
-            "CLIO_RELAY_CORE_DIR": str(state_dir / "core"),
-            "CLIO_RELAY_SPOOL_DIR": str(state_dir / "spool"),
-            "CLIO_RELAY_OWNER_SESSION_ID": str(settings["session_id"]),
-            "CLIO_RELAY_SESSION_GENERATION_ID": str(settings["generation_id"]),
-            "CLIO_RELAY_OWNER_SESSION_CLUSTER": cluster,
-            "CLIO_RELAY_OWNER_SESSION_API_PORT": str(port),
-            "CLIO_RELAY_API_TOKEN": str(settings["api_token"]),
-            "CLIO_RELAY_SESSION_OWNER_TOKEN": str(settings["session_owner_token"]),
-            CLUSTER_REGISTRY_ENV: str(registry_path),
-            "CLIO_RELAY_SESSION_REGISTRY_SHA256": hashlib.sha256(registry_bytes).hexdigest(),
-            "CLIO_RELAY_SESSION_ROUTE_REVISION": cluster_route_revision(definition),
-        }
+    app = site_app(
+        SiteSettings(
+            cluster=cluster,
+            session_id=str(settings["session_id"]),
+            generation_id=str(settings["generation_id"]),
+            api_token=str(settings["api_token"]),
+            session_owner_token=str(settings["session_owner_token"]),
+            state_dir=state_dir,
+            port=port,
+        )
     )
-    # The app reads its gated environment once, at import.
-    from clio_relay.adapters.worker.http_api import app as relay_http_app
 
     frpc_toml = run / FRPC_TOML
     _write_private(frpc_toml, render_frpc_proxy_toml(definition, cluster=cluster, local_port=port))
@@ -151,8 +138,9 @@ def serve_site(state_dir: Path) -> None:
         {**os.environ, **frp_secrets},
         run / FRPC_LOG,
     )
+    # Relay keeps idle streams for 60 s, so the site must keep them longer.
     server = uvicorn.Server(
-        uvicorn.Config(relay_http_app, host="127.0.0.1", port=port, access_log=False)
+        uvicorn.Config(app, host="127.0.0.1", port=port, access_log=False, timeout_keep_alive=300)
     )
 
     async def announce() -> None:
@@ -183,5 +171,5 @@ def site_serve_command(
         Path, typer.Option("--state-dir", help="The worker's directory on this site.")
     ],
 ) -> None:
-    """Serve this site's worker: the owned API and its frpc proxy."""
+    """Serve this site's worker: its API and its frpc proxy."""
     serve_site(state_dir.expanduser().resolve())
