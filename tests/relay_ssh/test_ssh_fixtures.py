@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import stat
 import subprocess
 import sys
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,7 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle, JobStatus
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import InputRef, JobSpec
+from clio_relay.jobs.spec import InputRef, JobAttributes, JobSpec
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
@@ -125,6 +127,60 @@ async def test_lq5_a_slurm_job_completes_after_relay_restarts(
     again = await second.run(spec, operation_id=operation_id)
     assert again.native_id == handle.native_id
 
+
+def site_shell(fx: dict[str, str], profile: str, command: str) -> str:
+    done = subprocess.run(
+        ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", profile, command],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return done.stdout
+
+
+def scheduler_limit(fx: dict[str, str], profile: str, native_id: str) -> str | None:
+    """Return the walltime the scheduler holds for a job, as it reports it."""
+    if profile == "fx-slurm":
+        line = site_shell(fx, profile, f"scontrol show job -o {native_id}")
+        return next(
+            field.split("=", 1)[1] for field in line.split() if field.startswith("TimeLimit=")
+        )
+    report = json.loads(
+        site_shell(fx, profile, f"PATH=/opt/pbs/bin:$PATH qstat -f -F json {native_id}")
+    )
+    (job,) = report["Jobs"].values()
+    return job.get("Resource_List", {}).get("walltime")
+
+
+@pytest.mark.parametrize("profile", ["fx-slurm", "fx-pbs"])
+async def test_a_job_without_a_duration_gets_the_schedulers_limit(
+    fx: dict[str, str], tmp_path: Path, profile: str
+) -> None:
+    """Relay sets no walltime of its own: no directive, and no 10 minute cap."""
+    adapter = build(fx, tmp_path, profile)
+    files = await adapter.files()
+    expected = {"fx-slurm": ("UNLIMITED", "00:15:00"), "fx-pbs": (None, "00:15:00")}[profile]
+    for spec, limit in (
+        (JobSpec(executable="sleep", arguments=["3600"]), expected[0]),
+        (
+            JobSpec(
+                executable="sleep",
+                arguments=["3600"],
+                attributes=JobAttributes(duration=timedelta(minutes=15)),
+            ),
+            expected[1],
+        ),
+    ):
+        handle = await adapter.run(spec, operation_id=new_id("op"))
+        try:
+            script = (await files.read(f"{handle.data['job_dir']}/submit.sh")).decode()
+            has_directive = "#SBATCH --time=" in script or "#PBS -l walltime=" in script
+            assert has_directive == (limit is not None), script
+            assert handle.native_id is not None
+            assert scheduler_limit(fx, profile, handle.native_id) == limit
+        finally:
+            await adapter.cancel(handle)
 
 async def test_lq6_the_pbs_script_and_status_come_from_psij(
     fx: dict[str, str], tmp_path: Path

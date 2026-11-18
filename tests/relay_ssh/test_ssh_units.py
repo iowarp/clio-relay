@@ -5,6 +5,7 @@ These run without a site. The live checks are in the fixture modules.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter, SshConfig, scripts
+from clio_relay.adapters.ssh.adapter import walltime
 from clio_relay.adapters.ssh.transport import Completed, SshTransport
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -167,6 +169,26 @@ def test_render_uses_the_sites_paths(tmp_path: Path, scheduler: str) -> None:
         "single_launch.sh",
     }
     assert all(path.is_file() for path in rendered.launcher_files)
+
+
+_TIME_DIRECTIVES = {"slurm": "#SBATCH --time=", "pbs": "#PBS -l walltime="}
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
+def test_no_duration_renders_no_walltime(tmp_path: Path, scheduler: str) -> None:
+    adapter = _adapter(tmp_path)
+    root = PurePosixPath("/home/someone/.clio-relay")
+    job_dir = root / "jobs" / "op_abc"
+    directive = _TIME_DIRECTIVES[scheduler]
+    bare = JobSpec(executable="true", attributes=JobAttributes(queue_name="debug"))
+    assert walltime(bare) is None
+    rendered = adapter._render(bare, scheduler, root, job_dir, "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert directive not in rendered.files["submit.sh"]
+    # A duration that was given is rendered.
+    timed = JobSpec(executable="true", attributes=JobAttributes(duration=timedelta(hours=3)))
+    assert walltime(timed) == timedelta(hours=3)
+    rendered = adapter._render(timed, scheduler, root, job_dir, "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert directive in rendered.files["submit.sh"]
 
 
 def test_render_detached(tmp_path: Path) -> None:

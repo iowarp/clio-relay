@@ -22,6 +22,7 @@ import logging
 import shlex
 import shutil
 import threading
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -107,6 +108,19 @@ def _remote_path(base: PurePosixPath, value: str | None) -> PurePosixPath | None
 def job_name(operation_id: str) -> str:
     """Return the scheduler job name relay gives an operation, for reconciling."""
     return f"relay-{operation_id}"
+
+
+def walltime(spec: JobSpec) -> timedelta | None:
+    """Return the walltime the spec asks for, or None when it gives none.
+
+    ``JobAttributes`` fills ``duration`` with a default, so a duration counts only
+    when it was given: by the caller, or by the site's ``defaults.duration``.
+    """
+    attributes = spec.attributes
+    duration: timedelta | None = getattr(attributes, "duration", None)
+    if duration is None or "duration" not in attributes.model_fields_set:
+        return None
+    return duration
 
 
 class _Rendered:
@@ -345,6 +359,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
         executor = _executor(scheduler, self.render_dir)
         psij_spec = spec.to_psij(name=name)
+        # Relay never sets a walltime of its own (RL18). With none in the spec, PSI/J
+        # gets None and writes no directive, so the scheduler's default applies.
+        psij_attributes: Any = psij_spec.attributes
+        psij_attributes.duration = walltime(spec)
         # PSI/J would make these absolute against this machine. They are the site's paths.
         psij_spec._directory = workdir  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         psij_spec._stdout_path = stdout  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
