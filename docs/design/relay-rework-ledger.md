@@ -126,6 +126,10 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - `BaseAdapter.runs_packages` (default `False`) says the adapter runs a reviewed package rather than the agent's command. Tapis sets it.
   - The entry point `guard = "clio_relay.guard:create_guard"` is registered. It falls back to `DefaultGuard` while `clio_relay.guard` is not installed.
   - The docs index links `docs/guarded-sites.md`, which W13 writes.
+- **Outputs carry metadata, and a running job reports its latest step (W9's requests, RL40 and RL43).**
+  - `OutputRef.metadata: dict[str, Any]` (default empty) is JSON the adapter or package attaches; relay passes it on unchanged. Two keys have a set meaning, named by constants in `jobs/handles.py`: `view` (`VIEW_METADATA`) holds the output's view descriptor (path or path pattern, format, ParaView reader and its configuration, whether it is still being written), and `provenance` (`PROVENANCE_METADATA`) holds the package version and hash and its input digests. W9's `serve.provenance` goes there.
+  - `JobStatus.progress: JobProgress | None` is the latest step an adapter observed: `step`, `total`, `message`, `outputs` (what the step wrote, each with its descriptor) and `data` (adapter-owned JSON). On each observation relay stores it in the operation's `result["progress"]`, so `describe`, the operation's structured result and the final task result carry it in full.
+  - The task's `statusMessage` names it: "relay operation is running: step 3 of 10; wrote snapshot 3; views: snapshots" (`surface/progress.py`). The full descriptor is not put in `tasks/get` while the task is working, because the tasks extension's `GetTaskResult` has no `_meta` (its schema forbids extra properties). A client reads the step from the operation instead. This keeps relay a plain MCP server: no client needs a relay-only field to follow a run.
 
 ### Published interfaces (M1)
 
