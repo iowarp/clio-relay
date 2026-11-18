@@ -86,23 +86,68 @@ def brief(shown: dict[str, Any]) -> dict[str, Any]:
     return shown
 
 
-async def sign_in(client: Client, site: str) -> dict[str, Any]:
-    """Probe the site; if it needs a sign-in, start it on the page and wait for it."""
-    probe = brief(await tool(client, "files", {"site": site, "op": "list", "path": "."}))
-    out: dict[str, Any] = {"probe": probe}
-    if probe.get("refusal") != "needs_sign_in":
-        return out
-    ask = next(a for a in probe["asks"] if a.get("page"))
-    out["start"] = {k: v for k, v in page(ask["page"], "start").items() if k != "text"}
+async def sign_in_page(url: str) -> dict[str, Any]:
+    """Start a sign-in on its page and wait until the page says how it ended."""
+    out: dict[str, Any] = {"start": {k: v for k, v in page(url, "start").items() if k != "text"}}
     polls = 0
     while True:
         polls += 1
-        shown = page(ask["page"])
+        shown = page(url)
         if "Signed in" in shown["text"] or re.search(r"fail|declin|did not", shown["text"], re.I):
             out["page"] = shown["text"][-600:]
             break
         await asyncio.sleep(2)
     out["page_polls"] = polls
+    return out
+
+
+async def answer_asks(asks: list[dict[str, Any]]) -> list[Any]:
+    """Answer each ask on its page the way a person would."""
+    answered: list[Any] = []
+    for ask in asks:
+        if not ask.get("page"):
+            continue
+        if ask.get("kind") == "url":
+            signed = await sign_in_page(ask["page"])
+            answered.append({"ask_id": ask.get("ask_id"), "kind": "url", **signed})
+            continue
+        shown = page(ask["page"])
+        posted = page(ask["page"], "accept")
+        answered.append(
+            {
+                "ask_id": ask.get("ask_id"),
+                "kind": ask.get("kind"),
+                "question": shown["text"][-900:],
+                "post": posted.get("post"),
+            }
+        )
+    return answered
+
+
+async def settle(client: Client, started: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
+    """Answer a run's asks and resume it until relay stops asking."""
+    rounds: list[Any] = []
+    operation = started.get("operation_id")
+    asking = ("needs_approval", "needs_sign_in")
+    while operation and started.get("refusal") in asking and started.get("asks"):
+        rounds.append(await answer_asks(started["asks"]))
+        started = brief(await tool(client, "run", {"resume": operation, "wait_s": 5}))
+        rounds.append({"resumed": {k: v for k, v in started.items() if k != "asks"}})
+    return started, rounds
+
+
+async def sign_in(client: Client, site: str) -> dict[str, Any]:
+    """Probe the site; if it needs a sign-in, sign in through a small run's page."""
+    probe = brief(await tool(client, "files", {"site": site, "op": "list", "path": "."}))
+    out: dict[str, Any] = {"probe": probe}
+    if probe.get("refusal") != "needs_sign_in":
+        return out
+    spec = {"executable": "/bin/sh", "arguments": ["-c", "echo w8-signed-in"]}
+    started = brief(await tool(client, "run", {"site": site, "spec": spec, "wait_s": 5}))
+    out["started"] = started
+    started, out["rounds"] = await settle(client, started)
+    if started.get("operation_id") and not started.get("refusal"):
+        out["final"] = await wait_final(client, started["operation_id"])
     out["after"] = brief(await tool(client, "files", {"site": site, "op": "list", "path": "."}))
     return out
 
@@ -161,6 +206,7 @@ async def run_job(client: Client, site: str, tag: str) -> dict[str, Any]:
     }
     started = brief(await tool(client, "run", {"site": site, "spec": spec, "wait_s": 5}))
     out: dict[str, Any] = {"staged": brief(staged), "started": started}
+    started, out["approvals"] = await settle(client, started)
     operation = started.get("operation_id")
     if operation and not started.get("refusal"):
         final = await wait_final(client, operation)
@@ -282,24 +328,6 @@ async def step_observe(args: argparse.Namespace) -> dict[str, Any]:
         return out
 
 
-async def answer_asks(client: Client, operation: str, asks: list[dict[str, Any]]) -> list[Any]:
-    answered: list[Any] = []
-    for ask in asks:
-        if not ask.get("page"):
-            continue
-        shown = page(ask["page"])
-        posted = page(ask["page"], "accept")
-        answered.append(
-            {
-                "ask_id": ask.get("ask_id"),
-                "kind": ask.get("kind"),
-                "question": shown["text"][-900:],
-                "post": posted.get("post"),
-            }
-        )
-    return answered
-
-
 async def step_guarded(args: argparse.Namespace) -> dict[str, Any]:
     async with connect() as client:
         out: dict[str, Any] = {"step": "guarded"}
@@ -326,13 +354,8 @@ async def step_guarded(args: argparse.Namespace) -> dict[str, Any]:
         }
         started = brief(await tool(client, "run", {"site": args.site, "spec": spec, "wait_s": 5}))
         out["started"] = started
+        started, out["approvals"] = await settle(client, started)
         operation = started.get("operation_id")
-        rounds: list[Any] = []
-        while operation and started.get("refusal") == "needs_approval":
-            rounds.append(await answer_asks(client, operation, started.get("asks", [])))
-            started = brief(await tool(client, "run", {"resume": operation, "wait_s": 5}))
-            rounds.append({"resumed": {k: v for k, v in started.items() if k != "asks"}})
-        out["approvals"] = rounds
         if operation and not started.get("refusal"):
             final = await wait_final(client, operation)
             out["final"] = final
