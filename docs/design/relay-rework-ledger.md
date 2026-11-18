@@ -572,6 +572,12 @@ All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, aga
     - Units: `test_a_signal_to_the_batch_shell_reaches_the_command` (only the batch shell is signalled; the grandchild's trap runs and `.ec` reads 143) and `test_the_batch_shell_keeps_the_commands_exit_code` (7).
   - A forgotten job whose batch shell wrote `.ec` 143 after a signal still asks `sacct`, so the forgotten-job test above keeps reading `cancelled`. Units: `test_a_forgotten_job_the_scheduler_stopped_asks_accounting[CANCELLED|TIMEOUT|none]`.
 - At `6023709` (on integration `87da62d`): `pytest tests/relay_ssh`, `87 passed in 479.31s`, none skipped. `ruff check`, `ruff format` and `pyright` clean.
+- Deleted inputs leave the store (W9's `secrets.env`), at `540decd`:
+  - Units in `test_ssh_store.py`: a final record drops the blob of an input the job deleted, keeps one it kept, one it replaced, and one another job still links; `input_entries` gives nothing for unreadable `inputs.json`.
+  - `test_an_input_the_job_deletes_leaves_no_copy_in_the_store[fx-slurm|fx-pbs|fx-ssh]`: a job sources `serve/secrets.env`, deletes it and ends; its blob is gone, `kept.txt`'s blob and the job's link stay. A second job deletes its copy and sleeps: the blob stays while it runs and is gone once it is `cancelled`.
+  - Live on Ares Slurm with `remote_dir: clio-relay-rework/w7-scratch/blob-remote`: job 27803 `completed`, stdout the token, secret blob gone, kept blob present; job 27804 deleted its copy, the blob stayed while it ran, then `cancelled` and the blob was gone, the kept one present.
+  - The store code is `adapters/ssh/store.py` and its tests have their own modules, so `scripts.py`, `test_ssh_units.py` and `test_ssh_fixtures.py` stay under 500 lines. `check_file_size.py`: OK, with src 79.44% and tests 70.07% under 500 lines.
+  - `pytest tests/relay_ssh`, `93 passed in 550.07s`, none skipped. `ruff check`, `ruff format` and `pyright` clean.
 
 ## W8. The worker adapter and the old surface's removal
 
