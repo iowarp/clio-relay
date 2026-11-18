@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn, cast
 
 import typer
 
@@ -22,6 +22,7 @@ from clio_relay.surface.settings import RelayPaths
 
 if TYPE_CHECKING:
     from clio_relay.identity import Identities
+    from clio_relay.surface.service import RelayService
 
 app = typer.Typer(no_args_is_help=True, help="See and answer what relay is asking, and sign in.")
 
@@ -34,18 +35,18 @@ def _print(value: Any) -> None:
     typer.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
-def _fail(message: str, code: int = 2) -> None:
+def _fail(message: str, code: int = 2) -> NoReturn:
     typer.echo(message, err=True)
     raise typer.Exit(code)
 
 
-def _service() -> Any:
+def _service() -> RelayService:
     from clio_relay.surface.service import RelayService
 
     return RelayService(_paths())
 
 
-def _ask(service: Any, ask_id: str) -> Ask:
+def _ask(service: RelayService, ask_id: str) -> Ask:
     found = service.asks.get(ask_id)
     if found is None:
         _fail(f"there is no ask {ask_id!r}")
@@ -89,7 +90,7 @@ def asks_show(ask_id: str) -> None:
     _print(shown)
 
 
-def _advance(service: Any, ask: Ask) -> None:
+def _advance(service: RelayService, ask: Ask) -> None:
     if ask.operation_id:
         record = asyncio.run(service.advance(ask.operation_id))
         _print({"ask": ask.ask_id, "operation": record.operation_id, "state": record.state.value})
@@ -156,15 +157,12 @@ def asks_page(ask_id: str) -> None:
     base = read_base(paths.state_dir)
     if base is None:
         _fail("no relay is serving its page here. Start relay, then try again")
-        return
     ttl = float(os.environ.get(PAGE_TTL_ENV) or DEFAULT_PAGE_TTL_S)
     token = PageTokens(paths.state_dir / "pages", ttl).mint(ask.ask_id)
     typer.echo(page_url(base, ask.ask_id, token))
     if not base.startswith(("http://127.0.0.1", "http://localhost")):
-        typer.echo(
-            f"Sign in with any user name and the operator token in {operator_token_file(paths.state_dir)}",
-            err=True,
-        )
+        where = operator_token_file(paths.state_dir)
+        typer.echo(f"Sign in with any user name and the operator token in {where}", err=True)
 
 
 def _identities() -> Identities:
@@ -185,7 +183,11 @@ def asks_identities() -> None:
     from clio_relay.identity.probe import load
 
     statuses = asyncio.run(_identities().statuses())
-    probes = load(_paths())
+    probes: dict[str, dict[str, Any]] = {
+        site: cast(dict[str, Any], item)
+        for site, item in load(_paths()).items()
+        if isinstance(item, dict)
+    }
     _print(
         [
             {
@@ -193,7 +195,7 @@ def asks_identities() -> None:
                 "sites": {
                     site: item.get("state")
                     for site, item in probes.items()
-                    if isinstance(item, dict) and item.get("identity") == status.provider
+                    if item.get("identity") == status.provider
                 },
             }
             for status in statuses
@@ -210,7 +212,6 @@ async def _sign_in(name: str) -> str:
     identity = identities.get(name)
     if identity is None:
         _fail(f"relay has no {name} sign-in")
-        raise AssertionError
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
         ctx = SignInContext(store=identities.context.store, http=http)
         step = await identity.begin(ctx)
@@ -248,7 +249,6 @@ def asks_sign_in(provider: str) -> None:
         results = asyncio.run(probe_identity(provider, _paths()))
     except Refusal as refusal:
         _fail(f"{refusal.reason.value}: {refusal.message}")
-        return
     except KeyboardInterrupt:
         sys.exit(130)
     _print([item.model_dump(mode="json") for item in results])
@@ -260,7 +260,6 @@ def asks_sign_out(provider: str) -> None:
     identity = _identities().get(provider)
     if identity is None:
         _fail(f"relay has no {provider} sign-in")
-        return
     asyncio.run(identity.sign_out())
     _print({"provider": provider, "signed_out": True})
 

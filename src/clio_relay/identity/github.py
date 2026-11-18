@@ -64,9 +64,7 @@ class GitHubIdentity(OAuthIdentity):
         device_code = body.get("device_code")
         user_code = body.get("user_code")
         verification = body.get("verification_uri")
-        if status != 200 or not (
-            isinstance(device_code, str) and isinstance(user_code, str)
-        ):
+        if status != 200 or not (isinstance(device_code, str) and isinstance(user_code, str)):
             reason = body.get("error") or f"HTTP {status}"
             raise Refusal(
                 RefusalReason.UNREACHABLE,

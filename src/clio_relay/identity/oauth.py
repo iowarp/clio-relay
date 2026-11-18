@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -95,8 +95,9 @@ class OAuthIdentity:
     def _stored_tokens(self) -> list[Token]:
         entry = self.stored() or {}
         found: list[Token] = []
-        for item in entry.get("tokens") or []:
-            if isinstance(item, dict) and item.get("access_token"):  # pyright: ignore[reportUnknownMemberType]
+        tokens_value: list[Any] = list(cast(list[Any], entry.get("tokens") or []))
+        for item in tokens_value:
+            if isinstance(item, dict) and cast(dict[str, Any], item).get("access_token"):
                 found.append(Token.model_validate(item))
         return found
 
@@ -128,9 +129,8 @@ class OAuthIdentity:
                 provider=self.name, title=self.title, state="signed_out", detail=problem
             )
         live = [token for token in tokens if token.live()]
-        if not live and entry.get("refresh_token"):
-            if await self.refresh():
-                live = [token for token in self._stored_tokens() if token.live()]
+        if not live and entry.get("refresh_token") and await self.refresh():
+            live = [token for token in self._stored_tokens() if token.live()]
         expiry = [token.expires_at for token in live if token.expires_at is not None]
         return IdentityStatus(
             provider=self.name,
@@ -175,12 +175,16 @@ async def post_form(
 ) -> tuple[int, dict[str, Any]]:
     """POST a form and return the status and JSON body. The body is never logged."""
     try:
-        response = await http.post(
-            url, data=data, auth=auth, headers={"Accept": "application/json"}
-        )
+        if auth is None:
+            response = await http.post(url, data=data, headers={"Accept": "application/json"})
+        else:
+            response = await http.post(
+                url, data=data, auth=auth, headers={"Accept": "application/json"}
+            )
     except httpx.HTTPError as exc:
         raise Refusal(
-            RefusalReason.UNREACHABLE, f"could not reach {httpx.URL(url).host}: {type(exc).__name__}"
+            RefusalReason.UNREACHABLE,
+            f"could not reach {httpx.URL(url).host}: {type(exc).__name__}",
         ) from exc
     try:
         body: object = response.json()

@@ -13,6 +13,7 @@ reads asks stays quiet.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -136,7 +137,9 @@ class RelayAskProvider:
     def paths(self) -> RelayPaths:
         """Return relay's paths, with this provider's state directory."""
         configured = self.context.settings.get("config_dir")
-        config = Path(configured) if isinstance(configured, str) else RelayPaths.from_env().config_dir
+        config = (
+            Path(configured) if isinstance(configured, str) else RelayPaths.from_env().config_dir
+        )
         return RelayPaths(
             config_dir=config,
             state_dir=self.context.state_dir,
@@ -379,7 +382,9 @@ class RelayAskProvider:
                         and mode_of(ask) == "identity"
                         and ask.binding.get("provider") == provider
                     ):
-                        self.finish_url_ask(ask.ask_id, {"signed_in": True, "source": status.source})
+                        self.finish_url_ask(
+                            ask.ask_id, {"signed_in": True, "source": status.source}
+                        )
         try:
             results = await probe_identity(provider, self.paths())
         except Exception:
@@ -401,8 +406,6 @@ class RelayAskProvider:
             self._loopback = None
         client, self._http = self._http, None
         if client is not None:
-            try:
+            with contextlib.suppress(RuntimeError):
                 await self.runner.call(client.aclose())
-            except RuntimeError:
-                pass
         self.runner.close()

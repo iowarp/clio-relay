@@ -21,7 +21,7 @@ blocker O10); without one, sign-in refuses and says so.
 from __future__ import annotations
 
 import secrets
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -43,8 +43,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 DEFAULT_AUTH_URL = "https://auth.globus.org"
 DEFAULT_SCOPES = (
-    "openid profile email offline_access "
-    "urn:globus:auth:scope:transfer.api.globus.org:all"
+    "openid profile email offline_access urn:globus:auth:scope:transfer.api.globus.org:all"
 )
 
 
@@ -115,9 +114,7 @@ class GlobusIdentity(OAuthIdentity):
         if step is None:
             return SignInResult(state="failed", message="no Globus sign-in is in progress")
         if params.get("error"):
-            return SignInResult(
-                state="failed", message=f"Globus said {params.get('error')}"
-            )
+            return SignInResult(state="failed", message=f"Globus said {params.get('error')}")
         if "state" in params and not secrets.compare_digest(
             params["state"], str(step.data.get("state", ""))
         ):
@@ -146,7 +143,9 @@ class GlobusIdentity(OAuthIdentity):
         documents: list[dict[str, Any]] = [body]
         others = body.get("other_tokens")
         if isinstance(others, list):
-            documents.extend(item for item in others if isinstance(item, dict))  # pyright: ignore[reportUnknownVariableType]
+            for item in cast(list[Any], others):
+                if isinstance(item, dict):
+                    documents.append(cast(dict[str, Any], item))
         tokens: list[dict[str, Any]] = []
         for document in documents:
             entry = token_entry(document)
@@ -180,10 +179,10 @@ class GlobusIdentity(OAuthIdentity):
         changed = False
         tokens: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=30) as http:
-            for item in entry.get("tokens") or []:
+            for item in cast(list[Any], entry.get("tokens") or []):
                 if not isinstance(item, dict):
                     continue
-                current: dict[str, Any] = dict(item)  # pyright: ignore[reportUnknownArgumentType]
+                current: dict[str, Any] = dict(cast(dict[str, Any], item))
                 refresh = current.get("refresh_token")
                 if isinstance(refresh, str) and refresh:
                     status, body = await post_form(

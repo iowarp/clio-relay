@@ -277,9 +277,10 @@ class PageCore:
         ask = self.owner.context.asks.get(ask_id)
         if ask is None:
             return self._unknown()
-        if fields.get("op", "") != (ask.operation_id or "") or fields.get(
-            "bd", ""
-        ) != ask.binding_digest:
+        if (
+            fields.get("op", "") != (ask.operation_id or "")
+            or fields.get("bd", "") != ask.binding_digest
+        ):
             return response(409, "This page is out of date", "<p>Reload it and look again.</p>")
         if self.finished(ask):
             return self._done(ask)
@@ -331,7 +332,9 @@ class PageCore:
         elif action == "secret" and value:
             await signins.secret(ask, value)
         elif action in ("prompt", "prompt_yes", "prompt_decline"):
-            answer = None if action == "prompt_decline" else ("yes" if action == "prompt_yes" else value)
+            answer = (
+                None if action == "prompt_decline" else ("yes" if action == "prompt_yes" else value)
+            )
             await signins.prompt(ask, fields.get("prompt_id", ""), answer)
         elif action == "done":
             await signins.confirm(ask)

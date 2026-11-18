@@ -112,13 +112,14 @@ def mount(server: Any, owner: RelayAskProvider, public_base: str) -> None:
         headers = {key.lower(): value for key, value in request.headers.items()}
         here = f"{request.url.scheme}://{request.url.netloc}"
         origins = {public_origin, here}
-        return _respond(
-            await owner.runner.call(owner.core.post(ask_id, fields, headers, origins))
-        )
+        return _respond(await owner.runner.call(owner.core.post(ask_id, fields, headers, origins)))
 
-    server.custom_route(CALLBACK, methods=["GET"], name="relay-asks-callback", include_in_schema=False)(
-        callback
-    )
     server.custom_route(
-        "/relay/asks/{ask_id}", methods=["GET", "POST"], name="relay-asks-page", include_in_schema=False
+        CALLBACK, methods=["GET"], name="relay-asks-callback", include_in_schema=False
+    )(callback)
+    server.custom_route(
+        "/relay/asks/{ask_id}",
+        methods=["GET", "POST"],
+        name="relay-asks-page",
+        include_in_schema=False,
     )(page)

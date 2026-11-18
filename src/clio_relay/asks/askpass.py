@@ -283,9 +283,7 @@ class Broker:
         kind_value = values.get("kind")
         text = str(values.get("prompt", ""))
         kind: PromptKind = (
-            cast(PromptKind, kind_value)
-            if kind_value in ("secret", "text", "confirm", "notice")
-            else classify(text)
+            kind_value if kind_value in ("secret", "text", "confirm", "notice") else classify(text)
         )
         prompt = Prompt(prompt_id=secrets.token_hex(8), text=text, kind=kind)
         with self._lock:

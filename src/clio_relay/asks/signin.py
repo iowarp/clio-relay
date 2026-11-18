@@ -189,9 +189,7 @@ class SignIns:
         env = askpass.environment_for(session, self.owner.context.state_dir)
         item.tasks.append(self.owner.runner.spawn(self._run_starter(item, start, env)))
 
-    async def _run_starter(
-        self, item: SignIn, start: askpass.Starter, env: dict[str, str]
-    ) -> None:
+    async def _run_starter(self, item: SignIn, start: askpass.Starter, env: dict[str, str]) -> None:
         try:
             await start(env)
         except Refusal as refusal:

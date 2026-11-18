@@ -37,7 +37,9 @@ from clio_relay.surface.settings import RelayPaths
 
 logger = logging.getLogger(__name__)
 
-ProbeState = Literal["ready", "missing_allocation", "needs_sign_in", "unreachable", "not_configured"]
+ProbeState = Literal[
+    "ready", "missing_allocation", "needs_sign_in", "unreachable", "not_configured"
+]
 
 _NOT_CONFIGURED = {
     RefusalReason.UNKNOWN_ADAPTER,
@@ -57,7 +59,9 @@ class ProbeResult(BaseModel):
     at: datetime = Field(default_factory=utc_now)
 
 
-def sites_for(identity: str, paths: RelayPaths) -> list[tuple[SiteEntry, Literal["sites", "catalog"]]]:
+def sites_for(
+    identity: str, paths: RelayPaths
+) -> list[tuple[SiteEntry, Literal["sites", "catalog"]]]:
     """Return the person's sites, then the catalog's, that name ``identity``."""
     found: list[tuple[SiteEntry, Literal["sites", "catalog"]]] = []
     seen: set[str] = set()
