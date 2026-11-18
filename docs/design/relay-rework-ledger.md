@@ -1070,8 +1070,22 @@ Fixes and edits beyond the mechanical move, in commit order:
   - An existing `~/.local/src/jarvis-util` is left alone: nothing adopts, probes or removes it. The journal's recovery roots keep that path, so a journal written by an older bootstrap still recovers.
   - Receipts are no longer required to list jarvis-util, and an older receipt that lists it (`reused` or `prepared`) still validates and still passes the reuse acceptance check. Tests cover both.
   - Version skew. An installed rework-era relay rejects the new desired state (`error: bootstrap desired state is invalid`), because its model still requires `jarvis_util_commit`. The preflight script now reports that exact line as `bootstrap_preflight_unsupported=desired_state_schema`, and the controller does a full bootstrap. Any other inspector error still fails. `test_preflight_reinstalls_a_relay_that_rejects_the_desired_state_schema` runs the script against both. Pre-rework relays already map to `missing_command`.
+- **The JARVIS runtime-authority path deleted (0800e35, cb706f1, 9985a56).** After W9 retired the binding chain (c4e94d4), `/internal/jarvis-runtime-authority` always answered 409. Deleted:
+  - the route in `http_api_routes_session.py`, its `JarvisRuntimeAuthorityRequest` model, and the door-error reasons `jarvis_runtime_authority_unavailable` and `jarvis_runtime_authority_conflict`;
+  - the hidden `clio-relay worker jarvis-runtime-authority` command (`cli_jarvis_runtime_authority.py`);
+  - `remote_cli.run_remote_jarvis_runtime_authority` and its private-command helpers, which nothing else used;
+  - in W9's `jarvis_service_runtime.py` and `jarvis_service_runtime_models.py`, as the coordinator directed: the local authority resolver, `JarvisServiceRuntimeAuthority`, `JarvisPrivateServiceAuthorization` and the authority schema id;
+  - in W9's `test_jarvis_service_runtime.py`: the tests of the authority transport and endpoint. The owned-session API still refuses to start without an API token, so that test stays as `test_owned_session_api_cannot_start_without_api_token`.
+  - The door-error pins move to 66 reasons, 52 R9 HTTP statuses, 110 routed sites (125 with middleware) and 57 exception-backed sites.
+  - Left in place: `native_jarvis_contract.py:45` and `:156` still require jarvis-cd's `ExecutionStore.resolve_service_runtime_authority` in the installation check. That is a capability check on jarvis-cd, not relay's path, and dropping it changes what an installation accepts, so it is a question for the coordinator.
+- **LQ32 wording (2cc93c2).** W9's retired-binding refusal and docstrings named `mcp_call`. They now say "MCP tool-call job". The refusal still starts with "relay no longer binds JARVIS service runtimes".
 
 ### Gate evidence
+
+**At 2cc93c2 (integration 2db7d8d merged in b21aed4).** On Ares.
+- **LQ1.** A wheel built at 2cc93c2 in a clean venv: `clio-relay` and `python -m clio_relay` each list exactly `describe`, `exec`, `files`, `run` and `serve` to an MCP stdio client, on 2026-07-28 and 2025-11-25, with and without A2UI. No app-only tools.
+- **LQ32.** No hits for `relay_submit`, `mcp_call`, `browser_gateway` or `scheduler_providers` in the tree outside `docs/design`, in tracked paths, in the wheel (595 files) or in the installed package.
+- **Tests.** `test_jarvis_service_runtime`, `test_door_errors`, `test_cli`, `test_installation`, `test_component_runtime_identity`, `test_http_api`, `test_http_api_dial_burndown_routes`, `test_remote_cli`, `test_service_runtime`, `test_session_api`, `tests/serve` and `tests/worker`: 510 passed after the pin updates, none failed or skipped. `ruff check` and `ruff format --check` are clean. Pyright counts 4535, under the 4558 baseline. `check_file_size.py` passes once the jarvis-util comment line in `bootstrap_journal.py` is removed.
 
 **After the cutover (2a3dd4b, on integration c214d4f plus the commits above).** On Ares.
 - **LQ1.** A wheel built at 2a3dd4b (sha256 `66bd2abcdc36…`) is installed in a clean venv. `clio-relay --help` and `python -m clio_relay --help` list serve, connect, adapters, site, rendezvous, asks and worker. An MCP stdio client lists exactly `describe`, `exec`, `files`, `run` and `serve` through both entry points, on 2026-07-28 and on 2025-11-25, with and without A2UI in the request; no app-only tools are listed.
@@ -1135,7 +1149,11 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 - **W1, at 2a3dd4b.**
   - Lower `BASELINE_TOTAL` to 4905 (4902 at d56458b).
   - `check_file_size.py:261` names the deleted `_builtin_repos.py (213)` in a comment.
+- **W1, at 2cc93c2.**
+  - Lower `BASELINE_TOTAL` to 4535.
+  - `check_file_size.py` lines 385 and 986-993 describe the deleted `jarvis-runtime-authority` command, the authority resolver and `run_remote_jarvis_runtime_authority`. The script also offers ratchet-downs (for example `bootstrap.py` 924 to 922) and distribution raises.
 - **Open findings for the coordinator.**
+  - Should the installation check stop requiring jarvis-cd's `ExecutionStore.resolve_service_runtime_authority` (`native_jarvis_contract.py:45`, `:156`)? Relay no longer calls it.
   - Resolved (deec1d0): a fresh worker bootstrap cloned the private, archived `grc-iit/jarvis-util`, so it stopped at `git clone` on a host without GitHub credentials. The coordinator decided to drop it, and the bootstrap no longer needs it.
   - In full mode, the receipt's `jarvis_preservation.repositories` block is the default (`action: reused`, no added repos), because the full path does not pass its reconcile evidence into `make_bootstrap_receipt`. This predates the rework and does not change validation; the script's `jarvis_managed_repo=` line is the live evidence.
 - **W9 (done on W9's branch).** `frp_transport.py` named the deleted `connection-model.md` at lines 34, 46, 48, 115, 200 and 458.
