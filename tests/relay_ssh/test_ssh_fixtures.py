@@ -322,6 +322,61 @@ async def test_lq7_a_rerun_stages_nothing(fx: dict[str, str], tmp_path: Path) ->
     assert all(size < 1024 * 1024 for size in sizes[first_sizes:]), sizes
 
 
+@pytest.mark.parametrize("profile", ["fx-slurm", "fx-pbs", "fx-ssh"])
+async def test_an_input_the_job_deletes_leaves_no_copy_in_the_store(
+    fx: dict[str, str], tmp_path: Path, profile: str
+) -> None:
+    """Like serve's ``secrets.env``: read once and deleted by the job, then gone from the site."""
+    adapter = build(fx, tmp_path, profile)
+    files = await adapter.files()
+    kept = adapter.context.content.put(f"kept {new_id('k')}\n".encode())
+
+    def on_site(path: str) -> bool:
+        parent = path.rsplit("/", 1)[0]
+        answer = site_shell(fx, profile, f"ls -f {parent} >/dev/null 2>&1; test -e {path} && echo y")
+        return answer.strip() == "y"
+
+    def store(digest: str) -> str:
+        return f"{RUN_DIR}/{profile}/content/cas/sha256/{digest[:2]}/{digest}"
+
+    async def start(body: str) -> tuple[JobHandle, str]:
+        secret = adapter.context.content.put(f"TOKEN={new_id('s')}\n".encode())
+        spec = JobSpec(
+            executable="sh",
+            arguments=["-c", f". serve/secrets.env; rm -f serve/secrets.env; {body}"],
+            inputs=[
+                InputRef(name="serve/secrets.env", sha256=secret),
+                InputRef(name="kept.txt", sha256=kept),
+            ],
+        )
+        handle = await adapter.run(spec, operation_id=new_id("op"))
+        assert on_site(store(secret))
+        return handle, secret
+
+    finished, finished_secret = await start('echo "$TOKEN"')
+    final = await wait_final(adapter, finished)
+    assert final.state.value == "completed", final
+    stdout = (await files.read(f"{finished.data['job_dir']}/stdout")).decode()
+    assert stdout.startswith("s_")
+    assert not on_site(store(finished_secret))
+    assert on_site(store(kept))
+    assert on_site(f"{finished.data['job_dir']}/kept.txt")
+
+    running, running_secret = await start("sleep 3600")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DEADLINE_S
+    while on_site(f"{running.data['job_dir']}/serve/secrets.env"):
+        assert loop.time() < deadline, "the job never deleted its copy"
+        await asyncio.sleep(2)
+    # The job is still running, so its input stays in the store until it ends.
+    assert on_site(store(running_secret))
+    await adapter.cancel(running)
+    final = await wait_final(adapter, running)
+    assert final.state.value == "cancelled", final
+    assert not on_site(store(running_secret))
+    assert on_site(store(kept))
+
+
 async def test_lq8_a_detached_job_is_read_by_a_later_poll(
     fx: dict[str, str], tmp_path: Path
 ) -> None:

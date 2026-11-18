@@ -64,7 +64,10 @@ and the gate asks for it unless the site's `spend.ask` is `never`.
    [psij-python](https://exaworks.org/psij-python/). The scheduler is the one
    the site has, found by `describe` when `scheduler` is `auto`.
 2. Inputs are staged by content into `<remote_dir>/content/cas/` with `scp`.
-   An input already on the site is not sent again.
+   An input already on the site is not sent again. If the job deletes an input
+   from its directory, for example a file of secrets it reads once, relay
+   removes the site's stored copy too when the job ends or is cancelled, unless
+   another job still uses it.
 3. One `ssh` call writes the script into the job's directory and submits it.
    The directory is `<remote_dir>/jobs/<operation id>/` and holds the script,
    the submit result, `stdout`, `stderr` and the exit code.
