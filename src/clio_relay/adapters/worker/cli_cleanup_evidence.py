@@ -24,14 +24,12 @@ from clio_relay.cluster_config import (
     release_private_configuration_windows_parent_guard,
 )
 from clio_relay.config import RelaySettings
+from clio_relay.durable_validation_write import durably_ensure_validation_directory
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.installation import (
     INSTALL_RECEIPT_PATH_ENV,
     default_install_receipt_path,
-)
-from clio_relay.validation_report import (
-    durably_ensure_validation_directory,
 )
 
 

@@ -21,7 +21,7 @@ this module stays its owner.
 **Collaborators imported directly, not through ``cli``.** None of
 ``clio_relay.adapters.worker.cluster_probe``, ``clio_relay.adapters.worker.bootstrap_pin``,
 ``clio_relay.adapters.worker.deployment``'s ``render_endpoint_user_service``,
-``clio_relay.validation_report``'s reporting types, or
+``clio_relay.run_report_models``' reporting types, or
 ``clio_relay.errors``'s exceptions are audited patch-seam collaborators
 (``tests/test_cli_patch_seam.py``) -- cli.py itself reached them by bare
 import, so this module does too, matching cli.py's own prior style (the
@@ -85,13 +85,9 @@ from clio_relay.adapters.worker.cluster_probe import pinned_runtime_present, pro
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, WorkerCapacityPolicy
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.validation_report import (
-    EvidenceReference,
-    ValidationRecorder,
-    ValidationResource,
-    default_report_path,
-    new_live_validation_report,
-)
+from clio_relay.run_report import default_report_path
+from clio_relay.run_report_models import EvidenceReference, ValidationResource
+from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
 
 
 def _resolved_worker_capacity_policy(
@@ -539,7 +535,7 @@ def cluster_install_endpoint_service(
             "--require-persistent/--allow-login-scoped",
             help=(
                 "Require systemd user lingering so the enabled worker survives all logouts. "
-                "The login-scoped opt-out is diagnostic and not release-gate eligible."
+                "The login-scoped opt-out is for diagnosis only."
             ),
         ),
     ] = True,
@@ -598,7 +594,7 @@ def cluster_restart_endpoint_service(
             "--require-persistent/--allow-login-scoped",
             help=(
                 "Require systemd user lingering so the enabled worker survives all logouts. "
-                "The login-scoped opt-out is diagnostic and not release-gate eligible."
+                "The login-scoped opt-out is for diagnosis only."
             ),
         ),
     ] = True,

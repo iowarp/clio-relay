@@ -40,9 +40,7 @@ from clio_relay.installation import (
 from clio_relay.owner_session_admission import (
     desktop_owner_session_admission_id as _desktop_owner_session_admission_id,
 )
-from clio_relay.validation_report import (
-    SoftwareIdentity,
-)
+from clio_relay.run_report_models import SoftwareIdentity
 
 
 @cli_session.session_app.command("start")

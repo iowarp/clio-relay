@@ -1,6 +1,6 @@
 """Identify the exact ``uv`` executable in this process's OS ancestor chain (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Install-source
 detection wants to know whether *this* process was actually launched by a
 specific, verified ``uv`` binary -- not merely that one exists on ``PATH``.

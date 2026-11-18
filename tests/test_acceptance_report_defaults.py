@@ -16,9 +16,7 @@ from clio_relay.cluster_config import (
     RemoteMcpServerConfig,
 )
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import (
-    load_validation_report,
-)
+from clio_relay.run_report import load_validation_report
 
 
 @pytest.fixture(autouse=True)

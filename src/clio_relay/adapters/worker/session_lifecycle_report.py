@@ -32,7 +32,7 @@ from clio_relay.session_wire_models import (
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.session_transaction import _OwnedSessionTransaction
-    from clio_relay.validation_report import (
+    from clio_relay.run_report_models import (
         CleanupEvidence,
         LiveValidationReport,
         ValidationResource,
@@ -132,7 +132,7 @@ class SessionLifecycleReport(BaseModel):
 
     def validation_resources(self) -> list[ValidationResource]:
         """Return all lifecycle resources in the shared validation-report shape."""
-        from clio_relay.validation_report import ValidationResource
+        from clio_relay.run_report_models import ValidationResource
 
         resources: list[ValidationResource] = []
         generation_id = self.session_generation_id
@@ -185,7 +185,7 @@ class SessionLifecycleReport(BaseModel):
 
     def to_cleanup_evidence(self, *, stop_worker: bool | None = None) -> CleanupEvidence:
         """Convert this lifecycle result to shared cleanup evidence."""
-        from clio_relay.validation_report import CleanupEvidence
+        from clio_relay.run_report_models import CleanupEvidence
 
         effective_stop_worker = (
             any(
@@ -219,12 +219,12 @@ class SessionLifecycleReport(BaseModel):
         artifact_sha256: str | None = None,
     ) -> LiveValidationReport:
         """Convert one live lifecycle operation to canonical release evidence."""
-        from clio_relay.validation_report import (
+        from clio_relay.run_report_models import (
             EvidenceReference,
             ValidationCheck,
             ValidationStatus,
-            new_live_validation_report,
         )
+        from clio_relay.run_report_recorder import new_live_validation_report
 
         cluster = self.cluster or "unknown"
         report = new_live_validation_report(

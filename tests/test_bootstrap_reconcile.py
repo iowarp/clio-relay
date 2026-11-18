@@ -53,8 +53,8 @@ from clio_relay.adapters.worker.bootstrap_reconcile import (
     write_jarvis_wrapper,
 )
 from clio_relay.errors import ConfigurationError
+from clio_relay.file_digest import sha256_file
 from clio_relay.installation import PersistentUvToolIdentity
-from clio_relay.validation_report import sha256_file
 
 
 def _digest(value: bytes) -> str:

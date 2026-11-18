@@ -9,20 +9,16 @@ from pathlib import Path
 
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.remote_cli as remote_cli
-import clio_relay.validation_report as validation_report_module
+import clio_relay.run_report as run_report_module
 from clio_relay.cluster_config import (
     ClusterDefinition,
 )
+from clio_relay.file_digest import sha256_file
 from clio_relay.installation import (
     attach_verified_worker_identity,
 )
-from clio_relay.validation_report import (
-    CleanupEvidence,
-    LiveValidationReport,
-    ValidationRecorder,
-    new_live_validation_report,
-    sha256_file,
-)
+from clio_relay.run_report_models import CleanupEvidence, LiveValidationReport
+from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
 
 REMOTE_CLEANUP_WORKER_INFO_TIMEOUT_SECONDS = 20.0
 
@@ -98,7 +94,7 @@ def _write_remote_verified_report(
         recorder.finish(exc)
         recorder.write(path)
         raise
-    validation_report_module.write_validation_report(report, path)
+    run_report_module.write_validation_report(report, path)
 
 
 def _write_cleanup_validation_report(
@@ -124,7 +120,7 @@ def _write_cleanup_validation_report(
     Return ``True`` only when that optional provenance warning was recorded.
     """
     if report.install_source.artifact_sha256 is None:
-        validation_report_module.write_validation_report(report, path)
+        run_report_module.write_validation_report(report, path)
         return False
     if worker_observation_error is not None:
         recorder = ValidationRecorder(report)

@@ -123,7 +123,7 @@ from clio_relay.adapters.worker.clio_kit_constants import (
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
 )
-from clio_relay.validation_report import sha256_file
+from clio_relay.file_digest import sha256_file
 
 artifact_value = os.environ["CLIO_RELAY_BOOTSTRAP_ARTIFACT"]
 desired_payload = json.loads(os.environ["CLIO_RELAY_BOOTSTRAP_DESIRED_STATE"])

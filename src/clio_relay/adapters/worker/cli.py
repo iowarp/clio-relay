@@ -73,10 +73,8 @@ from clio_relay.pagination import (
     MAX_RESPONSE_PAGE_RECORDS,  # noqa: F401 -- test_cli.py paginates via cli.MAX_RESPONSE_PAGE_RECORDS
 )
 from clio_relay.process_containment import consume_broker_child_environment
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    redact_sensitive_values,
-)
+from clio_relay.redaction import redact_sensitive_values
+from clio_relay.run_report_models import LiveValidationReport
 
 worker_app = typer.Typer(
     no_args_is_help=True,

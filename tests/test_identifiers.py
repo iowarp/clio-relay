@@ -46,7 +46,7 @@ from clio_relay.models import (
     SchedulerCancelPending,
     TaskTimelineEvent,
 )
-from clio_relay.validation_report import CleanupEvidence
+from clio_relay.run_report_models import CleanupEvidence
 
 
 @pytest.mark.parametrize(

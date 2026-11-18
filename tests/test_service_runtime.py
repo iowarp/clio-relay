@@ -52,6 +52,7 @@ from clio_relay.models import (
     SchedulerStatus,
     ServiceRuntimeSpec,
 )
+from clio_relay.run_report_models import LiveValidationReport, ValidationStatus
 from clio_relay.service_runtime import (
     ServiceRuntimePendingResult,
     ServiceRuntimeStartResult,
@@ -61,10 +62,6 @@ from clio_relay.service_runtime import (
 from clio_relay.service_runtime_types import (
     CommandRunner,
     LocalConnectorIdentity,
-)
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    ValidationStatus,
 )
 from tests.gateway_ownership_crash_fixture import (
     DurableFixtureRunner,

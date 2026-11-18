@@ -31,11 +31,11 @@ from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import FrpLinkConfig, HeldFrpVisitor
 from clio_relay.relay_host import FrpTransportProtocol
+from clio_relay.run_report_models import parse_transport_probe_evidence
 from clio_relay.session_wire_models import (
     OwnedSessionStartStatusSelector,
     RemoteSessionStateEvidence,
 )
-from clio_relay.validation_report import parse_transport_probe_evidence
 
 
 def _frp_cluster_definition() -> ClusterDefinition:

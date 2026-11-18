@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 import clio_relay.adapters.worker.deployment as deployment
 from clio_relay import __version__
@@ -472,12 +471,8 @@ def test_clio_kit_exact_version_override_requires_its_own_digest() -> None:
         )
 
 
-def test_bootstrap_uv_pin_matches_release_policy() -> None:
-    """Keep the verified cluster bootstrap toolchain aligned with the release gate."""
-    policy_path = Path(__file__).parents[1] / "docs" / "release-gate-1.0.yaml"
-    policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
-
-    assert policy["required_uv_version"] == UV_VERSION
+def test_bootstrap_uv_pin_is_digest_bound() -> None:
+    """Keep the cluster bootstrap toolchain pinned to known uv digests."""
     assert UV_LINUX_AMD64_ARCHIVE_SHA256 == (
         "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
     )

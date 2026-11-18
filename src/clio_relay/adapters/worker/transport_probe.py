@@ -81,7 +81,7 @@ from clio_relay.frp_link import (
 )
 from clio_relay.frp_link import assert_loopback_port_available as _assert_local_bind_port_available
 from clio_relay.relay_host import FrpcConfig, FrpTransportProtocol, render_frpc_config
-from clio_relay.validation_report import TransportCleanupResourceEvidence
+from clio_relay.run_report_models import TransportCleanupResourceEvidence
 
 
 def run_frp_http_probe(

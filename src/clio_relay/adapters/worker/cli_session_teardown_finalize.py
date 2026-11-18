@@ -41,8 +41,8 @@ from clio_relay.adapters.worker.cli_session_teardown_state import _TeardownState
 from clio_relay.adapters.worker.owned_session_record import clear_owned_session_record
 from clio_relay.adapters.worker.session_lifecycle import session_lifecycle_report_sha256
 from clio_relay.errors import RelayError
+from clio_relay.file_digest import sha256_file
 from clio_relay.models import JobState
-from clio_relay.validation_report import sha256_file
 
 
 def _run_teardown_finalize_phase(state: _TeardownState) -> None:

@@ -1,6 +1,6 @@
 """Verify the running process's install artifact against its claimed digest (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). This module owns the
 artifact-provenance concern: binding a claimed ``artifact_sha256`` (or, for a
 VCS install, an exact-pinned git commit sha) to the exact bytes the running
@@ -19,8 +19,8 @@ Embedded/checkout build identity (:func:`embedded_build_info` /
 :func:`checkout_build_info`) and install-source classification
 (:func:`classify_install_source` / :func:`is_official_github_release_wheel`)
 live here too since both feed the same provenance picture. The install-source
-*detection* orchestration (still in :mod:`clio_relay.validation_report`, not
-yet extracted) calls into this module; :func:`_direct_wheel_bytes` reads the
+*detection* orchestration (:mod:`clio_relay.install_identity`) calls into
+this module; :func:`_direct_wheel_bytes` reads the
 shared regular-file identity primitives from
 :mod:`clio_relay.regular_file_identity`.
 """
@@ -49,8 +49,8 @@ from typing import Any, cast
 from clio_relay import __version__
 from clio_relay.redaction import redact_url
 from clio_relay.regular_file_identity import read_open_regular_file, regular_file_identity
+from clio_relay.run_report_models import InstallSourceKind
 from clio_relay.validation_limits import MAX_DISTRIBUTION_WHEEL_BYTES
-from clio_relay.validation_schema import InstallSourceKind
 
 _OFFICIAL_RELEASE_WHEEL_PATH = re.compile(
     r"/iowarp/clio-relay/releases/download/v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)/"

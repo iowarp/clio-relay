@@ -34,21 +34,12 @@ identities, `tests/relay_ssh` the ssh adapter and `tests/relay_tapis` the Tapis
 adapter. The ssh and asks tests reach the W2 fixture sites named in the file
 that `CLIO_RELAY_FIXTURES_ENV` points to.
 
-## build-once release CI
+## ci
 
-The trusted release candidate is produced only by the primary Ubuntu/Python
-3.12 leg of a `merge_group` run. The other five matrix legs pass the downloaded
-wheel, source distribution, and canonical checksum file through
-`release validate-local --prebuilt-artifact-dir`; that mode rejects extra,
-missing, or changed files and cannot execute either `uv build` path. The final
-CI seal binds all six machine-readable reports to one distribution digest map,
-tested merge-group commit, Git tree, queued PR, run, and attempt.
-
-A protected-main tag must identify the merged PR commit and the same tested Git
-tree. The tag workflow is a lightweight binding workflow: it performs no sync,
-test, component fetch, artifact build, or candidate execution. Repository rules
-and merge-queue behavior require a live disposable canary before an owner
-enables them; checkout tests alone cannot prove GitHub's eventual merge identity.
+`.github/workflows/ci.yml` runs `uv run ruff check`, `uv run ruff format --check`,
+`uv run pyright` and `uv run pytest` on the tree. `.github/workflows/release.yml`
+runs on a `v*` tag, builds the wheel and source distribution, and publishes them.
+Neither is a release gate: release qualification is the live LQ rows.
 
 ## live acceptance
 
@@ -127,32 +118,12 @@ file is only a view. Reports contain package/build/install identity, checks,
 relay and scheduler jobs, sessions/connectors, artifact and log references,
 cleanup policy, residual resources, and partial failure evidence.
 
-The complete report-producing acceptance CLI inventory is `release validate-local`;
+The report-producing acceptance commands sit under `clio-relay worker`:
 `relay-host test-frpc-connection`, `test-http-transport`, `test-direct-transport`, and
-`test-ssh-transport`; `remote-mcp validate`; `cluster bootstrap`; `session detach`
-and `session teardown`; `queue validate`; `scheduler validate-lifecycle`; `gateway
-start-runtime`, `detach-runtime`, and `stop-runtime`; `jarvis-mcp-validate`; and
-`live-test`. Every invocation writes a collision-resistant default JSON report on
+`test-ssh-transport`; `cluster bootstrap`; and `session detach` and
+`session teardown`. Every invocation writes a collision-resistant default JSON report on
 success and after preflight or runtime failure unless the operator supplies an
-explicit path. `release gate` consumes those reports; it is not an acceptance-report
-producer.
+explicit path.
 
-Long scheduler residence is represented as `pending`, never as workload failure.
-Resume `live-test` with `--resume-report`; the new sibling report observes the
-same run, job, idempotency key, and phase-specific JARVIS identities without a
-TTL, resubmission, or scheduler cancellation. Pending reports are diagnostic and
-are rejected by the release gate until the exact run produces a passed report.
-
-Use `clio-relay release validate-local` for the local quality report. Candidate
-wheel reports are sealed before PyPI publication and remain valuable regression
-evidence, but the final
-`clio-relay release gate --policy docs/release-gate-1.0.yaml` matrix accepts
-only reports produced through a persistent, exact
-`uv tool install --python 3.12 --no-config clio-relay==<version>` installation.
-A checkout, local wheel, or temporary `uvx` report is diagnostic evidence, not
-proof of the released persistent-tool path.
-
-The pending lifecycle and scheduler-provider procedure is
-`lifecycle-scheduler-live-validation.md`. Candidate-wheel evidence can gate
-artifact publication, but only a repeated released persistent-tool run
-satisfies the final release gate. A checkout run satisfies neither gate.
+The 1.0 release gate is gone. Release qualification is the LQ and RL rows in
+`docs/design/relay-rework-plan.md`, proven by live runs.

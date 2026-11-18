@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import cast
 
 from clio_relay.errors import RelayError
-from clio_relay.validation_report import (
+from clio_relay.run_report_models import (
     TransportCleanupAction,
     TransportCleanupOutcome,
     TransportCleanupResourceEvidence,

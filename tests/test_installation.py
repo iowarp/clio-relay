@@ -42,7 +42,7 @@ from clio_relay.jarvis_mcp import (
     jarvis_cd_lock_binding_expectation,
     jarvis_mcp_command,
 )
-from clio_relay.validation_report import (
+from clio_relay.run_report_models import (
     InstallSource,
     InstallSourceKind,
     LiveValidationReport,

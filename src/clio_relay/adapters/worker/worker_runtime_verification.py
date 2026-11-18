@@ -5,7 +5,7 @@ Extracted from ``installation.py`` (iowarp/clio-relay#231): this owns
 index), the ``verify_remote_*`` identity comparisons a worker's self-reported
 payload must pass, and ``attach_verified_worker_identity`` -- the top-level
 function that turns a remote worker's runtime-info payload into checks and
-resources on a :class:`~clio_relay.validation_report.LiveValidationReport`.
+resources on a :class:`~clio_relay.run_report_models.LiveValidationReport`.
 
 ``worker_runtime_info`` calls ``installation_info``/``load_install_receipt``,
 which stay resident in ``installation.py`` (the receipt-lifecycle keystone).
@@ -47,7 +47,7 @@ from clio_relay.dev_mode import VerificationFindings, enforce
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation_receipt_models import InstallReceipt
 from clio_relay.remote_values import expand_remote_value_on_host
-from clio_relay.validation_report import (
+from clio_relay.run_report_models import (
     EvidenceReference,
     InstallSourceKind,
     LiveValidationReport,

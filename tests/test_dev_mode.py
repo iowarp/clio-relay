@@ -20,7 +20,7 @@ from clio_relay.dev_mode import (
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import InstallReceipt
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.run_report_models import SoftwareIdentity
 
 #: Modules protecting live state/other tenants -- clio-relay#211 requires these
 #: to stay hard regardless of dev mode. Zero coupling to clio_relay.dev_mode is

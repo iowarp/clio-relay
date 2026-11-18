@@ -49,6 +49,8 @@ from clio_relay.distribution_source_identity import (
     verify_distribution_file_source,  # noqa: F401
 )
 from clio_relay.errors import ConfigurationError
+from clio_relay.file_digest import sha256_file
+from clio_relay.install_identity import detect_install_source, detect_software_identity
 from clio_relay.installation_receipt_models import (
     INSTALL_RECEIPT_SCHEMA,  # noqa: F401
     JARVIS_EXECUTION_HANDLE_SCHEMA,  # noqa: F401
@@ -77,13 +79,7 @@ from clio_relay.persistent_uv_tool_probe import (
     MAX_UV_TOOL_RECEIPT_BYTES,  # noqa: F401
     probe_persistent_uv_tool_identity,  # noqa: F401
 )
-from clio_relay.validation_report import (
-    InstallSource,
-    InstallSourceKind,
-    detect_install_source,
-    detect_software_identity,
-    sha256_file,
-)
+from clio_relay.run_report_models import InstallSource, InstallSourceKind
 
 INSTALL_RECEIPT_PATH_ENV = "CLIO_RELAY_INSTALL_RECEIPT"
 

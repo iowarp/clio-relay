@@ -55,7 +55,7 @@ not relocate them:
   import discipline (below) exists to avoid. The other four reach
   ``cli.py``'s thin forwarders at call time, same as the ``cli.py``-owned
   helpers above, and ``default_report_path`` is imported straight from its
-  true owner, ``validation_report.py``, since it never moved.
+  true owner, ``run_report.py``, since it never moved.
 
 **The import-cycle discipline.** ``cli.py`` imports this module to register
 ``relay_host_app``, and this module reaches back into ``cli.py`` for the
@@ -113,7 +113,7 @@ from clio_relay.relay_host import (
     render_frpc_visitor_config,
     render_frps_config,
 )
-from clio_relay.validation_report import default_report_path
+from clio_relay.run_report import default_report_path
 
 # `cli` (`clio_relay.adapters.worker.cli`) is deliberately NOT imported at module level, not
 # even under `TYPE_CHECKING`: nothing in this file uses `cli` in a type
@@ -701,8 +701,7 @@ def install_proxy(
             "--require-persistent/--allow-login-scoped",
             help=(
                 "Require systemd user lingering so the enabled proxy survives all "
-                "logouts. The login-scoped opt-out is diagnostic and not "
-                "release-gate eligible."
+                "logouts. The login-scoped opt-out is for diagnosis only."
             ),
         ),
     ] = True,

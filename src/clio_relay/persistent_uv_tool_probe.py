@@ -37,8 +37,8 @@ from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.distribution_source_identity import verify_distribution_file_source
 from clio_relay.errors import ConfigurationError
+from clio_relay.file_digest import sha256_file
 from clio_relay.installation_receipt_models import PersistentUvToolIdentity
-from clio_relay.validation_report import sha256_file
 
 MAX_UV_TOOL_RECEIPT_BYTES = 256 * 1024
 _UV_FD_EXEC_SOURCE = r"""import hashlib

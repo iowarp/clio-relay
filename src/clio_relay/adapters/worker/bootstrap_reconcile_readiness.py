@@ -14,7 +14,7 @@ from pathlib import Path
 from clio_relay.adapters.worker.bootstrap_reconcile_models import BootstrapDesiredState
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.errors import ConfigurationError
-from clio_relay.validation_report import sha256_file
+from clio_relay.file_digest import sha256_file
 
 
 def _queue_readiness_verified(evidence: dict[str, object] | None) -> bool:

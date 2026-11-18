@@ -1,6 +1,6 @@
 """Bounded-payload budgets for validation evidence (#231; see bounded_payload.py).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Mirrors the shape of
 :mod:`clio_relay.bounded_payload`'s T1/T2/T3 catalog: every byte/count/depth
 budget the validation-report family enforces lives here as a single owner, so

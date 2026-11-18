@@ -1,6 +1,6 @@
 """Pin, verify, and create Windows validation-report directories (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). A durable report
 write must prove its target directory is a real, non-reparse, non-symlink
 directory that has not been swapped out from under it between the identity

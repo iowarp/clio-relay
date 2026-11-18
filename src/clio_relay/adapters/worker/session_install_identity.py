@@ -5,8 +5,8 @@ from __future__ import annotations
 from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import InstallReceipt
+from clio_relay.run_report_models import SoftwareIdentity
 from clio_relay.session_wire_models import SessionApiReleaseIdentity
-from clio_relay.validation_report import SoftwareIdentity
 
 
 def release_identity_from_receipt(receipt: InstallReceipt) -> SessionApiReleaseIdentity:
