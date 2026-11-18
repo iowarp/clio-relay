@@ -50,6 +50,14 @@ class ContentStore:
             raise
         return digest
 
+    def drop(self, digest: str) -> bool:
+        """Remove ``digest``. Return whether it was present."""
+        try:
+            self.path_for(digest).unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
     def get(self, digest: str) -> bytes:
         """Return the bytes of ``digest``. Refuses with ``input_missing``."""
         path = self.path_for(digest)
