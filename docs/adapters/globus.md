@@ -44,6 +44,10 @@ when it goes offline:
       command: [globus-compute-endpoint, start, clio-relay]
 ```
 
+The start command runs through that adapter's `exec` with no time limit. Relay
+logs each quiet stretch and stops only if the call is cancelled. Set
+`start.timeout_s` if you want a limit.
+
 ## Signing in
 
 The adapter uses relay's `globus` identity. It needs the Globus Compute scope
