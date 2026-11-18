@@ -33,7 +33,7 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import ServiceSpec
-from clio_relay.serve import settings as serve_settings
+from clio_relay.serve import config as serve_settings
 from clio_relay.serve.forward import Forward
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
@@ -48,7 +48,7 @@ from clio_relay.serve.plan import (
     site_files,
     wrapped_job,
 )
-from clio_relay.serve.settings import SiteServe
+from clio_relay.serve.config import SiteServe
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)
@@ -227,20 +227,26 @@ class ServeRuntime:
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(self.resume())
 
-    def ui_data(self, record: OperationRecord) -> dict[str, Any]:
-        """Return what only a view may see: each protected port's secret (RL22)."""
+    def ui_data(self, record: OperationRecord) -> dict[str, Any] | None:
+        """Return what only a view may see: port URLs and protected ports' secrets (RL22).
+
+        Relay strips every URL from the endpoint it records, so this is the one
+        place a client finds them.
+        """
         plan = self._cached(record.operation_id)
         if plan is None:
-            return {}
+            return None
         ports: dict[str, Any] = {}
         for port in plan.ports:
+            entry: dict[str, Any] = {"address": f"127.0.0.1:{port.local_port}"}
+            url = port.url()
+            if url:
+                entry["url"] = url
             if port.secret_env and port.secret_env in plan.secrets:
-                ports[port.name] = {
-                    "url": port.url(),
-                    "secret": plan.secrets[port.secret_env],
-                    "secret_env": port.secret_env,
-                }
-        return {"ports": ports} if ports else {}
+                entry["secret"] = plan.secrets[port.secret_env]
+                entry["secret_env"] = port.secret_env
+            ports[port.name] = entry
+        return {"ports": ports} if ports else None
 
     async def resume(self) -> None:
         """Bring back the desktop ports of services that were ready when relay stopped."""
@@ -577,7 +583,7 @@ class ServeRuntime:
         if raw:
             with contextlib.suppress(ValueError):
                 stopped = json.loads(raw)
-        outputs = list(status.outputs)
+        outputs = [item for item in status.outputs if _is_artifact(item)]
         seen = {item.path for item in outputs}
         listing = await self._read(plan, adapter, "artifacts.txt")
         if listing and plan.job_dir:
@@ -607,11 +613,10 @@ class ServeRuntime:
         elif reason == "idle":
             parts.append("released after its idle time")
         elif reason == "port_taken":
-            node = plan.host or "the node"
-            parts.append(
-                f"refused: a port the service needs was already in use on {node}; "
-                "serve/launch.log in the job directory names it"
-            )
+            node = stopped.get("host") or plan.host or "the node"
+            port = stopped.get("port")
+            named = f"port {port} ({stopped.get('port_name')})" if port else "a port it needs"
+            parts.append(f"refused: {named} was already in use on {node}")
         elif reason == "exited":
             parts.append(f"the service exited with {stopped.get('exit_code')}")
         elif reason == "signal":
@@ -655,3 +660,14 @@ def connect_handle(plan: ServePlan) -> str:
     }
     raw = json.dumps(payload, separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+# The wrapper's own files. Logs stay, because a person reads them after a failure.
+_SERVE_FILES = {"service.log", "launch.log", "frpc.log"}
+
+
+def _is_artifact(item: OutputRef) -> bool:
+    """Return whether an adapter-listed output is the service's, not the wrapper's."""
+    parts = item.name.replace("\\", "/").split("/")
+    if "serve" in parts[:-1]:
+        return parts[-1] in _SERVE_FILES
+    return True

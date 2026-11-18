@@ -24,7 +24,7 @@ from clio_relay.jobs.handles import Endpoint, EndpointPort, JobHandle, utc_now
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobSpec, PortProtocol, ServiceSpec
 from clio_relay.serve import frp
-from clio_relay.serve.settings import Rendezvous, SiteServe
+from clio_relay.serve.config import Rendezvous, SiteServe
 
 SERVE_DIR = "serve"
 SECRET_ENV_PREFIX = "secret_env:"

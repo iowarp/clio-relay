@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from clio_relay.serve.settings import Rendezvous
+from clio_relay.serve.config import Rendezvous
 
 ENV_TOKEN = "CLIO_RELAY_FRP_TOKEN"
 ENV_SECRET_KEY = "CLIO_RELAY_FRP_SK"
