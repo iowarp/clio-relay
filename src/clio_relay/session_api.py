@@ -57,8 +57,8 @@ class ChannelReconnectRequired(RelayError):
     ``__enter__`` (bring-up/resume) and ``request_json`` (an in-flight
     operation that discovers the drop) -- whenever a
     :class:`~clio_relay.control_channel.ChannelDropped` reaches an
-    owned-session operation. Per the 2FA operating assumption
-    (docs/connection-model.md:141-157) this is never turned into a redial
+    owned-session operation. Per the 2FA operating assumption (a dial may
+    need a person, so relay never dials on its own) this is never turned into a redial
     here, or anywhere upstream of an explicit user action: the connection's
     own :attr:`~clio_relay.adapters.worker.remote_connection.RemoteConnection.state` is
     already ``"authorization_required"`` by the time this is raised (the
