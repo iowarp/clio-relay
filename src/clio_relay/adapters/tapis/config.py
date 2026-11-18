@@ -1,0 +1,46 @@
+"""Settings for the ``tapis`` adapter."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class TapisConfig(BaseModel):
+    """One Tapis system, reached through one tenant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = Field(
+        default="https://tacc.tapis.io", description="The Tapis tenant's base address"
+    )
+    tenant_id: str = Field(default="tacc", description="The tenant id")
+    authn: Literal["pki", "tms"] = Field(
+        default="pki",
+        description=(
+            "pki: relay makes a key pair for a host the person can reach over SSH. "
+            "tms: Tapis's trust manager makes and holds the key, for hosts with a second factor"
+        ),
+    )
+    system_id: str | None = Field(
+        default=None,
+        description=(
+            "The Tapis system. Defaults to clio-relay.<Tapis username>.<site id>, "
+            "the system relay registers for the person"
+        ),
+    )
+    work_dir: str | None = Field(
+        default=None,
+        description=(
+            "Relay's directory on the system, as a Tapis path. Defaults to the system's "
+            "job working directory"
+        ),
+    )
+    launcher: Literal["open", "guarded"] = Field(
+        default="open",
+        description="open runs the job spec's executable; guarded runs reviewed packages only",
+    )
+    client_id: str | None = Field(
+        default=None, description="Relay's OAuth client in the tenant, when not the shipped one"
+    )
