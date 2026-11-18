@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -4484,7 +4485,13 @@ def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
     cleanup_observations: list[JobState] = []
     sleep_calls: list[float] = []
 
+    real_sleep = time.sleep
+
     def acknowledge_after_poll(seconds: float) -> None:
+        # Threads left by other tests in this process (psij pollers) also call time.sleep.
+        if threading.current_thread() is not threading.main_thread():
+            real_sleep(seconds)
+            return
         sleep_calls.append(seconds)
         queue.acknowledge_job_cancellation(job.job_id)
         queue.release_lease(lease.lease_id)
