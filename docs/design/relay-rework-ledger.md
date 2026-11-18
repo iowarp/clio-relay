@@ -357,6 +357,116 @@ Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `j
 
 ## W6. Asks and identities
 
+Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2 merged in). Files: `src/clio_relay/asks/`, `src/clio_relay/identity/` (not `tacc.py`), `src/clio_relay/cli_asks.py`, `tests/asks/`.
+
+### Published interfaces
+
+- **The `asks` hook.** `clio_relay.asks:create_provider(context) -> RelayAskProvider`, registered as `asks` in `clio_relay.hooks` (a60bc01). It implements W1's `AskProvider`:
+  - `choose(...)` and `approve(...)` store a form ask. An approval is bound to the operation id, the spec digest and the charge, and the page shows queue, account, nodes, walltime and the most it may use.
+  - `url(site=, operation_id=, need=)` stores a URL ask.
+  - It also implements `MountsPages.mount(server)`, `page_address(ask)` and `close()`.
+  - The sign-in mode comes from the need: an `https` URL is an external page; `keyring:<name>` asks for a secret; a name in the identity table is a sign-in through that provider; a site with a registered askpass starter runs ssh; anything else is a confirm.
+- **The page.** Each page is single-use: the token in its URL is good for one POST, and a second POST gets 404. The link expires after `CLIO_RELAY_PAGE_TTL_S` (default 24 hours); the ask itself does not, and `asks page <ask>` mints a fresh link. GET only shows. A POST needs a CSRF token that is an HMAC of the ask and page token. Nothing is logged: the askpass answers stay in memory, the records hold no secret, and `serve` runs uvicorn with its access log off.
+  - Over stdio the page is on a loopback listener, and `<state>/pages/base.json` holds its address.
+  - Over Streamable HTTP it is under relay's own origin at `/relay/asks/<ask_id>` and `/relay/asks/callback`. It needs the operator credential: HTTP Basic, any user name, with the operator token as the password. The token is `CLIO_RELAY_OPERATOR_TOKEN` or `<state>/operator-token` (0600, written when the routes mount). This is separate from the MCP bearer token, so a client holding only the bearer cannot approve anything.
+- **Askpass (RL28), as given to W7.** An adapter calls `clio_relay.asks.askpass.environment(site=, operation_id=None, title=None, state_dir=None)`. That returns `SSH_ASKPASS` (`clio-relay-askpass`, the `[project.scripts]` entry; `askpass.program()` finds it), `SSH_ASKPASS_REQUIRE=force`, `DISPLAY`, `CLIO_RELAY_ASKPASS_ADDR`, `CLIO_RELAY_ASKPASS_TOKEN`, `CLIO_RELAY_ASKPASS_SITE` and, when given, `CLIO_RELAY_ASKPASS_OPERATION`.
+  - The adapter sets `BatchMode=no` and closes stdin.
+  - ssh runs the helper once per prompt, with the prompt as `argv[1]`. The helper prints the answer, or exits 1 on a decline.
+  - `SSH_ASKPASS_PROMPT=confirm` prints `yes` on agreement. `none` shows a notice until ssh ends the helper.
+  - `askpass.register_sign_in(site_id, async starter(env))` lets a site's sign-in run from the page.
+  - W7 found that `-M` together with `-o ControlMaster=yes` puts OpenSSH in ask mode, which raises "Allow shared connection?" through askpass every session. Use `ControlMaster=yes` alone.
+- **The identity table (RL30), as given to W10.** `clio_relay.identity`:
+  - `register(name, factory | None)`, `get(name)` (returns the factory), `names()`, and the entry point group `clio_relay.identities`.
+  - Relay ships `globus` and `github`. `tacc` points at `clio_relay.identity.tacc:TaccIdentity` and is skipped while that module is absent.
+  - A factory takes `IdentityContext(store, grants, settings)`.
+  - A provider meets the `IdentityProvider` Protocol in `identity/base.py`: `name` and `title`, plus async `status()`, `token(resource_server=None)`, `begin(ctx)`, `poll(ctx, step)`, `callback(ctx, params)` and `sign_out()`.
+  - A redirect provider keeps its OAuth state in `step.data["state"]`. `step.data` is never shown or written down.
+- **Shared identities for adapters.** `clio_relay.identity.shared()` returns the `Identities` the serving relay uses, so it sees `--grant-file`. Outside a serving relay it builds one from `CLIO_RELAY_GRANT_FILE_<PROVIDER>` and the keyring. `shared().get("globus")` returns a built provider.
+- **Grant files.** `GrantFiles` reads `CLIO_RELAY_GRANT_FILE_<PROVIDER>`, overridden by `--grant-file PROVIDER=PATH`. It re-reads a file when its mtime, size or inode changes. A grant token comes before a keyring token. On a change, `GrantWatcher` probes the sites that name that identity (`identity/probe.py`; results in `<state>/identity/probes.json`).
+- **The keyring.** `TokenStore` uses keyring service `clio-relay` with JSON entries. Secrets typed on the page are kept as `secret:<name>`, read with `TokenStore().secret(name)`, and written with `set_secret` and `delete_secret`. `CLIO_RELAY_KEYRING=memory` keeps entries in the process, for tests.
+- **`clio-relay-next asks`** (mounted by `cli_next`):
+  - `list [--all]`, `show`, `page`;
+  - `answer <ask> [--decline] [--value]`, `decline`;
+  - `identities`, `sign-in <provider>`, `sign-out <provider>`, `probe <provider>`.
+  - `answer` refuses with exit 2 (`approval_mismatch`) when the operation's spec digest no longer matches the approval.
+
+### Answers for W11
+
+- `Token` is a pydantic model: `resource_server: str | None`, `access_token: SecretStr` (read it with `.get_secret_value()`), `token_type = "Bearer"`, `expires_at: datetime | None`, `scopes: list[str]`, `source: "grant" | "keyring"`, and `live()`. It is not a tuple.
+- `status()` and `token()` are async, as are `begin`, `poll`, `callback` and `sign_out`.
+- Use `clio_relay.identity.shared().get("globus")`, not `identity.get("globus")`: `get` returns the factory, not a provider.
+- Cloud keys: the service `clio-relay` is W6's, so use `TokenStore().secret("aws-access-key-id")` rather than raw keyring entries. The names under `secret:` are W11's to choose. To have the person type one on relay's page, raise `SignInNeed(provider="keyring:aws-access-key-id")`.
+
+### Decisions
+
+- **The page needs the operator credential over HTTP, and loopback stays credential-free.** Over stdio the page is on 127.0.0.1 with a single-use token, as the plan says. Over HTTP the origin is reachable from other machines, so it takes HTTP Basic on top.
+- **The origin rule.** A POST whose `Origin` or `Referer` is foreign is refused. A POST with neither passes, because some browsers drop both on a form POST to the same origin; the HMAC CSRF token is the defence.
+- **`accept` is taken as `done`** on a URL ask's page, so an MCP client that answers `accept` works.
+- **No hard limit on the person.** No ask, askpass prompt or sign-in has a time limit. A prompt whose ssh has gone away is dropped, and a device sign-in polls at the provider's interval until the person finishes or declines.
+- **A standalone askpass prompt** (one not tied to an operation) is seen only through `clio-relay-next asks list` and `page`. No MCP request carries it.
+- **Globus sign-in** is a native-app PKCE flow: the person pastes the code on relay's page. GitHub uses the device flow, with its code shown on relay's page and not in the transcript. The client ids come from `CLIO_RELAY_GLOBUS_CLIENT_ID` and `CLIO_RELAY_GITHUB_CLIENT_ID`, or from `settings`.
+- **Production keeps the OS keyring.** `keyrings.alt` is only in the `testing` extra, for headless Ares.
+
+### Facts
+
+- **`SSH_ASKPASS_REQUIRE` is honoured from OpenSSH 8.4** ([release notes](https://www.openssh.com/txt/release-8.4): "a new $SSH_ASKPASS_REQUIRE environment variable, including forcibly enabling and disabling its use", bz#69).
+  - Ares and every W2 fixture run 8.9p1, so `force` works there; the fx-otp tests prove it.
+  - On Windows, Win32-OpenSSH 8.1 (the Windows 10 and Server 2019 built-in) ignores it ([PowerShell/Win32-OpenSSH#1726](https://github.com/PowerShell/Win32-OpenSSH/issues/1726)). 8.6p1 (the Windows 11 built-in) honours it ([PowerShell/Win32-OpenSSH#2115](https://github.com/PowerShell/Win32-OpenSSH/issues/2115)).
+  - This machine has `OpenSSH_for_Windows_9.5p2`; it was not exercised with askpass, since tests run on Ares only.
+  - Before 8.4, askpass runs only with `DISPLAY` set and no terminal. Relay closes stdin and sets `DISPLAY`, which is enough for a detached relay, but `force` is the dependable route.
+- **Ares has Slurm accounting off** (`AccountingStorageType = accounting_storage/none`), so `sacct` returns nothing. `squeue -t all` keeps a finished job for `MinJobAge = 300 s`. Reconciling by name on Ares therefore works only within 5 minutes of the job ending.
+- **mcp 2.3.0 and fastmcp 4.2.1** in the W6 venv. `mcp.Client.call_tool` has no `raise_on_error`.
+
+### Evidence
+
+`tests/asks` on Ares at 8b13e42 (`CLIO_RELAY_KEYRING=memory`): **68 passed, 0 skipped**. That includes `test_askpass_otp`: real ssh to fx-otp (127.0.0.1:47103), with the key and then a TOTP typed on relay's page, answered and declined. ruff, `ruff format --check` and strict pyright are clean on the W6 files.
+
+`tests/relay_next` with W6 installed: everything passes except `test_transports.py::test_plain_mcp_client_over_http[legacy]` and `[auto]`. W1's helper opens the HTTP page without the operator credential, and the stub it was written against had none. This is a request to W1 (see Open).
+
+**LQ42, live on Ares, 2026-11-18.** The client is `tests/asks/lq42_live.py`. It uses the official `mcp` SDK `Client` with no elicitation callback and no tasks, and opens a new connection for each step. The site is `slurm` (adapter `local`, `{"scheduler": "slurm"}`, `--policy open --spend always`), the job `/bin/sh -c "hostname; echo lq42-<tag>"` on partition `debug`, PT5M.
+
+- **Over stdio, mode `legacy`** (`python tests/asks/lq42_live.py --site slurm <step>`):
+  - The gate: `run` refused with `needs_approval`, operation `op_8bd623bec5c50aace0da1f47`, ask `ask_63381fe64a9f82c3cb6138df`, and a page on `http://127.0.0.1:10165`. The ask's message was "Run /bin/sh on slurm? It may use up to 0.0833 node-hours (1 node(s) for 5 min)."
+  - Two GETs of the page returned 200, after which `describe` still showed `awaiting_input`, the ask `pending` and no native id.
+  - Approving on the page: POST 200; the same POST again, 404.
+  - Retry 1 and retry 2 (`run resume`) both returned Slurm job **27724**.
+  - The same run with a changed spec got a new operation (`op_1e477f453cdd09a4b161496d`) and a new approval. The first approval did not carry over.
+  - Reconnecting: `describe` showed `completed`, job 27724. `files read jobs/<op>/stdout` gave `ares-comp-03` and `lq42-gate`.
+  - Decline: `op_13632a885db31975f126bff2` went to `cancelled` (`declined`), with no handle and no job directory.
+  - No answer: `op_b474063849e345932b3a93dd` stayed `awaiting_input`, with no handle and no job directory; a retry was again `needs_approval`.
+  - Cancel through `run`: `op_7ec137cc87b2d3de98a12a17` was approved and ran as job 27725, then `run cancel` gave `cancelled` and Slurm showed 27725 `CANCELLED`.
+- **Over Streamable HTTP with TLS, from compute nodes.**
+  - Relay ran on the login node: `clio-relay-next serve --http --host ares.ares.local --port 47160 --tls-cert … --tls-key …`, with a self-signed certificate.
+  - The client ran under `srun -p debug -N1` on ares-comp-03 (gate, decline, no answer) and ares-comp-04 (reconnect).
+  - MCP without the bearer: 401.
+  - The gate: `op_53a0f721139608c923a83519`, ask `ask_690532b42e5aa0e5da6fdff4`, page `https://ares.ares.local:47160/relay/asks/…`.
+    - The page without the operator credential: **401**.
+    - With it: GET 200 twice, still `pending`, no job.
+    - Approve: POST 200, then 404.
+    - Two retries: one job, **27731**.
+  - Decline (mode `legacy`) and no answer (mode `auto`) submitted nothing.
+  - Reconnect: `completed`, with output read through `files`.
+  - The serve log has no request lines and no page URLs.
+- **Exactly once across a crash.** A fake `sbatch` first on `PATH` runs the real one and then `kill -9`s relay, after Slurm has accepted the job and before relay writes its id. Relay is then restarted with the normal `PATH`.
+  - **As merged, it fails to reconcile.** `op_841635bf1ab636c3eb03c79a` was accepted by Slurm as job 27726, which ran to completion. After the restart relay could not find it and, after `SUBMIT_GRACE`, recorded `failed` ("no job was found"). The cause: psij's Slurm template takes `--job-name` from `job.name`, which is empty, so Slurm names the job `submit.sh`, not `relay-<op>`. Nothing was submitted twice, but relay lost the job.
+  - **With a two-line fix in the local adapter** (tried in the W6 clone on Ares only, then reverted): add `--job-name=relay-<op>` to the sbatch argv. Then `op_301e8834aacd8e397afe52a8` was killed after acceptance, and the restart reconciled it by name to job **27727**: history `submitting` ("job name relay-op_…"), then `queued` ("reconciled after an interrupted submit"), `running`, `completed`. squeue held exactly one job for it.
+- **Not covered here.** `files` transfer, `serve` service and stop, A2UI, and the tab token belong to W1, W9 and W14, and are left to their owners' LQ42 runs.
+
+### Halves of other rows
+
+- **LQ10 and LQ11 (W8).** Ready. A worker's sign-in raises a `url` ask with a loopback page; the code is typed on the page (askpass, or a `keyring:` secret) and is never in an ask record, the transcript or a log. W8 registers its starter with `askpass.register_sign_in`.
+- **LQ19 and LQ20 (W13).** Ready, proven above through W1's stub guard: the page shows queue, account, nodes, walltime and the most it may use; a no submits nothing; nobody answering leaves the operation waiting with no job. W13 runs them with its own guard.
+- **LQ39 (W10).** Ready on W6's side. TACC registers in the identity table; a device-code sign-in shows its code on relay's page (`SignInStep(relay_page=True, display=…)`), never in `ask.url`.
+- **Globus (O10).** Tested against a stub only. **The live Globus sign-in is pending O10** (no native-app client is registered yet). It is not a pass.
+
+### Open
+
+- **To W1: name Slurm jobs.** In `LocalAdapter._submit_batch`, add `--job-name=relay-<op>` to the sbatch argv, or the PBS equivalent `-N`. Without it, reconciling by name never finds a job, as the crash run above shows. Also note that on Ares, `find()` can only see a job within 5 minutes of it ending.
+- **To W1: refuse a changed resume.** `run(resume=op, site=, spec=)` ignores a changed spec and goes on with the approved one. It should refuse `approval_mismatch` when the site or the spec digest differs, as `_resume_round` already does.
+- **To W1: the HTTP page needs the operator credential.** Give `tests/relay_next/conftest.py::answer_page` an optional `auth`. `test_transports.py` should pass `("operator", (state_dir / "operator-token").read_text())` for the HTTP server.
+- **To W1: a `config_dir` setting.** The ask provider falls back to `RelayPaths.from_env().config_dir` because `HookContext.settings` has no `config_dir`.
+- **Live Globus** waits for O10.
+
 ## W7. The ssh adapter and scheduler jobs
 
 ## W8. The worker adapter and the old surface's removal
