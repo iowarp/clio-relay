@@ -438,7 +438,11 @@ def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPat
     shared = Identities()
     fake = types.ModuleType("clio_relay.identity")
     fake.__dict__["shared"] = lambda: shared
-    fake.__dict__["get"] = lambda name: pytest.fail("get returns the factory, not a provider")
+
+    def factory_get(name: str) -> object:
+        pytest.fail(f"get({name!r}) returns the factory, not a provider")
+
+    fake.__dict__["get"] = factory_get
     monkeypatch.setitem(sys.modules, "clio_relay.identity", fake)
     assert tokens.provider("globus") is built
     assert isinstance(tokens.provider("nobody"), tokens.GrantFileProvider)

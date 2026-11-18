@@ -177,9 +177,12 @@ def test_secrets_come_from_relays_token_store(
     fake = types.ModuleType("clio_relay.identity.store")
     fake.__dict__["TokenStore"] = Store
     monkeypatch.setitem(sys.modules, "clio_relay.identity.store", fake)
-    credentials = {"provider": "aws", "env": {"AWS_ACCESS_KEY_ID": "aws-access-key-id"}}
+    credentials: dict[str, object] = {
+        "provider": "aws",
+        "env": {"AWS_ACCESS_KEY_ID": "aws-access-key-id"},
+    }
     adapter = _build(tmp_path, credentials=credentials)
-    assert adapter._credential_env() == {"AWS_ACCESS_KEY_ID": "from-store"}  # pyright: ignore[reportPrivateUsage]
+    assert adapter._credential_env() == {"AWS_ACCESS_KEY_ID": "from-store"}  # pyright: ignore[reportPrivateUsage]  # pyright: ignore[reportPrivateUsage]
     assert asked == ["aws-access-key-id"]
 
 
