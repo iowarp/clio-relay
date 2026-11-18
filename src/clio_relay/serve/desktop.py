@@ -152,8 +152,7 @@ def settings(paths: RelayPaths, changes: dict[str, str] | None) -> dict[str, Any
             if rendezvous
             else None,
             sites={
-                key: serve_settings.SiteServe.model_validate(value)
-                for key, value in sites.items()
+                key: serve_settings.SiteServe.model_validate(value) for key, value in sites.items()
             },
         )
     except ValidationError as exc:

@@ -34,6 +34,7 @@ from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.serve import config as serve_settings
+from clio_relay.serve.config import SiteServe
 from clio_relay.serve.forward import Forward
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
@@ -48,7 +49,6 @@ from clio_relay.serve.plan import (
     site_files,
     wrapped_job,
 )
-from clio_relay.serve.config import SiteServe
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)
@@ -660,6 +660,7 @@ def connect_handle(plan: ServePlan) -> str:
     }
     raw = json.dumps(payload, separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
 
 # The wrapper's own files. Logs stay, because a person reads them after a failure.
 _SERVE_FILES = {"service.log", "launch.log", "frpc.log"}
