@@ -18,7 +18,6 @@ from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Ver
 from clio_relay.adapters.hooks import (
     Ask,
     AskProvider,
-    Charge,
     GuardHook,
     HookContext,
     ServeHook,
@@ -42,6 +41,7 @@ from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
+from clio_relay.surface.guarding import approval_message, review_asks
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 
@@ -66,18 +66,6 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
     name = namer(operation_id)
     return name if isinstance(name, str) else None
 
-
-def _approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
-    if charge.walltime_s is None or charge.node_hours is None:
-        return (
-            f"{action} on {site.title}? It asks for {charge.nodes} node(s) and sets no "
-            "walltime, so its duration and cost are unknown: the scheduler's default "
-            "limit applies."
-        )
-    return (
-        f"{action} on {site.title}? It may use up to {charge.node_hours:g} {charge.unit} "
-        f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
-    )
 
 
 class RelayService:
@@ -268,7 +256,8 @@ class RelayService:
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
-        (await self.guard.check_run(site, job)).raise_if_refused()
+        decision = await self.guard.check_run(site, job)
+        decision.raise_if_refused()
         charge = await self.guard.price(site, job)
         operation_id = new_id("op")
         result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
@@ -293,6 +282,7 @@ class RelayService:
             asks.append(
                 await self.ask_provider.url(site=site, operation_id=operation_id, need=need)
             )
+        asks.extend(await review_asks(self.ask_provider, site, record, decision))
         if site.spend.needs_approval(charge.node_hours):
             binding = {
                 "site": site.id,
@@ -303,7 +293,7 @@ class RelayService:
                 await self.ask_provider.approve(
                     site=site,
                     operation_id=operation_id,
-                    message=_approval_message(action, site, charge),
+                    message=approval_message(action, site, charge),
                     binding=binding,
                 )
             )
@@ -493,9 +483,11 @@ class RelayService:
         if record.kind == "serve":
             return await self._start_service(operation_id, site, adapter, record)
         try:
-            handle = await adapter.run(
-                JobSpec.model_validate(record.spec), operation_id=operation_id
+            # The guard may rewrite what is submitted; record.spec stays what was approved.
+            spec = await self.guard.prepare(
+                site, JobSpec.model_validate(record.spec), adapter=adapter
             )
+            handle = await adapter.run(spec, operation_id=operation_id)
         except Refusal as refusal:
             return self._finish(operation_id, OperationState.FAILED, refusal)
         except Exception as exc:
@@ -523,8 +515,10 @@ class RelayService:
         record: OperationRecord,
     ) -> OperationRecord:
         try:
+            service = ServiceSpec.model_validate(record.spec)
+            job = await self.guard.prepare(site, service.job, adapter=adapter)
             endpoint = await self.serve_hook.start(
-                site, adapter, ServiceSpec.model_validate(record.spec), record
+                site, adapter, service.model_copy(update={"job": job}), record
             )
         except Refusal as refusal:
             return self._finish(operation_id, OperationState.FAILED, refusal)

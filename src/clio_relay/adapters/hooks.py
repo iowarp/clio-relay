@@ -194,6 +194,15 @@ class GuardHook(Protocol):
         """Return the most ``spec`` may cost on ``site``."""
         ...
 
+    async def prepare(self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]) -> JobSpec:
+        """Return the spec ``adapter`` submits, for example with a reviewed package staged.
+
+        Relay calls it just before it submits a job or starts a service's job.
+        It never changes the operation record, so the approved digest stays the
+        one the person saw. A refusal fails the operation.
+        """
+        ...
+
 
 @runtime_checkable
 class ServeHook(Protocol):
