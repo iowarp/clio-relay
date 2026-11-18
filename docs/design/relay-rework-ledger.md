@@ -871,12 +871,17 @@ LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `
 
 Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` were held, because W9's runtime still imported them. W9 dropped those imports at 5a01766. W8 merged W9's branch at that commit (91bcc3c), so the deletion could go ahead, and deleted the three groups with their tests (ba5ad4b). Nothing in `src`, `tests`, `jarvis-packages` or `scripts` imports them now. The worker's scheduler module is imported as `worker_scheduler`.
 
-Still to clear for LQ32, in a follow-up on this branch:
-- the `browser_gateway_overloaded` code and its adapter in `door_errors`;
-- the `mcp_call` job kind (`models_enums`, `models_job_specs`, and W9's `jarvis_service_runtime_validation`);
-- the `virtual_*_mcp_call` release-gate roles;
-- comments in W1's scripts;
-- the user docs (`architecture`, `mcp-tasks`, `operations`, `release-acceptance-1.0`). README is W1's.
+Done in the follow-up (353ef89):
+- The seven `browser_*` door reasons and `as_browser_gateway_error` are removed. Nothing produced them once the gateway was gone. REASONS goes from 75 to 68, and the HTTP statuses from 61 to 54.
+- In the user docs, the sections for the deleted commands are removed: `operations.md` (agent, `mcp-server`, remote JARVIS MCP, remote MCP federation, `live-test`) and `architecture.md` (remote MCP catalogs, the `mcp_call` row).
+- Links to the deleted `connection-model.md` and `remote-mcp-federation.md` now point at `docs/adapters/worker.md`, or are dropped.
+
+Left, with the reason:
+- The `mcp_call` job kind (`JobKind.MCP_CALL`, `McpCallSpec`) has no producer and no runner on the worker. W9's `jarvis_service_runtime_validation.py:55` still reads it, so W8 removes it after W9 drops that use. Its test hits go with it.
+- The `virtual_*_mcp_call` roles are vocabulary of the old 1.0 release gate: `release_gate_resources`, `validation_report` and `docs/release-gate-1.0.yaml`. That code is reached through `validation_report`, which the bootstrap and session code still use. Renaming a role changes recorded reports for no gain. Whether the 1.0 release-gate machinery goes is a decision for the coordinator.
+- Some history comments in W1's scripts name deleted modules. W8 leaves W1's files alone beyond the approved edits.
+- `README.md` (lines 42, 62, 130, 253) and `docs/mcp-tasks.md:127` belong to W1.
+- `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). It needs a rewrite owner once the cutover settles the command names.
 
 ### clio-schemas
 
