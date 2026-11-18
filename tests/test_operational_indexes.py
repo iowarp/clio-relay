@@ -353,7 +353,7 @@ def test_lease_indexes_reject_missing_endpoint_and_consistent_kind_relabel(
     queue.repair_lease_operational_indexes()
     original_kind_ref = queue._lease_cluster_kind_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     original_expiry_ref = queue._lease_expiry_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    relabeled = replace(identity, job_kind=JobKind.MCP_CALL)
+    relabeled = replace(identity, job_kind=JobKind.REMOTE_AGENT)
     original_kind_ref.unlink()
     original_expiry_ref.unlink()
     for path in (

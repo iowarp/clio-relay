@@ -14,8 +14,6 @@ for the boundary/lookalike cases a naive implementation gets wrong.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from clio_relay.bounded_payload import (
@@ -88,9 +86,7 @@ def test_build_truncation_record_honors_an_explicit_evidence_ref() -> None:
 
 def test_a_38mib_stdout_capture_is_recorded_head_tail_with_a_typed_elision_marker() -> None:
     """Drives ``bound_stream_capture`` directly with a synthetic capture much
-    larger than the default 1 MiB + 1 MiB stdout window -- the companion
-    test in ``test_mcp_call_runner.py`` drives the same scenario through the
-    runner's actual ``_write_mcp_result`` build path.
+    larger than the default 1 MiB + 1 MiB stdout window.
     """
     middle = "B" * (38 * 1024 * 1024)
     original = ("A" * STDOUT_HEAD_MAX_BYTES) + middle + ("C" * STDOUT_TAIL_MAX_BYTES)
@@ -293,28 +289,3 @@ def test_sabotage_twin_is_delivery_refusal_false_for_an_ordinary_successful_docu
 def test_sabotage_twin_is_delivery_refusal_false_when_delivery_is_not_a_mapping() -> None:
     malformed = {"result_available": False, "delivery": "not-a-dict"}
     assert not is_delivery_refusal(malformed)
-
-
-# --------------------------------------------------------------------------- #
-# Worker-package vendoring (mirrors the process_containment.py precedent)
-# --------------------------------------------------------------------------- #
-
-
-def test_the_worker_vendored_copy_is_an_exact_mirror() -> None:
-    """``jarvis-packages/clio_relay/clio_relay/bounded_payload.py`` is a
-    deliberately vendored, byte-identical copy of
-    ``src/clio_relay/bounded_payload.py`` -- the same self-contained-
-    worker-package model ``process_containment.py`` already uses (doc §7's
-    "precedent for byte-identical enforcement";
-    ``test_process_containment.py::
-    test_embedded_containment_source_is_an_exact_isolated_runtime_mirror``).
-    ``runner.py`` (``jarvis-packages/clio_relay/clio_relay/mcp_call/
-    runner.py``) imports ``clio_relay.bounded_payload`` and must resolve it
-    from its own standalone package tree when deployed to a JARVIS worker,
-    not from ``src/clio_relay``.
-    """
-    root = Path(__file__).parents[1]
-    source = root / "src" / "clio_relay" / "bounded_payload.py"
-    embedded = root / "jarvis-packages" / "clio_relay" / "clio_relay" / "bounded_payload.py"
-
-    assert embedded.read_bytes() == source.read_bytes()

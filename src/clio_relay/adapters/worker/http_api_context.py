@@ -48,6 +48,7 @@ from clio_relay.adapters.worker.core_queue import (
     INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
     ClioCoreQueue,
 )
+from clio_relay.adapters.worker.endpoint_job_execution import SUPPORTED_JOB_KINDS
 from clio_relay.errors import ConfigurationError, QueueConflictError
 from clio_relay.adapters.worker.http_api_redaction import _public_record
 from clio_relay.identifiers import DurableRecordId
@@ -59,14 +60,10 @@ from clio_relay.job_identity import (
 )
 from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
-    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
     ArtifactRef,
     GatewaySession,
     InputArtifactIngestPolicy,
     JobKind,
-    McpAdmissionAuthority,
-    McpAdmissionClass,
-    McpCallSpec,
     RelayJob,
     RelayTask,
     new_id,
@@ -207,13 +204,17 @@ class RelayApiContext:
         job: RelayJob,
         *,
         owner_session_identity: JobOwnerSessionIdentity | None = None,
-        mcp_admission_authority: McpAdmissionAuthority | None = None,
         input_ingest_policy: InputArtifactIngestPolicy | None = None,
     ) -> RelayJob:
         self.ensure_intake_open()
         if self.owner_session_cluster is not None and job.cluster != self.owner_session_cluster:
             raise door_errors.http_problem(
                 "job_cluster_mismatch", "job cluster does not match this owned relay session"
+            )
+        if job.kind not in SUPPORTED_JOB_KINDS:
+            raise door_errors.http_problem(
+                "job_submission_refused",
+                message=f"this relay no longer accepts {job.kind.value} jobs",
             )
         metadata = dict(job.metadata)
         protected = sorted(
@@ -222,7 +223,6 @@ class RelayApiContext:
                 "owner_session_id",
                 "owner_session_generation_id",
                 "owner_session_admission_id",
-                MCP_ADMISSION_AUTHORITY_METADATA_KEY,
                 INPUT_INGEST_ATTEMPT_METADATA_KEY,
                 INPUT_INGEST_ORIGINAL_POLICY_METADATA_KEY,
                 INPUT_INGEST_POLICY_METADATA_KEY,
@@ -251,31 +251,6 @@ class RelayApiContext:
             )
         except OwnerSessionIdentityError as exc:
             raise door_errors.http_problem("owner_session_identity_refused", exc=exc) from exc
-        if job.kind is JobKind.MCP_CALL:
-            if not isinstance(job.spec, McpCallSpec):
-                raise door_errors.http_problem(
-                    "mcp_admission_refused",
-                    message="MCP job has an invalid specification",
-                )
-            if job.spec.admission_class is McpAdmissionClass.CONTROL_QUERY:
-                if mcp_admission_authority is None:
-                    raise door_errors.http_problem(
-                        "mcp_admission_refused",
-                        message="control-query MCP admission requires server authority",
-                    )
-                metadata[MCP_ADMISSION_AUTHORITY_METADATA_KEY] = mcp_admission_authority.model_dump(
-                    mode="json"
-                )
-            elif mcp_admission_authority is not None:
-                raise door_errors.http_problem(
-                    "mcp_admission_refused",
-                    message="workload MCP admission must not carry control-query authority",
-                )
-        elif mcp_admission_authority is not None:
-            raise door_errors.http_problem(
-                "mcp_admission_refused",
-                message="MCP admission authority cannot be attached to another job kind",
-            )
         if job.kind is JobKind.INPUT_INGEST:
             if input_ingest_policy is None:
                 raise door_errors.http_problem(

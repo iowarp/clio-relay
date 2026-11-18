@@ -57,8 +57,8 @@ from clio_relay.installation import (
     write_install_receipt,
 )
 from clio_relay.jarvis_mcp import jarvis_mcp_server_artifact_verified
-from clio_relay.mcp_call.runner import mcp_server_artifact_identity
-from clio_relay.remote_mcp import (
+from clio_relay.adapters.worker.server_artifact_identity import mcp_server_artifact_identity
+from clio_relay.adapters.worker.clio_kit_constants import (
     CLIO_KIT_JARVIS_USER_CONTRACT_ID,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
@@ -99,7 +99,7 @@ relay_component = ComponentArtifactIdentity(
     artifact_filename=(relay_artifact.name if relay_artifact is not None else None),
     artifact_sha256=(sha256_file(relay_artifact) if relay_artifact is not None else None),
     runtime_artifact_path=(str(relay_artifact) if relay_artifact is not None else None),
-    runtime_command=[os.environ["RELAY_EXECUTABLE"], "installation-info"],
+    runtime_command=[os.environ["RELAY_EXECUTABLE"], "worker", "installation-info"],
     runtime_interpreters={{
         "provider": os.environ["RELAY_PROVIDER_PYTHON"],
         "execution": os.environ["ACTIVE_JARVIS_PYTHON"],
@@ -234,7 +234,7 @@ write_install_receipt(
 )
 __CLIO_RELAY_GENERATION_RECEIPT__
     CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json" \
-      "$RELAY_EXECUTABLE" installation-info >"$BOOTSTRAP_GENERATION/installation-info.json"
+      "$RELAY_EXECUTABLE" worker installation-info >"$BOOTSTRAP_GENERATION/installation-info.json"
     export CLIO_RELAY_INSTALL_RECEIPT="$BOOTSTRAP_GENERATION/install-receipt.json"
     "$RELAY_PROVIDER_PYTHON" - <<'__CLIO_RELAY_VERIFY_GENERATION__'
 import json
@@ -495,7 +495,7 @@ __CLIO_RELAY_STAGED_REPOSITORY_EVIDENCE__
   )"
   export BOOTSTRAP_JARVIS_REPO_RECONCILIATION
   bootstrap_verify_stable_activation_links
-  "$HOME/.local/share/clio-relay/current/bin/clio-relay" installation-info >/dev/null
+  "$HOME/.local/share/clio-relay/current/bin/clio-relay" worker installation-info >/dev/null
   "$HOME/.local/share/clio-relay/current/bin/clio-relay" --help >/dev/null
   bootstrap_candidate_action journal-advance activated
   echo "$BOOTSTRAP_JARVIS_CONFIG_SHA256_BEFORE *$JARVIS_CONFIG_FILE" | \

@@ -77,7 +77,7 @@ def _worker_upgrade_fence_script(
                 "bootstrap_release_worker_lifetime_guard() { :; }",
             ]
         )
-        return no_service_fence, "", "clio-relay init", ""
+        return no_service_fence, "", "clio-relay worker init", ""
     initial_proof = _worker_writer_proof_shell(
         rendered_core_dir=rendered_core_dir,
         success_variable="WORKER_WRITER_PROOF",
@@ -298,4 +298,4 @@ def _worker_upgrade_fence_script(
             "fi",
         ]
     )
-    return fence, recheck, "clio-relay init --migrate-legacy-output", restart
+    return fence, recheck, "clio-relay worker init --migrate-legacy-output", restart

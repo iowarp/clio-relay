@@ -68,10 +68,11 @@ def decode_nul_values(value: bytes) -> list[str]:
 
 
 def relay_process_invocation(argv: list[str]) -> list[str] | None:
-    """Return command arguments for one exact installed relay invocation."""
+    """Return the worker command arguments of one exact installed relay invocation."""
     for index, argument in enumerate(argv):
         if os.path.basename(argument) == "clio-relay":
-            return argv[index + 1 :]
+            command = argv[index + 1 :]
+            return command[1:] if command[:1] == ["worker"] else command
     return None
 
 
@@ -423,9 +424,6 @@ def prove_no_writer(cluster: str, expected_core: str, proc_root: Path) -> None:
             elif command[:2] == ["api", "start"]:
                 writer_kind = "api"
                 options = command[2:]
-            elif command[:1] == ["mcp-server"]:
-                writer_kind = "mcp-server"
-                options = command[1:]
             process_cluster = option_value(options, "--cluster")
             environ_path = process / "environ"
             try:
@@ -464,7 +462,7 @@ def prove_no_writer(cluster: str, expected_core: str, proc_root: Path) -> None:
                         f"cluster={process_cluster!r} core={expected!r} "
                         f"while bootstrapping cluster={cluster!r}"
                     )
-                if writer_kind in {"api", "mcp-server"}:
+                if writer_kind == "api":
                     fail(
                         f"live {writer_kind} writer pid={entry.name} still owns "
                         f"core={expected!r} while bootstrapping cluster={cluster!r}; "

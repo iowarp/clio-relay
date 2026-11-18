@@ -7,8 +7,7 @@ scheduler-job-id extraction and ownership-proof verification
 (``_scheduler_job_ids_from_metadata``, ``_owned_scheduler_job_ids_from_
 metadata``), native-JARVIS runtime-metadata classification (``_runtime_
 metadata_exact_marker_reconciliation``, ``_runtime_metadata_is_native``,
-``_native_runtime_execution_mode``, ``_native_runtime_created_at``,
-``_runtime_metadata_is_mcp_transport_wrapper``), task-state predicates
+``_native_runtime_execution_mode``, ``_native_runtime_created_at``), task-state predicates
 (``_task_direct_execution_pinned``, ``_task_scheduler_submission_refused``,
 ``_runtime_sidecar_channel_failed``), the durable scheduler-submission-
 intent reader/validator (``_durable_scheduler_submission_intent``), and two
@@ -16,10 +15,9 @@ small task-list lookups (``_task_id_for_scheduler_job``, ``_task_scheduler_
 status``) plus an isolated-subprocess-environment context manager
 (``_job_subprocess_env``).
 
-``_native_runtime_created_at`` depends on ``endpoint_recovery_directory.py``
-(``_recovery_timestamp``, the strict timezone-aware ISO parser), a leaf
-relative to this module, so it stays acyclic. ``EndpointWorker`` (still
-resident in ``endpoint.py``) is this module's main caller.
+``_native_runtime_created_at`` parses with ``_aware_timestamp``, the strict
+timezone-aware ISO parser. ``EndpointWorker`` (still resident in ``endpoint.py``)
+is this module's main caller.
 """
 
 from __future__ import annotations
@@ -31,15 +29,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, cast
 
-from clio_relay.adapters.worker.endpoint_recovery_directory import _recovery_timestamp
 from clio_relay.adapters.worker.endpoint_sidecar_types import RUNTIME_SIDECAR_CHANNEL_SCHEMA
 from clio_relay.errors import RelayError
-from clio_relay.models import JarvisRunSpec, McpCallSpec, RelayJob, RelayTask, RemoteAgentTaskSpec
+from clio_relay.models import JarvisRunSpec, RelayJob, RelayTask, RemoteAgentTaskSpec
 from clio_relay.runtime_metadata import JarvisRuntimeMetadata, RuntimeMetadataSource
 
 
 def _job_timeout_seconds(job: RelayJob) -> int | None:
-    if isinstance(job.spec, (JarvisRunSpec, RemoteAgentTaskSpec, McpCallSpec)):
+    if isinstance(job.spec, (JarvisRunSpec, RemoteAgentTaskSpec)):
         return job.spec.timeout_seconds
     return None
 
@@ -157,35 +154,19 @@ def _native_runtime_created_at(metadata: JarvisRuntimeMetadata) -> datetime:
     raw_created_at = cast(dict[str, object], record).get("created_at")
     if not isinstance(raw_created_at, str):
         raise RelayError("native JARVIS execution record omitted created_at")
-    created_at = _recovery_timestamp(raw_created_at)
+    created_at = _aware_timestamp(raw_created_at)
     if created_at is None:
         raise RelayError("native JARVIS execution record created_at is invalid")
     return created_at
 
 
-def _runtime_metadata_is_mcp_transport_wrapper(metadata: JarvisRuntimeMetadata) -> bool:
-    """Return whether metadata describes the direct wrapper around one MCP call."""
-    if (
-        metadata.source is not RuntimeMetadataSource.JARVIS_SIDECAR
-        or metadata.scheduler_provider is not None
-        or metadata.scheduler_job_id is not None
-    ):
-        return False
-    native_execution = metadata.details.get("native_execution")
-    if isinstance(native_execution, dict):
-        handle = cast(dict[str, object], native_execution).get("execution_handle")
-        record = cast(dict[str, object], native_execution).get("execution_record")
-        return (
-            isinstance(handle, dict)
-            and cast(dict[str, object], handle).get("mode") == "direct"
-            and isinstance(record, dict)
-            and cast(dict[str, object], record).get("submitted") is False
-        )
-    nested_details = metadata.details.get("details")
-    return metadata.details.get("execution_mode") == "direct" or (
-        isinstance(nested_details, dict)
-        and cast(dict[str, object], nested_details).get("execution_mode") == "direct"
-    )
+def _aware_timestamp(value: str) -> datetime | None:
+    """Parse one timezone-aware durable timestamp without coercion."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _task_direct_execution_pinned(task: RelayTask) -> bool:

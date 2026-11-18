@@ -44,7 +44,7 @@ def reconcile_script_commit(
   BOOTSTRAP_QUEUE_DURATION_NS=0
   BOOTSTRAP_QUEUE_BEFORE="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info 2>/dev/null || true
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info 2>/dev/null || true
   )"
   export BOOTSTRAP_QUEUE_BEFORE
   if ! python3 -c \
@@ -99,14 +99,14 @@ def reconcile_script_commit(
 
   BOOTSTRAP_QUEUE_EVIDENCE="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info
   )"
   BOOTSTRAP_WORKER_EVIDENCE=""
   if [ "$BOOTSTRAP_SERVICE_ACTIVE_AFTER" = "1" ]; then
     for _BOOTSTRAP_READY_ATTEMPT in $(seq 1 90); do
       if BOOTSTRAP_WORKER_EVIDENCE="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-          "$HOME/.local/bin/clio-relay" endpoint worker-info \
+          "$HOME/.local/bin/clio-relay" worker endpoint worker-info \
             --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 \
             --readiness-only 2>/dev/null
       )"; then
@@ -351,7 +351,7 @@ bootstrap_reuse_repair() {{
   BOOTSTRAP_QUEUE_DURATION_NS=0
   BOOTSTRAP_QUEUE_BEFORE="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info 2>/dev/null || true
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info 2>/dev/null || true
   )"
   export BOOTSTRAP_QUEUE_BEFORE
   if ! python3 -c \
@@ -404,14 +404,14 @@ bootstrap_reuse_repair() {{
   fi
   BOOTSTRAP_QUEUE_EVIDENCE="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info
   )"
   BOOTSTRAP_WORKER_EVIDENCE=""
   if [ "$BOOTSTRAP_SERVICE_ACTIVE_AFTER" = "1" ]; then
     for _BOOTSTRAP_READY_ATTEMPT in $(seq 1 90); do
       if BOOTSTRAP_WORKER_EVIDENCE="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-          "$HOME/.local/bin/clio-relay" endpoint worker-info \
+          "$HOME/.local/bin/clio-relay" worker endpoint worker-info \
             --cluster "$WORKER_CLUSTER_NAME" --freshness-seconds 120 \
             --readiness-only 2>/dev/null
       )"; then

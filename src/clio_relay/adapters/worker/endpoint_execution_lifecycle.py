@@ -18,43 +18,17 @@ re-exports the name verbatim so any other reader of
 
 from __future__ import annotations
 
-import functools
 import os
 import socket
 
 from clio_relay import process_containment
 from clio_relay.adapters.worker.core_queue import DEFAULT_EXACT_RECORD_LIMIT
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_dispatch_refusal_detail,
-    _durable_jarvis_execution_recovery,
-    _durable_runtime_recovery_state,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _jarvis_execution_recovery_retry_due,
-)
-from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
-    _owned_scheduler_job_ids_from_metadata,
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    SchedulerSubmissionUnresolvedError,
-)
-from clio_relay.adapters.worker.endpoint_worker_lanes import (
-    quarantine_relay_error,
-)
-from clio_relay.errors import RelayError
-from clio_relay.adapters.worker.jarvis_dispatch_failure import (
-    JARVIS_DISPATCH_REFUSAL_RESOLUTION,
-)
 from clio_relay.models import (
     JobState,
     RelayJob,
     RelayTask,
     utc_now,
 )
-from clio_relay.runtime_metadata import (
-    JarvisRuntimeMetadata,
-)
-from clio_relay.spool import JobSpool
 
 EXECUTION_CLEANUP_SCAN_LIMIT = DEFAULT_EXACT_RECORD_LIMIT + 1
 
@@ -77,16 +51,7 @@ class ExecutionLifecycleMixin:
             "endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
             "containment": process_containment.owned_process_metadata(pid),
         }
-        current_task = self.queue.get_task(task.task_id)
-        recovery_intent = _durable_jarvis_execution_recovery(job, current_task)
-        start_metadata: dict[str, object] = {"execution_ownership": execution}
-        if recovery_intent is not None and recovery_intent["state"] == "pending":
-            start_metadata["jarvis_execution_recovery"] = {
-                **recovery_intent,
-                "dispatch_state": "started",
-                "dispatch_started_at": started_at,
-            }
-        self.queue.update_task_metadata(task.task_id, start_metadata)
+        self.queue.update_task_metadata(task.task_id, {"execution_ownership": execution})
         self.queue.append_event(
             job.job_id,
             "execution.started",
@@ -132,210 +97,35 @@ class ExecutionLifecycleMixin:
                 continue
             if any(not lease.is_expired() for lease in leases):
                 continue
-            # clio-relay#238: this fetch sits outside the per-marker
-            # try/except below and previously killed the calling worker slot
-            # on one poisoned record -- see quarantine_relay_error's docstring.
-            recovery_intent = quarantine_relay_error(
-                functools.partial(_durable_jarvis_execution_recovery, job, task),
-                queue=self.queue,
-                job_id=job.job_id,
-                task_id=task.task_id,
-                context="execution_cleanup_reconciliation",
-            )
-            if (
-                recovery_intent is not None
-                and recovery_intent["state"] == "pending"
-                and not _jarvis_execution_recovery_retry_due(recovery_intent)
-            ):
-                continue
             eligible += 1
             try:
-                recovered_dispatch = False
-                dispatch_not_released = False
-                dispatch_refused = False
-                recovered_runtime: JarvisRuntimeMetadata | None = None
-                recovery_spool: JobSpool | None = None
                 process_id = self._terminate_recorded_execution(
                     task,
                     allow_unstarted=True,
                 )
                 task = self.queue.get_task(task.task_id)
-                self._terminate_recorded_jarvis_recovery_query(job, task)
-                task = self.queue.get_task(task.task_id)
-                recovery_intent = _durable_jarvis_execution_recovery(job, task)
-                if (
-                    recovery_intent is not None
-                    and recovery_intent["state"] == "pending"
-                    and recovery_intent["dispatch_state"] == "prepared"
-                ):
-                    dispatch_not_released = True
-                    self.queue.append_event(
-                        job.job_id,
-                        "jarvis.dispatch_not_released",
-                        "Restart cleanup proved the JARVIS dispatch was never released",
-                        payload={
-                            "task_id": task.task_id,
-                            "execution_id": recovery_intent["execution_id"],
-                            "recovery_query_attempted": False,
-                        },
-                    )
-                elif recovery_intent is not None and recovery_intent["state"] == "pending":
-                    recovery_spool = JobSpool(
-                        self.settings.spool_dir,
-                        job,
-                        max_log_bytes_per_stream=(self.settings.spool_max_log_bytes_per_stream),
-                        max_log_bytes_per_job=self.settings.spool_max_log_bytes_per_job,
-                    )
-                    previous_runtime, previous_digests = _durable_runtime_recovery_state(task)
-                    recovered_state: list[JarvisRuntimeMetadata | None] = [previous_runtime]
-                    recovered_scheduler_job_ids = _owned_scheduler_job_ids_from_metadata(
-                        task.metadata,
-                        relay_job_id=job.job_id,
-                        task_id=task.task_id,
-                    )
-                    recorded_refusal = self._recorded_jarvis_dispatch_refusal(
-                        job,
-                        spool=recovery_spool,
-                    )
-                    with self._jarvis_execution_recovery_claim(job, task=task):
-                        if recorded_refusal is not None:
-                            self._refuse_jarvis_execution_recovery(
-                                job,
-                                task_id=task.task_id,
-                                spool=recovery_spool,
-                                refusal=recorded_refusal,
-                            )
-                            dispatch_refused = True
-                        else:
-                            recovered_dispatch = self._recover_jarvis_execution(
-                                job,
-                                task_id=task.task_id,
-                                spool=recovery_spool,
-                                state=recovered_state,
-                                digests=previous_digests,
-                                scheduler_job_ids=recovered_scheduler_job_ids,
-                            )
-                    recovered_runtime = recovered_state[0]
-                    task = self.queue.get_task(task.task_id)
-                    recovery_intent = _durable_jarvis_execution_recovery(job, task)
-                elif (
-                    recovery_intent is not None
-                    and recovery_intent.get("resolution") == JARVIS_DISPATCH_REFUSAL_RESOLUTION
-                ):
-                    dispatch_refused = True
-                elif recovery_intent is not None:
-                    recovery_spool = JobSpool(
-                        self.settings.spool_dir,
-                        job,
-                        max_log_bytes_per_stream=(self.settings.spool_max_log_bytes_per_stream),
-                        max_log_bytes_per_job=self.settings.spool_max_log_bytes_per_job,
-                    )
-                    recovered_runtime = self._validated_recovered_jarvis_dispatch(
-                        job,
-                        task=task,
-                        spool=recovery_spool,
-                    )
-                    recovered_dispatch = True
-                if recovery_intent is None:
-                    self._reconcile_recorded_scheduler_submission(job, task)
-                elif dispatch_not_released or dispatch_refused:
-                    pass
-                elif recovery_intent["state"] != "resolved" or not recovered_dispatch:
-                    raise SchedulerSubmissionUnresolvedError(
-                        "JARVIS execution response recovery remains pending"
-                    )
+                self._reconcile_recorded_scheduler_submission(job, task)
                 cancellation_requested = job.state == JobState.CANCELED or isinstance(
                     job.metadata.get("cancellation_request"),
                     dict,
                 )
-                if (
-                    cancellation_requested
-                    and self._scheduler_cancel_was_requested(job.job_id)
-                    and recovery_intent is not None
-                    and not dispatch_not_released
-                    and not dispatch_refused
-                ):
-                    owned_ids = self._durable_scheduler_job_ids(
-                        job,
-                        task.task_id,
-                        [],
-                    )
-                    if owned_ids:
-                        self._cancel_scheduler_jobs(job, owned_ids)
-                    else:
-                        self._record_scheduler_cancel_refused(job)
                 cleanup_metadata = self._remove_recorded_execution_sidecars(job, task)
-                if recovered_dispatch and not cancellation_requested:
-                    if recovery_spool is None or recovered_runtime is None:
-                        raise RelayError(
-                            "resolved JARVIS execution recovery omitted its durable result"
-                        )
-                    self._finalize_recovered_jarvis_dispatch(
-                        job,
-                        task=task,
-                        spool=recovery_spool,
-                        runtime_metadata=recovered_runtime,
-                    )
-                    task = self.queue.get_task(task.task_id)
                 if task.state not in {
                     JobState.SUCCEEDED,
                     JobState.FAILED,
                     JobState.CANCELED,
                 }:
-                    target_state = (
-                        JobState.SUCCEEDED
-                        if recovered_dispatch and not cancellation_requested
-                        else JobState.CANCELED
-                        if cancellation_requested
-                        else JobState.FAILED
-                    )
+                    target_state = JobState.CANCELED if cancellation_requested else JobState.FAILED
                     self.queue.update_task_state(
                         task.task_id,
                         target_state,
                         message=(
-                            f"Recovered durable JARVIS response: {task.name}"
-                            if target_state is JobState.SUCCEEDED
-                            else f"Recovered task cancellation after worker restart: {task.name}"
+                            f"Recovered task cancellation after worker restart: {task.name}"
                             if cancellation_requested
                             else f"Closed stale execution attempt after worker restart: {task.name}"
                         ),
-                        metadata={
-                            "restart_cleanup_recovered": True,
-                            "mcp_dispatch_recovered": recovered_dispatch,
-                        },
+                        metadata={"restart_cleanup_recovered": True},
                     )
-                if recovered_dispatch and not cancellation_requested:
-                    current_job = self.queue.get_job(job.job_id)
-                    if current_job.state is not JobState.SUCCEEDED:
-                        self.queue.update_job_state(
-                            job.job_id,
-                            JobState.SUCCEEDED,
-                            message="JARVIS MCP response recovered from durable execution",
-                        )
-                elif dispatch_refused and not cancellation_requested:
-                    current_job = self.queue.get_job(job.job_id)
-                    if current_job.state not in {
-                        JobState.FAILED,
-                        JobState.CANCELED,
-                    }:
-                        self.queue.update_job_state(
-                            job.job_id,
-                            JobState.FAILED,
-                            message="JARVIS run failed",
-                            error=_durable_jarvis_dispatch_refusal_detail(task),
-                        )
-                elif dispatch_not_released and not cancellation_requested:
-                    current_job = self.queue.get_job(job.job_id)
-                    if current_job.state not in {
-                        JobState.FAILED,
-                        JobState.CANCELED,
-                    }:
-                        self.queue.update_job_state(
-                            job.job_id,
-                            JobState.FAILED,
-                            message="JARVIS dispatch was never released",
-                            error="owned JARVIS process did not reach dispatch release",
-                        )
                 self.queue.acknowledge_execution_cleanup(
                     job.job_id,
                     task.task_id,

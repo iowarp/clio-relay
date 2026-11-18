@@ -466,12 +466,16 @@ if [ "$BOOTSTRAP_RECOVERY_REQUIRED" = "0" ] && \
     if command -v timeout >/dev/null 2>&1; then
       BOOTSTRAP_QUEUE_EVIDENCE="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-          timeout 20 "$BOOTSTRAP_CURRENT_RELAY" queue readiness-info 2>/dev/null || true
+          timeout 20 "$BOOTSTRAP_CURRENT_RELAY" worker queue readiness-info 2>/dev/null \
+          || timeout 20 "$BOOTSTRAP_CURRENT_RELAY" queue readiness-info 2>/dev/null || true
       )"
       if [ "$BOOTSTRAP_SERVICE_WAS_ACTIVE" = "true" ]; then
         BOOTSTRAP_WORKER_EVIDENCE="$(
           CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-            timeout 20 "$BOOTSTRAP_CURRENT_RELAY" endpoint worker-info \
+            timeout 20 "$BOOTSTRAP_CURRENT_RELAY" worker endpoint worker-info \
+              --cluster {shlex.quote(cluster or "")} --freshness-seconds 120 \
+              --readiness-only 2>/dev/null \
+            || timeout 20 "$BOOTSTRAP_CURRENT_RELAY" endpoint worker-info \
               --cluster {shlex.quote(cluster or "")} --freshness-seconds 120 \
               --readiness-only 2>/dev/null || true
         )"

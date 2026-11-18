@@ -174,7 +174,7 @@ class QueueLegacyOutputMigrationMixin:
             ),
             action=(
                 "stop and verify every process that can write this queue, then run "
-                "clio-relay init --migrate-legacy-output"
+                "clio-relay worker init --migrate-legacy-output"
             ),
         )
 

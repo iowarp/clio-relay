@@ -37,13 +37,23 @@ from clio_relay.models import (
     RelayTask,
     utc_now,
 )
-from clio_relay.remote_mcp import VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
+_RELAY_TRANSPORT_CONTROL_FIELDS = frozenset(
+    {
+        "idempotency_key",
+        "wait_for_terminal",
+        "wait_timeout_seconds",
+        "poll_seconds",
+        "include_logs",
+        "log_limit",
+    }
+)
+"""Relay-consumed tool arguments that never change the executed work."""
 
 
 def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     """Strip clio-relay's own transport-control keys before a task identity compare.
 
-    ``VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS`` (``idempotency_key``,
+    ``_RELAY_TRANSPORT_CONTROL_FIELDS`` (``idempotency_key``,
     ``wait_for_terminal``, ``wait_timeout_seconds``, ``poll_seconds``,
     ``include_logs``, ``log_limit``) are consumed by clio-relay's own MCP
     transport and never forwarded to the remote server -- they cannot change
@@ -57,7 +67,7 @@ def _canonical_mcp_task_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in arguments.items()
-        if key not in VIRTUAL_REMOTE_MCP_RELAY_CONTROL_FIELDS
+        if key not in _RELAY_TRANSPORT_CONTROL_FIELDS
     }
 
 

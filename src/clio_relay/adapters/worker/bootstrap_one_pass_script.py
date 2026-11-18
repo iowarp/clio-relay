@@ -36,12 +36,12 @@ Scope note: the identity this module observes covers the REQUIRED
 installed host without any extra dependency -- ``hostnames`` -- plus the
 optional ``site_marker_sha256``, using the exact same primitives
 (``socket.gethostname``/``socket.getfqdn``/sha256 of ``/etc/machine-id``) as
-the hidden ``clio-relay endpoint target-info`` command. ``ssh_host_key_sha256``
+the hidden ``clio-relay worker endpoint target-info`` command. ``ssh_host_key_sha256``
 is deliberately NOT gathered here: it is observed by ``ssh-keyscan``/
 ``ssh-keygen`` against locally cached host keys, which never authenticates
 against the target and so never costs a session -- callers compose it
 locally. ``scheduler_cluster_name`` needs the full scheduler-provider
-registry (``clio_relay.scheduler_providers``) and is left unset; a caller
+registry (``clio_relay.adapters.worker.scheduler``) and is left unset; a caller
 that needs it still has the operator-pinned fallback.
 """
 

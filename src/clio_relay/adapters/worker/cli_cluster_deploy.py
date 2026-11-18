@@ -13,19 +13,10 @@ two-file-one-Typer pattern ``cli_queue.py``/``cli_queue_maintenance.py`` and
 commands span well past the 800-line new-file cap, so the module stays
 split by this exact registry/deployment seam rather than merged into one.
 
-**Two private helpers moved here.** ``_invalidate_remote_mcp_cache_after_
-bootstrap`` had every one of its call sites inside this exact six-command
-group (``cluster_bootstrap``) -- not shared plumbing, matching
-``cli_cluster.py``'s own reasoning for ``_route_revision_before_edit``/
-``_warn_if_route_revision_changed``/``_split_csv``. ``_resolved_worker_
-capacity_policy`` (``cluster_install_endpoint_service``'s) turned out NOT
-to be single-caller -- ``cli_endpoint.py``'s ``endpoint_start`` and
-``endpoint_render_user_service`` also call it (a gap this fix-forward
-closed: ``cli_endpoint.py`` now reaches it via ``import clio_relay.
-cli_cluster_deploy as cli_cluster_deploy`` rather than the stale
-``cli._resolved_worker_capacity_policy`` it was left calling when this
-module was cut). It stays defined here rather than moving again to
-``cli_support.py`` since this remains its primary/majority owner.
+**One private helper lives here.** ``_resolved_worker_capacity_policy``
+(``cluster_install_endpoint_service``'s) is also called by
+``cli_endpoint.py``'s ``endpoint_start`` and ``endpoint_render_user_service``;
+this module stays its owner.
 
 **Collaborators imported directly, not through ``cli``.** None of
 ``clio_relay.adapters.worker.cluster_probe``, ``clio_relay.adapters.worker.bootstrap_pin``,
@@ -43,20 +34,16 @@ acceptance`` ARE audited -- reached via ``import clio_relay.X as X`` then
 ``tests/test_cli_patch_seam.py``'s existing ``AUDITED_COLLABORATORS``
 entries for those five just move their recorded caller from ``cli`` to
 ``cli_cluster_deploy`` rather than needing a new shape.
-``RemoteMcpSchemaCache``/``default_remote_mcp_cache_path``
-(``_invalidate_remote_mcp_cache_after_bootstrap``'s own collaborators) and
-``_kind_concurrency_options`` (``_resolved_worker_capacity_policy``'s)
-remain genuinely shared -- both still have call sites elsewhere in cli.py's
-``remote-mcp``/other cluster-registry commands -- so they stay reached via
-``cli.<symbol>`` through the function-local import below, unchanged.
+``_kind_concurrency_options`` (``_resolved_worker_capacity_policy``'s) is
+shared with other cluster-registry commands, so it is reached via
+``cli.<symbol>`` through the function-local import below.
 
 **The import-cycle discipline.** ``cli`` is never bound as a module-level
 name here, matching every prior extraction: it is imported function-locally,
 as the first statement of each command body that needs a cross-cutting
 ``cli.py`` collaborator (``_require_cluster``, ``_run_or_exit``,
 ``_write_failed_acceptance_report``, ``_echo_lines``, ``_json_output``,
-``_remote_target_identity``, ``RemoteMcpSchemaCache``,
-``default_remote_mcp_cache_path``, ``_kind_concurrency_options``).
+``_remote_target_identity``, ``_kind_concurrency_options``).
 """
 
 # `cli.<symbol>` references below are intentional cross-module access to a
@@ -104,58 +91,6 @@ from clio_relay.validation_report import (
     default_report_path,
     new_live_validation_report,
 )
-
-
-def _invalidate_remote_mcp_cache_after_bootstrap(
-    *,
-    cluster: str,
-    receipt: dict[str, object],
-    registry_path: Path | None = None,
-) -> dict[str, object]:
-    """Invalidate cluster-scoped MCP schemas when bootstrap changes its generation."""
-    import clio_relay.adapters.worker.cli as cli
-
-    raw_generation = receipt.get("generation")
-    if not isinstance(raw_generation, dict):
-        return {
-            "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-            "cluster": cluster,
-            "previous_generation": None,
-            "active_generation": None,
-            "generation_changed": None,
-            "action": "generation_unreported",
-            "removed_server_count": 0,
-            "removed_server_names": [],
-        }
-    generation = cast(dict[str, object], raw_generation)
-    previous_generation = generation.get("previous")
-    active_generation = generation.get("active")
-    if previous_generation is not None and (
-        not isinstance(previous_generation, str) or not previous_generation
-    ):
-        raise RelayError("bootstrap receipt has an invalid previous generation identity")
-    if not isinstance(active_generation, str) or not active_generation:
-        raise RelayError("bootstrap receipt has an invalid active generation identity")
-    generation_changed = previous_generation != active_generation
-    removed_server_names: tuple[str, ...] = ()
-    if generation_changed:
-        cache_path = cli.default_remote_mcp_cache_path(
-            registry_path=registry_path or cli_cluster.default_registry_path()
-        )
-        _cache, removed_server_names = cli.RemoteMcpSchemaCache.invalidate_cluster_entries(
-            cache_path,
-            cluster,
-        )
-    return {
-        "schema_version": "clio-relay.remote-mcp-cache-invalidation.v1",
-        "cluster": cluster,
-        "previous_generation": previous_generation,
-        "active_generation": active_generation,
-        "generation_changed": generation_changed,
-        "action": "invalidated" if generation_changed else "preserved",
-        "removed_server_count": len(removed_server_names),
-        "removed_server_names": list(removed_server_names),
-    }
 
 
 def _resolved_worker_capacity_policy(
@@ -338,17 +273,6 @@ def cluster_bootstrap(
                     receipt_lines[0].partition("=")[2],
                     "bootstrap invocation receipt",
                 )
-                cache_invalidation = _invalidate_remote_mcp_cache_after_bootstrap(
-                    cluster=cluster,
-                    receipt=receipt,
-                )
-                evidence.append(
-                    EvidenceReference(
-                        kind="remote_mcp_cache_invalidation",
-                        reference=f"remote-mcp-cache:{cluster}",
-                        metadata=cache_invalidation,
-                    )
-                )
                 invocation_id = receipt.get("invocation_id")
                 if not isinstance(invocation_id, str) or not invocation_id.startswith("bootstrap_"):
                     raise RelayError("bootstrap receipt omitted its unique invocation identity")
@@ -372,7 +296,6 @@ def cluster_bootstrap(
                             "ssh_host": ssh_host or definition.ssh_host,
                             "bootstrap_profile": definition.bootstrap_profile,
                             "output_sha256": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
-                            "remote_mcp_cache_invalidation": cache_invalidation,
                         },
                     )
                 )

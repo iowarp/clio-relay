@@ -666,7 +666,7 @@ from clio_relay.adapters.worker.jarvis_execution import run_native_jarvis_broker
 # installed ``clio_relay`` package before JARVIS resolves a package from its
 # registered repositories.  Python otherwise keeps searching only that
 # installed package's ``__path__``, silently bypassing a newer registered
-# ``clio_relay.mcp_call`` package.  Retain the already-loaded trusted modules,
+# ``clio_relay`` subpackage.  Retain the already-loaded trusted modules,
 # but give future relay-owned package imports the same first-repository
 # precedence that JARVIS applies in ``Pipeline._load_package_instance``.
 import clio_relay as clio_relay_namespace

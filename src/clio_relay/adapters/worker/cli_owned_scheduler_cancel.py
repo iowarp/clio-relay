@@ -16,7 +16,7 @@ import clio_relay.adapters.worker.cli_remote_collection_pagination as cli_remote
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
-import clio_relay.scheduler_providers as scheduler_providers
+import clio_relay.adapters.worker.scheduler as scheduler_providers
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import RelayError
 from clio_relay.models import (

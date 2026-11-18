@@ -1,8 +1,8 @@
 """Lease admission/acquisition ownership: the worker-lane leasing path.
 
 Owns ``acquire_next_job``, ``acquire_job``, ``submit_and_acquire_job``, and
-their private collaborators (``_lease_job_unlocked``, the MCP admission-lane
-matcher/counter, the per-endpoint active-lease lookup). Split out of
+their private collaborators (``_lease_job_unlocked`` and the per-endpoint
+active-lease lookup). Split out of
 ``queue_leases.py`` (facade surface #231 file-size gate, #774 ratchet):
 admission has zero call-graph dependency on that owner's listing/renewal/
 release/recovery-entrypoint methods and vice versa, so the split is a clean
@@ -21,13 +21,11 @@ from clio_relay.adapters.worker import (
     queue_store_read,
     queue_store_write,
 )
-from clio_relay.errors import ConfigurationError, QueueConflictError
+from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
-    McpAdmissionClass,
-    McpCallSpec,
     RelayJob,
     utc_now,
 )
@@ -35,21 +33,6 @@ from clio_relay.adapters.worker.worker_concurrency import KindConcurrencyInput, 
 
 _LeaseIndexIdentity = queue_lease_records.LeaseIndexIdentity
 _LeaseExpiryReference = queue_layout.LeaseExpiryReference
-
-
-def _job_matches_mcp_admission_class(
-    job: RelayJob,
-    admission_class: McpAdmissionClass,
-) -> bool:
-    """Match one durable job to a strict MCP worker lane.
-
-    Non-MCP and kind/spec-mismatched jobs remain workload so the ordinary lane
-    can fail them explicitly. They can never enter the privileged control
-    lane.
-    """
-    if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
-        return admission_class is McpAdmissionClass.WORKLOAD
-    return job.spec.admission_class is admission_class
 
 
 class QueueLeaseAdmissionMixin:
@@ -126,35 +109,16 @@ class QueueLeaseAdmissionMixin:
         ttl_seconds: int = 300,
         max_attempts: int = 3,
         kind_concurrency: KindConcurrencyInput | None = None,
-        mcp_admission_class: McpAdmissionClass | None = None,
-        mcp_admission_limit: int | None = None,
     ) -> Lease | None:
         """Lease the next queued job accepted by one atomic worker lane.
 
-        ``mcp_admission_class`` is a strict lane filter.  Workload lanes accept
-        every non-MCP job plus workload-class MCP jobs; control lanes accept
-        only explicitly classified MCP control queries.  The optional limit is
-        checked against active durable leases while the same queue lock selects
-        and leases the next job.
+        Per-kind concurrency limits are checked against active durable leases
+        while the same queue lock selects and leases the next job.
         """
         endpoint_id = queue_layout.QueueLayout.require_durable_record_id(
             endpoint_id, field="endpoint_id"
         )
         normalized_kind_concurrency = normalize_kind_concurrency(kind_concurrency)
-        if mcp_admission_class is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            mcp_admission_class,
-            McpAdmissionClass,
-        ):
-            raise ConfigurationError("worker MCP admission class is invalid")
-        if mcp_admission_limit is not None:
-            if mcp_admission_class is None:
-                raise ConfigurationError("worker MCP admission limit requires an admission class")
-            if (
-                isinstance(mcp_admission_limit, bool)
-                or not isinstance(mcp_admission_limit, int)  # pyright: ignore[reportUnnecessaryIsInstance]
-                or mcp_admission_limit < 1
-            ):
-                raise ConfigurationError("worker MCP admission limit must be at least 1")
         self.initialize()
         with self._lock:
             self._recover_pending_transitions_unlocked()
@@ -168,15 +132,6 @@ class QueueLeaseAdmissionMixin:
                 expiry_refs=reusable_expiry_refs,
             )
             if active is not None:
-                active_job = self.get_job(active.job_id)
-                if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
-                    active_job,
-                    mcp_admission_class,
-                ):
-                    raise QueueConflictError(
-                        "endpoint active lease does not match its MCP admission lane: "
-                        f"{endpoint_id}"
-                    )
                 return active
             active_counts, global_lease_total = self._lease_capacity_snapshot(
                 cluster=cluster,
@@ -184,17 +139,6 @@ class QueueLeaseAdmissionMixin:
             )
             if global_lease_total >= queue_layout.MAX_LIVE_LEASE_RECORDS:
                 return None
-            mcp_admission_at_limit = False
-            active_mcp_workload_count: int | None = None
-            if mcp_admission_class is not None and mcp_admission_limit is not None:
-                mcp_admission_at_limit = (
-                    self._active_mcp_admission_count_unlocked(
-                        cluster=cluster,
-                        admission_class=mcp_admission_class,
-                        expiry_refs=reusable_expiry_refs,
-                    )
-                    >= mcp_admission_limit
-                )
             queued_jobs, _ = queue_store_read.scan_many(
                 self._storage_root / "jobs_queued",
                 RelayJob,
@@ -205,30 +149,10 @@ class QueueLeaseAdmissionMixin:
                     continue
                 if job.kind is JobKind.INPUT_INGEST:
                     continue
-                if mcp_admission_class is not None and not _job_matches_mcp_admission_class(
-                    job,
-                    mcp_admission_class,
-                ):
-                    continue
-                if mcp_admission_at_limit and job.kind is JobKind.MCP_CALL:
-                    continue
                 if self._job_has_pending_execution_cleanup_unlocked(job.cluster, job.job_id):
                     continue
                 kind_limit = normalized_kind_concurrency.get(job.kind)
                 active_kind_count = active_counts.get(job.kind, 0)
-                if job.kind is JobKind.MCP_CALL and mcp_admission_class is not None:
-                    if mcp_admission_class is McpAdmissionClass.CONTROL_QUERY:
-                        # Control queries have their own explicit, atomic admission cap.
-                        # A workload MCP ceiling must never consume the reserved lane.
-                        kind_limit = None
-                    else:
-                        if active_mcp_workload_count is None:
-                            active_mcp_workload_count = self._active_mcp_admission_count_unlocked(
-                                cluster=cluster,
-                                admission_class=McpAdmissionClass.WORKLOAD,
-                                expiry_refs=reusable_expiry_refs,
-                            )
-                        active_kind_count = active_mcp_workload_count
                 if kind_limit is not None and active_kind_count >= kind_limit:
                     continue
                 return self._lease_job_unlocked(
@@ -238,69 +162,6 @@ class QueueLeaseAdmissionMixin:
                     validated_global_total=global_lease_total,
                 )
         return None
-
-    def _active_mcp_admission_count_unlocked(
-        self,
-        *,
-        cluster: str,
-        admission_class: McpAdmissionClass,
-        expiry_refs: list[_LeaseExpiryReference] | None,
-    ) -> int:
-        """Count one MCP admission class from bounded, validated live leases."""
-        if expiry_refs is None:
-            expiry_refs, truncated = self._scan_expiry_refs(
-                limit=queue_layout.MAX_LIVE_LEASE_RECORDS
-            )
-            if truncated:
-                raise QueueConflictError("lease expiry index exceeded its safety bound")
-        cluster_token = queue_lease_records.lease_cluster_token(cluster)
-        count = 0
-        for (
-            expires_key,
-            indexed_cluster,
-            job_kind,
-            endpoint_token,
-            job_token,
-            lease_token,
-            identity_token,
-        ) in expiry_refs:
-            if indexed_cluster != cluster_token or job_kind is not JobKind.MCP_CALL:
-                continue
-            identity = self._read_lease_index_identity_by_token(
-                lease_token,
-                identity_token,
-            )
-            if (
-                identity.cluster != cluster
-                or identity.job_kind is not JobKind.MCP_CALL
-                or queue_lease_records.lease_endpoint_token(identity.endpoint_id) != endpoint_token
-                or queue_lease_records.lease_job_token(identity.job_id) != job_token
-                or queue_lease_records.lease_expiry_key(identity.expires_at) != expires_key
-            ):
-                raise QueueConflictError(
-                    f"lease expiry admission identity mismatch: {identity.lease_id}"
-                )
-            lease = self._store_adapter.read_optional(
-                self._storage_root / "leases" / f"{identity.lease_id}.json",
-                Lease,
-            )
-            if lease is None:
-                raise QueueConflictError(
-                    f"lease expiry admission index is orphaned: {identity.lease_id}"
-                )
-            self._validate_lease_index_identity(lease, identity)
-            job = self.get_job(identity.job_id)
-            if (
-                job.cluster != cluster
-                or job.kind is not JobKind.MCP_CALL
-                or job.leased_by != identity.endpoint_id
-            ):
-                raise QueueConflictError(
-                    f"active MCP admission lease changed job identity: {identity.lease_id}"
-                )
-            if _job_matches_mcp_admission_class(job, admission_class):
-                count += 1
-        return count
 
     def acquire_job(
         self,

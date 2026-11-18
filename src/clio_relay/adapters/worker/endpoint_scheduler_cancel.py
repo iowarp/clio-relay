@@ -14,10 +14,6 @@ import time
 from typing import Any, cast
 
 from clio_relay.command_evidence import bounded_error_detail
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _jarvis_execution_recovery_is_pending,
-    _trusted_jarvis_mcp_route,
-)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _owned_scheduler_job_ids_from_metadata,
     _task_id_for_scheduler_job,
@@ -30,8 +26,6 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
 )
 from clio_relay.errors import RelayError
 from clio_relay.models import (
-    JobKind,
-    McpCallSpec,
     RelayJob,
     SchedulerStatus,
 )
@@ -102,16 +96,6 @@ class SchedulerCancelMixin:
             if owned_ids:
                 scheduler_cancel_attempted[0] = True
                 self._cancel_scheduler_jobs(job, owned_ids)
-            elif _jarvis_execution_recovery_is_pending(
-                job,
-                self.queue.get_task(task_id),
-            ):
-                self.queue.append_event(
-                    job.job_id,
-                    "scheduler.cancel_identity_pending",
-                    "Explicit scheduler cancellation is waiting for JARVIS ownership recovery",
-                    payload={"task_id": task_id},
-                )
             else:
                 scheduler_cancel_attempted[0] = True
                 self._record_scheduler_cancel_refused(job)
@@ -130,29 +114,6 @@ class SchedulerCancelMixin:
         scheduler_job_ids: list[str],
         scheduler_cancel_attempted: list[bool],
     ) -> None:
-        route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
-        if route_valid:
-            self.queue.append_event(
-                job.job_id,
-                "mcp.dispatch_timeout",
-                "JARVIS MCP dispatch exceeded timeout_seconds; workload ownership will be queried",
-                payload={
-                    "task_id": task_id,
-                    "scheduler_cancel_requested": False,
-                },
-            )
-            return
-        if job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
-            self.queue.append_event(
-                job.job_id,
-                "mcp.dispatch_timeout",
-                "Endpoint MCP operation exceeded timeout_seconds; contained process terminated",
-                payload={
-                    "task_id": task_id,
-                    "scheduler_cancel_requested": False,
-                },
-            )
-            return
         durable_scheduler_job_ids = self._durable_scheduler_job_ids(
             job,
             task_id,

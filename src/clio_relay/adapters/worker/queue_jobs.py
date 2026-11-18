@@ -46,7 +46,6 @@ from clio_relay.models import (
     RelayJob,
     SchedulerCancelPending,
     UsedArtifactRef,
-    prepare_owned_jarvis_run_submission,
     utc_now,
 )
 from clio_relay.pagination import MAX_RESPONSE_PAGE_RECORDS, validate_response_page_limit
@@ -186,7 +185,6 @@ class QueueJobsMixin:
                         f"invalid idempotency record for key: {job.idempotency_key}"
                     )
                 job = job.model_copy(update={"job_id": cast(str, canonical_job_id)})
-            job = prepare_owned_jarvis_run_submission(job)
             job_digest = queue_idempotency._job_idempotency_digest(job)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             if job.submission_digest not in {None, job_digest}:
                 raise QueueConflictError("submitted job carries a mismatched submission_digest")

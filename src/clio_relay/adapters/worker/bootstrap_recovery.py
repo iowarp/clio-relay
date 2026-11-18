@@ -49,7 +49,7 @@ _POST_ACTIVATION_STATES = frozenset(
 
 _RETIRE_PROCEDURE = (
     "back up the journal file to '<path>.stale-backup-<UTC timestamp>' next to "
-    "it, remove the original, first confirming with `clio-relay installation-info` "
+    "it, remove the original, first confirming with `clio-relay worker installation-info` "
     "that the active generation is healthy and untouched, then re-run "
     "`cluster bootstrap`"
 )

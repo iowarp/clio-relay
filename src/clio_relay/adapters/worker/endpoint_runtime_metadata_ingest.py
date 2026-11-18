@@ -1,52 +1,26 @@
-"""One-use scheduler-launch-refusal/direct-execution proof consumption plus the
-remote-MCP-call runtime metadata ingest path.
+"""One-use scheduler-launch-refusal and direct-execution proof consumption.
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition.
 ``_consume_scheduler_launch_refusal``/``_consume_direct_execution_proof`` validate and
-redact the one-use durable proofs a JARVIS preflight embeds in its runtime record;
-``_ingest_mcp_runtime_metadata`` reads ``mcp-result.json`` for a remote
-(non-endpoint-owned) MCP call and adopts native runtime metadata from it.
+redact the one-use durable proofs a JARVIS preflight embeds in its runtime record.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 from typing import Any, cast
 
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _attributed_jarvis_dispatch_refusal,
-    _trusted_jarvis_mcp_route,
-    trusted_jarvis_mcp_result,
-)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _durable_scheduler_submission_intent,
-    _runtime_metadata_is_mcp_transport_wrapper,
-    _runtime_metadata_is_native,
     _runtime_sidecar_channel_failed,
 )
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _configured_scheduler_provider_name,
     _jarvis_pipeline_name,
 )
-from clio_relay.errors import ConfigurationError
-from clio_relay.filesystem_paths import (
-    internal_filesystem_path,
-)
-from clio_relay.adapters.worker.jarvis_dispatch_failure import (
-    McpRuntimeIngestOutcome,
-)
-from clio_relay.models import (
-    McpCallSpec,
-    RelayJob,
-)
-from clio_relay.runtime_metadata import (
-    JarvisRuntimeMetadata,
-    RuntimeMetadataSource,
-    runtime_metadata_from_mcp_result_document,
-)
-from clio_relay.spool import JobSpool
+from clio_relay.models import RelayJob
+from clio_relay.runtime_metadata import JarvisRuntimeMetadata
 
 
 class RuntimeMetadataIngestMixin:
@@ -192,138 +166,3 @@ class RuntimeMetadataIngestMixin:
                 }
             }
         )
-
-    def _ingest_mcp_runtime_metadata(
-        self,
-        job: RelayJob,
-        *,
-        task_id: str,
-        spool: JobSpool,
-        state: list[JarvisRuntimeMetadata | None],
-        digests: set[str],
-        scheduler_job_ids: list[str],
-    ) -> McpRuntimeIngestOutcome:
-        """Ingest structured runtime metadata returned by a remote MCP call.
-
-        Returns:
-            Whether native runtime metadata was adopted, together with the typed
-            refusal when the pinned route answered with an explicit tool error.
-        """
-        route_valid, _route_reason = _trusted_jarvis_mcp_route(job)
-        if not route_valid:
-            return McpRuntimeIngestOutcome(ingested=False)
-        result_path = spool.path / "mcp-result.json"
-        storage_result_path = internal_filesystem_path(result_path)
-        if not storage_result_path.exists():
-            return McpRuntimeIngestOutcome(ingested=False)
-        try:
-            result_document = json.loads(storage_result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_read_failed",
-                f"MCP runtime result could not be read: {exc}",
-            )
-            return McpRuntimeIngestOutcome(ingested=False)
-        trusted, reason = trusted_jarvis_mcp_result(job, result_document)
-        if not trusted:
-            refusal = _attributed_jarvis_dispatch_refusal(job, result_document)
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                f"Refused JARVIS MCP runtime metadata: {reason}",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": reason,
-                    "dispatch_refused": refusal is not None,
-                },
-            )
-            return McpRuntimeIngestOutcome(ingested=False, refusal=refusal)
-        try:
-            metadata = runtime_metadata_from_mcp_result_document(result_document)
-        except ValueError as exc:
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                f"Refused invalid native JARVIS execution documents: {exc}",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": str(exc),
-                },
-            )
-            raise ConfigurationError(
-                f"native JARVIS execution documents were invalid: {exc}"
-            ) from exc
-        if metadata is None:
-            return McpRuntimeIngestOutcome(ingested=False)
-        if not _runtime_metadata_is_native(metadata):
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                "Refused non-native JARVIS MCP execution metadata",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": "native handle, record, and progress documents are required",
-                },
-            )
-            return McpRuntimeIngestOutcome(ingested=False)
-        expected_pipeline_id = (
-            job.spec.arguments.get("pipeline_id") if isinstance(job.spec, McpCallSpec) else None
-        )
-        if metadata.pipeline_id != expected_pipeline_id:
-            reason = "native JARVIS pipeline identity did not match the durable MCP request"
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                f"Refused JARVIS MCP runtime metadata: {reason}",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": reason,
-                },
-            )
-            raise ConfigurationError(reason)
-        expected_execution_id = (
-            job.spec.arguments.get("execution_id") if isinstance(job.spec, McpCallSpec) else None
-        )
-        if metadata.execution_id != expected_execution_id:
-            reason = "native JARVIS execution identity did not match the durable MCP request"
-            self.queue.append_event(
-                job.job_id,
-                "runtime.metadata_refused",
-                f"Refused JARVIS MCP runtime metadata: {reason}",
-                payload={
-                    "source": RuntimeMetadataSource.JARVIS_MCP.value,
-                    "ownership_verified": False,
-                    "reason": reason,
-                },
-            )
-            raise ConfigurationError(reason)
-        current_runtime = state[0]
-        superseded_transport_runtime = (
-            current_runtime
-            if current_runtime is not None
-            and current_runtime.execution_id != metadata.execution_id
-            and _runtime_metadata_is_mcp_transport_wrapper(current_runtime)
-            else None
-        )
-        self._persist_runtime_metadata(
-            job,
-            task_id=task_id,
-            metadata=metadata,
-            state=state,
-            digests=digests,
-            scheduler_job_ids=scheduler_job_ids,
-            superseded_transport_runtime=superseded_transport_runtime,
-        )
-        self._resolve_jarvis_execution_recovery(
-            job,
-            task_id=task_id,
-            metadata=metadata,
-            resolution="dispatch_result",
-            result_path=result_path,
-        )
-        return McpRuntimeIngestOutcome(ingested=True)

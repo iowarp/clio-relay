@@ -76,7 +76,7 @@ import typer
 import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.adapters.worker.endpoint as endpoint
 import clio_relay.installation as installation
-import clio_relay.scheduler_providers as scheduler_providers
+import clio_relay.adapters.worker.scheduler as scheduler_providers
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service, write_endpoint_user_service
@@ -123,11 +123,8 @@ def endpoint_start(
         int | None,
         typer.Option(
             help=(
-                "Slots carved out of total capacity for control-class MCP queries. Defaults "
-                "to the cluster's registered worker_capacity for worker endpoints "
-                "(clio-relay#219) rather than an unpinned 0: 0 silently starves every "
-                "control-class job (jarvis_describe and kin) with no typed reason -- it just "
-                "never gets picked up."
+                "Accepted so units rendered by earlier versions still start; the worker no "
+                "longer runs control-class MCP queries, so it reserves no slots for them."
             )
         ),
     ] = None,
@@ -155,12 +152,8 @@ def endpoint_start(
         if scheduler_provider is None:
             definition = cli._require_cluster(cluster)
     if definition is not None:
-        # clio-relay#219: resolve unpinned concurrency/control_query_concurrency from
-        # the cluster's own registered WorkerCapacityPolicy (the same resolution
-        # `endpoint render-user-service` already applies) instead of this command's
-        # own disconnected CLI defaults -- a fresh worker deployment that never pins
-        # these flags otherwise gets control_query_concurrency=0 and silently
-        # starves every control-class job.
+        # clio-relay#219: resolve unpinned concurrency from the cluster's own
+        # registered WorkerCapacityPolicy, as `endpoint render-user-service` does.
         capacity = cli_cluster_deploy._resolved_worker_capacity_policy(
             definition,
             concurrency=concurrency,
@@ -169,38 +162,12 @@ def endpoint_start(
             clear_kind_concurrency=False,
         )
         resolved_concurrency = capacity.concurrency
-        resolved_control_query_concurrency = capacity.control_query_concurrency
         resolved_kind_concurrency: dict[JobKind, int] = capacity.kind_concurrency
     else:
-        # No cluster is configured (desktop role): preserve the historical
-        # single-slot, no-reserved-control-capacity default exactly.
-        # WorkerCapacityPolicy requires concurrency>=2, which does not fit this
-        # role's single-slot default, so its own bounds are enforced directly.
         resolved_concurrency = 1 if concurrency is None else concurrency
-        resolved_control_query_concurrency = (
-            0 if control_query_concurrency is None else control_query_concurrency
-        )
         if resolved_concurrency < 1:
             raise typer.BadParameter("--concurrency must be at least 1")
-        if resolved_control_query_concurrency < 0:
-            raise typer.BadParameter("--control-query-concurrency must not be negative")
-        if resolved_control_query_concurrency >= resolved_concurrency:
-            raise typer.BadParameter("--control-query-concurrency must be less than --concurrency")
         resolved_kind_concurrency = cli._kind_concurrency_options(kind_concurrency)
-    if role == EndpointRole.WORKER and resolved_control_query_concurrency == 0:
-        # clio-relay#219: a worker with zero control-query capacity accepts
-        # describe-class submissions and never runs them -- indistinguishable
-        # from slow until an operator discovers the knob. Warn loudly at
-        # startup instead of leaving that silent.
-        typer.echo(
-            f"warning: worker {cluster or 'local'!r} is starting with "
-            "control_query_concurrency=0; every describe-class control-query job "
-            "submitted to it will queue forever with no typed reason. Pass "
-            "--control-query-concurrency N (N >= 1) here, or bake it into the persisted "
-            "systemd unit with 'clio-relay endpoint render-user-service --cluster "
-            f"{cluster or '<cluster>'} --control-query-concurrency N'.",
-            err=True,
-        )
     selected_scheduler = scheduler_provider
     if selected_scheduler is None and definition is not None:
         selected_scheduler = definition.scheduler_provider
@@ -209,7 +176,6 @@ def endpoint_start(
         settings=settings,
         cluster=cluster or "local",
         concurrency=resolved_concurrency,
-        control_query_concurrency=resolved_control_query_concurrency,
         kind_concurrency=resolved_kind_concurrency,
         scheduler_provider=(
             scheduler_providers.provider_for_scheduler(selected_scheduler)

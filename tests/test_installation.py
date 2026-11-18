@@ -1935,7 +1935,7 @@ def test_jarvis_mcp_command_receipt_path_overrides_ambient_current_installation(
 ) -> None:
     """#228: an explicit receipt_path must win over the ambient/global receipt.
 
-    The pinned ``/jobs/jarvis-mcp-call`` route resolved its launcher via this
+    The pinned JARVIS MCP launcher was once resolved via this
     PROCESS's ambient current installation (``CLIO_RELAY_INSTALL_RECEIPT`` /
     the box-global ``current`` symlink fallback) rather than the CLUSTER's
     own registered ``relay_install_receipt`` -- on a multi-tenant host, a

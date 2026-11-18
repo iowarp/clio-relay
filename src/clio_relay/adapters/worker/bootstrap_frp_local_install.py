@@ -1,7 +1,7 @@
 """Local (Windows) frp install for the Linux/Windows cluster bootstrap CLI.
 
 Split from bootstrap.py (clio-relay#255). `install_local_frp` installs frpc/frps for the
-operator's own Windows machine (used by ``clio-relay install-frp``, distinct from the
+operator's own Windows machine (used by ``clio-relay worker install-frp``, distinct from the
 remote Linux cluster's own frp install embedded in the rendered bootstrap script); its
 four helpers (directory cleanup, release-archive fetch/verify, and executable/digest
 assertion) are private to this concern. None of the six names are monkeypatched;

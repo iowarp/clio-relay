@@ -3,10 +3,7 @@
 split/http-api-w3 (iowarp/clio-relay#231): moved verbatim out of
 ``http_api.py``. None of these models or their validators referenced any of
 ``create_app()``'s local closures, so this is an unmodified, atomic move.
-``http_api.py`` re-exports every model class under its original name so
-external imports (e.g. ``from clio_relay.adapters.worker.http_api import
-JarvisMcpCallSubmitRequest``, used by ``tests/test_jarvis_handle_first_
-admission.py``) keep resolving it.
+Routes import these models from this module directly.
 """
 
 from __future__ import annotations
@@ -18,20 +15,15 @@ import secrets
 from datetime import datetime
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clio_relay.config import MAX_INPUT_FILE_MAX_BYTES
 from clio_relay.identifiers import DurableRecordId
 from clio_relay.jarvis_service_runtime import JarvisServiceRuntimeBinding
 from clio_relay.models import (
-    REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactUse,
     GatewaySessionState,
-    JarvisRunInputManifest,
-    McpControlQueryEvidence,
-    McpOperation,
     TaskEventStatus,
-    validate_mcp_env_from,
 )
 
 
@@ -126,106 +118,6 @@ class RemoteAgentSubmitRequest(BaseModel):
         default_factory=_empty_artifact_uses,
         max_length=1_000,
     )
-
-
-class McpCallSubmitRequest(BaseModel):
-    """HTTP request to submit a remote MCP tool call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    cluster: str
-    server: str
-    server_args: list[str] = Field(default_factory=list)
-    env_from: dict[str, str] = Field(default_factory=dict)
-    expected_server_artifact_digest: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    expected_registered_contract: str | None = Field(default=None, min_length=1, max_length=256)
-    operation: McpOperation = McpOperation.TOOLS_CALL
-    tool: str | None = None
-    arguments: dict[str, object] = Field(default_factory=dict)
-    jarvis_input_manifest: JarvisRunInputManifest | None = None
-    control_query_evidence: McpControlQueryEvidence | None = None
-    timeout_seconds: int | None = Field(default=None, gt=0)
-    idempotency_key: str
-    used_artifact_refs: list[ArtifactUse] = Field(
-        default_factory=_empty_artifact_uses,
-        max_length=1_000,
-    )
-
-    @field_validator("env_from")
-    @classmethod
-    def validate_environment_references(cls, value: dict[str, str]) -> dict[str, str]:
-        """Reject invalid names and relay-owned credential references."""
-        return validate_mcp_env_from(value)
-
-    @model_validator(mode="after")
-    def validate_operation_contract(self) -> McpCallSubmitRequest:
-        """Keep call and discovery payloads unambiguous before admission."""
-        if self.operation is McpOperation.TOOLS_CALL:
-            if not self.tool:
-                raise ValueError("tool is required for tools/call")
-            if self.jarvis_input_manifest is not None and (
-                self.tool != "jarvis_run"
-                or self.expected_registered_contract != REGISTERED_JARVIS_USER_CONTRACT
-                or self.arguments.get("pipeline_id") != self.jarvis_input_manifest.route.pipeline_id
-            ):
-                raise ValueError(
-                    "JARVIS input manifests require the exact registered jarvis_run pipeline"
-                )
-            return self
-        if self.tool is not None:
-            raise ValueError("tool must be omitted for tools/list")
-        if self.arguments:
-            raise ValueError("arguments must be empty for tools/list")
-        if self.expected_server_artifact_digest is not None:
-            raise ValueError("tools/list must not carry an expected server artifact digest")
-        if self.expected_registered_contract is not None:
-            raise ValueError("tools/list must not carry a registered semantic contract binding")
-        if self.control_query_evidence is not None:
-            raise ValueError("tools/list must not carry control-query route evidence")
-        if self.jarvis_input_manifest is not None:
-            raise ValueError("tools/list must not carry a JARVIS input manifest")
-        return self
-
-
-class JarvisMcpCallSubmitRequest(BaseModel):
-    """HTTP request to submit a remote JARVIS MCP tool call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    cluster: str
-    operation: McpOperation = McpOperation.TOOLS_CALL
-    tool: str | None = None
-    arguments: dict[str, object] = Field(default_factory=dict)
-    expected_server_artifact_digest: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    timeout_seconds: int | None = Field(default=None, gt=0)
-    idempotency_key: str
-    used_artifact_refs: list[ArtifactUse] = Field(
-        default_factory=_empty_artifact_uses,
-        max_length=1_000,
-    )
-
-    @model_validator(mode="after")
-    def reject_internal_jarvis_run_wait(self) -> JarvisMcpCallSubmitRequest:
-        """Keep workload waiting out of the trusted handle-first HTTP ingress."""
-        if self.operation is McpOperation.TOOLS_CALL and not self.tool:
-            raise ValueError("tool is required for tools/call")
-        if self.operation is McpOperation.TOOLS_LIST:
-            if self.tool is not None:
-                raise ValueError("tool must be omitted for tools/list")
-            if self.arguments:
-                raise ValueError("arguments must be empty for tools/list")
-            if self.expected_server_artifact_digest is not None:
-                raise ValueError("tools/list must not carry an expected server artifact digest")
-            return self
-        if self.tool == "jarvis_run" and "wait" in self.arguments:
-            raise ValueError("jarvis_run does not accept internal wait; use jarvis_get_execution")
-        return self
 
 
 class QueueCancelRequest(BaseModel):

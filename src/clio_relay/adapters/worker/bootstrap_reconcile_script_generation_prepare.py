@@ -54,7 +54,7 @@ def reconcile_script_generation_prepare(
     """
     return f"""  recovery_queue="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info 2>/dev/null || true
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info 2>/dev/null || true
   )"
   export recovery_queue
   if ! python3 -c \
@@ -73,7 +73,7 @@ def reconcile_script_generation_prepare(
   fi
   recovery_queue="$(
     CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-      "$HOME/.local/bin/clio-relay" queue readiness-info
+      "$HOME/.local/bin/clio-relay" worker queue readiness-info
   )"
   export recovery_queue
   if ! python3 -c \
@@ -93,7 +93,7 @@ def reconcile_script_generation_prepare(
     for _BOOTSTRAP_REPAIR_RECOVERY_WORKER_ATTEMPT in $(seq 1 90); do
       recovery_worker="$(
         CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-          "$HOME/.local/bin/clio-relay" endpoint worker-info \
+          "$HOME/.local/bin/clio-relay" worker endpoint worker-info \
             --cluster "$cluster_name" --freshness-seconds 120 2>/dev/null || true
       )"
       if printf '%s\\n' "$recovery_worker" | python3 -c \
@@ -225,9 +225,9 @@ bootstrap_recover_previous_transaction() {{
           CLIO_RELAY_CORE_DIR={rendered_core_dir} \
           CLIO_RELAY_SPOOL_DIR={rendered_spool_dir} \
           {WORKER_LIFETIME_GUARD_FD_ENV}="$WORKER_LIFETIME_GUARD_FD" \
-            "$HOME/.local/bin/clio-relay" init --migrate-legacy-output
+            "$HOME/.local/bin/clio-relay" worker init --migrate-legacy-output
           CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-            "$HOME/.local/bin/clio-relay" queue readiness-info >/dev/null
+            "$HOME/.local/bin/clio-relay" worker queue readiness-info >/dev/null
           exec 8>&-
           if [ "$service_was_active" = "1" ] && [ -n "$service_name" ]; then
             bootstrap_recover_service "$service_name"
@@ -236,7 +236,7 @@ bootstrap_recover_previous_transaction() {{
             for _BOOTSTRAP_RECOVERY_WORKER_ATTEMPT in $(seq 1 90); do
               recovery_worker="$(
                 CLIO_RELAY_CORE_DIR={rendered_core_dir} \
-                  "$HOME/.local/bin/clio-relay" endpoint worker-info \
+                  "$HOME/.local/bin/clio-relay" worker endpoint worker-info \
                     --cluster "$cluster_name" --freshness-seconds 120 2>/dev/null || true
               )"
               if printf '%s\\n' "$recovery_worker" | python3 -c \
@@ -543,7 +543,6 @@ __CLIO_RELAY_RECONCILE_PYPI_DIGEST__
     fi
     JARVIS_PACKAGE_PROBE='import clio_relay, jarvis_cd; '
     JARVIS_PACKAGE_PROBE+='import clio_relay.bounded_command.pkg; '
-    JARVIS_PACKAGE_PROBE+='import clio_relay.mcp_call.pkg; '
     JARVIS_PACKAGE_PROBE+='import clio_relay.remote_agent.pkg'
     "$RELAY_PROVIDER_PYTHON" -I -c "$JARVIS_PACKAGE_PROBE"
     "$ACTIVE_JARVIS_PYTHON" -I -c "$JARVIS_PACKAGE_PROBE"

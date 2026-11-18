@@ -175,7 +175,7 @@ service_enabled="$(systemctl --user is-enabled {quoted_unit} 2>/dev/null || true
 service_active="$(systemctl --user is-active {quoted_unit} 2>/dev/null || true)"
 if [ "$service_active" != "active" ]; then
   echo "frpc proxy unit is not active after install: {paths.unit_name} $service_active" >&2
-  echo "diagnose with: clio-relay relay-host proxy-status --cluster <cluster>" >&2
+  echo "diagnose with: clio-relay worker relay-host proxy-status --cluster <cluster>" >&2
   exit 1
 fi
 service_enabled_bool=false

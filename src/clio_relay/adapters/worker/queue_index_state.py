@@ -221,7 +221,7 @@ def require_index_migration_complete(storage_root: Path) -> None:
     """Require every durable index migration component to be complete."""
     if read_index_migration_state(storage_root).get("complete") is not True:
         raise QueueConflictError(
-            "queue indexes require migration; run `clio-relay queue migrate-indexes` "
+            "queue indexes require migration; run `clio-relay worker queue migrate-indexes` "
             "before starting workers"
         )
 

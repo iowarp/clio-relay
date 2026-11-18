@@ -107,7 +107,7 @@ def _start_script(
         f"{remote_env(definition)}\n"
         f"{token_export}"
         f"printf '%s' {_shell_single_quote(request_json)} | "
-        f"{relay_executable} session start-owned\n"
+        f"{relay_executable} worker session start-owned\n"
     )
 
 
@@ -149,7 +149,7 @@ def _owned_status_script(
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
-        f"{relay_executable} session recovery-status --cluster {shlex.quote(cluster)} "
+        f"{relay_executable} worker session recovery-status --cluster {shlex.quote(cluster)} "
         f"--session-id {shlex.quote(session_id)}{probe_argument}\n"
     )
 
@@ -171,7 +171,7 @@ def _owned_start_status_script(
     return (
         "set -euo pipefail\n"
         f"{remote_env(definition)}\n"
-        f"{relay_executable} session start-status-owned "
+        f"{relay_executable} worker session start-status-owned "
         f"--cluster {shlex.quote(selector.cluster)} "
         f"--session-id {shlex.quote(selector.session_id)} "
         f"--start-operation-id {shlex.quote(selector.start_operation_id)} "
@@ -200,7 +200,7 @@ def _owned_identity_challenge_script(
         "umask 077\n"
         f"{remote_env(definition)}\n"
         f"printf '%s' {_shell_single_quote(request.model_dump_json())} | "
-        f"{relay_executable} session challenge-owned\n"
+        f"{relay_executable} worker session challenge-owned\n"
     )
 
 
@@ -214,7 +214,7 @@ def _owned_cleanup_finalize_script(
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        f"{relay_executable} session finalize-cleanup-owned\n"
+        f"{relay_executable} worker session finalize-cleanup-owned\n"
     )
 
 
@@ -225,7 +225,7 @@ def _owned_cleanup_report_read_script(*, definition: ClusterDefinition) -> str:
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        f"{relay_executable} session read-cleanup-report-owned\n"
+        f"{relay_executable} worker session read-cleanup-report-owned\n"
     )
 
 
@@ -259,7 +259,7 @@ def _owned_teardown_script(
         "umask 077\n"
         f"{remote_env(definition)}\n"
         f"printf '%s' {_shell_single_quote(request.model_dump_json())} | "
-        f"{relay_executable} session teardown-owned\n"
+        f"{relay_executable} worker session teardown-owned\n"
     )
 
 

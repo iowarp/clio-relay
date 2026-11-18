@@ -21,9 +21,8 @@ from clio_relay import jarvis_provider
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.adapters.worker.jarvis_execution import sanitized_jarvis_environment
-from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
 from clio_relay.jarvis_provider import JarvisCdProvider
-from clio_relay.models import JarvisRunSpec, JobKind, McpCallSpec, RelayJob, RemoteAgentTaskSpec
+from clio_relay.models import JarvisRunSpec, JobKind, RelayJob, RemoteAgentTaskSpec
 
 
 def _private_sidecar_environment(*, scheduler_expected: bool | str) -> dict[str, str]:
@@ -483,42 +482,6 @@ def test_remote_agent_task_yaml_generation(tmp_path: Path) -> None:
     assert package["agent_args"] == ["--prompt", "{prompt_path}"]
     assert package["prompt_path"].endswith("prompt.md")
     assert package["context"] == {"source_event_seq": 7, "match_groups": {"step": "50"}}
-
-
-def test_mcp_call_yaml_generation() -> None:
-    provider = JarvisCdProvider()
-    rendered = provider.render_mcp_call_yaml(
-        McpCallSpec(
-            server="uvx",
-            server_args=[
-                "--from",
-                "clio-kit==2.2.6",
-                "clio-kit",
-                "mcp-server",
-                "jarvis",
-            ],
-            env_from={"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"},
-            expected_jarvis_cd_lock_binding=jarvis_cd_lock_binding_expectation(),
-            tool="inspect",
-            arguments={"path": "x"},
-        )
-    )
-    document = yaml.safe_load(rendered)
-
-    package = document["pkgs"][0]
-    assert package["pkg_type"] == "clio_relay.mcp_call"
-    assert package["server"] == "uvx"
-    assert package["server_args"] == [
-        "--from",
-        "clio-kit==2.2.6",
-        "clio-kit",
-        "mcp-server",
-        "jarvis",
-    ]
-    assert package["env_from"] == {"SCIENCE_TOKEN": "SITE_SCIENCE_TOKEN"}
-    assert package["expected_jarvis_cd_lock_binding"] == jarvis_cd_lock_binding_expectation()
-    assert package["tool"] == "inspect"
-    assert package["arguments"] == {"path": "x"}
 
 
 def test_named_pipeline_command_uses_configured_jarvis_binary() -> None:

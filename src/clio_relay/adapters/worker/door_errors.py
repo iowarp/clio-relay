@@ -10,9 +10,7 @@ through this module -- tracked as its own live issue,
 `iowarp/clio-relay#235 <https://github.com/iowarp/clio-relay/issues/235>`_)
 -- each translated exceptions to their own locally-invented wire shape.
 This module is the single classification owner: :func:`classify` turns a
-caught exception (or a durable, never-raised
-:class:`~clio_relay.adapters.worker.jarvis_dispatch_failure.JarvisDispatchRefusal`) into a
-:class:`RelayFault`. The cohesive renderers live in
+caught exception into a :class:`RelayFault`. The cohesive renderers live in
 :mod:`clio_relay.adapters.worker.door_error_adapters` and are re-exported here for the
 established public and test patch surface. A call site never picks its own
 status code: every ``reason``, and everything that follows from it
@@ -21,16 +19,13 @@ status code: every ``reason``, and everything that follows from it
 
 **Dispatch order** (see :func:`classify`):
 
-1. A :class:`JarvisDispatchRefusal` is a frozen dataclass a durable
-   ``jarvis_run`` result *carries* -- never raised and caught -- so it gets
-   its own object-typed entry point ahead of exception dispatch.
-2. An explicit ``reason=`` keyword is the call-path-scope override for sites
+1. An explicit ``reason=`` keyword is the call-path-scope override for sites
    that already have a shipped, call-path-fixed reason (``fastmcp_server.py``'s
    ``_handle_get`` catch-all always means
    ``mcp_task_status_reconciliation_failed``, regardless of the underlying
    exception's type). These call sites already know their own reason; this
    module still owns everything that follows from it.
-3. Seven exception types have an unambiguous 1:1 reason and are dispatched
+2. Seven exception types have an unambiguous 1:1 reason and are dispatched
    by ``isinstance`` with no call-site help:
    :class:`TaskInputParkConflictError`, :class:`NotFoundError`,
    :class:`ConfigurationError`,
@@ -38,7 +33,7 @@ status code: every ``reason``, and everything that follows from it
    :class:`~clio_relay.adapters.worker.storage_runtime.StorageRuntimeViolation`,
    :class:`ObservationTimeoutError`, and
    :class:`~clio_relay.job_identity.OwnerSessionIdentityError`.
-4. Anything else is ``internal_error``: the traceback is logged once, here,
+3. Anything else is ``internal_error``: the traceback is logged once, here,
    via ``logger.exception`` -- and never reaches ``message`` (nor, by
    construction, the wire). This is what makes §3's "0 unclassified
    exceptions reach the wire" exit criterion meetable. "Once" describes
@@ -124,7 +119,6 @@ from clio_relay.errors import (
     TaskInputParkConflictError,
 )
 from clio_relay.errors import public_message_error as public_message_error
-from clio_relay.adapters.worker.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
 from clio_relay.adapters.worker.storage_runtime import (
     StorageAdmissionError,
@@ -227,13 +221,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 mcp_code=mcp_types.INTERNAL_ERROR,
                 http_status=500,
                 title="MCP task status reconciliation failed",
-            ),
-            _row(
-                "jarvis_dispatch_refused",
-                retryable=False,
-                mcp_code=mcp_types.INVALID_PARAMS,
-                http_status=422,
-                title="JARVIS dispatch refused",
             ),
             _row(
                 "not_found",
@@ -357,13 +344,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("task_not_found", 404, "Task not found"),
             _http_row("gateway_not_found", 404, "Gateway not found"),
             _http_row("artifact_not_found", 404, "Artifact not found"),
-            # clio-relay#278: a bare execution_id (the artifact-listing
-            # surfaces' alternative to job_id) that resolved to no unique
-            # owning jarvis_run job -- distinct from job_not_found/
-            # artifact_not_found so a caller can tell "the execution id
-            # itself is unknown" apart from "the job/artifact id is
-            # unknown" without re-parsing message text.
-            _http_row("execution_not_found", 404, "Execution not found"),
             _http_row(
                 "session_generation_identity_unavailable",
                 409,
@@ -377,7 +357,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("unbound_session_api", 409, "Unbound session API"),
             _http_row("job_cluster_mismatch", 409, "Job cluster mismatch"),
             _http_row("job_submission_conflict", 409, "Job submission conflict"),
-            _http_row("mcp_submission_conflict", 409, "MCP submission conflict"),
             _http_row(
                 "jarvis_runtime_authority_conflict",
                 409,
@@ -391,7 +370,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("queue_operation_conflict", 409, "Queue operation conflict"),
             _http_row("retention_conflict", 409, "Retention conflict"),
             _http_row("job_submission_refused", 422, "Job submission refused"),
-            _http_row("mcp_admission_refused", 422, "MCP admission refused"),
             _http_row("input_ingest_refused", 422, "Input ingest refused"),
             _http_row("job_route_refused", 422, "Job route refused"),
             _http_row("jarvis_submission_refused", 422, "JARVIS submission refused"),
@@ -661,21 +639,18 @@ def http_problem(
 
 
 def classify(
-    exc: BaseException | JarvisDispatchRefusal,
+    exc: BaseException,
     *,
     reason: str | None = None,
     message: str | None = None,
     data: Mapping[str, Any] | None = None,
     _table: Mapping[str, ReasonSpec] = REASONS,
 ) -> RelayFault:
-    """Classify one caught exception (or a carried refusal) into a :class:`RelayFault`.
+    """Classify one caught exception into a :class:`RelayFault`.
 
     Args:
-        exc: The caught exception, or a durable
-            :class:`JarvisDispatchRefusal` a ``jarvis_run`` result carries
-            (never raised-and-caught -- see dispatch rule 1 in the module
-            docstring).
-        reason: A call-path-scope override (dispatch rule 2). Must already be
+        exc: The caught exception.
+        reason: A call-path-scope override (dispatch rule 1). Must already be
             a key in the reason table; an unregistered reason is a caller
             bug, not a silent fallback, and raises :class:`ValueError`.
         message: Deliberate bounded public detail. When omitted, a marked
@@ -691,30 +666,13 @@ def classify(
 
     Returns:
         The classified :class:`RelayFault`. Falls back to ``internal_error``
-        (dispatch rule 4) when nothing else matches, logging the traceback
+        (dispatch rule 3) when nothing else matches, logging the traceback
         once via ``logger.exception`` here -- on the HTTP surface, Starlette's
         ``ServerErrorMiddleware`` still re-raises after the response is sent
         (by design, so a real ASGI server can log it too), so a second,
         server-side-only log line from uvicorn is expected, not a bug (F6).
         Unmarked exception internals never reach the wire either way.
     """
-    if isinstance(exc, JarvisDispatchRefusal):
-        spec = _table["jarvis_dispatch_refused"]
-        return _build(
-            spec,
-            message=(
-                message
-                if message is not None
-                else public_message(reason=spec.reason, title=spec.title)
-            ),
-            data=data
-            if data is not None
-            else {
-                "code": exc.code,
-                "pipeline_id": exc.pipeline_id,
-                "execution_id": exc.execution_id,
-            },
-        )
     if reason is not None:
         if reason not in _table:
             msg = f"door_errors.classify(): {reason!r} is not a registered REASONS entry"

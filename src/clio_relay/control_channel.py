@@ -596,10 +596,10 @@ def owned_session_channel_bootstrap_script(
         "set -euo pipefail\n"
         "umask 077\n"
         f"{remote_env(definition)}\n"
-        f"__clio_status=$({relay_executable} session recovery-status "
+        f"__clio_status=$({relay_executable} worker session recovery-status "
         f"--cluster {shlex.quote(cluster)} --session-id {shlex.quote(session_id)})\n"
         f"__clio_identity=$(printf '%s' {shlex.quote(challenge_request)} | "
-        f"{relay_executable} session challenge-owned)\n"
+        f"{relay_executable} worker session challenge-owned)\n"
         # Frame the document so a login-shell banner, or an executor that
         # pretty-prints its JSON, cannot be mistaken for the bootstrap.
         f"printf '%s\\n' {shlex.quote(begin)}\n"

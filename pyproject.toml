@@ -50,7 +50,6 @@ packages = ["src/clio_relay"]
 "jarvis-packages" = "clio_relay/assets/jarvis-packages"
 "jarvis-packages/clio_relay/clio_relay/_jarvis_api.py" = "clio_relay/_jarvis_api.py"
 "jarvis-packages/clio_relay/clio_relay/bounded_command" = "clio_relay/bounded_command"
-"jarvis-packages/clio_relay/clio_relay/mcp_call" = "clio_relay/mcp_call"
 "jarvis-packages/clio_relay/clio_relay/remote_agent" = "clio_relay/remote_agent"
 
 [tool.hatch.build.targets.sdist]
@@ -77,6 +76,7 @@ tapis = "clio_relay.adapters.tapis:TapisAdapter"
 globus = "clio_relay.adapters.globus:GlobusAdapter"
 iri = "clio_relay.adapters.iri:IriAdapter"
 sky = "clio_relay.adapters.sky:SkyAdapter"
+worker = "clio_relay.adapters.worker:WorkerAdapter"
 fixture = "clio_relay.testing.fixture_adapter:FixtureAdapter"
 
 [project.entry-points."clio_relay.hooks"]
@@ -124,7 +124,7 @@ ignore = ["ANN401"]
 # (clio-relay#158). The exemption keeps the portable spelling from being
 # "upgraded" back into a defect; tests/test_bootstrap_journal_portability.py
 # guards the module's floor.
-"src/clio_relay/bootstrap_journal.py" = ["UP017"]
+"src/clio_relay/adapters/worker/bootstrap_journal.py" = ["UP017"]
 # The guard test deliberately exercises the portable spelling it protects.
 "tests/test_bootstrap_journal_portability.py" = ["UP017"]
 

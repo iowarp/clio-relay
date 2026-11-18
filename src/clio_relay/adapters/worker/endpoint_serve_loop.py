@@ -19,7 +19,6 @@ instance's MRO, not through any import.
 from __future__ import annotations
 
 import concurrent.futures
-import functools
 import os
 import socket
 import time
@@ -35,9 +34,6 @@ from clio_relay.adapters.worker.endpoint_execution_sidecar_cleanup import (
     _close_runtime_sidecar_anchors,
     _execution_cleanup_ack_metadata,
     _remove_execution_sidecars,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _jarvis_execution_recovery_is_pending,
 )
 from clio_relay.adapters.worker.endpoint_owner_session_sweep import sweep_expired_owner_session_leases
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
@@ -62,7 +58,6 @@ from clio_relay.models import (
     EndpointRole,
     JobState,
     Lease,
-    McpAdmissionClass,
     RelayJob,
 )
 from clio_relay.spool import JobSpool
@@ -77,13 +72,8 @@ from clio_relay.adapters.worker.worker_concurrency import (
 class ServeLoopMixin:
     """Mixin: ServeLoop methods split from EndpointWorker (clio-relay#231)."""
 
-    def run_once(
-        self,
-        *,
-        mcp_admission_class: McpAdmissionClass = McpAdmissionClass.WORKLOAD,
-        mcp_admission_limit: int | None = None,
-    ) -> RelayJob | None:
-        """Run one job from a strict workload or reserved MCP control lane."""
+    def run_once(self) -> RelayJob | None:
+        """Lease and run at most one admitted job."""
         self._require_open_queue_identity()
         if self.role != EndpointRole.WORKER:
             return None
@@ -106,12 +96,9 @@ class ServeLoopMixin:
 
         worker = cast(EndpointWorker, self)
         sweep_expired_owner_session_leases(worker, cluster=worker.cluster)
-        workload_lane = mcp_admission_class is McpAdmissionClass.WORKLOAD
-        if workload_lane:
-            self._reconcile_canceled_scheduler_jobs()
+        self._reconcile_canceled_scheduler_jobs()
         if (
-            workload_lane
-            and self.reconcile_execution_cleanup
+            self.reconcile_execution_cleanup
             and self._foreground_jobs_since_cleanup >= EXECUTION_CLEANUP_MAX_FOREGROUND_JOBS
         ):
             self._reconcile_pending_execution_cleanup()
@@ -121,11 +108,9 @@ class ServeLoopMixin:
             cluster=self.cluster,
             ttl_seconds=self.lease_ttl_seconds,
             kind_concurrency=self.kind_concurrency,
-            mcp_admission_class=mcp_admission_class,
-            mcp_admission_limit=mcp_admission_limit,
         )
         if lease is None:
-            if workload_lane and self.reconcile_execution_cleanup:
+            if self.reconcile_execution_cleanup:
                 self._reconcile_pending_execution_cleanup()
                 self._foreground_jobs_since_cleanup = 0
             return None
@@ -137,7 +122,7 @@ class ServeLoopMixin:
                 self._record_unhandled_job_failure(job, exc)
         finally:
             self.queue.release_lease(lease.lease_id)
-        if workload_lane and self.reconcile_execution_cleanup:
+        if self.reconcile_execution_cleanup:
             self._foreground_jobs_since_cleanup += 1
         return self.queue.get_job(job.job_id)
 
@@ -152,32 +137,6 @@ class ServeLoopMixin:
                 payload={"error": detail},
             )
             return
-        if isinstance(error, SchedulerSubmissionUnresolvedError):
-            pending_recovery_task_ids: list[str] = []
-            for task in self._bounded_job_tasks(job.job_id):
-                try:
-                    recovery_pending = _jarvis_execution_recovery_is_pending(
-                        current,
-                        task,
-                    )
-                except RelayError:
-                    recovery_pending = False
-                if recovery_pending:
-                    pending_recovery_task_ids.append(task.task_id)
-            if pending_recovery_task_ids:
-                self.queue.append_event(
-                    job.job_id,
-                    "jarvis.execution_reconciliation_deferred",
-                    "Relay response remains nonterminal while JARVIS ownership is queried",
-                    payload={
-                        "task_ids": pending_recovery_task_ids,
-                        "error": detail,
-                        "scheduler_cancel_requested": self._scheduler_cancel_was_requested(
-                            job.job_id
-                        ),
-                    },
-                )
-                return
         if isinstance(current.metadata.get("cancellation_request"), dict):
             self.queue.append_event(
                 job.job_id,
@@ -217,19 +176,10 @@ class ServeLoopMixin:
                 time.sleep(poll_seconds)
 
     def _serve_worker_slots(self, *, poll_seconds: float) -> None:
-        slot_admission_classes = [
-            *([McpAdmissionClass.WORKLOAD] * self.workload_concurrency),
-            *([McpAdmissionClass.CONTROL_QUERY] * self.control_query_concurrency),
-        ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             futures = [
-                executor.submit(
-                    self._serve_worker_slot,
-                    index,
-                    poll_seconds,
-                    admission_class,
-                )
-                for index, admission_class in enumerate(slot_admission_classes)
+                executor.submit(self._serve_worker_slot, index, poll_seconds)
+                for index in range(self.concurrency)
             ]
             for future in concurrent.futures.as_completed(futures):
                 future.result()
@@ -238,22 +188,19 @@ class ServeLoopMixin:
         self,
         index: int,
         poll_seconds: float,
-        admission_class: McpAdmissionClass,
     ) -> None:
         from clio_relay.adapters.worker.endpoint import EndpointWorker
 
-        workload_lane = admission_class is McpAdmissionClass.WORKLOAD
         worker = EndpointWorker(
             role=self.role,
             settings=self.settings,
             cluster=self.cluster,
             concurrency=1,
-            control_query_concurrency=0,
             kind_concurrency=self.kind_concurrency,
             queue=self.queue,
             scheduler_provider=self.scheduler_provider,
             storage_runtime=self.storage_runtime,
-            reconcile_execution_cleanup=workload_lane and index == 0,
+            reconcile_execution_cleanup=index == 0,
         )
         endpoint = EndpointRegistration(
             role=self.role,
@@ -264,9 +211,6 @@ class ServeLoopMixin:
                 "worker_slot": index,
                 "parent_endpoint_id": None if self.endpoint is None else self.endpoint.endpoint_id,
                 "concurrency": 1,
-                "workload_concurrency": 1 if workload_lane else 0,
-                "control_query_concurrency": 0 if workload_lane else 1,
-                "mcp_admission_class": admission_class.value,
                 "kind_concurrency": kind_concurrency_metadata(self.kind_concurrency),
                 "process_containment": process_containment.containment_capability(),
                 "installation_info": _worker_installation_snapshot(),
@@ -279,20 +223,11 @@ class ServeLoopMixin:
         )
         worker.endpoint = self.queue.register_endpoint(endpoint)
         registered_endpoint = worker.endpoint
-        admission_limit = (
-            self.control_query_concurrency
-            if admission_class is McpAdmissionClass.CONTROL_QUERY
-            else None
-        )
         while True:
             # clio-relay#238: contain any otherwise-unhandled exception here
             # instead of a silent per-slot thread death (endpoint_worker_lanes).
             registered_endpoint = run_worker_lane_iteration(
-                functools.partial(
-                    worker.run_once,
-                    mcp_admission_class=admission_class,
-                    mcp_admission_limit=admission_limit,
-                ),
+                worker.run_once,
                 queue=self.queue,
                 endpoint=registered_endpoint,
             )

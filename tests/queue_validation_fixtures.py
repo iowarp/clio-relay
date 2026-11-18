@@ -21,7 +21,6 @@ from clio_relay.models import (
     EndpointRegistration,
     EndpointRole,
     JobKind,
-    McpAdmissionClass,
     SchedulerPhase,
     SchedulerStatus,
 )
@@ -161,8 +160,6 @@ class LiveWorkerFleet:
                 metadata={
                     "worker_supervisor": True,
                     "concurrency": 3,
-                    "workload_concurrency": 3,
-                    "control_query_concurrency": 0,
                     "kind_concurrency": {"jarvis": 2},
                     "scheduler_provider": "slurm",
                     "process_containment": containment_capability(),
@@ -190,9 +187,6 @@ class LiveWorkerFleet:
                     "worker_slot": index,
                     "parent_endpoint_id": "test-supervisor",
                     "concurrency": 1,
-                    "workload_concurrency": 1,
-                    "control_query_concurrency": 0,
-                    "mcp_admission_class": McpAdmissionClass.WORKLOAD.value,
                     "kind_concurrency": {"jarvis": 2},
                     "scheduler_provider": "slurm",
                     "process_containment": containment_capability(),

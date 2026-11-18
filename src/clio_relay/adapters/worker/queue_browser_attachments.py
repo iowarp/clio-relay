@@ -20,7 +20,7 @@ from clio_relay.adapters.worker import (
     queue_index_state,
     queue_layout,
 )
-from clio_relay.browser_gateway import BrowserAttachmentRecord
+from clio_relay.adapters.worker.browser_attachment_record import BrowserAttachmentRecord
 from clio_relay.errors import BrowserAttachmentIdentityConflictError, QueueConflictError
 from clio_relay.models import GatewaySession, GatewaySessionState, RelayJob, utc_now
 

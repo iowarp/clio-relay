@@ -2346,11 +2346,11 @@ def _managed_relay_repository(home: Path) -> tuple[Path, Path]:
     generation = home / ".local/share/clio-relay/generations" / fingerprint
     registered_repository = generation / "source/jarvis-packages/clio_relay"
     registered_package = registered_repository / "clio_relay"
-    registered_mcp_call = registered_package / "mcp_call"
-    registered_mcp_call.mkdir(parents=True)
+    registered_bounded_command = registered_package / "bounded_command"
+    registered_bounded_command.mkdir(parents=True)
     (registered_package / "__init__.py").write_text("", encoding="utf-8")
-    (registered_mcp_call / "__init__.py").write_text("", encoding="utf-8")
-    (registered_mcp_call / "runner.py").write_text(
+    (registered_bounded_command / "__init__.py").write_text("", encoding="utf-8")
+    (registered_bounded_command / "runner.py").write_text(
         "IDENTITY = 'registered-package'\n",
         encoding="utf-8",
     )
@@ -2415,7 +2415,7 @@ def test_wrapper_resolves_only_bootstrap_managed_relay_repository_after_core_imp
     home = tmp_path / "home"
     home.mkdir()
     managed_repository, registered_package = _managed_relay_repository(home)
-    registered_mcp_call = registered_package / "mcp_call"
+    registered_bounded_command = registered_package / "bounded_command"
     same_basename_operator_repository = tmp_path / "operator/clio_relay"
     same_basename_operator_repository.mkdir(parents=True)
     unrelated_repository = tmp_path / "operator/science_packages"
@@ -2447,7 +2447,7 @@ def test_wrapper_resolves_only_bootstrap_managed_relay_repository_after_core_imp
         "import clio_relay\n"
         "import clio_relay.process_containment as containment\n"
         "exec(sys.argv[3], globals(), globals())\n"
-        "import clio_relay.mcp_call.runner as runner\n"
+        "import clio_relay.bounded_command.runner as runner\n"
         "print(json.dumps({\n"
         "    'containment': containment.__file__,\n"
         "    'namespace_paths': list(clio_relay.__path__),\n"
@@ -2481,7 +2481,7 @@ def test_wrapper_resolves_only_bootstrap_managed_relay_repository_after_core_imp
         str(registered_package.resolve()),
         str(installed_package),
     ]
-    assert observed["runner"] == str(registered_mcp_call / "runner.py")
+    assert observed["runner"] == str(registered_bounded_command / "runner.py")
     assert observed["identity"] == "registered-package"
     assert observed["repositories"] == repositories
 

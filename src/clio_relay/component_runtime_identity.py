@@ -243,7 +243,6 @@ from importlib.metadata import version
 
 import clio_relay
 import clio_relay.bounded_command.pkg
-import clio_relay.mcp_call.pkg
 import clio_relay.remote_agent.pkg
 import jarvis_cd
 
@@ -254,7 +253,6 @@ print(json.dumps({
     "imports": [
         "clio_relay",
         "clio_relay.bounded_command.pkg",
-        "clio_relay.mcp_call.pkg",
         "clio_relay.remote_agent.pkg",
         "jarvis_cd",
     ],
@@ -284,7 +282,6 @@ print(json.dumps({
     expected_imports = [
         "clio_relay",
         "clio_relay.bounded_command.pkg",
-        "clio_relay.mcp_call.pkg",
         "clio_relay.remote_agent.pkg",
         "jarvis_cd",
     ]

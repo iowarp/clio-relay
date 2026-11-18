@@ -23,12 +23,8 @@ from clio_relay.models import (
     INPUT_INGEST_POLICY_METADATA_KEY,
     JobKind,
     JobTombstone,
-    McpAdmissionClass,
-    McpCallSpec,
     RelayJob,
     artifact_use_payload,
-    is_owned_jarvis_run_spec,
-    prepare_owned_jarvis_run_submission,
     utc_now,
 )
 
@@ -69,7 +65,6 @@ class QueueIdempotencyMixin(queue_order_index.QueueOrderIndexMixin):
             try:
                 raw = queue_store_read.read_json_document(key_path)
             except FileNotFoundError:
-                job = prepare_owned_jarvis_run_submission(job)
                 job_digest = _job_idempotency_digest(job)
                 if job.submission_digest not in {None, job_digest}:
                     raise QueueConflictError(
@@ -95,9 +90,7 @@ class QueueIdempotencyMixin(queue_order_index.QueueOrderIndexMixin):
                     f"{job.idempotency_key}"
                 )
             canonical_job_id = cast(str, canonical_job_id)
-            job = prepare_owned_jarvis_run_submission(
-                job.model_copy(update={"job_id": canonical_job_id})
-            )
+            job = job.model_copy(update={"job_id": canonical_job_id})
             job_digest = _job_idempotency_digest(job)
             if job.submission_digest not in {None, job_digest}:
                 raise QueueConflictError("submitted job carries a mismatched submission_digest")
@@ -240,16 +233,6 @@ def _job_idempotency_digest(job: RelayJob) -> str:
         spec_payload = cast(dict[str, object], raw_spec)
         if spec_payload.get("expected_jarvis_cd_lock_binding") is None:
             spec_payload.pop("expected_jarvis_cd_lock_binding", None)
-        if (
-            job.kind is JobKind.MCP_CALL
-            and isinstance(job.spec, McpCallSpec)
-            and job.spec.admission_class is McpAdmissionClass.WORKLOAD
-        ):
-            spec_payload.pop("admission_class", None)
-        if is_owned_jarvis_run_spec(job.kind, job.spec):
-            raw_arguments = spec_payload.get("arguments")
-            if isinstance(raw_arguments, dict):
-                cast(dict[str, object], raw_arguments).pop("execution_id", None)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

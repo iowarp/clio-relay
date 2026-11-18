@@ -16,17 +16,7 @@ from clio_relay.job_identity import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
 )
-from clio_relay.models import (
-    MCP_ADMISSION_AUTHORITY_METADATA_KEY,
-    REGISTERED_JARVIS_USER_CONTRACT,
-    JobKind,
-    McpAdmissionAuthority,
-    McpAdmissionClass,
-    McpCallSpec,
-    McpOperation,
-    RelayJob,
-    prepare_owned_jarvis_run_submission,
-)
+from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
 from clio_relay.adapters.worker.remote_connection import RemoteConnectionRegistry
 from clio_relay.session_api import (
     ChannelReconnectRequired,
@@ -189,59 +179,11 @@ def _settings(tmp_path: Path) -> RelaySettings:
     )
 
 
-def _job(expected_digest: str) -> RelayJob:
+def _job(pipeline_name: str = "science-pipeline") -> RelayJob:
     return RelayJob(
         cluster="ares",
-        kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(
-            server="clio-kit",
-            server_args=["mcp-server", "jarvis"],
-            expected_server_artifact_digest=expected_digest,
-            admission_class=McpAdmissionClass.CONTROL_QUERY,
-            tool="jarvis_get_execution",
-            arguments={"execution_id": "execution-1"},
-            timeout_seconds=60,
-        ),
-        idempotency_key="owned-session-client",
-        owner_session_id="desktop-session-1",
-        owner_session_generation_id="generation-1",
-        metadata={
-            "owner": "clio-relay",
-            "owner_session_id": "desktop-session-1",
-            "owner_session_generation_id": "generation-1",
-            MCP_ADMISSION_AUTHORITY_METADATA_KEY: McpAdmissionAuthority(
-                source="pinned_jarvis_contract",
-                operation=McpOperation.TOOLS_CALL,
-                tool="jarvis_get_execution",
-                expected_server_artifact_digest=expected_digest,
-            ).model_dump(mode="json"),
-        },
-    )
-
-
-def _admitted_jarvis_run_job(
-    expected_digest: str,
-    *,
-    pipeline_id: str = "science-pipeline",
-) -> RelayJob:
-    """Return the exact server-normalized receipt for an owned JARVIS run."""
-
-    submitted = RelayJob(
-        cluster="ares",
-        kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(
-            server="clio-kit",
-            server_args=["mcp-server", "jarvis"],
-            expected_server_artifact_digest=expected_digest,
-            expected_jarvis_cd_lock_binding={
-                "schema_version": "clio-relay.jarvis-cd-lock-expectation.v1",
-                "version": "1.3.16",
-                "url": "https://example.invalid/jarvis-cd.whl",
-                "sha256": "b" * 64,
-            },
-            tool="jarvis_run",
-            arguments={"pipeline_id": pipeline_id},
-        ),
+        kind=JobKind.JARVIS,
+        spec=JarvisRunSpec(pipeline_name=pipeline_name),
         idempotency_key="owned-session-client",
         owner_session_id="desktop-session-1",
         owner_session_generation_id="generation-1",
@@ -251,7 +193,6 @@ def _admitted_jarvis_run_job(
             "owner_session_generation_id": "generation-1",
         },
     )
-    return prepare_owned_jarvis_run_submission(submitted)
 
 
 def _install_transport(
@@ -339,49 +280,10 @@ class _Transport:
         return len(self.processes)
 
 
-def _submit_jarvis_run_receipt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    admitted: RelayJob,
-    expected_digest: str,
-    arguments: dict[str, object],
-) -> RelayJob:
-    """Submit caller arguments against one simulated authenticated admission receipt."""
-
-    identity = session_identity_document(
-        owner_token="owner-token",
-        cluster="ares",
-        session_id="desktop-session-1",
-        generation_id="generation-1",
-        nonce="1" * 64,
-    )
-    _install_transport(
-        monkeypatch,
-        responses=[
-            _Response(identity),
-            _Response(admitted.model_dump(mode="json")),
-        ],
-    )
-    return submit_owned_session_job(
-        definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
-        settings=_settings(tmp_path),
-        path="/jobs/jarvis-mcp-call",
-        payload={
-            "cluster": "ares",
-            "tool": "jarvis_run",
-            "arguments": arguments,
-            "expected_server_artifact_digest": expected_digest,
-            "idempotency_key": "owned-session-client",
-        },
-    )
-
-
 def test_owned_session_client_proves_identity_before_sending_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expected_digest = "a" * 64
     identity = session_identity_document(
         owner_token="owner-token",
         cluster="ares",
@@ -393,22 +295,19 @@ def test_owned_session_client_proves_identity_before_sending_credentials(
         monkeypatch,
         responses=[
             _Response(identity),
-            _Response(_job(expected_digest).model_dump(mode="json")),
+            _Response(_job().model_dump(mode="json")),
         ],
     )
     payload: dict[str, object] = {
         "cluster": "ares",
-        "tool": "jarvis_get_execution",
-        "arguments": {"execution_id": "execution-1"},
-        "expected_server_artifact_digest": expected_digest,
-        "timeout_seconds": 60,
+        "pipeline_name": "science-pipeline",
         "idempotency_key": "owned-session-client",
     }
 
     job = submit_owned_session_job(
         definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
         settings=_settings(tmp_path),
-        path="/jobs/jarvis-mcp-call",
+        path="/jobs/jarvis-pipeline",
         payload=payload,
     )
 
@@ -434,7 +333,6 @@ def test_owned_session_submission_rejects_dropped_artifact_dependencies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expected_digest = "a" * 64
     identity = session_identity_document(
         owner_token="owner-token",
         cluster="ares",
@@ -446,7 +344,7 @@ def test_owned_session_submission_rejects_dropped_artifact_dependencies(
         monkeypatch,
         responses=[
             _Response(identity),
-            _Response(_job(expected_digest).model_dump(mode="json")),
+            _Response(_job().model_dump(mode="json")),
         ],
     )
 
@@ -454,68 +352,20 @@ def test_owned_session_submission_rejects_dropped_artifact_dependencies(
         submit_owned_session_job(
             definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
             settings=_settings(tmp_path),
-            path="/jobs/jarvis-mcp-call",
+            path="/jobs/jarvis-pipeline",
             payload={
                 "cluster": "ares",
-                "tool": "jarvis_get_execution",
-                "arguments": {"execution_id": "execution-1"},
-                "expected_server_artifact_digest": expected_digest,
+                "pipeline_name": "science-pipeline",
                 "idempotency_key": "owned-session-client",
                 "used_artifact_refs": [{"artifact_id": "artifact_input", "sha256": "b" * 64}],
             },
         )
 
 
-def test_owned_session_submission_accepts_relay_owned_jarvis_execution_identity(
+def test_owned_session_submission_rejects_a_different_jarvis_pipeline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Admission may add only its deterministic execution ID to jarvis_run arguments."""
-
-    expected_digest = "a" * 64
-    admitted = _admitted_jarvis_run_job(expected_digest)
-    received = _submit_jarvis_run_receipt(
-        tmp_path,
-        monkeypatch,
-        admitted=admitted,
-        expected_digest=expected_digest,
-        arguments={"pipeline_id": "science-pipeline"},
-    )
-
-    assert isinstance(received.spec, McpCallSpec)
-    assert isinstance(admitted.spec, McpCallSpec)
-    assert received.spec.arguments == admitted.spec.arguments
-    assert received.spec.arguments["execution_id"].startswith("jarvis_")
-
-
-def test_owned_session_submission_accepts_registered_jarvis_execution_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Registered JARVIS admission may add its deterministic execution ID."""
-
-    expected_digest = "a" * 64
-    submitted = RelayJob(
-        cluster="ares",
-        kind=JobKind.MCP_CALL,
-        spec=McpCallSpec(
-            server="clio-kit",
-            server_args=["mcp-server", "jarvis"],
-            expected_server_artifact_digest=expected_digest,
-            expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
-            tool="jarvis_run",
-            arguments={"pipeline_id": "science-pipeline"},
-        ),
-        idempotency_key="owned-session-client",
-        owner_session_id="desktop-session-1",
-        owner_session_generation_id="generation-1",
-        metadata={
-            "owner": "clio-relay",
-            "owner_session_id": "desktop-session-1",
-            "owner_session_generation_id": "generation-1",
-        },
-    )
-    admitted = prepare_owned_jarvis_run_submission(submitted)
     identity = session_identity_document(
         owner_token="owner-token",
         cluster="ares",
@@ -527,80 +377,19 @@ def test_owned_session_submission_accepts_registered_jarvis_execution_identity(
         monkeypatch,
         responses=[
             _Response(identity),
-            _Response(admitted.model_dump(mode="json")),
+            _Response(_job("other-pipeline").model_dump(mode="json")),
         ],
     )
 
-    received = submit_owned_session_job(
-        definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
-        settings=_settings(tmp_path),
-        path="/jobs/mcp-call",
-        payload={
-            "cluster": "ares",
-            "server": "clio-kit",
-            "server_args": ["mcp-server", "jarvis"],
-            "expected_server_artifact_digest": expected_digest,
-            "expected_registered_contract": REGISTERED_JARVIS_USER_CONTRACT,
-            "tool": "jarvis_run",
-            "arguments": {"pipeline_id": "science-pipeline"},
-            "idempotency_key": "owned-session-client",
-        },
-    )
-
-    assert isinstance(received.spec, McpCallSpec)
-    assert received.spec.arguments["execution_id"].startswith("jarvis_")
-
-
-def test_owned_session_submission_rejects_other_jarvis_run_arguments_after_normalization(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Execution-ID normalization must not hide a changed pipeline or other caller input."""
-
-    expected_digest = "a" * 64
-    admitted = _admitted_jarvis_run_job(expected_digest, pipeline_id="other-pipeline")
-    with pytest.raises(RelayError, match="different JARVIS MCP call"):
-        _submit_jarvis_run_receipt(
-            tmp_path,
-            monkeypatch,
-            admitted=admitted,
-            expected_digest=expected_digest,
-            arguments={"pipeline_id": "science-pipeline"},
-        )
-
-
-def test_owned_session_submission_accepts_only_proven_jarvis_execution_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An explicit execution ID is valid only when the receipt's durable identity proves it."""
-
-    expected_digest = "a" * 64
-    admitted = _admitted_jarvis_run_job(expected_digest)
-    assert isinstance(admitted.spec, McpCallSpec)
-    execution_id = admitted.spec.arguments["execution_id"]
-    received = _submit_jarvis_run_receipt(
-        tmp_path,
-        monkeypatch,
-        admitted=admitted,
-        expected_digest=expected_digest,
-        arguments={
-            "pipeline_id": "science-pipeline",
-            "execution_id": execution_id,
-        },
-    )
-    assert isinstance(received.spec, McpCallSpec)
-    assert received.spec.arguments["execution_id"] == execution_id
-
-    with pytest.raises(RelayError, match="different execution identity"):
-        _submit_jarvis_run_receipt(
-            tmp_path,
-            monkeypatch,
-            admitted=admitted,
-            expected_digest=expected_digest,
-            arguments={
-                "pipeline_id": "science-pipeline",
-                "execution_id": "jarvis_forged",
+    with pytest.raises(RelayError, match="different JARVIS pipeline name"):
+        submit_owned_session_job(
+            definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
+            settings=_settings(tmp_path),
+            path="/jobs/jarvis-pipeline",
+            payload={
+                "cluster": "ares",
+                "pipeline_name": "science-pipeline",
+                "idempotency_key": "owned-session-client",
             },
         )
 
@@ -815,12 +604,10 @@ def test_owned_session_client_rejects_replaced_generation_before_credentials(
         submit_owned_session_job(
             definition=ClusterDefinition(name="ares", ssh_host="ares-login"),
             settings=_settings(tmp_path),
-            path="/jobs/jarvis-mcp-call",
+            path="/jobs/jarvis-pipeline",
             payload={
                 "cluster": "ares",
-                "tool": "jarvis_get_execution",
-                "arguments": {},
-                "expected_server_artifact_digest": "a" * 64,
+                "pipeline_name": "science-pipeline",
                 "idempotency_key": "stale-generation",
             },
         )

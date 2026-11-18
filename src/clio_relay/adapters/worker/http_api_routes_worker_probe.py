@@ -2,12 +2,11 @@
 
 ``cli_remote_worker_probe.py``'s ``_remote_worker_info``/``_remote_target_
 identity`` previously reached these two facts exclusively through a
-per-operation ``ssh ... clio-relay endpoint worker-info|target-info``
+per-operation ``ssh ... clio-relay worker endpoint worker-info|target-info``
 dial, even when a live owned-session channel already existed for a
 re-verification (``cli_remote_worker_attach.py``, ``cli_scheduler.py``'s
-scheduler-provider gate, ``cli_jarvis_mcp_validate.py``/``cli_remote_mcp_
-validate.py``). Both facts are pure, side-effect-free reads of the
-serving process's own local state (``worker_runtime_info``: durable
+scheduler-provider gate, ``cli_jarvis_mcp_validate.py``). Both facts are
+pure, side-effect-free reads of the serving process's own local state (``worker_runtime_info``: durable
 worker-heartbeat/installation records; the target document: hostname,
 machine-id marker, scheduler identity) -- the SAME computation
 ``cli_endpoint.py``'s ``endpoint worker-info``/``target-info`` commands
@@ -40,7 +39,7 @@ from clio_relay.adapters.worker import door_errors
 from clio_relay.dev_mode import dev_mode_enabled
 from clio_relay.errors import ConfigurationError
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
-from clio_relay.scheduler_providers import provider_for_scheduler
+from clio_relay.adapters.worker.scheduler import provider_for_scheduler
 from clio_relay.adapters.worker.worker_runtime_verification import worker_runtime_info
 
 CLUSTER_TARGET_INFO_SCHEMA = "clio-relay.cluster-target-info.v1"

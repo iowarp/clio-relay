@@ -328,7 +328,7 @@ if [ "$argv_count" -ne 1 ] || [ -n "$policy_parse_error" ] || \
   if [ -n "$policy_parse_error" ]; then
     printf 'policy parse error: %s\\n' "$policy_parse_error" >&2
   fi
-  echo "run 'clio-relay cluster install-endpoint-service --cluster <configured-cluster>'" >&2
+  echo "run 'clio-relay worker cluster install-endpoint-service --cluster <configured-cluster>'" >&2
   echo "to reinstall the managed unit" >&2
   exit 79
 fi

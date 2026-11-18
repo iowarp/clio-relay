@@ -81,9 +81,8 @@ def worker_runtime_info(
     generation for other tenants while one cluster is pinned to its own.
 
     ``pinned_install_receipt_path`` may be recorded ``$HOME/``-anchored (the
-    same convention ``jarvis_run_environment.registered_site_spack_command``
-    expands for ``spack_executable``, and ``jarvis_mcp.jarvis_mcp_command``
-    expands for its own per-cluster receipt pin, clio-relay#228). It is
+    same convention ``jarvis_mcp.jarvis_mcp_command`` expands for its own
+    per-cluster receipt pin, clio-relay#228). It is
     expanded via :func:`clio_relay.remote_values.expand_remote_value_on_host`
     against this process's own home before loading -- ``Path.expanduser()``
     alone only expands a leading ``~`` and silently leaves a literal

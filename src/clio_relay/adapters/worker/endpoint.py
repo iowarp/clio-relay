@@ -19,19 +19,12 @@ from typing import cast as cast
 from filelock import FileLock as FileLock
 from filelock import Timeout as Timeout
 
-from clio_relay import execution_watch as execution_watch
 from clio_relay import process_containment as process_containment
 from clio_relay.adapters.worker.bootstrap_reconcile import (
     resolve_receipt_bound_jarvis_python as resolve_receipt_bound_jarvis_python,
 )
 from clio_relay.command_evidence import bounded_error_detail as bounded_error_detail
 from clio_relay.config import RelaySettings as RelaySettings
-from clio_relay.console_stream import CONSOLE_STREAM as CONSOLE_STREAM
-from clio_relay.console_stream import ConsoleLiveTailer as ConsoleLiveTailer
-from clio_relay.console_stream import console_tailer_for_mcp_call as console_tailer_for_mcp_call
-from clio_relay.console_stream import (
-    flush_terminal_console_from_path as flush_terminal_console_from_path,
-)
 from clio_relay.adapters.worker.core_queue import DEFAULT_EXACT_RECORD_LIMIT as DEFAULT_EXACT_RECORD_LIMIT
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue as ClioCoreQueue
 from clio_relay.adapters.worker.endpoint_execution_cleanup_actions import ExecutionCleanupActionsMixin
@@ -59,42 +52,6 @@ from clio_relay.adapters.worker.endpoint_execution_sidecar_cleanup import (
 from clio_relay.adapters.worker.endpoint_execution_sidecar_cleanup import (
     _remove_execution_sidecars as _remove_execution_sidecars,
 )
-from clio_relay.adapters.worker.endpoint_jarvis_dispatch import JarvisDispatchMixin
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _attributed_jarvis_dispatch_refusal as _attributed_jarvis_dispatch_refusal,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_dispatch_refusal_detail as _durable_jarvis_dispatch_refusal_detail,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_execution_recovery as _durable_jarvis_execution_recovery,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_runtime_recovery_state as _durable_runtime_recovery_state,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _jarvis_execution_recovery_intent as _jarvis_execution_recovery_intent,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _jarvis_execution_recovery_is_pending as _jarvis_execution_recovery_is_pending,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _trusted_jarvis_execution_query_validation as _trusted_jarvis_execution_query_validation,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _trusted_jarvis_mcp_route as _trusted_jarvis_mcp_route,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    endpoint_mcp_runner_command as endpoint_mcp_runner_command,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    minimal_mcp_runner_environment as minimal_mcp_runner_environment,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    trusted_jarvis_mcp_result as trusted_jarvis_mcp_result,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery_bookkeeping import JarvisRecoveryBookkeepingMixin
-from clio_relay.adapters.worker.endpoint_jarvis_recovery_query import JarvisRecoveryQueryMixin
 from clio_relay.adapters.worker.endpoint_job_execution import JobExecutionMixin
 from clio_relay.adapters.worker.endpoint_progress_ingest import ProgressIngestMixin
 from clio_relay.adapters.worker.endpoint_progress_log_io import (
@@ -121,41 +78,10 @@ from clio_relay.adapters.worker.endpoint_progress_trust import (
     _read_bounded_sidecar_record as _read_bounded_sidecar_record,
 )
 from clio_relay.adapters.worker.endpoint_progress_trust import (
-    _trusted_mcp_progress_metadata as _trusted_mcp_progress_metadata,
-)
-from clio_relay.adapters.worker.endpoint_progress_trust import (
-    _trusted_native_mcp_progress_metadata as _trusted_native_mcp_progress_metadata,
-)
-from clio_relay.adapters.worker.endpoint_progress_trust import (
     _trusted_provider_metadata as _trusted_provider_metadata,
 )
 from clio_relay.adapters.worker.endpoint_progress_trust import (
     _trusted_sidecar_metadata as _trusted_sidecar_metadata,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _close_recovery_directory_anchor as _close_recovery_directory_anchor,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _jarvis_execution_recovery_retry_due as _jarvis_execution_recovery_retry_due,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _open_or_create_recovery_directory as _open_or_create_recovery_directory,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _read_owned_recovery_result as _read_owned_recovery_result,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import _recovery_timestamp as _recovery_timestamp
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _remove_owned_recovery_output as _remove_owned_recovery_output,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _validate_recovery_directory_path as _validate_recovery_directory_path,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    _validate_recovery_process_cwd as _validate_recovery_process_cwd,
-)
-from clio_relay.adapters.worker.endpoint_recovery_directory import (
-    write_private_json_file as write_private_json_file,
 )
 from clio_relay.adapters.worker.endpoint_result_finalization import ResultFinalizationMixin
 from clio_relay.adapters.worker.endpoint_runtime_metadata_ingest import RuntimeMetadataIngestMixin
@@ -188,9 +114,6 @@ from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _runtime_metadata_exact_marker_reconciliation as _runtime_metadata_exact_marker_reconciliation,
 )
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
-    _runtime_metadata_is_mcp_transport_wrapper as _runtime_metadata_is_mcp_transport_wrapper,
-)
-from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _runtime_metadata_is_native as _runtime_metadata_is_native,
 )
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
@@ -218,27 +141,6 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
 )
 from clio_relay.adapters.worker.endpoint_sidecar_types import EXECUTION_CLEANUP_SCHEMA as EXECUTION_CLEANUP_SCHEMA
 from clio_relay.adapters.worker.endpoint_sidecar_types import EXECUTION_LAUNCH_PROTOCOL as EXECUTION_LAUNCH_PROTOCOL
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS as MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS,
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS as MCP_JARVIS_EXECUTION_QUERY_PROCESS_TIMEOUT_SECONDS,  # noqa: E501
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS as MCP_JARVIS_EXECUTION_QUERY_TIMEOUT_SECONDS,
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES as MCP_JARVIS_EXECUTION_RECOVERY_RESULT_MAX_BYTES,  # noqa: E501
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS as MCP_JARVIS_EXECUTION_RECOVERY_RETRY_BASE_SECONDS,  # noqa: E501
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS as MCP_JARVIS_EXECUTION_RECOVERY_RETRY_MAX_SECONDS,  # noqa: E501
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA as MCP_JARVIS_EXECUTION_RECOVERY_SCHEMA,
-)
 from clio_relay.adapters.worker.endpoint_sidecar_types import (
     PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES as PACKAGE_PROGRESS_LOG_FINAL_MAX_BYTES,
 )
@@ -276,7 +178,6 @@ from clio_relay.adapters.worker.endpoint_sidecar_types import (
     SchedulerSubmissionUnresolvedError as SchedulerSubmissionUnresolvedError,
 )
 from clio_relay.adapters.worker.endpoint_sidecar_types import _PackageProgressLogState as _PackageProgressLogState
-from clio_relay.adapters.worker.endpoint_sidecar_types import _RecoveryDirectoryAnchor as _RecoveryDirectoryAnchor
 from clio_relay.adapters.worker.endpoint_sidecar_types import _RuntimeSidecarAnchor as _RuntimeSidecarAnchor
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _bounded_output_event_chunks as _bounded_output_event_chunks,
@@ -313,7 +214,6 @@ from clio_relay.adapters.worker.endpoint_worker_environment import (
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _worker_process_identity as _worker_process_identity,
 )
-from clio_relay.adapters.worker.endpoint_worker_lanes import quarantine_relay_error as quarantine_relay_error
 from clio_relay.adapters.worker.endpoint_worker_lanes import run_worker_lane_iteration as run_worker_lane_iteration
 from clio_relay.errors import ConfigurationError as ConfigurationError
 from clio_relay.errors import QueueConflictError as QueueConflictError
@@ -321,24 +221,10 @@ from clio_relay.errors import RelayError as RelayError
 from clio_relay.filesystem_paths import internal_filesystem_path as internal_filesystem_path
 from clio_relay.filesystem_paths import logical_filesystem_text as logical_filesystem_text
 from clio_relay.identifiers import filesystem_key as filesystem_key
-from clio_relay.adapters.worker.jarvis_dispatch_failure import (
-    JARVIS_DISPATCH_REFUSAL_RESOLUTION as JARVIS_DISPATCH_REFUSAL_RESOLUTION,
-)
-from clio_relay.adapters.worker.jarvis_dispatch_failure import JarvisDispatchRefusal as JarvisDispatchRefusal
-from clio_relay.adapters.worker.jarvis_dispatch_failure import McpRuntimeIngestOutcome as McpRuntimeIngestOutcome
 from clio_relay.adapters.worker.jarvis_execution import (
     RUNTIME_SCHEDULER_PROVIDER_ENV as RUNTIME_SCHEDULER_PROVIDER_ENV,
 )
-from clio_relay.adapters.worker.jarvis_execution_artifacts import (
-    ingest_jarvis_execution_outputs_from_path as ingest_jarvis_execution_outputs_from_path,
-)
 from clio_relay.jarvis_provider import JarvisCdProvider as JarvisCdProvider
-from clio_relay.adapters.worker.jarvis_run_environment import (
-    jarvis_run_environment_values as jarvis_run_environment_values,
-)
-from clio_relay.adapters.worker.jarvis_run_environment import (
-    registered_site_spack_command as registered_site_spack_command,
-)
 from clio_relay.models import CLIO_PROVENANCE_METADATA_KEY as CLIO_PROVENANCE_METADATA_KEY
 from clio_relay.models import ArtifactRef as ArtifactRef
 from clio_relay.models import EndpointRegistration as EndpointRegistration
@@ -347,8 +233,6 @@ from clio_relay.models import JarvisRunSpec as JarvisRunSpec
 from clio_relay.models import JobKind as JobKind
 from clio_relay.models import JobState as JobState
 from clio_relay.models import Lease as Lease
-from clio_relay.models import McpAdmissionClass as McpAdmissionClass
-from clio_relay.models import McpCallSpec as McpCallSpec
 from clio_relay.models import ProgressRecord as ProgressRecord
 from clio_relay.models import RelayEvent as RelayEvent
 from clio_relay.models import RelayJob as RelayJob
@@ -367,9 +251,6 @@ from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority as PackageProgressSourceAuthority,
 )
 from clio_relay.progress_provenance import (
-    validate_jarvis_execution_progress_metadata as validate_jarvis_execution_progress_metadata,
-)
-from clio_relay.progress_provenance import (
     validate_package_progress_metadata as validate_package_progress_metadata,
 )
 from clio_relay.progress_provenance import (
@@ -385,17 +266,14 @@ from clio_relay.runtime_metadata import (
 )
 from clio_relay.runtime_metadata import merge_runtime_metadata as merge_runtime_metadata
 from clio_relay.runtime_metadata import (
-    runtime_metadata_from_mcp_result_document as runtime_metadata_from_mcp_result_document,
-)
-from clio_relay.runtime_metadata import (
     runtime_metadata_from_sidecar_record as runtime_metadata_from_sidecar_record,
 )
-from clio_relay.scheduler_providers import SchedulerProvider as SchedulerProvider
-from clio_relay.scheduler_providers import (
+from clio_relay.adapters.worker.scheduler import SchedulerProvider as SchedulerProvider
+from clio_relay.adapters.worker.scheduler import (
     SchedulerReconciliationProvider as SchedulerReconciliationProvider,
 )
-from clio_relay.scheduler_providers import provider_for_scheduler as provider_for_scheduler
-from clio_relay.scheduler_providers import (
+from clio_relay.adapters.worker.scheduler import provider_for_scheduler as provider_for_scheduler
+from clio_relay.adapters.worker.scheduler import (
     reconciliation_provider_for_scheduler as reconciliation_provider_for_scheduler,
 )
 from clio_relay.spool import JobSpool as JobSpool
@@ -420,9 +298,6 @@ class EndpointWorker(
     ProgressIngestMixin,
     RuntimeSidecarFailureMixin,
     RuntimeMetadataIngestMixin,
-    JarvisRecoveryQueryMixin,
-    JarvisRecoveryBookkeepingMixin,
-    JarvisDispatchMixin,
     RuntimeMetadataPersistMixin,
     SchedulerSubmissionMixin,
     SchedulerSubmissionReconcileMixin,
@@ -434,9 +309,9 @@ class EndpointWorker(
 ):
     """Endpoint worker for desktop or cluster roles.
 
-    Runtime HOST only: this class is the composed facade over the 17
+    Runtime HOST only: this class is the composed facade over the 14
     ``endpoint_*.py`` mixins (iowarp/clio-relay#231's endpoint split) that
-    each own one execution/recovery/cleanup concern. What stays directly
+    each own one execution/cleanup concern. What stays directly
     resident here is lifecycle only -- constructing and validating the
     worker's queue/provider/lease identity (``__init__``), releasing it
     (``close``/``__del__``), the closed/identity guard every public entry
@@ -466,7 +341,6 @@ class EndpointWorker(
         settings: RelaySettings,
         cluster: str = "local",
         concurrency: int = 1,
-        control_query_concurrency: int = 0,
         kind_concurrency: KindConcurrencyInput | None = None,
         queue: ClioCoreQueue | None = None,
         provider: JarvisCdProvider | None = None,
@@ -480,24 +354,9 @@ class EndpointWorker(
             or concurrency < 1
         ):
             raise ConfigurationError("worker concurrency must be at least 1")
-        if (
-            isinstance(control_query_concurrency, bool)
-            or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                control_query_concurrency,
-                int,
-            )
-            or control_query_concurrency < 0
-        ):
-            raise ConfigurationError("worker control-query concurrency cannot be negative")
-        if control_query_concurrency >= concurrency:
-            raise ConfigurationError(
-                "worker control-query concurrency must leave at least one workload slot"
-            )
         self.role = role
         self.cluster = cluster
         self.concurrency = concurrency
-        self.control_query_concurrency = control_query_concurrency
-        self.workload_concurrency = concurrency - control_query_concurrency
         self.kind_concurrency = normalize_kind_concurrency(kind_concurrency)
         self.reconcile_execution_cleanup = reconcile_execution_cleanup
         self._foreground_jobs_since_cleanup = 0
@@ -628,8 +487,6 @@ class EndpointWorker(
         if self.role == EndpointRole.WORKER and self.concurrency > 1:
             metadata["worker_supervisor"] = True
         if self.role == EndpointRole.WORKER:
-            metadata["workload_concurrency"] = self.workload_concurrency
-            metadata["control_query_concurrency"] = self.control_query_concurrency
             metadata["installation_info"] = _worker_installation_snapshot()
             process_identity = _worker_process_identity()
             if process_identity is not None:

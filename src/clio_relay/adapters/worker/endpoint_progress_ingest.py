@@ -1,10 +1,8 @@
 """Progress-sidecar ingest, poll-cadence wiring, and package progress log tailing.
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition. Covers reading the
-authenticated package-progress sidecar (``_ingest_progress_sidecar``), composing the
-#259 console-tail step onto the job's own poll cadence
-(``_wrap_poll``/``_tail_console_stream``), the per-poll-tick orchestration
-(``_poll_running_job``), the storage safety guard (``_check_runtime_storage``), and
+authenticated package-progress sidecar (``_ingest_progress_sidecar``), the per-poll-tick
+orchestration (``_poll_running_job``), the storage safety guard (``_check_runtime_storage``), and
 tailing a package's own progress log file with reset/truncation detection
 (``_ingest_package_progress_logs``/``_drain_package_progress_logs``/
 ``_baseline_package_progress_logs``).
@@ -14,15 +12,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from clio_relay.console_stream import (
-    CONSOLE_STDERR_STREAM,
-    CONSOLE_STREAM,
-    ConsoleLiveTailer,
-)
 from clio_relay.adapters.worker.endpoint_progress_log_io import (
     _open_package_progress_log,
     _progress_log_identity,
@@ -78,9 +70,8 @@ class ProgressIngestMixin:
 
     ``queue``/``storage_runtime`` are declared ``TYPE_CHECKING``-only (never
     assigned here) so strict pyright can resolve ``self.queue``/
-    ``self.storage_runtime`` across this mixin's own methods -- see
-    ``JarvisDispatchMixin``'s identical note in
-    ``endpoint_jarvis_dispatch.py`` for why.
+    ``self.storage_runtime`` across this mixin's own methods; the sole
+    composing class, ``EndpointWorker``, assigns them in ``__init__``.
     """
 
     if TYPE_CHECKING:
@@ -172,51 +163,6 @@ class ProgressIngestMixin:
                     progress_sidecar_sequence[0] += 1
             progress_sidecar_offset[0] = handle.tell()
 
-    def _wrap_poll(
-        self,
-        job: RelayJob,
-        console_tailer: ConsoleLiveTailer | None,
-        inner: Callable[[], None],
-    ) -> Callable[[], None]:
-        """Compose the job's own poll step with the #259 console tail step.
-
-        ``inner`` (lease renewal, progress/runtime sidecar ingest, ...) is
-        unchanged; this only adds a best-effort console-tail increment on
-        the same cadence, self-throttled inside :class:`ConsoleLiveTailer`.
-        """
-
-        def _poll() -> None:
-            inner()
-            self._tail_console_stream(job, console_tailer)
-
-        return _poll
-
-    def _tail_console_stream(
-        self,
-        job: RelayJob,
-        console_tailer: ConsoleLiveTailer | None,
-    ) -> None:
-        """Advance one #259 live-tail increment (stdout AND stderr); never
-        raises into the job."""
-        if console_tailer is None:
-            return
-        step = console_tailer.poll()
-        if step.reason is not None:
-            self.queue.append_event(
-                job.job_id,
-                f"console.{step.reason}",
-                step.message or "console live-tail reason",
-                payload={"stream": CONSOLE_STREAM, "reason": step.reason},
-            )
-        stderr_step = console_tailer.poll_stderr()
-        if stderr_step.reason is not None:
-            self.queue.append_event(
-                job.job_id,
-                f"console_stderr.{stderr_step.reason}",
-                stderr_step.message or "console_stderr live-tail reason",
-                payload={"stream": CONSOLE_STDERR_STREAM, "reason": stderr_step.reason},
-            )
-
     def _poll_running_job(
         self,
         lease: Lease,
@@ -244,26 +190,22 @@ class ProgressIngestMixin:
         runtime_metadata_state: list[JarvisRuntimeMetadata | None] | None = None,
         runtime_metadata_digests: set[str] | None = None,
         spool: JobSpool | None = None,
-        ingest_progress_sidecar: bool = True,
-        ingest_runtime_sidecar: bool = True,
     ) -> None:
         self._renew_lease_if_needed(lease, last_renewed_at)
         if spool is not None:
             self._check_runtime_storage(job, spool)
-        if ingest_progress_sidecar:
-            self._ingest_progress_sidecar(
-                job,
-                progress_sidecar,
-                progress_sidecar_offset=progress_sidecar_offset,
-                progress_sidecar_record_count=progress_sidecar_record_count,
-                progress_sidecar_sequence=progress_sidecar_sequence,
-                progress_sidecar_token=progress_sidecar_token,
-                progress_sidecar_anchor=progress_sidecar_anchor,
-                failures=progress_sidecar_failures,
-            )
+        self._ingest_progress_sidecar(
+            job,
+            progress_sidecar,
+            progress_sidecar_offset=progress_sidecar_offset,
+            progress_sidecar_record_count=progress_sidecar_record_count,
+            progress_sidecar_sequence=progress_sidecar_sequence,
+            progress_sidecar_token=progress_sidecar_token,
+            progress_sidecar_anchor=progress_sidecar_anchor,
+            failures=progress_sidecar_failures,
+        )
         if (
-            ingest_runtime_sidecar
-            and runtime_sidecar is not None
+            runtime_sidecar is not None
             and runtime_sidecar_offset is not None
             and runtime_sidecar_record_count is not None
             and runtime_sidecar_sequence is not None

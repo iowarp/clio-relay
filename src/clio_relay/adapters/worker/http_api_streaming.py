@@ -174,12 +174,9 @@ async def _monitor_stream_payloads(
         await asyncio.sleep(poll_seconds)
 
 
-#: clio-relay#221/#259: the SSE log-tail follow interval. The (now 0.25s,
-#: adversarial-review-tightened) ``CONSOLE_TAIL_MIN_POLL_INTERVAL_SECONDS``
-#: floor (:mod:`clio_relay.console_stream`) stays a SEPARATE constant for
-#: the capture-side tailer this generator reads from -- this is how often
-#: an already-held SSE response checks that spool for newly appended
-#: bytes. Matches :data:`clio_relay.observation.PATTERN_OBSERVATION_
+#: clio-relay#221/#259: the SSE log-tail follow interval, how often an
+#: already-held SSE response checks the spool for newly appended bytes.
+#: Matches :data:`clio_relay.observation.PATTERN_OBSERVATION_
 #: POLL_SECONDS`'s own value for the same class of problem.
 LOG_SSE_FOLLOW_POLL_SECONDS = 0.15
 

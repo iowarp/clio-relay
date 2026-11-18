@@ -314,8 +314,8 @@ def _classify_endpoint_service(
     sub_state: str,
     result: str,
 ) -> tuple[EndpointServiceRecoveryState, str, str | None]:
-    install_action = f"clio-relay cluster install-endpoint-service --cluster {cluster}"
-    restart_action = f"clio-relay cluster restart-endpoint-service --cluster {cluster}"
+    install_action = f"clio-relay worker cluster install-endpoint-service --cluster {cluster}"
+    restart_action = f"clio-relay worker cluster restart-endpoint-service --cluster {cluster}"
     if not installed:
         return "not-installed", "managed endpoint service is not installed", install_action
     if not enabled:

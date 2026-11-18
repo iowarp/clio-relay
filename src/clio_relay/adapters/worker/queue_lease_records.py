@@ -574,14 +574,18 @@ def lease_expiry_ref_name(identity: LeaseIndexIdentity) -> str:
     )
 
 
+# Every decodable kind keeps a code so leases written for retired kinds still parse.
+_LEASE_KIND_CODES: dict[JobKind, str] = {kind: kind.value[0] for kind in JobKind}
+_LEASE_KINDS_BY_CODE: dict[str, JobKind] = {
+    code: kind for kind, code in _LEASE_KIND_CODES.items()
+}
+if len(_LEASE_KINDS_BY_CODE) != len(_LEASE_KIND_CODES):
+    raise RuntimeError("job kind lease codes must be unique")
+
+
 def lease_kind_code(job_kind: JobKind) -> str:
     """Encode a job kind for a compact lease reference."""
-    return {
-        JobKind.JARVIS: "j",
-        JobKind.REMOTE_AGENT: "r",
-        JobKind.MCP_CALL: "m",
-        JobKind.INPUT_INGEST: "i",
-    }[job_kind]
+    return _LEASE_KIND_CODES[job_kind]
 
 
 def lease_identity_token(identity: LeaseIndexIdentity) -> str:
@@ -634,12 +638,7 @@ def parse_lease_expiry_ref_name(
         _suffix,
     ) = parts
     try:
-        job_kind = {
-            "j": JobKind.JARVIS,
-            "r": JobKind.REMOTE_AGENT,
-            "m": JobKind.MCP_CALL,
-            "i": JobKind.INPUT_INGEST,
-        }[kind_code]
+        job_kind = _LEASE_KINDS_BY_CODE[kind_code]
         expires_key = int(expires_raw)
     except (KeyError, ValueError):
         return None

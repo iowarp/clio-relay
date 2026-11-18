@@ -3,8 +3,8 @@ remove sidecars.
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition. The action family
 ``_reconcile_pending_execution_cleanup`` (``endpoint_execution_lifecycle.py``)
-dispatches to per task: terminate an orphaned execution or its recovery-query process
-(``_terminate_recorded_execution``/ ``_terminate_recorded_jarvis_recovery_query``),
+dispatches to per task: terminate an orphaned execution
+(``_terminate_recorded_execution``),
 reconcile one canceled execution (``_reconcile_canceled_execution``), and
 quarantine/remove its sidecars once ownership is proven
 (``_stage_execution_sidecar_quarantine``/ ``_ensure_recorded_execution_cleanup_plan``/
@@ -23,9 +23,6 @@ from clio_relay.adapters.worker.endpoint_execution_sidecar_cleanup import (
     _execution_cleanup_quarantine_paths,
     _execution_sidecar_cleanup_plan,
     _remove_execution_sidecars,
-)
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_execution_recovery,
 )
 from clio_relay.adapters.worker.endpoint_runtime_sidecar_anchor import (
     _runtime_sidecar_anchor_from_metadata,
@@ -125,39 +122,6 @@ class ExecutionCleanupActionsMixin:
             raise RelayError(
                 f"could not reconcile prior execution for task {task.task_id}: {exc}"
             ) from exc
-        return process_id
-
-    def _terminate_recorded_jarvis_recovery_query(
-        self,
-        job: RelayJob,
-        task: RelayTask,
-    ) -> int | None:
-        """Terminate an interrupted read-only recovery query before replaying it."""
-        intent = _durable_jarvis_execution_recovery(job, task)
-        if intent is None:
-            return None
-        raw_ownership = intent.get("query_process")
-        if raw_ownership is None:
-            return None
-        if not isinstance(raw_ownership, dict):
-            raise RelayError(f"JARVIS recovery query ownership is invalid for task {task.task_id}")
-        synthetic = task.model_copy(update={"metadata": {"execution_ownership": raw_ownership}})
-        process_id = self._terminate_recorded_execution(synthetic)
-        self.queue.update_task_metadata(
-            task.task_id,
-            {
-                "jarvis_execution_recovery": {
-                    **intent,
-                    "query_process": None,
-                }
-            },
-        )
-        self.queue.append_event(
-            job.job_id,
-            "jarvis.execution_recovery_process_reconciled",
-            "Interrupted JARVIS execution recovery query was proven stopped",
-            payload={"task_id": task.task_id, "pid": process_id},
-        )
         return process_id
 
     def _reconcile_canceled_execution(self, job: RelayJob) -> None:

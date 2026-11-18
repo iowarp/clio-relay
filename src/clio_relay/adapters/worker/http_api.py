@@ -26,7 +26,7 @@ route bodies to owner modules:
 
 Every name external code or tests reached through ``clio_relay.adapters.worker.http_api``
 (``create_app``, the module-level ``app``, ``InputArtifactBodyLimitMiddleware``,
-``JarvisMcpCallSubmitRequest``, ``OWNER_SESSION_ID_HEADER``,
+``OWNER_SESSION_ID_HEADER``,
 ``SESSION_GENERATION_ID_HEADER``, and the ``door_errors`` module reference)
 stays importable from here under its original name.
 """
@@ -57,13 +57,13 @@ from clio_relay.adapters.worker.http_api_error_handlers import (
     _relay_unhandled_exception_handler,
 )
 from clio_relay.adapters.worker.http_api_middleware import InputArtifactBodyLimitMiddleware
-from clio_relay.adapters.worker.http_api_models import JarvisMcpCallSubmitRequest as JarvisMcpCallSubmitRequest
 from clio_relay.adapters.worker.http_api_routes_artifacts import register_artifact_routes
 from clio_relay.adapters.worker.http_api_routes_events import register_event_routes
 from clio_relay.adapters.worker.http_api_routes_gateway import register_gateway_routes
 from clio_relay.adapters.worker.http_api_routes_jobs import register_job_routes
 from clio_relay.adapters.worker.http_api_routes_owner_session_admin import register_owner_session_admin_routes
 from clio_relay.adapters.worker.http_api_routes_queue import register_queue_routes
+from clio_relay.adapters.worker.http_api_routes_adapter import register_adapter_routes
 from clio_relay.adapters.worker.http_api_routes_scheduler import register_scheduler_routes
 from clio_relay.adapters.worker.http_api_routes_session import register_session_routes
 from clio_relay.adapters.worker.http_api_routes_worker_probe import register_worker_probe_routes
@@ -177,6 +177,7 @@ def create_app(settings: RelaySettings | None = None) -> FastAPI:
         # internally, so the registration itself is the gate.
         register_scheduler_routes(app, ctx, auth_dependency=auth_dependency)
         register_worker_probe_routes(app, ctx, auth_dependency=auth_dependency)
+        register_adapter_routes(app, ctx, auth_dependency=auth_dependency)
 
     return app
 

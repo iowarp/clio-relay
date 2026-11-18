@@ -2,7 +2,7 @@
 
 Split out of ``transport_probe.py`` (iowarp/clio-relay#231): the single
 function that renders the ``bash -s`` script the FRP HTTP probe pipes over
-SSH -- it starts the owned ``clio-relay api`` process and the remote
+SSH -- it starts the owned ``clio-relay worker api`` process and the remote
 ``frpc`` proxy under a shared owner token, then writes the token-scoped
 process-identity metadata ``_cleanup_remote_probe``
 (``transport_probe_remote_cleanup.py``) later verifies before tearing
@@ -82,7 +82,7 @@ else
   exit 1
 fi
 setsid env "CLIO_RELAY_PROBE_OWNER_TOKEN=$owner_token" \
-  clio-relay api start --host 127.0.0.1 --port {api_port}{require_token} \
+  clio-relay worker api start --host 127.0.0.1 --port {api_port}{require_token} \
   >"$probe_dir/api.log" 2>&1 &
 api_pid="$!"
 sleep 1
@@ -135,7 +135,7 @@ def identity(pid_raw, kind, markers):
     raise RuntimeError(f"owned {{kind}} process did not establish its identity")
 
 processes = [
-    identity(api_pid, "remote_relay_api", ["clio-relay", "api", "start", "--port", api_port]),
+    identity(api_pid, "remote_relay_api", ["clio-relay", "worker", "api", "start", "--port", api_port]),
     identity(frpc_pid, "remote_connector", ["frpc", f"{{tmp}}/frpc.toml"]),
 ]
 metadata = {{

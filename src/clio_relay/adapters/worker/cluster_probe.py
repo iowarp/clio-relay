@@ -147,7 +147,7 @@ def probe_cluster_runtime(definition: ClusterDefinition) -> dict[str, object]:
     else:
         state = "relay_not_installed"
     repair = (
-        None if state == "ready" else f"clio-relay cluster bootstrap --cluster {definition.name}"
+        None if state == "ready" else f"clio-relay worker cluster bootstrap --cluster {definition.name}"
     )
     report.update(
         {

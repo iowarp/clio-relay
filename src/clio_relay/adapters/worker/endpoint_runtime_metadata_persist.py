@@ -1,6 +1,5 @@
 """Durable runtime-metadata merge/persist: the single choke point every runtime-metadata
-source (stdout marker, sidecar record, MCP result, recovery query, scheduler
-reconciliation) writes through.
+source (stdout marker, sidecar record, scheduler reconciliation) writes through.
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition.
 ``_persist_runtime_metadata`` merges an incoming observation against the durable state,
@@ -14,16 +13,12 @@ import hashlib
 import json
 from typing import cast
 
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_execution_recovery,
-)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _runtime_metadata_exact_marker_reconciliation,
     _runtime_metadata_is_native,
     _runtime_sidecar_channel_failed,
     _task_direct_execution_pinned,
 )
-from clio_relay.errors import ConfigurationError
 from clio_relay.models import (
     RelayJob,
     SchedulerPhase,
@@ -48,29 +43,14 @@ class RuntimeMetadataPersistMixin:
         state: list[JarvisRuntimeMetadata | None],
         digests: set[str],
         scheduler_job_ids: list[str],
-        superseded_transport_runtime: JarvisRuntimeMetadata | None = None,
-        allow_artifact_pinned_recovery: bool = False,
     ) -> None:
         """Persist one normalized runtime observation to job, task, and events."""
         task = self.queue.get_task(task_id)
         failed_channel = _runtime_sidecar_channel_failed(task)
-        recovery_intent = _durable_jarvis_execution_recovery(job, task)
-        recovery_authorized = (
-            allow_artifact_pinned_recovery
-            and recovery_intent is not None
-            and recovery_intent["state"] == "pending"
-            and metadata.source is RuntimeMetadataSource.JARVIS_MCP
-            and _runtime_metadata_is_native(metadata)
-            and metadata.pipeline_id == recovery_intent["pipeline_id"]
-            and metadata.execution_id == recovery_intent["execution_id"]
-        )
         incoming_reconciliation = _runtime_metadata_exact_marker_reconciliation(metadata)
         if failed_channel and (
-            not recovery_authorized
-            and (
-                metadata.source is not RuntimeMetadataSource.RELAY_RECONCILIATION
-                or incoming_reconciliation is None
-            )
+            metadata.source is not RuntimeMetadataSource.RELAY_RECONCILIATION
+            or incoming_reconciliation is None
         ):
             state[0] = None
             digests.clear()
@@ -89,11 +69,8 @@ class RuntimeMetadataPersistMixin:
                 },
             )
             return
-        if superseded_transport_runtime is not None and state[0] != superseded_transport_runtime:
-            raise ConfigurationError("MCP transport runtime changed before it could be superseded")
         if (
-            superseded_transport_runtime is None
-            and _task_direct_execution_pinned(task)
+            _task_direct_execution_pinned(task)
             and (metadata.scheduler_provider is not None or metadata.scheduler_job_id is not None)
         ):
             self.queue.append_event(
@@ -117,7 +94,7 @@ class RuntimeMetadataPersistMixin:
         if digest in digests:
             return
         digests.add(digest)
-        previous = None if superseded_transport_runtime is not None else state[0]
+        previous = state[0]
         if (
             _runtime_metadata_is_native(metadata)
             and previous is not None
@@ -205,10 +182,6 @@ class RuntimeMetadataPersistMixin:
             "scheduler_job_ids": list(scheduler_job_ids),
             "scheduler_job_ownership": scheduler_ownership,
         }
-        if superseded_transport_runtime is not None:
-            durable_metadata["mcp_transport_runtime_metadata"] = (
-                superseded_transport_runtime.model_dump(mode="json")
-            )
         native_execution = merged.details.get("native_execution")
         if isinstance(native_execution, dict):
             typed_native = cast(dict[str, object], native_execution)
@@ -223,18 +196,6 @@ class RuntimeMetadataPersistMixin:
         durable_metadata["scheduler"] = merged.scheduler_provider
         self.queue.update_job_metadata(job.job_id, durable_metadata)
         self.queue.update_task_metadata(task_id, durable_metadata)
-        if superseded_transport_runtime is not None:
-            self.queue.append_event(
-                job.job_id,
-                "runtime.transport_metadata_superseded",
-                "Trusted JARVIS MCP runtime superseded its direct transport wrapper",
-                payload={
-                    "transport_execution_id": superseded_transport_runtime.execution_id,
-                    "owned_execution_id": merged.execution_id,
-                    "owned_scheduler_job_id": merged.scheduler_job_id,
-                    "ownership_verified": scheduler_ownership_verified,
-                },
-            )
         if failed_channel and exact_marker_reconciliation is not None:
             self._resolve_runtime_sidecar_failure_by_reconciliation(
                 job,

@@ -11,10 +11,6 @@ per-page ssh exec (iowarp/clio-relay#276). This module generalizes that
 pattern into the one place cli_owned_relay_jobs.py / cli_owned_scheduler_
 cancel.py / cli_remote_worker_probe.py's dial sites route their decision
 through, instead of each repeating an ad hoc channel-or-ssh branch.
-``cli_remote_mcp.py``'s artifact-content read was dropped from this slice
-(review B1): the discovery job it reads carries no owner metadata, so
-``GET /artifacts/{id}/content`` 403s every time over an owned channel --
-that dial site stays ssh, unconditionally, undisturbed by this module.
 
 :func:`live_matching_connection` never dials anything -- it is
 ``RemoteConnectionRegistry.get()``, read-only. A connection held for a

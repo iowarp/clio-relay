@@ -354,10 +354,10 @@ def _diagnose_frpc_proxy(
     if load_state_category == "error":
         return (
             f"frpc proxy unit file is malformed (LoadState={load_state}); re-run "
-            "`clio-relay relay-host install-proxy` to rewrite it"
+            "`clio-relay worker relay-host install-proxy` to rewrite it"
         )
     if not installed:
-        return "frpc proxy unit is not installed; run `clio-relay relay-host install-proxy`"
+        return "frpc proxy unit is not installed; run `clio-relay worker relay-host install-proxy`"
     if not enabled:
         return "frpc proxy unit is installed but not enabled"
     if restart_looping:

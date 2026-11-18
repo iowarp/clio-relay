@@ -95,7 +95,7 @@ OWNED_SESSION_REGISTRY_ENV = "CLIO_RELAY_OWNED_SESSION_REGISTRY"
 OWNED_SESSION_RECORD_SCHEMA: Final = "clio-relay.owned-session-record.v1"
 
 _RECOVERY_HINT: Final = (
-    "delete the file and re-run `clio-relay session start --cluster <cluster>` to "
+    "delete the file and re-run `clio-relay worker session start --cluster <cluster>` to "
     "recreate it, or restore a known-good backup"
 )
 

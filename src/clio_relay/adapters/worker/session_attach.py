@@ -196,7 +196,7 @@ def resolve_attach_target(
     record = load_owned_session_record(cluster, path=record_path)
     if record is None:
         raise NoDurableSessionRecordError(
-            f"no durable session record for cluster {cluster!r}; run `clio-relay session "
+            f"no durable session record for cluster {cluster!r}; run `clio-relay worker session "
             f"start --cluster {cluster} ...` to create one, or set "
             "CLIO_RELAY_OWNER_SESSION_ID / CLIO_RELAY_SESSION_GENERATION_ID / "
             "CLIO_RELAY_OWNER_SESSION_CLUSTER explicitly"
@@ -288,7 +288,7 @@ def attach_owned_session(
             session_id=target.session_id,
             detail=(
                 "the held channel dropped while attaching; re-run "
-                "'clio-relay session attach' to authorize one reconnect "
+                "'clio-relay worker session attach' to authorize one reconnect "
                 f"({exc})"
             ),
         ) from exc
@@ -401,7 +401,7 @@ def build_attach_report(
             session_id=target.session_id,
             detail=(
                 "the held channel dropped during attach verification; re-run "
-                "'clio-relay session attach' to authorize one reconnect "
+                "'clio-relay worker session attach' to authorize one reconnect "
                 f"({exc})"
             ),
         ) from exc

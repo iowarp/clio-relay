@@ -18,7 +18,6 @@ from clio_relay.models import (
     JobKind,
     JobState,
     Lease,
-    McpAdmissionClass,
     RelayJob,
     RelayTask,
 )
@@ -188,8 +187,7 @@ def test_only_worker_slot_zero_owns_cleanup_reconciliation(
         a real application fault can never again kill a daemon-mode worker slot
         silently. A same-hierarchy ``StopSlot`` would be swallowed by that same
         barrier and the ``while True: ... time.sleep(0)`` loop below it would spin
-        forever (matches the identical fix in
-        ``test_control_query_admission.py::test_supervised_slots_publish_total_and_disjoint_lane_metadata``).
+        forever.
         ``BaseException`` is the same idiom Python's own control-flow signals
         (``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit``) use to stay
         outside blanket ``except Exception`` handlers.
@@ -215,9 +213,9 @@ def test_only_worker_slot_zero_owns_cleanup_reconciliation(
     monkeypatch.setattr(endpoint_module, "EndpointWorker", FakeSlotWorker)
     try:
         with pytest.raises(StopSlot):
-            cast(Any, supervisor)._serve_worker_slot(0, 0, McpAdmissionClass.WORKLOAD)
+            cast(Any, supervisor)._serve_worker_slot(0, 0)
         with pytest.raises(StopSlot):
-            cast(Any, supervisor)._serve_worker_slot(1, 0, McpAdmissionClass.WORKLOAD)
+            cast(Any, supervisor)._serve_worker_slot(1, 0)
     finally:
         supervisor.close()
 

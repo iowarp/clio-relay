@@ -52,6 +52,9 @@ _VALIDATION_PROVENANCE_ENV = (
 )
 
 
+# Remote relay commands are the worker adapter's, mounted as `clio-relay worker`.
+WORKER_COMMAND_GROUP = "worker"
+
 @contextmanager
 def remote_command_timeout(timeout_seconds: float) -> Generator[None, None, None]:
     """Bound nested remote CLI calls in the current execution context."""
@@ -84,13 +87,15 @@ def run_remote_clio(
     *,
     cluster_registry_path: str | None = None,
 ) -> str:
-    """Run a clio-relay command on a configured cluster and return stdout.
+    """Run a ``clio-relay worker`` command on a configured cluster and return stdout.
+
+    ``args`` start at the worker group, for example ``["queue", "list"]``.
 
     ``cluster_registry_path`` is invocation-scoped. It makes a staged desktop
     route authoritative for only this SSH command and never changes persistent
     configuration on the cluster.
     """
-    rendered_args = " ".join(shlex.quote(arg) for arg in args)
+    rendered_args = " ".join(shlex.quote(arg) for arg in [WORKER_COMMAND_GROUP, *args])
     environment = remote_env(definition)
     if cluster_registry_path is not None:
         rendered_registry_path = render_remote_shell_path(
@@ -113,7 +118,9 @@ def run_remote_jarvis_runtime_authority(
     maximum_stdout_bytes: int,
 ) -> str:
     """Resolve private JARVIS authority through a bounded, output-safe SSH transport."""
-    rendered_args = " ".join(shlex.quote(arg) for arg in ["jarvis-runtime-authority", *args])
+    rendered_args = " ".join(
+        shlex.quote(arg) for arg in [WORKER_COMMAND_GROUP, "jarvis-runtime-authority", *args]
+    )
     relay_executable = render_remote_shell_value(
         definition.relay_executable,
         field="relay_executable",

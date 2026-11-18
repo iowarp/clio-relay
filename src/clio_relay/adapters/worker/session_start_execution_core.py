@@ -758,6 +758,7 @@ def execute_owned_session_start(
                 "-I",
                 "-c",
                 "from clio_relay.adapters.worker.cli import app; app()",
+                "worker",
                 "api",
                 "start",
                 "--host",

@@ -56,7 +56,6 @@ from clio_relay.errors import (
 )
 from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
 from clio_relay.adapters.worker.http_api import create_app
-from clio_relay.adapters.worker.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
 from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
 from clio_relay.models import JobKind, JobState
@@ -72,7 +71,6 @@ _EXPECTED_REASONS = frozenset(
         "mcp_task_input_park_conflict",
         "mcp_task_conflict",
         "mcp_task_status_reconciliation_failed",
-        "jarvis_dispatch_refused",
         "not_found",
         "configuration_error",
         "storage_admission_refused",
@@ -103,7 +101,6 @@ _EXPECTED_REASONS = frozenset(
         "task_not_found",
         "gateway_not_found",
         "artifact_not_found",
-        "execution_not_found",
         "session_generation_identity_unavailable",
         "session_intake_closed",
         "session_binding_headers_required",
@@ -111,7 +108,6 @@ _EXPECTED_REASONS = frozenset(
         "unbound_session_api",
         "job_cluster_mismatch",
         "job_submission_conflict",
-        "mcp_submission_conflict",
         "jarvis_runtime_authority_conflict",
         "jarvis_artifact_conflict",
         "input_ingest_conflict",
@@ -121,7 +117,6 @@ _EXPECTED_REASONS = frozenset(
         "queue_operation_conflict",
         "retention_conflict",
         "job_submission_refused",
-        "mcp_admission_refused",
         "input_ingest_refused",
         "job_route_refused",
         "jarvis_submission_refused",
@@ -179,7 +174,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
             "task_not_found",
             "gateway_not_found",
             "artifact_not_found",
-            "execution_not_found",
         },
         404,
     ),
@@ -192,7 +186,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
             "unbound_session_api",
             "job_cluster_mismatch",
             "job_submission_conflict",
-            "mcp_submission_conflict",
             "jarvis_runtime_authority_conflict",
             "jarvis_artifact_conflict",
             "input_ingest_conflict",
@@ -207,7 +200,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
     **dict.fromkeys(
         {
             "job_submission_refused",
-            "mcp_admission_refused",
             "input_ingest_refused",
             "job_route_refused",
             "jarvis_submission_refused",
@@ -423,34 +415,6 @@ def test_classify_carries_owner_session_identity_detail_as_extension_data() -> N
     assert fault.data == {key: value for key, value in exc.detail.items() if key != "message"}
     assert fault.data["code"] == "owner_session_identity_invalid"
     assert str(exc) not in json.dumps(fault.data)
-
-
-def test_classify_jarvis_dispatch_refusal_is_an_object_entry_point() -> None:
-    """JarvisDispatchRefusal is a durable-result dataclass, never raised-and-caught.
-
-    F11: this reason is declared in the frozen table but not yet emitted by
-    any production call site -- no code today constructs a durable
-    ``jarvis_run`` result and hands its refusal to ``classify()``. This test
-    (and the vocabulary itself) is forward-declared contract, not a
-    regression proof of live behavior.
-    """
-    refusal = JarvisDispatchRefusal(
-        code="jarvis_tool_error",
-        message="the pipeline refused to dispatch",
-        pipeline_id="pipeline-1",
-        execution_id="execution-1",
-        payload_schema_version="jarvis.error.v1",
-    )
-    fault = door_errors.classify(refusal)
-    assert fault.reason == "jarvis_dispatch_refused"
-    assert fault.message == "JARVIS dispatch refused."
-    assert refusal.message not in fault.message
-    assert fault.data == {
-        "code": "jarvis_tool_error",
-        "pipeline_id": "pipeline-1",
-        "execution_id": "execution-1",
-    }
-    assert fault.retryable is False
 
 
 def test_classify_reason_override_is_call_path_scoped_not_type_based() -> None:
@@ -1015,12 +979,12 @@ _HTTP_API_SPLIT_MODULES = (
 
 
 def _http_api_split_sources() -> list[tuple[str, str]]:
-    root = Path(__file__).parents[1] / "src" / "clio_relay"
+    root = Path(__file__).parents[1] / "src" / "clio_relay" / "adapters" / "worker"
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 123 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 113 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -1049,6 +1013,11 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
     123 (was 113): clio-relay#179 dial burn-down (review M5): three new
     owned-session-channel route modules add 10 more raise sites -- see
     ``_HTTP_API_SPLIT_MODULES``'s own comment for the per-module breakdown.
+
+    113 (was 123): removing the MCP job routes drops 6 sites in
+    http_api_routes_jobs.py and 3 MCP admission sites in
+    http_api_context.py, and removing the execution-scoped artifact-listing
+    route drops its single ``execution_not_found`` site.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1072,7 +1041,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 123
+    assert len(calls) == 113
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1084,7 +1053,12 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
     )
 
     middleware_source = (
-        Path(__file__).parents[1] / "src" / "clio_relay" / "http_api_middleware.py"
+        Path(__file__).parents[1]
+        / "src"
+        / "clio_relay"
+        / "adapters"
+        / "worker"
+        / "http_api_middleware.py"
     ).read_text(encoding="utf-8")
     middleware_tree = ast.parse(middleware_source)
     functions = {
@@ -1112,7 +1086,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 138
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 128
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1145,11 +1119,11 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_59_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
-    (``mcp_submission_conflict`` on ``submit_mcp_call``,
+    (a since-removed MCP submission conflict site and
     ``job_submission_conflict`` on ``submit_owned``) deliberately opted OUT
     of this closed set -- an agent meeting either refusal needs the raw
     conflict/mismatch detail PLUS an authored what-to-do-next tail (the
@@ -1167,6 +1141,10 @@ def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None
     ``http_api_routes_worker_probe.py``, 3 in ``http_api_routes_
     scheduler.py``, each a ``ConfigurationError`` re-raised as
     ``configuration_error``) join the closed set unchanged: 58 -> 63.
+
+    Removing the MCP job routes drops 3 sites and removing the
+    execution-scoped listing route drops its ``execution_not_found`` site:
+    63 -> 59.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1181,7 +1159,7 @@ def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 63
+    assert len(calls) == 59
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])

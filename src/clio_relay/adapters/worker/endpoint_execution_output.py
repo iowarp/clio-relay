@@ -2,7 +2,7 @@
 
 Owner module for iowarp/clio-relay#231's endpoint decomposition. Covers writing the
 post-run provenance artifact (``_append_provenance_artifact``), rendering the JARVIS
-pipeline YAML (``_render_job_yaml``), the endpoint-MCP-vs-JARVIS transport dispatch
+pipeline YAML (``_render_job_yaml``), the JARVIS transport dispatch
 (``_run_execution_streaming``/ ``_run_jarvis_streaming``), durable stdout/stderr capture
 with truncation events (``_append_output``/``_append_ignored_stdout_markers``), and
 package progress record validation/persistence (``_append_package_progress_records``).
@@ -15,24 +15,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from clio_relay import process_containment
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    endpoint_mcp_runner_command,
-)
 from clio_relay.adapters.worker.endpoint_progress_log_io import (
     _validated_native_subprocess_cwd,
 )
 from clio_relay.adapters.worker.endpoint_progress_trust import (
-    _trusted_mcp_progress_metadata,
-    _trusted_native_mcp_progress_metadata,
     _trusted_provider_metadata,
     _trusted_sidecar_metadata,
 )
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _runtime_metadata_is_native,
-)
-from clio_relay.adapters.worker.endpoint_sidecar_types import (
-    MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS,
 )
 from clio_relay.adapters.worker.endpoint_worker_environment import (
     _bounded_output_event_chunks,
@@ -49,7 +40,6 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
-    McpCallSpec,
     ProgressRecord,
     RelayEvent,
     RelayJob,
@@ -60,7 +50,6 @@ from clio_relay.adapters.worker.progress_adapters import (
 )
 from clio_relay.progress_provenance import (
     PackageProgressSourceAuthority,
-    validate_jarvis_execution_progress_metadata,
     validate_package_progress_metadata,
     validate_package_progress_provider_metadata,
 )
@@ -85,51 +74,26 @@ class ExecutionOutputMixin:
         terminal_state: JobState,
         runtime_metadata: JarvisRuntimeMetadata | None,
     ) -> None:
-        endpoint_mcp_call = job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec)
-        provider_metadata: dict[str, object]
-        spool_metadata: dict[str, object]
-        artifact_metadata: dict[str, object]
-        if endpoint_mcp_call:
-            provider_metadata = {
-                "name": "clio-relay-endpoint-mcp",
-                "runner": str(Path(endpoint_mcp_runner_command(pipeline_path)[1])),
-                "process_containment": process_containment.containment_capability(),
-                "outer_jarvis_pipeline": False,
-            }
-            spool_metadata = {
-                "path": str(spool.path),
-                "request": str(pipeline_path),
-                "stdout": str(spool.path / "stdout.log"),
-                "stderr": str(spool.path / "stderr.log"),
-                "log_capture": spool.capture_summary(),
-            }
-            artifact_metadata = {
-                "request": _file_summary(pipeline_path),
-                "stdout": _file_summary(spool.path / "stdout.log"),
-                "stderr": _file_summary(spool.path / "stderr.log"),
-                "log_capture": _file_summary(spool.log_capture_path),
-            }
-        else:
-            provider_metadata = {
-                "name": "jarvis-cd",
-                "jarvis_bin": self.settings.jarvis_bin,
-                "agent_bin": self.settings.agent_bin,
-                "agent_adapter": self.settings.agent_adapter,
-                "agent_args": self.settings.agent_args,
-            }
-            spool_metadata = {
-                "path": str(spool.path),
-                "pipeline": str(pipeline_path),
-                "stdout": str(spool.path / "stdout.log"),
-                "stderr": str(spool.path / "stderr.log"),
-                "log_capture": spool.capture_summary(),
-            }
-            artifact_metadata = {
-                "pipeline": _file_summary(pipeline_path),
-                "stdout": _file_summary(spool.path / "stdout.log"),
-                "stderr": _file_summary(spool.path / "stderr.log"),
-                "log_capture": _file_summary(spool.log_capture_path),
-            }
+        provider_metadata: dict[str, object] = {
+            "name": "jarvis-cd",
+            "jarvis_bin": self.settings.jarvis_bin,
+            "agent_bin": self.settings.agent_bin,
+            "agent_adapter": self.settings.agent_adapter,
+            "agent_args": self.settings.agent_args,
+        }
+        spool_metadata: dict[str, object] = {
+            "path": str(spool.path),
+            "pipeline": str(pipeline_path),
+            "stdout": str(spool.path / "stdout.log"),
+            "stderr": str(spool.path / "stderr.log"),
+            "log_capture": spool.capture_summary(),
+        }
+        artifact_metadata: dict[str, object] = {
+            "pipeline": _file_summary(pipeline_path),
+            "stdout": _file_summary(spool.path / "stdout.log"),
+            "stderr": _file_summary(spool.path / "stderr.log"),
+            "log_capture": _file_summary(spool.log_capture_path),
+        }
         provenance_path = spool.write_provenance(
             {
                 "job": job.model_dump(mode="json"),
@@ -173,8 +137,6 @@ class ExecutionOutputMixin:
                 job.spec,
                 relay_job_id=job.job_id,
             )
-        if job.kind == JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
-            return self.provider.render_mcp_call_yaml(job.spec)
         raise ConfigurationError(f"job kind/spec mismatch for {job.job_id}")
 
     def _run_execution_streaming(
@@ -193,29 +155,7 @@ class ExecutionOutputMixin:
         on_timeout: Callable[[], None],
         on_poll: Callable[[], None],
     ) -> subprocess.CompletedProcess[str]:
-        """Run MCP transport directly and reserve JARVIS for JARVIS-owned jobs."""
-        if job.kind is JobKind.MCP_CALL and isinstance(job.spec, McpCallSpec):
-            if pipeline_name is not None:
-                raise ConfigurationError("endpoint MCP operations cannot name a JARVIS pipeline")
-            runtime_cwd = None if cwd is None else _validated_native_subprocess_cwd(cwd)
-            outer_timeout = (
-                None
-                if timeout_seconds is None
-                else timeout_seconds + MCP_ENDPOINT_RUNNER_EXIT_GRACE_SECONDS
-            )
-            return self.provider.run_command_streaming(
-                endpoint_mcp_runner_command(pipeline_path),
-                process_label="endpoint MCP operation",
-                cwd=runtime_cwd,
-                env=env,
-                on_stdout=on_stdout,
-                on_stderr=on_stderr,
-                on_start=on_start,
-                should_cancel=should_cancel,
-                timeout_seconds=outer_timeout,
-                on_timeout=on_timeout,
-                on_poll=on_poll,
-            )
+        """Run the job's pipeline through JARVIS."""
         return self._run_jarvis_streaming(
             job,
             pipeline_path=pipeline_path,
@@ -376,7 +316,6 @@ class ExecutionOutputMixin:
             try:
                 metadata = _optional_metadata(typed_payload.get("metadata"))
                 provider_validated_record = package_progress_provider is not None
-                native_progress_record = False
                 if not progress_sidecar_authenticated and package_progress_provider is None:
                     raise ConfigurationError("package progress record has no bound provider")
                 if package_progress_provider is not None:
@@ -420,16 +359,6 @@ class ExecutionOutputMixin:
                         source_authority=source_authority,
                         acceptance_validated=acceptance_validated,
                     )
-                elif progress_sidecar_authenticated and isinstance(
-                    metadata.get("mcp_progress_bridge"), dict
-                ):
-                    trusted_metadata = _trusted_mcp_progress_metadata(job, metadata)
-                    provider_validated_record = True
-                elif progress_sidecar_authenticated and isinstance(
-                    metadata.get("mcp_native_progress_bridge"), dict
-                ):
-                    trusted_metadata = _trusted_native_mcp_progress_metadata(job, metadata)
-                    native_progress_record = True
                 else:
                     trusted_metadata = _trusted_sidecar_metadata(metadata, job_id=job.job_id)
                 progress = ProgressRecord(
@@ -442,15 +371,7 @@ class ExecutionOutputMixin:
                     source_event_seq=source_event_seq,
                     metadata=trusted_metadata,
                 )
-                if native_progress_record:
-                    validate_jarvis_execution_progress_metadata(progress.metadata)
-                    if progress.metadata["progress_determinate"] is not (
-                        progress.current is not None and progress.total is not None
-                    ):
-                        raise ConfigurationError(
-                            "native JARVIS progress determinate flag did not match values"
-                        )
-                elif provider_validated_record:
+                if provider_validated_record:
                     validate_package_progress_provider_metadata(progress.metadata)
                 else:
                     validate_package_progress_metadata(progress.metadata)

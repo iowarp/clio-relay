@@ -1,7 +1,7 @@
 """Owner-session self-admission routes (iowarp/clio-relay#179 dial burn-down).
 
 Two owned-session control-plane operations that previously had no HTTP
-surface and so fell to a per-operation ``ssh ... clio-relay session
+surface and so fell to a per-operation ``ssh ... clio-relay worker session
 quiesce-intake`` / ``... session admission-status`` dial even when the
 held channel was already live: quiescing this session's OWN intake for
 teardown, and reading this session's OWN admission status. Both are scoped

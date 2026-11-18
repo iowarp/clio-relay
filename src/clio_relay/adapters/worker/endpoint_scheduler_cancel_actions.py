@@ -37,7 +37,7 @@ from clio_relay.models import (
     SchedulerStatus,
     utc_now,
 )
-from clio_relay.scheduler_providers import (
+from clio_relay.adapters.worker.scheduler import (
     SchedulerProvider,
     provider_for_scheduler,
 )

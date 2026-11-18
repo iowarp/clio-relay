@@ -544,7 +544,6 @@ uv pip install --python "$JARVIS_VENV/bin/python" \\
   --refresh-package clio-relay "$RELAY_INSTALL_TARGET"
 JARVIS_PACKAGE_PROBE='import clio_relay, jarvis_cd; '
 JARVIS_PACKAGE_PROBE+='import clio_relay.bounded_command.pkg; '
-JARVIS_PACKAGE_PROBE+='import clio_relay.mcp_call.pkg; '
 JARVIS_PACKAGE_PROBE+='import clio_relay.remote_agent.pkg'
 "$RELAY_PROVIDER_PYTHON" -c "$JARVIS_PACKAGE_PROBE"
 "$JARVIS_VENV/bin/python" -c "$JARVIS_PACKAGE_PROBE"

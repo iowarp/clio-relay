@@ -30,8 +30,8 @@ from clio_relay.adapters.worker.jarvis_execution import (
     scheduled_jarvis_command,
     yaml_jarvis_command,
 )
-from clio_relay.models import JarvisRunSpec, McpCallSpec, RemoteAgentTaskSpec
-from clio_relay.scheduler_providers import provider_for_scheduler
+from clio_relay.models import JarvisRunSpec, RemoteAgentTaskSpec
+from clio_relay.adapters.worker.scheduler import provider_for_scheduler
 
 STREAM_RESULT_TAIL_MAX_CHARACTERS = 1024 * 1024
 STREAM_READ_CHARACTERS = 64 * 1024
@@ -152,34 +152,6 @@ class JarvisCdProvider:
                     "workdir": str(spec.workdir) if spec.workdir is not None else None,
                     "timeout_seconds": spec.timeout_seconds,
                     "context": spec.context or None,
-                }
-            ],
-        }
-        return yaml.safe_dump(_drop_none(document), sort_keys=False)
-
-    def render_mcp_call_yaml(self, spec: McpCallSpec) -> str:
-        """Render a JARVIS pipeline for a remote MCP tool call."""
-        document: dict[str, Any] = {
-            "name": "clio-relay-mcp-call",
-            "pkgs": [
-                {
-                    "pkg_type": "clio_relay.mcp_call",
-                    "pkg_name": "mcp_call",
-                    "server": spec.server,
-                    "server_args": spec.server_args or None,
-                    "env_from": spec.env_from or None,
-                    "expected_server_artifact_digest": spec.expected_server_artifact_digest,
-                    "expected_registered_contract": spec.expected_registered_contract,
-                    "expected_jarvis_cd_lock_binding": spec.expected_jarvis_cd_lock_binding,
-                    "operation": spec.operation.value,
-                    "tool": spec.tool,
-                    "arguments": spec.arguments or None,
-                    "jarvis_input_manifest": (
-                        spec.jarvis_input_manifest.model_dump(mode="json")
-                        if spec.jarvis_input_manifest is not None
-                        else None
-                    ),
-                    "timeout_seconds": spec.timeout_seconds,
                 }
             ],
         }

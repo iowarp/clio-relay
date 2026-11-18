@@ -13,9 +13,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, cast
 
-from clio_relay.adapters.worker.endpoint_jarvis_recovery import (
-    _durable_jarvis_execution_recovery,
-)
 from clio_relay.adapters.worker.endpoint_scheduler_metadata import (
     _durable_scheduler_submission_intent,
     _owned_scheduler_job_ids_from_metadata,
@@ -35,7 +32,7 @@ from clio_relay.runtime_metadata import (
     JarvisRuntimeMetadata,
     RuntimeMetadataSource,
 )
-from clio_relay.scheduler_providers import (
+from clio_relay.adapters.worker.scheduler import (
     SchedulerReconciliationProvider,
     reconciliation_provider_for_scheduler,
 )
@@ -56,34 +53,6 @@ class SchedulerSubmissionMixin:
     ) -> bool:
         """Prove direct execution or scheduler ownership before cleanup can succeed."""
         task = self.queue.get_task(task_id)
-        recovery_intent = _durable_jarvis_execution_recovery(job, task)
-        if recovery_intent is not None and recovery_intent["state"] == "resolved":
-            recovered_provider = recovery_intent.get("scheduler_provider")
-            recovered_job_id = recovery_intent.get("scheduler_job_id")
-            if recovered_provider is None and recovered_job_id is None:
-                return False
-            if not isinstance(recovered_provider, str) or not isinstance(
-                recovered_job_id,
-                str,
-            ):
-                raise SchedulerSubmissionUnresolvedError(
-                    "recovered JARVIS scheduler identity is incomplete"
-                )
-            owned_ids = _owned_scheduler_job_ids_from_metadata(
-                task.metadata,
-                relay_job_id=job.job_id,
-                task_id=task_id,
-            )
-            if owned_ids != [recovered_job_id]:
-                raise SchedulerSubmissionUnresolvedError(
-                    "recovered JARVIS scheduler ownership did not match task metadata"
-                )
-            scheduler_job_ids[:] = owned_ids
-            return True
-        if recovery_intent is not None:
-            raise SchedulerSubmissionUnresolvedError(
-                "JARVIS execution recovery has not resolved its native scheduler identity"
-            )
         intent = _durable_scheduler_submission_intent(task)
         if intent["scheduler_expected"] is False:
             return False

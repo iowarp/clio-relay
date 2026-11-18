@@ -26,12 +26,6 @@ split is designed to avoid). Both are leaves, so this module stays acyclic;
 ``endpoint.py``'s still-co-resident ``_remove_execution_sidecars`` calls into
 ``_remove_execution_sidecars_windows`` here on the Windows branch of its own
 cross-platform quarantine.
-
-Near-duplicates the same ``kernel32`` handle-cleanup pattern in
-``mcp_call/runner.py`` (``_open_windows_snapshot_cleanup_handle`` and
-siblings) -- no shared import is possible there (separately wheel-packaged
-subprocess entry point, per the architecture doc's own §4.5/§5 note), so
-that duplication is accepted by design, not an oversight of this split.
 """
 
 from __future__ import annotations

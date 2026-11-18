@@ -17,7 +17,6 @@ from clio_relay.bounded_payload import JSON, build_delivery_refusal
 from clio_relay.config import RelaySettings
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.adapters.worker.jarvis_execution_artifacts import EXECUTION_OUTPUT_OWNERSHIP_SCHEMA
 from clio_relay.models import (
     TERMINAL_STATES,
     Cursor,
@@ -45,6 +44,8 @@ from clio_relay.spool import (
 )
 
 MAX_ARTIFACT_CONTENT_BYTES = 16 * 1_048_576
+EXECUTION_OUTPUT_OWNERSHIP_SCHEMA = "clio-relay.execution-output.v1"
+"""Ownership schema of JARVIS execution outputs recorded by earlier relay releases."""
 MAX_MONITOR_RULE_RECORDS = 10_000
 
 

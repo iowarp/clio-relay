@@ -48,7 +48,7 @@ from clio_relay.filesystem_paths import internal_filesystem_path
 from clio_relay.installation import installation_info
 from clio_relay.jarvis_provider import JarvisCdProvider
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob, SchedulerPhase, SchedulerStatus
-from clio_relay.scheduler_providers import SchedulerProvider
+from clio_relay.adapters.worker.scheduler import SchedulerProvider
 from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 
 

@@ -126,7 +126,7 @@ def install_frpc_proxy_over_ssh(
     if not receipt.active:
         raise RelayError(
             "frpc proxy install reported success but the receipt shows the unit is "
-            f"not active for cluster {cluster!r}; diagnose with `clio-relay relay-host "
+            f"not active for cluster {cluster!r}; diagnose with `clio-relay worker relay-host "
             f"proxy-status --cluster {cluster}` -- receipt: {receipt.model_dump_json()}"
         )
     return receipt

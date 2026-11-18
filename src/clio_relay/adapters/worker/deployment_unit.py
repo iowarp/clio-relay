@@ -101,6 +101,7 @@ def render_endpoint_user_service(
     )
     exec_start_arguments = [
         relay_bin,
+        "worker",
         "endpoint",
         "start",
         "--role",
@@ -122,7 +123,7 @@ def render_endpoint_user_service(
     exec_start_pre = " ".join(
         _systemd_exec_argument(argument, allow_home_specifier=index == 0)
         for index, argument in enumerate(
-            [relay_bin, "queue", "migrate-indexes", "--all", "--batch-size", "500"]
+            [relay_bin, "worker", "queue", "migrate-indexes", "--all", "--batch-size", "500"]
         )
     )
     description_cluster = _systemd_exec_argument(cluster, allow_home_specifier=False)

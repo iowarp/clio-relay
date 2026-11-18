@@ -117,8 +117,8 @@ from clio_relay.installation import (
     probe_jarvis_native_execution_capability,
     write_install_receipt,
 )
-from clio_relay.mcp_call.runner import mcp_server_artifact_identity
-from clio_relay.remote_mcp import (
+from clio_relay.adapters.worker.server_artifact_identity import mcp_server_artifact_identity
+from clio_relay.adapters.worker.clio_kit_constants import (
     CLIO_KIT_JARVIS_USER_CONTRACT_ID,
     CLIO_KIT_JARVIS_USER_CONTRACT_SHA256_BY_ID,
     CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
@@ -276,6 +276,7 @@ receipt = write_install_receipt(
             runtime_artifact_path=(str(relay_artifact) if relay_artifact is not None else None),
             runtime_command=[
                 os.environ["CLIO_RELAY_BOOTSTRAP_RELAY_EXECUTABLE"],
+                "worker",
                 "installation-info",
             ],
             runtime_interpreters={
