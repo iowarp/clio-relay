@@ -370,6 +370,7 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
 - Every `ssh` and `scp` uses `BatchMode=yes`. A site that asks for a code refuses with `interactive_auth_required`, naming `worker` as the adapter to use, unless `interactive_sign_in` is set. Then `sign_in_needed()` returns `SignInNeed(provider="ssh")` and registers a starter with W6's `askpass.register_sign_in`; the starter brings up a ControlMaster through askpass, and every later call reuses it with `BatchMode=yes`. Until W6 merges, the adapter falls back to an `askpass:` program from the config.
 - serve: the adapter declares it and calls `clio_relay.serve.start_for` lazily, and exposes `ssh_argv()` for W9's `ssh -L`.
 - No time limits on jobs or transfers. Only the connection setup has one (`connect_timeout_s`, default 30 s), which refuses as `unreachable`.
+- No walltime of relay's own (coordinator decision after the gate). When the spec gives no `duration`, the adapter passes `None` to PSI/J, which then writes no `--time` or `walltime` line, and the scheduler's partition or queue default applies. A site default walltime is the existing `defaults.duration` in the site entry (and so in the catalog schema, since `CatalogEntry` extends `SiteEntry`); the service fills it in before pricing and before the record, so the charge and the script agree. The adapter takes a duration as given only when it is in the spec's `model_fields_set`, because `JobAttributes.duration` still defaults to 10 minutes.
 
 ### Facts
 
@@ -377,7 +378,7 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
   - `Job` has no `name`, which its templates read; the adapter sets it from the operation.
   - The pbspro template writes `#PBS -N="name"`, which `qsub` refuses; the adapter rewrites the line to `#PBS -N name`.
   - `JobSpec` paths and the launch command are made absolute against the local machine; the adapter sets the site's paths after building the spec.
-  - With no `duration`, `JobAttributes` asks the scheduler for 10 minutes. The charge then reports `walltime_s: 600` and `node_hours: 0.1667` for a 30 s job. Any spec without a duration gets that limit, so W1 may want a site default.
+  - With no `duration`, W1's `JobAttributes` fills in 10 minutes (`jobs/spec.py`), and the record round trip (`model_dump`, then `JobSpec.model_validate` at submit) marks it as given. So through the service every job without a duration is still sent with 10 minutes and charged `walltime_s: 600`, until W1 makes the default `None` (requested). Directly through the adapter, and once W1's change lands, no walltime is sent.
 - OpenSSH: `-M` together with `-o ControlMaster=yes` is "ask" mode, which confirms every shared session through askpass ("Master refused session request" under BatchMode). Use `ControlMaster=yes` alone. This matters to W6's sign-in page.
 - Ares, from the [GRC Ares user guide](https://grc.iit.edu/docs/ares/ares-user-guide/) and live `sinfo`: partitions `compute` (default, 22 nodes, 2 days), `debug` (6 nodes, 4 days) and `datacrumbs`; 40 threads and about 47 GB per node; Ubuntu 22.04.5; `module` (Lmod 8.7.25) works only in a login shell, so the skill says to wrap commands in `bash -lc`.
 

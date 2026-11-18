@@ -44,6 +44,11 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 Jobs and transfers have no time limit. A long upload or a job that runs for
 days is allowed to finish.
 
+Relay asks the scheduler for no walltime of its own. A job's walltime is its
+`duration`, or the site's `defaults.duration` when the job gives none. With
+neither, the batch script has no time line, and the scheduler's default for
+the partition or queue applies.
+
 ## How a job runs
 
 1. Relay renders the batch script on your machine with
