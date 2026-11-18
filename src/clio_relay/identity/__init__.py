@@ -197,12 +197,12 @@ def shared() -> Identities:
     global _shared
     with _lock:
         if _shared is not None:
-                return _shared
+            return _shared
     from clio_relay.surface.settings import RelayPaths
 
     grants = GrantFiles.from_settings({"grant_files": dict(RelayPaths.from_env().grant_files)})
     built = Identities(IdentityContext(store=TokenStore(), grants=grants))
     with _lock:
         if _shared is None:
-                _shared = built
+            _shared = built
         return _shared

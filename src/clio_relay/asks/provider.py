@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from clio_relay import identity
 from clio_relay.adapters.base import SignInNeed
 from clio_relay.adapters.hooks import Ask, AskState, HookContext
 from clio_relay.asks import askpass
@@ -32,7 +33,6 @@ from clio_relay.asks.loopback import LoopbackServer
 from clio_relay.asks.pages import DEFAULT_PAGE_TTL_S, PageTokens
 from clio_relay.asks.runner import Runner
 from clio_relay.asks.signin import Mode, SignIns, mode_of
-from clio_relay import identity
 from clio_relay.identity import GrantFiles, GrantWatcher, Identities, IdentityContext, TokenStore
 from clio_relay.identity import get as identity_factory
 from clio_relay.identity.probe import probe_identity
