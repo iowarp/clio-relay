@@ -67,9 +67,7 @@ class Skill:
 
 def skills(config_dir: Path) -> dict[str, Skill]:
     """Return every skill by name. The person's own replace shipped ones."""
-    found = {
-        name: Skill(name, text, "catalog") for name, text in catalog.skills().items()
-    }
+    found = {name: Skill(name, text, "catalog") for name, text in catalog.skills().items()}
     folder = config_dir / "skills"
     if folder.is_dir():
         for path in sorted(folder.glob("*.md")):
@@ -84,7 +82,9 @@ def _is_path(link: str) -> bool:
     return link.endswith(".md") or "/" in link or "\\" in link or link.startswith("~")
 
 
-def site_skill(site: SiteEntry, config_dir: Path, known: dict[str, Skill] | None = None) -> Skill | None:
+def site_skill(
+    site: SiteEntry, config_dir: Path, known: dict[str, Skill] | None = None
+) -> Skill | None:
     """Return the skill ``site`` links, or None when it links none or it can't be read."""
     link = site.skill
     if not link:
@@ -151,9 +151,7 @@ class SkillResources(Provider):
             skill = site_skill(entry, self._config_dir, known)
             if skill is not None:
                 found.append(
-                    _resource(
-                        site_skill_uri(entry.id), skill, f"How to use the site {entry.title}"
-                    )
+                    _resource(site_skill_uri(entry.id), skill, f"How to use the site {entry.title}")
                 )
         return found
 

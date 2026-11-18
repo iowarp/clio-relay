@@ -74,7 +74,7 @@ def test_skill_resources_list_and_read(relay_paths: RelayPaths) -> None:
             assert site_skill_uri("bare") not in listed
             assert site_skill_uri("lost") not in listed
             item = listed[site_skill_uri("fx")]
-            assert item.mimeType == "text/markdown" and item.title == "Using fx"
+            assert item.mime_type == "text/markdown" and item.title == "Using fx"
             read = await client.read_resource(site_skill_uri("fx"))
             assert getattr(read[0], "text", None) == "# Using fx\nSubmit with run.\n"
 
