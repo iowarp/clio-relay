@@ -11,7 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from importlib.metadata import entry_points
+from importlib.metadata import EntryPoint, entry_points
+from logging import getLogger
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -25,6 +26,8 @@ from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
 
 HOOK_GROUP = "clio_relay.hooks"
+
+_log = getLogger(__name__)
 
 AskKind = Literal["choose", "approve", "url"]
 AskState = Literal["pending", "accepted", "declined", "cancelled"]
@@ -218,13 +221,30 @@ def set_hook(name: Literal["asks", "guard", "serve"], factory: HookFactory | Non
         _overrides[name] = factory
 
 
+def _module_missing(point: EntryPoint, exc: ModuleNotFoundError) -> bool:
+    """Return whether ``exc`` says the entry point's own module is not installed."""
+    module = point.module
+    return exc.name is not None and (module == exc.name or module.startswith(f"{exc.name}."))
+
+
 def hook_factory(name: Literal["asks", "guard", "serve"], default: HookFactory) -> HookFactory:
-    """Return the factory for ``name``: an override, an entry point, or the default."""
+    """Return the factory for ``name``: an override, an entry point, or the default.
+
+    An entry point whose module is not installed falls back to the default,
+    which is the safe stub (the guard stub refuses guarded sites). Any other
+    import error is raised.
+    """
     if name in _overrides:
         return _overrides[name]
     for point in entry_points(group=HOOK_GROUP):
         if point.name == name:
-            loaded: object = point.load()
+            try:
+                loaded: object = point.load()
+            except ModuleNotFoundError as exc:
+                if not _module_missing(point, exc):
+                    raise
+                _log.warning("hook %s: %s is not installed; using the stub", name, point.value)
+                return default
             if not callable(loaded):
                 raise Refusal(
                     RefusalReason.INVALID_CONFIG,
