@@ -3,9 +3,8 @@
 
 Extracted from ``service_runtime.py`` (#231 rework slice 18, class-mixin
 split): ``_verified_scheduler_submission`` (prove the exact scheduler
-provider and job ID from either a verified JARVIS binding or the
-relay-created remote sidecar, with a narrow quiesced-owner direct-source
-fallback gated by ``_quiesced_owner_source_recovery_is_authorized``),
+provider and job ID from the relay-created remote sidecar; a session that
+still holds a JARVIS runtime binding is refused and names its job),
 ``_stop_local_connector`` (the shared desktop-connector termination used by
 start rollback, stop, detach, and attach rollback) and its
 ``_remove_unpublished_local_connector_files`` cleanup, the single-shot
@@ -38,8 +37,8 @@ from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_scheduler_contracts as _scheduler_contracts
 from clio_relay import service_runtime_submission_scripts as _submission_scripts
 from clio_relay import service_runtime_types as _types
-from clio_relay.errors import ConfigurationError, QueueConflictError, RelayError
-from clio_relay.jarvis_service_runtime import reverify_jarvis_service_runtime
+from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.jarvis_service_runtime import retired_jarvis_binding_message
 from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
@@ -48,7 +47,6 @@ from clio_relay.models import (
     ServiceRuntimeSpec,
     utc_now,
 )
-from clio_relay.owner_session_admission import desktop_owner_session_admission_id
 from clio_relay.service_runtime_scheduler_names import canonical_scheduler
 from clio_relay.session_wire_models import CleanupResource
 
@@ -59,8 +57,6 @@ class _ServiceRuntimeObservationMixin:
     def _verified_scheduler_submission(
         self,
         session: GatewaySession,
-        *,
-        allow_quiesced_owner_source_recovery: bool = False,
     ) -> _types._VerifiedSchedulerSubmission:
         """Prove the exact provider and job ID from the relay-created remote sidecar."""
         scheduler_job_id = _primitives._optional_str(session.scheduler_job_id)
@@ -72,50 +68,7 @@ class _ServiceRuntimeObservationMixin:
             raise RelayError("owned runtime has no valid service runtime specification") from exc
         binding_document = session.gateway.get("jarvis_runtime_binding")
         if binding_document is not None:
-            try:
-                verified = reverify_jarvis_service_runtime(
-                    queue=self.queue,
-                    definition=self.definition,
-                    settings=self.settings,
-                    binding_document=binding_document,
-                )
-            except (ConfigurationError, RelayError):
-                if not (
-                    allow_quiesced_owner_source_recovery
-                    and self._quiesced_owner_source_recovery_is_authorized(session)
-                ):
-                    raise
-                try:
-                    verified = reverify_jarvis_service_runtime(
-                        queue=self.queue,
-                        definition=self.definition,
-                        settings=None,
-                        binding_document=binding_document,
-                    )
-                except ValueError as exc:
-                    raise RelayError(
-                        f"JARVIS service runtime binding re-verification failed: {exc}"
-                    ) from exc
-            except ValueError as exc:
-                raise RelayError(
-                    f"JARVIS service runtime binding re-verification failed: {exc}"
-                ) from exc
-            binding = verified.binding
-            if (
-                binding.scheduler_provider is None
-                or binding.scheduler_native_id is None
-                or binding.scheduler_provider != session.scheduler
-                or binding.scheduler_native_id != scheduler_job_id
-                or spec.scheduler != session.scheduler
-            ):
-                raise RelayError(
-                    "scheduler identity disagrees with the verified JARVIS runtime binding"
-                )
-            return _types._VerifiedSchedulerSubmission(
-                provider=binding.scheduler_provider,
-                scheduler_job_id=binding.scheduler_native_id,
-                spec=spec,
-            )
+            raise RelayError(retired_jarvis_binding_message(binding_document))
         intents = _primitives._object(session.gateway.get("ownership_intents", {}))
         scheduler_intent = _primitives._object(intents.get("scheduler_submission", {}))
         if (
@@ -187,53 +140,6 @@ class _ServiceRuntimeObservationMixin:
             provider=canonical_provider,
             scheduler_job_id=scheduler_job_id,
             spec=spec,
-        )
-
-    def _quiesced_owner_source_recovery_is_authorized(
-        self,
-        session: GatewaySession,
-    ) -> bool:
-        """Authorize a non-canceling direct source read for an exact closing owner."""
-        teardown_intent = _primitives._object(session.gateway.get("teardown_intent", {}))
-        owner_session_id = _primitives._optional_str(session.metadata.get("owner_session_id"))
-        generation_id = _primitives._optional_str(
-            session.metadata.get("owner_session_generation_id")
-        )
-        admission_id = _primitives._optional_str(session.metadata.get("owner_session_admission_id"))
-        if owner_session_id is None or generation_id is None or admission_id is None:
-            return False
-        try:
-            expected_admission_id = desktop_owner_session_admission_id(
-                cluster=self.cluster,
-                session_id=owner_session_id,
-            )
-        except ValueError:
-            return False
-        if (
-            teardown_intent.get("schema_version") != "clio-relay.gateway-teardown-intent.v1"
-            or teardown_intent.get("gateway_session_id") != session.session_id
-            or teardown_intent.get("cancel_scheduler_job") is not False
-            or self.settings.owner_session_id != owner_session_id
-            or self.settings.owner_session_generation_id != generation_id
-            or self.settings.resolved_owner_session_cluster() != self.cluster
-            or admission_id != expected_admission_id
-        ):
-            return False
-        try:
-            cleanup_intent = self.queue.get_owner_session_cleanup_intent(
-                admission_id,
-                session_generation_id=generation_id,
-            )
-        except (OSError, QueueConflictError, ValueError):
-            return False
-        return bool(
-            cleanup_intent is not None
-            and cleanup_intent.get("schema_version") == "clio-relay.owner-session-cleanup-intent.v1"
-            and cleanup_intent.get("owner_session_id") == admission_id
-            and cleanup_intent.get("session_generation_id") == generation_id
-            and cleanup_intent.get("cancel_scheduler_jobs") is False
-            and isinstance(cleanup_intent.get("operation_id"), str)
-            and bool(cleanup_intent.get("operation_id"))
         )
 
     def _observe_allocation_and_health_once(

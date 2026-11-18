@@ -2,9 +2,8 @@
 
 Extracted from ``service_runtime.py`` (#231 rework slice 19b, class-mixin
 split): ``_start_local_visitor`` (launch the owned desktop-side frpc visitor
-process), plus the bounded HTTP health waits it is followed by --
-``_wait_for_jarvis_health`` (schema-versioned anonymous-vs-authenticated
-boundary proof) and ``_wait_for_local_health``. The
+process), plus the bounded HTTP health wait it is followed by,
+``_wait_for_local_health``. The
 ``_LOCAL_CONNECTOR_WRAPPER_CODE`` and ``_MAX_LOCAL_HEALTH_BYTES`` constants
 move with their only callers.
 
@@ -22,7 +21,6 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Literal, cast
 
 import httpx
 
@@ -30,13 +28,8 @@ from clio_relay import service_runtime_connector_identity as _connector_identity
 from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_readiness as _readiness
 from clio_relay import service_runtime_scheduler_contracts as _scheduler_contracts
-from clio_relay import service_runtime_types as _types
 from clio_relay.errors import RelayError
 from clio_relay.frp_link import FrpLinkConfig, start_owned_frp_visitor
-from clio_relay.jarvis_service_runtime import (
-    JARVIS_SERVICE_RUNTIME_SCHEMA_V1,
-    JARVIS_SERVICE_RUNTIME_SCHEMA_V2,
-)
 from clio_relay.models import GatewaySession, ServiceRuntimeSpec
 from clio_relay.relay_host import FrpTransportProtocol
 
@@ -131,75 +124,6 @@ class _ServiceRuntimeLocalStartMixin:
         }
         _connector_identity._write_local_connector_sidecar(metadata_path, connector)
         return connector
-
-    def _wait_for_jarvis_health(
-        self,
-        health_url: str,
-        *,
-        timeout_seconds: float,
-        poll_seconds: float,
-        runtime_schema_version: Literal["jarvis.service-runtime.v1", "jarvis.service-runtime.v2"],
-        authorization: str | None,
-        max_attempts: int | None = None,
-    ) -> None:
-        """Prove the versioned JARVIS HTTP authorization boundary is live."""
-        if runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
-            if authorization is not None:
-                raise _types._DefinitiveRuntimeObservationError(
-                    "legacy JARVIS service runtime unexpectedly resolved authorization"
-                )
-        elif runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V2:
-            if authorization is None:
-                raise _types._DefinitiveRuntimeObservationError(
-                    "authenticated JARVIS service runtime omitted authorization"
-                )
-        else:
-            raise _types._DefinitiveRuntimeObservationError(
-                "JARVIS service runtime schema is unsupported"
-            )
-        deadline = time.monotonic() + timeout_seconds
-        last_error = "no response"
-        attempts = 0
-        while time.monotonic() < deadline:
-            attempts += 1
-            try:
-                anonymous = _readiness._read_bounded_http_response(
-                    health_url,
-                    headers=None,
-                    maximum_bytes=None,
-                    deadline=deadline,
-                )
-                if runtime_schema_version == JARVIS_SERVICE_RUNTIME_SCHEMA_V1:
-                    if 200 <= anonymous.status_code < 300:
-                        return
-                    last_error = f"legacy anonymous health status={anonymous.status_code}"
-                else:
-                    if 200 <= anonymous.status_code < 300:
-                        raise _types._DefinitiveRuntimeObservationError(
-                            "authenticated JARVIS service health accepted an anonymous request"
-                        )
-                    if anonymous.status_code != 401:
-                        last_error = f"anonymous health status={anonymous.status_code}"
-                    else:
-                        authenticated = _readiness._read_bounded_http_response(
-                            health_url,
-                            headers={"Authorization": cast(str, authorization)},
-                            maximum_bytes=None,
-                            deadline=deadline,
-                        )
-                        if 200 <= authenticated.status_code < 300:
-                            return
-                        if authenticated.status_code in {401, 403}:
-                            raise _types._DefinitiveRuntimeObservationError(
-                                "authenticated JARVIS service rejected its verified authority"
-                            )
-                        last_error = f"authenticated health status={authenticated.status_code}"
-            except httpx.HTTPError:
-                last_error = "HTTP transport failed"
-            if max_attempts is not None and attempts >= max_attempts:
-                break
-            _readiness._sleep_before_deadline(self.sleep, poll_seconds, deadline)
-        raise RelayError(f"JARVIS service health boundary was not ready: {last_error}")
 
     def _wait_for_local_health(
         self,
