@@ -17,6 +17,10 @@ from datetime import UTC, datetime
 import pytest
 
 import clio_relay.contract_gate as contract_gate_module
+from clio_relay.adapters.worker.clio_kit_constants import (
+    CLIO_KIT_JARVIS_USER_CONTRACT_ID,
+    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
+)
 from clio_relay.contract_gate import (
     SurfaceContractDegradation,
     SurfaceContractStatus,
@@ -28,13 +32,9 @@ from clio_relay.contract_gate import (
 from clio_relay.dev_mode import DEV_MODE_ENV
 from clio_relay.errors import ConfigurationError, ContractSurfaceUnavailableError
 from clio_relay.installation import CLIO_KIT_MCP_CONTRACT_SCHEMA
-from clio_relay.remote_mcp import (
-    CLIO_KIT_JARVIS_USER_CONTRACT_ID,
-    CLIO_KIT_JARVIS_USER_LEGACY_CONTRACT_ID,
-)
 
 # Reuse the relay's own registered ids/schema (single source of truth,
-# release_pin_sites-tracked in remote_mcp.py/installation.py) instead of
+# defined in adapters/worker/clio_kit_constants.py and installation.py) instead of
 # duplicating the literal strings here -- this test exercises the
 # NEGOTIATION algorithm, not a second copy of the pin.
 CONTRACT_SCHEMA = CLIO_KIT_MCP_CONTRACT_SCHEMA

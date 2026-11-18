@@ -108,6 +108,10 @@ class InputRef(_Spec):
 
     name: str = Field(min_length=1, description="Relative path inside the job directory")
     sha256: str
+    transient: bool = Field(
+        default=False,
+        description="Never outlives its job: relay and the site drop their copies when it ends",
+    )
 
     @field_validator("sha256")
     @classmethod

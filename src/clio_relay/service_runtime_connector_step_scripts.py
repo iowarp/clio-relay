@@ -1,13 +1,9 @@
-"""Embedded remote shell/Python scripts for allocation-connector-step lifecycle.
+"""Embedded remote shell/Python scripts for remote connector checks.
 
 Extracted from ``service_runtime.py`` (#231 rework slice): the SSH-delivered
-script generators for the scheduler-allocation connector path -- querying,
-canceling, and reconciling one scheduler connector step
-(``_remote_connector_step_status_script``,
-``_remote_connector_step_cancel_script``,
-``_remote_connector_step_reconcile_script``), probing a remote service's HTTP
-health endpoint (``_remote_http_probe_script``), and discovering/status-
-checking one remote frpc connector by its durable, race-safe identity sidecar
+script generators for probing a remote service's HTTP health endpoint
+(``_remote_http_probe_script``), and discovering/status-checking one remote
+frpc connector by its durable, race-safe identity sidecar
 (``_remote_connector_discovery_script``, ``_remote_connector_status_script``).
 Every returned string is Python source embedded as heredoc text the remote
 host runs, not live code in this module.
@@ -20,81 +16,6 @@ from __future__ import annotations
 
 import base64
 import shlex
-
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.remote_cli import remote_env
-
-
-def _remote_connector_step_status_script(
-    *,
-    definition: ClusterDefinition,
-    provider: str,
-    scheduler_job_id: str,
-    scheduler_step_id: str,
-    placement_host: str,
-) -> str:
-    command = [
-        "clio-relay",
-        "scheduler",
-        "connector-step-status",
-        scheduler_step_id,
-        "--scheduler-job-id",
-        scheduler_job_id,
-        "--cluster",
-        definition.name,
-        "--provider",
-        provider,
-        "--placement-host",
-        placement_host,
-    ]
-    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
-
-
-def _remote_connector_step_cancel_script(
-    *,
-    definition: ClusterDefinition,
-    provider: str,
-    scheduler_job_id: str,
-    scheduler_step_id: str,
-) -> str:
-    command = [
-        "clio-relay",
-        "scheduler",
-        "connector-step-cancel",
-        scheduler_step_id,
-        "--scheduler-job-id",
-        scheduler_job_id,
-        "--cluster",
-        definition.name,
-        "--provider",
-        provider,
-    ]
-    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
-
-
-def _remote_connector_step_reconcile_script(
-    *,
-    definition: ClusterDefinition,
-    provider: str,
-    scheduler_job_id: str,
-    step_marker: str,
-    placement_host: str,
-) -> str:
-    command = [
-        "clio-relay",
-        "scheduler",
-        "connector-step-reconcile",
-        scheduler_job_id,
-        "--cluster",
-        definition.name,
-        "--provider",
-        provider,
-        "--placement-host",
-        placement_host,
-        "--step-marker",
-        step_marker,
-    ]
-    return f"set -euo pipefail\n{remote_env(definition)} {shlex.join(command)}\n"
 
 
 def _remote_http_probe_script(

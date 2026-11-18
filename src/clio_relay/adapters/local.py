@@ -383,8 +383,21 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         else:
             status = await asyncio.to_thread(self._supervised_status, handle)
         if status.state.final:
+            await asyncio.to_thread(self._drop_transient, handle)
             status.outputs = await asyncio.to_thread(self._outputs, handle)
         return status
+
+    @staticmethod
+    def _drop_transient(handle: JobHandle) -> None:
+        """Remove the job directory's copies of inputs marked transient (RL16)."""
+        job_dir = Path(handle.data["job_dir"])
+        try:
+            spec = JobSpec.model_validate_json((job_dir / "spec.json").read_text("utf-8"))
+        except (FileNotFoundError, ValueError):
+            return
+        for item in spec.inputs:
+            if item.transient:
+                (job_dir / item.name).unlink(missing_ok=True)
 
     async def _batch_status(self, handle: JobHandle) -> JobStatus:
         scheduler = cast(SchedulerName, handle.data["scheduler"])

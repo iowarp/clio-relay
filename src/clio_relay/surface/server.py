@@ -53,6 +53,7 @@ from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
+from clio_relay.surface.progress import progress_message
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.skills import SkillResources
@@ -265,7 +266,8 @@ class RelayTasksExtension(ServerExtension):
         latest = service_message(record)
         if latest is not None:
             return f"the service is {record.state.value}: {latest}"
-        return f"relay operation is {record.state.value}"
+        note = progress_message(record)
+        return f"relay operation is {record.state.value}" + (f": {note}" if note else "")
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
         return {

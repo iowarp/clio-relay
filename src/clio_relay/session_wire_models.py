@@ -1,6 +1,6 @@
 """Wire models for owned remote relay session lifecycle operations.
 
-Extracted from :mod:`clio_relay.session_lifecycle` (iowarp/clio-relay#231,
+Extracted from :mod:`clio_relay.adapters.worker.session_lifecycle` (iowarp/clio-relay#231,
 R8(iii); see ``docs/design/relay-architecture-2026-08.md`` §4.4). This module
 owns the wire-contract cluster: one frozen dataclass (:class:`RemoteSession`)
 plus sixteen ``pydantic.BaseModel`` types that define the exact stdin/stdout
@@ -8,7 +8,7 @@ contracts, selectors, and status/result documents the owned-session state
 machine passes across process and API boundaries.
 
 The state-machine logic that constructs and interprets these types stays in
-:mod:`clio_relay.session_lifecycle`, which re-exports every name here under
+:mod:`clio_relay.adapters.worker.session_lifecycle`, which re-exports every name here under
 its original binding so existing callers, tests, and monkeypatch seams that
 reference ``session_lifecycle.<Symbol>`` keep resolving unchanged (a pure
 move, not a behavior change).

@@ -11,17 +11,17 @@ from typing import Literal
 
 import pytest
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_layout,
     queue_legacy_audit,
     queue_legacy_output_audit,
     queue_legacy_output_codec,
     queue_legacy_output_migration,
 )
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.queue_store_lock import LegacyQueueStateError
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JobKind, JobState, JobTombstone, RelayEvent, utc_now
-from clio_relay.queue_store_lock import LegacyQueueStateError
 
 
 def _event_path(root: Path, job_id: str, seq: int) -> Path:
@@ -82,7 +82,7 @@ def test_legacy_output_migration_requires_explicit_authorization(tmp_path: Path)
     with pytest.raises(LegacyQueueStateError) as raised:
         ClioCoreQueue(root).initialize()
 
-    assert "clio-relay init --migrate-legacy-output" in raised.value.report["action"]
+    assert "clio-relay worker init --migrate-legacy-output" in raised.value.report["action"]
     assert _event_path(root, "job_legacy_output", 1).read_bytes() == original
     assert not (root / "legacy_output_archives").exists()
     assert not (root / "legacy_output_receipts").exists()

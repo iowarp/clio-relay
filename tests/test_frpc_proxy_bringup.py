@@ -14,11 +14,14 @@ from typing import Any
 
 import pytest
 
-from clio_relay import frpc_proxy_bringup
+from clio_relay.adapters.worker import frpc_proxy_bringup
+from clio_relay.adapters.worker.frpc_proxy_receipt import (
+    BRINGUP_RECEIPT_SCHEMA,
+    TEARDOWN_RECEIPT_SCHEMA,
+)
+from clio_relay.adapters.worker.frpc_unit import frpc_proxy_paths
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import RelayError
-from clio_relay.frpc_proxy_receipt import BRINGUP_RECEIPT_SCHEMA, TEARDOWN_RECEIPT_SCHEMA
-from clio_relay.frpc_unit import frpc_proxy_paths
 
 
 def _definition(*, cluster: str = "ares") -> ClusterDefinition:
@@ -286,7 +289,9 @@ def test_install_default_timeout_exceeds_the_activation_observers_own_bound() ->
     ssh mid-script in exactly the slow case the observer exists to ride out,
     leaving unbounded partial remote state and no receipt at all.
     """
-    from clio_relay.deployment_activation import ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS
+    from clio_relay.adapters.worker.deployment_activation import (
+        ENDPOINT_SERVICE_START_OBSERVATION_TIMEOUT_SECONDS,
+    )
 
     assert (
         frpc_proxy_bringup.FRPC_PROXY_INSTALL_SSH_TIMEOUT_SECONDS

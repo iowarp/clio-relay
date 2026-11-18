@@ -9,17 +9,17 @@ from typing import cast
 import pytest
 from typer.testing import CliRunner
 
-import clio_relay.cli as cli
-import clio_relay.endpoint_service_status as service_status
-from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.deployment import render_endpoint_user_service
-from clio_relay.endpoint_service_status import (
+import clio_relay.adapters.worker.cli as cli
+import clio_relay.adapters.worker.endpoint_service_status as service_status
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+from clio_relay.adapters.worker.endpoint_service_status import (
     EndpointServiceReadiness,
     endpoint_service_readiness_over_ssh,
     parse_endpoint_service_readiness,
     render_endpoint_service_readiness_script,
 )
+from clio_relay.cluster_config import ClusterDefinition
 
 
 def _status_output(**overrides: str) -> str:
@@ -120,7 +120,7 @@ def test_intentional_stop_is_distinct_from_failed_worker_exit() -> None:
     assert intentional.intentional_stop is True
     assert intentional.recovery_state == "intentional-stop"
     assert intentional.operator_action == (
-        "clio-relay cluster restart-endpoint-service --cluster alpha"
+        "clio-relay worker cluster restart-endpoint-service --cluster alpha"
     )
     assert failed.ready is False
     assert failed.intentional_stop is False

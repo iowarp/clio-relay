@@ -18,17 +18,14 @@ import types
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from typing import BinaryIO, Literal, cast
 
 import httpx
 import pytest
-from typer.testing import CliRunner
 
-import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.remote_cli as remote_cli
+import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_connector_step_scripts as service_runtime_connector_step_scripts
@@ -37,20 +34,11 @@ import clio_relay.service_runtime_local_start as service_runtime_local_start
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
-import clio_relay.session_lifecycle as session_lifecycle
-from clio_relay import cli as relay_cli
-from clio_relay.browser_gateway import (
-    CAPABILITY_ENV,
-    UPSTREAM_AUTHORIZATION_ENV,
-    BrowserGatewayBootstrap,
-    BrowserGatewayConfig,
-)
-from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource
+from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
-    BrowserAttachmentIdentityConflictError,
     ConfigurationError,
     QueueConflictError,
     RelayError,
@@ -74,12 +62,8 @@ from clio_relay.service_runtime_types import (
     CommandRunner,
     LocalConnectorIdentity,
 )
-from clio_relay.session_lifecycle import CleanupResource
 from clio_relay.validation_report import (
-    EvidenceReference,
     LiveValidationReport,
-    ValidationRecorder,
-    ValidationResource,
     ValidationStatus,
 )
 from tests.gateway_ownership_crash_fixture import (
@@ -377,54 +361,6 @@ def test_remote_connector_start_rejects_response_identity_drift(
         )
 
 
-def test_browser_detach_maps_only_the_typed_identity_conflict_not_any_queue_conflict_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CQ16 typed-conflict fix, failing-first proof.
-
-    ``_revoke_browser_attachment`` used to catch ``QueueConflictError`` and
-    inspect ``str(exc)`` for the substring "changed before revocation" to
-    decide whether to remap it to a public ``ConfigurationError`` -- the
-    banned prose-match pattern. A decoy ``QueueConflictError`` that happens
-    to carry that same substring for an unrelated reason proves the
-    difference: under the old substring check this decoy would have been
-    misclassified and remapped to ``ConfigurationError``; under the typed
-    ``except BrowserAttachmentIdentityConflictError`` catch it must
-    propagate unchanged as a plain ``QueueConflictError``. This test fails
-    against the old substring-matching implementation and passes only once
-    the catch discriminates by exception type.
-    """
-    queue = ClioCoreQueue(tmp_path / "core")
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    session = queue.create_gateway_session(
-        GatewaySession(cluster="test-cluster", name="decoy-conflict")
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=settings,
-        queue=queue,
-        cluster="test-cluster",
-        definition=_definition(),
-        token="token",
-        secret_key="secret",
-    )
-
-    def decoy_revoke(*_args: object, **_kwargs: object) -> GatewaySession:
-        raise QueueConflictError(
-            "browser attachment changed before revocation for an unrelated reason"
-        )
-
-    monkeypatch.setattr(queue, "begin_gateway_browser_attachment_revoke", decoy_revoke)
-
-    with pytest.raises(QueueConflictError) as excinfo:
-        supervisor.browser_detach(
-            session_id=session.session_id,
-            attachment_id="browser-decoy",
-        )
-    assert not isinstance(excinfo.value, ConfigurationError)
-    assert not isinstance(excinfo.value, BrowserAttachmentIdentityConflictError)
-
-
 @pytest.fixture(autouse=True)
 def _fake_connector_process_absent(  # pyright: ignore[reportUnusedFunction]
     monkeypatch: pytest.MonkeyPatch,
@@ -576,7 +512,7 @@ class FakeRunner(CommandRunner):
                 json.dumps({"state": state, "service_host": "compute-01"}) + "\n",
                 "",
             )
-        if "clio-relay scheduler cancel 12345" in script:
+        if "clio-relay worker scheduler cancel 12345" in script:
             self.provider_canceled_jobs.append("12345")
             return subprocess.CompletedProcess(
                 command,
@@ -596,7 +532,7 @@ class FakeRunner(CommandRunner):
                 + "\n",
                 "",
             )
-        if "clio-relay scheduler status 12345" in script:
+        if "clio-relay worker scheduler status 12345" in script:
             state = "canceled" if self.provider_canceled_jobs else "running"
             return subprocess.CompletedProcess(
                 command,
@@ -990,92 +926,6 @@ class AmbiguousRemoteConnectorStartRunner(FakeRunner):
         )
 
 
-def test_browser_proxy_secrets_exist_only_in_anonymous_stdin_bootstrap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Capability and upstream bearer avoid argv, env, files, records, and logs."""
-    runner = FakeRunner()
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    supervisor = ServiceRuntimeSupervisor(
-        settings=settings,
-        queue=ClioCoreQueue(settings.core_dir),
-        cluster="test-cluster",
-        definition=_definition(),
-        token="token",
-        secret_key="secret",
-        runner=runner,
-        sleep=lambda _seconds: None,
-    )
-    session = GatewaySession(cluster="test-cluster", name="browser-secret-handoff")
-    runtime_dir = settings.core_dir.parent / "runtime-sessions" / session.session_id
-    runtime_dir.mkdir(parents=True)
-    config_path = runtime_dir / "browser-test.browser-gateway.json"
-    stdout_path = runtime_dir / "browser-test.browser-gateway.out"
-    stderr_path = runtime_dir / "browser-test.browser-gateway.err"
-    metadata_path = runtime_dir / "browser-test.browser-gateway-owner.json"
-    capability = "q" * 43
-    bearer_token = "a" * 64
-    authorization = f"Bearer {bearer_token}"
-    config = BrowserGatewayConfig(
-        attachment_id="browser-secret-test",
-        token_sha256=hashlib.sha256(capability.encode("utf-8")).hexdigest(),
-        bind_port=28778,
-        upstream_protocol="http",
-        upstream_port=28777,
-        allowed_paths=["/healthz", "/commands"],
-        command_path="/commands",
-        expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-        revocation_path=str((runtime_dir / "browser-test.revoked").resolve()),
-    )
-    intent: dict[str, object] = {
-        "owner_token": "owner-token",
-        "connector_generation_id": "generation-id",
-        "config_path": str(config_path),
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "metadata_path": str(metadata_path),
-    }
-    monkeypatch.setenv(CAPABILITY_ENV, "stale-capability")
-    monkeypatch.setenv(
-        UPSTREAM_AUTHORIZATION_ENV,
-        f"Bearer {'b' * 64}",
-    )
-
-    proxy = supervisor._start_browser_proxy(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        session=session,
-        config=config,
-        capability=capability,
-        upstream_authorization=authorization,
-        ownership_intent=intent,
-    )
-
-    assert runner.popen_inputs[0] is not None
-    bootstrap = BrowserGatewayBootstrap.model_validate_json(runner.popen_inputs[0])
-    assert bootstrap.capability == capability
-    assert bootstrap.upstream_authorization == authorization
-    environment = cast(dict[str, str], runner.popen_environments[0])
-    assert CAPABILITY_ENV not in environment
-    assert UPSTREAM_AUTHORIZATION_ENV not in environment
-    assert environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] == "owner-token"
-    assert environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] == "generation-id"
-    non_pipe_surfaces = "\n".join(
-        (
-            json.dumps(runner.popen_commands[0], sort_keys=True),
-            json.dumps(environment, sort_keys=True),
-            config_path.read_text(encoding="utf-8"),
-            json.dumps(proxy, sort_keys=True),
-            metadata_path.read_text(encoding="utf-8"),
-            stdout_path.read_text(encoding="utf-8"),
-            stderr_path.read_text(encoding="utf-8"),
-            session.model_dump_json(),
-        )
-    )
-    assert capability not in non_pipe_surfaces
-    assert authorization not in non_pipe_surfaces
-    assert bearer_token not in non_pipe_surfaces
-
-
 class FailingSubmitRunner(FakeRunner):
     def run(
         self,
@@ -1205,7 +1055,7 @@ class ProviderRetentionRunner(FakeRunner):
         input_text: str | None = None,
         timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if self.retention_status is not None and "clio-relay scheduler status 12345" in (
+        if self.retention_status is not None and "clio-relay worker scheduler status 12345" in (
             input_text or ""
         ):
             self.commands.append(list(command))
@@ -1318,7 +1168,7 @@ class LongPendingDeferredHostRunner(FakeRunner):
                 output,
                 "",
             )
-        if "clio-relay scheduler status 12345" in script:
+        if "clio-relay worker scheduler status 12345" in script:
             self.commands.append(list(command))
             self.inputs.append(input_text)
             self.scheduler_polls += 1
@@ -1478,16 +1328,19 @@ def _start_lifecycle_frp_runtime(
     def allow_private_path(_path: Path, *, directory: bool = True) -> None:
         del directory
 
+    def allow_private_directory(path: Path) -> None:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+
     for module_name in (
         "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
+        "clio_relay.adapters.worker.worker_lifetime_lock",
         # #231 class-mixin split: _gateway_transition_lock_path (the caller)
         # lives in service_runtime_core.py now, not service_runtime.py.
         "clio_relay.service_runtime_core",
     ):
         monkeypatch.setattr(
             f"{module_name}.ensure_private_configuration_directory",
-            allow_private_path,
+            allow_private_directory,
             raising=False,
         )
     for module_name in (
@@ -1495,7 +1348,7 @@ def _start_lifecycle_frp_runtime(
         # -- it only uses ensure_private_configuration_directory
         # (src/clio_relay/service_runtime_core.py).
         "clio_relay.cluster_config",
-        "clio_relay.worker_lifetime_lock",
+        "clio_relay.adapters.worker.worker_lifetime_lock",
     ):
         monkeypatch.setattr(
             f"{module_name}.ensure_private_configuration_path",
@@ -1509,7 +1362,7 @@ def _start_lifecycle_frp_runtime(
             yield handle
 
     monkeypatch.setattr(
-        "clio_relay.queue_store_write.cluster_config.open_private_atomic_file",
+        "clio_relay.adapters.worker.queue_store_write.cluster_config.open_private_atomic_file",
         open_test_atomic_file,
     )
     settings = RelaySettings(
@@ -2399,10 +2252,10 @@ def test_service_runtime_uses_explicit_slurm_provider_for_tracking_and_cancel(
     assert runner.provider_canceled_jobs == ["12345"]
     assert runner.canceled_jobs == []
     provider_scripts = [
-        script or "" for script in runner.inputs if "clio-relay scheduler" in (script or "")
+        script or "" for script in runner.inputs if "clio-relay worker scheduler" in (script or "")
     ]
-    assert any("clio-relay scheduler status 12345" in script for script in provider_scripts)
-    assert any("clio-relay scheduler cancel 12345" in script for script in provider_scripts)
+    assert any("clio-relay worker scheduler status 12345" in script for script in provider_scripts)
+    assert any("clio-relay worker scheduler cancel 12345" in script for script in provider_scripts)
     scheduler_resource = next(item for item in result.resources if item.kind == "scheduler_job")
     assert scheduler_resource.provider == "slurm"
     assert scheduler_resource.observed_state == "canceled"
@@ -2548,8 +2401,8 @@ def test_service_runtime_refuses_changed_scheduler_ownership_before_cancel(
     assert runner.provider_canceled_jobs == []
     assert "jarvis runtime cancel" not in scheduler_scripts
     assert "jarvis runtime status" not in scheduler_scripts
-    assert "clio-relay scheduler cancel" not in scheduler_scripts
-    assert "clio-relay scheduler status" not in scheduler_scripts
+    assert "clio-relay worker scheduler cancel" not in scheduler_scripts
+    assert "clio-relay worker scheduler status" not in scheduler_scripts
 
 
 def test_service_runtime_refuses_client_forged_scheduler_state_without_remote_anchor(
@@ -5679,769 +5532,6 @@ def test_service_runtime_rejects_unstructured_scheduler_output(tmp_path: Path) -
     )
 
 
-def test_gateway_start_runtime_cli_uses_service_runtime_spec(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_path = tmp_path / "runtime.json"
-    spec_path.write_text(_runtime_spec().model_dump_json(), encoding="utf-8")
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "frpc-test")
-    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
-    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
-
-    def fake_start(
-        self: ServiceRuntimeSupervisor,
-        *,
-        name: str,
-        spec: ServiceRuntimeSpec,
-        owner_session_id: str | None = None,
-        owner_session_generation_id: str | None = None,
-    ) -> ServiceRuntimeStartResult:
-        del owner_session_id, owner_session_generation_id
-        session = self.queue.create_gateway_session(
-            gateway_session_for_cli(cluster="test-cluster", name=name, spec=spec)
-        )
-
-        return ServiceRuntimeStartResult(
-            session=session,
-            connect_url="http://127.0.0.1:28777",
-            health_url="http://127.0.0.1:28777/healthz",
-            stream_url=None,
-            compatibility_urls={},
-            events_url=None,
-        )
-
-    def fake_worker_identity(
-        report: LiveValidationReport,
-        definition: ClusterDefinition,
-        *,
-        observed_worker_info: dict[str, object] | None = None,
-    ) -> None:
-        assert observed_worker_info is None
-        assert definition.name == "test-cluster"
-        recorder = ValidationRecorder(report)
-        with recorder.check("worker.artifact-version", "verified remote worker") as evidence:
-            evidence.append(EvidenceReference(kind="test", excerpt="worker verified"))
-        recorder.add_resource(
-            ValidationResource(
-                kind="relay_worker",
-                resource_id="worker:test-cluster",
-                cluster="test-cluster",
-                state="running",
-            )
-        )
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
-    monkeypatch.setattr(
-        "clio_relay.cli_remote_worker_attach._attach_verified_remote_worker",
-        fake_worker_identity,
-    )
-    validation_report = tmp_path / "gateway-validation.json"
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "start-runtime",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "generic-image-service",
-            "--runtime-json-file",
-            str(spec_path),
-            "--validation-report",
-            str(validation_report),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert '"runtime_kind": "image-service"' in result.output
-    report = json.loads(validation_report.read_text(encoding="utf-8"))
-    assert "worker.artifact-version" in {check["check_id"] for check in report["checks"]}
-    assert "relay_worker" in {resource["kind"] for resource in report["resources"]}
-
-
-def test_gateway_start_runtime_cli_returns_resumable_pending_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_path = tmp_path / "runtime.json"
-    spec = _runtime_spec().model_copy(update={"scheduler": "slurm"})
-    spec_path.write_text(spec.model_dump_json(), encoding="utf-8")
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
-    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
-
-    def fake_start(
-        self: ServiceRuntimeSupervisor,
-        *,
-        name: str,
-        spec: ServiceRuntimeSpec,
-        owner_session_id: str | None = None,
-        owner_session_generation_id: str | None = None,
-        owner_session_admission_id: str | None = None,
-    ) -> ServiceRuntimePendingResult:
-        del owner_session_id, owner_session_generation_id, owner_session_admission_id
-        session = self.queue.create_gateway_session(
-            GatewaySession(
-                cluster="test-cluster",
-                name=name,
-                state=GatewaySessionState.PENDING,
-                scheduler="slurm",
-                scheduler_job_id="998877",
-                queue_state="pending",
-                gateway={"runtime_spec": spec.model_dump(mode="json")},
-                metadata={"owner": "clio-relay", "runtime_kind": spec.kind},
-            )
-        )
-        return ServiceRuntimePendingResult(session=session)
-
-    def forbid_worker_identity(
-        _report: LiveValidationReport,
-        _definition: ClusterDefinition,
-        *,
-        observed_worker_info: dict[str, object] | None = None,
-    ) -> None:
-        del observed_worker_info
-        pytest.fail("pending runtime must return before worker provenance observation")
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
-    monkeypatch.setattr(
-        cli_remote_worker_attach, "_attach_verified_remote_worker", forbid_worker_identity
-    )
-    report_path = tmp_path / "gateway-pending.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "start-runtime",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "queued-runtime",
-            "--runtime-json-file",
-            str(spec_path),
-            "--validation-report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["outcome"] == "pending"
-    assert payload["scheduler_job_id"] == "998877"
-    assert payload["scheduler_action"] == "none"
-    assert payload["relay_action"] == "none"
-    assert payload["retry_selector"] == {
-        "cluster": "test-cluster",
-        "gateway_session_id": payload["session_id"],
-        "scheduler_provider": "slurm",
-        "scheduler_job_id": "998877",
-    }
-    report = LiveValidationReport.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert report.status is ValidationStatus.PENDING
-    assert report.checks[0].status is ValidationStatus.PENDING
-    assert report.error is None
-    assert any(
-        resource.kind == "scheduler_job"
-        and resource.resource_id == "998877"
-        and resource.metadata["retained"] is True
-        for resource in report.resources
-    )
-
-    resumed_session_ids: list[str] = []
-
-    def fake_resume(
-        self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-    ) -> ServiceRuntimePendingResult:
-        resumed_session_ids.append(session_id)
-        return ServiceRuntimePendingResult(session=self.queue.get_gateway_session(session_id))
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "resume_start", fake_resume)
-    resume_report_path = tmp_path / "gateway-resume-pending.json"
-    resumed = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "resume-runtime",
-            payload["session_id"],
-            "--cluster",
-            "test-cluster",
-            "--validation-report",
-            str(resume_report_path),
-        ],
-    )
-
-    assert resumed.exit_code == 0, resumed.output
-    assert resumed_session_ids == [payload["session_id"]]
-    resumed_payload = json.loads(resumed.output)
-    assert resumed_payload["retry_selector"] == payload["retry_selector"]
-    resumed_report = LiveValidationReport.model_validate_json(
-        resume_report_path.read_text(encoding="utf-8")
-    )
-    assert resumed_report.status is ValidationStatus.PENDING
-
-
-@pytest.mark.parametrize(
-    "status",
-    [
-        {
-            "owner": "clio-relay",
-            "session_id": "desktop-session",
-            "session_generation_id": "wrong-generation",
-            "running": True,
-            "ownership_verified": True,
-        },
-        {
-            "owner": "clio-relay",
-            "session_id": "desktop-session",
-            "session_generation_id": "generation-1",
-            "running": False,
-            "ownership_verified": True,
-        },
-        {
-            "owner": "clio-relay",
-            "session_id": "desktop-session",
-            "session_generation_id": "generation-1",
-            "running": True,
-            "ownership_verified": False,
-        },
-    ],
-    ids=("wrong-generation", "stopped", "unverified-owner"),
-)
-def test_owned_gateway_start_requires_live_exact_remote_generation_before_side_effects(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    status: dict[str, object],
-) -> None:
-    spec_path = tmp_path / "runtime.json"
-    spec_path.write_text(_runtime_spec().model_dump_json(), encoding="utf-8")
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    core_dir = tmp_path / "core"
-    report_path = tmp_path / "gateway-admission-failed.json"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
-    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
-
-    def fake_process_status(**_kwargs: object) -> dict[str, object]:
-        return status
-
-    monkeypatch.setattr(session_lifecycle, "status_remote_session", fake_process_status)
-
-    def forbidden_start(
-        _self: ServiceRuntimeSupervisor,
-        **_kwargs: object,
-    ) -> ServiceRuntimeStartResult:
-        raise AssertionError("runtime side effects must not start")
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", forbidden_start)
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "start-runtime",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "owned-runtime",
-            "--runtime-json-file",
-            str(spec_path),
-            "--owner-session-id",
-            "desktop-session",
-            "--owner-session-generation-id",
-            "generation-1",
-            "--validation-report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "requires a live owned session with the exact generation" in result.output
-    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "failed"
-    assert ClioCoreQueue(core_dir).list_gateway_sessions() == []
-
-
-def test_owned_gateway_start_holds_transition_lock_through_runtime_start(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_path = tmp_path / "runtime.json"
-    spec = _runtime_spec()
-    spec_path.write_text(spec.model_dump_json(), encoding="utf-8")
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    core_dir = tmp_path / "core"
-    events: list[str] = []
-    lock_held = False
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
-    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
-
-    class RecordingLock:
-        def __enter__(self) -> None:
-            nonlocal lock_held
-            assert lock_held is False
-            lock_held = True
-            events.append("enter")
-
-        def __exit__(self, *_args: object) -> None:
-            nonlocal lock_held
-            assert lock_held is True
-            events.append("exit")
-            lock_held = False
-
-    def make_lock(*, cluster: str, session_id: str) -> RecordingLock:
-        assert (cluster, session_id) == ("test-cluster", "desktop-session")
-        return RecordingLock()
-
-    def process_status(**_kwargs: object) -> dict[str, object]:
-        assert lock_held is True
-        events.append("status")
-        return {
-            "owner": "clio-relay",
-            "session_id": "desktop-session",
-            "session_generation_id": "generation-1",
-            "running": True,
-            "ownership_verified": True,
-        }
-
-    def remote_status(_definition: ClusterDefinition, args: list[str]) -> str:
-        assert lock_held is True
-        assert args[:2] == ["session", "admission-status"]
-        events.append("admission")
-        return json.dumps(
-            {
-                "schema_version": "clio-relay.owner-session-admission-status.v1",
-                "owner_session_id": "desktop-session",
-                "session_generation_id": "generation-1",
-                "active_generation_id": "generation-1",
-                "closing_generation_id": None,
-                "active": True,
-                "closing": False,
-                "closed": False,
-                "open": True,
-                "cleanup_intent": None,
-            }
-        )
-
-    def fake_start(
-        self: ServiceRuntimeSupervisor,
-        *,
-        name: str,
-        spec: ServiceRuntimeSpec,
-        owner_session_id: str | None = None,
-        owner_session_generation_id: str | None = None,
-        owner_session_admission_id: str | None = None,
-    ) -> ServiceRuntimeStartResult:
-        assert lock_held is True
-        events.append("start")
-        assert owner_session_id == "desktop-session"
-        assert owner_session_generation_id == "generation-1"
-        assert owner_session_admission_id is not None
-        session = self.queue.create_gateway_session(
-            GatewaySession(
-                cluster="test-cluster",
-                name=name,
-                metadata={
-                    "owner": "clio-relay",
-                    "owner_session_id": owner_session_id,
-                    "owner_session_generation_id": owner_session_generation_id,
-                    "owner_session_admission_id": owner_session_admission_id,
-                },
-                gateway={"runtime_spec": spec.model_dump(mode="json")},
-            )
-        )
-        return ServiceRuntimeStartResult(
-            session=session,
-            connect_url="http://127.0.0.1:28777",
-            health_url="http://127.0.0.1:28777/healthz",
-            stream_url=None,
-            compatibility_urls={},
-            events_url=None,
-        )
-
-    monkeypatch.setattr(relay_cli, "_session_transition_lock", make_lock)
-    monkeypatch.setattr(session_lifecycle, "status_remote_session", process_status)
-    monkeypatch.setattr(remote_cli, "run_remote_clio", remote_status)
-
-    def skip_worker_identity(
-        _report: LiveValidationReport,
-        _definition: ClusterDefinition,
-        *,
-        observed_worker_info: dict[str, object] | None = None,
-    ) -> None:
-        assert observed_worker_info is None
-        return
-
-    monkeypatch.setattr(
-        cli_remote_worker_attach, "_attach_verified_remote_worker", skip_worker_identity
-    )
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fake_start)
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "start-runtime",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "owned-runtime",
-            "--runtime-json-file",
-            str(spec_path),
-            "--owner-session-id",
-            "desktop-session",
-            "--owner-session-generation-id",
-            "generation-1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert events == ["enter", "status", "admission", "status", "admission", "start", "exit"]
-
-
-def test_gateway_start_runtime_cli_writes_canonical_failure_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_path = tmp_path / "runtime.json"
-    spec_path.write_text(_runtime_spec().model_dump_json(), encoding="utf-8")
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "frpc-test")
-    monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "token")
-    monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "secret")
-
-    def fail_start(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        name: str,
-        spec: ServiceRuntimeSpec,
-        owner_session_id: str | None = None,
-        owner_session_generation_id: str | None = None,
-    ) -> ServiceRuntimeStartResult:
-        del name, spec, owner_session_id, owner_session_generation_id
-        raise RelayError("desktop connector did not establish owned process identity")
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "start", fail_start)
-    validation_report = tmp_path / "gateway-failed-validation.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "start-runtime",
-            "--cluster",
-            "test-cluster",
-            "--name",
-            "generic-image-service",
-            "--runtime-json-file",
-            str(spec_path),
-            "--validation-report",
-            str(validation_report),
-        ],
-    )
-
-    assert result.exit_code == 1
-    report = json.loads(validation_report.read_text(encoding="utf-8"))
-    assert report["schema_version"] == "1.0"
-    assert report["scenario"] == "gateway-runtime"
-    assert report["cluster"] == "test-cluster"
-    assert report["status"] == "failed"
-    assert report["completed_at"] is not None
-    assert report["checks"] == [
-        {
-            "check_id": "gateway.start-runtime",
-            "summary": "start scheduler-backed gateway runtime",
-            "status": "failed",
-            "started_at": report["checks"][0]["started_at"],
-            "completed_at": report["checks"][0]["completed_at"],
-            "evidence": [],
-            "error": ("RelayError: desktop connector did not establish owned process identity"),
-        }
-    ]
-    assert report["error"] == (
-        "RelayError: desktop connector did not establish owned process identity"
-    )
-
-
-def test_gateway_stop_runtime_cli_writes_canonical_failure_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cluster_path = tmp_path / ".clio-relay" / "clusters.json"
-    cluster_path.parent.mkdir(parents=True)
-    cluster_path.write_text(
-        '{"clusters":{"test-cluster":' + _definition().model_dump_json() + "}}",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-
-    def fail_stop(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-        cancel_scheduler_job: bool = False,
-    ) -> object:
-        del session_id, cancel_scheduler_job
-        raise RelayError("remote connector ownership changed")
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", fail_stop)
-    validation_report = tmp_path / "gateway-stop-failed-validation.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "stop-runtime",
-            "gateway-owned",
-            "--cluster",
-            "test-cluster",
-            "--validation-report",
-            str(validation_report),
-        ],
-    )
-
-    assert result.exit_code == 1
-    report = json.loads(validation_report.read_text(encoding="utf-8"))
-    assert report["scenario"] == "gateway-runtime"
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "gateway.stop-runtime"
-    assert report["error"] == "RelayError: remote connector ownership changed"
-
-
-def test_gateway_stop_runtime_default_report_failure_controls_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_cluster_registry(tmp_path)
-    session = gateway_session_for_cli(
-        cluster="test-cluster",
-        name="canonical-failure",
-        spec=_runtime_spec(),
-    ).model_copy(
-        update={
-            "state": GatewaySessionState.CLOSED,
-            "gateway": {
-                "runtime_spec": _runtime_spec().model_dump(mode="json"),
-                "teardown_intent": {
-                    "schema_version": "clio-relay.gateway-teardown-intent.v1",
-                    "operation_id": "gateway_cleanup_canonical_failure",
-                    "gateway_session_id": "canonical-failure",
-                    "cancel_scheduler_job": True,
-                    "created_at": "2026-07-19T00:00:00Z",
-                },
-            },
-        }
-    )
-    result = ServiceRuntimeStopResult(
-        session=session,
-        mode="teardown",
-        stopped_local_pid=555,
-        stopped_remote_pid=444,
-        canceled_scheduler_job=None,
-        resources=[
-            CleanupResource(
-                kind=kind,
-                resource_id=resource_id,
-                location="test-cluster",
-                action="stop",
-                ownership_verified=True,
-                outcome="stopped",
-                verified_after_operation=True,
-            )
-            for kind, resource_id in (
-                ("desktop_connector", "555"),
-                ("remote_connector", "444"),
-            )
-        ]
-        + [
-            CleanupResource(
-                kind="scheduler_job",
-                resource_id="12345",
-                location="test-cluster",
-                action="cancel",
-                ownership_verified=True,
-                outcome="terminal",
-                verified_after_operation=True,
-                observed_state="completed",
-            ),
-            CleanupResource(
-                kind="gateway_record",
-                resource_id=session.session_id,
-                location="test-cluster",
-                action="close",
-                ownership_verified=True,
-                outcome="closed",
-                verified_after_operation=True,
-            ),
-        ],
-        errors=[],
-    )
-
-    def return_stop_result(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-        cancel_scheduler_job: bool = False,
-    ) -> ServiceRuntimeStopResult:
-        del session_id, cancel_scheduler_job
-        return result
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", return_stop_result)
-
-    invoked = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "stop-runtime",
-            session.session_id,
-            "--cluster",
-            "test-cluster",
-            "--cancel-scheduler-job",
-        ],
-    )
-
-    assert invoked.exit_code == 1
-    reports = list((tmp_path / ".clio-relay" / "validation-reports").glob("*.json"))
-    assert len(reports) == 1
-    canonical = json.loads(reports[0].read_text(encoding="utf-8"))
-    assert canonical["status"] == "failed"
-    checks = {check["check_id"]: check["status"] for check in canonical["checks"]}
-    assert checks["gateway.scheduler-canceled"] == "failed"
-
-
-def test_gateway_detach_runtime_default_report_requires_verified_retention(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_cluster_registry(tmp_path)
-    session = gateway_session_for_cli(
-        cluster="test-cluster",
-        name="detach-canonical-failure",
-        spec=_runtime_spec(),
-    ).model_copy(update={"state": GatewaySessionState.DEGRADED})
-    result = ServiceRuntimeStopResult(
-        session=session,
-        mode="detach",
-        stopped_local_pid=555,
-        stopped_remote_pid=None,
-        canceled_scheduler_job=None,
-        resources=[
-            CleanupResource(
-                kind="desktop_connector",
-                resource_id="555",
-                location="desktop",
-                action="stop",
-                ownership_verified=True,
-                outcome="stopped",
-                verified_after_operation=True,
-            ),
-            CleanupResource(
-                kind="remote_connector",
-                resource_id="444",
-                location="test-cluster",
-                action="retain",
-                ownership_verified=True,
-                outcome="retained",
-                verified_after_operation=True,
-            ),
-            CleanupResource(
-                kind="scheduler_job",
-                resource_id="12345",
-                location="test-cluster",
-                action="retain",
-                ownership_verified=True,
-                outcome="retained",
-                verified_after_operation=False,
-                observed_state="unknown",
-            ),
-        ],
-        errors=[],
-    )
-    worker_verifications: list[str] = []
-
-    def record_worker_verification(
-        _report: LiveValidationReport,
-        definition: ClusterDefinition,
-        *,
-        observed_worker_info: dict[str, object] | None = None,
-    ) -> None:
-        assert observed_worker_info is None
-        worker_verifications.append(definition.name)
-
-    def return_detach_result(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-    ) -> ServiceRuntimeStopResult:
-        del session_id
-        return result
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "detach", return_detach_result)
-    monkeypatch.setattr(
-        cli_remote_worker_attach,
-        "_attach_verified_remote_worker",
-        record_worker_verification,
-    )
-
-    invoked = CliRunner().invoke(
-        app,
-        ["gateway", "detach-runtime", session.session_id, "--cluster", "test-cluster"],
-    )
-
-    assert invoked.exit_code == 1
-    reports = list((tmp_path / ".clio-relay" / "validation-reports").glob("*.json"))
-    assert len(reports) == 1
-    canonical = json.loads(reports[0].read_text(encoding="utf-8"))
-    assert canonical["status"] == "failed"
-    checks = {check["check_id"]: check["status"] for check in canonical["checks"]}
-    assert checks["gateway.jobs-preserved-default"] == "failed"
-    assert worker_verifications == ["test-cluster"]
-
-
 def test_gateway_report_fails_when_remote_worker_identity_does_not_match(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6487,127 +5577,6 @@ def test_gateway_report_fails_when_remote_worker_identity_does_not_match(
     assert worker_checks[0]["status"] == "failed"
 
 
-def test_managed_gateway_commands_prefer_desktop_runtime_record(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "frpc-test")
-    _write_cluster_registry(tmp_path)
-    queue = ClioCoreQueue(tmp_path / "core")
-    stored_session = gateway_session_for_cli(
-        cluster="test-cluster",
-        name="desktop-managed-runtime",
-        spec=_runtime_spec(),
-    )
-    stored_session.gateway["transport"] = {
-        "desktop_connector": {"owner_token": "private-owner-capability"}
-    }
-    session = queue.create_gateway_session(stored_session)
-
-    def unexpected_remote(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("desktop-managed gateway must not be routed to remote CLI")
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", unexpected_remote)
-
-    read = CliRunner().invoke(
-        app,
-        ["gateway", "get", session.session_id, "--cluster", "test-cluster"],
-    )
-    updated = CliRunner().invoke(
-        app,
-        [
-            "gateway",
-            "update",
-            session.session_id,
-            "--cluster",
-            "test-cluster",
-            "--state",
-            "degraded",
-        ],
-    )
-    closed = CliRunner().invoke(
-        app,
-        ["gateway", "close", session.session_id, "--cluster", "test-cluster"],
-    )
-
-    assert read.exit_code == 0
-    assert updated.exit_code == 0
-    assert "private-owner-capability" not in read.output
-    assert (
-        json.loads(read.output)["gateway"]["transport"]["desktop_connector"]["owner_token"]
-        == "<redacted>"
-    )
-    assert "private-owner-capability" not in updated.output
-    assert json.loads(updated.output)["state"] == "degraded"
-    assert closed.exit_code == 1
-    assert "must be closed with stop-runtime" in closed.output
-    assert "private-owner-capability" not in closed.output
-    persisted = queue.get_gateway_session(session.session_id)
-    assert persisted.state == GatewaySessionState.DEGRADED
-    assert (
-        persisted.gateway["transport"]["desktop_connector"]["owner_token"]
-        == "private-owner-capability"
-    )
-
-
-def test_gateway_list_combines_desktop_and_remote_records(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLIO_RELAY_CLI_MODE", "ssh")
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "frpc-test")
-    _write_cluster_registry(tmp_path)
-    queue = ClioCoreQueue(tmp_path / "core")
-    local = queue.create_gateway_session(
-        gateway_session_for_cli(
-            cluster="test-cluster",
-            name="desktop-managed-runtime",
-            spec=_runtime_spec(),
-        )
-    )
-    remote = GatewaySession(
-        session_id="gateway_remote_record",
-        cluster="test-cluster",
-        name="cluster-managed-runtime",
-    )
-
-    def fake_remote(
-        command: list[str],
-        *,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        assert capture_output is True
-        assert check is False
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps([remote.model_dump(mode="json")]).encode(),
-            b"",
-        )
-
-    monkeypatch.setattr("clio_relay.remote_cli.subprocess.run", fake_remote)
-
-    result = CliRunner().invoke(
-        app,
-        ["gateway", "list", "--cluster", "test-cluster"],
-    )
-
-    assert result.exit_code == 0
-    page = json.loads(result.output)
-    assert {item["session_id"] for item in page["gateway_sessions"]} == {
-        local.session_id,
-        remote.session_id,
-    }
-    assert page["source_totals"] == {"desktop": 1, "cluster": 1}
-    assert page["aggregate_record_limit"] == 200
-
-
 def gateway_session_for_cli(
     *,
     cluster: str,
@@ -6635,12 +5604,6 @@ def _definition() -> ClusterDefinition:
             server_addr="frps.example.org",
             server_port=443,
         ),
-    )
-
-
-def _write_cluster_registry(root: Path) -> None:
-    ClusterRegistry(clusters={"test-cluster": _definition()}).save(
-        root / ".clio-relay" / "clusters.json"
     )
 
 
@@ -6837,63 +5800,6 @@ def test_legacy_jarvis_v1_health_accepts_anonymous_opaque_2xx(
     )
 
     assert observed_headers == [None]
-
-
-def test_browser_health_accepts_opaque_2xx_with_exact_null_origin_cors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    supervisor = _health_probe_supervisor(tmp_path)
-    observed_origins: list[str | None] = []
-
-    def browser_health(request: httpx.Request) -> httpx.Response:
-        observed_origins.append(request.headers.get("origin"))
-        return httpx.Response(
-            200,
-            headers={"Access-Control-Allow-Origin": "null"},
-            content=b"\xffopaque-browser-health",
-        )
-
-    transport = httpx.MockTransport(browser_health)
-    monkeypatch.setattr(
-        service_runtime_readiness,
-        "_new_readiness_http_client",
-        _mock_http_client_factory(transport),
-    )
-
-    supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        "http://127.0.0.1:28778/healthz?capability=private",
-        timeout_seconds=1.0,
-        poll_seconds=0.1,
-    )
-
-    assert observed_origins == ["null"]
-
-
-def test_browser_health_rejects_wildcard_cors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    supervisor = _health_probe_supervisor(tmp_path)
-    transport = httpx.MockTransport(
-        lambda _request: httpx.Response(
-            200,
-            headers={"Access-Control-Allow-Origin": "*"},
-            content=b"ignored",
-        )
-    )
-    monkeypatch.setattr(
-        service_runtime_readiness,
-        "_new_readiness_http_client",
-        _mock_http_client_factory(transport),
-    )
-
-    with pytest.raises(RelayError, match="not exactly null"):
-        supervisor._wait_for_browser_health(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            "http://127.0.0.1:28778/healthz?capability=private",
-            timeout_seconds=0.03,
-            poll_seconds=1.0,
-        )
 
 
 def test_authenticated_jarvis_health_failure_redacts_echoed_bearer_from_error_and_metadata(

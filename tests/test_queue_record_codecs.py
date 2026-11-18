@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_layout,
     queue_lease_records,
     queue_legacy_output_codec,

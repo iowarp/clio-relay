@@ -23,7 +23,10 @@ import re
 from pathlib import Path
 from types import ModuleType
 
-from clio_relay import bootstrap_candidate_uv_install_source, bootstrap_staged_provider_source
+from clio_relay.adapters.worker import (
+    bootstrap_candidate_uv_install_source,
+    bootstrap_staged_provider_source,
+)
 
 
 def _module_source(module: ModuleType) -> str:

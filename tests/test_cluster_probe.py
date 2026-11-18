@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from pytest import MonkeyPatch
 
-import clio_relay.cluster_probe as cluster_probe
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.cluster_probe import (
+import clio_relay.adapters.worker.cluster_probe as cluster_probe
+from clio_relay.adapters.worker.cluster_probe import (
     CLUSTER_PROBE_SCHEMA,
     probe_cluster_runtime,
 )
+from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ObservationTimeoutError
 
 _DEAD_PIN = ClusterDefinition(

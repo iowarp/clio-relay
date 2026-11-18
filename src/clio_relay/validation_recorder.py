@@ -64,7 +64,7 @@ class ValidationRecorder:
         self.report = report
         self._active_check: str | None = None
         self._job_ids_by_scope: dict[str, str] = {}
-        self._scheduler_providers_by_scope: dict[str, str] = {}
+        self._scheduler_provider_by_scope: dict[str, str] = {}
         self._transport_probe_ids: set[str] = set()
 
     @property
@@ -175,7 +175,7 @@ class ValidationRecorder:
         if key == "direct_transport.result" and value == "xtcp":
             self._record_passed_fact("transport.direct", "direct XTCP transport", line)
         if key.endswith(".runtime_scheduler_provider"):
-            self._scheduler_providers_by_scope[scope] = value
+            self._scheduler_provider_by_scope[scope] = value
         if key.endswith(".runtime_scheduler_job_id"):
             self.add_resource(
                 ValidationResource(
@@ -183,7 +183,7 @@ class ValidationRecorder:
                     resource_id=value,
                     role=scope,
                     cluster=self.report.cluster,
-                    provider=self._scheduler_providers_by_scope.get(scope),
+                    provider=self._scheduler_provider_by_scope.get(scope),
                     metadata={"metadata_source": "structured_runtime"},
                 )
             )

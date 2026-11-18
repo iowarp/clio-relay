@@ -45,9 +45,9 @@ from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
     SchedulerConnectorPlacement,
-    SchedulerConnectorStepIdentity,
     utc_now,
 )
+from clio_relay.service_runtime_scheduler_names import allocation_connector_intent_residual
 
 
 class _ServiceRuntimeReconciliationMixin:
@@ -685,48 +685,9 @@ class _ServiceRuntimeReconciliationMixin:
             or connector_base.get("pid") is not None
         ):
             raise RelayError("allocation connector sidecar identity does not match its intent")
-        record = _scheduler_contracts._last_json_object(
-            self._ssh(
-                _connector_step_scripts._remote_connector_step_reconcile_script(
-                    definition=self.definition,
-                    provider=provider_name,
-                    scheduler_job_id=scheduler_job_id,
-                    step_marker=step_marker,
-                    placement_host=placement.placement_host,
-                )
+        raise RelayError(
+            allocation_connector_intent_residual(
+                scheduler_job_id=scheduler_job_id,
+                step_marker=step_marker,
             )
         )
-        if (
-            record.get("schema_version") != "clio-relay.scheduler-connector-step-reconciliation.v1"
-            or record.get("scheduler") != provider_name
-            or record.get("scheduler_job_id") != scheduler_job_id
-            or record.get("step_marker") != step_marker
-            or record.get("placement_host") != placement.placement_host
-            or not isinstance(record.get("found"), bool)
-        ):
-            raise RelayError("scheduler step reconciliation returned mismatched identity")
-        if record.get("found") is False:
-            if record.get("step") is not None:
-                raise RelayError("scheduler step reconciliation contradicted step absence")
-            return None, True
-        if connector_base is None:
-            raise RelayError("active scheduler connector step has no durable allocation sidecar")
-        try:
-            step = SchedulerConnectorStepIdentity.model_validate_json(
-                json.dumps(record.get("step"), separators=(",", ":"), allow_nan=False)
-            )
-        except (TypeError, ValueError) as exc:
-            raise RelayError("scheduler step reconciliation returned invalid identity") from exc
-        connector = {
-            **connector_base,
-            "scheduler_step_id": step.scheduler_step_id,
-            "scheduler_step": step.model_dump(mode="json"),
-        }
-        self._allocation_connector_identity(
-            session_id=session_id,
-            connector=connector,
-        )
-        status = self._poll_allocation_connector_step(step)
-        if status.state == "absent":
-            return None, True
-        return connector, False

@@ -7,7 +7,7 @@ from typing import cast
 
 import pytest
 
-from clio_relay.bootstrap_acceptance import bootstrap_reuse_acceptance_evidence
+from clio_relay.adapters.worker.bootstrap_acceptance import bootstrap_reuse_acceptance_evidence
 from clio_relay.errors import RelayError
 
 

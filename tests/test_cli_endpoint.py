@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``endpoint_app`` commands' extraction into
-``src/clio_relay/cli_endpoint.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_endpoint.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 ``test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix``,
@@ -40,15 +40,15 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_endpoint as cli_endpoint
-import clio_relay.endpoint as endpoint
+import clio_relay.adapters.worker.cli_endpoint as cli_endpoint
+import clio_relay.adapters.worker.endpoint as endpoint
 import clio_relay.installation as installation_module
-from clio_relay import cli
-from clio_relay.cli import app
+from clio_relay.adapters.worker import cli
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.scheduler import SchedulerProvider
 from clio_relay.cluster_config import ClusterDefinition, WorkerCapacityPolicy
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import JobKind
-from clio_relay.scheduler_providers import SchedulerProvider
 
 
 @pytest.fixture(autouse=True)
@@ -163,53 +163,6 @@ def test_endpoint_worker_without_explicit_provider_uses_cluster_registry(
     assert captured["closed"] is True
     provider = cast(SchedulerProvider, captured["scheduler_provider"])
     assert provider.name == "slurm"
-
-
-def test_endpoint_start_defaults_control_query_concurrency_from_cluster_registry(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219: an unpinned worker must never silently start with zero control-query
-    capacity. Historically ``endpoint start`` had its own disconnected CLI
-    default of 0, independent of the cluster's registered WorkerCapacityPolicy
-    (whose own default is 1) -- a fresh deployment that never pins
-    --control-query-concurrency got a worker that accepts describe-class jobs
-    and never runs them, with no typed reason.
-    """
-    captured: dict[str, object] = {}
-    definition = ClusterDefinition(
-        name="configured-cluster",
-        ssh_host="configured-cluster",
-        scheduler_provider="slurm",
-    )
-
-    class FakeWorker:
-        def register(self) -> None:
-            captured["registered"] = True
-
-        def run_once(self) -> None:
-            captured["ran_once"] = True
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        captured.update(kwargs)
-        return FakeWorker()
-
-    def load_cluster(cluster: str) -> ClusterDefinition:
-        return definition
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", load_cluster)
-
-    result = CliRunner().invoke(
-        app,
-        ["endpoint", "start", "--role", "worker", "--cluster", "configured-cluster", "--once"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["control_query_concurrency"] == 1
-    assert captured["concurrency"] == 3
 
 
 def test_endpoint_start_rejects_zero_control_query_concurrency_against_a_registered_cluster(
@@ -358,78 +311,6 @@ def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
 
     assert result.exit_code == 0, result.output
     assert captured["kind_concurrency"] == {JobKind.MCP_CALL: 2}
-
-
-def test_endpoint_start_warns_loudly_when_control_query_concurrency_is_explicitly_zero(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """#219: a worker started with an explicit --scheduler-provider bypasses
-    cluster-registry resolution (test_endpoint_worker_with_explicit_provider_
-    does_not_require_remote_registry) and so is not bound by
-    WorkerCapacityPolicy's >= 1 floor; 0 remains reachable there. It must
-    still surface a loud, typed warning rather than silently starting a
-    worker that will never pick up a describe-class job.
-    """
-
-    class FakeWorker:
-        def register(self) -> None:
-            pass
-
-        def run_once(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    def make_worker(**kwargs: object) -> FakeWorker:
-        return FakeWorker()
-
-    def fail_registry_lookup(cluster: str) -> ClusterDefinition:
-        raise AssertionError(f"unexpected registry lookup for {cluster}")
-
-    monkeypatch.setattr(endpoint, "EndpointWorker", make_worker)
-    monkeypatch.setattr(cli, "_require_cluster", fail_registry_lookup)
-
-    zero = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "homelab",
-            "--scheduler-provider",
-            "external",
-            "--control-query-concurrency",
-            "0",
-            "--once",
-        ],
-    )
-    nonzero = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "homelab",
-            "--scheduler-provider",
-            "external",
-            "--control-query-concurrency",
-            "1",
-            "--concurrency",
-            "2",
-            "--once",
-        ],
-    )
-
-    assert zero.exit_code == 0, zero.output
-    assert "control_query_concurrency=0" in zero.output
-    assert "queue forever" in zero.output
-    assert nonzero.exit_code == 0, nonzero.output
-    assert "control_query_concurrency=0" not in nonzero.output
 
 
 def test_endpoint_worker_info_exposes_bounded_readiness_mode(

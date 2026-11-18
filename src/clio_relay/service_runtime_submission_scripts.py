@@ -7,8 +7,8 @@ submission on a remote host through a durable, race-safe sidecar --
 command behind a bounded output anchor), ``_remote_submission_record_script``
 (promote the anchored output into the durable submission record),
 ``_template_command_script`` (fill a scheduler-job-id template into one
-shell-quoted command line), and ``_remote_scheduler_script`` (status/cancel/
-connector-placement queries against the cluster's own scheduler CLI). Every
+shell-quoted command line), and ``_remote_scheduler_script`` (status and cancel
+queries against the cluster's own scheduler CLI). Every
 returned string is Python source embedded as heredoc text the remote host
 runs, not live code in this module -- see the doc's B4 note on why a naive
 ``grep '^def '`` sweep over this class of function is unreliable.
@@ -610,12 +610,13 @@ def _template_command_script(command: Sequence[str], scheduler_job_id: str) -> s
 def _remote_scheduler_script(
     *,
     definition: ClusterDefinition,
-    operation: Literal["status", "cancel", "connector-placement"],
+    operation: Literal["status", "cancel"],
     provider: str,
     scheduler_job_id: str,
 ) -> str:
     command = [
         "clio-relay",
+        "worker",
         "scheduler",
         operation,
         scheduler_job_id,

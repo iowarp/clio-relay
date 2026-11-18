@@ -49,7 +49,7 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.owner_session_admission import desktop_owner_session_admission_id
-from clio_relay.scheduler_providers import provider_for_scheduler
+from clio_relay.service_runtime_scheduler_names import canonical_scheduler
 from clio_relay.session_wire_models import CleanupResource
 
 
@@ -141,7 +141,7 @@ class _ServiceRuntimeObservationMixin:
         assert submission_marker is not None
         assert intent_job_id is not None
         try:
-            canonical_provider = provider_for_scheduler(session.scheduler).name
+            canonical_provider = canonical_scheduler(session.scheduler)
         except ConfigurationError as exc:
             raise RelayError(f"scheduler provider identity is invalid: {exc}") from exc
         if (
@@ -253,7 +253,7 @@ class _ServiceRuntimeObservationMixin:
                     provider=spec.scheduler,
                     scheduler_job_id=scheduler_job_id,
                 )
-                if provider_for_scheduler(spec.scheduler).name != "external"
+                if canonical_scheduler(spec.scheduler) != "external"
                 else None
             )
         except ConfigurationError:
@@ -482,15 +482,15 @@ class _ServiceRuntimeObservationMixin:
         if scheduler_job_id is None:
             raise ConfigurationError("scheduler retention requires a scheduler job id")
         try:
-            provider = provider_for_scheduler(session.scheduler)
-            if provider.name == "external":
+            provider_name = canonical_scheduler(session.scheduler)
+            if provider_name == "external":
                 observed_state = self._observe_runtime_state(
                     spec=spec,
                     scheduler_job_id=scheduler_job_id,
                 )
             else:
                 provider_status = self._poll_scheduler_provider(
-                    provider=provider.name,
+                    provider=provider_name,
                     scheduler_job_id=scheduler_job_id,
                 )
                 observed_state = provider_status.phase.value
@@ -583,14 +583,14 @@ class _ServiceRuntimeObservationMixin:
         spec: ServiceRuntimeSpec,
         scheduler_job_id: str,
     ) -> str:
-        provider = provider_for_scheduler(scheduler)
-        if provider.name == "external":
+        provider_name = canonical_scheduler(scheduler)
+        if provider_name == "external":
             return self._observe_runtime_state(
                 spec=spec,
                 scheduler_job_id=scheduler_job_id,
             )
         return self._poll_scheduler_provider(
-            provider=provider.name,
+            provider=provider_name,
             scheduler_job_id=scheduler_job_id,
         ).phase.value
 
@@ -635,7 +635,7 @@ class _ServiceRuntimeObservationMixin:
             status = SchedulerStatus.model_validate(_scheduler_contracts._last_json_object(output))
         except (ValueError, TypeError) as exc:
             raise RelayError("scheduler provider returned invalid structured status") from exc
-        expected_provider = provider_for_scheduler(provider).name
+        expected_provider = canonical_scheduler(provider)
         if status.scheduler != expected_provider:
             raise RelayError(
                 "scheduler provider identity mismatch: "
@@ -664,7 +664,7 @@ class _ServiceRuntimeObservationMixin:
         )
         result = _scheduler_contracts._last_json_object(output)
         if (
-            result.get("scheduler") != provider_for_scheduler(provider).name
+            result.get("scheduler") != canonical_scheduler(provider)
             or result.get("scheduler_job_id") != scheduler_job_id
             or result.get("cancel_requested") is not True
             or result.get("accepted") is not True

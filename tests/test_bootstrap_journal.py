@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-import clio_relay.bootstrap_journal as journal_module
-from clio_relay.bootstrap_journal import (
+import clio_relay.adapters.worker.bootstrap_journal as journal_module
+from clio_relay.adapters.worker.bootstrap_journal import (
     BootstrapJournalError,
     advance_journal,
     copy_owned_file,
@@ -23,7 +23,7 @@ from clio_relay.bootstrap_journal import (
     record_phase,
     recovery_plan,
 )
-from clio_relay.bootstrap_reconcile import BootstrapTransactionJournal
+from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapTransactionJournal
 
 _REVERSIBLE_BOUNDARIES = (
     "downloads",
