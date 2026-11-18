@@ -93,7 +93,9 @@ def test_a_task_shows_why_a_service_is_not_ready(
 
     async def scenario() -> None:
         async with Client(create_server(relay_paths), mode="auto") as client:
-            task = await call_tool_task(client, "serve", {"site": "lab", "spec": SPEC.model_dump(mode="json")})
+            task = await call_tool_task(
+                client, "serve", {"site": "lab", "spec": SPEC.model_dump(mode="json")}
+            )
             message = ""
             for _ in range(100):
                 message = (await task.status()).status_message or ""
@@ -106,6 +108,7 @@ def test_a_task_shows_why_a_service_is_not_ready(
     asyncio.run(scenario())
 
 
+@pytest.mark.asyncio
 async def test_a_failed_look_keeps_the_service_open_and_says_why(
     relay_paths: RelayPaths, scripted: list[ScriptedServe]
 ) -> None:
@@ -115,12 +118,13 @@ async def test_a_failed_look_keeps_the_service_open_and_says_why(
     scripted[-1].next = RuntimeError("the job store is unreadable")
     seen = await service.refresh(record.operation_id)
     assert not seen.state.final
-    assert seen.result["message"] == (
+    assert (seen.result or {})["message"] == (
         "relay could not observe the service: RuntimeError: the job store is unreadable"
     )
     await service.close()
 
 
+@pytest.mark.asyncio
 async def test_open_services_are_observed_once_at_startup(
     relay_paths: RelayPaths, scripted: list[ScriptedServe]
 ) -> None:

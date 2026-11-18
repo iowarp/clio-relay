@@ -51,8 +51,8 @@ from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
-from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
+from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 

@@ -80,7 +80,6 @@ def _approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
     )
 
 
-
 class RelayService:
     """One relay host's view of its sites and operations."""
 
