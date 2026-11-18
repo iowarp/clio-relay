@@ -297,7 +297,15 @@ class ComputeTab:
         """Gather every site's view."""
         identities = self._identities()
         probes = load_probes(self.service.paths)
-        return [await self.view(site, identities, probes) for site in self.service.sites.list()]
+        found: list[SiteView] = []
+        for site in self.service.sites.list():
+            try:
+                found.append(await self.view(site, identities, probes))
+            except Exception as exc:  # one site that cannot be read must not hide the others
+                logger.warning("reading site %s for the tab", site.id, exc_info=True)
+                detail = f"Relay could not read this site's state ({type(exc).__name__})"
+                found.append(SiteView(site=site, status={"state": "unavailable", "detail": detail}))
+        return found
 
     def _catalog(self) -> list[SiteEntry]:
         try:
@@ -393,7 +401,12 @@ class ComputeTab:
         async with self._lock:
             await asyncio.to_thread(self._load_state)
             self.state.notice = ""
-            outcome = await handler(grant.subject, _dict(values))
+            try:
+                outcome = await handler(grant.subject, _dict(values))
+            except Exception as exc:  # the tab says what failed rather than going blank
+                logger.exception("the Compute tab's %s action failed", action)
+                self.state.notice = f"That did not work: relay hit {type(exc).__name__}."
+                outcome = Outcome(ok=False)
             await asyncio.to_thread(self._save_state)
             self._seen = await asyncio.to_thread(self._snapshot)
             views = await self.views()
@@ -452,6 +465,10 @@ class ComputeTab:
             results = await self.service.site_added(site.id)
         except Refusal as refusal:
             self.state.notice = f"{done} Setting it up failed: {refusal.message}."
+            return
+        except Exception as exc:  # the site is saved; say the set-up did not finish
+            logger.warning("setting up site %s", site.id, exc_info=True)
+            self.state.notice = f"{done} Setting it up failed ({type(exc).__name__})."
             return
         failed = [
             f"{name} could not set it up ({_dict(_dict(result).get('refusal')).get('message', '')})"

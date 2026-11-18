@@ -354,6 +354,44 @@ def test_add_edit_switch_probe_and_remove_go_through_the_store(
     asyncio.run(scenario())
 
 
+def test_a_site_that_cannot_be_read_leaves_the_others(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clio_relay.surface.a2ui import tab as tab_module
+
+    add_site(relay_paths)
+    add_site(relay_paths, "broken")
+    real = tab_module.site_status
+
+    async def status(service: RelayService, site: Any) -> dict[str, Any]:
+        if site.id == "broken":
+            raise RuntimeError("no keyring")
+        return await real(service, site)
+
+    async def probe(self: Any, site_id: str, values: dict[str, Any]) -> Any:
+        raise RuntimeError("probe blew up")
+
+    monkeypatch.setattr(tab_module, "site_status", status)
+    monkeypatch.setattr(tab_module.ComputeTab, "probe_site", probe)
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            assert {"s-fx", "s-broken"} <= host.visible("relay-sites")
+            assert "Relay could not read this site's state (RuntimeError)" in host.text(
+                "relay-sites"
+            )
+            result = await host.press("relay-sites", "s-fx-probe-button")
+            assert not result.is_error
+            assert result.structured_content["notice"] == (
+                "That did not work: relay hit RuntimeError."
+            )
+            assert "That did not work: relay hit RuntimeError." in host.text("relay-sites")
+
+    asyncio.run(scenario())
+
+
 def test_changes_from_the_command_line_refresh_the_tab(relay_paths: RelayPaths) -> None:
     heard: asyncio.Queue[str] = asyncio.Queue()
 
