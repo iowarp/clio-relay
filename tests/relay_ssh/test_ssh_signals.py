@@ -160,7 +160,8 @@ async def test_the_batch_shell_waits_when_the_scheduler_signals_every_process(
         f"touch {started}; sleep 3600 & wait"
     )
     launcher = tmp_path / "single_launch.sh"
-    launcher.write_text(f"echo $$ > {tmp_path}/launcher.pid\nsh -c {shlex.quote(command)} &\nwait\n")
+    pid = tmp_path / "launcher.pid"
+    launcher.write_text(f"echo $$ > {pid}\nsh -c {shlex.quote(command)} &\nwait\n")
     rendered = f"#!/bin/bash\n\n/bin/bash {launcher}\n\necho done > {tmp_path}/batch\n"
     batch = tmp_path / "submit.sh"
     batch.write_text(forward_signals(rendered, str(launcher), str(tmp_path)))
@@ -168,7 +169,7 @@ async def test_the_batch_shell_waits_when_the_scheduler_signals_every_process(
     while not started.exists():
         assert shell.returncode is None
         await asyncio.sleep(0.05)
-    group = os.getpgid(int((tmp_path / "launcher.pid").read_text()))
+    group = os.getpgid(int(pid.read_text()))
     assert group != os.getpgid(shell.pid)
     os.killpg(group, signal.SIGTERM)
     shell.send_signal(signal.SIGTERM)

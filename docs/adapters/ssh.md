@@ -85,7 +85,8 @@ gets `SIGTERM` first, so a `trap` in it can clean up, and is killed only after
 the scheduler's grace period (Slurm's `KillWait`, PBS's `kill_delay`). Some
 Slurm sites signal only the batch shell; relay's Slurm script passes the
 signal on to your command and waits for it to finish its trap, so it behaves
-the same on every site.
+the same on every site. A command over several lines, such as a multi-line
+`bash -c` script, is handled the same way.
 
 On a shared filesystem such as NFS, a file written on one node can stay
 invisible on another for a minute or two. Relay lists a directory before it

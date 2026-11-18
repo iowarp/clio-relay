@@ -74,6 +74,7 @@ def test_inputs_json_that_is_not_a_list_gives_no_inputs() -> None:
     old = store.input_entries([json.dumps([{"name": "x", "sha256": "a" * 64}])])
     assert old == [store.StagedInput("x", "a" * 64, False)]
 
+
 def test_inputs_json_carries_the_transient_mark() -> None:
     digest = "ab" * 32
     assert store.entry(InputRef(name="a", sha256=digest)) == {
