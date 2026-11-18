@@ -136,13 +136,17 @@ async def settle(client: Client, started: dict[str, Any]) -> tuple[dict[str, Any
     return started, rounds
 
 
-async def sign_in(client: Client, site: str) -> dict[str, Any]:
-    """Probe the site; if it needs a sign-in, sign in through a small run's page."""
+async def sign_in(client: Client, site: str, spec: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Probe the site; if it needs a sign-in, sign in through a small run's page.
+
+    A guarded site refuses a free-form run before it asks for anything, so the
+    caller passes a package spec there.
+    """
     probe = brief(await tool(client, "files", {"site": site, "op": "list", "path": "."}))
     out: dict[str, Any] = {"probe": probe}
     if probe.get("refusal") != "needs_sign_in":
         return out
-    spec = {"executable": "/bin/sh", "arguments": ["-c", "echo w8-signed-in"]}
+    spec = spec or {"executable": "/bin/sh", "arguments": ["-c", "echo w8-signed-in"]}
     started = brief(await tool(client, "run", {"site": site, "spec": spec, "wait_s": 5}))
     out["started"] = started
     started, out["rounds"] = await settle(client, started)
@@ -195,17 +199,26 @@ async def wait_final(client: Client, operation_id: str) -> dict[str, Any]:
         await asyncio.sleep(3)
 
 
-async def run_job(client: Client, site: str, tag: str) -> dict[str, Any]:
-    marker = f"w8-input-{tag}-{time.time_ns()}\n"
-    staged = await tool(client, "files", {"site": site, "op": "stage", "content": marker})
-    digest = hashlib.sha256(marker.encode()).hexdigest()
-    spec = {
-        "executable": "/bin/sh",
-        "arguments": ["-c", "cat in.txt; hostname; echo w8-job-done"],
-        "inputs": [{"name": "in.txt", "sha256": digest}],
-    }
+async def run_job(
+    client: Client, site: str, tag: str, args: argparse.Namespace | None = None
+) -> dict[str, Any]:
+    """Run a job and wait for it: free-form, or the package when ``args`` names one."""
+    out: dict[str, Any] = {}
+    if args is not None and args.package:
+        spec = package_spec(args, tag)
+        marker = f"w8-{tag}"
+    else:
+        marker = f"w8-input-{tag}-{time.time_ns()}\n"
+        staged = await tool(client, "files", {"site": site, "op": "stage", "content": marker})
+        out["staged"] = brief(staged)
+        digest = hashlib.sha256(marker.encode()).hexdigest()
+        spec = {
+            "executable": "/bin/sh",
+            "arguments": ["-c", "cat in.txt; hostname; echo w8-job-done"],
+            "inputs": [{"name": "in.txt", "sha256": digest}],
+        }
     started = brief(await tool(client, "run", {"site": site, "spec": spec, "wait_s": 5}))
-    out: dict[str, Any] = {"staged": brief(staged), "started": started}
+    out["started"] = started
     started, out["approvals"] = await settle(client, started)
     operation = started.get("operation_id")
     if operation and not started.get("refusal"):
@@ -215,9 +228,21 @@ async def run_job(client: Client, site: str, tag: str) -> dict[str, Any]:
     return out
 
 
+def package_spec(args: argparse.Namespace, greeting: str) -> dict[str, Any]:
+    return {
+        "package": {
+            "name": args.package,
+            "version": args.version,
+            "sha256": args.sha256,
+            "parameters": {"greeting": f"w8-{greeting}"},
+        }
+    }
+
+
 async def step_signin(args: argparse.Namespace) -> dict[str, Any]:
     async with connect() as client:
-        return {"step": "signin", "site": args.site, **await sign_in(client, args.site)}
+        spec = package_spec(args, "signin") if args.package else None
+        return {"step": "signin", "site": args.site, **await sign_in(client, args.site, spec)}
 
 
 async def step_files(args: argparse.Namespace) -> dict[str, Any]:
@@ -268,7 +293,7 @@ async def step_drop_site(args: argparse.Namespace) -> dict[str, Any]:
         )
         out["kill"] = (killed.stdout + killed.stderr).strip()
         out["recovery"] = await recover(client, args.site)
-        out["job"] = await run_job(client, args.site, f"{args.tag}-after-site-drop")
+        out["job"] = await run_job(client, args.site, f"{args.tag}-after-site-drop", args)
         out["files"] = await files_round_trip(client, args.site, f"{args.tag}-after-site-drop")
         return out
 
@@ -310,7 +335,7 @@ async def step_drop_relay(args: argparse.Namespace) -> dict[str, Any]:
         out["killed_visitors"] = visitors
         out["recovery"] = await recover(client, args.site)
         out["visitors_after"] = _descendant_frpc(os.getpid())
-        out["job"] = await run_job(client, args.site, f"{args.tag}-after-relay-drop")
+        out["job"] = await run_job(client, args.site, f"{args.tag}-after-relay-drop", args)
         out["files"] = await files_round_trip(client, args.site, f"{args.tag}-after-relay-drop")
         return out
 
@@ -344,14 +369,7 @@ async def step_guarded(args: argparse.Namespace) -> dict[str, Any]:
         ls = await tool(client, "exec", {"site": args.site, "command": ["ls", "-d", "."]})
         out["exec_ls"] = {k: ls.get(k) for k in ("refusal", "exit_code", "stdout")}
         out["files"] = await files_round_trip(client, args.site, f"{args.tag}-guarded")
-        spec = {
-            "package": {
-                "name": args.package,
-                "version": args.version,
-                "sha256": args.sha256,
-                "parameters": {"greeting": f"w8-{args.tag}"},
-            }
-        }
+        spec = package_spec(args, args.tag)
         started = brief(await tool(client, "run", {"site": args.site, "spec": spec, "wait_s": 5}))
         out["started"] = started
         started, out["approvals"] = await settle(client, started)
