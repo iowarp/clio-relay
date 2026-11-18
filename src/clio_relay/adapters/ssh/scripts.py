@@ -220,11 +220,18 @@ fi
 
 _FORWARD_SIGNALS = """# Some Slurm sites signal only this shell on a cancel and kill the rest after
 # KillWait. Run the launch in its own process group, pass signals on to it and wait.
+# Where the scheduler signals every process itself, the launch has already ended,
+# so the signal is not sent twice.
 _relay_job=
 _relay_held=
+_relay_live() {{
+  command -v ps >/dev/null 2>&1 || return 0
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
+}}
 _relay_pass() {{
-  if [ -n "$_relay_job" ]; then kill -s "$1" -- "-$_relay_job" 2>/dev/null
-  else _relay_held=$1; fi
+  if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
+  sleep 1
+  _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null
 }}
 trap '_relay_pass TERM' TERM
 trap '_relay_pass INT' INT
