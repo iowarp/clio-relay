@@ -82,10 +82,10 @@ Ports are chosen from 47100 up, skipping any port in use, and kept in `ports.env
 
 ### Smoke evidence on Ares
 
-Run at `36219c0` and earlier commits of this branch, from `~/clio-relay-rework/clio-relay-w2` with the shared toolchain (`uv run`).
+Run at `a774081` (fixture code identical to `36219c0`) after a fresh `down`, `build`, `up`, from `~/clio-relay-rework/clio-relay-w2` with the shared toolchain (`uv run`).
 
 - `scripts/ares/fixtures.sh up`: all seven sites ready in 80 s with images built.
-- `uv run pytest tests/test_fixtures_smoke.py`: `13 passed in 51.61s`. The tests:
+- `uv run pytest tests/test_fixtures_smoke.py`: `13 passed in 58.31s`. The tests:
   - `fx-ssh`: hostname, user and Python; a 64 KiB file round-trips through scp and sftp with a matching SHA-256; a key not in `authorized_keys` is refused.
   - `fx-slurm`: `sinfo` shows both partitions; psij's `squeue --me -o %i -h -r -t all` runs; an `sbatch --wrap` job reaches `COMPLETED` in `sacct` and its output names `fx-slurm`.
   - `fx-pbs`: a `qsub` job reaches `job_state F` with `Exit_status 0` in `qstat -f -F json -x`, and its output is staged back.
