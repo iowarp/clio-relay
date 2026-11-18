@@ -38,7 +38,6 @@ from clio_relay.serve import config as serve_settings
 from clio_relay.serve.config import SiteServe
 from clio_relay.serve.forward import Forward
 from clio_relay.serve.mount import Mounter, tool_prefix
-from clio_relay.serve.provenance import with_provenance
 from clio_relay.serve.plan import (
     SERVE_DIR,
     HopState,
@@ -51,6 +50,7 @@ from clio_relay.serve.plan import (
     site_files,
     wrapped_job,
 )
+from clio_relay.serve.provenance import with_provenance
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)

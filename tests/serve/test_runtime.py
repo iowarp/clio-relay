@@ -158,9 +158,7 @@ def test_a_stops_outputs_carry_provenance(tmp_path: Path) -> None:
     runtime._read = read  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
     own = {"provenance": {"schema": "a package's own"}, "view": {"path": "/x"}}
     log = OutputRef(name="serve/launch.log", path="/scratch/jobs/op_test/serve/launch.log")
-    status = JobStatus(
-        state=JobState.COMPLETED, outputs=[log.model_copy(update={"metadata": own})]
-    )
+    status = JobStatus(state=JobState.COMPLETED, outputs=[log.model_copy(update={"metadata": own})])
     final = asyncio.run(runtime._finish(plan, None, status))  # pyright: ignore[reportPrivateUsage]
     found = {item.name: item.metadata for item in final.outputs}
     assert found["serve/launch.log"] == own
