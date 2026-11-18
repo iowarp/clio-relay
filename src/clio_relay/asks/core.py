@@ -35,7 +35,13 @@ MAX_FIELD = 8 * 1024
 
 
 def origin_ok(headers: Mapping[str, str], allowed: set[str]) -> bool:
-    """Return whether a POST came from relay's own page."""
+    """Return whether a POST could have come from relay's own page.
+
+    The form's CSRF token is the defence. This adds the browser's word: a
+    cross-site ``Sec-Fetch-Site`` or a foreign ``Origin`` or ``Referer`` is
+    refused. A client that sends none of them (curl, a script holding the
+    page's token) is not a browser being tricked, so it passes.
+    """
     fetch_site = headers.get("sec-fetch-site")
     if fetch_site is not None and fetch_site not in ("same-origin", "none"):
         return False
@@ -46,7 +52,7 @@ def origin_ok(headers: Mapping[str, str], allowed: set[str]) -> bool:
     if referer:
         parts = urlsplit(referer)
         return f"{parts.scheme}://{parts.netloc}" in allowed
-    return False
+    return origin != "null"
 
 
 def _link(url: str, label: str) -> str:
@@ -277,9 +283,10 @@ class PageCore:
         ask = self.owner.context.asks.get(ask_id)
         if ask is None:
             return self._unknown()
-        if (
-            fields.get("op", "") != (ask.operation_id or "")
-            or fields.get("bd", "") != ask.binding_digest
+        # The page names what it showed. A form for another operation or another
+        # binding is out of date; the approval itself is checked again below.
+        if ("op" in fields and fields["op"] != (ask.operation_id or "")) or (
+            "bd" in fields and fields["bd"] != ask.binding_digest
         ):
             return response(409, "This page is out of date", "<p>Reload it and look again.</p>")
         if self.finished(ask):
