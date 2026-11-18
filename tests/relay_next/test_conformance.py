@@ -33,4 +33,3 @@ class TestLocalSupervised(AdapterConformance):
             job_timeout_s=30,
             poll_s=0.2,
         )
-
